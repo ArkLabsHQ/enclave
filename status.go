@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -64,26 +63,6 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Instance State: (error: %v)\n", err)
 		} else {
 			fmt.Printf("  Instance State: %s\n", state)
-		}
-	}
-
-	// Query KMS key state.
-	if kmsKeyID != "" {
-		keyState, err := ac.getKeyState(ctx, kmsKeyID)
-		if err != nil {
-			fmt.Printf("  KMS Key State:  (error: %v)\n", err)
-		} else {
-			fmt.Printf("  KMS Key State:  %s\n", keyState)
-		}
-
-		// Check if locked.
-		policy, err := ac.getKeyPolicy(ctx, kmsKeyID)
-		if err != nil {
-			fmt.Printf("  KMS Locked:     (error: %v)\n", err)
-		} else if strings.Contains(policy, "PutKeyPolicy") {
-			fmt.Printf("  KMS Locked:     no\n")
-		} else {
-			fmt.Printf("  KMS Locked:     yes\n")
 		}
 	}
 

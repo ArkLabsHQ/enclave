@@ -69,21 +69,45 @@ func runDestroy(cmd *cobra.Command, args []string) error {
 	fmt.Printf("[destroy] Retaining KMS key (logical ID: %s)\n", kmsLogicalID)
 
 	env := cfg.configEnv()
-	if err := runCmd("aws", []string{
-		"cloudformation", "delete-stack",
-		"--stack-name", cfg.stackName(),
-		"--retain-resources", kmsLogicalID,
-		"--region", cfg.Region,
-	}, root, env); err != nil {
-		return err
-	}
+	stack := cfg.stackName()
 
-	fmt.Println("[destroy] Waiting for stack deletion...")
-	return runCmd("aws", []string{
-		"cloudformation", "wait", "stack-delete-complete",
-		"--stack-name", cfg.stackName(),
+	// First attempt: delete without --retain-resources.
+	fmt.Println("[destroy] Deleting stack...")
+	_ = runCmd("aws", []string{
+		"cloudformation", "delete-stack",
+		"--stack-name", stack,
 		"--region", cfg.Region,
 	}, root, env)
+
+	fmt.Println("[destroy] Waiting for stack deletion...")
+	waitErr := runCmd("aws", []string{
+		"cloudformation", "wait", "stack-delete-complete",
+		"--stack-name", stack,
+		"--region", cfg.Region,
+	}, root, env)
+
+	if waitErr != nil {
+		// Stack likely entered DELETE_FAILED because CloudFormation can't
+		// delete the KMS key (locked policy). Retry with --retain-resources.
+		fmt.Printf("[destroy] Stack deletion failed, retaining KMS key %s and retrying...\n", kmsLogicalID)
+		if err := runCmd("aws", []string{
+			"cloudformation", "delete-stack",
+			"--stack-name", stack,
+			"--retain-resources", kmsLogicalID,
+			"--region", cfg.Region,
+		}, root, env); err != nil {
+			return err
+		}
+
+		fmt.Println("[destroy] Waiting for stack deletion...")
+		return runCmd("aws", []string{
+			"cloudformation", "wait", "stack-delete-complete",
+			"--stack-name", stack,
+			"--region", cfg.Region,
+		}, root, env)
+	}
+
+	return nil
 }
 
 // findKMSKeyLogicalID synthesizes the CDK stack and parses the CloudFormation

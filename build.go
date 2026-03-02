@@ -339,9 +339,9 @@ func buildMgmtBinary(cfg *Config, root string) error {
 	outDir := filepath.Join(root, "enclave", "artifacts")
 	fmt.Println("[build] Building management server binary...")
 
-	// Install the mgmt binary from the SDK module at the configured rev.
+	// Install the mgmt binary from the latest published SDK version.
 	// GOBIN controls where the binary is placed.
-	modulePath := "github.com/ArkLabsHQ/introspector-enclave/mgmt@" + cfg.SDK.Rev
+	modulePath := "github.com/ArkLabsHQ/introspector-enclave/mgmt@latest"
 	cmd := exec.Command("go", "install", "-trimpath", modulePath)
 	cmd.Env = append(os.Environ(),
 		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",

@@ -1,15 +1,23 @@
-name: Verify SDK Hashes
+name: Release SDK Version
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag version (e.g. v0.0.29)'
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
-  verify-hashes:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
 
       - uses: cachix/install-nix-action@v27
         with:
@@ -17,54 +25,116 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Compute source hash
-        id: source
+      - name: Validate version
         run: |
-          REV="${GITHUB_REF_NAME}"
-          RAW=$(nix-prefetch-url --unpack --type sha256 \
-            "https://github.com/${{ github.repository }}/archive/${REV}.tar.gz")
-          HASH=$(nix hash convert --hash-algo sha256 --to sri "$RAW")
-          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
-          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
-          echo "Source hash for ${REV}: ${HASH}"
-
-      - name: Verify sdk-hashes.json matches
-        run: |
-          if [ ! -f sdk-hashes.json ]; then
-            echo "::warning::sdk-hashes.json not found — skipping comparison"
-            exit 0
+          TAG="${{ inputs.version }}"
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version format: ${TAG} (expected vX.Y.Z)"
+            exit 1
           fi
-          FILE_REV=$(jq -r '.rev' sdk-hashes.json)
-          FILE_HASH=$(jq -r '.hash' sdk-hashes.json)
-          EXPECTED_HASH="${{ steps.source.outputs.hash }}"
-          TAG="${{ steps.source.outputs.rev }}"
-
-          # Only compare if sdk-hashes.json claims to be for this tag.
-          if [ "$FILE_REV" = "$TAG" ]; then
-            if [ "$FILE_HASH" != "$EXPECTED_HASH" ]; then
-              echo "::error::Source hash mismatch!"
-              echo "  sdk-hashes.json: ${FILE_HASH}"
-              echo "  computed:        ${EXPECTED_HASH}"
-              exit 1
-            fi
-            echo "Source hash matches."
-          else
-            echo "sdk-hashes.json is for ${FILE_REV}, not ${TAG} — skipping hash comparison."
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Use a new version number."
+            exit 1
           fi
 
-      - name: Build enclave-supervisor
+      - name: Compute vendor hash
+        id: vendor
         run: |
           cd sdk
+          OUTPUT=$(nix build --impure \
+            --extra-experimental-features 'nix-command flakes' \
+            --expr '
+              let pkgs = import <nixpkgs> {};
+              in pkgs.buildGoModule {
+                pname = "enclave-supervisor";
+                version = "dev";
+                src = ./.;
+                subPackages = ["cmd/enclave-supervisor"];
+                vendorHash = "";
+                doCheck = false;
+              }
+            ' 2>&1 || true)
+          VENDOR_HASH=$(echo "$OUTPUT" | grep 'got:' | awk '{print $2}')
+          if [ -z "$VENDOR_HASH" ]; then
+            # If no mismatch, the current vendor hash is correct.
+            VENDOR_HASH=$(jq -r '.vendor_hash' ../sdk-hashes.json)
+          fi
+          echo "vendor_hash=${VENDOR_HASH}" >> "$GITHUB_OUTPUT"
+          echo "Vendor hash: ${VENDOR_HASH}"
+
+      - name: Update sdk-hashes.json and commit
+        id: commit
+        run: |
+          TAG="${{ inputs.version }}"
+          VENDOR_HASH="${{ steps.vendor.outputs.vendor_hash }}"
+
+          # Write sdk-hashes.json with a placeholder source hash.
+          # The source hash depends on file contents (circular), so we
+          # write it, commit, tag, then compute the real hash in a second pass.
+          jq -n \
+            --arg rev "$TAG" \
+            --arg hash "placeholder" \
+            --arg vendor_hash "$VENDOR_HASH" \
+            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > sdk-hashes.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sdk-hashes.json
+          git commit -m "sdk hashes for ${TAG}"
+
+      - name: Compute real source hash and finalize
+        run: |
+          TAG="${{ inputs.version }}"
+          VENDOR_HASH="${{ steps.vendor.outputs.vendor_hash }}"
+
+          # Tag current commit to compute the archive hash.
+          git tag "$TAG"
+          RAW=$(nix-prefetch-url --unpack --type sha256 \
+            "file://$(git archive --format=tar.gz --prefix=source/ HEAD | tee /tmp/archive.tar.gz | wc -c | xargs -I{} echo /tmp/archive.tar.gz)" 2>/dev/null || true)
+
+          # Compute hash from the git archive directly.
+          TMPDIR=$(mktemp -d)
+          git archive --format=tar.gz --prefix=source/ HEAD | tar xz -C "$TMPDIR"
+          SOURCE_HASH=$(nix hash path "$TMPDIR/source")
+          rm -rf "$TMPDIR"
+          echo "Source hash: ${SOURCE_HASH}"
+
+          # Update sdk-hashes.json with the real hash.
+          jq -n \
+            --arg rev "$TAG" \
+            --arg hash "$SOURCE_HASH" \
+            --arg vendor_hash "$VENDOR_HASH" \
+            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > sdk-hashes.json
+
+          # Amend the commit and re-tag.
+          git add sdk-hashes.json
+          git commit --amend --no-edit
+          git tag -f "$TAG"
+
+          echo "Final sdk-hashes.json:"
+          cat sdk-hashes.json
+
+      - name: Push commit and tag
+        run: |
+          TAG="${{ inputs.version }}"
+          git push origin HEAD:master
+          git push origin "refs/tags/${TAG}"
+          echo "Pushed ${TAG}"
+
+      - name: Verify build
+        run: |
+          cd sdk
+          VENDOR_HASH=$(jq -r '.vendor_hash' ../sdk-hashes.json)
           nix build --impure \
             --extra-experimental-features 'nix-command flakes' \
             --expr "
               let pkgs = import <nixpkgs> {};
               in pkgs.buildGoModule {
                 pname = \"enclave-supervisor\";
-                version = \"${{ steps.source.outputs.rev }}\";
+                version = \"${{ inputs.version }}\";
                 src = ./.;
                 subPackages = [\"cmd/enclave-supervisor\"];
-                vendorHash = \"$(jq -r '.vendor_hash' ../sdk-hashes.json 2>/dev/null || echo '')\";
+                vendorHash = \"${VENDOR_HASH}\";
                 tags = [\"netgo\"];
                 doCheck = false;
               }

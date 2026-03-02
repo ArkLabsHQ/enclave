@@ -61,14 +61,14 @@ func getFrameworkFiles(language string) []frameworkFile {
 			Content: frameworkGvproxyService,
 		},
 		{
+			RelPath: "enclave/systemd/enclave-mgmt.service",
+			Mode:    0644,
+			Content: frameworkMgmtService,
+		},
+		{
 			RelPath: "enclave/user_data/user_data",
 			Mode:    0644,
 			Content: frameworkUserData,
-		},
-		{
-			RelPath: ".github/workflows/verify-enclave.yml",
-			Mode:    0644,
-			Content: frameworkVerifyWorkflow,
 		},
 		{
 			RelPath: ".github/workflows/deploy-enclave.yml",
@@ -315,6 +315,26 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 `
 
+// Systemd unit — management server for health monitoring and guarded teardown.
+const frameworkMgmtService = `[Unit]
+Description=Enclave management server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=enclave-mgmt
+EnvironmentFile=/etc/environment
+ExecStart=/home/ec2-user/app/enclave-mgmt
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`
+
 // EC2 user_data cloud-init — installs dependencies, downloads EIF, configures services.
 // Template variables (e.g. ${__REGION__}) are resolved by CDK Fn::Sub at deploy time.
 const frameworkUserData = `Content-Type: multipart/mixed; boundary="//"
@@ -397,6 +417,12 @@ aws s3 cp ${__ENCLAVE_INIT_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-watchdo
 aws s3 cp ${__IMDS_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-imds-proxy.service
 aws s3 cp ${__GVPROXY_SYSTEMD_S3_URL__} /etc/systemd/system/gvproxy.service
 
+# Download management server binary and systemd unit
+aws s3 cp ${__MGMT_BINARY_S3_URL__} /home/ec2-user/app/enclave-mgmt
+chmod +x /home/ec2-user/app/enclave-mgmt
+chown ec2-user:ec2-user /home/ec2-user/app/enclave-mgmt
+aws s3 cp ${__MGMT_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-mgmt.service
+
 cat <<EOF >> /etc/environment
 ENCLAVE_APP_NAME=${__APP_NAME__}
 EIF_PATH=/home/ec2-user/app/server/enclave.eif
@@ -410,6 +436,7 @@ EOF
 systemctl enable --now enclave-watchdog.service
 systemctl enable --now enclave-imds-proxy.service
 systemctl enable --now gvproxy.service
+systemctl enable --now enclave-mgmt.service
 --//--
 `
 
@@ -812,7 +839,8 @@ LAUNCHER
 }
 `
 
-// GitHub Actions workflow — deploy enclave via OIDC-authenticated AWS credentials.
+// GitHub Actions workflow — deploy enclave via OIDC-authenticated AWS credentials,
+// then verify attestation and publish results to GitHub Pages.
 // Users must set repo variables AWS_ROLE_ARN and AWS_REGION, and configure an
 // OIDC identity provider in AWS IAM for token.actions.githubusercontent.com.
 const frameworkDeployWorkflow = `name: Deploy Enclave
@@ -861,7 +889,7 @@ jobs:
           enclave build
           enclave deploy
 
-          # Extract deployment outputs for manifest.
+          # Extract deployment outputs for manifest and verification.
           pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
           pcr1=$(jq -r '.PCR1' enclave/artifacts/pcr.json)
           pcr2=$(jq -r '.PCR2' enclave/artifacts/pcr.json)
@@ -870,7 +898,7 @@ jobs:
           echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
 
           # Extract Elastic IP from CDK outputs.
-          elastic_ip=$(jq -r 'to_entries[0].value | .["ElasticIP"] // .["Elastic IP"] // empty' enclave/cdk-outputs.json)
+          elastic_ip=$(jq -r 'to_entries[0].value | .ElasticIP // .["Elastic IP"] // empty' enclave/cdk-outputs.json 2>/dev/null || echo "")
           echo "elastic_ip=${elastic_ip}" >> "$GITHUB_OUTPUT"
 
       - name: Publish deployment manifest
@@ -918,87 +946,6 @@ jobs:
           **PCR0:** \` + "\\`" + `${PCR0}` + "\\`" + `
           **Deployed:** ${TIMESTAMP}
           **Commit:** ${COMMIT_SHA}"
-`
-
-// GitHub Actions workflow — destroy enclave infrastructure via OIDC-authenticated AWS credentials.
-const frameworkDestroyWorkflow = `name: Destroy Enclave
-
-on:
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
-
-# Same repo variables as deploy:
-#   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy
-#   AWS_REGION    - AWS region
-
-jobs:
-  destroy:
-    runs-on: ubuntu-latest
-    if: vars.AWS_ROLE_ARN != ''
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
-          aws-region: ` + "${{ vars.AWS_REGION }}" + `
-
-      - name: Install AWS CDK
-        run: npm install -g aws-cdk
-
-      - name: Destroy stack
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
-          # CDK stack synthesis references image.eif as an S3 asset, so the path
-          # must exist even for destroy. An empty placeholder is sufficient.
-          mkdir -p enclave/artifacts
-          touch enclave/artifacts/image.eif
-          enclave destroy --force
-`
-
-// GitHub Actions workflow — daily attestation verification + GitHub Pages status page.
-// Writes to an attestation/ subdirectory on the gh-pages branch so it coexists
-// with any existing GitHub Pages content.
-const frameworkVerifyWorkflow = `name: Verify Enclave
-
-on:
-  schedule:
-    - cron: '0 0 * * *'  # daily at midnight UTC
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    if: vars.ENCLAVE_URL != ''
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
-
-      - name: Pull Nix Docker image
-        run: docker pull nixos/nix:2.24.9
-
-      - name: Build EIF (reproducible)
-        run: enclave build
 
       - name: Display PCR measurements
         run: |
@@ -1010,17 +957,12 @@ jobs:
       - name: Verify attestation
         id: verify
         run: |
-          pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
-          pcr1=$(jq -r '.PCR1' enclave/artifacts/pcr.json)
-          pcr2=$(jq -r '.PCR2' enclave/artifacts/pcr.json)
-
-          echo "pcr0=${pcr0}" >> "$GITHUB_OUTPUT"
-          echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
-          echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
+          pcr0="` + "${{ steps.deploy.outputs.pcr0 }}" + `"
 
           output=$(enclave verify \
-            --base-url "` + "${{ vars.ENCLAVE_URL }}" + `" \
-            --expected-pcr0 "${pcr0}" 2>&1) && status="pass" || status="fail"
+            --base-url "https://` + "${{ steps.deploy.outputs.elastic_ip }}" + `" \
+            --expected-pcr0 "${pcr0}" \
+            --wait 300 2>&1) && status="pass" || status="fail"
 
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           echo "output<<EOF" >> "$GITHUB_OUTPUT"
@@ -1038,13 +980,13 @@ jobs:
             exit 1
           fi
 
-      - name: Generate status files
+      - name: Generate attestation status page
         if: always() && steps.verify.outcome != 'skipped'
         env:
           VERIFY_STATUS: ` + "${{ steps.verify.outputs.status || 'unknown' }}" + `
-          VERIFY_PCR0: ` + "${{ steps.verify.outputs.pcr0 || '' }}" + `
-          VERIFY_PCR1: ` + "${{ steps.verify.outputs.pcr1 || '' }}" + `
-          VERIFY_PCR2: ` + "${{ steps.verify.outputs.pcr2 || '' }}" + `
+          VERIFY_PCR0: ` + "${{ steps.deploy.outputs.pcr0 || '' }}" + `
+          VERIFY_PCR1: ` + "${{ steps.deploy.outputs.pcr1 || '' }}" + `
+          VERIFY_PCR2: ` + "${{ steps.deploy.outputs.pcr2 || '' }}" + `
           VERIFY_OUTPUT: ` + "${{ steps.verify.outputs.output || '' }}" + `
           REPO: ` + "${{ github.repository }}" + `
           COMMIT_SHA: ` + "${{ github.sha }}" + `
@@ -1135,3 +1077,52 @@ jobs:
           git commit -m "update attestation status"
           git push origin gh-pages
 `
+
+// GitHub Actions workflow — destroy enclave infrastructure via OIDC-authenticated AWS credentials.
+const frameworkDestroyWorkflow = `name: Destroy Enclave
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# Same repo variables as deploy:
+#   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy
+#   AWS_REGION    - AWS region
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    if: vars.AWS_ROLE_ARN != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install enclave CLI
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
+          aws-region: ` + "${{ vars.AWS_REGION }}" + `
+
+      - name: Install AWS CDK
+        run: npm install -g aws-cdk
+
+      - name: Destroy stack
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
+          # CDK stack synthesis references asset paths (EIF + mgmt binary).
+          # They must exist even for destroy. Empty placeholders are sufficient.
+          mkdir -p enclave/artifacts
+          touch enclave/artifacts/image.eif
+          touch enclave/artifacts/enclave-mgmt
+          enclave destroy --force
+`
+

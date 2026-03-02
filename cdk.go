@@ -100,6 +100,14 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		Path: jsii.String(repoPath("enclave/systemd/gvproxy.service")),
 	})
 
+	mgmtBinary := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveMgmtBinary"), &awss3assets.AssetProps{
+		Path: jsii.String(repoPath("enclave/artifacts/enclave-mgmt")),
+	})
+
+	mgmtSystemd := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveMgmtService"), &awss3assets.AssetProps{
+		Path: jsii.String(repoPath("enclave/systemd/enclave-mgmt.service")),
+	})
+
 	// Create SSM parameters for each configured secret.
 	var secretParams []awsssm.StringParameter
 	for _, secret := range secrets {
@@ -226,6 +234,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	enclaveInitSystemd.GrantRead(role)
 	imdsSystemd.GrantRead(role)
 	gvproxySystemd.GrantRead(role)
+	mgmtBinary.GrantRead(role)
+	mgmtSystemd.GrantRead(role)
 	// Grant access to all per-secret SSM parameters (ciphertext + migration).
 	for _, param := range secretParams {
 		param.GrantRead(role)
@@ -257,6 +267,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		"__ENCLAVE_INIT_SYSTEMD_S3_URL__": enclaveInitSystemd.S3ObjectUrl(),
 		"__IMDS_SYSTEMD_S3_URL__":         imdsSystemd.S3ObjectUrl(),
 		"__GVPROXY_SYSTEMD_S3_URL__":      gvproxySystemd.S3ObjectUrl(),
+		"__MGMT_BINARY_S3_URL__":          mgmtBinary.S3ObjectUrl(),
+		"__MGMT_SYSTEMD_S3_URL__":         mgmtSystemd.S3ObjectUrl(),
 		"__REGION__":                      stack.Region(),
 		"__KMS_KEY_ID__":                  encryptionKey.KeyId(),
 	}

@@ -110,12 +110,18 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Build the host-side management server binary.
+	if err := buildMgmtBinary(cfg, root); err != nil {
+		return fmt.Errorf("build management server: %w", err)
+	}
+
 	fmt.Println()
 	fmt.Println("[build] Done:")
 	fmt.Printf("  PCR0: %s\n", pcrs.PCR0)
 	fmt.Printf("  PCR1: %s\n", pcrs.PCR1)
 	fmt.Printf("  PCR2: %s\n", pcrs.PCR2)
 	fmt.Printf("  EIF:  enclave/artifacts/image.eif\n")
+	fmt.Printf("  Mgmt: enclave/artifacts/enclave-mgmt\n")
 	fmt.Println()
 	fmt.Println("Next: enclave deploy")
 	return nil
@@ -325,4 +331,36 @@ func BuildEIFLocal(cfg *Config, root string) (*PCRValues, error) {
 	}
 
 	return &pcrs, nil
+}
+
+// buildMgmtBinary cross-compiles the host-side management server from the SDK
+// for Linux amd64 and places the binary in enclave/artifacts/.
+func buildMgmtBinary(cfg *Config, root string) error {
+	outDir := filepath.Join(root, "enclave", "artifacts")
+	fmt.Println("[build] Building management server binary...")
+
+	// Install the mgmt binary from the SDK module at the configured rev.
+	// GOBIN controls where the binary is placed.
+	modulePath := "github.com/ArkLabsHQ/introspector-enclave/mgmt@" + cfg.SDK.Rev
+	cmd := exec.Command("go", "install", "-trimpath", modulePath)
+	cmd.Env = append(os.Environ(),
+		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		"GOBIN="+outDir,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("go install mgmt: %w", err)
+	}
+
+	// go install names the binary after the module directory ("mgmt").
+	// Rename to "enclave-mgmt" for clarity on the host.
+	src := filepath.Join(outDir, "mgmt")
+	dst := filepath.Join(outDir, "enclave-mgmt")
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("rename mgmt binary: %w", err)
+	}
+
+	return nil
 }

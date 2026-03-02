@@ -137,12 +137,25 @@ func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 st
 
 	elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
 
+	// Persist instance ID and elastic IP in SSM so they're available across
+	// CI runs (cdk-outputs.json is gitignored and not present during upgrades
+	// or destroy).
+	_ = ac.putParameter(ctx, cfg.ssmParam("InstanceID"), instanceID)
+	if elasticIP != "" {
+		_ = ac.putParameter(ctx, cfg.ssmParam("ElasticIP"), elasticIP)
+	}
+
 	fmt.Println()
 	fmt.Println("[deploy] Done.")
 	fmt.Printf("  Instance ID: %s\n", instanceID)
 	fmt.Printf("  Elastic IP:  %s\n", elasticIP)
 	fmt.Printf("  PCR0:        %s\n", pcr0)
-	fmt.Println()
+
+	fmt.Printf("\n[deploy] Verifying deployment (waiting up to 120s)...\n")
+	if err := initialVerification(elasticIP, pcr0, 120); err != nil {
+		fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
+		fmt.Println("[deploy] Try: enclave verify --wait 300")
+	}
 
 	return nil
 }
@@ -289,20 +302,30 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	fmt.Printf("  New KMS Key:  %s\n", newKMSKeyID)
 	fmt.Printf("  Old KMS Key:  %s (scheduled for deletion by new enclave on boot)\n", kmsKeyID)
 	fmt.Printf("  PCR0:         %s\n", pcr0)
+
+	// Read elastic IP from SSM (stored during fresh deploy) for verification.
+	elasticIP, _ := ac.getParameter(ctx, cfg.ssmParam("ElasticIP"))
+	if elasticIP != "" {
+		fmt.Printf("\n[deploy] Verifying upgrade (waiting up to 60s)...\n")
+		if err := initialVerification(elasticIP, pcr0, 60); err != nil {
+			fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
+			fmt.Println("[deploy] Try: enclave verify --wait 300")
+		}
+	}
+
 	return nil
 }
 
-// restartEnclaveOnHost downloads the new EIF from S3, replaces the EIF the watchdog
-// uses (enclave.eif, matching EIF_PATH in /etc/environment), and restarts the watchdog.
-// The watchdog's enclave name comes from ENCLAVE_NAME in /etc/environment (default "app").
+// restartEnclaveOnHost downloads the new EIF from S3, replaces the EIF on disk,
+// and restarts the enclave via the management server's start/stop endpoints.
 func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, instanceID, eifBucket string) error {
-	return ac.runOnHost(ctx, instanceID, "stop enclave, update EIF, restart watchdog", []string{
+	return ac.runOnHost(ctx, instanceID, "stop enclave, update EIF, restart enclave", []string{
 		"set -e",
 		fmt.Sprintf("aws s3 cp s3://%s/image.eif /tmp/new-enclave.eif --region %s", eifBucket, cfg.Region),
-		`nitro-cli terminate-enclave --enclave-name "${ENCLAVE_NAME:-app}" 2>/dev/null || true`,
+		"curl -sf -X POST http://localhost:8443/stop || true",
 		"cp /tmp/new-enclave.eif /home/ec2-user/app/server/enclave.eif",
 		"chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif",
-		"systemctl restart enclave-watchdog",
+		"curl -sf -X POST http://localhost:8443/start",
 	})
 }
 
@@ -359,6 +382,49 @@ func applyTransitionalKMSPolicy(ctx context.Context, ac *awsClients, keyID, ec2R
 }`, ec2RoleARN, accountRoot)
 
 	return ac.putKeyPolicy(ctx, keyID, policy, false)
+}
+
+// --- Post-deploy verification ---
+
+// initialVerification runs attestation verification with retry against a
+// freshly deployed enclave. Reuses the same checks as `enclave verify`.
+func initialVerification(elasticIP, pcr0 string, waitSeconds int) error {
+	client := verifyHTTPClient(true)
+	baseURL := "https://" + elasticIP
+
+	runAllChecks := func() error {
+		result, err := verifyAttestation(client, baseURL, pcr0)
+		if err != nil {
+			return err
+		}
+		if err := verifyAttestationKeyBinding(client, baseURL, result); err != nil {
+			return err
+		}
+		if err := verifyPCR0Chain(client, baseURL); err != nil {
+			return fmt.Errorf("PCR0 chain: %w", err)
+		}
+		return nil
+	}
+
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	interval := 5 * time.Second
+	attempt := 0
+
+	for {
+		attempt++
+		err := runAllChecks()
+		if err == nil {
+			fmt.Println("[deploy] Verification passed.")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		remaining := time.Until(deadline).Truncate(time.Second)
+		fmt.Printf("[deploy] Attempt %d failed (%s), retrying... (%s remaining)\n",
+			attempt, shortErr(err), remaining)
+		time.Sleep(interval)
+	}
 }
 
 // --- File helpers ---

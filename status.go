@@ -87,15 +87,44 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Query enclave info via SSM (best-effort).
+	// Query enclave health via the management server (best-effort).
 	if instanceID != "" {
 		fmt.Println()
+		healthJSON := ac.runCommandOutput(ctx, instanceID,
+			"curl -sf http://localhost:8443/health 2>/dev/null || echo '{}'")
+		if healthJSON != "" && healthJSON != "{}" {
+			var health struct {
+				Status     string `json:"status"`
+				EnclaveID  string `json:"enclave_id"`
+				EnclaveCID int    `json:"enclave_cid"`
+				CPUCount   int    `json:"cpu_count"`
+				MemoryMiB  int    `json:"memory_mib"`
+				State      string `json:"state"`
+				Timestamp  string `json:"timestamp"`
+			}
+			if err := json.Unmarshal([]byte(healthJSON), &health); err == nil {
+				fmt.Printf("  Enclave Status: %s\n", health.Status)
+				if health.EnclaveID != "" {
+					fmt.Printf("  Enclave ID:     %s\n", health.EnclaveID)
+					fmt.Printf("  Enclave CID:    %d\n", health.EnclaveCID)
+					fmt.Printf("  CPU Count:      %d\n", health.CPUCount)
+					fmt.Printf("  Memory (MiB):   %d\n", health.MemoryMiB)
+				}
+			} else {
+				fmt.Println("  Enclave Health: (parse error)")
+			}
+		} else {
+			fmt.Println("  Enclave Health: (mgmt server not reachable)")
+		}
+
+		// Also query app-level enclave info (nitriding) if running.
 		enclaveInfo := ac.runCommandOutput(ctx, instanceID,
 			"curl -sf -k https://127.0.0.1:443/v1/enclave-info 2>/dev/null || echo '{}'")
 		if enclaveInfo != "" && enclaveInfo != "{}" {
 			var info map[string]interface{}
 			if err := json.Unmarshal([]byte(enclaveInfo), &info); err == nil {
-				fmt.Println("  Enclave Info:")
+				fmt.Println()
+				fmt.Println("  App Info:")
 				if v, ok := info["version"]; ok {
 					fmt.Printf("    Version:         %v\n", v)
 				}
@@ -103,8 +132,6 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					fmt.Printf("    Previous PCR0:   %v\n", v)
 				}
 			}
-		} else {
-			fmt.Println("  Enclave Info:   (not reachable)")
 		}
 	}
 

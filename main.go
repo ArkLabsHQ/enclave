@@ -25,6 +25,8 @@ func Execute() {
 		updateCmd(),
 		buildCmd(),
 		deployCmd(),
+		startCmd(),
+		stopCmd(),
 		verifyCmd(),
 		statusCmd(),
 		curlCmd(),

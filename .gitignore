@@ -25,6 +25,7 @@ introspector
 introspector-client
 ./bin/
 *.eif
+mgmt/mgmt
 
 # Temporary build artifacts
 /tmp/enclave-verify-*

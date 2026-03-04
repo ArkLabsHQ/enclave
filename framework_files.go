@@ -903,6 +903,7 @@ jobs:
 
       - name: Publish deployment manifest
         if: steps.deploy.outputs.elastic_ip != ''
+        continue-on-error: true
         env:
           PCR0: ` + "${{ steps.deploy.outputs.pcr0 }}" + `
           PCR1: ` + "${{ steps.deploy.outputs.pcr1 }}" + `
@@ -1065,6 +1066,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Save generated status page before discarding local changes.
+          cp -r _site /tmp/_site
+
           # Discard all local modifications (e.g. sed on enclave.yaml, build
           # artifacts, flake.lock) so we can cleanly switch branches.
           git reset --hard HEAD
@@ -1079,8 +1083,8 @@ jobs:
           fi
 
           mkdir -p attestation
-          cp _site/index.html attestation/
-          cp _site/status.json attestation/
+          cp /tmp/_site/index.html attestation/
+          cp /tmp/_site/status.json attestation/
           git add attestation/index.html attestation/status.json
           git diff --cached --quiet && exit 0
           git commit -m "update attestation status"

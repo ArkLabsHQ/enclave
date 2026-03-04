@@ -927,25 +927,31 @@ jobs:
             > deployment.json
 
           # Create a timestamped release with the manifest attached.
-          gh release create "$TAG" deployment.json \
-            --title "Deploy ${TAG}" \
-            --notes "Deployed at ${TIMESTAMP} from commit ${COMMIT_SHA}.
+          cat > /tmp/release-notes.md <<NOTES
+          Deployed at ${TIMESTAMP} from commit ${COMMIT_SHA}.
 
           **Elastic IP:** ${ELASTIC_IP}
-          **PCR0:** \` + "\\`" + `${PCR0}` + "\\`" + `"
+          **PCR0:** ${PCR0}
+          NOTES
+          gh release create "$TAG" deployment.json \
+            --title "Deploy ${TAG}" \
+            --notes-file /tmp/release-notes.md
 
           # Update the 'latest' release so clients can always fetch the
           # current manifest at releases/download/latest/deployment.json.
           gh release delete latest --yes 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
-          gh release create latest deployment.json \
-            --title "Latest Deployment" \
-            --notes "Current production deployment. Updated by each deploy.
+          cat > /tmp/latest-notes.md <<NOTES
+          Current production deployment. Updated by each deploy.
 
           **Elastic IP:** ${ELASTIC_IP}
-          **PCR0:** \` + "\\`" + `${PCR0}` + "\\`" + `
+          **PCR0:** ${PCR0}
           **Deployed:** ${TIMESTAMP}
-          **Commit:** ${COMMIT_SHA}"
+          **Commit:** ${COMMIT_SHA}
+          NOTES
+          gh release create latest deployment.json \
+            --title "Latest Deployment" \
+            --notes-file /tmp/latest-notes.md
 
       - name: Display PCR measurements
         run: |
@@ -971,7 +977,7 @@ jobs:
 
           echo "## Enclave Verification" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Status:** ${status}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **PCR0:** ` + "\\`" + `${pcr0}` + "\\`" + `" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **PCR0:** ${pcr0}" >> "$GITHUB_STEP_SUMMARY"
           echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
           echo "${output}" >> "$GITHUB_STEP_SUMMARY"
           echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
@@ -1059,8 +1065,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Checkout gh-pages, preserving any existing files (e.g. deployment.json
-          # from the deploy workflow). Only update status.json and index.html.
+          # Discard any local modifications (e.g. sed on enclave.yaml, build
+          # artifacts) so we can cleanly switch to the gh-pages branch.
+          git stash --include-untracked
+
           if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
             git checkout --orphan gh-pages
             git rm -rf .

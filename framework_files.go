@@ -1065,9 +1065,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Discard any local modifications (e.g. sed on enclave.yaml, build
-          # artifacts) so we can cleanly switch to the gh-pages branch.
-          git stash --include-untracked
+          # Discard all local modifications (e.g. sed on enclave.yaml, build
+          # artifacts, flake.lock) so we can cleanly switch branches.
+          git reset --hard HEAD
+          git clean -fd
 
           if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
             git checkout --orphan gh-pages

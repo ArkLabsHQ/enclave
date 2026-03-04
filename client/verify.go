@@ -18,6 +18,55 @@ import (
 	"github.com/hf/nitrite"
 )
 
+// VerifyManifestProvenance checks that a deployment manifest has a valid
+// GitHub artifact attestation, proving it was produced by a GitHub Actions
+// workflow — not manually uploaded. It calls the GitHub Attestations API
+// with the SHA256 digest of the manifest bytes.
+//
+// For public repos, token can be empty. For private repos, pass a GitHub
+// token with attestations:read permission.
+func VerifyManifestProvenance(ctx context.Context, repo string, manifestBytes []byte, token string) error {
+	digest := sha256.Sum256(manifestBytes)
+	digestStr := fmt.Sprintf("sha256:%x", digest)
+
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/attestations/%s", repo, digestStr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("attestations API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("attestations API status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		Attestations []json.RawMessage `json:"attestations"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode attestations: %w", err)
+	}
+
+	if len(result.Attestations) == 0 {
+		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
+	}
+
+	return nil
+}
+
 // enclaveInfoResponse is the JSON structure returned by /v1/enclave-info.
 type enclaveInfoResponse struct {
 	Version           string `json:"version"`

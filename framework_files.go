@@ -851,6 +851,7 @@ on:
 permissions:
   id-token: write
   contents: write
+  attestations: write
 
 # Required repo variables:
 #   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy for this repo
@@ -953,6 +954,29 @@ jobs:
           gh release create latest deployment.json \
             --title "Latest Deployment" \
             --notes-file /tmp/latest-notes.md
+
+      - name: Attest deployment manifest
+        if: steps.deploy.outputs.elastic_ip != ''
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: deployment.json
+
+      - name: Attest PCR measurements
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: enclave/artifacts/pcr.json
+
+      - name: Attestation verification instructions
+        if: steps.deploy.outputs.elastic_ip != ''
+        run: |
+          echo "## Artifact Attestations" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verify deployment manifest provenance:" >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
+          echo "gh attestation verify deployment.json --repo ` + "${{ github.repository }}" + `" >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Display PCR measurements
         run: |

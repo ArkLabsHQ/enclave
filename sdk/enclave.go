@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nsm"
@@ -40,6 +41,11 @@ type Enclave struct {
 	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
 	initError               atomic.Value // stores string, updated progressively during init
+
+	// Encrypted persistent storage (S3-backed, AES-256-GCM with single DEK).
+	s3Client   *s3.Client
+	bucketName string
+	dek        []byte // 32-byte plaintext AES-256 key, in memory only
 }
 
 // New creates an Enclave that is safe to use immediately for serving
@@ -90,6 +96,12 @@ func (e *Enclave) Init(ctx context.Context) error {
 		}
 	}
 
+	e.setInitError("initializing storage")
+	if err := e.initStorage(ctx); err != nil {
+		e.setInitError(fmt.Sprintf("init storage: %s", err))
+		return fmt.Errorf("init storage: %w", err)
+	}
+
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
 		e.previousPCR0 = pcr0
 	}
@@ -131,15 +143,23 @@ func (e *Enclave) AttestationPubkey() string {
 
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
-//	GET  /v1/enclave-info
-//	POST /v1/export-key
-//	POST /v1/extend-pcr
-//	POST /v1/lock-pcr
+//	GET    /v1/enclave-info
+//	POST   /v1/export-key
+//	POST   /v1/extend-pcr
+//	POST   /v1/lock-pcr
+//	PUT    /v1/storage/{key...}
+//	GET    /v1/storage/{key...}
+//	DELETE /v1/storage/{key...}
+//	GET    /v1/storage
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
 	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
+	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
+	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
+	mux.HandleFunc("DELETE /v1/storage/{key...}", e.handleStorageDelete)
+	mux.HandleFunc("GET /v1/storage", e.handleStorageList)
 }
 
 // Middleware returns an http.Handler that signs all responses with the

@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecrassets"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awskms"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awss3"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awss3assets"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsssm"
 	"github.com/aws/constructs-go/constructs/v10"
@@ -190,6 +191,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		PrivateDnsEnabled: jsii.Bool(true),
 	})
 
+	awsec2.NewGatewayVpcEndpoint(stack, jsii.String("S3Endpoint"), &awsec2.GatewayVpcEndpointProps{
+		Vpc:     vpc,
+		Service: awsec2.GatewayVpcEndpointAwsService_S3(),
+	})
+
 	nitroInstanceSG := awsec2.NewSecurityGroup(stack, jsii.String("NitroInstanceSG"), &awsec2.SecurityGroupProps{
 		Vpc:              vpc,
 		AllowAllOutbound: jsii.Bool(true),
@@ -324,6 +330,35 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
 	})
 	kmsKeyIDParam.GrantRead(role)
+
+	// Encrypted persistent storage bucket for enclave data (Store/Load API).
+	storageBucket := awss3.NewBucket(stack, jsii.String("EnclaveStorage"), &awss3.BucketProps{
+		RemovalPolicy:     awscdk.RemovalPolicy_RETAIN,
+		BlockPublicAccess: awss3.BlockPublicAccess_BLOCK_ALL(),
+		EnforceSSL:        jsii.Bool(true),
+	})
+	storageBucket.GrantReadWrite(role, nil)
+
+	storageBucketParam := awsssm.NewStringParameter(stack, jsii.String("StorageBucketName"), &awsssm.StringParameterProps{
+		StringValue:   storageBucket.BucketName(),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/StorageBucketName", deployment, appName)),
+	})
+	storageBucketParam.GrantRead(role)
+
+	// SSM parameter for the storage data encryption key (DEK).
+	storageDEKParam := awsssm.NewStringParameter(stack, jsii.String("StorageDEK"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext", deployment, appName)),
+	})
+	storageDEKParam.GrantRead(role)
+	storageDEKParam.GrantWrite(role)
+
+	storageDEKMigrationParam := awsssm.NewStringParameter(stack, jsii.String("MigrationStorageDEK"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)),
+	})
+	storageDEKMigrationParam.GrantRead(role)
+	storageDEKMigrationParam.GrantWrite(role)
 
 	awscdk.NewCfnOutput(stack, jsii.String("EC2 Instance Role ARN"), &awscdk.CfnOutputProps{
 		Value:       role.RoleArn(),

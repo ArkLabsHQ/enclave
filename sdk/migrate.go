@@ -73,6 +73,12 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		exported = append(exported, secret.Name)
 	}
 
+	// Export storage DEK: re-encrypt under migration KMS key.
+	if err := e.exportStorageDEK(ctx, kmsClient, ssmClient, migrationKeyID); err != nil {
+		http.Error(w, fmt.Sprintf("storage DEK export failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	pcr0, _, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

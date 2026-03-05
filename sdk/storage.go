@@ -7,9 +7,11 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -312,4 +314,116 @@ func (e *Enclave) exportStorageDEK(ctx context.Context, kmsClient *kms.Client, s
 
 	migParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
 	return storeCiphertextInSSM(ctx, ssmClient, migParam, ciphertextB64)
+}
+
+// handleStoragePut handles PUT /v1/storage/{key...}.
+// The request body is stored as-is (raw bytes).
+func (e *Enclave) handleStoragePut(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := e.Store(r.Context(), key, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(struct {
+		Key    string `json:"key"`
+		Status string `json:"status"`
+	}{Key: key, Status: "stored"})
+}
+
+// handleStorageGet handles GET /v1/storage/{key...}.
+// Returns the raw decrypted bytes with application/octet-stream.
+func (e *Enclave) handleStorageGet(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+
+	data, err := e.Load(r.Context(), key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, "key not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(data)
+}
+
+// handleStorageDelete handles DELETE /v1/storage/{key...}.
+func (e *Enclave) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := e.Delete(r.Context(), key); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Key    string `json:"key"`
+		Status string `json:"status"`
+	}{Key: key, Status: "deleted"})
+}
+
+// handleStorageList handles GET /v1/storage?prefix=...
+// Returns a JSON array of keys matching the prefix.
+func (e *Enclave) handleStorageList(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+
+	keys, err := e.List(r.Context(), prefix)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if keys == nil {
+		keys = []string{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Keys []string `json:"keys"`
+	}{Keys: keys})
 }

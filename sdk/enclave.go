@@ -143,15 +143,23 @@ func (e *Enclave) AttestationPubkey() string {
 
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
-//	GET  /v1/enclave-info
-//	POST /v1/export-key
-//	POST /v1/extend-pcr
-//	POST /v1/lock-pcr
+//	GET    /v1/enclave-info
+//	POST   /v1/export-key
+//	POST   /v1/extend-pcr
+//	POST   /v1/lock-pcr
+//	PUT    /v1/storage/{key...}
+//	GET    /v1/storage/{key...}
+//	DELETE /v1/storage/{key...}
+//	GET    /v1/storage
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
 	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
+	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
+	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
+	mux.HandleFunc("DELETE /v1/storage/{key...}", e.handleStorageDelete)
+	mux.HandleFunc("GET /v1/storage", e.handleStorageList)
 }
 
 // Middleware returns an http.Handler that signs all responses with the

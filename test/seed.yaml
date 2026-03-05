@@ -1,0 +1,13 @@
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+          Description: "Test enclave key for local development"
+          KeyUsage: ENCRYPT_DECRYPT
+        BackingKeys:
+          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+Aliases:
+  - AliasName: alias/test-enclave-key
+    TargetKeyId: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"

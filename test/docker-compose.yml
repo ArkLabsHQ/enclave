@@ -1,0 +1,38 @@
+services:
+  local-kms:
+    image: nsmithuk/local-kms
+    ports:
+      - "8080:8080"
+    environment:
+      KMS_REGION: us-east-1
+      KMS_ACCOUNT_ID: "123456789012"
+    volumes:
+      - ./seed.yaml:/init/seed.yaml
+
+  kms-proxy:
+    build:
+      context: ../
+      dockerfile: cmd/local-kms-proxy/Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      UPSTREAM_KMS_URL: "http://local-kms:8080"
+      LISTEN_ADDR: ":4000"
+    depends_on:
+      - local-kms
+
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: ssm,sts
+
+  mock-imds:
+    build:
+      context: ../
+      dockerfile: cmd/mock-imds/Dockerfile
+    ports:
+      - "1338:1338"
+    environment:
+      LISTEN_ADDR: ":1338"

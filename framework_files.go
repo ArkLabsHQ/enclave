@@ -388,6 +388,7 @@ allowlist:
 - {address: ssm.${__REGION__}.amazonaws.com, port: 443}
 - {address: ssm-fips.${__REGION__}.amazonaws.com, port: 443}
 - {address: sts.${__REGION__}.amazonaws.com, port: 443}
+- {address: s3.${__REGION__}.amazonaws.com, port: 443}
 - {address: 169.254.169.254, port: 80}
 
 EOF

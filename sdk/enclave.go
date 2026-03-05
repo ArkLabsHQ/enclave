@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nsm"
@@ -40,6 +41,11 @@ type Enclave struct {
 	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
 	initError               atomic.Value // stores string, updated progressively during init
+
+	// Encrypted persistent storage (S3-backed, AES-256-GCM with single DEK).
+	s3Client   *s3.Client
+	bucketName string
+	dek        []byte // 32-byte plaintext AES-256 key, in memory only
 }
 
 // New creates an Enclave that is safe to use immediately for serving
@@ -88,6 +94,12 @@ func (e *Enclave) Init(ctx context.Context) error {
 			e.setInitError(fmt.Sprintf("extend PCRs with secret pubkeys: %s", err))
 			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 		}
+	}
+
+	e.setInitError("initializing storage")
+	if err := e.initStorage(ctx); err != nil {
+		e.setInitError(fmt.Sprintf("init storage: %s", err))
+		return fmt.Errorf("init storage: %w", err)
 	}
 
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {

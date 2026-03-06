@@ -1238,7 +1238,7 @@ const frameworkFlakeNixDotnet = `{
           dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
 
           projectFile = appCfg.nix_project_file;
-          nugetDeps = appCfg.nix_vendor_hash;
+          nugetDeps = ./deps.json;
 
           selfContainedBuild = true;
           executables = [ appCfg.binary_name ];

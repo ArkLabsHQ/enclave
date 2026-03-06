@@ -562,8 +562,8 @@ app:
   nix_repo: ""                   # GitHub repo name (required)
   nix_rev: ""                    # Git commit SHA (required)
   nix_hash: ""                   # Nix source hash: nix-prefetch-url --unpack (required)
-  nix_vendor_hash: ""            # NuGet deps hash (required)
-  nix_project_file: "MyEnclaveApp.csproj"  # .csproj file to build
+  nix_project_file: "MyEnclaveApp.csproj"  # .csproj file to build (required)
+  # NuGet deps: run 'enclave setup' to generate deps.json (used by flake.nix)
   binary_name: ""                # Output binary name (defaults to 'name')
 
   # Environment variables baked into the EIF.

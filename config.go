@@ -34,6 +34,7 @@ type AppConfig struct {
 	NixHash        string            `yaml:"nix_hash"`
 	NixVendorHash  string            `yaml:"nix_vendor_hash"`
 	NixSubPackages []string          `yaml:"nix_sub_packages"`
+	NixProjectFile string            `yaml:"nix_project_file"`
 	BinaryName     string            `yaml:"binary_name"`
 	Env            map[string]string `yaml:"env"`
 }

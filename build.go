@@ -48,6 +48,7 @@ type buildConfigAppJSON struct {
 	NixHash        string            `json:"nix_hash"`
 	NixVendorHash  string            `json:"nix_vendor_hash"`
 	NixSubPackages []string          `json:"nix_sub_packages"`
+	NixProjectFile string            `json:"nix_project_file"`
 	BinaryName     string            `json:"binary_name"`
 	Env            map[string]string `json:"env"`
 }
@@ -164,6 +165,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 			NixHash:        cfg.App.NixHash,
 			NixVendorHash:  cfg.App.NixVendorHash,
 			NixSubPackages: cfg.App.NixSubPackages,
+			NixProjectFile: cfg.App.NixProjectFile,
 			BinaryName:     cfg.App.BinaryName,
 			Env:            resolvedEnv,
 		},

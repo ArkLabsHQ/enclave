@@ -92,6 +92,7 @@ func main() {
 	child.Env = append(os.Environ(),
 		"ENCLAVE_APP_PORT="+appPort,
 		"PORT="+appPort,
+		"ENCLAVE_MGMT_TOKEN="+enc.MgmtToken(),
 	)
 	if err := child.Start(); err != nil {
 		log.Fatalf("start %s: %v", appPath, err)

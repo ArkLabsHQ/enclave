@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nsm"
@@ -40,12 +42,57 @@ type Enclave struct {
 	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
 	initError               atomic.Value // stores string, updated progressively during init
+	mgmtToken               string       // bearer token for management endpoints (empty = no auth)
+	dynamicSecretsCount     atomic.Int64 // count of loaded dynamic secrets, for enclave-info
+
+	// Encrypted persistent storage (S3-backed, AES-256-GCM with single DEK).
+	s3Client   *s3.Client
+	bucketName string
+	dek        []byte // 32-byte plaintext AES-256 key, in memory only
 }
 
 // New creates an Enclave that is safe to use immediately for serving
 // management endpoints. Call Init() separately to complete initialization.
+// A random management token is generated for authenticating internal API calls.
 func New() *Enclave {
-	return &Enclave{previousPCR0: "genesis"}
+	token := generateMgmtToken()
+	return &Enclave{previousPCR0: "genesis", mgmtToken: token}
+}
+
+// MgmtToken returns the management token for authenticating internal API calls.
+// Pass this to the consumer app via environment variable.
+func (e *Enclave) MgmtToken() string {
+	return e.mgmtToken
+}
+
+// generateMgmtToken creates a 32-byte random hex token.
+func generateMgmtToken() string {
+	b := make([]byte, 32)
+	if _, err := secureRandom(b); err != nil {
+		panic(fmt.Sprintf("generate mgmt token: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+// secureRandom fills the buffer with random bytes from the Nitro NSM hardware
+// RNG (/dev/nsm GetRandom). If NSM is unavailable (dev/testing outside an
+// enclave), falls back to crypto/rand.
+//
+// Inside an enclave crypto/rand relies on the kernel entropy pool which is
+// severely starved (no disk, no network, no HID — only RDRAND). The NSM
+// hardware RNG is a dedicated, independent entropy source provided by AWS
+// specifically for this reason. If we successfully open /dev/nsm (meaning
+// we ARE in an enclave) but GetRandom fails, we return the error rather
+// than silently falling back to the weak pool.
+func secureRandom(b []byte) (int, error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		// Not in an enclave (no /dev/nsm) — crypto/rand is fine on normal Linux.
+		return rand.Read(b)
+	}
+	defer session.Close()
+	// In an enclave — NSM hardware RNG is the only trustworthy source.
+	return session.Read(b)
 }
 
 // Init initializes the enclave: generates an ephemeral attestation key,
@@ -90,6 +137,18 @@ func (e *Enclave) Init(ctx context.Context) error {
 		}
 	}
 
+	e.setInitError("initializing storage")
+	if err := e.initStorage(ctx); err != nil {
+		e.setInitError(fmt.Sprintf("init storage: %s", err))
+		return fmt.Errorf("init storage: %w", err)
+	}
+
+	if count, err := e.loadDynamicSecrets(ctx); err != nil {
+		log.Printf("warning: load dynamic secrets: %v", err)
+	} else {
+		e.dynamicSecretsCount.Store(int64(count))
+	}
+
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
 		e.previousPCR0 = pcr0
 	}
@@ -131,15 +190,27 @@ func (e *Enclave) AttestationPubkey() string {
 
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
-//	GET  /v1/enclave-info
-//	POST /v1/export-key
-//	POST /v1/extend-pcr
-//	POST /v1/lock-pcr
+//	GET    /v1/enclave-info
+//	POST   /v1/export-key
+//	POST   /v1/extend-pcr
+//	POST   /v1/lock-pcr
+//	PUT    /v1/storage/{key...}
+//	GET    /v1/storage/{key...}
+//	DELETE /v1/storage/{key...}
+//	GET    /v1/storage
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
 	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
+	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
+	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
+	mux.HandleFunc("DELETE /v1/storage/{key...}", e.handleStorageDelete)
+	mux.HandleFunc("GET /v1/storage", e.handleStorageList)
+	mux.HandleFunc("PUT /v1/secrets/{name}", e.handleSecretPut)
+	mux.HandleFunc("GET /v1/secrets/{name}", e.handleSecretGet)
+	mux.HandleFunc("DELETE /v1/secrets/{name}", e.handleSecretDelete)
+	mux.HandleFunc("GET /v1/secrets", e.handleSecretList)
 }
 
 // Middleware returns an http.Handler that signs all responses with the
@@ -198,7 +269,7 @@ func loadSecretsConfig() ([]SecretDef, error) {
 // its public key hash with nitriding via POST /enclave/hash.
 func (e *Enclave) generateAttestationKey() error {
 	keyBytes := make([]byte, 32)
-	if _, err := rand.Read(keyBytes); err != nil {
+	if _, err := secureRandom(keyBytes); err != nil {
 		return fmt.Errorf("generate random bytes: %w", err)
 	}
 
@@ -307,12 +378,14 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0            string `json:"previous_pcr0"`
 		PreviousPCR0Attestation string `json:"previous_pcr0_attestation,omitempty"`
 		AttestationPubkey       string `json:"attestation_pubkey,omitempty"`
+		DynamicSecrets          int64  `json:"dynamic_secrets"`
 		Error                   string `json:"error,omitempty"`
 	}{
 		Version:                 Version,
 		PreviousPCR0:            e.previousPCR0,
 		PreviousPCR0Attestation: e.previousPCR0Attestation,
 		AttestationPubkey:       e.AttestationPubkey(),
+		DynamicSecrets:          e.dynamicSecretsCount.Load(),
 		Error:                   e.InitError(),
 	})
 }
@@ -320,6 +393,9 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 // handleExtendPCR extends a user-defined PCR (16-31) with the provided data.
 // This allows the user's app to extend PCRs via HTTP without importing the SDK.
 func (e *Enclave) handleExtendPCR(w http.ResponseWriter, r *http.Request) {
+	if !e.checkMgmtToken(w, r) {
+		return
+	}
 	var req struct {
 		PCR  uint   `json:"pcr"`
 		Data string `json:"data"` // base64-encoded
@@ -349,6 +425,9 @@ func (e *Enclave) handleExtendPCR(w http.ResponseWriter, r *http.Request) {
 
 // handleLockPCR locks a user-defined PCR (16-31) to prevent further extension.
 func (e *Enclave) handleLockPCR(w http.ResponseWriter, r *http.Request) {
+	if !e.checkMgmtToken(w, r) {
+		return
+	}
 	var req struct {
 		PCR uint `json:"pcr"`
 	}

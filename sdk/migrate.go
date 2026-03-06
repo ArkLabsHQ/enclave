@@ -26,6 +26,9 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
 		return
 	}
+	// Note: export-key has its own SSM-based authorization (MigrationKMSKeyID
+	// must be set by the CLI). No mgmt token check — the CLI calls this via
+	// curl on the EC2 host and doesn't have the enclave's runtime token.
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
@@ -71,6 +74,12 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		}
 
 		exported = append(exported, secret.Name)
+	}
+
+	// Export storage DEK: re-encrypt under migration KMS key.
+	if err := e.exportStorageDEK(ctx, kmsClient, ssmClient, migrationKeyID); err != nil {
+		http.Error(w, fmt.Sprintf("storage DEK export failed: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	pcr0, _, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)

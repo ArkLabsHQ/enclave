@@ -24,13 +24,13 @@ By default, runs hash computation inside a Docker container (same nixos
 image as 'enclave build'). Use --local to use the host nix installation.
 
 Use --language to set the app language and generate the correct flake.nix.
-Supported languages: go (default), nodejs.
+Supported languages: go (default), nodejs, dotnet.
 
 All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
-	cmd.Flags().String("language", "", "Set app language: go, nodejs")
+	cmd.Flags().String("language", "", "Set app language: go, nodejs, dotnet")
 	return cmd
 }
 
@@ -67,10 +67,10 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	language := cfg.App.Language
 	if languageFlag != "" {
 		switch languageFlag {
-		case "go", "nodejs":
+		case "go", "nodejs", "dotnet":
 			language = languageFlag
 		default:
-			return fmt.Errorf("unsupported language: %s (supported: go, nodejs)", languageFlag)
+			return fmt.Errorf("unsupported language: %s (supported: go, nodejs, dotnet)", languageFlag)
 		}
 	}
 
@@ -193,26 +193,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 func computeHashesDocker(root, rev string, subPackages []string, nixImage string, language string) (nixHash, vendorHash string, err error) {
 	resultFile := ".enclave-setup-result"
 
-	// Build the language-specific trial build expression.
-	var trialBuildExpr string
-	switch language {
-	case "nodejs":
-		trialBuildExpr = `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
-    pname = "app"; version = "dev"; src = ./.;
-    npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
-  }`
-	default: // "go"
-		var nixPkgs []string
-		for _, p := range subPackages {
-			nixPkgs = append(nixPkgs, fmt.Sprintf(`\"%s\"`, p))
-		}
-		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-		trialBuildExpr = fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
-    pname = "app"; version = "dev"; src = ./.;
-    subPackages = %s; vendorHash = "";
-    env.CGO_ENABLED = "0"; doCheck = false;
-  }`, nixSubPkgs)
-	}
+	trialBuildExpr := buildTrialExpr(language, subPackages, true)
 
 	// Shell script that runs inside the container.
 	// Writes results to a file in the mounted volume so the host can read them.
@@ -367,29 +348,47 @@ func computeNixHash(root string, rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// computeVendorHash runs a trial nix build with an empty deps hash to discover
-// the expected hash. It parses the "got:" line from the error output.
-// For Go, this is the vendor hash; for Node.js, the npm deps hash.
-func computeVendorHash(root string, subPackages []string, language string) (string, error) {
-	var expr string
+// buildTrialExpr returns a Nix expression for a trial build with an empty deps
+// hash. When built, Nix will fail and print the expected hash in a "got:" line.
+// If escaped is true, quotes are backslash-escaped (for embedding in shell scripts).
+func buildTrialExpr(language string, subPackages []string, escaped bool) string {
+	q := `"`
+	if escaped {
+		q = `\"`
+	}
 	switch language {
 	case "nodejs":
-		expr = `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
-  pname = "app"; version = "dev"; src = ./.;
-  npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
-}`
+		return `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
+    pname = "app"; version = "dev"; src = ./.;
+    npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
+  }`
+	case "dotnet":
+		return `let pkgs = import <nixpkgs> {}; in pkgs.buildDotnetModule {
+    pname = "app"; version = "dev"; src = ./.;
+    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0;
+    dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
+    nugetDeps = ""; doCheck = false;
+  }`
 	default: // "go"
 		var nixPkgs []string
 		for _, p := range subPackages {
-			nixPkgs = append(nixPkgs, fmt.Sprintf("%q", p))
+			nixPkgs = append(nixPkgs, q+p+q)
 		}
 		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-		expr = fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
-  pname = "app"; version = "dev"; src = ./.;
-  subPackages = %s; vendorHash = "";
-  env.CGO_ENABLED = "0"; doCheck = false;
-}`, nixSubPkgs)
+		return fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+    pname = "app"; version = "dev"; src = ./.;
+    subPackages = %s; vendorHash = "";
+    env.CGO_ENABLED = "0"; doCheck = false;
+  }`, nixSubPkgs)
 	}
+}
+
+// computeVendorHash runs a trial nix build with an empty deps hash to discover
+// the expected hash. It parses the "got:" line from the error output.
+// For Go, this is the vendor hash; for Node.js, the npm deps hash;
+// for .NET, the NuGet deps hash.
+func computeVendorHash(root string, subPackages []string, language string) (string, error) {
+	expr := buildTrialExpr(language, subPackages, false)
 
 	cmd := exec.Command("nix", "build",
 		"--impure",

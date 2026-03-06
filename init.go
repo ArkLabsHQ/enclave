@@ -29,7 +29,7 @@ sdk:
   vendor_hash: ""                # Go vendor hash (required)
 
 app:
-  language: "go"                 # App language: go, nodejs
+  language: "go"                 # App language: go, nodejs, dotnet
   source: nix                    # "nix" = fetch from GitHub via Nix
 
   # GitHub coordinates for the app to run inside the enclave.
@@ -119,7 +119,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("Edit enclave/enclave.yaml with your app and SDK details.")
 		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No SDK imports needed — the supervisor handles attestation automatically.")
-		fmt.Println("Set 'app.language' to your language (go, nodejs) and run 'enclave setup --language <lang>'.")
+		fmt.Println("Set 'app.language' to your language (go, nodejs, dotnet) and run 'enclave setup --language <lang>'.")
 		fmt.Println("Then run 'enclave init' again to validate.")
 		return nil
 	}

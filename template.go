@@ -187,7 +187,7 @@ sdk:
   vendor_hash: ""                # Go vendor hash (required)
 
 app:
-  language: "go"                 # App language: go, nodejs
+  language: "go"                 # App language: go, nodejs, dotnet
   source: nix                    # "nix" = fetch from GitHub via Nix
 
   # GitHub coordinates for the app to run inside the enclave.
@@ -270,7 +270,7 @@ sdk:
   vendor_hash: ""                # Go vendor hash (required)
 
 app:
-  language: "nodejs"             # App language: go, nodejs
+  language: "nodejs"             # App language: go, nodejs, dotnet
   source: nix                    # "nix" = fetch from GitHub via Nix
 
   # GitHub coordinates for the app to run inside the enclave.

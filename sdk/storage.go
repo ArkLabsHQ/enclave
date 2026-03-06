@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -175,7 +174,7 @@ func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
 	}
 
 	nonce := make([]byte, nonceSize)
-	if _, err := rand.Read(nonce); err != nil {
+	if _, err := secureRandom(nonce); err != nil {
 		return fmt.Errorf("generate nonce: %w", err)
 	}
 
@@ -323,13 +322,21 @@ func (e *Enclave) handleStoragePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
 		return
 	}
+	if !e.checkMgmtToken(w, r) {
+		return
+	}
 
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "key is required", http.StatusBadRequest)
 		return
 	}
+	if strings.HasPrefix(key, "secrets/") {
+		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
+		return
+	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB limit
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -356,10 +363,17 @@ func (e *Enclave) handleStorageGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
 		return
 	}
+	if !e.checkMgmtToken(w, r) {
+		return
+	}
 
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+	if strings.HasPrefix(key, "secrets/") {
+		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
 		return
 	}
 
@@ -383,10 +397,17 @@ func (e *Enclave) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
 		return
 	}
+	if !e.checkMgmtToken(w, r) {
+		return
+	}
 
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+	if strings.HasPrefix(key, "secrets/") {
+		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
 		return
 	}
 
@@ -407,6 +428,9 @@ func (e *Enclave) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
 func (e *Enclave) handleStorageList(w http.ResponseWriter, r *http.Request) {
 	if !e.initDone.Load() {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.checkMgmtToken(w, r) {
 		return
 	}
 

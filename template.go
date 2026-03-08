@@ -171,7 +171,7 @@ const golangConfigTemplate = `# Enclave configuration
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: dev                     # Build version (baked into binary via ldflags)
+version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
@@ -254,7 +254,7 @@ const nodejsConfigTemplate = `# Enclave configuration
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: dev                     # Build version
+version: 0.0.1                   # Build version (semver)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
@@ -536,7 +536,7 @@ const dotnetConfigTemplate = `# Enclave configuration
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: dev                     # Build version
+version: 0.0.1                   # Build version (semver)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})

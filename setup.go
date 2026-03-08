@@ -101,6 +101,21 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Generate flake.lock to pin all input revisions for reproducible builds.
+	fmt.Println("[setup] Generating flake.lock...")
+	lockCmd := exec.Command("nix", "flake", "lock",
+		"--extra-experimental-features", "nix-command flakes",
+	)
+	lockCmd.Dir = root
+	lockCmd.Stdout = os.Stdout
+	lockCmd.Stderr = os.Stderr
+	if err := lockCmd.Run(); err != nil {
+		fmt.Printf("[setup] Warning: could not generate flake.lock: %v\n", err)
+		fmt.Println("[setup] Run 'nix flake lock' manually and commit flake.lock for reproducible builds.")
+	} else {
+		fmt.Println("[setup] Generated flake.lock — commit this file for reproducible builds.")
+	}
+
 	subPackages := cfg.App.NixSubPackages
 	if len(subPackages) == 0 {
 		subPackages = []string{"."}
@@ -202,9 +217,10 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		if language == "dotnet" {
 			fmt.Println("Warning: deps.json was not generated.")
 			fmt.Println("To generate it manually:")
-			fmt.Println("  1. Run: nix build --impure --expr 'let pkgs = import <nixpkgs> {}; in (pkgs.buildDotnetModule { pname = \"app\"; version = \"dev\"; src = ./.; dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0; dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0; doCheck = false; }).passthru.fetch-deps'")
-			fmt.Println("  2. Run the resulting script: ./result")
-			fmt.Println("  3. Move the generated deps.json to your project root (next to flake.nix)")
+			fmt.Println("  1. Create an empty deps.json: echo '[]' > deps.json")
+			fmt.Println("  2. Run: nix build --impure --expr 'let pkgs = import <nixpkgs> {}; in (pkgs.buildDotnetModule { pname = \"app\"; version = \"0.0.1\"; src = ./.; dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0_1xx; dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0; nugetDeps = ./deps.json; doCheck = false; }).passthru.fetch-deps'")
+			fmt.Println("  3. Run the resulting script: ./result deps.json")
+			fmt.Println("  4. The generated deps.json should be in your project root (next to flake.nix)")
 		} else {
 			fmt.Println("Warning: nix_vendor_hash is still empty.")
 			fmt.Println("To compute it manually:")
@@ -390,7 +406,7 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 	switch language {
 	case "nodejs":
 		return `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
-    pname = "app"; version = "dev"; src = ./.;
+    pname = "app"; version = "0.0.1"; src = ./.;
     npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
   }`
 	default: // "go"
@@ -400,7 +416,7 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 		}
 		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
 		return fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
-    pname = "app"; version = "dev"; src = ./.;
+    pname = "app"; version = "0.0.1"; src = ./.;
     subPackages = %s; vendorHash = "";
     env.CGO_ENABLED = "0"; doCheck = false;
   }`, nixSubPkgs)
@@ -446,11 +462,19 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 // nix's fetch-deps mechanism. Unlike Go/Node, dotnet doesn't use a hash —
 // it needs a JSON file listing all NuGet packages and their hashes.
 func generateDotnetDeps(root string) error {
+	// Seed an empty deps.json so nugetDeps = ./deps.json is a valid path.
+	// Without this, nugetDeps defaults to null and fetch-deps isn't generated.
+	depsPath := filepath.Join(root, "deps.json")
+	if err := os.WriteFile(depsPath, []byte("[]\n"), 0644); err != nil {
+		return fmt.Errorf("write seed deps.json: %w", err)
+	}
+
 	// Step 1: Build the fetch-deps script via passthru.
 	expr := `let pkgs = import <nixpkgs> {}; in (pkgs.buildDotnetModule {
-    pname = "app"; version = "dev"; src = ./.;
-    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0;
+    pname = "app"; version = "0.0.1"; src = ./.;
+    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0_1xx;
     dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
+    nugetDeps = ./deps.json;
     doCheck = false;
   }).passthru.fetch-deps`
 
@@ -467,8 +491,7 @@ func generateDotnetDeps(root string) error {
 		return fmt.Errorf("build fetch-deps script: %w", err)
 	}
 
-	// Step 2: Run the fetch-deps script to generate deps.json.
-	depsPath := filepath.Join(root, "deps.json")
+	// Step 2: Run the fetch-deps script to regenerate deps.json with real deps.
 	fetchCmd := exec.Command("./result", depsPath)
 	fetchCmd.Dir = root
 	fetchCmd.Stdout = os.Stdout
@@ -502,13 +525,17 @@ SOURCE_HASH=$(nix hash path "$TMPDIR/source")
 rm -rf "$TMPDIR"
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
+# Seed empty deps.json so nugetDeps is a path (enables fetch-deps passthru)
+echo '[]' > /src/deps.json
+
 # Generate deps.json via fetch-deps
 nix build --impure \
   --extra-experimental-features 'nix-command flakes' \
   --expr 'let pkgs = import <nixpkgs> {}; in (pkgs.buildDotnetModule {
-    pname = "app"; version = "dev"; src = ./.;
-    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0;
+    pname = "app"; version = "0.0.1"; src = ./.;
+    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0_1xx;
     dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
+    nugetDeps = ./deps.json;
     doCheck = false;
   }).passthru.fetch-deps' 2>&1 || true
 

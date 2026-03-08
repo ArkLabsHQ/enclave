@@ -488,7 +488,7 @@ func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, er
 		nixImage = "nixos/nix:2.24.9"
 	}
 	if version == "" {
-		version = "dev"
+		version = "0.0.1"
 	}
 	if region == "" {
 		region = "us-east-1"

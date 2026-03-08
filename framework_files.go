@@ -1176,7 +1176,9 @@ const frameworkFlakeNixDotnet = `{
   description = "Nitro Enclave - reproducible build (.NET)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Pinned nixpkgs commit for reproducible .NET SDK version.
+    # Update deliberately with: nix flake update nixpkgs
+    nixpkgs.url = "github:NixOS/nixpkgs/e38213b91d3786389a446dfce4ff5a8aaf6012f2";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -1234,7 +1236,9 @@ const frameworkFlakeNixDotnet = `{
             hash = appCfg.nix_hash;
           };
 
-          dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0;
+          # Pinned SDK feature band for reproducible builds.
+          # sdk_10_0_1xx locks to 10.0.1xx (won't jump to 10.0.2xx+).
+          dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0_1xx;
           dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
 
           projectFile = appCfg.nix_project_file;
@@ -1242,6 +1246,12 @@ const frameworkFlakeNixDotnet = `{
 
           selfContainedBuild = true;
           executables = [ appCfg.binary_name ];
+
+          # Native AOT: produces a single statically-linked binary (like Go).
+          # Eliminates 300+ runtime DLLs and removes JIT/IL non-determinism.
+          dotnetBuildFlags = [ "/p:PublishAot=true" "/p:StripSymbols=true" ];
+          dotnetPublishFlags = [ "/p:PublishAot=true" "/p:StripSymbols=true" ];
+
           doCheck = false;
         };
 
@@ -1294,14 +1304,16 @@ const frameworkFlakeNixDotnet = `{
         appDir = pkgs.runCommand "enclave-app" { } ''
           mkdir -p $out/app/data
 
-          # Self-contained .NET publish: executable is in bin/, supporting libs in lib/.
-          cp ` + "${upstream-app}" + `/bin/` + "${appCfg.binary_name}" + ` $out/app/` + "${appCfg.binary_name}" + `
-          chmod +x $out/app/` + "${appCfg.binary_name}" + `
-
-          # Copy supporting libraries from lib/ (runtime DLLs, etc.)
-          if [ -d "` + "${upstream-app}" + `/lib/` + "${appCfg.binary_name}" + `" ]; then
+          # With Native AOT: bin/ contains a real statically-linked native binary.
+          # Without AOT: bin/ has a wrapper, lib/<name>/ has the DLL-based app.
+          if [ -f "` + "${upstream-app}" + `/lib/` + "${appCfg.binary_name}" + `/` + "${appCfg.binary_name}" + `" ]; then
+            # Non-AOT: copy from lib/ (the real binary + runtime DLLs).
             cp -r ` + "${upstream-app}" + `/lib/` + "${appCfg.binary_name}" + `/* $out/app/
+          else
+            # AOT: single native binary in bin/.
+            cp ` + "${upstream-app}" + `/bin/` + "${appCfg.binary_name}" + ` $out/app/` + "${appCfg.binary_name}" + `
           fi
+          chmod +x $out/app/` + "${appCfg.binary_name}" + `
 
           cp ` + "${enclave-supervisor}" + `/bin/enclave-supervisor $out/app/enclave-supervisor
           cp ` + "${nitriding}" + `/bin/nitriding $out/app/nitriding

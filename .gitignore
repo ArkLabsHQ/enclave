@@ -1,26 +1,40 @@
 .vscode
 build/
 bin/
-cdk.out/
-cdk/cdk.out/
-introspector
-cdk/cdk
-cdk/cdk-app
+enclave/cdk.out/
+builder/cdk.out/
 
 # Nix build outputs
-result
-result-*
+enclave/artifacts/
+flake_result
+flake_result-*
 enclave-image.tar.gz
 
 # CDK outputs
-cdk-outputs.json
+enclave/cdk-outputs.json
+
+# Generated build config (from enclave.yaml for Nix)
+enclave/build-config.json
+
+# Enclave CLI config (contains account IDs)
+enclave.yaml
+
 
 # Built binaries
+introspector
 introspector-client
+./bin/
 *.eif
+mgmt/mgmt
 
 # Temporary build artifacts
 /tmp/enclave-verify-*
 
 # Go vendor directory
 vendor/
+
+# Example folder (not used in production) /examples/
+example/
+
+bin/
+

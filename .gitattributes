@@ -1,0 +1,4 @@
+# Exclude from git archive / GitHub release tarballs.
+# This breaks the circular dependency: sdk-hashes.json stores the
+# source hash of the archive, so it cannot be inside that archive.
+sdk-hashes.json export-ignore

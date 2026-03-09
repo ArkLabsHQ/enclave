@@ -1,0 +1,41 @@
+# Enclave configuration for local QEMU testing.
+# All AWS endpoints point to mock services on the host via gvproxy gateway.
+
+name: test-app
+version: 0.0.1
+region: us-east-1
+account: "123456789012"
+prefix: dev
+instance_type: m6i.xlarge
+nix_image: nixos/nix:2.24.9
+
+sdk:
+  rev: "v0.0.41"
+  hash: "sha256-6e0yiFOeeglgSdLu/dX2wQg8CcJ/uHvjcghhhEeapZU="
+  vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
+
+app:
+  language: "go"
+  source: nix
+
+  nix_owner: "ArkLabsHQ"
+  nix_repo: "introspector-enclave"
+  nix_rev: "2ed7174363775e948c5da46cb6a619d2ffe56fb9"
+  nix_hash: "sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo="
+  nix_vendor_hash: "sha256-mGKxBRU5TPgdmiSx0DHEd0Ys8gsVD/YdBfbDdSVpC3U="
+  nix_sub_packages:
+    - "cmd"
+  binary_name: "test-app"
+
+  # Mock endpoint overrides: 192.168.127.1 = gvproxy gateway (host network).
+  env:
+    IMDS_ENDPOINT: "192.168.127.1:1338"
+    AWS_ENDPOINT_URL_KMS: "http://192.168.127.1:4000"
+    AWS_ENDPOINT_URL_SSM: "http://192.168.127.1:4566"
+    AWS_ENDPOINT_URL_STS: "http://192.168.127.1:4566"
+    AWS_ENDPOINT_URL_S3: "http://192.168.127.1:4566"
+    ENCLAVE_KMS_KEY_ID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+
+# No secrets for the skeleton app — keeps the test simple.
+# The supervisor will still init KMS/SSM, just with no secret decryption.
+secrets: []

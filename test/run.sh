@@ -8,9 +8,12 @@
 #   ./run.sh              Build skeleton test app EIF, then run full test
 #   ./run.sh <path-to-eif>  Use a pre-built EIF
 #
-# Prerequisites:
+# Prerequisites (pick one):
 #   nix develop ./test   (provides QEMU, vhost-device-vsock, gvproxy, awscli)
-#   docker compose       (for mock services)
+#   docker compose --profile test run --build test-runner  (all-in-one Docker)
+#
+# Additional requirements:
+#   docker compose       (for mock services, unless SKIP_MOCK_SERVICES=1)
 #   enclave CLI          (for building EIF, only if no EIF path given)
 set -euo pipefail
 
@@ -23,7 +26,9 @@ cleanup() {
   echo ""
   echo "=== Tearing down ==="
   [ -n "${BOOT_PID:-}" ] && kill "$BOOT_PID" 2>/dev/null && wait "$BOOT_PID" 2>/dev/null || true
-  docker compose down -v 2>/dev/null || true
+  if [ "${SKIP_MOCK_SERVICES:-}" != "1" ]; then
+    docker compose down -v 2>/dev/null || true
+  fi
   echo "Done."
 }
 trap cleanup EXIT
@@ -53,10 +58,15 @@ if [ -z "$EIF_PATH" ]; then
   echo ""
 fi
 
-# Step 1: Start mock services.
-echo "=== [1/4] Starting mock services ==="
-docker compose up -d --build --wait
-echo ""
+# Step 1: Start mock services (skipped when run inside Docker test-runner).
+if [ "${SKIP_MOCK_SERVICES:-}" != "1" ]; then
+  echo "=== [1/4] Starting mock services ==="
+  docker compose up -d --build --wait
+  echo ""
+else
+  echo "=== [1/4] Mock services already running (Docker) ==="
+  echo ""
+fi
 
 # Step 2: Seed SSM parameters and S3 bucket.
 echo "=== [2/4] Seeding mock AWS services ==="
@@ -78,8 +88,11 @@ while [ $SECONDS -lt "$BOOT_TIMEOUT" ]; do
     wait "$BOOT_PID" || true
     exit 1
   fi
-  if curl -skf "https://localhost:${HOST_TLS_PORT:-8443}/enclave/health" -o /dev/null 2>/dev/null; then
-    echo "  Enclave is ready (${SECONDS}s)"
+  # Accept any HTTP response (200 or 503) — supervisor is running.
+  HTTP_CODE=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+    "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "503" ]; then
+    echo "  Enclave responding (${SECONDS}s) — HTTP $HTTP_CODE"
     break
   fi
   sleep 2

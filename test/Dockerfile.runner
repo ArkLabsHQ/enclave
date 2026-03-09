@@ -1,0 +1,61 @@
+# Provides QEMU 9.2.4, vhost-device-vsock 0.3.0, and gvproxy 0.8.6
+# for running enclave tests without requiring Nix.
+#
+# Usage (via docker compose):
+#   docker compose --profile test run --build test-runner
+#
+# Or standalone (start mock services first):
+#   docker build -f Dockerfile.runner -t enclave-test-runner .
+#   docker compose up -d --build --wait
+#   docker run --rm --privileged --network host \
+#     -v $PWD:/test enclave-test-runner \
+#     ./run.sh app/enclave/artifacts/image.eif
+
+# --- Stage 1: Build vhost-device-vsock 0.3.0 ---
+FROM rust:1.83-bookworm AS vsock-build
+WORKDIR /src
+RUN git clone --depth 1 --branch vhost-device-vsock-v0.3.0 \
+      https://github.com/rust-vmm/vhost-device.git .
+RUN cargo build --release -p vhost-device-vsock
+
+# --- Stage 2: Build gvproxy v0.8.6 ---
+FROM golang:1.23-bookworm AS gvproxy-build
+RUN go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.8.6
+
+# --- Stage 3: Build QEMU 9.2.4 (x86_64 system emulator only) ---
+FROM debian:bookworm AS qemu-build
+RUN apt-get update && apt-get install -y \
+      build-essential meson ninja-build pkg-config git \
+      python3 python3-venv wget flex bison \
+      libglib2.0-dev libpixman-1-dev libfdt-dev libcap-ng-dev \
+      libslirp-dev liburing-dev \
+      libcbor-dev libgnutls28-dev
+RUN wget -q https://download.qemu.org/qemu-9.2.4.tar.xz \
+    && tar xf qemu-9.2.4.tar.xz
+WORKDIR /qemu-9.2.4
+# Build with all default features for x86_64. The nitro-enclave machine type
+# requires vhost-user + virtio-nsm which are included by default.
+RUN ./configure \
+      --target-list=x86_64-softmmu \
+      --enable-kvm \
+      --enable-vhost-user \
+      --enable-gnutls
+RUN make -j$(nproc)
+RUN make DESTDIR=/qemu-install install
+
+# --- Stage 4: Runtime ---
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 curl jq ca-certificates procps psmisc \
+      libglib2.0-0 libpixman-1-0 libfdt1 libcap-ng0 \
+      libslirp0 liburing2 \
+      libcbor0.8 libgnutls30 \
+      awscli \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=vsock-build /src/target/release/vhost-device-vsock /usr/local/bin/
+COPY --from=gvproxy-build /go/bin/gvproxy /usr/local/bin/
+COPY --from=qemu-build /qemu-install/usr/local/ /usr/local/
+
+WORKDIR /test

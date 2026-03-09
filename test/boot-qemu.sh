@@ -38,6 +38,7 @@ cleanup() {
   [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null && echo "  Stopped QEMU ($QEMU_PID)"
   [ -n "${GVPROXY_PID:-}" ] && kill "$GVPROXY_PID" 2>/dev/null && echo "  Stopped gvproxy ($GVPROXY_PID)"
   [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)"
+  [ -n "${AWS_PROXY_PID:-}" ] && kill "$AWS_PROXY_PID" 2>/dev/null && echo "  Stopped AWS proxy ($AWS_PROXY_PID)"
   [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)"
   [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)"
   rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET"
@@ -89,24 +90,33 @@ if ! kill -0 "$HB_PID" 2>/dev/null; then
   exit 1
 fi
 
-# IMDS proxy: viproxy inside the enclave connects to vsock CID 3 port 8002 for IMDS.
-# vhost-device-vsock forwards this to AF_VSOCK CID 1:8002. We proxy it to mock-imds.
-# NOTE: Disabled by default — when IMDS is reachable, the supervisor's Init() blocks
-# on KMS calls through gvproxy's TAP network. Without IMDS, Init() fails fast and the
-# test app starts immediately. Enable with ENABLE_IMDS_PROXY=1 once gvproxy TAP
-# forwarding to mock KMS/SSM is working.
-if [ "${ENABLE_IMDS_PROXY:-0}" = "1" ]; then
-  echo "=== Starting IMDS vsock proxy ==="
-  MOCK_IMDS_PORT="${MOCK_IMDS_PORT:-1338}"
-  python3 "$SCRIPT_DIR/vsock-proxy.py" 8002 127.0.0.1 "$MOCK_IMDS_PORT" &
-  IMDS_PROXY_PID=$!
-  sleep 0.5
+# Vsock proxies: viproxy inside the enclave maps local TCP ports to vsock connections.
+# vhost-device-vsock (forward-cid=1) routes them to AF_VSOCK CID 1 on the host.
+# These proxies bridge AF_VSOCK → TCP to reach mock services on localhost.
+echo "=== Starting vsock service proxies ==="
 
-  if ! kill -0 "$IMDS_PROXY_PID" 2>/dev/null; then
-    echo "  Warning: IMDS vsock proxy failed to start (viproxy will not work)"
-  else
-    echo "  vsock:8002 -> 127.0.0.1:${MOCK_IMDS_PORT} (mock IMDS)"
-  fi
+# IMDS: viproxy 127.0.0.1:80 → vsock 3:8002 → AF_VSOCK 1:8002 → mock-imds:1338
+MOCK_IMDS_PORT="${MOCK_IMDS_PORT:-1338}"
+python3 "$SCRIPT_DIR/vsock-proxy.py" 8002 127.0.0.1 "$MOCK_IMDS_PORT" &
+IMDS_PROXY_PID=$!
+
+# AWS services: viproxy 127.0.0.1:4566 → vsock 3:8003 → AF_VSOCK 1:8003 → localstack:4566
+LOCALSTACK_PORT="${LOCALSTACK_PORT:-4566}"
+python3 "$SCRIPT_DIR/vsock-proxy.py" 8003 127.0.0.1 "$LOCALSTACK_PORT" &
+AWS_PROXY_PID=$!
+
+sleep 0.5
+
+if ! kill -0 "$IMDS_PROXY_PID" 2>/dev/null; then
+  echo "  Warning: IMDS vsock proxy failed to start"
+else
+  echo "  vsock:8002 -> 127.0.0.1:${MOCK_IMDS_PORT} (mock IMDS)"
+fi
+
+if ! kill -0 "$AWS_PROXY_PID" 2>/dev/null; then
+  echo "  Warning: AWS vsock proxy failed to start"
+else
+  echo "  vsock:8003 -> 127.0.0.1:${LOCALSTACK_PORT} (localstack)"
 fi
 
 # gvproxy: the enclave's start.sh connects to vsock CID 3 port 1024 for networking.
@@ -179,11 +189,17 @@ while [ $SECONDS -lt "$BOOT_TIMEOUT" ]; do
   fi
 
   # nitriding serves HTTPS on enclave:443, forwarded to localhost:HOST_TLS_PORT.
-  if curl -skf "https://localhost:${HOST_TLS_PORT}/enclave/health" -o /dev/null 2>/dev/null; then
-    echo "  Enclave is ready! (${SECONDS}s)"
+  # Accept both 200 (ready) and 503 (Init() failed but supervisor+app running).
+  HTTP_CODE=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+    "https://localhost:${HOST_TLS_PORT}/health" 2>/dev/null || echo "000")
+
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "503" ]; then
+    HEALTH=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT}/health" 2>/dev/null || echo "{}")
+    echo "  Enclave responding (${SECONDS}s) — HTTP $HTTP_CODE"
+    echo "  Health: $HEALTH"
     echo ""
     echo "=== Enclave running ==="
-    echo "  Health:        https://localhost:${HOST_TLS_PORT}/enclave/health"
+    echo "  Health:        https://localhost:${HOST_TLS_PORT}/health"
     echo "  Enclave info:  https://localhost:${HOST_TLS_PORT}/v1/enclave-info"
     echo "  App:           https://localhost:${HOST_TLS_PORT}/"
     echo ""

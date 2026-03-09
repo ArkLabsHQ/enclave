@@ -8,11 +8,37 @@ set -euo pipefail
 ENDPOINT="${LOCALSTACK_ENDPOINT:-http://localhost:4566}"
 DEPLOYMENT="${ENCLAVE_DEPLOYMENT:-dev}"
 APP_NAME="${ENCLAVE_APP_NAME:-app}"
-KMS_KEY_ARN="arn:aws:kms:us-east-1:123456789012:key/test-key-id"
 BUCKET_NAME="${STORAGE_BUCKET_NAME:-test-enclave-storage}"
 
-AWS="aws --endpoint-url=$ENDPOINT --region us-east-1 --no-cli-pager"
+export AWS_PAGER=""
+# Localstack doesn't validate credentials, but the CLI requires them.
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+AWS="aws --endpoint-url=$ENDPOINT --region us-east-1"
 
+echo "=== Creating KMS key ==="
+# Use JSON output + jq for reliable extraction (AWS CLI v1 --query can be flaky).
+KMS_KEY_ARN=""
+CREATE_OUTPUT=$($AWS kms create-key --description "Test enclave key" --output json 2>&1) || true
+if [ -n "$CREATE_OUTPUT" ]; then
+  KMS_KEY_ARN=$(echo "$CREATE_OUTPUT" | jq -r '.KeyMetadata.Arn // empty' 2>/dev/null) || true
+fi
+if [ -z "${KMS_KEY_ARN:-}" ]; then
+  echo "  create-key output: ${CREATE_OUTPUT:0:200}"
+  # Key may already exist from a previous run; list and use the first one.
+  LIST_OUTPUT=$($AWS kms list-keys --output json 2>&1) || true
+  if [ -n "$LIST_OUTPUT" ]; then
+    KMS_KEY_ARN=$(echo "$LIST_OUTPUT" | jq -r '.Keys[0].KeyArn // empty' 2>/dev/null) || true
+  fi
+fi
+if [ -z "${KMS_KEY_ARN:-}" ]; then
+  echo "  list-keys output: ${LIST_OUTPUT:0:200}" >&2
+  echo "  ERROR: could not create or find a KMS key" >&2
+  exit 1
+fi
+echo "  Key: $KMS_KEY_ARN"
+
+echo ""
 echo "=== Seeding SSM parameters ==="
 
 # KMS key ID — read by getKMSKeyID() in sdk/kms_ssm.go

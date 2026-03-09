@@ -43,7 +43,8 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	// Read current key policy to determine state.
 	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId: aws.String(keyID),
+		KeyId:      aws.String(keyID),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)
@@ -56,7 +57,10 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	}
 
 	// PCR0 not in policy. Check if we can modify it.
-	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
+	// Accept both explicit "PutKeyPolicy" and the "kms:*" wildcard (e.g. localstack default policy).
+	canPut := currentPolicy.Policy != nil &&
+		(strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") || strings.Contains(*currentPolicy.Policy, `"kms:*"`))
+	if !canPut {
 		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 
@@ -68,7 +72,10 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
 	if err != nil {
-		return fmt.Errorf("parse role ARN: %w", err)
+		// Not an assumed-role ARN (e.g. local testing with mock credentials).
+		// Use the raw ARN as the policy principal — valid for any IAM principal.
+		log.Printf("kms_policy: using raw ARN as principal: %s", *identity.Arn)
+		roleARN = *identity.Arn
 	}
 
 	policy := buildKMSPolicy(roleARN, pcr0)
@@ -83,6 +90,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		}
 		_, err = kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
 			KeyId:                          aws.String(keyID),
+			PolicyName:                     aws.String("default"),
 			Policy:                         aws.String(policy),
 			BypassPolicyLockoutSafetyCheck: true,
 		})

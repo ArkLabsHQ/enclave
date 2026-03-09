@@ -30,16 +30,23 @@
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
         # signing middleware. The user's app is just a plain HTTP server.
+        # Set SDK_LOCAL_PATH to use a local checkout instead of fetching from GitHub.
+        sdkSrc = let localPath = builtins.getEnv "SDK_LOCAL_PATH"; in
+          if localPath != "" then
+            builtins.path { path = localPath; name = "source"; }
+          else
+            pkgs.fetchFromGitHub {
+              owner = "ArkLabsHQ";
+              repo = "introspector-enclave";
+              rev = sdkCfg.rev;
+              hash = sdkCfg.hash;
+            };
+
         enclave-supervisor = pkgs.buildGoModule {
           pname = "enclave-supervisor";
           version = buildCfg.version;
 
-          src = pkgs.fetchFromGitHub {
-            owner = "ArkLabsHQ";
-            repo = "introspector-enclave";
-            rev = sdkCfg.rev;
-            hash = sdkCfg.hash;
-          };
+          src = sdkSrc;
 
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;

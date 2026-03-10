@@ -56,7 +56,16 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	}
 
 	// PCR0 not in policy. Check if we can modify it.
-	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
+	// Modifiable when: policy is empty (fresh key), contains explicit "PutKeyPolicy",
+	// or contains the "kms:*" wildcard (e.g. AWS default policy).
+	policyText := ""
+	if currentPolicy.Policy != nil {
+		policyText = *currentPolicy.Policy
+	}
+	canPut := policyText == "" ||
+		strings.Contains(policyText, "PutKeyPolicy") ||
+		strings.Contains(policyText, `"kms:*"`)
+	if !canPut {
 		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 

@@ -42,8 +42,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	// Read current key policy to determine state.
 	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId:      aws.String(keyID),
-		PolicyName: aws.String("default"),
+		KeyId: aws.String(keyID),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)

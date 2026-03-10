@@ -13,8 +13,8 @@ nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.42"
-  hash: "sha256-X9nVw4hrUPIXJtGgMNd6EqwmYK5yOYLMtKBjOQnJung="
+  rev: "v0.0.43"
+  hash: "sha256-bLlypG10dqYUemCuxpl7l8jvbROmdjHaeCpq0Urj/mk="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -34,12 +34,13 @@ app:
   # This bypasses gvproxy TAP (outbound NAT broken in QEMU nitro-enclave).
   env:
     # viproxy mappings: local TCP → vsock CID 3 (forwarded to host by vhost-device-vsock)
-    ENCLAVE_VIPROXY_IN_ADDRS: "127.0.0.1:80,127.0.0.1:4566"
-    ENCLAVE_VIPROXY_OUT_ADDRS: "3:8002,3:8003"
+    ENCLAVE_VIPROXY_IN_ADDRS: "127.0.0.1:80,127.0.0.1:4566,127.0.0.1:4000"
+    ENCLAVE_VIPROXY_OUT_ADDRS: "3:8002,3:8003,3:8004"
     # IMDS via viproxy (port 80 → vsock:8002 → mock-imds:1338)
     IMDS_ENDPOINT: "127.0.0.1"
     # AWS endpoints via viproxy (port 4566 → vsock:8003 → localstack:4566)
-    AWS_ENDPOINT_URL_KMS: "http://127.0.0.1:4566"
+    AWS_ENDPOINT_URL_KMS: "http://127.0.0.1:4000"
+    ENCLAVE_KMS_KEY_ID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
     AWS_ENDPOINT_URL_SSM: "http://127.0.0.1:4566"
     AWS_ENDPOINT_URL_STS: "http://127.0.0.1:4566"
     AWS_ENDPOINT_URL_S3: "http://127.0.0.1:4566"

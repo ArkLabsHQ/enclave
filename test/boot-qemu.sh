@@ -39,6 +39,7 @@ cleanup() {
   [ -n "${GVPROXY_PID:-}" ] && kill "$GVPROXY_PID" 2>/dev/null && echo "  Stopped gvproxy ($GVPROXY_PID)"
   [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)"
   [ -n "${AWS_PROXY_PID:-}" ] && kill "$AWS_PROXY_PID" 2>/dev/null && echo "  Stopped AWS proxy ($AWS_PROXY_PID)"
+  [ -n "${KMS_PROXY_PID:-}" ] && kill "$KMS_PROXY_PID" 2>/dev/null && echo "  Stopped KMS proxy ($KMS_PROXY_PID)"
   [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)"
   [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)"
   rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET"
@@ -105,6 +106,11 @@ LOCALSTACK_PORT="${LOCALSTACK_PORT:-4566}"
 python3 "$SCRIPT_DIR/vsock-proxy.py" 8003 127.0.0.1 "$LOCALSTACK_PORT" &
 AWS_PROXY_PID=$!
 
+# KMS: viproxy 127.0.0.1:4000 → vsock 3:8004 → AF_VSOCK 1:8004 → kms-proxy:4000
+KMS_PROXY_PORT="${KMS_PROXY_PORT:-4000}"
+python3 "$SCRIPT_DIR/vsock-proxy.py" 8004 127.0.0.1 "$KMS_PROXY_PORT" &
+KMS_PROXY_PID=$!
+
 sleep 0.5
 
 if ! kill -0 "$IMDS_PROXY_PID" 2>/dev/null; then
@@ -117,6 +123,12 @@ if ! kill -0 "$AWS_PROXY_PID" 2>/dev/null; then
   echo "  Warning: AWS vsock proxy failed to start"
 else
   echo "  vsock:8003 -> 127.0.0.1:${LOCALSTACK_PORT} (localstack)"
+fi
+
+if ! kill -0 "$KMS_PROXY_PID" 2>/dev/null; then
+  echo "  Warning: KMS vsock proxy failed to start"
+else
+  echo "  vsock:8004 -> 127.0.0.1:${KMS_PROXY_PORT} (kms-proxy)"
 fi
 
 # gvproxy: the enclave's start.sh connects to vsock CID 3 port 1024 for networking.

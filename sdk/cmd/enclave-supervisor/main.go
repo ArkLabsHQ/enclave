@@ -78,7 +78,16 @@ func main() {
 	}()
 
 	// 6. Bootstrap: attestation key, KMS secrets, PCR extension (may block).
-	if err := enc.Init(ctx); err != nil {
+	initCtx := ctx
+	if t := envOr("ENCLAVE_INIT_TIMEOUT", ""); t != "" {
+		if d, err := time.ParseDuration(t); err == nil {
+			var cancel context.CancelFunc
+			initCtx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+			log.Printf("init timeout: %s", d)
+		}
+	}
+	if err := enc.Init(initCtx); err != nil {
 		log.Printf("enclave init error: %v", err)
 	}
 

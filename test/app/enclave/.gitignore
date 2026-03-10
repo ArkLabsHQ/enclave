@@ -1,0 +1,13 @@
+# Build artifacts (EIF image + PCR measurements)
+artifacts/
+
+# Generated build config (from enclave.yaml for Nix)
+build-config.json
+
+# CDK outputs (contains account-specific IDs)
+cdk-outputs.json
+cdk.out/
+
+# Nix build symlinks
+result
+result-*

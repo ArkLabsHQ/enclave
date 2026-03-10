@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
@@ -26,9 +25,9 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ssmClient := ssm.NewFromConfig(awsCfg)
-	kmsClient := kms.NewFromConfig(awsCfg)
-	stsClient := sts.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
+	stsClient := newSTSClient(awsCfg)
 
 	keyID, err := getKMSKeyID(ctx, ssmClient)
 	if err != nil {
@@ -56,7 +55,10 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	}
 
 	// PCR0 not in policy. Check if we can modify it.
-	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
+	// Accept both explicit "PutKeyPolicy" and the "kms:*" wildcard (e.g. localstack default policy).
+	canPut := currentPolicy.Policy != nil &&
+		(strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") || strings.Contains(*currentPolicy.Policy, `"kms:*"`))
+	if !canPut {
 		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 
@@ -68,7 +70,10 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
 	if err != nil {
-		return fmt.Errorf("parse role ARN: %w", err)
+		// Not an assumed-role ARN (e.g. local testing with mock credentials).
+		// Use the raw ARN as the policy principal — valid for any IAM principal.
+		log.Printf("kms_policy: using raw ARN as principal: %s", *identity.Arn)
+		roleARN = *identity.Arn
 	}
 
 	policy := buildKMSPolicy(roleARN, pcr0)

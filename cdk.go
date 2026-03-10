@@ -24,6 +24,8 @@ type NitroIntrospectorStackProps struct {
 	InstanceType string
 	AppName      string
 	Secrets      []SecretConfig
+	// Local skips VPC, EC2, S3 assets, and ECR — for deploying to localstack.
+	Local bool
 }
 
 func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *NitroIntrospectorStackProps) awscdk.Stack {
@@ -31,6 +33,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	repoRoot := "."
 	instanceType := "m6i.xlarge"
 	appName := "app"
+	local := false
 	var secrets []SecretConfig
 	stackProps := awscdk.StackProps{}
 	if props != nil {
@@ -48,6 +51,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 			appName = props.AppName
 		}
 		secrets = props.Secrets
+		local = props.Local
 	}
 
 	stack := awscdk.NewStack(scope, jsii.String(id), &stackProps)
@@ -55,6 +59,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	repoPath := func(parts ...string) string {
 		return filepath.Join(append([]string{repoRoot}, parts...)...)
 	}
+
+	// ── KMS key (shared) ──
 
 	encryptionKey := awskms.NewKey(stack, jsii.String("EncryptionKey"), &awskms.KeyProps{
 		EnableKeyRotation: jsii.Bool(true),
@@ -65,19 +71,26 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	// EC2 instance role before tearing down the stack.
 	encryptionKey.ApplyRemovalPolicy(awscdk.RemovalPolicy_RETAIN)
 
-	outboundProxyImage := awsecrassets.NewDockerImageAsset(stack, jsii.String("gvproxy"), &awsecrassets.DockerImageAssetProps{
-		Directory: jsii.String(repoRoot),
-		Platform:  awsecrassets.Platform_LINUX_AMD64(),
-		File:      jsii.String("enclave/gvproxy/Dockerfile"),
-		AssetName: jsii.String("gvisor-tap-vsock"),
-		Exclude: &[]*string{
-			jsii.String("enclave/cdk.out"),
-			jsii.String("enclave/artifacts"),
-			jsii.String("flake_result"),
-			jsii.String(".git"),
-			jsii.String("bin"),
-		},
-	})
+	// ── ECR Docker image (remote only — requires Docker daemon) ──
+
+	var outboundProxyImage awsecrassets.DockerImageAsset
+	if !local {
+		outboundProxyImage = awsecrassets.NewDockerImageAsset(stack, jsii.String("gvproxy"), &awsecrassets.DockerImageAssetProps{
+			Directory: jsii.String(repoRoot),
+			Platform:  awsecrassets.Platform_LINUX_AMD64(),
+			File:      jsii.String("enclave/gvproxy/Dockerfile"),
+			AssetName: jsii.String("gvisor-tap-vsock"),
+			Exclude: &[]*string{
+				jsii.String("enclave/cdk.out"),
+				jsii.String("enclave/artifacts"),
+				jsii.String("flake_result"),
+				jsii.String(".git"),
+				jsii.String("bin"),
+			},
+		})
+	}
+
+	// ── S3 assets (shared — synth-local creates stubs for missing files) ──
 
 	// The EIF is built by Nix (nix build .#eif) before CDK deploy.
 	// Upload the pre-built, reproducible EIF to S3.
@@ -109,7 +122,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		Path: jsii.String(repoPath("enclave/systemd/enclave-mgmt.service")),
 	})
 
-	// Create SSM parameters for each configured secret.
+	// ── SSM parameters for secrets (shared) ──
+
 	var secretParams []awsssm.StringParameter
 	for _, secret := range secrets {
 		param := awsssm.NewStringParameter(stack, jsii.String("Secret_"+secret.Name), &awsssm.StringParameterProps{
@@ -148,100 +162,108 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
 	})
 
-	vpc := awsec2.NewVpc(stack, jsii.String("VPC"), &awsec2.VpcProps{
-		NatGateways: jsii.Number(1),
-		SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
-			{
-				Name:       jsii.String("public"),
-				SubnetType: awsec2.SubnetType_PUBLIC,
+	// ── VPC + networking (remote only) ──
+
+	var vpc awsec2.Vpc
+	var nitroInstanceSG awsec2.SecurityGroup
+	if !local {
+		vpc = awsec2.NewVpc(stack, jsii.String("VPC"), &awsec2.VpcProps{
+			NatGateways: jsii.Number(1),
+			SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
+				{
+					Name:       jsii.String("public"),
+					SubnetType: awsec2.SubnetType_PUBLIC,
+				},
+				{
+					Name:       jsii.String("private"),
+					SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
+				},
 			},
-			{
-				Name:       jsii.String("private"),
+			EnableDnsSupport:   jsii.Bool(true),
+			EnableDnsHostnames: jsii.Bool(true),
+		})
+
+		awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("KMSEndpoint"), &awsec2.InterfaceVpcEndpointProps{
+			Vpc: vpc,
+			Subnets: &awsec2.SubnetSelection{
 				SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
 			},
-		},
-		EnableDnsSupport:   jsii.Bool(true),
-		EnableDnsHostnames: jsii.Bool(true),
-	})
+			Service:           awsec2.InterfaceVpcEndpointAwsService_KMS(),
+			PrivateDnsEnabled: jsii.Bool(true),
+		})
 
-	awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("KMSEndpoint"), &awsec2.InterfaceVpcEndpointProps{
-		Vpc: vpc,
-		Subnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
-		},
-		Service:           awsec2.InterfaceVpcEndpointAwsService_KMS(),
-		PrivateDnsEnabled: jsii.Bool(true),
-	})
+		awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("SSMEndpoint"), &awsec2.InterfaceVpcEndpointProps{
+			Vpc: vpc,
+			Subnets: &awsec2.SubnetSelection{
+				SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
+			},
+			Service:           awsec2.InterfaceVpcEndpointAwsService_SSM(),
+			PrivateDnsEnabled: jsii.Bool(true),
+		})
 
-	awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("SSMEndpoint"), &awsec2.InterfaceVpcEndpointProps{
-		Vpc: vpc,
-		Subnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
-		},
-		Service:           awsec2.InterfaceVpcEndpointAwsService_SSM(),
-		PrivateDnsEnabled: jsii.Bool(true),
-	})
+		awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("ECREndpoint"), &awsec2.InterfaceVpcEndpointProps{
+			Vpc: vpc,
+			Subnets: &awsec2.SubnetSelection{
+				SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
+			},
+			Service:           awsec2.InterfaceVpcEndpointAwsService_ECR(),
+			PrivateDnsEnabled: jsii.Bool(true),
+		})
 
-	awsec2.NewInterfaceVpcEndpoint(stack, jsii.String("ECREndpoint"), &awsec2.InterfaceVpcEndpointProps{
-		Vpc: vpc,
-		Subnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
-		},
-		Service:           awsec2.InterfaceVpcEndpointAwsService_ECR(),
-		PrivateDnsEnabled: jsii.Bool(true),
-	})
+		awsec2.NewGatewayVpcEndpoint(stack, jsii.String("S3Endpoint"), &awsec2.GatewayVpcEndpointProps{
+			Vpc:     vpc,
+			Service: awsec2.GatewayVpcEndpointAwsService_S3(),
+		})
 
-	awsec2.NewGatewayVpcEndpoint(stack, jsii.String("S3Endpoint"), &awsec2.GatewayVpcEndpointProps{
-		Vpc:     vpc,
-		Service: awsec2.GatewayVpcEndpointAwsService_S3(),
-	})
+		nitroInstanceSG = awsec2.NewSecurityGroup(stack, jsii.String("NitroInstanceSG"), &awsec2.SecurityGroupProps{
+			Vpc:              vpc,
+			AllowAllOutbound: jsii.Bool(true),
+			Description:      jsii.String("Private SG for Nitro Enclave EC2 instance"),
+		})
 
-	nitroInstanceSG := awsec2.NewSecurityGroup(stack, jsii.String("NitroInstanceSG"), &awsec2.SecurityGroupProps{
-		Vpc:              vpc,
-		AllowAllOutbound: jsii.Bool(true),
-		Description:      jsii.String("Private SG for Nitro Enclave EC2 instance"),
-	})
+		nitroInstanceSG.AddIngressRule(
+			awsec2.Peer_AnyIpv4(),
+			awsec2.Port_Tcp(jsii.Number(443)),
+			jsii.String("Allow HTTPS from internet"),
+			jsii.Bool(false),
+		)
 
-	nitroInstanceSG.AddIngressRule(
-		awsec2.Peer_AnyIpv4(),
-		awsec2.Port_Tcp(jsii.Number(443)),
-		jsii.String("Allow HTTPS from internet"),
-		jsii.Bool(false),
-	)
+		// Use CfnSecurityGroupIngress for self-referencing rules to avoid
+		// CloudFormation circular dependency with the EC2 instance.
+		awsec2.NewCfnSecurityGroupIngress(stack, jsii.String("SelfTCP443"), &awsec2.CfnSecurityGroupIngressProps{
+			GroupId:               nitroInstanceSG.SecurityGroupId(),
+			SourceSecurityGroupId: nitroInstanceSG.SecurityGroupId(),
+			IpProtocol:            jsii.String("tcp"),
+			FromPort:              jsii.Number(443),
+			ToPort:                jsii.Number(443),
+		})
 
-	// Use CfnSecurityGroupIngress for self-referencing rules to avoid
-	// CloudFormation circular dependency with the EC2 instance.
-	awsec2.NewCfnSecurityGroupIngress(stack, jsii.String("SelfTCP443"), &awsec2.CfnSecurityGroupIngressProps{
-		GroupId:               nitroInstanceSG.SecurityGroupId(),
-		SourceSecurityGroupId: nitroInstanceSG.SecurityGroupId(),
-		IpProtocol:            jsii.String("tcp"),
-		FromPort:              jsii.Number(443),
-		ToPort:                jsii.Number(443),
-	})
+		awsec2.NewCfnSecurityGroupIngress(stack, jsii.String("SelfICMP"), &awsec2.CfnSecurityGroupIngressProps{
+			GroupId:               nitroInstanceSG.SecurityGroupId(),
+			SourceSecurityGroupId: nitroInstanceSG.SecurityGroupId(),
+			IpProtocol:            jsii.String("icmp"),
+			FromPort:              jsii.Number(-1),
+			ToPort:                jsii.Number(-1),
+		})
+	}
 
-	awsec2.NewCfnSecurityGroupIngress(stack, jsii.String("SelfICMP"), &awsec2.CfnSecurityGroupIngressProps{
-		GroupId:               nitroInstanceSG.SecurityGroupId(),
-		SourceSecurityGroupId: nitroInstanceSG.SecurityGroupId(),
-		IpProtocol:            jsii.String("icmp"),
-		FromPort:              jsii.Number(-1),
-		ToPort:                jsii.Number(-1),
-	})
-
-	amznLinux := awsec2.MachineImage_LatestAmazonLinux2023(nil)
+	// ── IAM role (shared) ──
 
 	role := awsiam.NewRole(stack, jsii.String("InstanceSSM"), &awsiam.RoleProps{
 		AssumedBy: awsiam.NewServicePrincipal(jsii.String("ec2.amazonaws.com"), nil),
 	})
-	role.AddManagedPolicy(
-		awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("AmazonSSMManagedInstanceCore")),
-	)
-
+	if !local {
+		role.AddManagedPolicy(
+			awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("AmazonSSMManagedInstanceCore")),
+		)
+	}
 	enclaveInit.GrantRead(role)
 	enclaveInitSystemd.GrantRead(role)
 	imdsSystemd.GrantRead(role)
 	gvproxySystemd.GrantRead(role)
 	mgmtBinary.GrantRead(role)
 	mgmtSystemd.GrantRead(role)
+
 	// Grant access to all per-secret SSM parameters (ciphertext + migration).
 	for _, param := range secretParams {
 		param.GrantRead(role)
@@ -255,34 +277,12 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	migrationOldKMSKeyIDParam.GrantRead(role)
 	migrationOldKMSKeyIDParam.GrantWrite(role)
 
-	blockDevice := awsec2.BlockDevice{
-		DeviceName: jsii.String("/dev/xvda"),
-		Volume: awsec2.BlockDeviceVolume_Ebs(jsii.Number(32), &awsec2.EbsDeviceOptions{
-			VolumeType:          awsec2.EbsDeviceVolumeType_GP2,
-			Encrypted:           jsii.Bool(true),
-			DeleteOnTermination: jsii.Bool(deployment == "dev"),
-		}),
-	}
-
-	mappings := map[string]*string{
-		"__DEV_MODE__":                    jsii.String(deployment),
-		"__APP_NAME__":                    jsii.String(appName),
-		"__GVPROXY_IMAGE_URI__":           outboundProxyImage.ImageUri(),
-		"__EIF_S3_URL__":                  enclaveEif.S3ObjectUrl(),
-		"__ENCLAVE_INIT_S3_URL__":         enclaveInit.S3ObjectUrl(),
-		"__ENCLAVE_INIT_SYSTEMD_S3_URL__": enclaveInitSystemd.S3ObjectUrl(),
-		"__IMDS_SYSTEMD_S3_URL__":         imdsSystemd.S3ObjectUrl(),
-		"__GVPROXY_SYSTEMD_S3_URL__":      gvproxySystemd.S3ObjectUrl(),
-		"__MGMT_BINARY_S3_URL__":          mgmtBinary.S3ObjectUrl(),
-		"__MGMT_SYSTEMD_S3_URL__":         mgmtSystemd.S3ObjectUrl(),
-		"__REGION__":                      stack.Region(),
-		"__KMS_KEY_ID__":                  encryptionKey.KeyId(),
-	}
-
-	userDataRaw := awscdk.Fn_Sub(jsii.String(ReadFileOrPanic(repoPath("enclave/user_data/user_data"))), &mappings)
+	// ── KMS grants (shared) ──
 
 	enclaveEif.GrantRead(role)
-	outboundProxyImage.Repository().GrantPull(role)
+	if !local {
+		outboundProxyImage.Repository().GrantPull(role)
+	}
 	encryptionKey.GrantEncryptDecrypt(role)
 	// The enclave self-applies KMS policy using its hardware-attested PCR0.
 	// EC2 role needs PutKeyPolicy + GetKeyPolicy for this self-apply step.
@@ -299,31 +299,67 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		Principals: &[]awsiam.IPrincipal{role},
 	}), jsii.Bool(true))
 
-	instance := awsec2.NewInstance(stack, jsii.String("NitroInstance"), &awsec2.InstanceProps{
-		InstanceType: awsec2.NewInstanceType(jsii.String(instanceType)),
-		Vpc:          vpc,
-		VpcSubnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PUBLIC,
-		},
-		MachineImage:  amznLinux,
-		BlockDevices:  &[]*awsec2.BlockDevice{&blockDevice},
-		Role:          role,
-		SecurityGroup: nitroInstanceSG,
-		UserData:      awsec2.UserData_Custom(userDataRaw),
-	})
+	// ── EC2 instance (remote only) ──
 
-	// Enable Nitro Enclaves on the underlying CFN resource (L2 InstanceProps has no NitroEnclaveEnabled field).
-	cfnInstance := instance.Node().DefaultChild().(awsec2.CfnInstance)
-	cfnInstance.AddPropertyOverride(jsii.String("EnclaveOptions.Enabled"), jsii.Bool(true))
+	var instance awsec2.Instance
+	var eip awsec2.CfnEIP
+	if !local {
+		amznLinux := awsec2.MachineImage_LatestAmazonLinux2023(nil)
 
-	// Elastic IP gives the instance a static public address that survives reboots.
-	eip := awsec2.NewCfnEIP(stack, jsii.String("EnclaveEIP"), &awsec2.CfnEIPProps{
-		Domain: jsii.String("vpc"),
-	})
-	awsec2.NewCfnEIPAssociation(stack, jsii.String("EnclaveEIPAssoc"), &awsec2.CfnEIPAssociationProps{
-		AllocationId: eip.AttrAllocationId(),
-		InstanceId:   instance.InstanceId(),
-	})
+		blockDevice := awsec2.BlockDevice{
+			DeviceName: jsii.String("/dev/xvda"),
+			Volume: awsec2.BlockDeviceVolume_Ebs(jsii.Number(32), &awsec2.EbsDeviceOptions{
+				VolumeType:          awsec2.EbsDeviceVolumeType_GP2,
+				Encrypted:           jsii.Bool(true),
+				DeleteOnTermination: jsii.Bool(deployment == "dev"),
+			}),
+		}
+
+		mappings := map[string]*string{
+			"__DEV_MODE__":                    jsii.String(deployment),
+			"__APP_NAME__":                    jsii.String(appName),
+			"__GVPROXY_IMAGE_URI__":           outboundProxyImage.ImageUri(),
+			"__EIF_S3_URL__":                  enclaveEif.S3ObjectUrl(),
+			"__ENCLAVE_INIT_S3_URL__":         enclaveInit.S3ObjectUrl(),
+			"__ENCLAVE_INIT_SYSTEMD_S3_URL__": enclaveInitSystemd.S3ObjectUrl(),
+			"__IMDS_SYSTEMD_S3_URL__":         imdsSystemd.S3ObjectUrl(),
+			"__GVPROXY_SYSTEMD_S3_URL__":      gvproxySystemd.S3ObjectUrl(),
+			"__MGMT_BINARY_S3_URL__":          mgmtBinary.S3ObjectUrl(),
+			"__MGMT_SYSTEMD_S3_URL__":         mgmtSystemd.S3ObjectUrl(),
+			"__REGION__":                      stack.Region(),
+			"__KMS_KEY_ID__":                  encryptionKey.KeyId(),
+		}
+
+		userDataRaw := awscdk.Fn_Sub(jsii.String(ReadFileOrPanic(repoPath("enclave/user_data/user_data"))), &mappings)
+
+		instance = awsec2.NewInstance(stack, jsii.String("NitroInstance"), &awsec2.InstanceProps{
+			InstanceType: awsec2.NewInstanceType(jsii.String(instanceType)),
+			Vpc:          vpc,
+			VpcSubnets: &awsec2.SubnetSelection{
+				SubnetType: awsec2.SubnetType_PUBLIC,
+			},
+			MachineImage:  amznLinux,
+			BlockDevices:  &[]*awsec2.BlockDevice{&blockDevice},
+			Role:          role,
+			SecurityGroup: nitroInstanceSG,
+			UserData:      awsec2.UserData_Custom(userDataRaw),
+		})
+
+		// Enable Nitro Enclaves on the underlying CFN resource (L2 InstanceProps has no NitroEnclaveEnabled field).
+		cfnInstance := instance.Node().DefaultChild().(awsec2.CfnInstance)
+		cfnInstance.AddPropertyOverride(jsii.String("EnclaveOptions.Enabled"), jsii.Bool(true))
+
+		// Elastic IP gives the instance a static public address that survives reboots.
+		eip = awsec2.NewCfnEIP(stack, jsii.String("EnclaveEIP"), &awsec2.CfnEIPProps{
+			Domain: jsii.String("vpc"),
+		})
+		awsec2.NewCfnEIPAssociation(stack, jsii.String("EnclaveEIPAssoc"), &awsec2.CfnEIPAssociationProps{
+			AllocationId: eip.AttrAllocationId(),
+			InstanceId:   instance.InstanceId(),
+		})
+	}
+
+	// ── SSM + S3 for enclave data (shared) ──
 
 	kmsKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("KMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   encryptionKey.KeyId(),
@@ -332,11 +368,16 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	kmsKeyIDParam.GrantRead(role)
 
 	// Encrypted persistent storage bucket for enclave data (Store/Load API).
-	storageBucket := awss3.NewBucket(stack, jsii.String("EnclaveStorage"), &awss3.BucketProps{
+	bucketProps := &awss3.BucketProps{
 		RemovalPolicy:     awscdk.RemovalPolicy_RETAIN,
 		BlockPublicAccess: awss3.BlockPublicAccess_BLOCK_ALL(),
 		EnforceSSL:        jsii.Bool(true),
-	})
+	}
+	if local {
+		bucketProps.RemovalPolicy = awscdk.RemovalPolicy_DESTROY
+		bucketProps.EnforceSSL = nil
+	}
+	storageBucket := awss3.NewBucket(stack, jsii.String("EnclaveStorage"), bucketProps)
 	storageBucket.GrantReadWrite(role, nil)
 
 	storageBucketParam := awsssm.NewStringParameter(stack, jsii.String("StorageBucketName"), &awsssm.StringParameterProps{
@@ -360,6 +401,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	storageDEKMigrationParam.GrantRead(role)
 	storageDEKMigrationParam.GrantWrite(role)
 
+	// ── Outputs ──
+
 	awscdk.NewCfnOutput(stack, jsii.String("EC2 Instance Role ARN"), &awscdk.CfnOutputProps{
 		Value:       role.RoleArn(),
 		Description: jsii.String("EC2 Instance Role ARN"),
@@ -370,14 +413,21 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		Description: jsii.String("KMS Key ID"),
 	})
 
-	awscdk.NewCfnOutput(stack, jsii.String("Instance ID"), &awscdk.CfnOutputProps{
-		Value:       instance.InstanceId(),
-		Description: jsii.String("EC2 Instance ID"),
-	})
+	if !local {
+		awscdk.NewCfnOutput(stack, jsii.String("Instance ID"), &awscdk.CfnOutputProps{
+			Value:       instance.InstanceId(),
+			Description: jsii.String("EC2 Instance ID"),
+		})
 
-	awscdk.NewCfnOutput(stack, jsii.String("Elastic IP"), &awscdk.CfnOutputProps{
-		Value:       eip.Ref(),
-		Description: jsii.String("Static public IP for the enclave instance"),
+		awscdk.NewCfnOutput(stack, jsii.String("Elastic IP"), &awscdk.CfnOutputProps{
+			Value:       eip.Ref(),
+			Description: jsii.String("Static public IP for the enclave instance"),
+		})
+	}
+
+	awscdk.NewCfnOutput(stack, jsii.String("Storage Bucket"), &awscdk.CfnOutputProps{
+		Value:       storageBucket.BucketName(),
+		Description: jsii.String("S3 storage bucket name"),
 	})
 
 	return stack

@@ -66,8 +66,8 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ssmClient := ssm.NewFromConfig(awsCfg)
-	kmsClient := kms.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
 
 	paramName := getSecretSSMParamName(secret.Name)
 	keyID, err := getKMSKeyID(ctx, ssmClient)

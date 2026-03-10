@@ -12,6 +12,9 @@ enclave-image.tar.gz
 
 # CDK outputs
 enclave/cdk-outputs.json
+cdk-local.out/
+test/cdk-local.out/
+test/cdk-local-outputs.json
 
 # Generated build config (from enclave.yaml for Nix)
 enclave/build-config.json
@@ -23,6 +26,7 @@ enclave.yaml
 # Built binaries
 introspector
 introspector-client
+synth-local
 ./bin/
 *.eif
 mgmt/mgmt

@@ -56,10 +56,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	}
 
 	// PCR0 not in policy. Check if we can modify it.
-	// Accept both explicit "PutKeyPolicy" and the "kms:*" wildcard (e.g. localstack default policy).
-	canPut := currentPolicy.Policy != nil &&
-		(strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") || strings.Contains(*currentPolicy.Policy, `"kms:*"`))
-	if !canPut {
+	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
 		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 

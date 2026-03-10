@@ -60,14 +60,14 @@ else
   fail "Attestation headers" "X-Attestation-Pubkey missing"
 fi
 
-# Test 4: Init status (error expected without real AWS services)
+# Test 4: Init must complete successfully
 echo "[4/5] Init status"
 if [ -n "$INFO" ]; then
   INIT_ERR=$(echo "$INFO" | jq -r '.error // empty' 2>/dev/null || echo "")
   if [ -z "$INIT_ERR" ]; then
-    pass "Init completed successfully (no init_error)"
+    pass "Init completed successfully"
   else
-    pass "Init reported error (expected without AWS): ${INIT_ERR:0:60}"
+    fail "Init" "${INIT_ERR:0:80}"
   fi
 else
   fail "Init status" "could not fetch enclave-info"

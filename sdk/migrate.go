@@ -38,7 +38,7 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
 
 	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
 	if err != nil {
@@ -46,7 +46,7 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kmsClient := kms.NewFromConfig(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
 
 	var exported []string
 	for _, secret := range e.secrets {
@@ -105,7 +105,7 @@ func readMigrationPreviousPCR0(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
 	deployment := getDeployment()
 	appName := getAppName()
 	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
@@ -118,7 +118,7 @@ func readMigrationPreviousPCR0Attestation(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
 	deployment := getDeployment()
 	appName := getAppName()
 	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName))
@@ -173,7 +173,7 @@ func deleteOldKMSKey(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
 	deployment := getDeployment()
 	appName := getAppName()
 
@@ -182,7 +182,7 @@ func deleteOldKMSKey(ctx context.Context) {
 		return
 	}
 
-	kmsClient := kms.NewFromConfig(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
 	pendingDays := int32(7)
 	_, err = kmsClient.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
 		KeyId:               aws.String(oldKeyID),

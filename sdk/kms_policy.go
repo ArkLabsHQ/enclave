@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
@@ -26,9 +25,9 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ssmClient := ssm.NewFromConfig(awsCfg)
-	kmsClient := kms.NewFromConfig(awsCfg)
-	stsClient := sts.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
+	stsClient := newSTSClient(awsCfg)
 
 	keyID, err := getKMSKeyID(ctx, ssmClient)
 	if err != nil {
@@ -43,8 +42,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	// Read current key policy to determine state.
 	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId:      aws.String(keyID),
-		PolicyName: aws.String("default"),
+		KeyId: aws.String(keyID),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)
@@ -90,7 +88,6 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		}
 		_, err = kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
 			KeyId:                          aws.String(keyID),
-			PolicyName:                     aws.String("default"),
 			Policy:                         aws.String(policy),
 			BypassPolicyLockoutSafetyCheck: true,
 		})

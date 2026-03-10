@@ -41,7 +41,7 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ssmClient := ssm.NewFromConfig(awsCfg)
+	ssmClient := newSSMClient(awsCfg)
 	deployment := getDeployment()
 	appName := getAppName()
 
@@ -51,10 +51,10 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 		return nil // no bucket provisioned, storage disabled
 	}
 
-	e.s3Client = s3.NewFromConfig(awsCfg)
+	e.s3Client = newS3Client(awsCfg)
 	e.bucketName = bucketName
 
-	kmsClient := kms.NewFromConfig(awsCfg)
+	kmsClient := newKMSClient(awsCfg)
 	keyID, err := getKMSKeyID(ctx, ssmClient)
 	if err != nil {
 		return fmt.Errorf("get KMS key ID: %w", err)

@@ -4,7 +4,7 @@ services:
     ports:
       - "4566:4566"
     environment:
-      SERVICES: ssm,sts,s3,kms
+      SERVICES: ssm,sts,s3,kms,cloudformation,iam
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
       interval: 5s

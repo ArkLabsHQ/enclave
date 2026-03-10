@@ -52,6 +52,9 @@
             # gvproxy: outbound networking for the enclave via TAP over vsock.
             pkgs.gvproxy
 
+            # Node.js for CDK synthesis (jsii) and cdklocal (auto-installed by deploy-local.sh).
+            pkgs.nodejs_20
+
             # Utilities for testing.
             pkgs.curl
             pkgs.jq

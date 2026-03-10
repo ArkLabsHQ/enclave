@@ -20,6 +20,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Auto-enter Nix dev shell if QEMU tools aren't available.
+if ! command -v vhost-device-vsock >/dev/null 2>&1 || ! command -v gvproxy >/dev/null 2>&1 || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+  if command -v nix >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/flake.nix" ]; then
+    echo "Required tools not found. Entering nix develop ./test ..."
+    exec nix develop "$SCRIPT_DIR" --command bash "$0" "$@"
+  else
+    echo "Error: Missing required tools (vhost-device-vsock, gvproxy, qemu-system-x86_64)." >&2
+    echo "  Run: nix develop ./test" >&2
+    exit 1
+  fi
+fi
+
 EIF_PATH="${1:-}"
 
 cleanup() {
@@ -68,9 +80,14 @@ else
   echo ""
 fi
 
-# Step 2: Seed SSM parameters and S3 bucket.
-echo "=== [2/4] Seeding mock AWS services ==="
-./seed-ssm.sh
+# Step 2: Provision AWS resources (CDK to localstack, or seed-ssm.sh fallback).
+if [ "${USE_CDK_LOCAL:-}" = "1" ] || { command -v cdklocal >/dev/null 2>&1 || [ -x /tmp/cdklocal/node_modules/.bin/cdklocal ]; }; then
+  echo "=== [2/4] Deploying local CDK stack to localstack ==="
+  ./deploy-local.sh
+else
+  echo "=== [2/4] Seeding mock AWS services ==="
+  ./seed-ssm.sh
+fi
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).

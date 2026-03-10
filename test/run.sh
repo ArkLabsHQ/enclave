@@ -80,14 +80,9 @@ else
   echo ""
 fi
 
-# Step 2: Provision AWS resources (CDK to localstack, or seed-ssm.sh fallback).
-if [ "${USE_CDK_LOCAL:-}" = "1" ] || { command -v cdklocal >/dev/null 2>&1 || [ -x /tmp/cdklocal/node_modules/.bin/cdklocal ]; }; then
-  echo "=== [2/4] Deploying local CDK stack to localstack ==="
-  ./deploy-local.sh
-else
-  echo "=== [2/4] Seeding mock AWS services ==="
-  ./seed-ssm.sh
-fi
+# Step 2: Deploy CDK stack to localstack.
+echo "=== [2/4] Deploying local CDK stack to localstack ==="
+./deploy-local.sh
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).

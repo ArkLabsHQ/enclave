@@ -1,17 +1,20 @@
-# Enclave configuration for local QEMU testing.
-# All AWS endpoints point to mock services on the host via gvproxy gateway.
+# Enclave configuration
+# Edit this file then run: enclave init
 
-name: test-app
-version: 0.0.1
-region: us-east-1
-account: "123456789012"
-prefix: dev
-instance_type: m6i.xlarge
-nix_image: nixos/nix:2.24.9
+name: my-app                     # App name (used in stack name, EIF name)
+version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
+region: us-east-1                # AWS region
+account: ""                      # AWS account ID (required)
+prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+instance_type: m6i.xlarge        # EC2 instance type
+nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 
+# SDK coordinates for the enclave supervisor binary.
+# The supervisor handles attestation, secrets, PCR extension, and signing
+# middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.41"
-  hash: "sha256-6e0yiFOeeglgSdLu/dX2wQg8CcJ/uHvjcghhhEeapZU="
+  rev: "v0.0.42"
+  hash: "sha256-X9nVw4hrUPIXJtGgMNd6EqwmYK5yOYLMtKBjOQnJung="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -20,8 +23,8 @@ app:
 
   nix_owner: "ArkLabsHQ"
   nix_repo: "introspector-enclave"
-  nix_rev: "2ed7174363775e948c5da46cb6a619d2ffe56fb9"
-  nix_hash: "sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo="
+  nix_rev: "13a0bc15e6961e0ab90c74e651342c91f2262533"
+  nix_hash: "sha256-UPKnsusigerqudXdJilaANN5pQJ1BffEFsaflegyoI4="
   nix_vendor_hash: "sha256-mGKxBRU5TPgdmiSx0DHEd0Ys8gsVD/YdBfbDdSVpC3U="
   nix_sub_packages:
     - "cmd"

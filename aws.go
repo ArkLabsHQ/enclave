@@ -85,7 +85,8 @@ func (ac *awsClients) getKeyState(ctx context.Context, keyID string) (string, er
 
 func (ac *awsClients) getKeyPolicy(ctx context.Context, keyID string) (string, error) {
 	out, err := ac.kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId: aws.String(keyID),
+		KeyId:      aws.String(keyID),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		return "", err

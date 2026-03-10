@@ -42,7 +42,8 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	// Read current key policy to determine state.
 	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId: aws.String(keyID),
+		KeyId:      aws.String(keyID),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)
@@ -70,10 +71,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
 	if err != nil {
-		// Not an assumed-role ARN (e.g. local testing with mock credentials).
-		// Use the raw ARN as the policy principal — valid for any IAM principal.
-		log.Printf("kms_policy: using raw ARN as principal: %s", *identity.Arn)
-		roleARN = *identity.Arn
+		return fmt.Errorf("resolve IAM role ARN: %w", err)
 	}
 
 	policy := buildKMSPolicy(roleARN, pcr0)
@@ -103,15 +101,25 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 }
 
 // assumedRoleARNToRoleARN converts an STS assumed-role ARN to an IAM role ARN.
+// If the ARN is already an IAM principal (role, user, root), it is returned as-is.
 //
 //	arn:aws:sts::123456789012:assumed-role/MyRole/i-abc123
 //	→ arn:aws:iam::123456789012:role/MyRole
+//
+//	arn:aws:iam::000000000000:root → returned as-is
 func assumedRoleARNToRoleARN(arn string) (string, error) {
 	parts := strings.SplitN(arn, ":", 6)
 	if len(parts) < 6 {
 		return "", fmt.Errorf("invalid ARN: %s", arn)
 	}
-	resource := parts[5] // assumed-role/ROLE_NAME/SESSION_NAME
+	service := parts[2]  // "iam" or "sts"
+	resource := parts[5] // assumed-role/ROLE_NAME/SESSION_NAME or role/NAME or root
+
+	// Already an IAM ARN — valid KMS policy principal as-is.
+	if service == "iam" {
+		return arn, nil
+	}
+
 	segments := strings.SplitN(resource, "/", 3)
 	if len(segments) < 2 || segments[0] != "assumed-role" {
 		return "", fmt.Errorf("not an assumed-role ARN: %s", arn)

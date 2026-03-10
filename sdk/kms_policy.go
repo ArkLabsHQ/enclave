@@ -42,7 +42,8 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 
 	// Read current key policy to determine state.
 	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId: aws.String(keyID),
+		KeyId:      aws.String(keyID),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)
@@ -86,6 +87,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		_, err = kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
 			KeyId:                          aws.String(keyID),
 			Policy:                         aws.String(policy),
+			PolicyName:                     aws.String("default"),
 			BypassPolicyLockoutSafetyCheck: true,
 		})
 		if err == nil {

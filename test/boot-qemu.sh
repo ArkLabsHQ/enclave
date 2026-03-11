@@ -33,15 +33,15 @@ BOOT_TIMEOUT="${BOOT_TIMEOUT:-60}"
 HOST_TLS_PORT="${HOST_TLS_PORT:-8443}"
 
 cleanup() {
-  echo ""
-  echo "=== Cleaning up ==="
-  [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null && echo "  Stopped QEMU ($QEMU_PID)"
-  [ -n "${GVPROXY_PID:-}" ] && kill "$GVPROXY_PID" 2>/dev/null && echo "  Stopped gvproxy ($GVPROXY_PID)"
-  [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)"
-  [ -n "${AWS_PROXY_PID:-}" ] && kill "$AWS_PROXY_PID" 2>/dev/null && echo "  Stopped AWS proxy ($AWS_PROXY_PID)"
-  [ -n "${KMS_PROXY_PID:-}" ] && kill "$KMS_PROXY_PID" 2>/dev/null && echo "  Stopped KMS proxy ($KMS_PROXY_PID)"
-  [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)"
-  [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)"
+  echo "" 2>/dev/null
+  echo "=== Cleaning up ===" 2>/dev/null
+  [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null && echo "  Stopped QEMU ($QEMU_PID)" 2>/dev/null
+  [ -n "${GVPROXY_PID:-}" ] && kill "$GVPROXY_PID" 2>/dev/null && echo "  Stopped gvproxy ($GVPROXY_PID)" 2>/dev/null
+  [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)" 2>/dev/null
+  [ -n "${AWS_PROXY_PID:-}" ] && kill "$AWS_PROXY_PID" 2>/dev/null && echo "  Stopped AWS proxy ($AWS_PROXY_PID)" 2>/dev/null
+  [ -n "${KMS_PROXY_PID:-}" ] && kill "$KMS_PROXY_PID" 2>/dev/null && echo "  Stopped KMS proxy ($KMS_PROXY_PID)" 2>/dev/null
+  [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)" 2>/dev/null
+  [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)" 2>/dev/null
   rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET"
 }
 trap cleanup EXIT
@@ -49,6 +49,8 @@ trap cleanup EXIT
 # Kill any stale processes from previous runs (use exact binary match, not -f).
 killall vhost-device-vsock 2>/dev/null || true
 killall gvproxy 2>/dev/null || true
+pkill -f heartbeat.py 2>/dev/null || true
+pkill -f vsock-proxy.py 2>/dev/null || true
 sleep 0.5
 
 # Clean up stale sockets.

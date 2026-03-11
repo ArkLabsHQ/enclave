@@ -37,6 +37,19 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	if err := cfg.validateSDK(); err != nil {
 		return err
 	}
+
+	local := os.Getenv("LOCAL_DEPLOYMENT") == "true"
+
+	// Local mode: just CDK synth + deploy to localstack, no AWS resources needed.
+	if local {
+		root, err := findAppRoot()
+		if err != nil {
+			return err
+		}
+		fmt.Println("[deploy] Local mode (localstack)")
+		return runCDKDeploy(cfg, root)
+	}
+
 	if err := cfg.validateAccount(); err != nil {
 		return err
 	}

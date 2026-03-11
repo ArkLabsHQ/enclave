@@ -18,29 +18,31 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-# Auto-enter Nix dev shell if QEMU tools aren't available.
-if ! command -v vhost-device-vsock >/dev/null 2>&1 || ! command -v gvproxy >/dev/null 2>&1 || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-  if command -v nix >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/flake.nix" ]; then
-    echo "Required tools not found. Entering nix develop ./test ..."
-    exec nix develop "$SCRIPT_DIR" --command bash "$0" "$@"
-  else
-    echo "Error: Missing required tools (vhost-device-vsock, gvproxy, qemu-system-x86_64)." >&2
-    echo "  Run: nix develop ./test" >&2
-    exit 1
-  fi
+# Auto-enter Nix dev shell if required tools are missing.
+if ! command -v vhost-device-vsock &>/dev/null || ! command -v qemu-system-x86_64 &>/dev/null; then
+  echo "Required tools not found, entering nix develop ..."
+  exec nix develop "${SCRIPT_DIR}" --command "$0" "$@"
 fi
+
+# Build enclave CLI from source (ensures latest code, no stale binaries).
+ENCLAVE_CLI="/tmp/enclave-cli"
+echo "Building enclave CLI..."
+(cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cmd/enclave)
+echo "  Built: $ENCLAVE_CLI"
+echo ""
 
 EIF_PATH="${1:-}"
 
 cleanup() {
   echo ""
   echo "=== Tearing down ==="
+  "$ENCLAVE_CLI" destroy --force 2>/dev/null || true
   [ -n "${BOOT_PID:-}" ] && kill "$BOOT_PID" 2>/dev/null && wait "$BOOT_PID" 2>/dev/null || true
-  if [ "${SKIP_MOCK_SERVICES:-}" != "1" ]; then
-    docker compose down -v 2>/dev/null || true
-  fi
+  echo "Destroy Mock Services..."
+  docker compose down -v 2>/dev/null || true
   echo "Done."
 }
 trap cleanup EXIT
@@ -51,38 +53,28 @@ echo "==============================="
 echo ""
 
 # Step 0 (optional): Build test EIF from skeleton app.
-if [ -z "$EIF_PATH" ]; then
-  echo "=== [0/4] Building test EIF from skeleton app ==="
+echo "=== [0/4] Building test EIF from skeleton app ==="
   echo "  Source: test/app/"
-  if ! command -v enclave >/dev/null 2>&1; then
-    echo "Error: 'enclave' CLI not found. Either:" >&2
-    echo "  - Install it: go install -o /tmp/enclave-test ./cmd/enclave" >&2
-    echo "  - Or provide a pre-built EIF: ./run.sh <path-to-eif>" >&2
-    exit 1
-  fi
-  (cd app && enclave build)
+  (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
-  if [ ! -f "$EIF_PATH" ]; then
-    echo "Error: EIF build failed — $EIF_PATH not found" >&2
-    exit 1
-  fi
   echo "  Built: $EIF_PATH"
-  echo ""
-fi
+echo ""
 
 # Step 1: Start mock services (skipped when run inside Docker test-runner).
-if [ "${SKIP_MOCK_SERVICES:-}" != "1" ]; then
-  echo "=== [1/4] Starting mock services ==="
+echo "=== [1/4] Starting mock services ==="
+  docker compose down -v 2>/dev/null || true
   docker compose up -d --build --wait
-  echo ""
-else
-  echo "=== [1/4] Mock services already running (Docker) ==="
-  echo ""
-fi
+echo ""
 
 # Step 2: Deploy CDK stack to localstack.
 echo "=== [2/4] Deploying local CDK stack to localstack ==="
-./deploy-local.sh
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export LOCAL_DEPLOYMENT=true
+export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+
+"$ENCLAVE_CLI" deploy
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).

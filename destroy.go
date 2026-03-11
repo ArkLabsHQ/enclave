@@ -28,6 +28,19 @@ func runDestroy(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	local := os.Getenv("LOCAL_DEPLOYMENT") == "true"
+
+	// Local mode: just cdklocal destroy against localstack.
+	if local {
+		root, err := findAppRoot()
+		if err != nil {
+			return err
+		}
+		fmt.Println("[destroy] Local mode (localstack)")
+		return runCDKDestroy(cfg, root)
+	}
+
 	if err := cfg.validateAccount(); err != nil {
 		return err
 	}

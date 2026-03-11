@@ -57,13 +57,19 @@ type SDKConfig struct {
 }
 
 func loadConfig() (*Config, error) {
-	root, err := findRepoRoot()
-	if err != nil {
-		return nil, err
+	// ENCLAVE_CONFIG overrides the default config path (useful for local testing
+	// with a config at a non-standard location like test/app/enclave/enclave.yaml).
+	configPath := os.Getenv("ENCLAVE_CONFIG")
+	if configPath == "" {
+		root, err := findRepoRoot()
+		if err != nil {
+			return nil, err
+		}
+		configPath = filepath.Join(root, configFile)
 	}
-	data, err := os.ReadFile(filepath.Join(root, configFile))
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w\nRun 'enclave init' to create one.", configFile, err)
+		return nil, fmt.Errorf("cannot read %s: %w\nRun 'enclave init' to create one.", configPath, err)
 	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -182,6 +188,21 @@ func (o CDKOutputs) getOutput(stackName string, keys ...string) string {
 // stackName returns the CDK stack name from the config.
 func (c *Config) stackName() string {
 	return c.Prefix + "Nitro" + c.Name
+}
+
+// findAppRoot returns the root directory of the app (parent of enclave/).
+// When ENCLAVE_CONFIG is set, derives it from the config path (go up 2 levels
+// from .../enclave/enclave.yaml). Otherwise falls back to findRepoRoot().
+func findAppRoot() (string, error) {
+	if configPath := os.Getenv("ENCLAVE_CONFIG"); configPath != "" {
+		abs, err := filepath.Abs(configPath)
+		if err != nil {
+			return "", err
+		}
+		// configPath = .../enclave/enclave.yaml → go up 2 levels
+		return filepath.Dir(filepath.Dir(abs)), nil
+	}
+	return findRepoRoot()
 }
 
 // findRepoRoot walks up from cwd looking for enclave.yaml or .git.

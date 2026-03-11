@@ -90,7 +90,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		})
 	}
 
-	// ── S3 assets (shared — synth-local creates stubs for missing files) ──
+	// ── S3 assets (shared) ──
 
 	// The EIF is built by Nix (nix build .#eif) before CDK deploy.
 	// Upload the pre-built, reproducible EIF to S3.

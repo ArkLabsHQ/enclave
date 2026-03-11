@@ -45,6 +45,7 @@ app:
     AWS_ENDPOINT_URL_STS: "http://127.0.0.1:4566"
     AWS_ENDPOINT_URL_S3: "http://127.0.0.1:4566"
 
-# No secrets for the skeleton app — keeps the test simple.
-# The supervisor will still init KMS/SSM, just with no secret decryption.
-secrets: []
+# One secret for testing KMS secret init and migration.
+secrets:
+  - name: signing-key
+    env_var: SIGNING_KEY

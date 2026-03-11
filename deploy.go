@@ -2,8 +2,10 @@ package introspector_enclave
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,41 +41,54 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	}
 
 	local := os.Getenv("LOCAL_DEPLOYMENT") == "true"
+	ctx := context.Background()
 
-	// Local mode: just CDK synth + deploy to localstack, no AWS resources needed.
+	var root string
+	var ac *awsClients
+
 	if local {
-		root, err := findAppRoot()
+		var err error
+		root, err = findAppRoot()
 		if err != nil {
 			return err
 		}
 		fmt.Println("[deploy] Local mode (localstack)")
-		return runCDKDeploy(cfg, root)
-	}
 
-	if err := cfg.validateAccount(); err != nil {
-		return err
-	}
+		// CDK deploy first (idempotent).
+		if err := runCDKDeploy(cfg, root); err != nil {
+			return err
+		}
 
-	root, err := findRepoRoot()
-	if err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-	ac, err := newAWSClients(ctx, cfg.Region, cfg.Profile)
-	if err != nil {
-		return err
+		ac, err = newAWSClientsWithEnv(ctx, cfg.Region, "", cfg.App.Env)
+		if err != nil {
+			return err
+		}
+	} else {
+		if err := cfg.validateAccount(); err != nil {
+			return err
+		}
+		var err error
+		root, err = findRepoRoot()
+		if err != nil {
+			return err
+		}
+		ac, err = newAWSClients(ctx, cfg.Region, cfg.Profile)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Step 1: Read PCR0 from build artifacts.
 	pcr0, err := readPCR0(root)
-	if err != nil {
+	if err != nil && !local {
 		return err
 	}
-	fmt.Printf("[deploy] PCR0 from build: %s\n", pcr0)
+	if pcr0 != "" {
+		fmt.Printf("[deploy] PCR0 from build: %s\n", pcr0)
+	}
 
 	// Step 2: Detect upgrade mode.
-	// An upgrade is when the instance is already running with initialized secrets.
+	// An upgrade is when the enclave is already running with initialized secrets.
 	stack := cfg.stackName()
 	outputsPath := filepath.Join(root, "enclave", "cdk-outputs.json")
 
@@ -84,20 +99,27 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		outputs, err := loadCDKOutputs(root)
 		if err == nil {
 			instanceID = outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
-			if instanceID != "" {
+
+			// Check if the enclave is running.
+			isRunning := false
+			if local {
+				isRunning = isEnclaveHealthy()
+			} else if instanceID != "" {
 				state, stateErr := ac.getInstanceState(ctx, instanceID)
-				if stateErr == nil && state == "running" && len(cfg.Secrets) > 0 {
-					cipher, _ := ac.getParameter(ctx, cfg.ssmParam(cfg.Secrets[0].Name+"/Ciphertext"))
-					if cipher != "" && cipher != "UNSET" {
-						isUpgrade = true
-					}
+				isRunning = stateErr == nil && state == "running"
+			}
+
+			if isRunning {
+				kmsKey, _ := ac.getParameter(ctx, cfg.ssmParam("KMSKeyID"))
+				if kmsKey != "" && kmsKey != "UNSET" {
+					isUpgrade = true
 				}
 			}
 		}
 	}
 
 	if isUpgrade {
-		fmt.Printf("\n[deploy] Upgrade mode: existing enclave on %s\n\n", instanceID)
+		fmt.Printf("\n[deploy] Upgrade mode\n\n")
 
 		outputs, err := loadCDKOutputs(root)
 		if err != nil {
@@ -111,11 +133,25 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		}
 
 		ec2RoleARN := outputs.getOutput(stack, "EC2InstanceRoleARN")
+		if local {
+			// Local: no real EC2 role, use account root.
+			account := cfg.Account
+			if account == "" {
+				account = "000000000000"
+			}
+			ec2RoleARN = fmt.Sprintf("arn:aws:iam::%s:root", account)
+		}
+
 		if kmsKeyID == "" || ec2RoleARN == "" {
 			return fmt.Errorf("missing KMSKeyID or EC2InstanceRoleARN from CDK outputs")
 		}
 
 		return deployUpgrade(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
+	}
+
+	if local {
+		// Local fresh deploy already done (CDK deploy above).
+		return nil
 	}
 
 	fmt.Printf("\n[deploy] Fresh deploy\n\n")
@@ -212,18 +248,27 @@ func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root,
 // deployUpgradeLocked handles migration when the KMS key is locked:
 // create temp KMS key → export signing key from old enclave → restart with new key.
 func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string, pcr0, instanceID, kmsKeyID, ec2RoleARN string) error {
-	fmt.Println("[deploy] Create Deploy s3 bucket")
-	eifBucket, err := createUpgradeBucket(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
+	local := os.Getenv("LOCAL_DEPLOYMENT") == "true"
 
-	if err != nil {
-		return err
+	var eifBucket string
+	if !local {
+		fmt.Println("[deploy] Create Deploy s3 bucket")
+		var err error
+		eifBucket, err = createUpgradeBucket(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
+		if err != nil {
+			return err
+		}
 	}
 
 	fmt.Println("[deploy] KMS key is locked — using temporary key migration")
 
 	// Step 1: Create new KMS key for the new enclave version.
+	pcr0Short := pcr0
+	if len(pcr0Short) > 16 {
+		pcr0Short = pcr0Short[:16]
+	}
 	newKMSKeyID, err := ac.createKey(ctx,
-		fmt.Sprintf("%s migration key for PCR0 %s...", cfg.Name, pcr0[:16]))
+		fmt.Sprintf("%s migration key for PCR0 %s...", cfg.Name, pcr0Short))
 	if err != nil {
 		return fmt.Errorf("create migration KMS key: %w", err)
 	}
@@ -232,7 +277,11 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	// Step 2: Apply transitional policy — Encrypt + admin (no Decrypt).
 	// The new enclave will self-apply PCR0-restricted Decrypt during Init().
 	if err := applyTransitionalKMSPolicy(ctx, ac, newKMSKeyID, ec2RoleARN, cfg.Account); err != nil {
-		return fmt.Errorf("apply transitional policy to new KMS key: %w", err)
+		if local {
+			fmt.Printf("[deploy] Warning: transitional policy failed (local-kms may not support): %v\n", err)
+		} else {
+			return fmt.Errorf("apply transitional policy to new KMS key: %w", err)
+		}
 	}
 
 	// Step 3: Store migration parameters in SSM.
@@ -247,14 +296,37 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	}
 	fmt.Println("[deploy] Migration KMS key IDs stored in SSM")
 
-	// Step 4: Call old enclave's export endpoint via SSM.
+	// Step 4: Call old enclave's export endpoint.
 	fmt.Println("[deploy] Calling old enclave's export endpoint...")
-	exportCmd := `curl -sf -k -X POST https://127.0.0.1:443/v1/export-key`
-
-	if err := ac.runOnHost(ctx, instanceID, "export secrets from old enclave", []string{exportCmd}); err != nil {
-		fmt.Println("[deploy] Export failed, cleaning up")
-		ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-		return fmt.Errorf("export secrets from old enclave: %w", err)
+	if local {
+		// Local: call enclave directly via HTTPS (no SSM agent).
+		enclaveURL := localEnclaveURL()
+		fmt.Printf("[deploy] Calling export-key at %s ...\n", enclaveURL)
+		client := &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		resp, err := client.Post(enclaveURL+"/v1/export-key", "", nil)
+		if err != nil {
+			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
+			return fmt.Errorf("export secrets from old enclave: %w", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
+			return fmt.Errorf("export-key returned %d", resp.StatusCode)
+		}
+		fmt.Println("[deploy] Export-key succeeded")
+	} else {
+		// Production: call via SSM Run Command on the EC2 host.
+		exportCmd := `curl -sf -k -X POST https://127.0.0.1:443/v1/export-key`
+		if err := ac.runOnHost(ctx, instanceID, "export secrets from old enclave", []string{exportCmd}); err != nil {
+			fmt.Println("[deploy] Export failed, cleaning up")
+			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
+			return fmt.Errorf("export secrets from old enclave: %w", err)
+		}
 	}
 
 	// Step 5: Wait for per-secret migration ciphertexts to appear in SSM.
@@ -299,8 +371,12 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	fmt.Printf("[deploy] Updated KMSKeyID to %s\n", newKMSKeyID)
 
 	// Step 8: Stop old enclave, update EIF, restart watchdog.
-	if err := restartEnclaveOnHost(ctx, ac, cfg, instanceID, eifBucket); err != nil {
-		return err
+	if local {
+		fmt.Println("[deploy] Skipping restart (local mode)")
+	} else {
+		if err := restartEnclaveOnHost(ctx, ac, cfg, instanceID, eifBucket); err != nil {
+			return err
+		}
 	}
 
 	// Step 9: Clean up migration SSM params.
@@ -316,13 +392,15 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	fmt.Printf("  Old KMS Key:  %s (scheduled for deletion by new enclave on boot)\n", kmsKeyID)
 	fmt.Printf("  PCR0:         %s\n", pcr0)
 
-	// Read elastic IP from SSM (stored during fresh deploy) for verification.
-	elasticIP, _ := ac.getParameter(ctx, cfg.ssmParam("ElasticIP"))
-	if elasticIP != "" {
-		fmt.Printf("\n[deploy] Verifying upgrade (waiting up to 60s)...\n")
-		if err := initialVerification(elasticIP, pcr0, 60); err != nil {
-			fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
-			fmt.Println("[deploy] Try: enclave verify --wait 300")
+	if !local {
+		// Read elastic IP from SSM (stored during fresh deploy) for verification.
+		elasticIP, _ := ac.getParameter(ctx, cfg.ssmParam("ElasticIP"))
+		if elasticIP != "" {
+			fmt.Printf("\n[deploy] Verifying upgrade (waiting up to 60s)...\n")
+			if err := initialVerification(elasticIP, pcr0, 60); err != nil {
+				fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
+				fmt.Println("[deploy] Try: enclave verify --wait 300")
+			}
 		}
 	}
 
@@ -340,6 +418,37 @@ func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, inst
 		"chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif",
 		"curl -sf -X POST http://localhost:8443/start",
 	})
+}
+
+// --- Local helpers ---
+
+
+// isEnclaveHealthy checks if the local enclave is responding on the health endpoint.
+func isEnclaveHealthy() bool {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Get(localEnclaveURL() + "/health")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusServiceUnavailable
+}
+
+// localEnclaveURL returns the base URL for the local QEMU enclave.
+func localEnclaveURL() string {
+	if url := os.Getenv("ENCLAVE_URL"); url != "" {
+		return url
+	}
+	port := os.Getenv("HOST_TLS_PORT")
+	if port == "" {
+		port = "8443"
+	}
+	return "https://localhost:" + port
 }
 
 // --- KMS policy functions ---

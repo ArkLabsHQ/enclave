@@ -30,6 +30,12 @@ type awsClients struct {
 }
 
 func newAWSClients(ctx context.Context, region, profile string) (*awsClients, error) {
+	return newAWSClientsWithEnv(ctx, region, profile, nil)
+}
+
+// newAWSClientsWithEnv creates AWS clients, optionally overriding endpoints
+// from the app env map (AWS_ENDPOINT_URL_KMS, AWS_ENDPOINT_URL_SSM, etc).
+func newAWSClientsWithEnv(ctx context.Context, region, profile string, appEnv map[string]string) (*awsClients, error) {
 	opts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(region),
 	}
@@ -40,13 +46,32 @@ func newAWSClients(ctx context.Context, region, profile string) (*awsClients, er
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return &awsClients{
-		region:    region,
-		ec2Client: ec2.NewFromConfig(cfg),
-		kmsClient: kms.NewFromConfig(cfg),
-		ssmClient: ssm.NewFromConfig(cfg),
-		s3Client:  s3.NewFromConfig(cfg),
-	}, nil
+
+	ac := &awsClients{region: region}
+	ac.ec2Client = ec2.NewFromConfig(cfg)
+
+	if ep := appEnv["AWS_ENDPOINT_URL_KMS"]; ep != "" {
+		ac.kmsClient = kms.NewFromConfig(cfg, func(o *kms.Options) { o.BaseEndpoint = aws.String(ep) })
+	} else {
+		ac.kmsClient = kms.NewFromConfig(cfg)
+	}
+
+	if ep := appEnv["AWS_ENDPOINT_URL_SSM"]; ep != "" {
+		ac.ssmClient = ssm.NewFromConfig(cfg, func(o *ssm.Options) { o.BaseEndpoint = aws.String(ep) })
+	} else {
+		ac.ssmClient = ssm.NewFromConfig(cfg)
+	}
+
+	if ep := appEnv["AWS_ENDPOINT_URL_S3"]; ep != "" {
+		ac.s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(ep)
+			o.UsePathStyle = true
+		})
+	} else {
+		ac.s3Client = s3.NewFromConfig(cfg)
+	}
+
+	return ac, nil
 }
 
 // --- EC2 ---

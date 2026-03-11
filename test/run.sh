@@ -53,7 +53,7 @@ echo "==============================="
 echo ""
 
 # Step 0 (optional): Build test EIF from skeleton app.
-echo "=== [0/4] Building test EIF from skeleton app ==="
+echo "=== [0/5] Building test EIF from skeleton app ==="
   echo "  Source: test/app/"
   (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
@@ -61,13 +61,13 @@ echo "=== [0/4] Building test EIF from skeleton app ==="
 echo ""
 
 # Step 1: Start mock services (skipped when run inside Docker test-runner).
-echo "=== [1/4] Starting mock services ==="
+echo "=== [1/5] Starting mock services ==="
   docker compose down -v 2>/dev/null || true
   docker compose up -d --build --wait
 echo ""
 
 # Step 2: Deploy CDK stack to localstack.
-echo "=== [2/4] Deploying local CDK stack to localstack ==="
+echo "=== [2/5] Deploying local CDK stack to localstack ==="
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
@@ -78,7 +78,7 @@ export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).
-echo "=== [3/4] Booting enclave in QEMU ==="
+echo "=== [3/5] Booting enclave in QEMU ==="
 ./boot-qemu.sh "$EIF_PATH" &
 BOOT_PID=$!
 
@@ -109,8 +109,15 @@ fi
 echo ""
 
 # Step 4: Run smoke tests.
-echo "=== [4/4] Running smoke tests ==="
+echo "=== [4/5] Running smoke tests ==="
 ./smoke-test.sh
+echo ""
+
+# Step 5: Run migration via enclave deploy (upgrade detection).
+# The enclave is running with secrets initialized, so a second deploy
+# detects upgrade mode and exercises the full migration code path.
+echo "=== [5/5] Running migration (enclave deploy upgrade) ==="
+"$ENCLAVE_CLI" deploy
 
 echo ""
 echo "==============================="

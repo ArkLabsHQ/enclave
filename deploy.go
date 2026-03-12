@@ -138,7 +138,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	if local {
 		fmt.Println("[deploy] Local mode (localstack)")
 		// CDK deploy first (idempotent).
-		runCDKDeploy(cfg, root)
+		return runCDKDeploy(cfg, root)
 
 	}
 

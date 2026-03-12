@@ -71,7 +71,7 @@
             echo "Usage:"
             echo "  ./run.sh <path-to-eif>     Run full test suite"
             echo "  ./boot-qemu.sh <path-to-eif>  Boot enclave in QEMU"
-            echo "  ./smoke-test.sh            Run smoke tests against running enclave"
+            echo "  ./integration-test.sh      Run integration tests against running enclave"
           '';
         };
       }

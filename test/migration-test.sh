@@ -102,13 +102,20 @@ else
 fi
 
 # --- Step 4: Verify migration artifacts in SSM ---
-echo "[5/5] Verify migration artifacts in SSM"
+echo "[5/6] Verify migration artifacts in SSM"
 
 MIG_CT=$(ssm_get "$PREFIX/Migration/signing-key/Ciphertext")
 if [ -n "$MIG_CT" ] && [ "$MIG_CT" != "UNSET" ]; then
   pass "Migration ciphertext for signing-key exists in SSM"
 else
   fail "Migration ciphertext" "not found in SSM"
+fi
+
+MIG_DEK=$(ssm_get "$PREFIX/Migration/StorageDEK/Ciphertext")
+if [ -n "$MIG_DEK" ] && [ "$MIG_DEK" != "UNSET" ]; then
+  pass "Migration StorageDEK ciphertext exists in SSM (${#MIG_DEK} chars)"
+else
+  fail "Migration StorageDEK" "not found in SSM (storage DEK not exported)"
 fi
 
 MIG_PCR0=$(ssm_get "$PREFIX/MigrationPreviousPCR0")
@@ -123,6 +130,15 @@ if [ -n "$MIG_ATTEST" ] && [ "$MIG_ATTEST" != "UNSET" ]; then
   pass "MigrationPreviousPCR0Attestation stored (${#MIG_ATTEST} chars)"
 else
   fail "MigrationPreviousPCR0Attestation" "not found in SSM"
+fi
+
+# --- Step 5: Verify storage still works after export ---
+echo "[6/6] Storage round-trip after export"
+STORAGE_RESP=$(curl -sk --max-time 10 "${BASE_URL}/test/storage" 2>/dev/null || echo "")
+if echo "$STORAGE_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+  pass "Storage round-trip works after DEK export"
+else
+  fail "Storage after export" "${STORAGE_RESP:0:120}"
 fi
 
 # --- Summary ---

@@ -141,16 +141,50 @@ if [ $SECONDS -ge "$INIT_TIMEOUT" ]; then
 fi
 echo ""
 
-# Step 4: Run smoke tests.
-echo "=== [4/5] Running smoke tests ==="
-./smoke-test.sh
+# Step 4: Run integration tests.
+echo "=== [4/6] Running integration tests ==="
+./integration-test.sh
 echo ""
 
 # Step 5: Run migration via enclave deploy (upgrade detection).
 # The enclave is running with secrets initialized, so a second deploy
 # detects upgrade mode and exercises the full migration code path.
-echo "=== [5/5] Running migration (enclave deploy upgrade) ==="
+echo "=== [5/6] Running migration (enclave deploy upgrade) ==="
 "$ENCLAVE_CLI" deploy
+echo ""
+
+# Step 6: Post-migration verification.
+# After migration, the enclave should still be healthy and storage should
+# still work (DEK was exported and can be re-imported on next boot).
+echo "=== [6/6] Post-migration verification ==="
+HTTP_CODE=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
+  "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ]; then
+  echo "  PASS: Enclave healthy after migration"
+else
+  echo "  FAIL: Enclave unhealthy after migration (HTTP $HTTP_CODE)" >&2
+  exit 1
+fi
+
+# Verify previous_pcr0 was updated (no longer "genesis" after export-key).
+PREV_PCR0=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null \
+  | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
+if [ -n "$PREV_PCR0" ] && [ "$PREV_PCR0" != "genesis" ]; then
+  echo "  PASS: previous_pcr0 updated after migration (${PREV_PCR0:0:16}...)"
+elif [ "$PREV_PCR0" = "genesis" ]; then
+  echo "  INFO: previous_pcr0 still genesis (expected for first migration)"
+else
+  echo "  WARN: could not read previous_pcr0"
+fi
+
+# Verify storage still works after migration.
+STORAGE_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage" 2>/dev/null || echo "")
+if echo "$STORAGE_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+  echo "  PASS: Storage round-trip works after migration"
+else
+  echo "  FAIL: Storage broken after migration: ${STORAGE_RESP:0:120}" >&2
+  exit 1
+fi
 
 echo ""
 echo "==============================="

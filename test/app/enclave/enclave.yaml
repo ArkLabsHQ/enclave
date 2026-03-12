@@ -30,20 +30,14 @@ app:
     - "cmd"
   binary_name: "test-app"
 
-  # Route AWS traffic through viproxy → vsock → host vsock-proxy → mock services.
-  # This bypasses gvproxy TAP (outbound NAT broken in QEMU nitro-enclave).
   env:
-    # viproxy mappings: local TCP → vsock CID 3 (forwarded to host by vhost-device-vsock)
-    ENCLAVE_VIPROXY_IN_ADDRS: "127.0.0.1:80,127.0.0.1:4566,127.0.0.1:4000"
-    ENCLAVE_VIPROXY_OUT_ADDRS: "3:8002,3:8003,3:8004"
-    # IMDS via viproxy (port 80 → vsock:8002 → mock-imds:1338)
-    IMDS_ENDPOINT: "127.0.0.1"
-    # AWS endpoints via viproxy (port 4566 → vsock:8003 → localstack:4566)
-    AWS_ENDPOINT_URL_KMS: "http://127.0.0.1:4000"
+    # AWS services through gvproxy TAP via host.containers.internal (matches production path).
+    # IMDS uses viproxy by default (127.0.0.1:80 → vsock 3:8002) — no override needed.
+    AWS_ENDPOINT_URL_KMS: "http://host.containers.internal:4000"
     ENCLAVE_KMS_KEY_ID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
-    AWS_ENDPOINT_URL_SSM: "http://127.0.0.1:4566"
-    AWS_ENDPOINT_URL_STS: "http://127.0.0.1:4566"
-    AWS_ENDPOINT_URL_S3: "http://127.0.0.1:4566"
+    AWS_ENDPOINT_URL_SSM: "http://host.containers.internal:4566"
+    AWS_ENDPOINT_URL_STS: "http://host.containers.internal:4566"
+    AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"
 
 # One secret for testing KMS secret init and migration.
 secrets:

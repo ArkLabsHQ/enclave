@@ -77,7 +77,7 @@ func synthCDKStack(cfg *Config, root string) error {
 // from the pre-synthesized output directory.
 //
 // When LOCAL_DEPLOYMENT=true, uses cdklocal instead of cdk, runs bootstrap
-// first (required by localstack), and writes outputs to test/cdk-local-outputs.json.
+// first (required by localstack).
 func runCDKDeploy(cfg *Config, root string) error {
 	if err := synthCDKStack(cfg, root); err != nil {
 		return err

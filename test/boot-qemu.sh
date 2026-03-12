@@ -38,8 +38,6 @@ cleanup() {
   [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null && echo "  Stopped QEMU ($QEMU_PID)" 2>/dev/null
   [ -n "${GVPROXY_PID:-}" ] && kill "$GVPROXY_PID" 2>/dev/null && echo "  Stopped gvproxy ($GVPROXY_PID)" 2>/dev/null
   [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)" 2>/dev/null
-  [ -n "${AWS_PROXY_PID:-}" ] && kill "$AWS_PROXY_PID" 2>/dev/null && echo "  Stopped AWS proxy ($AWS_PROXY_PID)" 2>/dev/null
-  [ -n "${KMS_PROXY_PID:-}" ] && kill "$KMS_PROXY_PID" 2>/dev/null && echo "  Stopped KMS proxy ($KMS_PROXY_PID)" 2>/dev/null
   [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)" 2>/dev/null
   [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)" 2>/dev/null
   rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET"
@@ -93,25 +91,16 @@ if ! kill -0 "$HB_PID" 2>/dev/null; then
   exit 1
 fi
 
-# Vsock proxies: viproxy inside the enclave maps local TCP ports to vsock connections.
-# vhost-device-vsock (forward-cid=1) routes them to AF_VSOCK CID 1 on the host.
-# These proxies bridge AF_VSOCK → TCP to reach mock services on localhost.
-echo "=== Starting vsock service proxies ==="
+# Vsock proxy for IMDS: viproxy inside the enclave maps 127.0.0.1:80 to vsock CID 3:8002.
+# vhost-device-vsock (forward-cid=1) routes to AF_VSOCK CID 1:8002 on the host.
+# This proxy bridges AF_VSOCK → TCP to reach mock-imds on localhost.
+# IMDS uses viproxy (not TAP) because it's needed before nitriding sets up networking.
+# All other AWS services (KMS, SSM, STS, S3) go through gvproxy TAP via host.containers.internal.
+echo "=== Starting IMDS vsock proxy ==="
 
-# IMDS: viproxy 127.0.0.1:80 → vsock 3:8002 → AF_VSOCK 1:8002 → mock-imds:1338
 MOCK_IMDS_PORT="${MOCK_IMDS_PORT:-1338}"
 python3 "$SCRIPT_DIR/vsock-proxy.py" 8002 127.0.0.1 "$MOCK_IMDS_PORT" &
 IMDS_PROXY_PID=$!
-
-# AWS services: viproxy 127.0.0.1:4566 → vsock 3:8003 → AF_VSOCK 1:8003 → localstack:4566
-LOCALSTACK_PORT="${LOCALSTACK_PORT:-4566}"
-python3 "$SCRIPT_DIR/vsock-proxy.py" 8003 127.0.0.1 "$LOCALSTACK_PORT" &
-AWS_PROXY_PID=$!
-
-# KMS: viproxy 127.0.0.1:4000 → vsock 3:8004 → AF_VSOCK 1:8004 → kms-proxy:4000
-KMS_PROXY_PORT="${KMS_PROXY_PORT:-4000}"
-python3 "$SCRIPT_DIR/vsock-proxy.py" 8004 127.0.0.1 "$KMS_PROXY_PORT" &
-KMS_PROXY_PID=$!
 
 sleep 0.5
 
@@ -119,18 +108,6 @@ if ! kill -0 "$IMDS_PROXY_PID" 2>/dev/null; then
   echo "  Warning: IMDS vsock proxy failed to start"
 else
   echo "  vsock:8002 -> 127.0.0.1:${MOCK_IMDS_PORT} (mock IMDS)"
-fi
-
-if ! kill -0 "$AWS_PROXY_PID" 2>/dev/null; then
-  echo "  Warning: AWS vsock proxy failed to start"
-else
-  echo "  vsock:8003 -> 127.0.0.1:${LOCALSTACK_PORT} (localstack)"
-fi
-
-if ! kill -0 "$KMS_PROXY_PID" 2>/dev/null; then
-  echo "  Warning: KMS vsock proxy failed to start"
-else
-  echo "  vsock:8004 -> 127.0.0.1:${KMS_PROXY_PORT} (kms-proxy)"
 fi
 
 # gvproxy: the enclave's start.sh connects to vsock CID 3 port 1024 for networking.

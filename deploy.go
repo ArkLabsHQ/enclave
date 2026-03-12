@@ -52,12 +52,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("[deploy] Local mode (localstack)")
-
-		// CDK deploy first (idempotent).
-		if err := runCDKDeploy(cfg, root); err != nil {
-			return err
-		}
 
 		ac, err = newAWSClientsWithEnv(ctx, cfg.Region, "", cfg.App.Env)
 		if err != nil {
@@ -133,14 +127,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		}
 
 		ec2RoleARN := outputs.getOutput(stack, "EC2InstanceRoleARN")
-		if local {
-			// Local: no real EC2 role, use account root.
-			account := cfg.Account
-			if account == "" {
-				account = "000000000000"
-			}
-			ec2RoleARN = fmt.Sprintf("arn:aws:iam::%s:root", account)
-		}
 
 		if kmsKeyID == "" || ec2RoleARN == "" {
 			return fmt.Errorf("missing KMSKeyID or EC2InstanceRoleARN from CDK outputs")
@@ -150,8 +136,10 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	}
 
 	if local {
-		// Local fresh deploy already done (CDK deploy above).
-		return nil
+		fmt.Println("[deploy] Local mode (localstack)")
+		// CDK deploy first (idempotent).
+		runCDKDeploy(cfg, root)
+
 	}
 
 	fmt.Printf("\n[deploy] Fresh deploy\n\n")
@@ -421,7 +409,6 @@ func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, inst
 }
 
 // --- Local helpers ---
-
 
 // isEnclaveHealthy checks if the local enclave is responding on the health endpoint.
 func isEnclaveHealthy() bool {

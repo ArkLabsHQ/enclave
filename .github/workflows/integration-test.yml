@@ -42,3 +42,4 @@ jobs:
         run: cd test && nix develop . --command ./run.sh
         env:
           BOOT_TIMEOUT: "120"
+          INIT_TIMEOUT: "180"

@@ -82,9 +82,12 @@ echo "=== [3/5] Booting enclave in QEMU ==="
 ./boot-qemu.sh "$EIF_PATH" &
 BOOT_PID=$!
 
-# Wait for the enclave to become ready (poll health endpoint).
+# Wait for the enclave to boot and Init to complete.
+# Phase 1: wait for any HTTP response (supervisor started).
+# Phase 2: wait for HTTP 200 (Init complete). 503 means Init is still running.
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-90}"
-echo "  Waiting for enclave health (timeout: ${BOOT_TIMEOUT}s)..."
+INIT_TIMEOUT="${INIT_TIMEOUT:-120}"
+echo "  Waiting for enclave boot (timeout: ${BOOT_TIMEOUT}s)..."
 SECONDS=0
 while [ $SECONDS -lt "$BOOT_TIMEOUT" ]; do
   if ! kill -0 "$BOOT_PID" 2>/dev/null; then
@@ -92,7 +95,6 @@ while [ $SECONDS -lt "$BOOT_TIMEOUT" ]; do
     wait "$BOOT_PID" || true
     exit 1
   fi
-  # Accept any HTTP response (200 or 503) — supervisor is running.
   HTTP_CODE=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
     "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
   if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "503" ]; then
@@ -104,6 +106,37 @@ done
 
 if [ $SECONDS -ge "$BOOT_TIMEOUT" ]; then
   echo "Error: enclave did not become ready within ${BOOT_TIMEOUT}s" >&2
+  exit 1
+fi
+
+# Phase 2: wait for Init to complete (health returns 200).
+echo "  Waiting for Init to complete (timeout: ${INIT_TIMEOUT}s)..."
+SECONDS=0
+while [ $SECONDS -lt "$INIT_TIMEOUT" ]; do
+  if ! kill -0 "$BOOT_PID" 2>/dev/null; then
+    echo "Error: boot-qemu.sh exited unexpectedly" >&2
+    wait "$BOOT_PID" || true
+    exit 1
+  fi
+  HTTP_CODE=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+    "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ]; then
+    echo "  Init complete (${SECONDS}s)"
+    break
+  fi
+  # Show progress with current init status.
+  if [ "$HTTP_CODE" = "503" ]; then
+    STATUS=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null \
+      | jq -r '.error // "unknown"' 2>/dev/null || echo "unknown")
+    echo "  Init in progress (${SECONDS}s): $STATUS"
+  fi
+  sleep 5
+done
+
+if [ $SECONDS -ge "$INIT_TIMEOUT" ]; then
+  echo "Error: Init did not complete within ${INIT_TIMEOUT}s" >&2
+  # Show final status for debugging.
+  curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || true
   exit 1
 fi
 echo ""

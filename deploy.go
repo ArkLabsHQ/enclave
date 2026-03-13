@@ -2,7 +2,6 @@ package introspector_enclave
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,7 +75,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Read PCR0 from build artifacts.
 	pcr0, err := readPCR0(root)
-	if err != nil && !local {
+	if err != nil {
 		return err
 	}
 	if pcr0 != "" {
@@ -84,44 +83,25 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 2: Detect upgrade mode.
-	// An upgrade is when the enclave is already running with initialized secrets.
+	// An upgrade is when secrets have been initialized (KMSKeyID set in SSM).
+	// This is the definitive signal — if the KMS key is set, a prior deploy
+	// locked it to a PCR0 and we need the full migration flow.
 	stack := cfg.stackName()
-	outputsPath := filepath.Join(root, "enclave", "cdk-outputs.json")
-
 	isUpgrade := false
-	var instanceID string
-
-	if _, err := os.Stat(outputsPath); err == nil {
-		outputs, err := loadCDKOutputs(root)
-		if err == nil {
-			instanceID = outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
-
-			// Check if the enclave is running.
-			isRunning := false
-			if local {
-				isRunning = isEnclaveHealthy()
-			} else if instanceID != "" {
-				state, stateErr := ac.getInstanceState(ctx, instanceID)
-				isRunning = stateErr == nil && state == "running"
-			}
-
-			if isRunning {
-				kmsKey, _ := ac.getParameter(ctx, cfg.ssmParam("KMSKeyID"))
-				if kmsKey != "" && kmsKey != "UNSET" {
-					isUpgrade = true
-				}
-			}
-		}
+	kmsKey, _ := ac.getParameter(ctx, cfg.ssmParam("KMSKeyID"))
+	if kmsKey != "" && kmsKey != "UNSET" {
+		isUpgrade = true
 	}
 
 	if isUpgrade {
-		fmt.Printf("\n[deploy] Upgrade mode\n\n")
+		fmt.Printf("\n[deploy] Upgrade mode (KMS key exists)\n\n")
 
 		outputs, err := loadCDKOutputs(root)
 		if err != nil {
 			return err
 		}
 
+		instanceID := outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
 		ec2RoleARN := outputs.getOutput(stack, "EC2InstanceRoleARN")
 
 		return deployUpgrade(ctx, ac, cfg, root, pcr0, instanceID, ec2RoleARN, local)
@@ -335,22 +315,6 @@ func callMgmtMigrateDirect(ctx context.Context, mgmtURL, payload string) error {
 }
 
 // --- Local helpers ---
-
-// isEnclaveHealthy checks if the local enclave is responding on the health endpoint.
-func isEnclaveHealthy() bool {
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-	resp, err := client.Get(localEnclaveURL() + "/health")
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusServiceUnavailable
-}
 
 // localEnclaveURL returns the base URL for the local QEMU enclave.
 func localEnclaveURL() string {

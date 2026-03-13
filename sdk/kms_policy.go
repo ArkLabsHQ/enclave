@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -49,23 +50,21 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		return fmt.Errorf("get current KMS key policy: %w", err)
 	}
 
-	// Check if policy already has this PCR0 — nothing to do.
-	if currentPolicy.Policy != nil && strings.Contains(*currentPolicy.Policy, pcr0) {
-		log.Printf("kms_policy: policy already contains PCR0 %s..., skipping", pcr0[:16])
-		return nil
-	}
-
-	// PCR0 not in policy. Check if we can modify it.
-	// Modifiable when: policy is empty (fresh key), contains explicit "PutKeyPolicy",
-	// or contains the "kms:*" wildcard (e.g. AWS default policy).
+	// Parse and inspect the policy JSON to determine state.
 	policyText := ""
 	if currentPolicy.Policy != nil {
 		policyText = *currentPolicy.Policy
 	}
-	canPut := policyText == "" ||
-		strings.Contains(policyText, "PutKeyPolicy") ||
-		strings.Contains(policyText, `"kms:*"`)
-	if !canPut {
+
+	hasPCR0, hasPutKeyPolicy := parseKMSPolicyState(policyText, pcr0)
+
+	if hasPCR0 {
+		log.Printf("kms_policy: policy already contains PCR0 %s..., skipping", pcr0[:16])
+		return nil
+	}
+
+	// Modifiable when: policy is empty (fresh key), or grants PutKeyPolicy or kms:*.
+	if policyText != "" && !hasPutKeyPolicy {
 		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 
@@ -135,6 +134,66 @@ func assumedRoleARNToRoleARN(arn string) (string, error) {
 	account := parts[4]
 	partition := parts[1]
 	return fmt.Sprintf("arn:%s:iam::%s:role/%s", partition, account, roleName), nil
+}
+
+// parseKMSPolicyState parses a KMS key policy JSON and returns:
+//   - hasPCR0: whether any statement's Condition references the given PCR0 value
+//   - hasPutKeyPolicy: whether any statement grants "kms:PutKeyPolicy" or "kms:*"
+func parseKMSPolicyState(policyJSON, pcr0 string) (hasPCR0, hasPutKeyPolicy bool) {
+	if policyJSON == "" {
+		return false, false
+	}
+
+	var policy struct {
+		Statement []struct {
+			Action    json.RawMessage        `json:"Action"`
+			Condition map[string]interface{} `json:"Condition"`
+		} `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
+		return false, false
+	}
+
+	for _, stmt := range policy.Statement {
+		// Check if this statement's condition references our PCR0.
+		for _, condOps := range stmt.Condition {
+			if ops, ok := condOps.(map[string]interface{}); ok {
+				for key, val := range ops {
+					if strings.Contains(strings.ToLower(key), "pcr0") {
+						if s, ok := val.(string); ok && s == pcr0 {
+							hasPCR0 = true
+						}
+					}
+				}
+			}
+		}
+
+		// Check if this statement grants PutKeyPolicy or kms:*.
+		actions := parseActions(stmt.Action)
+		for _, a := range actions {
+			if a == "kms:PutKeyPolicy" || a == "kms:*" {
+				hasPutKeyPolicy = true
+			}
+		}
+	}
+	return
+}
+
+// parseActions extracts action strings from a JSON value that can be
+// either a single string or an array of strings.
+func parseActions(raw json.RawMessage) []string {
+	if raw == nil {
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return []string{single}
+	}
+	var multi []string
+	if err := json.Unmarshal(raw, &multi); err == nil {
+		return multi
+	}
+	return nil
 }
 
 // buildKMSPolicy builds a locked KMS key policy: Decrypt is restricted to the

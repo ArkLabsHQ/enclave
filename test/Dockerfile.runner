@@ -4,9 +4,9 @@
 # Usage (via docker compose):
 #   docker compose --profile test run --build test-runner
 #
-# Or standalone (start mock services first):
-#   docker build -f Dockerfile.runner -t enclave-test-runner .
-#   docker compose up -d --build --wait
+# Or standalone (from repo root, start mock services first):
+#   docker build -f test/Dockerfile.runner -t enclave-test-runner .
+#   cd test && docker compose up -d --build --wait
 #   docker run --rm --privileged --network host \
 #     -v $PWD:/test enclave-test-runner \
 #     ./run.sh app/enclave/artifacts/image.eif
@@ -18,9 +18,17 @@ RUN git clone --depth 1 --branch vhost-device-vsock-v0.3.0 \
       https://github.com/rust-vmm/vhost-device.git .
 RUN cargo build --release -p vhost-device-vsock
 
-# --- Stage 2: Build gvproxy v0.8.6 ---
-FROM golang:1.23-bookworm AS gvproxy-build
+# --- Stage 2: Build gvproxy v0.8.6 + enclave CLI + mgmt ---
+# Build context must be the repo root (set in docker-compose.yml) so we can
+# access go.mod and all Go source for building the CLI and mgmt binaries.
+FROM golang:1.23-bookworm AS go-build
 RUN go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.8.6
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /enclave-cli ./cmd/enclave
+RUN CGO_ENABLED=0 go build -trimpath -o /enclave-mgmt ./mgmt/
 
 # --- Stage 3: Build QEMU 9.2.4 (x86_64 system emulator only) ---
 FROM debian:bookworm AS qemu-build
@@ -55,7 +63,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=vsock-build /src/target/release/vhost-device-vsock /usr/local/bin/
-COPY --from=gvproxy-build /go/bin/gvproxy /usr/local/bin/
+COPY --from=go-build /go/bin/gvproxy /usr/local/bin/
+COPY --from=go-build /enclave-cli /usr/local/bin/enclave-cli
+COPY --from=go-build /enclave-mgmt /usr/local/bin/enclave-mgmt
 COPY --from=qemu-build /qemu-install/usr/local/ /usr/local/
 
 WORKDIR /test

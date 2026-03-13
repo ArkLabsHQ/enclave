@@ -53,12 +53,9 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":"invalid request: %v"}`, err), http.StatusBadRequest)
 		return
 	}
-	testMode := os.Getenv("ENCLAVE_TEST_MODE") == "1"
-	if !testMode {
-		if req.EIFBucket == "" || req.EIFKey == "" || req.PCR0 == "" {
-			http.Error(w, `{"error":"eif_bucket, eif_key, and pcr0 are required"}`, http.StatusBadRequest)
-			return
-		}
+	if req.EIFBucket == "" || req.EIFKey == "" || req.PCR0 == "" {
+		http.Error(w, `{"error":"eif_bucket, eif_key, and pcr0 are required"}`, http.StatusBadRequest)
+		return
 	}
 	if len(req.SecretNames) == 0 {
 		http.Error(w, `{"error":"secret_names is required"}`, http.StatusBadRequest)
@@ -98,9 +95,11 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	// Idempotency: check if a previous migration attempt left a MigrationKMSKeyID.
 	var newKMSKeyID string
+	resuming := false
 	existingMigKey, _ := s.getParam(ctx, "MigrationKMSKeyID")
 	if existingMigKey != "" {
 		newKMSKeyID = existingMigKey
+		resuming = true
 		emit(1, "progress", fmt.Sprintf("Resuming previous migration with key: %s", newKMSKeyID))
 	} else {
 		// Step 2: Create new KMS key.
@@ -120,11 +119,29 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		emit(2, "progress", fmt.Sprintf("Created KMS key: %s", newKMSKeyID))
 	}
 
+	// rollbackKey schedules the newly created KMS key for deletion on failure.
+	// Skipped when resuming a previous attempt (key was already persisted).
+	rollbackKey := func() {
+		if resuming {
+			return
+		}
+		pendingDays := int32(7)
+		if _, err := s.kms.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
+			KeyId:               aws.String(newKMSKeyID),
+			PendingWindowInDays: &pendingDays,
+		}); err != nil {
+			log.Printf("[migrate] WARNING: failed to schedule orphaned key %s for deletion: %v", newKMSKeyID, err)
+		} else {
+			log.Printf("[migrate] Scheduled orphaned key %s for deletion (7-day window)", newKMSKeyID)
+		}
+		s.resetParam(ctx, "MigrationKMSKeyID")
+	}
+
 	// Step 3: Apply transitional KMS policy.
 	emit(3, "progress", "Applying transitional KMS policy...")
 	roleARN, accountID, err := s.getCallerRole(ctx)
 	if err != nil {
-		s.resetParam(ctx, "MigrationKMSKeyID")
+		rollbackKey()
 		emitErr(3, fmt.Sprintf("get caller identity: %v", err))
 		return
 	}
@@ -134,7 +151,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		Policy: aws.String(policy),
 	})
 	if err != nil {
-		s.resetParam(ctx, "MigrationKMSKeyID")
+		rollbackKey()
 		emitErr(3, fmt.Sprintf("apply transitional policy: %v", err))
 		return
 	}
@@ -143,10 +160,12 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	// Step 4: Store migration parameters in SSM.
 	emit(4, "progress", "Storing migration parameters in SSM...")
 	if err := s.putParam(ctx, "MigrationKMSKeyID", newKMSKeyID); err != nil {
+		rollbackKey()
 		emitErr(4, fmt.Sprintf("store MigrationKMSKeyID: %v", err))
 		return
 	}
 	if err := s.putParam(ctx, "MigrationOldKMSKeyID", oldKMSKeyID); err != nil {
+		rollbackKey()
 		emitErr(4, fmt.Sprintf("store MigrationOldKMSKeyID: %v", err))
 		return
 	}
@@ -154,8 +173,8 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	// Step 5: Call export-key on the running enclave.
 	emit(5, "progress", "Calling export-key on old enclave...")
-	if err := s.callExportKey(ctx); err != nil {
-		s.resetParam(ctx, "MigrationKMSKeyID")
+	if err := s.callExportKey(ctx, newKMSKeyID); err != nil {
+		rollbackKey()
 		emitErr(5, fmt.Sprintf("export-key failed: %v", err))
 		return
 	}
@@ -164,7 +183,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	// Step 6: Poll for migration ciphertexts.
 	emit(6, "progress", "Waiting for migration ciphertexts...")
 	if err := s.pollMigrationCiphertexts(ctx, req.SecretNames); err != nil {
-		s.resetParam(ctx, "MigrationKMSKeyID")
+		rollbackKey()
 		emitErr(6, fmt.Sprintf("poll ciphertexts: %v", err))
 		return
 	}
@@ -186,33 +205,44 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	emit(7, "progress", "Ciphertexts adopted, KMSKeyID updated")
 
 	// Step 8: Download new EIF, stop old enclave, replace, restart.
-	if testMode {
-		emit(8, "progress", "Test mode: skipping EIF download and enclave restart")
-	} else {
-		emit(8, "progress", "Downloading new EIF from S3...")
-		tmpEIF := "/tmp/new-enclave.eif"
-		if err := s.downloadEIF(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
-			emitErr(8, fmt.Sprintf("download EIF: %v", err))
-			return
-		}
+	// Commands are configurable for different environments:
+	//   Production: systemctl stop/start enclave-watchdog (default)
+	//   Test/QEMU:  custom commands to kill/restart boot-qemu.sh
+	eifDest := envOrDefault("ENCLAVE_EIF_PATH", eifPath)
+	stopCmd := envOrDefault("ENCLAVE_STOP_CMD", "systemctl stop enclave-watchdog")
+	startCmd := envOrDefault("ENCLAVE_START_CMD", "systemctl start enclave-watchdog")
 
-		emit(8, "progress", "Stopping old enclave...")
-		exec.Command("systemctl", "stop", "enclave-watchdog").Run()
-
-		if err := os.Rename(tmpEIF, eifPath); err != nil {
-			if cpErr := copyFile(tmpEIF, eifPath); cpErr != nil {
-				emitErr(8, fmt.Sprintf("replace EIF: %v", cpErr))
-				return
-			}
-		}
-
-		emit(8, "progress", "Starting new enclave...")
-		if out, err := exec.Command("systemctl", "start", "enclave-watchdog").CombinedOutput(); err != nil {
-			emitErr(8, fmt.Sprintf("start enclave: %v: %s", err, out))
-			return
-		}
-		emit(8, "progress", "Enclave restarted with new EIF")
+	// Download EIF before stopping enclave — if the download fails, the old
+	// enclave keeps running and we can retry the migration.
+	emit(8, "progress", "Downloading new EIF from S3...")
+	tmpEIF := "/tmp/new-enclave.eif"
+	if err := s.downloadEIF(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
+		emitErr(8, fmt.Sprintf("download EIF: %v", err))
+		return
 	}
+
+	// Stop old enclave only after successful download.
+	emit(8, "progress", fmt.Sprintf("Stopping old enclave (%s)...", stopCmd))
+	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
+		log.Printf("[migrate] stop command output: %s", out)
+		// Non-fatal: enclave may already be stopped.
+		emit(8, "progress", fmt.Sprintf("Stop command returned error (continuing): %v", err))
+	}
+
+	emit(8, "progress", fmt.Sprintf("Replacing EIF at %s...", eifDest))
+	if err := os.Rename(tmpEIF, eifDest); err != nil {
+		if cpErr := copyFile(tmpEIF, eifDest); cpErr != nil {
+			emitErr(8, fmt.Sprintf("replace EIF: %v", cpErr))
+			return
+		}
+	}
+
+	emit(8, "progress", fmt.Sprintf("Starting new enclave (%s)...", startCmd))
+	if out, err := exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput(); err != nil {
+		emitErr(8, fmt.Sprintf("start enclave: %v: %s", err, out))
+		return
+	}
+	emit(8, "progress", "Enclave restarted with new EIF")
 
 	// Step 9: Clean up migration SSM params.
 	emit(9, "progress", "Cleaning up migration parameters...")
@@ -227,7 +257,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 // callExportKey calls POST /v1/export-key on the running enclave.
 // The enclave URL defaults to https://127.0.0.1:443 but can be overridden
 // via ENCLAVE_URL for testing (e.g. https://127.0.0.1:8443 via gvproxy).
-func (s *server) callExportKey(ctx context.Context) error {
+func (s *server) callExportKey(ctx context.Context, migrationKeyID string) error {
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -235,10 +265,12 @@ func (s *server) callExportKey(ctx context.Context) error {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/export-key", nil)
+	body := fmt.Sprintf(`{"migration_key_id":%q}`, migrationKeyID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/export-key", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -255,19 +287,27 @@ func (s *server) callExportKey(ctx context.Context) error {
 func (s *server) pollMigrationCiphertexts(ctx context.Context, secretNames []string) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		found := 0
+		var missing []string
 		for _, name := range secretNames {
 			ct, _ := s.getParam(ctx, "Migration/"+name+"/Ciphertext")
-			if ct != "" {
-				found++
+			if ct == "" {
+				missing = append(missing, name)
 			}
 		}
-		if found == len(secretNames) {
+		if len(missing) == 0 {
 			return nil
 		}
 		time.Sleep(3 * time.Second)
 	}
-	return fmt.Errorf("timed out waiting for migration ciphertexts")
+	// Build list of missing ciphertexts for the error message.
+	var missing []string
+	for _, name := range secretNames {
+		ct, _ := s.getParam(ctx, "Migration/"+name+"/Ciphertext")
+		if ct == "" {
+			missing = append(missing, name)
+		}
+	}
+	return fmt.Errorf("timed out waiting for migration ciphertexts (missing: %s)", strings.Join(missing, ", "))
 }
 
 // --- AWS helpers ---

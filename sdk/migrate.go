@@ -26,9 +26,16 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
 		return
 	}
-	// Note: export-key has its own SSM-based authorization (MigrationKMSKeyID
-	// must be set by the CLI). No mgmt token check — the CLI calls this via
-	// curl on the EC2 host and doesn't have the enclave's runtime token.
+
+	// Parse request body — caller must provide the migration key ID.
+	var req struct {
+		MigrationKeyID string `json:"migration_key_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MigrationKeyID == "" {
+		http.Error(w, "migration_key_id is required in request body", http.StatusBadRequest)
+		return
+	}
+
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
@@ -40,9 +47,15 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	}
 	ssmClient := newSSMClient(awsCfg)
 
+	// Verify the provided migration key ID matches what's stored in SSM.
+	// This ensures the caller is the same entity that initiated the migration.
 	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
 	if err != nil {
-		http.Error(w, "migration key not configured", http.StatusInternalServerError)
+		http.Error(w, "migration key not configured", http.StatusPreconditionFailed)
+		return
+	}
+	if migrationKeyID != req.MigrationKeyID {
+		http.Error(w, "migration_key_id does not match", http.StatusForbidden)
 		return
 	}
 

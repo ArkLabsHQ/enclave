@@ -14,6 +14,9 @@ set -euo pipefail
 
 EIF_PATH="${1:?Usage: $0 <path-to-eif>}"
 
+# Write PID file so external processes (e.g. mgmt server) can stop us.
+echo $$ > /tmp/enclave-boot.pid
+
 if [ ! -f "$EIF_PATH" ]; then
   echo "Error: EIF not found at $EIF_PATH" >&2
   exit 1
@@ -40,7 +43,7 @@ cleanup() {
   [ -n "${IMDS_PROXY_PID:-}" ] && kill "$IMDS_PROXY_PID" 2>/dev/null && echo "  Stopped IMDS proxy ($IMDS_PROXY_PID)" 2>/dev/null
   [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null && echo "  Stopped heartbeat ($HB_PID)" 2>/dev/null
   [ -n "${VSOCK_PID:-}" ] && kill "$VSOCK_PID" 2>/dev/null && echo "  Stopped vhost-device-vsock ($VSOCK_PID)" 2>/dev/null
-  rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET"
+  rm -f "$VSOCK_SOCKET" "$GVPROXY_SOCKET" /tmp/enclave-boot.pid
 }
 trap cleanup EXIT
 

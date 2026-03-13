@@ -30,17 +30,25 @@ type attestationDocument struct {
 }
 
 // waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
+// Times out after 5 minutes to prevent infinite retries on broken KMS.
 func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef) error {
+	const timeout = 5 * time.Minute
 	interval := 5 * time.Second
 
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
 	for {
 		allLoaded := true
 		for _, s := range secrets {
 			if err := initializeOrLoadSecret(ctx, s); err != nil {
+				lastErr = fmt.Errorf("secret %s: %w", s.Name, err)
 				allLoaded = false
 				break
 			}
 			if strings.TrimSpace(os.Getenv(s.EnvVar)) == "" {
+				lastErr = fmt.Errorf("secret %s: env var %s is empty after load", s.Name, s.EnvVar)
 				allLoaded = false
 				break
 			}
@@ -51,7 +59,10 @@ func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			if lastErr != nil {
+				return fmt.Errorf("KMS secret loading timed out after %s (last error: %v)", timeout, lastErr)
+			}
+			return fmt.Errorf("KMS secret loading timed out after %s", timeout)
 		case <-time.After(interval):
 		}
 	}

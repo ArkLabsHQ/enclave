@@ -58,6 +58,37 @@ services:
       timeout: 3s
       retries: 5
 
+  # Host-side management server (replicates EC2 host mgmt in test).
+  # Uses host networking to reach the QEMU enclave on localhost:8443.
+  enclave-mgmt:
+    build:
+      context: ../
+      dockerfile: test/Dockerfile.mgmt
+    network_mode: host
+    environment:
+      ENCLAVE_AWS_REGION: us-east-1
+      ENCLAVE_DEPLOYMENT: dev
+      ENCLAVE_APP_NAME: my-app
+      ENCLAVE_MGMT_ADDR: "127.0.0.1:8444"
+      ENCLAVE_TEST_MODE: "1"
+      ENCLAVE_URL: "https://127.0.0.1:8443"
+      AWS_ENDPOINT_URL_KMS: "http://127.0.0.1:4000"
+      AWS_ENDPOINT_URL_SSM: "http://127.0.0.1:4566"
+      AWS_ENDPOINT_URL_STS: "http://127.0.0.1:4566"
+      AWS_ENDPOINT_URL_S3: "http://127.0.0.1:4566"
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      kms-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8444/health || exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # Full QEMU enclave test runner (replaces nix develop).
   # Usage: docker compose --profile test run --build test-runner
   test-runner:

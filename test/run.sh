@@ -148,7 +148,9 @@ echo ""
 
 # Step 5: Run migration via enclave deploy (upgrade detection).
 # The enclave is running with secrets initialized, so a second deploy
-# detects upgrade mode and exercises the full migration code path.
+# detects upgrade mode and exercises the full migration code path:
+# CLI uploads EIF to S3 (localstack) → calls mgmt POST /migrate → mgmt
+# orchestrates KMS key creation, export-key, ciphertext adoption.
 echo "=== [5/6] Running migration (enclave deploy upgrade) ==="
 "$ENCLAVE_CLI" deploy
 echo ""

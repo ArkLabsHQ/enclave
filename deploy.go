@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -120,19 +122,9 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// Read current KMS key ID from SSM (may differ from CDK output after migration).
-		kmsKeyID, _ := ac.getParameter(ctx, cfg.ssmParam("KMSKeyID"))
-		if kmsKeyID == "" {
-			kmsKeyID = outputs.getOutput(stack, "KMSKeyID", "KmsKeyId", "KMS Key ID")
-		}
-
 		ec2RoleARN := outputs.getOutput(stack, "EC2InstanceRoleARN")
 
-		if kmsKeyID == "" || ec2RoleARN == "" {
-			return fmt.Errorf("missing KMSKeyID or EC2InstanceRoleARN from CDK outputs")
-		}
-
-		return deployUpgrade(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
+		return deployUpgrade(ctx, ac, cfg, root, pcr0, instanceID, ec2RoleARN, local)
 	}
 
 	if local {
@@ -197,8 +189,9 @@ func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 st
 	return nil
 }
 
-// deployUpgrade handles upgrading an existing enclave.
-func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0, instanceID, kmsKeyID, ec2RoleARN string) (string, error) {
+// createUpgradeBucket creates an S3 bucket, grants the EC2 role read access,
+// and uploads the new EIF. Returns the bucket name.
+func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root, ec2RoleARN string) (string, error) {
 	// Create S3 bucket for EIF transfer (idempotent).
 	eifBucket := cfg.eifBucket()
 	ac.ensureBucket(ctx, eifBucket)
@@ -233,160 +226,64 @@ func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root,
 
 }
 
-// deployUpgradeLocked handles migration when the KMS key is locked:
-// create temp KMS key → export signing key from old enclave → restart with new key.
-func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string, pcr0, instanceID, kmsKeyID, ec2RoleARN string) error {
-	local := os.Getenv("LOCAL_DEPLOYMENT") == "true"
-
-	var eifBucket string
-	if !local {
-		fmt.Println("[deploy] Create Deploy s3 bucket")
-		var err error
-		eifBucket, err = createUpgradeBucket(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
-		if err != nil {
-			return err
-		}
-	}
-
-	fmt.Println("[deploy] KMS key is locked — using temporary key migration")
-
-	// Step 1: Create new KMS key for the new enclave version.
-	pcr0Short := pcr0
-	if len(pcr0Short) > 16 {
-		pcr0Short = pcr0Short[:16]
-	}
-	newKMSKeyID, err := ac.createKey(ctx,
-		fmt.Sprintf("%s migration key for PCR0 %s...", cfg.Name, pcr0Short))
+// deployUpgrade handles both local and production upgrades. Both paths upload
+// the EIF to S3 and send the same payload to the mgmt server's /migrate endpoint.
+// The only difference is transport: local calls mgmt directly via HTTP, production
+// uses SSM RunCommand (since localstack doesn't support SendCommand).
+func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0, instanceID, ec2RoleARN string, local bool) error {
+	// Step 1: Upload EIF to S3.
+	fmt.Println("[deploy] Uploading EIF to S3...")
+	eifBucket, err := createUpgradeBucket(ctx, ac, cfg, root, ec2RoleARN)
 	if err != nil {
-		return fmt.Errorf("create migration KMS key: %w", err)
-	}
-	fmt.Printf("[deploy] Created new KMS key: %s\n", newKMSKeyID)
-
-	// Step 2: Apply transitional policy — Encrypt + admin (no Decrypt).
-	// The new enclave will self-apply PCR0-restricted Decrypt during Init().
-	if err := applyTransitionalKMSPolicy(ctx, ac, newKMSKeyID, ec2RoleARN, cfg.Account); err != nil {
-		if local {
-			fmt.Printf("[deploy] Warning: transitional policy failed (local-kms may not support): %v\n", err)
-		} else {
-			return fmt.Errorf("apply transitional policy to new KMS key: %w", err)
-		}
+		return err
 	}
 
-	// Step 3: Store migration parameters in SSM.
-	ssmParams := map[string]string{
-		"MigrationKMSKeyID":    newKMSKeyID,
-		"MigrationOldKMSKeyID": kmsKeyID,
+	// Step 2: Build migration payload.
+	secretNames := make([]string, len(cfg.Secrets))
+	for i, s := range cfg.Secrets {
+		secretNames[i] = fmt.Sprintf("%q", s.Name)
 	}
-	for param, value := range ssmParams {
-		if err := ac.putParameter(ctx, cfg.ssmParam(param), value); err != nil {
-			return fmt.Errorf("store %s in SSM: %w", param, err)
-		}
-	}
-	fmt.Println("[deploy] Migration KMS key IDs stored in SSM")
+	migrateJSON := fmt.Sprintf(`{"eif_bucket":%q,"eif_key":"image.eif","pcr0":%q,"secret_names":[%s]}`,
+		eifBucket, pcr0, strings.Join(secretNames, ","))
 
-	// Step 4: Call old enclave's export endpoint.
-	fmt.Println("[deploy] Calling old enclave's export endpoint...")
+	// Step 3: Trigger migration on mgmt server.
 	if local {
-		// Local: call enclave directly via HTTPS (no SSM agent).
-		enclaveURL := localEnclaveURL()
-		fmt.Printf("[deploy] Calling export-key at %s ...\n", enclaveURL)
-		client := &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+		// Local: call mgmt directly via HTTP (localstack doesn't support SSM RunCommand).
+		mgmtURL := os.Getenv("ENCLAVE_MGMT_URL")
+		if mgmtURL == "" {
+			mgmtURL = "http://localhost:8444"
 		}
-		resp, err := client.Post(enclaveURL+"/v1/export-key", "", nil)
-		if err != nil {
-			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-			return fmt.Errorf("export secrets from old enclave: %w", err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-			return fmt.Errorf("export-key returned %d", resp.StatusCode)
-		}
-		fmt.Println("[deploy] Export-key succeeded")
-	} else {
-		// Production: call via SSM Run Command on the EC2 host.
-		exportCmd := `curl -sf -k -X POST https://127.0.0.1:443/v1/export-key`
-		if err := ac.runOnHost(ctx, instanceID, "export secrets from old enclave", []string{exportCmd}); err != nil {
-			fmt.Println("[deploy] Export failed, cleaning up")
-			ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-			return fmt.Errorf("export secrets from old enclave: %w", err)
-		}
-	}
-
-	// Step 5: Wait for per-secret migration ciphertexts to appear in SSM.
-	fmt.Println("[deploy] Waiting for migration ciphertexts...")
-	maxWait := 60
-	allFound := false
-	for elapsed := 0; elapsed < maxWait; elapsed += 3 {
-		found := 0
-		for _, secret := range cfg.Secrets {
-			ct, _ := ac.getParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
-			if ct != "" && ct != "UNSET" {
-				found++
-			}
-		}
-		if found == len(cfg.Secrets) {
-			allFound = true
-			fmt.Printf("[deploy] All %d migration ciphertexts stored in SSM\n", found)
-			break
-		}
-		time.Sleep(3 * time.Second)
-		fmt.Printf("[deploy] Waiting... (%d/%d secrets, %ds/%ds)\n", found, len(cfg.Secrets), elapsed+3, maxWait)
-	}
-
-	if !allFound {
-		ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-		return fmt.Errorf("timed out waiting for migration ciphertexts")
-	}
-
-	// Step 6: Copy each migration ciphertext to its permanent location.
-	for _, secret := range cfg.Secrets {
-		migCipher, _ := ac.getParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
-		if err := ac.putParameter(ctx, cfg.ssmParam(secret.Name+"/Ciphertext"), migCipher); err != nil {
-			return fmt.Errorf("copy migration ciphertext for %s: %w", secret.Name, err)
-		}
-	}
-	fmt.Printf("[deploy] Copied %d migration ciphertexts to permanent locations\n", len(cfg.Secrets))
-
-	// Step 7: Update KMSKeyID to the new key.
-	if err := ac.putParameter(ctx, cfg.ssmParam("KMSKeyID"), newKMSKeyID); err != nil {
-		return fmt.Errorf("update KMSKeyID: %w", err)
-	}
-	fmt.Printf("[deploy] Updated KMSKeyID to %s\n", newKMSKeyID)
-
-	// Step 8: Stop old enclave, update EIF, restart watchdog.
-	if local {
-		fmt.Println("[deploy] Skipping restart (local mode)")
-	} else {
-		if err := restartEnclaveOnHost(ctx, ac, cfg, instanceID, eifBucket); err != nil {
+		fmt.Printf("[deploy] Calling mgmt server at %s/migrate ...\n", mgmtURL)
+		if err := callMgmtMigrateDirect(ctx, mgmtURL, migrateJSON); err != nil {
 			return err
 		}
-	}
-
-	// Step 9: Clean up migration SSM params.
-	ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-	for _, secret := range cfg.Secrets {
-		ac.resetParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
+	} else {
+		// Production: trigger via SSM RunCommand on the EC2 host.
+		fmt.Println("[deploy] Triggering migration on host via SSM RunCommand...")
+		migrateCmd := fmt.Sprintf(`curl -sf -X POST http://localhost:8443/migrate -H 'Content-Type: application/json' -d '%s'`, migrateJSON)
+		if err := ac.runOnHost(ctx, instanceID, "migrate enclave", []string{migrateCmd}); err != nil {
+			return fmt.Errorf("migration failed: %w", err)
+		}
 	}
 
 	fmt.Println()
 	fmt.Println("[deploy] Migration complete.")
-	fmt.Printf("  Instance ID:  %s\n", instanceID)
-	fmt.Printf("  New KMS Key:  %s\n", newKMSKeyID)
-	fmt.Printf("  Old KMS Key:  %s (scheduled for deletion by new enclave on boot)\n", kmsKeyID)
-	fmt.Printf("  PCR0:         %s\n", pcr0)
+	fmt.Printf("  PCR0: %s\n", pcr0)
 
-	if !local {
-		// Read elastic IP from SSM (stored during fresh deploy) for verification.
-		elasticIP, _ := ac.getParameter(ctx, cfg.ssmParam("ElasticIP"))
-		if elasticIP != "" {
-			fmt.Printf("\n[deploy] Verifying upgrade (waiting up to 60s)...\n")
-			if err := initialVerification(elasticIP, pcr0, 60); err != nil {
-				fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
+	// Step 4: Verify the upgrade.
+	var verifyHost string
+	if local {
+		// Strip scheme — initialVerification prepends "https://".
+		u := localEnclaveURL()
+		verifyHost = strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+	} else {
+		verifyHost, _ = ac.getParameter(ctx, cfg.ssmParam("ElasticIP"))
+	}
+	if verifyHost != "" {
+		fmt.Printf("\n[deploy] Verifying upgrade (waiting up to 60s)...\n")
+		if err := initialVerification(verifyHost, pcr0, 60); err != nil {
+			fmt.Printf("[deploy] Warning: verification did not pass: %v\n", err)
+			if !local {
 				fmt.Println("[deploy] Try: enclave verify --wait 300")
 			}
 		}
@@ -395,17 +292,46 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string
 	return nil
 }
 
-// restartEnclaveOnHost downloads the new EIF from S3, replaces the EIF on disk,
-// and restarts the enclave via the management server's start/stop endpoints.
-func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, instanceID, eifBucket string) error {
-	return ac.runOnHost(ctx, instanceID, "stop enclave, update EIF, restart enclave", []string{
-		"set -e",
-		fmt.Sprintf("aws s3 cp s3://%s/image.eif /tmp/new-enclave.eif --region %s", eifBucket, cfg.Region),
-		"curl -sf -X POST http://localhost:8443/stop || true",
-		"cp /tmp/new-enclave.eif /home/ec2-user/app/server/enclave.eif",
-		"chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif",
-		"curl -sf -X POST http://localhost:8443/start",
-	})
+// callMgmtMigrateDirect calls the mgmt server's /migrate endpoint directly via HTTP.
+// The handler streams NDJSON status lines; errors are indicated via "status":"error"
+// in the last line (HTTP status is always 200 since headers are sent before steps run).
+func callMgmtMigrateDirect(ctx context.Context, mgmtURL, payload string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, mgmtURL+"/migrate",
+		strings.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 180 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("call mgmt /migrate: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mgmt /migrate returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Stream NDJSON status lines to stdout and check for errors.
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Print(string(body))
+
+	// Check last NDJSON line for error status.
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) > 0 {
+		var last struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(lines[len(lines)-1]), &last) == nil && last.Status == "error" {
+			return fmt.Errorf("migration failed: %s", last.Message)
+		}
+	}
+
+	return nil
 }
 
 // --- Local helpers ---
@@ -436,61 +362,6 @@ func localEnclaveURL() string {
 		port = "8443"
 	}
 	return "https://localhost:" + port
-}
-
-// --- KMS policy functions ---
-
-// applyTransitionalKMSPolicy applies a transitional KMS key policy for locked-key
-// migration. Grants Encrypt + self-apply permissions to the EC2 role (so the new
-// enclave can call PutKeyPolicy to add PCR0-restricted Decrypt during Init), and
-// admin to the account root.
-// Intentionally omits Decrypt — only the new enclave can add that after proving its PCR0.
-//
-// The EC2 role needs PutKeyPolicy and GetKeyPolicy granted directly in the key
-// policy because its IAM policy is scoped to the old CDK-managed key ARN.
-func applyTransitionalKMSPolicy(ctx context.Context, ac *awsClients, keyID, ec2RoleARN, account string) error {
-	fmt.Println("[deploy] Applying transitional KMS key policy (Encrypt + admin, no Decrypt)")
-
-	accountRoot := fmt.Sprintf("arn:aws:iam::%s:root", account)
-
-	policy := fmt.Sprintf(`{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "Enable encrypt and self-apply from enclave",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": [
-        "kms:Encrypt",
-        "kms:GetKeyPolicy",
-        "kms:PutKeyPolicy"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "Enable key administration (no decrypt)",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": [
-        "kms:DescribeKey",
-        "kms:GetKeyPolicy",
-        "kms:GetKeyRotationStatus",
-        "kms:ListResourceTags",
-        "kms:PutKeyPolicy",
-        "kms:EnableKeyRotation",
-        "kms:DisableKeyRotation",
-        "kms:TagResource",
-        "kms:UntagResource",
-        "kms:ScheduleKeyDeletion",
-        "kms:CancelKeyDeletion",
-        "kms:Encrypt"
-      ],
-      "Resource": "*"
-    }
-  ]
-}`, ec2RoleARN, accountRoot)
-
-	return ac.putKeyPolicy(ctx, keyID, policy, false)
 }
 
 // --- Post-deploy verification ---

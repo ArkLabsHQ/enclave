@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.49.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.67.8
+	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6
 	github.com/aws/constructs-go/constructs/v10 v10.3.0
 	github.com/aws/jsii-runtime-go v1.104.0
 	github.com/btcsuite/btcd/btcec/v2 v2.3.3
@@ -36,7 +37,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.13 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6 // indirect
 	github.com/aws/smithy-go v1.24.0 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1 // indirect
 	github.com/cdklabs/awscdk-asset-awscli-go/awscliv1/v2 v2.2.201 // indirect

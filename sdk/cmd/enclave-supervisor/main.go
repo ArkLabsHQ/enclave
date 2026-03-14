@@ -35,7 +35,7 @@ func main() {
 
 	// 4. Mux: management routes local, everything else proxied.
 	mux := http.NewServeMux()
-	enc.RegisterRoutes(mux) // /v1/enclave-info, /v1/export-key, /v1/extend-pcr, /v1/lock-pcr
+	enc.RegisterRoutes(mux) // /v1/enclave-info, /v1/export-key, /v1/storage, /v1/secrets
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

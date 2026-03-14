@@ -21,7 +21,6 @@ by default since nitriding uses self-signed certificates.
 Examples:
   enclave curl /health
   enclave curl /v1/enclave-info
-  enclave curl -X POST -d '{"pcr":16}' /v1/extend-pcr
   enclave curl -H "Content-Type: application/json" /my-endpoint
   enclave curl --base-url https://my-domain.com /api/data`,
 		Args: cobra.ExactArgs(1),

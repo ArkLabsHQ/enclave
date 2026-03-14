@@ -192,17 +192,17 @@ func (e *Enclave) AttestationPubkey() string {
 //
 //	GET    /v1/enclave-info
 //	POST   /v1/export-key
-//	POST   /v1/extend-pcr
-//	POST   /v1/lock-pcr
 //	PUT    /v1/storage/{key...}
 //	GET    /v1/storage/{key...}
 //	DELETE /v1/storage/{key...}
 //	GET    /v1/storage
+//	PUT    /v1/secrets/{name}
+//	GET    /v1/secrets/{name}
+//	DELETE /v1/secrets/{name}
+//	GET    /v1/secrets
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
-	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
-	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
 	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
 	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
 	mux.HandleFunc("DELETE /v1/storage/{key...}", e.handleStorageDelete)
@@ -240,16 +240,6 @@ func (e *Enclave) Middleware(next http.Handler) http.Handler {
 		w.WriteHeader(rec.status)
 		w.Write(body)
 	})
-}
-
-// ExtendPCR extends a user-defined PCR (16-31) with the given data.
-func (e *Enclave) ExtendPCR(index uint, data []byte) error {
-	return extendPCR(index, data)
-}
-
-// LockPCR locks a user-defined PCR (16-31) to prevent further extension.
-func (e *Enclave) LockPCR(index uint) error {
-	return lockPCR(index)
 }
 
 // loadSecretsConfig parses the ENCLAVE_SECRETS_CONFIG env var (JSON array).
@@ -390,64 +380,6 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExtendPCR extends a user-defined PCR (16-31) with the provided data.
-// This allows the user's app to extend PCRs via HTTP without importing the SDK.
-func (e *Enclave) handleExtendPCR(w http.ResponseWriter, r *http.Request) {
-	if !e.checkMgmtToken(w, r) {
-		return
-	}
-	var req struct {
-		PCR  uint   `json:"pcr"`
-		Data string `json:"data"` // base64-encoded
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.PCR < 16 || req.PCR > 31 {
-		http.Error(w, "pcr must be in range [16, 31]", http.StatusBadRequest)
-		return
-	}
-
-	data, err := base64.StdEncoding.DecodeString(req.Data)
-	if err != nil {
-		http.Error(w, "invalid base64 data", http.StatusBadRequest)
-		return
-	}
-
-	if err := extendPCR(req.PCR, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"pcr":%d,"status":"extended"}`, req.PCR)
-}
-
-// handleLockPCR locks a user-defined PCR (16-31) to prevent further extension.
-func (e *Enclave) handleLockPCR(w http.ResponseWriter, r *http.Request) {
-	if !e.checkMgmtToken(w, r) {
-		return
-	}
-	var req struct {
-		PCR uint `json:"pcr"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.PCR < 16 || req.PCR > 31 {
-		http.Error(w, "pcr must be in range [16, 31]", http.StatusBadRequest)
-		return
-	}
-
-	if err := lockPCR(req.PCR); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"pcr":%d,"status":"locked"}`, req.PCR)
-}
-
 // extendPCR extends a PCR with the given data via the NSM.
 func extendPCR(index uint, data []byte) error {
 	session, err := nsm.OpenDefaultSession()
@@ -465,26 +397,6 @@ func extendPCR(index uint, data []byte) error {
 	}
 	if resp.Error != "" {
 		return fmt.Errorf("ExtendPCR(%d): NSM error: %s", index, resp.Error)
-	}
-	return nil
-}
-
-// lockPCR locks a PCR to prevent further extension.
-func lockPCR(index uint) error {
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return fmt.Errorf("open NSM session: %w", err)
-	}
-	defer session.Close()
-
-	resp, err := session.Send(&request.LockPCR{
-		Index: uint16(index),
-	})
-	if err != nil {
-		return fmt.Errorf("LockPCR(%d): %w", index, err)
-	}
-	if resp.Error != "" {
-		return fmt.Errorf("LockPCR(%d): NSM error: %s", index, resp.Error)
 	}
 	return nil
 }

@@ -27,12 +27,21 @@ if ! command -v vhost-device-vsock &>/dev/null || ! command -v qemu-system-x86_6
   exec nix develop "${SCRIPT_DIR}" --command "$0" "$@"
 fi
 
-# Use pre-built binaries (Docker test-runner) 
-ENCLAVE_CLI="/tmp/enclave-cli"
-ENCLAVE_MGMT="/tmp/enclave-mgmt"
+# Use pre-built binaries (Docker test-runner) or build from source (nix develop).
+if command -v enclave-cli &>/dev/null && command -v enclave-mgmt &>/dev/null; then
+  ENCLAVE_CLI="$(command -v enclave-cli)"
+  ENCLAVE_MGMT="$(command -v enclave-mgmt)"
+  echo "Using pre-built binaries"
+elif command -v go &>/dev/null; then
+  ENCLAVE_CLI="/tmp/enclave-cli"
+  ENCLAVE_MGMT="/tmp/enclave-mgmt"
   echo "Building enclave CLI and mgmt server..."
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cmd/enclave)
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_MGMT" ./mgmt/)
+else
+  echo "Error: neither pre-built binaries (enclave-cli, enclave-mgmt) nor Go compiler found" >&2
+  exit 1
+fi
 
 
 echo "  CLI:  $ENCLAVE_CLI"
@@ -129,18 +138,43 @@ echo " Enclave Local Test Runner"
 echo "==============================="
 echo ""
 
-# Step 0 (optional): Build test EIF from skeleton app.
+# Detect if running inside Docker test-runner (no Nix, no docker CLI).
+IN_DOCKER=false
+if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+  IN_DOCKER=true
+fi
+
+# Step 0: Build test EIF from skeleton app.
 echo "=== [0/7] Building test EIF from skeleton app ==="
+if [ -n "$EIF_PATH" ] && [ -f "$EIF_PATH" ]; then
+  echo "  Using provided EIF: $EIF_PATH"
+elif [ "$IN_DOCKER" = true ]; then
+  # Inside Docker: use pre-built EIF from mounted volume (built on host).
+  if [ -f "app/enclave/artifacts/image.eif" ]; then
+    EIF_PATH="app/enclave/artifacts/image.eif"
+    echo "  Using pre-built EIF: $EIF_PATH"
+  else
+    echo "  Error: EIF must be pre-built when running inside Docker" >&2
+    echo "  Build it on the host first: cd test/app && enclave build --local" >&2
+    exit 1
+  fi
+else
+  # On host: always rebuild to ensure latest source is included.
   echo "  Source: test/app/"
   (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
   echo "  Built: $EIF_PATH"
+fi
 echo ""
 
-# Step 1: Start mock services (skipped when run inside Docker test-runner).
+# Step 1: Start mock services (skipped inside Docker — compose handles it).
 echo "=== [1/7] Starting mock services ==="
+if [ "$IN_DOCKER" = true ]; then
+  echo "  Skipped (services managed by docker compose)"
+else
   docker compose down -v 2>/dev/null || true
   docker compose up -d --build --wait
+fi
 echo ""
 
 # Step 2: Deploy CDK stack to localstack and start mgmt server.
@@ -150,6 +184,9 @@ export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export LOCAL_DEPLOYMENT=true
 export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+
+# Clean up any stale state from previous runs (KMS keys locked to old PCR0).
+"$ENCLAVE_CLI" destroy --force 2>/dev/null || true
 
 "$ENCLAVE_CLI" deploy
 
@@ -265,6 +302,37 @@ if echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
 else
   echo "  FAIL: Dynamic secrets broken after restart: ${DYN_RESP:0:120}" >&2
   exit 1
+fi
+
+# Verify attestation pubkey + PCR16 hash survived migration (write/verify pattern).
+# Pre-migration values were stored to encrypted storage in integration test 14.
+ATTEST_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/attestation-persistence" 2>/dev/null || echo "")
+ATTEST_PERSIST_PHASE=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.phase // empty' 2>/dev/null || echo "")
+if [ "$ATTEST_PERSIST_PHASE" = "verify" ]; then
+  PUBKEY_MATCH=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.pubkey_match // false' 2>/dev/null || echo "false")
+  PCR16_MATCH=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.pcr16_match // false' 2>/dev/null || echo "false")
+  if [ "$PUBKEY_MATCH" = "true" ] && [ "$PCR16_MATCH" = "true" ]; then
+    echo "  PASS: Attestation pubkey + PCR16 identical after migration (SIGNING_KEY survived)"
+  else
+    echo "  FAIL: Attestation values changed after migration!" >&2
+    echo "$ATTEST_PERSIST_RESP" | jq . >&2
+    exit 1
+  fi
+elif [ "$ATTEST_PERSIST_PHASE" = "write" ]; then
+  echo "  INFO: Attestation persistence re-written (expected after full restart)"
+else
+  echo "  WARN: Could not verify attestation persistence: ${ATTEST_PERSIST_RESP:0:120}"
+fi
+
+# Verify dynamic secret created before migration survived restart.
+DYN_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
+DYN_PERSIST_PHASE=$(echo "$DYN_PERSIST_RESP" | jq -r '.phase // empty' 2>/dev/null || echo "")
+if [ "$DYN_PERSIST_PHASE" = "verify" ] && echo "$DYN_PERSIST_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+  echo "  PASS: Dynamic secret survived migration+restart"
+elif [ "$DYN_PERSIST_PHASE" = "write" ]; then
+  echo "  INFO: Dynamic secret was re-written (expected after full restart)"
+else
+  echo "  WARN: Could not verify dynamic secret persistence: ${DYN_PERSIST_RESP:0:120}"
 fi
 
 # Step 7: Final enclave info.

@@ -21,7 +21,7 @@ RUN cargo build --release -p vhost-device-vsock
 # --- Stage 2: Build gvproxy v0.8.6 + enclave CLI + mgmt ---
 # Build context must be the repo root (set in docker-compose.yml) so we can
 # access go.mod and all Go source for building the CLI and mgmt binaries.
-FROM golang:1.23-bookworm AS go-build
+FROM golang:1.25-bookworm AS go-build
 RUN go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.8.6
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libglib2.0-0 libpixman-1-0 libfdt1 libcap-ng0 \
       libslirp0 liburing2 \
       libcbor0.8 libgnutls30 \
-      awscli \
+      awscli nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=vsock-build /src/target/release/vhost-device-vsock /usr/local/bin/

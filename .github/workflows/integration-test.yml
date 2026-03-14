@@ -35,11 +35,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build Nix dev shell
-        run: nix develop ./test --command echo "ready"
+      - name: Build test EIF
+        run: |
+          go build -o /tmp/enclave-cli ./cmd/enclave
+          cd test/app && /tmp/enclave-cli build --local
 
       - name: Run integration test
-        run: cd test && nix develop . --command ./run.sh
+        run: cd test && docker compose --profile test run --build test-runner
         env:
           BOOT_TIMEOUT: "120"
           INIT_TIMEOUT: "180"

@@ -2,7 +2,7 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /src
 COPY . .
 WORKDIR /src/cmd/local-kms-proxy
-RUN go build -o /local-kms-proxy .
+RUN CGO_ENABLED=0 go build -o /local-kms-proxy .
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates

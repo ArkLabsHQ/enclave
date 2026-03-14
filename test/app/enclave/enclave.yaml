@@ -4,7 +4,7 @@
 name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
 region: us-east-1                # AWS region
-account: "000000000000"          # AWS account ID (dummy for localstack)
+account: "000000000000"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds

@@ -40,7 +40,9 @@ func main() {
 	mux.HandleFunc("GET /test/storage-persistence", handleTestStoragePersistence)
 	mux.HandleFunc("GET /test/attestation", handleTestAttestation)
 	mux.HandleFunc("GET /test/dynamic-secrets", handleTestDynamicSecrets)
+	mux.HandleFunc("GET /test/dynamic-secret-persistence", handleTestDynamicSecretPersistence)
 	mux.HandleFunc("GET /test/pcr-secrets", handleTestPCRSecrets)
+	mux.HandleFunc("GET /test/attestation-persistence", handleTestAttestationPersistence)
 
 	log.Printf("listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -417,6 +419,81 @@ func handleTestDynamicSecrets(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
+// handleTestDynamicSecretPersistence creates or verifies a well-known dynamic secret.
+// First call (secret doesn't exist): creates "migration-persist-secret" → returns {"phase":"write"}.
+// Second call (secret exists): reads it back and verifies → returns {"phase":"verify","roundtrip":true}.
+// This lets the test suite verify dynamic secrets survive across migration/restart.
+func handleTestDynamicSecretPersistence(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	if token == "" {
+		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		return
+	}
+
+	const persistName = "migration-persist-secret"
+	const persistValue = "pre-migration-value"
+	const persistEnvVar = "TEST_PERSIST_SECRET"
+	results := map[string]any{"name": persistName}
+
+	// Try GET first — if it exists, we're in verify phase.
+	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/secrets/"+persistName, nil)
+	getReq.Header.Set("Authorization", "Bearer "+token)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		results["error"] = fmt.Sprintf("get failed: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+
+	if getResp.StatusCode == http.StatusOK && len(getBody) > 0 {
+		var secretResp struct {
+			Value string `json:"value"`
+		}
+		json.Unmarshal(getBody, &secretResp)
+		results["phase"] = "verify"
+		if secretResp.Value == persistValue {
+			results["roundtrip"] = true
+			results["status"] = "ok"
+		} else {
+			results["error"] = fmt.Sprintf("value mismatch: got %q, want %q", secretResp.Value, persistValue)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	// Write phase: secret doesn't exist yet, create it.
+	putBody, _ := json.Marshal(map[string]string{
+		"value":   persistValue,
+		"env_var": persistEnvVar,
+	})
+	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/secrets/"+persistName, bytes.NewReader(putBody))
+	putReq.Header.Set("Authorization", "Bearer "+token)
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		results["error"] = fmt.Sprintf("put failed: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusCreated {
+		results["error"] = fmt.Sprintf("put returned %d", putResp.StatusCode)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	results["phase"] = "write"
+	results["status"] = "ok"
+	json.NewEncoder(w).Encode(results)
+}
+
 // handleTestPCRSecrets verifies that static secret public keys were extended
 // into PCRs 16+. For each static secret, the SDK computes
 // SHA256(secp256k1_compressed_pubkey(secret_hex)) and extends PCR (16+i).
@@ -471,6 +548,135 @@ func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 	results["derivation_valid"] = true
 	results["pubkey_length"] = len(compressedPubkey)
 	results["hash_length"] = len(pubkeyHash)
+	results["status"] = "ok"
+	json.NewEncoder(w).Encode(results)
+}
+
+// handleTestAttestationPersistence verifies that the attestation pubkey and
+// PCR16 extension hash survive migration. Uses the write/verify pattern:
+//
+// First call (pre-migration): derives pubkey + PCR16 hash from SIGNING_KEY,
+// fetches attestation_pubkey from supervisor, stores all three values to
+// encrypted storage → returns {"phase":"write"}.
+//
+// Second call (post-migration): reads stored values, re-derives current values,
+// compares → returns {"phase":"verify","pubkey_match":true,"pcr16_match":true}.
+func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	if token == "" {
+		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		return
+	}
+
+	results := map[string]any{}
+
+	// Derive current attestation values from SIGNING_KEY.
+	signingKeyHex := os.Getenv("SIGNING_KEY")
+	if signingKeyHex == "" {
+		results["error"] = "SIGNING_KEY not set"
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	secretBytes, err := hex.DecodeString(signingKeyHex)
+	if err != nil || len(secretBytes) != 32 {
+		results["error"] = fmt.Sprintf("SIGNING_KEY invalid: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
+	compressedPubkey := privKey.PubKey().SerializeCompressed()
+	pubkeyHash := sha256.Sum256(compressedPubkey)
+	currentPCR16 := hex.EncodeToString(pubkeyHash[:])
+	currentPubkey := hex.EncodeToString(compressedPubkey)
+
+	// Fetch attestation_pubkey from supervisor (the ephemeral key used for signing).
+	infoResp, err := http.Get(supervisorURL + "/v1/enclave-info")
+	if err != nil {
+		results["error"] = fmt.Sprintf("fetch enclave-info: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	infoBody, _ := io.ReadAll(infoResp.Body)
+	infoResp.Body.Close()
+	var info struct {
+		AttestationPubkey string `json:"attestation_pubkey"`
+	}
+	json.Unmarshal(infoBody, &info)
+	currentAttestPubkey := info.AttestationPubkey
+
+	const storageKey = "test/attestation-persistence"
+
+	// Try GET — if stored data exists, we're in verify phase.
+	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/storage/"+storageKey, nil)
+	getReq.Header.Set("Authorization", "Bearer "+token)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		results["error"] = fmt.Sprintf("storage get: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	storedBody, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+
+	if getResp.StatusCode == http.StatusOK && len(storedBody) > 0 {
+		// Verify phase: compare stored pre-migration values with current.
+		var stored struct {
+			Pubkey      string `json:"pubkey"`
+			PCR16       string `json:"pcr16"`
+		}
+		json.Unmarshal(storedBody, &stored)
+
+		results["phase"] = "verify"
+		results["pre_migration_pubkey"] = stored.Pubkey
+		results["post_migration_pubkey"] = currentPubkey
+		results["pubkey_match"] = stored.Pubkey == currentPubkey
+		results["pre_migration_pcr16"] = stored.PCR16
+		results["post_migration_pcr16"] = currentPCR16
+		results["pcr16_match"] = stored.PCR16 == currentPCR16
+
+		if stored.Pubkey == currentPubkey && stored.PCR16 == currentPCR16 {
+			results["status"] = "ok"
+		} else {
+			results["error"] = "attestation values changed after migration"
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	// Write phase: store current values for post-migration comparison.
+	storeData, _ := json.Marshal(map[string]string{
+		"pubkey":          currentPubkey,
+		"pcr16":           currentPCR16,
+		"attest_pubkey":   currentAttestPubkey,
+	})
+	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/storage/"+storageKey, bytes.NewReader(storeData))
+	putReq.Header.Set("Authorization", "Bearer "+token)
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		results["error"] = fmt.Sprintf("storage put: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusCreated {
+		results["error"] = fmt.Sprintf("storage put returned %d", putResp.StatusCode)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	results["phase"] = "write"
+	results["pubkey"] = currentPubkey
+	results["pcr16"] = currentPCR16
+	results["attest_pubkey"] = currentAttestPubkey
 	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
 }

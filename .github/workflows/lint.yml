@@ -1,0 +1,44 @@
+name: Lint & Vet
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet (root)
+        run: go vet ./...
+
+      - name: Go vet (sdk)
+        run: cd sdk && go vet ./...
+
+      - name: Go vet (mgmt)
+        run: cd mgmt && go vet ./...
+
+      - name: golangci-lint (root)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: .
+
+      - name: golangci-lint (sdk)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: sdk
+
+      - name: golangci-lint (mgmt)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: mgmt

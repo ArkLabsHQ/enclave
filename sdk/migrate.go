@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -184,6 +185,7 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 func deleteOldKMSKey(ctx context.Context) {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
+		slog.Warn("deleteOldKMSKey: load AWS config failed", "error", err)
 		return
 	}
 	ssmClient := newSSMClient(awsCfg)
@@ -192,7 +194,7 @@ func deleteOldKMSKey(ctx context.Context) {
 
 	oldKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName))
 	if err != nil {
-		return
+		return // no old key to delete — normal case
 	}
 
 	kmsClient := newKMSClient(awsCfg)
@@ -202,15 +204,20 @@ func deleteOldKMSKey(ctx context.Context) {
 		PendingWindowInDays: &pendingDays,
 	})
 	if err != nil {
+		slog.Warn("deleteOldKMSKey: schedule deletion failed", "key_id", oldKeyID, "error", err)
 		return
 	}
+	slog.Info("scheduled old KMS key for deletion", "key_id", oldKeyID, "pending_days", 7)
 
-	_, _ = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
 		Value:     aws.String("UNSET"),
 		Type:      ssmtypes.ParameterTypeString,
 		Overwrite: aws.Bool(true),
 	})
+	if err != nil {
+		slog.Warn("deleteOldKMSKey: clear SSM param failed", "error", err)
+	}
 }
 
 // readSSMParam reads an SSM parameter value. Returns error if missing or UNSET.

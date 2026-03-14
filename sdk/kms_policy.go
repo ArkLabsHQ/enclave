@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -59,7 +59,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	hasPCR0, hasPutKeyPolicy := parseKMSPolicyState(policyText, pcr0)
 
 	if hasPCR0 {
-		log.Printf("kms_policy: policy already contains PCR0 %s..., skipping", pcr0[:16])
+		slog.Info("KMS policy already contains PCR0, skipping", "pcr0", pcr0[:16])
 		return nil
 	}
 
@@ -96,11 +96,11 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 			BypassPolicyLockoutSafetyCheck: true,
 		})
 		if err == nil {
-			log.Printf("kms_policy: applied PCR0-restricted policy (PCR0=%s...)", pcr0[:16])
+			slog.Info("applied PCR0-restricted KMS policy", "pcr0", pcr0[:16])
 			return nil
 		}
 		lastErr = err
-		log.Printf("kms_policy: PutKeyPolicy attempt %d failed: %v", attempt+1, err)
+		slog.Warn("PutKeyPolicy attempt failed", "attempt", attempt+1, "error", err)
 	}
 
 	return fmt.Errorf("kms put-key-policy after retries: %w", lastErr)

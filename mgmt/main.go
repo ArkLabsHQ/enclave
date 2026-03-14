@@ -16,7 +16,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,6 +34,10 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -43,7 +47,8 @@ func main() {
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		log.Fatalf("load AWS config: %v", err)
+		slog.Error("load AWS config failed", "error", err)
+		os.Exit(1)
 	}
 
 	// AWS clients with optional endpoint overrides for testing with mock services.
@@ -99,10 +104,11 @@ func main() {
 	addr := envOrDefault("ENCLAVE_MGMT_ADDR", "127.0.0.1:8443")
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 180 * time.Second,
+		Addr:           addr,
+		Handler:        mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   180 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	go func() {
@@ -112,9 +118,10 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("management server listening on %s (deployment=%s, app=%s)", addr, deployment, appName)
+	slog.Info("management server started", "addr", addr, "deployment", deployment, "app", appName)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	}
 }
 

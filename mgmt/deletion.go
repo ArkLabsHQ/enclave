@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -26,7 +26,7 @@ func (s *server) handleScheduleKeyDeletion(w http.ResponseWriter, r *http.Reques
 		WithDecryption: aws.Bool(false),
 	})
 	if err != nil || kmsOut.Parameter == nil || kmsOut.Parameter.Value == nil {
-		log.Printf("schedule-key-deletion: read KMSKeyID from SSM: %v", err)
+		slog.Error("read KMSKeyID from SSM failed", "error", err)
 		http.Error(w, "KMS key ID not found", http.StatusInternalServerError)
 		return
 	}
@@ -43,12 +43,12 @@ func (s *server) handleScheduleKeyDeletion(w http.ResponseWriter, r *http.Reques
 		PendingWindowInDays: &pendingDays,
 	})
 	if err != nil {
-		log.Printf("schedule-key-deletion: KMS error: %v", err)
+		slog.Error("KMS schedule-key-deletion failed", "error", err, "key_id", keyID)
 		http.Error(w, fmt.Sprintf("KMS schedule-key-deletion failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("schedule-key-deletion: key %s scheduled for deletion (7 day window)", keyID)
+	slog.Info("KMS key scheduled for deletion", "key_id", keyID, "pending_days", 7)
 	writeJSON(w, http.StatusOK, deletionResponse{
 		KeyID:       keyID,
 		PendingDays: 7,

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -18,12 +18,18 @@ import (
 )
 
 func main() {
+	sdk.InitLogging()
+
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// 1. Create enclave (instant — no blocking work).
-	enc := sdk.New()
+	enc, err := sdk.New()
+	if err != nil {
+		slog.Error("create enclave failed", "error", err)
+		os.Exit(1)
+	}
 
 	// 2. Ports.
 	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")
@@ -59,7 +65,7 @@ func main() {
 	})
 
 	mux.Handle("/", proxy)
-	handler := enc.Middleware(mux) // sign all responses
+	handler := sdk.LoggingMiddleware(enc.Middleware(mux)) // log + sign all responses
 
 	srv := &http.Server{
 		Addr:         ":" + proxyPort,
@@ -70,10 +76,11 @@ func main() {
 	}
 
 	// 5. Start HTTP server immediately (management endpoints available during init).
+	srvErr := make(chan error, 1)
 	go func() {
-		log.Printf("supervisor :%s -> :%s (version=%s)", proxyPort, appPort, sdk.Version)
+		slog.Info("supervisor started", "proxy_port", proxyPort, "app_port", appPort, "version", sdk.Version)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			srvErr <- err
 		}
 	}()
 
@@ -84,11 +91,11 @@ func main() {
 			var cancel context.CancelFunc
 			initCtx, cancel = context.WithTimeout(ctx, d)
 			defer cancel()
-			log.Printf("init timeout: %s", d)
+			slog.Info("init timeout configured", "timeout", d.String())
 		}
 	}
 	if err := enc.Init(initCtx); err != nil {
-		log.Printf("enclave init error: %v", err)
+		slog.Error("enclave init failed", "error", err)
 	}
 
 	// 7. Start user's app as child process (env vars from KMS are ready).
@@ -104,9 +111,10 @@ func main() {
 		"ENCLAVE_MGMT_TOKEN="+enc.MgmtToken(),
 	)
 	if err := child.Start(); err != nil {
-		log.Fatalf("start %s: %v", appPath, err)
+		slog.Error("start child failed", "path", appPath, "error", err)
+		os.Exit(1)
 	}
-	log.Printf("child: %s pid=%d", appPath, child.Process.Pid)
+	slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
 
 	// 8. Supervise: wait for child exit or shutdown signal.
 	childDone := make(chan error, 1)
@@ -115,16 +123,21 @@ func main() {
 	select {
 	case err := <-childDone:
 		if err != nil {
-			log.Printf("child exited: %v", err)
+			slog.Error("child exited", "error", err)
 		}
 		stop()
+	case err := <-srvErr:
+		slog.Error("server failed", "error", err)
+		_ = child.Process.Signal(syscall.SIGTERM)
+		<-childDone
+		os.Exit(1)
 	case <-ctx.Done():
-		log.Println("shutting down...")
+		slog.Info("shutting down")
 		_ = child.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-childDone:
 		case <-time.After(10 * time.Second):
-			log.Println("child did not exit, sending SIGKILL")
+			slog.Warn("child did not exit, sending SIGKILL")
 			_ = child.Process.Kill()
 			<-childDone
 		}
@@ -133,7 +146,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("server shutdown: %v", err)
+		slog.Error("server shutdown error", "error", err)
 	}
 }
 

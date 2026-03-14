@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -54,9 +54,12 @@ type Enclave struct {
 // New creates an Enclave that is safe to use immediately for serving
 // management endpoints. Call Init() separately to complete initialization.
 // A random management token is generated for authenticating internal API calls.
-func New() *Enclave {
-	token := generateMgmtToken()
-	return &Enclave{previousPCR0: "genesis", mgmtToken: token}
+func New() (*Enclave, error) {
+	token, err := generateMgmtToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate mgmt token: %w", err)
+	}
+	return &Enclave{previousPCR0: "genesis", mgmtToken: token}, nil
 }
 
 // MgmtToken returns the management token for authenticating internal API calls.
@@ -66,12 +69,12 @@ func (e *Enclave) MgmtToken() string {
 }
 
 // generateMgmtToken creates a 32-byte random hex token.
-func generateMgmtToken() string {
+func generateMgmtToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := secureRandom(b); err != nil {
-		panic(fmt.Sprintf("generate mgmt token: %v", err))
+		return "", fmt.Errorf("secure random: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // secureRandom fills the buffer with random bytes from the Nitro NSM hardware
@@ -144,7 +147,7 @@ func (e *Enclave) Init(ctx context.Context) error {
 	}
 
 	if count, err := e.loadDynamicSecrets(ctx); err != nil {
-		log.Printf("warning: load dynamic secrets: %v", err)
+		slog.Warn("load dynamic secrets failed", "error", err)
 	} else {
 		e.dynamicSecretsCount.Store(int64(count))
 	}
@@ -191,6 +194,7 @@ func (e *Enclave) AttestationPubkey() string {
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
 //	GET    /v1/enclave-info
+//	GET    /v1/metrics
 //	POST   /v1/export-key
 //	PUT    /v1/storage/{key...}
 //	GET    /v1/storage/{key...}
@@ -202,6 +206,7 @@ func (e *Enclave) AttestationPubkey() string {
 //	GET    /v1/secrets
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
+	mux.HandleFunc("GET /v1/metrics", handlePrometheusMetrics)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
 	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
@@ -211,6 +216,12 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/secrets/{name}", e.handleSecretGet)
 	mux.HandleFunc("DELETE /v1/secrets/{name}", e.handleSecretDelete)
 	mux.HandleFunc("GET /v1/secrets", e.handleSecretList)
+}
+
+// handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
+func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprint(w, enclaveMetrics.PrometheusText())
 }
 
 // Middleware returns an http.Handler that signs all responses with the
@@ -235,6 +246,8 @@ func (e *Enclave) Middleware(next http.Handler) http.Handler {
 			w.Header().Set("X-Attestation-Signature", sig)
 			w.Header().Set("X-Attestation-Pubkey",
 				hex.EncodeToString(e.attestationKey.PubKey().SerializeCompressed()))
+		} else {
+			w.Header().Set("X-Attestation-Error", "signing-failed")
 		}
 
 		w.WriteHeader(rec.status)
@@ -336,6 +349,7 @@ func (e *Enclave) signResponse(body []byte) string {
 	msgHash := sha256.Sum256(body)
 	sig, err := schnorr.Sign(e.attestationKey, msgHash[:])
 	if err != nil {
+		slog.Warn("schnorr sign failed", "error", err)
 		return ""
 	}
 	return hex.EncodeToString(sig.Serialize())
@@ -364,18 +378,20 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(struct {
-		Version                 string `json:"version"`
-		PreviousPCR0            string `json:"previous_pcr0"`
-		PreviousPCR0Attestation string `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey       string `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets          int64  `json:"dynamic_secrets"`
-		Error                   string `json:"error,omitempty"`
+		Version                 string           `json:"version"`
+		PreviousPCR0            string           `json:"previous_pcr0"`
+		PreviousPCR0Attestation string           `json:"previous_pcr0_attestation,omitempty"`
+		AttestationPubkey       string           `json:"attestation_pubkey,omitempty"`
+		DynamicSecrets          int64            `json:"dynamic_secrets"`
+		Metrics                 map[string]int64 `json:"metrics"`
+		Error                   string           `json:"error,omitempty"`
 	}{
 		Version:                 Version,
 		PreviousPCR0:            e.previousPCR0,
 		PreviousPCR0Attestation: e.previousPCR0Attestation,
 		AttestationPubkey:       e.AttestationPubkey(),
 		DynamicSecrets:          e.dynamicSecretsCount.Load(),
+		Metrics:                 enclaveMetrics.Snapshot(),
 		Error:                   e.InitError(),
 	})
 }

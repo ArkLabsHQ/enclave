@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -49,6 +49,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var req migrateRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"invalid request: %v"}`, err), http.StatusBadRequest)
 		return
@@ -69,7 +70,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	totalSteps := 9
 	emit := func(step int, status, msg string) {
-		log.Printf("[migrate] step %d/%d: %s", step, totalSteps, msg)
+		slog.Info("migrate step", "step", step, "total", totalSteps, "status", status, "msg", msg)
 		json.NewEncoder(w).Encode(migrateStatus{
 			Step:    step,
 			Total:   totalSteps,
@@ -130,9 +131,9 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 			KeyId:               aws.String(newKMSKeyID),
 			PendingWindowInDays: &pendingDays,
 		}); err != nil {
-			log.Printf("[migrate] WARNING: failed to schedule orphaned key %s for deletion: %v", newKMSKeyID, err)
+			slog.Warn("failed to schedule orphaned key for deletion", "key_id", newKMSKeyID, "error", err)
 		} else {
-			log.Printf("[migrate] Scheduled orphaned key %s for deletion (7-day window)", newKMSKeyID)
+			slog.Info("scheduled orphaned key for deletion", "key_id", newKMSKeyID, "pending_days", 7)
 		}
 		s.resetParam(ctx, "MigrationKMSKeyID")
 	}
@@ -208,6 +209,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	// Commands are configurable for different environments:
 	//   Production: systemctl stop/start enclave-watchdog (default)
 	//   Test/QEMU:  custom commands to kill/restart boot-qemu.sh
+	// Commands are split on whitespace — shell metacharacters are not supported.
 	eifDest := envOrDefault("ENCLAVE_EIF_PATH", eifPath)
 	stopCmd := envOrDefault("ENCLAVE_STOP_CMD", "systemctl stop enclave-watchdog")
 	startCmd := envOrDefault("ENCLAVE_START_CMD", "systemctl start enclave-watchdog")
@@ -222,9 +224,10 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stop old enclave only after successful download.
+	// Commands use sh -c because they may contain shell features (pipes, redirects, &&).
 	emit(8, "progress", fmt.Sprintf("Stopping old enclave (%s)...", stopCmd))
 	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
-		log.Printf("[migrate] stop command output: %s", out)
+		slog.Warn("stop command failed", "output", string(out), "error", err)
 		// Non-fatal: enclave may already be stopped.
 		emit(8, "progress", fmt.Sprintf("Stop command returned error (continuing): %v", err))
 	}

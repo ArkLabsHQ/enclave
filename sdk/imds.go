@@ -98,7 +98,9 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
 	imdsCreds, err := fetchIMDSCredentials(ctx)
 	if err != nil {
-		return awscfg.LoadDefaultConfig(ctx)
+		return awscfg.LoadDefaultConfig(ctx,
+			awscfg.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}),
+		)
 	}
 
 	region := os.Getenv("AWS_DEFAULT_REGION")
@@ -122,6 +124,7 @@ func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
 			imdsCreds.SecretAccessKey,
 			imdsCreds.Token,
 		)),
+		awscfg.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}),
 	)
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("load AWS config with IMDS credentials: %w", err)

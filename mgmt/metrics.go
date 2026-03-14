@@ -1,13 +1,24 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const nitridingMetricsURL = "http://localhost:9090/metrics"
+
+// enclaveMetricsClient is a shared HTTP client for fetching metrics from the enclave.
+// InsecureSkipVerify is used because the enclave's TLS cert is self-signed by nitriding.
+var enclaveMetricsClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+}
 
 func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -18,6 +29,17 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			io.Copy(w, resp.Body)
+		}
+	}
+
+	// Proxy enclave application metrics (Prometheus format from supervisor).
+	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
+	appResp, err := enclaveMetricsClient.Get(enclaveURL + "/v1/metrics")
+	if err == nil {
+		defer appResp.Body.Close()
+		if appResp.StatusCode == http.StatusOK {
+			fmt.Fprintln(w)
+			io.Copy(w, appResp.Body)
 		}
 	}
 

@@ -59,8 +59,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libglib2.0-0 libpixman-1-0 libfdt1 libcap-ng0 \
       libslirp0 liburing2 \
       libcbor0.8 libgnutls30 \
-      awscli nodejs npm \
+      awscli nodejs npm wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Prometheus for integration testing.
+RUN wget -qO- https://github.com/prometheus/prometheus/releases/download/v3.4.0/prometheus-3.4.0.linux-amd64.tar.gz \
+    | tar xz -C /usr/local/bin --strip-components=1 prometheus-3.4.0.linux-amd64/prometheus
 
 COPY --from=vsock-build /src/target/release/vhost-device-vsock /usr/local/bin/
 COPY --from=go-build /go/bin/gvproxy /usr/local/bin/

@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
+
+// envMu protects os.Setenv calls from concurrent access.
+var envMu sync.Mutex
 
 // DynamicSecret is the JSON envelope stored in S3 for each dynamic secret.
 type DynamicSecret struct {
@@ -52,10 +56,17 @@ func validateSecretName(name string) error {
 	return nil
 }
 
+// maxSecretValueSize is the maximum size of a dynamic secret value.
+// Env vars have OS-level limits (~128KB on Linux), so cap well below that.
+const maxSecretValueSize = 64 * 1024 // 64KB
+
 // StoreSecret encrypts and persists a dynamic secret.
 func (e *Enclave) StoreSecret(ctx context.Context, name, envVar, value string) error {
 	if err := validateSecretName(name); err != nil {
 		return err
+	}
+	if len(value) > maxSecretValueSize {
+		return fmt.Errorf("secret value too large (%d bytes, max %d)", len(value), maxSecretValueSize)
 	}
 
 	// Validate env_var doesn't collide with static secrets.
@@ -87,12 +98,14 @@ func (e *Enclave) StoreSecret(ctx context.Context, name, envVar, value string) e
 		return fmt.Errorf("marshal secret: %w", err)
 	}
 
-	log.Printf("secret stored: %s (env_var=%q)", name, envVar)
+	enclaveMetrics.SecretWrites.Add(1)
+	slog.Info("secret stored", "name", name, "env_var", envVar)
 	return e.Store(ctx, secretsPrefix+name, data)
 }
 
 // LoadSecret retrieves and decrypts a dynamic secret.
 func (e *Enclave) LoadSecret(ctx context.Context, name string) (*DynamicSecret, error) {
+	enclaveMetrics.SecretReads.Add(1)
 	data, err := e.Load(ctx, secretsPrefix+name)
 	if err != nil {
 		return nil, err
@@ -106,7 +119,8 @@ func (e *Enclave) LoadSecret(ctx context.Context, name string) (*DynamicSecret, 
 
 // DeleteSecret removes a dynamic secret from storage.
 func (e *Enclave) DeleteSecret(ctx context.Context, name string) error {
-	log.Printf("secret deleted: %s", name)
+	enclaveMetrics.SecretDeletes.Add(1)
+	slog.Info("secret deleted", "name", name)
 	return e.Delete(ctx, secretsPrefix+name)
 }
 
@@ -140,15 +154,15 @@ func (e *Enclave) loadDynamicSecrets(ctx context.Context) (int, error) {
 	for _, name := range names {
 		secret, err := e.LoadSecret(ctx, name)
 		if err != nil {
-			log.Printf("warning: skip dynamic secret %q: %v", name, err)
+			slog.Warn("skip dynamic secret", "name", name, "error", err)
 			continue
 		}
 		if secret.EnvVar != "" {
 			if prev, dup := seenEnvVars[secret.EnvVar]; dup {
-				log.Printf("warning: dynamic secret %q and %q both define env_var %q, last write wins", prev, name, secret.EnvVar)
+				slog.Warn("duplicate env_var in dynamic secrets", "prev", prev, "current", name, "env_var", secret.EnvVar)
 			}
 			seenEnvVars[secret.EnvVar] = name
-			os.Setenv(secret.EnvVar, secret.Value)
+			safeSetenv(secret.EnvVar, secret.Value)
 		}
 		loaded++
 	}
@@ -213,7 +227,11 @@ func (e *Enclave) handleSecretPut(w http.ResponseWriter, r *http.Request) {
 	isNew := existsErr != nil
 
 	if err := e.StoreSecret(r.Context(), name, req.EnvVar, req.Value); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if strings.Contains(err.Error(), "too large") {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -320,7 +338,7 @@ func (e *Enclave) handleSecretList(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		secret, err := e.LoadSecret(r.Context(), name)
 		if err != nil {
-			log.Printf("warning: skip secret %q in list: %v", name, err)
+			slog.Warn("skip secret in list", "name", name, "error", err)
 			continue
 		}
 		secrets = append(secrets, DynamicSecretInfo{
@@ -335,4 +353,11 @@ func (e *Enclave) handleSecretList(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(struct {
 		Secrets []DynamicSecretInfo `json:"secrets"`
 	}{Secrets: secrets})
+}
+
+// safeSetenv wraps os.Setenv with a mutex to prevent concurrent env mutations.
+func safeSetenv(key, value string) error {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Setenv(key, value)
 }

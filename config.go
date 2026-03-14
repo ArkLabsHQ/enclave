@@ -5,24 +5,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	accountIDRegex  = regexp.MustCompile(`^\d{12}$`)
+	secretNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+	envVarRegex     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+)
+
+// reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
+var reservedEnvPrefixes = []string{"ENCLAVE_", "AWS_"}
+
 const configFile = "enclave/enclave.yaml"
 
 type Config struct {
-	Name         string           `yaml:"name"`
-	Version      string           `yaml:"version"`
-	Region       string           `yaml:"region"`
-	Account      string           `yaml:"account"`
-	Prefix       string           `yaml:"prefix"`
-	Profile      string           `yaml:"profile"`
-	App          AppConfig        `yaml:"app"`
-	Secrets      []SecretConfig   `yaml:"secrets"`
-	SDK          SDKConfig        `yaml:"sdk"`
-	InstanceType string           `yaml:"instance_type"`
-	NixImage     string           `yaml:"nix_image"`
+	Name         string         `yaml:"name"`
+	Version      string         `yaml:"version"`
+	Region       string         `yaml:"region"`
+	Account      string         `yaml:"account"`
+	Prefix       string         `yaml:"prefix"`
+	Profile      string         `yaml:"profile"`
+	App          AppConfig      `yaml:"app"`
+	Secrets      []SecretConfig `yaml:"secrets"`
+	SDK          SDKConfig      `yaml:"sdk"`
+	InstanceType string         `yaml:"instance_type"`
+	NixImage     string         `yaml:"nix_image"`
 }
 
 type AppConfig struct {
@@ -95,11 +105,16 @@ func loadConfig() (*Config, error) {
 		cfg.App.Language = "go"
 	}
 	// Validate required fields.
+	if cfg.Name == "" {
+		return nil, fmt.Errorf("%s: 'name' is required", configFile)
+	}
 	if cfg.Region == "" {
 		return nil, fmt.Errorf("%s: 'region' is required", configFile)
 	}
+
 	// Validate secrets.
 	seen := make(map[string]bool)
+	seenEnv := make(map[string]bool)
 	for i, s := range cfg.Secrets {
 		if s.Name == "" {
 			return nil, fmt.Errorf("%s: secrets[%d].name is required", configFile, i)
@@ -107,19 +122,37 @@ func loadConfig() (*Config, error) {
 		if s.EnvVar == "" {
 			return nil, fmt.Errorf("%s: secrets[%d].env_var is required", configFile, i)
 		}
+		if !secretNameRegex.MatchString(s.Name) {
+			return nil, fmt.Errorf("%s: secrets[%d].name %q must be alphanumeric with underscores, starting with a letter", configFile, i, s.Name)
+		}
+		if !envVarRegex.MatchString(s.EnvVar) {
+			return nil, fmt.Errorf("%s: secrets[%d].env_var %q must be uppercase alphanumeric with underscores", configFile, i, s.EnvVar)
+		}
+		for _, prefix := range reservedEnvPrefixes {
+			if len(s.EnvVar) >= len(prefix) && s.EnvVar[:len(prefix)] == prefix {
+				return nil, fmt.Errorf("%s: secrets[%d].env_var %q uses reserved prefix %q", configFile, i, s.EnvVar, prefix)
+			}
+		}
 		if seen[s.Name] {
 			return nil, fmt.Errorf("%s: duplicate secret name %q", configFile, s.Name)
 		}
+		if seenEnv[s.EnvVar] {
+			return nil, fmt.Errorf("%s: duplicate secret env_var %q", configFile, s.EnvVar)
+		}
 		seen[s.Name] = true
+		seenEnv[s.EnvVar] = true
 	}
 	return &cfg, nil
 }
 
-// validateAccount checks that the AWS account ID is present. Only needed for
-// commands that interact with AWS (deploy, destroy, status, lock).
+// validateAccount checks that the AWS account ID is present and valid.
+// Only needed for commands that interact with AWS (deploy, destroy, status, lock).
 func (c *Config) validateAccount() error {
 	if c.Account == "" {
 		return fmt.Errorf("%s: 'account' is required", configFile)
+	}
+	if !accountIDRegex.MatchString(c.Account) {
+		return fmt.Errorf("%s: account %q must be a 12-digit AWS account ID", configFile, c.Account)
 	}
 	return nil
 }

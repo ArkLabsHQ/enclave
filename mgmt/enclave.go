@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -36,12 +36,12 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command("systemctl", "start", "enclave-watchdog")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("start enclave: %v: %s", err, output)
+		slog.Error("start enclave failed", "error", err, "output", string(output))
 		http.Error(w, fmt.Sprintf("failed to start enclave-watchdog: %v\n%s", err, output), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("start enclave: watchdog started")
+	slog.Info("enclave watchdog started")
 	writeJSON(w, http.StatusOK, enclaveActionResponse{
 		Action:  "start",
 		Status:  "started",
@@ -75,12 +75,12 @@ func (s *server) handleStop(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command("systemctl", "stop", "enclave-watchdog")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("stop enclave: %v: %s", err, output)
+		slog.Error("stop enclave failed", "error", err, "output", string(output))
 		http.Error(w, fmt.Sprintf("failed to stop enclave-watchdog: %v\n%s", err, output), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("stop enclave: watchdog stopped")
+	slog.Info("enclave watchdog stopped")
 	writeJSON(w, http.StatusOK, enclaveActionResponse{
 		Action:  "stop",
 		Status:  "stopped",

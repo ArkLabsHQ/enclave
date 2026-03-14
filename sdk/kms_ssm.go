@@ -119,7 +119,7 @@ func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClien
 	}
 
 	secretHex := hex.EncodeToString(out.Plaintext)
-	if err := os.Setenv(envVar, secretHex); err != nil {
+	if err := safeSetenv(envVar, secretHex); err != nil {
 		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 
@@ -169,7 +169,7 @@ func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ci
 
 	secretHex := normalizeSecretHex(plaintext)
 
-	if err := os.Setenv(envVar, secretHex); err != nil {
+	if err := safeSetenv(envVar, secretHex); err != nil {
 		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 

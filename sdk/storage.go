@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -78,7 +80,9 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 		if err := storeCiphertextInSSM(ctx, ssmClient, primaryParam, reEncrypted); err != nil {
 			return fmt.Errorf("store adopted DEK: %w", err)
 		}
-		_ = storeCiphertextInSSM(ctx, ssmClient, migParam, "UNSET")
+		if err := storeCiphertextInSSM(ctx, ssmClient, migParam, "UNSET"); err != nil {
+			slog.Warn("clear migrated DEK param failed", "error", err)
+		}
 		return nil
 	}
 
@@ -117,50 +121,71 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 }
 
 // decryptDEK decrypts a base64-encoded KMS ciphertext using NSM attestation.
+// Retries up to 3 times with exponential backoff on transient failures.
 func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64 string) ([]byte, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode ciphertext: %w", err)
 	}
 
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return nil, fmt.Errorf("open NSM session: %w", err)
-	}
-	defer session.Close()
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("KMS decrypt cancelled: %w", ctx.Err())
+			}
+			slog.Warn("retrying KMS decrypt", "attempt", attempt+1, "max_attempts", 3, "error", lastErr)
+		}
 
-	attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
-	if err != nil {
-		return nil, err
-	}
+		session, err := nsm.OpenDefaultSession()
+		if err != nil {
+			return nil, fmt.Errorf("open NSM session: %w", err)
+		}
 
-	out, err := kmsClient.Decrypt(ctx, &kms.DecryptInput{
-		KeyId:          aws.String(keyID),
-		CiphertextBlob: ciphertext,
-		Recipient: &kmstypes.RecipientInfo{
-			AttestationDocument:    attestationDoc,
-			KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("KMS decrypt: %w", err)
-	}
+		attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
+		if err != nil {
+			session.Close()
+			return nil, err
+		}
 
-	if len(out.CiphertextForRecipient) == 0 {
-		return nil, fmt.Errorf("KMS decrypt returned empty CiphertextForRecipient")
-	}
+		enclaveMetrics.KMSOperations.Add(1)
+		out, err := kmsClient.Decrypt(ctx, &kms.DecryptInput{
+			KeyId:          aws.String(keyID),
+			CiphertextBlob: ciphertext,
+			Recipient: &kmstypes.RecipientInfo{
+				AttestationDocument:    attestationDoc,
+				KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
+			},
+		})
+		session.Close()
+		if err != nil {
+			enclaveMetrics.KMSErrors.Add(1)
+			lastErr = err
+			continue
+		}
 
-	plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
-	}
+		if len(out.CiphertextForRecipient) == 0 {
+			return nil, fmt.Errorf("KMS decrypt returned empty CiphertextForRecipient")
+		}
 
-	return plaintext, nil
+		plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+		}
+
+		return plaintext, nil
+	}
+	return nil, fmt.Errorf("KMS decrypt failed after 3 attempts: %w", lastErr)
 }
 
 // Store encrypts data with the DEK and persists it to S3.
 func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
+	enclaveMetrics.StorageWrites.Add(1)
 	if e.dek == nil {
+		enclaveMetrics.StorageErrors.Add(1)
 		return fmt.Errorf("storage not initialized")
 	}
 
@@ -191,6 +216,7 @@ func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
 		Body:   bytes.NewReader(blob),
 	})
 	if err != nil {
+		enclaveMetrics.StorageErrors.Add(1)
 		return fmt.Errorf("S3 put: %w", err)
 	}
 	return nil
@@ -199,7 +225,9 @@ func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
 // Load retrieves and decrypts data from S3.
 // Returns ErrNotFound if the key does not exist.
 func (e *Enclave) Load(ctx context.Context, key string) ([]byte, error) {
+	enclaveMetrics.StorageReads.Add(1)
 	if e.dek == nil {
+		enclaveMetrics.StorageErrors.Add(1)
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
@@ -247,7 +275,9 @@ func (e *Enclave) Load(ctx context.Context, key string) ([]byte, error) {
 
 // Delete removes a key from storage.
 func (e *Enclave) Delete(ctx context.Context, key string) error {
+	enclaveMetrics.StorageDeletes.Add(1)
 	if e.s3Client == nil {
+		enclaveMetrics.StorageErrors.Add(1)
 		return fmt.Errorf("storage not initialized")
 	}
 

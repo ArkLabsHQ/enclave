@@ -13,8 +13,8 @@ nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.48"
-  hash: "sha256-ED/SuJskeJgyH6OvnpWoSTvPa4/vFiJurTwOY4fLd0k="
+  rev: "v0.0.49"
+  hash: "sha256-QVdEmr816UHDyVtoYJwuY+pgEtN5J8DfYDjh9RwHS3c="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -41,5 +41,5 @@ app:
 
 # One secret for testing KMS secret init and migration.
 secrets:
-  - name: signing-key
+  - name: signing_key
     env_var: SIGNING_KEY

@@ -174,7 +174,9 @@ func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 st
 func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root, ec2RoleARN string) (string, error) {
 	// Create S3 bucket for EIF transfer (idempotent).
 	eifBucket := cfg.eifBucket()
-	ac.ensureBucket(ctx, eifBucket)
+	if err := ac.ensureBucket(ctx, eifBucket); err != nil {
+		return "", fmt.Errorf("create EIF bucket: %w", err)
+	}
 
 	// Grant EC2 role read access to the bucket.
 	bucketPolicy := fmt.Sprintf(`{
@@ -194,7 +196,7 @@ func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root,
 	// Upload new EIF.
 	eifPath := filepath.Join(root, "enclave", "artifacts", "image.eif")
 	if _, err := os.Stat(eifPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("enclave/artifacts/image.eif not found. Run 'enclave build' first.")
+		return "", fmt.Errorf("enclave/artifacts/image.eif not found (run 'enclave build' first)")
 	}
 
 	fmt.Printf("[deploy] Uploading new EIF to s3://%s/image.eif ...\n", eifBucket)
@@ -288,7 +290,7 @@ func callMgmtMigrateDirect(ctx context.Context, mgmtURL, payload string) error {
 	if err != nil {
 		return fmt.Errorf("call mgmt /migrate: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -378,7 +380,7 @@ func readPCR0(root string) (string, error) {
 	pcrPath := filepath.Join(root, "enclave", "artifacts", "pcr.json")
 	data, err := os.ReadFile(pcrPath)
 	if err != nil {
-		return "", fmt.Errorf("enclave/artifacts/pcr.json not found. Run 'enclave build' first.")
+		return "", fmt.Errorf("enclave/artifacts/pcr.json not found (run 'enclave build' first)")
 	}
 	var pcrs PCRValues
 	if err := json.Unmarshal(data, &pcrs); err != nil {

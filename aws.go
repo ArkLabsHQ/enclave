@@ -11,9 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -96,51 +94,6 @@ func (ac *awsClients) waitInstanceReady(ctx context.Context, instanceID string) 
 	}, 10*time.Minute)
 }
 
-// --- KMS ---
-
-func (ac *awsClients) getKeyState(ctx context.Context, keyID string) (string, error) {
-	out, err := ac.kmsClient.DescribeKey(ctx, &kms.DescribeKeyInput{
-		KeyId: aws.String(keyID),
-	})
-	if err != nil {
-		return "", err
-	}
-	return string(out.KeyMetadata.KeyState), nil
-}
-
-func (ac *awsClients) getKeyPolicy(ctx context.Context, keyID string) (string, error) {
-	out, err := ac.kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId:      aws.String(keyID),
-		PolicyName: aws.String("default"),
-	})
-	if err != nil {
-		return "", err
-	}
-	if out.Policy == nil {
-		return "", nil
-	}
-	return *out.Policy, nil
-}
-
-func (ac *awsClients) putKeyPolicy(ctx context.Context, keyID, policy string, bypassLockout bool) error {
-	_, err := ac.kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-		KeyId:                          aws.String(keyID),
-		Policy:                         aws.String(policy),
-		BypassPolicyLockoutSafetyCheck: bypassLockout,
-	})
-	return err
-}
-
-func (ac *awsClients) createKey(ctx context.Context, description string) (string, error) {
-	out, err := ac.kmsClient.CreateKey(ctx, &kms.CreateKeyInput{
-		Description: aws.String(description),
-	})
-	if err != nil {
-		return "", err
-	}
-	return *out.KeyMetadata.KeyId, nil
-}
-
 // --- SSM ---
 
 func (ac *awsClients) getParameter(ctx context.Context, name string) (string, error) {
@@ -164,10 +117,6 @@ func (ac *awsClients) putParameter(ctx context.Context, name, value string) erro
 		Overwrite: aws.Bool(true),
 	})
 	return err
-}
-
-func (ac *awsClients) resetParameter(ctx context.Context, name string) error {
-	return ac.putParameter(ctx, name, "UNSET")
 }
 
 // runOnHost runs commands on the EC2 host via SSM Run Command and waits for completion.
@@ -283,7 +232,7 @@ func (ac *awsClients) uploadFile(ctx context.Context, bucket, key, filePath stri
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = ac.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
@@ -292,9 +241,3 @@ func (ac *awsClients) uploadFile(ctx context.Context, bucket, key, filePath stri
 	})
 	return err
 }
-
-// Suppress unused import warnings for types used only in method signatures.
-var (
-	_ ec2types.InstanceStateName
-	_ kmstypes.KeyState
-)

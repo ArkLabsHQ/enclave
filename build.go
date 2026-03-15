@@ -31,13 +31,13 @@ type EIFBuildConfig struct {
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
 type buildConfigJSON struct {
-	Name    string                 `json:"name"`
-	Version string                 `json:"version"`
-	Region  string                 `json:"region"`
-	Prefix  string                 `json:"prefix"`
-	App     buildConfigAppJSON     `json:"app"`
+	Name    string                  `json:"name"`
+	Version string                  `json:"version"`
+	Region  string                  `json:"region"`
+	Prefix  string                  `json:"prefix"`
+	App     buildConfigAppJSON      `json:"app"`
 	Secrets []buildConfigSecretJSON `json:"secrets"`
-	SDK     buildConfigSDKJSON     `json:"sdk"`
+	SDK     buildConfigSDKJSON      `json:"sdk"`
 }
 
 type buildConfigAppJSON struct {
@@ -146,10 +146,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 	// Convert secrets config.
 	var secrets []buildConfigSecretJSON
 	for _, s := range cfg.Secrets {
-		secrets = append(secrets, buildConfigSecretJSON{
-			Name:   s.Name,
-			EnvVar: s.EnvVar,
-		})
+		secrets = append(secrets, buildConfigSecretJSON(s))
 	}
 
 	bc := buildConfigJSON{

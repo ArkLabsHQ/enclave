@@ -113,7 +113,7 @@ echo "$SOURCE_HASH" > /src/%s
 	}
 
 	resultPath := filepath.Join(root, resultFile)
-	defer os.Remove(resultPath)
+	defer func() { _ = os.Remove(resultPath) }()
 
 	data, err := os.ReadFile(resultPath)
 	if err != nil {

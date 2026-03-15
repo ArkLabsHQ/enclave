@@ -147,7 +147,7 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 
 		attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
 		if err != nil {
-			session.Close()
+			_ = session.Close()
 			return nil, err
 		}
 
@@ -160,7 +160,7 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 				KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
 			},
 		})
-		session.Close()
+		_ = session.Close()
 		if err != nil {
 			enclaveMetrics.KMSErrors.Add(1)
 			lastErr = err
@@ -242,7 +242,7 @@ func (e *Enclave) Load(ctx context.Context, key string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("S3 get: %w", err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	blob, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -380,7 +380,7 @@ func (e *Enclave) handleStoragePut(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Key    string `json:"key"`
 		Status string `json:"status"`
 	}{Key: key, Status: "stored"})
@@ -418,7 +418,7 @@ func (e *Enclave) handleStorageGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 // handleStorageDelete handles DELETE /v1/storage/{key...}.
@@ -447,7 +447,7 @@ func (e *Enclave) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Key    string `json:"key"`
 		Status string `json:"status"`
 	}{Key: key, Status: "deleted"})
@@ -477,7 +477,7 @@ func (e *Enclave) handleStorageList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Keys []string `json:"keys"`
 	}{Keys: keys})
 }

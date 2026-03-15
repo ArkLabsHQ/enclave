@@ -93,7 +93,7 @@ func secureRandom(b []byte) (int, error) {
 		// Not in an enclave (no /dev/nsm) — crypto/rand is fine on normal Linux.
 		return rand.Read(b)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 	// In an enclave — NSM hardware RNG is the only trustworthy source.
 	return session.Read(b)
 }
@@ -221,7 +221,7 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 // handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
 func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprint(w, enclaveMetrics.PrometheusText())
+	_, _ = fmt.Fprint(w, enclaveMetrics.PrometheusText())
 }
 
 // Middleware returns an http.Handler that signs all responses with the
@@ -251,7 +251,7 @@ func (e *Enclave) Middleware(next http.Handler) http.Handler {
 		}
 
 		w.WriteHeader(rec.status)
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 }
 
@@ -296,7 +296,7 @@ func (e *Enclave) generateAttestationKey() error {
 	if err != nil {
 		return fmt.Errorf("POST /enclave/hash: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -363,7 +363,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 
 	if !e.initDone.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(struct {
+		_ = json.NewEncoder(w).Encode(struct {
 			Version      string `json:"version"`
 			PreviousPCR0 string `json:"previous_pcr0"`
 			Initializing bool   `json:"initializing"`
@@ -377,7 +377,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Version                 string           `json:"version"`
 		PreviousPCR0            string           `json:"previous_pcr0"`
 		PreviousPCR0Attestation string           `json:"previous_pcr0_attestation,omitempty"`
@@ -402,7 +402,7 @@ func extendPCR(index uint, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	resp, err := session.Send(&request.ExtendPCR{
 		Index: uint16(index),

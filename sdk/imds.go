@@ -47,7 +47,7 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch IMDS token: %w", err)
 	}
-	defer tokenResp.Body.Close()
+	defer func() { _ = tokenResp.Body.Close() }()
 
 	tokenBytes, err := io.ReadAll(tokenResp.Body)
 	if err != nil {
@@ -66,7 +66,7 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch IAM role: %w", err)
 	}
-	defer roleResp.Body.Close()
+	defer func() { _ = roleResp.Body.Close() }()
 
 	roleBytes, err := io.ReadAll(roleResp.Body)
 	if err != nil {
@@ -85,7 +85,7 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch credentials: %w", err)
 	}
-	defer credsResp.Body.Close()
+	defer func() { _ = credsResp.Body.Close() }()
 
 	var creds imdsCredentials
 	if err := json.NewDecoder(credsResp.Body).Decode(&creds); err != nil {

@@ -273,7 +273,7 @@ fi
 
 	// Read results from the file written by the container.
 	resultPath := filepath.Join(root, resultFile)
-	defer os.Remove(resultPath)
+	defer func() { _ = os.Remove(resultPath) }()
 
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
@@ -307,7 +307,7 @@ func detectGitRemote(root string) (owner, repo string, err error) {
 	cmd.Dir = root
 	out, err := cmd.Output()
 	if err != nil {
-		return "", "", fmt.Errorf("cannot detect git remote: %w\nMake sure you are in a git repo with an 'origin' remote.", err)
+		return "", "", fmt.Errorf("cannot detect git remote: %w (make sure you are in a git repo with an 'origin' remote)", err)
 	}
 
 	remoteURL := strings.TrimSpace(string(out))
@@ -363,7 +363,7 @@ func computeNixHash(root string, rev string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// git archive --format=tar.gz --prefix=source/ HEAD | tar xz -C tmpDir
 	archiveCmd := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
@@ -452,7 +452,7 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 	if len(matches) < 2 {
 		// Print stderr so user can debug.
 		fmt.Fprintf(os.Stderr, "\n[setup] Trial build output:\n%s\n", output)
-		return "", fmt.Errorf("could not extract vendor hash from trial build output.\nRun a manual nix build with vendorHash = \"\" and look for the 'got:' line.")
+		return "", fmt.Errorf("could not extract vendor hash from trial build output (run a manual nix build with vendorHash = \"\" and look for the 'got:' line)")
 	}
 
 	return matches[1], nil
@@ -556,7 +556,7 @@ fi
 	}
 
 	resultPath := filepath.Join(root, resultFile)
-	defer os.Remove(resultPath)
+	defer func() { _ = os.Remove(resultPath) }()
 
 	data, err := os.ReadFile(resultPath)
 	if err != nil {

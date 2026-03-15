@@ -137,7 +137,7 @@ func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ci
 	if err != nil {
 		return fmt.Errorf("open nsm session: %w", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
 	if err != nil {
@@ -243,7 +243,7 @@ func getAttestationDocumentB64() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open NSM session: %w", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	nonce := make([]byte, 32)
 	if _, err := io.ReadFull(session, nonce); err != nil {

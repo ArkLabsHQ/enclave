@@ -47,7 +47,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		if !enc.IsReady() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
+			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "initializing",
 				"error":  enc.InitError(),
 			})
@@ -55,13 +55,13 @@ func main() {
 		}
 		if enc.InitError() != "" {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
+			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "degraded",
 				"error":  enc.InitError(),
 			})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
 
 	mux.Handle("/", proxy)

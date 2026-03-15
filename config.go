@@ -79,7 +79,7 @@ func loadConfig() (*Config, error) {
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w\nRun 'enclave init' to create one.", configPath, err)
+		return nil, fmt.Errorf("cannot read %s: %w (run 'enclave init' to create one)", configPath, err)
 	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -195,7 +195,7 @@ type CDKOutputs map[string]map[string]string
 func loadCDKOutputs(root string) (CDKOutputs, error) {
 	data, err := os.ReadFile(filepath.Join(root, "enclave", "cdk-outputs.json"))
 	if err != nil {
-		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w\nRun 'enclave deploy' first.", err)
+		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w (run 'enclave deploy' first)", err)
 	}
 	var outputs CDKOutputs
 	if err := json.Unmarshal(data, &outputs); err != nil {

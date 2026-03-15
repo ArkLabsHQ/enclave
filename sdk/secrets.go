@@ -162,7 +162,7 @@ func (e *Enclave) loadDynamicSecrets(ctx context.Context) (int, error) {
 				slog.Warn("duplicate env_var in dynamic secrets", "prev", prev, "current", name, "env_var", secret.EnvVar)
 			}
 			seenEnvVars[secret.EnvVar] = name
-			safeSetenv(secret.EnvVar, secret.Value)
+			_ = safeSetenv(secret.EnvVar, secret.Value)
 		}
 		loaded++
 	}
@@ -241,7 +241,7 @@ func (e *Enclave) handleSecretPut(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Name   string `json:"name"`
 		Status string `json:"status"`
 	}{Name: name, Status: "stored"})
@@ -274,7 +274,7 @@ func (e *Enclave) handleSecretGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(secret)
+	_ = json.NewEncoder(w).Encode(secret)
 }
 
 // handleSecretDelete handles DELETE /v1/secrets/{name}.
@@ -311,7 +311,7 @@ func (e *Enclave) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 	e.dynamicSecretsCount.Add(-1)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Name   string `json:"name"`
 		Status string `json:"status"`
 	}{Name: name, Status: "deleted"})
@@ -350,7 +350,7 @@ func (e *Enclave) handleSecretList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
+	_ = json.NewEncoder(w).Encode(struct {
 		Secrets []DynamicSecretInfo `json:"secrets"`
 	}{Secrets: secrets})
 }

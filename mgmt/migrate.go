@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
@@ -71,7 +70,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	totalSteps := 9
 	emit := func(step int, status, msg string) {
 		slog.Info("migrate step", "step", step, "total", totalSteps, "status", status, "msg", msg)
-		json.NewEncoder(w).Encode(migrateStatus{
+		_ = json.NewEncoder(w).Encode(migrateStatus{
 			Step:    step,
 			Total:   totalSteps,
 			Status:  status,
@@ -278,7 +277,7 @@ func (s *server) callExportKey(ctx context.Context, migrationKeyID string) error
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("export-key returned %d: %s", resp.StatusCode, string(body))
@@ -343,7 +342,7 @@ func (s *server) putParam(ctx context.Context, name, value string) error {
 }
 
 func (s *server) resetParam(ctx context.Context, name string) {
-	s.putParam(ctx, name, "UNSET")
+	_ = s.putParam(ctx, name, "UNSET")
 }
 
 func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) error {
@@ -354,7 +353,7 @@ func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) 
 	if err != nil {
 		return fmt.Errorf("S3 GetObject: %w", err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	tmp := destPath + ".tmp"
 	f, err := os.Create(tmp)
@@ -362,12 +361,12 @@ func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) 
 		return err
 	}
 	if _, err := io.Copy(f, out.Body); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, destPath)
@@ -454,20 +453,15 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	return out.Close()
 }
-
-// Suppress unused import warnings.
-var (
-	_ kmstypes.KeyState
-)

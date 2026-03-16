@@ -23,8 +23,8 @@ app:
 
   nix_owner: "ArkLabsHQ"
   nix_repo: "introspector-enclave"
-  nix_rev: "bbd07ebfb69ea1c8a853faba1684d7e9e9dc4fee"
-  nix_hash: "sha256-m3Rpi1i2VLAHuJNRr50tpZnsG3O0Fe/aYyNgm44cR/A="
+  nix_rev: "fe47646e358fde58270b73e21676ff1e9f1e44f9"
+  nix_hash: "sha256-beQWmWFxWTzwiJ7v57Nv0rsp1SlBfa3p9gjVjU4MtRI="
   nix_vendor_hash: "sha256-qXVmH7vthrkgAVvaxAHdaTuZ0yeZsnkbcboytzbE13s="
   nix_sub_packages:
     - "cmd"

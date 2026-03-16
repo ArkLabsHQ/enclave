@@ -25,7 +25,9 @@ import (
 
 // attestationPayload is the CBOR structure inside a COSE Sign1 attestation document.
 type attestationPayload struct {
-	PCRs map[uint][]byte `cbor:"pcrs"`
+	PCRs     map[uint][]byte `cbor:"pcrs"`
+	UserData []byte          `cbor:"user_data"`
+	Nonce    []byte          `cbor:"nonce"`
 }
 
 // supervisorURL is the internal URL of the enclave-supervisor.
@@ -55,6 +57,7 @@ func main() {
 	mux.HandleFunc("GET /test/dynamic-secret-persistence", handleTestDynamicSecretPersistence)
 	mux.HandleFunc("GET /test/pcr-secrets", handleTestPCRSecrets)
 	mux.HandleFunc("GET /test/attestation-persistence", handleTestAttestationPersistence)
+	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
 
 	log.Printf("listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -551,7 +554,7 @@ func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch the real attestation document from nitriding to verify NSM works.
 	// QEMU NSM only includes PCRs 0-15; PCR16 is not in the attestation doc.
-	pcrs, err := fetchAttestationPCRs()
+	doc, err := fetchAttestationDoc()
 	if err != nil {
 		results["error"] = fmt.Sprintf("fetch attestation: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -559,7 +562,7 @@ func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results["pcr_count"] = len(pcrs)
+	results["pcr_count"] = len(doc.PCRs)
 	results["attestation_doc_valid"] = true
 
 	results["status"] = "ok"
@@ -574,7 +577,7 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 
 	results := map[string]any{}
 
-	pcrs, err := fetchAttestationPCRs()
+	doc, err := fetchAttestationDoc()
 	if err != nil {
 		results["error"] = fmt.Sprintf("fetch attestation: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -582,17 +585,17 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results["pcr_count"] = len(pcrs)
+	results["pcr_count"] = len(doc.PCRs)
 
 	// Report all PCR values.
 	pcrMap := map[string]string{}
-	for idx, val := range pcrs {
+	for idx, val := range doc.PCRs {
 		pcrMap[fmt.Sprintf("pcr%d", idx)] = hex.EncodeToString(val)
 	}
 	results["pcrs"] = pcrMap
 
 	// Check PCR0 is present (even if all zeros in QEMU).
-	if pcr0, ok := pcrs[0]; ok {
+	if pcr0, ok := doc.PCRs[0]; ok {
 		results["pcr0"] = hex.EncodeToString(pcr0)
 		results["pcr0_present"] = true
 		// Check if PCR0 is non-zero (QEMU may or may not set it).
@@ -612,12 +615,107 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// fetchAttestationPCRs fetches a raw attestation document from nitriding's
+// handleTestAttestationBinding verifies the full attestation chain of trust:
+// 1. Fetch a signed response from the supervisor (get X-Attestation-Pubkey header)
+// 2. Fetch the attestation document from nitriding (get UserData field)
+// 3. Verify SHA256(X-Attestation-Pubkey) == UserData
+// This proves the signing key is bound to the NSM attestation document.
+func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	results := map[string]any{}
+
+	// Step 1: Get the attestation pubkey from a signed response.
+	resp, err := http.Get(supervisorURL + "/v1/enclave-info")
+	if err != nil {
+		results["error"] = fmt.Sprintf("fetch enclave-info: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	pubkeyHex := resp.Header.Get("X-Attestation-Pubkey")
+	sigHex := resp.Header.Get("X-Attestation-Signature")
+	if pubkeyHex == "" || sigHex == "" {
+		results["error"] = "attestation headers missing from response"
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	// Verify the Schnorr signature on the response body.
+	pubkeyBytes, err := hex.DecodeString(pubkeyHex)
+	if err != nil {
+		results["error"] = fmt.Sprintf("decode pubkey: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	pubkey, err := btcec.ParsePubKey(pubkeyBytes)
+	if err != nil {
+		results["error"] = fmt.Sprintf("parse pubkey: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	sigBytes, _ := hex.DecodeString(sigHex)
+	sig, err := schnorr.ParseSignature(sigBytes)
+	if err != nil {
+		results["error"] = fmt.Sprintf("parse signature: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	msgHash := sha256.Sum256(body)
+	results["signature_valid"] = sig.Verify(msgHash[:], pubkey)
+
+	// Step 2: Compute SHA256(compressed_pubkey) — this is what the SDK registered
+	// with nitriding via POST /enclave/hash during Init.
+	pubkeyHash := sha256.Sum256(pubkeyBytes)
+	results["pubkey_hash"] = hex.EncodeToString(pubkeyHash[:])
+
+	// Step 3: Fetch attestation document and extract UserData.
+	doc, err := fetchAttestationDoc()
+	if err != nil {
+		results["error"] = fmt.Sprintf("fetch attestation doc: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	if len(doc.UserData) == 0 {
+		results["error"] = "attestation document has no user_data field"
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	results["user_data"] = hex.EncodeToString(doc.UserData)
+	results["user_data_length"] = len(doc.UserData)
+
+	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal UserData.
+	binding_valid := bytes.Equal(pubkeyHash[:], doc.UserData)
+	results["binding_valid"] = binding_valid
+
+	if binding_valid {
+		results["status"] = "ok"
+	} else {
+		results["error"] = fmt.Sprintf("binding mismatch: SHA256(pubkey)=%s, UserData=%s",
+			hex.EncodeToString(pubkeyHash[:]), hex.EncodeToString(doc.UserData))
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+
+	json.NewEncoder(w).Encode(results)
+}
+
+// fetchAttestationDoc fetches a raw attestation document from nitriding's
 // external HTTPS /enclave/attestation endpoint, parses the COSE Sign1 CBOR
-// structure, and returns the PCR map.
+// structure, and returns the full attestation payload (PCRs, UserData, Nonce).
 // Note: uses nitriding's HTTPS port (443) because /enclave/attestation is only
 // served on the external listener, not the internal HTTP port.
-func fetchAttestationPCRs() (map[uint][]byte, error) {
+func fetchAttestationDoc() (*attestationPayload, error) {
 	tlsClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -684,7 +782,7 @@ func fetchAttestationPCRs() (map[uint][]byte, error) {
 		return nil, fmt.Errorf("attestation document has no PCRs")
 	}
 
-	return doc.PCRs, nil
+	return &doc, nil
 }
 
 // handleTestAttestationPersistence verifies that the attestation pubkey and

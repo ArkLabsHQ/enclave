@@ -685,25 +685,37 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(doc.UserData) == 0 {
-		results["error"] = "attestation document has no user_data field"
+	// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
+	// Total 68 bytes. appKeyHash (our attestation pubkey hash) is at bytes 36:68.
+	results["user_data"] = hex.EncodeToString(doc.UserData)
+	results["user_data_length"] = len(doc.UserData)
+
+	if len(doc.UserData) < 68 {
+		results["error"] = fmt.Sprintf("UserData too short: %d bytes (need 68)", len(doc.UserData))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
 
-	results["user_data"] = hex.EncodeToString(doc.UserData)
-	results["user_data_length"] = len(doc.UserData)
+	if doc.UserData[34] != 0x12 || doc.UserData[35] != 0x20 {
+		results["error"] = fmt.Sprintf("UserData missing multihash prefix at offset 34 (got %02x %02x)", doc.UserData[34], doc.UserData[35])
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
 
-	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal UserData.
-	binding_valid := bytes.Equal(pubkeyHash[:], doc.UserData)
-	results["binding_valid"] = binding_valid
+	appKeyHash := doc.UserData[36:68]
+	results["app_key_hash"] = hex.EncodeToString(appKeyHash)
 
-	if binding_valid {
+	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal appKeyHash.
+	bindingValid := bytes.Equal(pubkeyHash[:], appKeyHash)
+	results["binding_valid"] = bindingValid
+
+	if bindingValid {
 		results["status"] = "ok"
 	} else {
-		results["error"] = fmt.Sprintf("binding mismatch: SHA256(pubkey)=%s, UserData=%s",
-			hex.EncodeToString(pubkeyHash[:]), hex.EncodeToString(doc.UserData))
+		results["error"] = fmt.Sprintf("binding mismatch: SHA256(pubkey)=%s, appKeyHash=%s",
+			hex.EncodeToString(pubkeyHash[:]), hex.EncodeToString(appKeyHash))
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 

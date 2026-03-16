@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
@@ -671,7 +672,12 @@ func fetchAttestationPCRs() (map[uint][]byte, error) {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	resp, err := tlsClient.Get("https://localhost:443/enclave/attestation")
+	nonceBytes := make([]byte, 20)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	resp, err := tlsClient.Get("https://localhost:443/enclave/attestation?nonce=" + nonce)
 	if err != nil {
 		return nil, fmt.Errorf("GET /enclave/attestation: %w", err)
 	}

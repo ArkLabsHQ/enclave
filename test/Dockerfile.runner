@@ -72,4 +72,7 @@ COPY --from=go-build /enclave-cli /usr/local/bin/enclave-cli
 COPY --from=go-build /enclave-mgmt /usr/local/bin/enclave-mgmt
 COPY --from=qemu-build /qemu-install/usr/local/ /usr/local/
 
+COPY test/boot-qemu.sh /usr/local/bin/boot-qemu.sh
+RUN chmod +x /usr/local/bin/boot-qemu.sh
+
 WORKDIR /test

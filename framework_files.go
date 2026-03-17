@@ -1592,20 +1592,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: cachix/install-nix-action@v27
-        with:
-          nix_path: nixpkgs=channel:nixos-25.05
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
       - uses: actions/setup-go@v5
         with:
           go-version: stable
 
       - name: Install enclave CLI
         run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - name: Pull Nix Docker image
+        run: docker pull nixos/nix:2.24.9
 
       - name: Build EIF
         run: enclave build
@@ -1665,6 +1660,7 @@ services:
   # Downloads the latest EIF from GitHub Releases before the enclave starts.
   eif-downloader:
     image: curlimages/curl:latest
+    user: "0:0"
     volumes:
       - eif-artifacts:/artifacts
     environment:

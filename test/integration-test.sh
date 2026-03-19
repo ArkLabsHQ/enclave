@@ -129,28 +129,42 @@ else
   fail "Dynamic secrets" "${DYN_RESP:0:120}"
 fi
 
-# Test 11: PCR secret derivation + attestation document fetch.
-# Verifies SIGNING_KEY → pubkey → extension data derivation and that NSM
-# returns a valid attestation document. QEMU NSM only includes PCRs 0-15.
-echo "[11/20] PCR secret derivation + attestation doc"
+# Test 11: PCR secret derivation + attestation document PCR16 verification.
+# Verifies SIGNING_KEY → pubkey → extension data derivation and that PCR16
+# in the attestation document matches the expected value (extended + locked by SDK).
+echo "[11/20] PCR secret derivation + PCR16 verification"
 PCR_RESP=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
 if [ -n "$PCR_RESP" ] && echo "$PCR_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   PCR_COUNT=$(echo "$PCR_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
-  pass "PCR derivation valid, attestation doc has ${PCR_COUNT} PCRs"
+  PCR16_VERIFIED=$(echo "$PCR_RESP" | jq -r '.pcr16_verified // false' 2>/dev/null || echo "false")
+  PCR16_PRESENT=$(echo "$PCR_RESP" | jq -r '.pcr16_present // false' 2>/dev/null || echo "false")
+  if [ "$PCR16_VERIFIED" = "true" ]; then
+    pass "PCR derivation valid, PCR16 verified from attestation doc (${PCR_COUNT} PCRs)"
+  elif [ "$PCR16_PRESENT" = "true" ]; then
+    fail "PCR16 present but value mismatch" "$(echo "$PCR_RESP" | jq -c '{expected_pcr16,actual_pcr16}')"
+  else
+    fail "PCR16 missing from attestation doc (lock failed?)" "$(echo "$PCR_RESP" | jq -c '{pcr_count,pcr16_present}')"
+  fi
 else
   fail "PCR secret derivation" "${PCR_RESP:0:120}"
 fi
 
 # Test 12: Full attestation document structure verification.
 # Fetches raw attestation doc, parses COSE Sign1 + CBOR, verifies PCR map exists,
-# PCR0 is present, and PCR16 matches expected value.
+# PCR0 is present and non-zero, and PCR16 matches expected value (locked by SDK).
 echo "[12/20] Attestation document structure"
 ATTEST_DOC_RESP=$($CURL "${BASE_URL}/test/attestation-document" 2>/dev/null || echo "")
 if [ -n "$ATTEST_DOC_RESP" ] && echo "$ATTEST_DOC_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   PCR_COUNT=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
-  PCR0_PRESENT=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr0_present // false' 2>/dev/null || echo "false")
+  PCR0_NONZERO=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr0_nonzero // false' 2>/dev/null || echo "false")
   PCR16_OK=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr16_verified // false' 2>/dev/null || echo "false")
-  pass "Attestation doc: ${PCR_COUNT} PCRs, PCR0=${PCR0_PRESENT}, PCR16_verified=${PCR16_OK}"
+  if [ "$PCR0_NONZERO" != "true" ]; then
+    fail "PCR0 is zero or missing" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr0_present,pcr0_nonzero}')"
+  elif [ "$PCR16_OK" != "true" ]; then
+    fail "PCR16 verification failed" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr16_verified,pcr16}')"
+  else
+    pass "Attestation doc: ${PCR_COUNT} PCRs, PCR0 valid, PCR16 verified"
+  fi
 else
   fail "Attestation document" "${ATTEST_DOC_RESP:0:120}"
 fi

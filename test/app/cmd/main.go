@@ -510,8 +510,9 @@ func handleTestDynamicSecretPersistence(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleTestPCRSecrets verifies secret-to-PCR derivation math and that the
-// NSM returns a valid attestation document. QEMU NSM only includes PCRs 0-15,
-// so PCR16 cannot be verified from the attestation doc in local tests.
+// NSM returns a valid attestation document with PCR16 matching the expected value.
+// PCR16 is extended with SHA256(compressed_pubkey) and then locked by the SDK,
+// so QEMU's NSM includes it in the attestation document (locked PCRs are included).
 func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -553,7 +554,7 @@ func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 	results["expected_pcr16"] = hex.EncodeToString(expectedPCR16[:])
 
 	// Fetch the real attestation document from nitriding to verify NSM works.
-	// QEMU NSM only includes PCRs 0-15; PCR16 is not in the attestation doc.
+	// PCR16 is now locked by the SDK after extension, so QEMU includes it.
 	doc, err := fetchAttestationDoc()
 	if err != nil {
 		results["error"] = fmt.Sprintf("fetch attestation: %v", err)
@@ -564,6 +565,17 @@ func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 
 	results["pcr_count"] = len(doc.PCRs)
 	results["attestation_doc_valid"] = true
+
+	// Verify PCR16 from the attestation document matches expected value.
+	if pcr16, ok := doc.PCRs[16]; ok {
+		actualPCR16 := hex.EncodeToString(pcr16)
+		results["actual_pcr16"] = actualPCR16
+		results["pcr16_present"] = true
+		results["pcr16_verified"] = actualPCR16 == hex.EncodeToString(expectedPCR16[:])
+	} else {
+		results["pcr16_present"] = false
+		results["pcr16_verified"] = false
+	}
 
 	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
@@ -594,11 +606,11 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	results["pcrs"] = pcrMap
 
-	// Check PCR0 is present (even if all zeros in QEMU).
+	// PCR0 must be present and non-zero. QEMU computes real PCR0 from the EIF
+	// (SHA384 of kernel + ramdisks + cmdline) at boot.
 	if pcr0, ok := doc.PCRs[0]; ok {
 		results["pcr0"] = hex.EncodeToString(pcr0)
 		results["pcr0_present"] = true
-		// Check if PCR0 is non-zero (QEMU may or may not set it).
 		allZero := true
 		for _, b := range pcr0 {
 			if b != 0 {
@@ -607,8 +619,40 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		results["pcr0_nonzero"] = !allZero
+		if allZero {
+			results["error"] = "PCR0 is all zeros — EIF hash not computed by QEMU"
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(results)
+			return
+		}
 	} else {
+		results["error"] = "PCR0 missing from attestation document"
 		results["pcr0_present"] = false
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	// Verify PCR16 is present and matches expected value (locked after extension).
+	signingKeyHex := os.Getenv("SIGNING_KEY")
+	if signingKeyHex != "" {
+		secretBytes, err := hex.DecodeString(signingKeyHex)
+		if err == nil && len(secretBytes) == 32 {
+			privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
+			compressedPubkey := privKey.PubKey().SerializeCompressed()
+			extensionData := sha256.Sum256(compressedPubkey)
+			var zeros48 [48]byte
+			extendInput := append(zeros48[:], extensionData[:]...)
+			expectedPCR16 := sha512.Sum384(extendInput)
+
+			if pcr16, ok := doc.PCRs[16]; ok {
+				actualPCR16 := hex.EncodeToString(pcr16)
+				results["pcr16"] = actualPCR16
+				results["pcr16_verified"] = actualPCR16 == hex.EncodeToString(expectedPCR16[:])
+			} else {
+				results["pcr16_verified"] = false
+			}
+		}
 	}
 
 	results["status"] = "ok"

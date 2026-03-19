@@ -96,13 +96,14 @@ fi
 
 # Vsock proxy for IMDS: viproxy inside the enclave maps 127.0.0.1:80 to vsock CID 3:8002.
 # vhost-device-vsock (forward-cid=1) routes to AF_VSOCK CID 1:8002 on the host.
-# This proxy bridges AF_VSOCK → TCP to reach mock-imds on localhost.
+# This proxy bridges AF_VSOCK → TCP to reach mock-imds (MOCK_IMDS_HOST, default localhost).
 # IMDS uses viproxy (not TAP) because it's needed before nitriding sets up networking.
 # All other AWS services (KMS, SSM, STS, S3) go through gvproxy TAP via host.containers.internal.
 echo "=== Starting IMDS vsock proxy ==="
 
 MOCK_IMDS_PORT="${MOCK_IMDS_PORT:-1338}"
-python3 "$SCRIPT_DIR/vsock-proxy.py" 8002 127.0.0.1 "$MOCK_IMDS_PORT" &
+MOCK_IMDS_HOST="${MOCK_IMDS_HOST:-127.0.0.1}"
+python3 "$SCRIPT_DIR/vsock-proxy.py" 8002 "$MOCK_IMDS_HOST" "$MOCK_IMDS_PORT" &
 IMDS_PROXY_PID=$!
 
 sleep 0.5
@@ -110,7 +111,7 @@ sleep 0.5
 if ! kill -0 "$IMDS_PROXY_PID" 2>/dev/null; then
   echo "  Warning: IMDS vsock proxy failed to start"
 else
-  echo "  vsock:8002 -> 127.0.0.1:${MOCK_IMDS_PORT} (mock IMDS)"
+  echo "  vsock:8002 -> ${MOCK_IMDS_HOST}:${MOCK_IMDS_PORT} (mock IMDS)"
 fi
 
 # gvproxy: the enclave's start.sh connects to vsock CID 3 port 1024 for networking.

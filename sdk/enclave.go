@@ -336,6 +336,9 @@ func (e *Enclave) extendPCRsWithSecretPubkeys(secrets []SecretDef) error {
 		if err := extendPCR(pcrIndex, hash[:]); err != nil {
 			return fmt.Errorf("extend PCR%d with secret %q pubkey: %w", pcrIndex, s.Name, err)
 		}
+		if err := lockPCR(pcrIndex); err != nil {
+			return fmt.Errorf("lock PCR%d after secret %q: %w", pcrIndex, s.Name, err)
+		}
 	}
 	return nil
 }
@@ -394,6 +397,26 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		Metrics:                 enclaveMetrics.Snapshot(),
 		Error:                   e.InitError(),
 	})
+}
+
+// lockPCR locks a PCR via the NSM, making it read-only.
+func lockPCR(index uint) error {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return fmt.Errorf("open NSM session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	resp, err := session.Send(&request.LockPCR{
+		Index: uint16(index),
+	})
+	if err != nil {
+		return fmt.Errorf("LockPCR(%d): %w", index, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("LockPCR(%d): NSM error: %s", index, resp.Error)
+	}
+	return nil
 }
 
 // extendPCR extends a PCR with the given data via the NSM.

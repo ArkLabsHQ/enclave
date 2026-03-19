@@ -13,8 +13,8 @@ nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.49"
-  hash: "sha256-QVdEmr816UHDyVtoYJwuY+pgEtN5J8DfYDjh9RwHS3c="
+  rev: "v0.0.51"
+  hash: "sha256-aje7giP0QFyMIthj5RvGO8aS+C8tEC0jvpm1t6T1C40="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -38,6 +38,8 @@ app:
     AWS_ENDPOINT_URL_SSM: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_STS: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"
+    AWS_ACCESS_KEY_ID: "test"
+    AWS_SECRET_ACCESS_KEY: "test"
 
 # One secret for testing KMS secret init and migration.
 secrets:

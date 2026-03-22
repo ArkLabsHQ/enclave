@@ -158,15 +158,24 @@ echo ""
 echo "=== Booting QEMU enclave ==="
 echo "  EIF:    $EIF_PATH"
 echo "  Memory: $MEMORY"
-echo "  KVM:    enabled"
+
+if [ -e /dev/kvm ]; then
+  ACCEL="--enable-kvm"
+  CPU_OPT="-cpu host"
+  echo "  KVM:    enabled"
+else
+  ACCEL="-accel tcg"
+  CPU_OPT="-cpu max"
+  echo "  KVM:    not available, using TCG (slow)"
+fi
 
 qemu-system-x86_64 \
   -M "nitro-enclave,vsock=c,id=test-enclave" \
   -kernel "$EIF_PATH" \
   -nographic \
   -m "$MEMORY" \
-  --enable-kvm \
-  -cpu host \
+  $ACCEL \
+  $CPU_OPT \
   -chardev "socket,id=c,path=${VSOCK_SOCKET}" &
 QEMU_PID=$!
 

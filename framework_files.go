@@ -454,6 +454,7 @@ ENCLAVE_NITRIDING_FQDN=example.com
 ENCLAVE_KMS_KEY_ID=${__KMS_KEY_ID__}
 ENCLAVE_DEPLOYMENT=${__DEV_MODE__}
 ENCLAVE_AWS_REGION=${__REGION__}
+ENCLAVE_MIGRATION_COOLDOWN=${__MIGRATION_COOLDOWN__}
 EOF
 
 systemctl enable --now enclave-watchdog.service
@@ -630,6 +631,7 @@ const frameworkFlakeNix = `{
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -832,6 +834,7 @@ LAUNCHER
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -1362,6 +1365,7 @@ const frameworkFlakeNixDotnet = `{
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
           ` + "${appEnvLines}" + `

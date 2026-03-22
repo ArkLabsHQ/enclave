@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -49,6 +51,12 @@ type Enclave struct {
 	s3Client   *s3.Client
 	bucketName string
 	dek        []byte // 32-byte plaintext AES-256 key, in memory only
+
+	// Migration cooldown cache (avoids hammering SSM on every enclave-info call).
+	cooldownMu        sync.Mutex
+	cooldownPending   bool
+	cooldownRemaining int // seconds
+	cooldownFetchedAt time.Time
 }
 
 // New creates an Enclave that is safe to use immediately for serving
@@ -380,23 +388,99 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cooldownSeconds, cooldownRemaining, migrationPending := e.getMigrationCooldownStatus(r.Context())
+
 	_ = json.NewEncoder(w).Encode(struct {
-		Version                 string           `json:"version"`
-		PreviousPCR0            string           `json:"previous_pcr0"`
-		PreviousPCR0Attestation string           `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey       string           `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets          int64            `json:"dynamic_secrets"`
-		Metrics                 map[string]int64 `json:"metrics"`
-		Error                   string           `json:"error,omitempty"`
+		Version                    string           `json:"version"`
+		PreviousPCR0               string           `json:"previous_pcr0"`
+		PreviousPCR0Attestation    string           `json:"previous_pcr0_attestation,omitempty"`
+		AttestationPubkey          string           `json:"attestation_pubkey,omitempty"`
+		DynamicSecrets             int64            `json:"dynamic_secrets"`
+		Metrics                    map[string]int64 `json:"metrics"`
+		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
+		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
+		MigrationPending           bool             `json:"migration_pending"`
+		Error                      string           `json:"error,omitempty"`
 	}{
-		Version:                 Version,
-		PreviousPCR0:            e.previousPCR0,
-		PreviousPCR0Attestation: e.previousPCR0Attestation,
-		AttestationPubkey:       e.AttestationPubkey(),
-		DynamicSecrets:          e.dynamicSecretsCount.Load(),
-		Metrics:                 enclaveMetrics.Snapshot(),
-		Error:                   e.InitError(),
+		Version:                    Version,
+		PreviousPCR0:               e.previousPCR0,
+		PreviousPCR0Attestation:    e.previousPCR0Attestation,
+		AttestationPubkey:          e.AttestationPubkey(),
+		DynamicSecrets:             e.dynamicSecretsCount.Load(),
+		Metrics:                    enclaveMetrics.Snapshot(),
+		MigrationCooldownSeconds:   cooldownSeconds,
+		MigrationCooldownRemaining: cooldownRemaining,
+		MigrationPending:           migrationPending,
+		Error:                      e.InitError(),
 	})
+}
+
+// getMigrationCooldownStatus returns the configured cooldown duration, remaining
+// seconds, and whether a migration is pending. Results are cached for 5 seconds
+// to avoid hammering SSM on frequent enclave-info calls.
+func (e *Enclave) getMigrationCooldownStatus(ctx context.Context) (configuredSeconds int, remainingSeconds int, pending bool) {
+	cooldownStr := os.Getenv("ENCLAVE_MIGRATION_COOLDOWN")
+	if cooldownStr == "" {
+		cooldownStr = "0s"
+	}
+	cooldown, err := time.ParseDuration(cooldownStr)
+	if err != nil {
+		return 0, 0, false
+	}
+	configuredSeconds = int(cooldown.Seconds())
+
+	// No cooldown configured — skip SSM check entirely.
+	if cooldown == 0 {
+		return 0, 0, false
+	}
+
+	// Return cached result if fresh.
+	e.cooldownMu.Lock()
+	if time.Since(e.cooldownFetchedAt) < 5*time.Second {
+		remaining := e.cooldownRemaining
+		pend := e.cooldownPending
+		e.cooldownMu.Unlock()
+		return configuredSeconds, remaining, pend
+	}
+	e.cooldownMu.Unlock()
+
+	// Fetch MigrationRequestedAt from SSM.
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return configuredSeconds, 0, false
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+
+	requestedAtStr, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationRequestedAt", deployment, appName))
+	if err != nil || requestedAtStr == "" {
+		e.cooldownMu.Lock()
+		e.cooldownPending = false
+		e.cooldownRemaining = 0
+		e.cooldownFetchedAt = time.Now()
+		e.cooldownMu.Unlock()
+		return configuredSeconds, 0, false
+	}
+
+	requestedAt, err := time.Parse(time.RFC3339, requestedAtStr)
+	if err != nil {
+		return configuredSeconds, 0, false
+	}
+
+	deadline := requestedAt.Add(cooldown)
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	e.cooldownMu.Lock()
+	e.cooldownPending = true
+	e.cooldownRemaining = int(remaining.Seconds())
+	e.cooldownFetchedAt = time.Now()
+	e.cooldownMu.Unlock()
+
+	return configuredSeconds, int(remaining.Seconds()), true
 }
 
 // lockPCR locks a PCR via the NSM, making it read-only.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,8 +32,9 @@ type Config struct {
 	App          AppConfig      `yaml:"app"`
 	Secrets      []SecretConfig `yaml:"secrets"`
 	SDK          SDKConfig      `yaml:"sdk"`
-	InstanceType string         `yaml:"instance_type"`
-	NixImage     string         `yaml:"nix_image"`
+	InstanceType      string         `yaml:"instance_type"`
+	NixImage          string         `yaml:"nix_image"`
+	MigrationCooldown string         `yaml:"migration_cooldown"`
 }
 
 type AppConfig struct {
@@ -103,6 +105,12 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.App.Language == "" {
 		cfg.App.Language = "go"
+	}
+	if cfg.MigrationCooldown == "" {
+		cfg.MigrationCooldown = "0s"
+	}
+	if _, err := time.ParseDuration(cfg.MigrationCooldown); err != nil {
+		return nil, fmt.Errorf("%s: invalid migration_cooldown %q: %w", configFile, cfg.MigrationCooldown, err)
 	}
 	// Validate required fields.
 	if cfg.Name == "" {

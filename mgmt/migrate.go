@@ -85,6 +85,59 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		emit(step, "error", msg)
 	}
 
+	// Step 0: Cooldown period (if configured).
+	if s.migrationCooldown > 0 {
+		requestedAt := time.Now().UTC()
+		if err := s.putParam(ctx, "MigrationRequestedAt", requestedAt.Format(time.RFC3339)); err != nil {
+			emitErr(0, fmt.Sprintf("store MigrationRequestedAt: %v", err))
+			return
+		}
+
+		s.migrationAbortMu.Lock()
+		s.migrationAbort = make(chan struct{})
+		abortCh := s.migrationAbort
+		s.migrationAbortMu.Unlock()
+
+		emit(0, "cooldown", fmt.Sprintf("Migration cooldown: %s (abort via POST /migrate/abort)", s.migrationCooldown))
+		deadline := requestedAt.Add(s.migrationCooldown)
+
+		// Scale tick interval: 1min for cooldowns > 1h, 10s otherwise.
+		tickInterval := 10 * time.Second
+		if s.migrationCooldown > time.Hour {
+			tickInterval = time.Minute
+		}
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+
+		aborted := false
+		for time.Now().UTC().Before(deadline) {
+			select {
+			case <-abortCh:
+				aborted = true
+			case <-ctx.Done():
+				aborted = true
+			case <-ticker.C:
+			}
+			if aborted {
+				break
+			}
+			remaining := time.Until(deadline).Round(time.Second)
+			emit(0, "cooldown", fmt.Sprintf("Cooldown: %s remaining", remaining))
+		}
+
+		s.resetParam(ctx, "MigrationRequestedAt")
+
+		s.migrationAbortMu.Lock()
+		s.migrationAbort = nil
+		s.migrationAbortMu.Unlock()
+
+		if aborted {
+			emit(0, "aborted", "Migration aborted during cooldown")
+			return
+		}
+		emit(0, "cooldown", "Cooldown expired, proceeding with migration")
+	}
+
 	// Step 1: Read current KMS key ID from SSM.
 	emit(1, "progress", "Reading current KMS key ID...")
 	oldKMSKeyID, err := s.getParam(ctx, "KMSKeyID")
@@ -445,6 +498,30 @@ func buildTransitionalPolicy(ec2RoleARN, accountRoot string) string {
     }
   ]
 }`, ec2RoleARN, accountRoot)
+}
+
+// handleMigrateAbort cancels a migration that is in the cooldown phase.
+func (s *server) handleMigrateAbort(w http.ResponseWriter, r *http.Request) {
+	s.migrationAbortMu.Lock()
+	ch := s.migrationAbort
+	s.migrationAbortMu.Unlock()
+
+	if ch == nil {
+		http.Error(w, `{"error":"no migration in cooldown"}`, http.StatusConflict)
+		return
+	}
+
+	select {
+	case <-ch:
+		http.Error(w, `{"error":"migration already past cooldown or aborted"}`, http.StatusConflict)
+	default:
+		close(ch)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "aborted",
+			"message": "migration cooldown aborted",
+		})
+	}
 }
 
 // copyFile copies src to dst as a fallback when rename fails (cross-device).

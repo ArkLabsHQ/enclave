@@ -35,9 +35,10 @@ type buildConfigJSON struct {
 	Version string                  `json:"version"`
 	Region  string                  `json:"region"`
 	Prefix  string                  `json:"prefix"`
-	App     buildConfigAppJSON      `json:"app"`
-	Secrets []buildConfigSecretJSON `json:"secrets"`
-	SDK     buildConfigSDKJSON      `json:"sdk"`
+	App               buildConfigAppJSON      `json:"app"`
+	Secrets           []buildConfigSecretJSON `json:"secrets"`
+	SDK               buildConfigSDKJSON      `json:"sdk"`
+	MigrationCooldown string                  `json:"migration_cooldown"`
 }
 
 type buildConfigAppJSON struct {
@@ -172,6 +173,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 			Hash:       cfg.SDK.Hash,
 			VendorHash: cfg.SDK.VendorHash,
 		},
+		MigrationCooldown: cfg.MigrationCooldown,
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")

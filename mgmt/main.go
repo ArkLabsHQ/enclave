@@ -83,14 +83,22 @@ func main() {
 		stsClient = sts.NewFromConfig(awsCfg)
 	}
 
+	cooldownStr := envOrDefault("ENCLAVE_MIGRATION_COOLDOWN", "0s")
+	cooldown, err := time.ParseDuration(cooldownStr)
+	if err != nil {
+		slog.Error("invalid ENCLAVE_MIGRATION_COOLDOWN", "value", cooldownStr, "error", err)
+		os.Exit(1)
+	}
+
 	mgmt := &server{
-		deployment: deployment,
-		appName:    appName,
-		region:     region,
-		ssm:        ssmClient,
-		kms:        kmsClient,
-		s3Client:   s3Client,
-		stsClient:  stsClient,
+		deployment:        deployment,
+		appName:           appName,
+		region:            region,
+		ssm:               ssmClient,
+		kms:               kmsClient,
+		s3Client:          s3Client,
+		stsClient:         stsClient,
+		migrationCooldown: cooldown,
 	}
 
 	mux := http.NewServeMux()
@@ -100,6 +108,7 @@ func main() {
 	mux.HandleFunc("POST /stop", mgmt.handleStop)
 	mux.HandleFunc("POST /schedule-key-deletion", mgmt.handleScheduleKeyDeletion)
 	mux.HandleFunc("POST /migrate", mgmt.handleMigrate)
+	mux.HandleFunc("POST /migrate/abort", mgmt.handleMigrateAbort)
 
 	addr := envOrDefault("ENCLAVE_MGMT_ADDR", "127.0.0.1:8443")
 
@@ -126,14 +135,17 @@ func main() {
 }
 
 type server struct {
-	deployment string
-	appName    string
-	region     string
-	ssm        *ssm.Client
-	kms        *kms.Client
-	s3Client   *s3.Client
-	stsClient  *sts.Client
-	migrateMu  sync.Mutex
+	deployment        string
+	appName           string
+	region            string
+	ssm               *ssm.Client
+	kms               *kms.Client
+	s3Client          *s3.Client
+	stsClient         *sts.Client
+	migrateMu         sync.Mutex
+	migrationCooldown time.Duration
+	migrationAbort    chan struct{}
+	migrationAbortMu  sync.Mutex
 }
 
 func (s *server) ssmParam(name string) string {

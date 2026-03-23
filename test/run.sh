@@ -152,21 +152,42 @@ echo "=== [0/9] Building test EIF from skeleton app ==="
 if [ -n "$EIF_PATH" ] && [ -f "$EIF_PATH" ]; then
   echo "  Using provided EIF: $EIF_PATH"
 elif [ "$IN_DOCKER" = true ]; then
-  # Inside Docker: use pre-built EIF from mounted volume (built on host).
+  # Inside Docker: use pre-built EIFs from mounted volume (built on host).
   if [ -f "app/enclave/artifacts/image.eif" ]; then
     EIF_PATH="app/enclave/artifacts/image.eif"
     echo "  Using pre-built EIF: $EIF_PATH"
+    if [ -f "app/enclave/artifacts/image-v2.eif" ]; then
+      echo "  Migration EIF: app/enclave/artifacts/image-v2.eif"
+    else
+      echo "  WARN: No migration EIF (image-v2.eif) — Step 7 will reuse same EIF"
+    fi
   else
     echo "  Error: EIF must be pre-built when running inside Docker" >&2
     echo "  Build it on the host first: cd test/app && enclave build --local" >&2
     exit 1
   fi
 else
-  # On host: always rebuild to ensure latest source is included.
-  echo "  Source: test/app/"
+  # On host: build v1 EIF, then v2 with different version for migration testing.
+  ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+  ARTIFACTS="${SCRIPT_DIR}/app/enclave/artifacts"
+  ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
+
+  echo "  Building v1 EIF (version ${ORIG_VERSION})..."
   (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
-  echo "  Built: $EIF_PATH"
+  echo "  v1 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr.json" | cut -c1-16)..."
+
+  echo "  Building v2 EIF (version 0.0.2) for migration..."
+  sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
+  (cd app && "$ENCLAVE_CLI" build --local)
+  cp "${ARTIFACTS}/image.eif" "${ARTIFACTS}/image-v2.eif"
+  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v2.json"
+  echo "  v2 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr-v2.json" | cut -c1-16)..."
+
+  # Restore v1 as the active EIF.
+  sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
+  (cd app && "$ENCLAVE_CLI" build --local)
+  echo "  Restored v1"
 fi
 echo ""
 
@@ -324,18 +345,32 @@ if [ "$MIG_PENDING" != "false" ]; then
 fi
 echo ""
 
-# Step 7: Build a new EIF with a different version (different PCR0) and migrate.
-# A real migration deploys new code with a different PCR0. We simulate this by
-# changing the version in enclave.yaml, which changes the binary → different hash.
+# Step 7: Deploy migration with a different EIF (different PCR0).
+# A real migration deploys new code with a different PCR0. The second EIF
+# must be pre-built on the host (see build-migration-eif.sh) and placed at
+# app/enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
 echo "=== [7/9] Running migration (enclave deploy upgrade) ==="
-ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
-ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
-echo "  Building migration EIF (version 0.0.2, current: ${ORIG_VERSION})..."
-sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
-"$ENCLAVE_CLI" build
-sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
-echo "  Migration EIF built, deploying..."
+MIGRATION_EIF="${SCRIPT_DIR}/app/enclave/artifacts/image-v2.eif"
+if [ -f "$MIGRATION_EIF" ]; then
+  echo "  Using migration EIF: $MIGRATION_EIF"
+  cp "$MIGRATION_EIF" "${SCRIPT_DIR}/app/enclave/artifacts/image.eif"
+  # Update pcr.json with the v2 PCR0.
+  if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" ]; then
+    cp "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
+  fi
+else
+  echo "  WARN: No migration EIF found (image-v2.eif), reusing same EIF"
+fi
 "$ENCLAVE_CLI" deploy
+
+# Debug: verify SSM KMSKeyID was updated by migration.
+echo "  Debug: SSM state after migration:"
+LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
+SSM_KMS_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/KMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
+echo "    /dev/my-app/KMSKeyID = ${SSM_KMS_KEY}"
+echo "    ENCLAVE_KMS_KEY_ID (env in EIF) = arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+SSM_MIG_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/MigrationKMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
+echo "    /dev/my-app/MigrationKMSKeyID = ${SSM_MIG_KEY}"
 echo ""
 
 # Step 8: Wait for restarted enclave and verify migration survival.

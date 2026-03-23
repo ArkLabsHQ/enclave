@@ -2,20 +2,19 @@
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
+version: 0.0.2
 region: us-east-1                # AWS region
 account: "000000000000"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
-migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)
 
 # SDK coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.52"
-  hash: "sha256-KjwwLUTOYBOox3F5BfggMe7eIVdu4bFFKqoDhfQN+4w="
+  rev: "v0.0.53"
+  hash: "sha256-ytLpa0KbQVLtX0vQi4wWKZG0BYvxjmgYaZU9TMj5PAQ="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:

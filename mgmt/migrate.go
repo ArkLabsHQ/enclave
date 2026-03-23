@@ -200,8 +200,9 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	policy := buildTransitionalPolicy(roleARN, fmt.Sprintf("arn:aws:iam::%s:root", accountID))
 	_, err = s.kms.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-		KeyId:  aws.String(newKMSKeyID),
-		Policy: aws.String(policy),
+		KeyId:      aws.String(newKMSKeyID),
+		Policy:     aws.String(policy),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		rollbackKey()

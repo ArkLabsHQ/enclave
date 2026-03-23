@@ -8,13 +8,14 @@ account: "000000000000"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
+migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)
 
 # SDK coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.51"
-  hash: "sha256-aje7giP0QFyMIthj5RvGO8aS+C8tEC0jvpm1t6T1C40="
+  rev: "v0.0.52"
+  hash: "sha256-KjwwLUTOYBOox3F5BfggMe7eIVdu4bFFKqoDhfQN+4w="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:

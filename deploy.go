@@ -54,7 +54,24 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		ac, err = newAWSClientsWithEnv(ctx, cfg.Region, "", cfg.App.Env)
+		// Copy app env, letting real environment variables override enclave.yaml
+		// values. This is needed because enclave.yaml uses addresses reachable
+		// from inside the QEMU enclave (e.g. host.containers.internal) while
+		// the CLI runs outside QEMU and needs host-local addresses.
+		appEnv := make(map[string]string)
+		for k, v := range cfg.App.Env {
+			appEnv[k] = v
+		}
+		for _, key := range []string{
+			"AWS_ENDPOINT_URL_KMS", "AWS_ENDPOINT_URL_SSM",
+			"AWS_ENDPOINT_URL_STS", "AWS_ENDPOINT_URL_S3",
+			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+		} {
+			if v := os.Getenv(key); v != "" {
+				appEnv[key] = v
+			}
+		}
+		ac, err = newAWSClientsWithEnv(ctx, cfg.Region, "", appEnv)
 		if err != nil {
 			return err
 		}

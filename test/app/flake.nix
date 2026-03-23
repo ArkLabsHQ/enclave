@@ -166,6 +166,7 @@
           AWS_REGION=${region}
           ENCLAVE_APP_NAME=${buildCfg.name}
           ENCLAVE_SECRETS_CONFIG=${secretsCfgJson}
+          ENCLAVE_MIGRATION_COOLDOWN=${buildCfg.migration_cooldown or "0s"}
           ENCLAVE_DEPLOYMENT=${deployment}
           ${appEnvLines}
         '';

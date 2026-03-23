@@ -319,14 +319,10 @@ func getSecretSSMParamName(secretName string) string {
 	return fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secretName)
 }
 
-// getKMSKeyID returns the KMS key ID from environment or SSM.
+// getKMSKeyID returns the KMS key ID, checking SSM first (updated during
+// migration) then falling back to environment variables (baked into the EIF).
 func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
-	if keyID := strings.TrimSpace(os.Getenv("ENCLAVE_KMS_KEY_ID")); keyID != "" {
-		return keyID, nil
-	}
-	if keyID := strings.TrimSpace(os.Getenv("INTROSPECTOR_KMS_KEY_ID")); keyID != "" {
-		return keyID, nil
-	}
+	// Check SSM first — migration updates this param with the new key ID.
 	deployment := getDeployment()
 	appName := getAppName()
 	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
@@ -334,13 +330,22 @@ func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
 		Name:           aws.String(paramName),
 		WithDecryption: aws.Bool(false),
 	})
-	if err != nil {
-		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
+		v := strings.TrimSpace(*out.Parameter.Value)
+		if v != "" && v != "UNSET" {
+			return v, nil
+		}
 	}
-	if out.Parameter == nil || out.Parameter.Value == nil {
-		return "", fmt.Errorf("KMS key ID not found in SSM parameter %s", paramName)
+
+	// Fallback to environment variables (build-time, baked into EIF).
+	if keyID := strings.TrimSpace(os.Getenv("ENCLAVE_KMS_KEY_ID")); keyID != "" {
+		return keyID, nil
 	}
-	return strings.TrimSpace(*out.Parameter.Value), nil
+	if keyID := strings.TrimSpace(os.Getenv("INTROSPECTOR_KMS_KEY_ID")); keyID != "" {
+		return keyID, nil
+	}
+
+	return "", fmt.Errorf("KMS key ID not found in SSM parameter %s or environment", paramName)
 }
 
 // normalizeSecretHex normalizes the secret to a hex string.

@@ -129,6 +129,9 @@ wait_for_enclave() {
   if [ $SECONDS -ge "$init_timeout" ]; then
     echo "Error: Init did not complete within ${init_timeout}s${label:+ ($label)}" >&2
     curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || true
+    echo ""
+    echo "  Boot log (errors and init):"
+    grep -i 'error\|fail\|init\|KMS\|secret\|policy\|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -30 | sed 's/^/    /' || echo "    (no boot log)"
     exit 1
   fi
 }
@@ -321,14 +324,17 @@ if [ "$MIG_PENDING" != "false" ]; then
 fi
 echo ""
 
-# Step 7: Run actual migration via enclave deploy (upgrade detection).
-# The enclave is running with secrets initialized, so a second deploy
-# detects upgrade mode and exercises the full migration code path:
-# CLI uploads EIF to S3 → calls mgmt POST /migrate → mgmt orchestrates
-# KMS key creation, export-key, ciphertext adoption, EIF download,
-# stops old enclave, starts new enclave with migrated KMS key.
-# The 5s cooldown will elapse before migration proceeds.
+# Step 7: Build a new EIF with a different version (different PCR0) and migrate.
+# A real migration deploys new code with a different PCR0. We simulate this by
+# changing the version in enclave.yaml, which changes the binary → different hash.
 echo "=== [7/9] Running migration (enclave deploy upgrade) ==="
+ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
+echo "  Building migration EIF (version 0.0.2, current: ${ORIG_VERSION})..."
+sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
+"$ENCLAVE_CLI" build
+sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
+echo "  Migration EIF built, deploying..."
 "$ENCLAVE_CLI" deploy
 echo ""
 

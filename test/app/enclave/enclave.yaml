@@ -13,8 +13,8 @@ nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.54"
-  hash: "sha256-6JByKXhosIBi4UkFVh05zyVIiRTVkx1mPbFf3yCQ4T0="
+  rev: "v0.0.55"
+  hash: "sha256-mf/rMIJ6L1c6vkYuvNdksQOQObP8xn9N2apw2ie2XKU="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:

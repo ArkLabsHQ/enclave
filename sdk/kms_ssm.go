@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -334,16 +333,16 @@ func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
 	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
 		v := strings.TrimSpace(*out.Parameter.Value)
 		if v != "" && v != "UNSET" {
-			slog.Info("KMS key ID from SSM", "param", paramName, "key_id", v[:16]+"...")
+			fmt.Printf("DEBUG getKMSKeyID: from SSM param=%s key_id=%s\n", paramName, v)
 			return v, nil
 		}
 	} else if err != nil {
-		slog.Warn("SSM lookup for KMS key ID failed, falling back to env var", "param", paramName, "error", err)
+		fmt.Printf("DEBUG getKMSKeyID: SSM lookup failed param=%s error=%v\n", paramName, err)
 	}
 
 	// Fallback to environment variables (build-time, baked into EIF).
 	if keyID := strings.TrimSpace(os.Getenv("ENCLAVE_KMS_KEY_ID")); keyID != "" {
-		slog.Info("KMS key ID from env var", "key_id", keyID[:16]+"...")
+		fmt.Printf("DEBUG getKMSKeyID: from env var key_id=%s\n", keyID)
 		return keyID, nil
 	}
 	if keyID := strings.TrimSpace(os.Getenv("INTROSPECTOR_KMS_KEY_ID")); keyID != "" {

@@ -132,6 +132,9 @@ wait_for_enclave() {
     echo ""
     echo "  Boot log (errors and init):"
     grep -i 'error\|fail\|init\|KMS\|secret\|policy\|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -30 | sed 's/^/    /' || echo "    (no boot log)"
+    echo ""
+    echo "  SDK init logs (Application says):"
+    grep 'Application says' /tmp/boot-qemu.log 2>/dev/null | head -30 | sed 's/^/    /' || echo "    (none)"
     exit 1
   fi
 }

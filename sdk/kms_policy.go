@@ -30,7 +30,9 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 	kmsClient := newKMSClient(awsCfg)
 	stsClient := newSTSClient(awsCfg)
 
+	slog.Info("DEBUG selfApplyKMSPolicy: calling getKMSKeyID")
 	keyID, err := getKMSKeyID(ctx, ssmClient)
+	slog.Info("DEBUG selfApplyKMSPolicy: getKMSKeyID returned", "key_id", keyID, "error", err)
 	if err != nil {
 		return fmt.Errorf("get KMS key ID: %w", err)
 	}

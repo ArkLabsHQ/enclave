@@ -14,8 +14,8 @@ migration_cooldown: "1m"         # Cooldown before migration proceeds (for testi
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.56"
-  hash: "sha256-ALiMSs642iGMwVE6e5tvVXNwMO3w/mUikxu8ERHhX+M="
+  rev: "v0.0.57"
+  hash: "sha256-z5Kx7flR1YHbn++J66Y5MntneSLFN6n48q21Woj2Jek="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:

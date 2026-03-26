@@ -98,7 +98,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		target := r.Header.Get("X-Amz-Target")
-		log.Printf("request: %s %s target=%s", r.Method, r.URL.Path, target)
 		// Check if this is a Decrypt call with Recipient.
 		if target == "TrentService.Decrypt" && r.Method == http.MethodPost {
 			handleDecrypt(w, r, upstream, proxy)
@@ -130,14 +129,12 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 
 	// If no Recipient, pass through as-is.
 	if req.Recipient == nil {
-		log.Printf("Decrypt: no Recipient, passing through to upstream")
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
-	log.Printf("Decrypt: has Recipient, building CMS envelope (KeyId=%s)", req.KeyId)
 	// Extract the RSA public key from the attestation document.
 	rsaPub, err := extractRSAPubKeyFromAttestationDoc(req.Recipient.AttestationDocument)
 	if err != nil {
@@ -210,8 +207,6 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
-	log.Printf("Decrypt: CMS envelope built, %d bytes, first 20 hex: %x", len(cmsData), cmsData[:20])
-
 	result := kmsDecryptResponseWithRecipient{
 		KeyId:                  decryptResp.KeyId,
 		CiphertextForRecipient: base64.StdEncoding.EncodeToString(cmsData),
@@ -273,9 +268,9 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 	}
 
 	ed := envelopedData{
-		Version: 0,
+		Version: 2,
 		RecipientInfos: []keyTransRecipientInfo{{
-			Version:             0,
+			Version:             2,
 			RecipientIdentifier: []byte{},
 			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
 				Algorithm: oidRSAESOAEP,

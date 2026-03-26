@@ -162,16 +162,9 @@ func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ci
 		return fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
 	}
 
-	fmt.Printf("DEBUG CiphertextForRecipient: %d bytes, first 20 hex: %x\n",
-		len(out.CiphertextForRecipient),
-		out.CiphertextForRecipient[:min(20, len(out.CiphertextForRecipient))])
-
 	plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
 	if err != nil {
-		return fmt.Errorf("decrypt CiphertextForRecipient (%d bytes, prefix %x): %w",
-			len(out.CiphertextForRecipient),
-			out.CiphertextForRecipient[:min(10, len(out.CiphertextForRecipient))],
-			err)
+		return fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
 	}
 
 	secretHex := normalizeSecretHex(plaintext)

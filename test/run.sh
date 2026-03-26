@@ -374,16 +374,6 @@ else
 fi
 "$ENCLAVE_CLI" deploy
 
-# Debug: verify SSM KMSKeyID was updated by migration.
-echo "  Debug: SSM state after migration:"
-LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
-SSM_KMS_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/KMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
-echo "    /dev/my-app/KMSKeyID = ${SSM_KMS_KEY}"
-echo "    ENCLAVE_KMS_KEY_ID (env in EIF) = (not set, using SSM)"
-SSM_MIG_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/MigrationKMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
-echo "    /dev/my-app/MigrationKMSKeyID = ${SSM_MIG_KEY}"
-echo ""
-
 # Step 8: Wait for restarted enclave and verify migration survival.
 # mgmt already stopped and restarted the enclave in step 7 (via boot-qemu.sh).
 # The new enclave must decrypt secrets from the NEW KMS key and re-import

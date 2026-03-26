@@ -36,7 +36,7 @@ var (
 
 type contentInfo struct {
 	ContentType asn1.ObjectIdentifier
-	Content     asn1.RawValue `asn1:"explicit,tag:0"`
+	Content     envelopedData `asn1:"explicit,tag:0"`
 }
 
 type envelopedData struct {
@@ -97,8 +97,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a Decrypt call with Recipient.
 		target := r.Header.Get("X-Amz-Target")
+		log.Printf("request: %s %s target=%s", r.Method, r.URL.Path, target)
+		// Check if this is a Decrypt call with Recipient.
 		if target == "TrentService.Decrypt" && r.Method == http.MethodPost {
 			handleDecrypt(w, r, upstream, proxy)
 			return
@@ -129,12 +130,14 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 
 	// If no Recipient, pass through as-is.
 	if req.Recipient == nil {
+		log.Printf("Decrypt: no Recipient, passing through to upstream")
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
+	log.Printf("Decrypt: has Recipient, building CMS envelope (KeyId=%s)", req.KeyId)
 	// Extract the RSA public key from the attestation document.
 	rsaPub, err := extractRSAPubKeyFromAttestationDoc(req.Recipient.AttestationDocument)
 	if err != nil {
@@ -207,6 +210,8 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
+	log.Printf("Decrypt: CMS envelope built, %d bytes, first 20 hex: %x", len(cmsData), cmsData[:20])
+
 	result := kmsDecryptResponseWithRecipient{
 		KeyId:                  decryptResp.KeyId,
 		CiphertextForRecipient: base64.StdEncoding.EncodeToString(cmsData),
@@ -268,9 +273,9 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 	}
 
 	ed := envelopedData{
-		Version: 2,
+		Version: 0,
 		RecipientInfos: []keyTransRecipientInfo{{
-			Version:             2,
+			Version:             0,
 			RecipientIdentifier: []byte{},
 			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
 				Algorithm: oidRSAESOAEP,
@@ -280,14 +285,9 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 		EncryptedContentInfo: eci,
 	}
 
-	edBytes, err := asn1.Marshal(ed)
-	if err != nil {
-		return nil, fmt.Errorf("marshal enveloped data: %w", err)
-	}
-
 	ci := contentInfo{
 		ContentType: oidEnvelopedData,
-		Content:     asn1.RawValue{FullBytes: edBytes},
+		Content:     ed,
 	}
 
 	return asn1.Marshal(ci)

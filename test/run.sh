@@ -217,6 +217,14 @@ export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 
 "$ENCLAVE_CLI" deploy
 
+# CDK created a KMS key in localstack, but we use local-kms for real KMS ops.
+# Overwrite SSM with the local-kms seeded key ID so the enclave uses it.
+LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
+aws ssm put-parameter $LOCALSTACK \
+  --name "/dev/my-app/KMSKeyID" --value "test-key-id" \
+  --type String --overwrite --no-cli-pager
+echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
+
 # Start mgmt server on the host (like production EC2 host).
 # Configured with stop/start commands that manage boot-qemu.sh via PID file.
 echo "  Starting mgmt server..."
@@ -371,7 +379,7 @@ echo "  Debug: SSM state after migration:"
 LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
 SSM_KMS_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/KMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
 echo "    /dev/my-app/KMSKeyID = ${SSM_KMS_KEY}"
-echo "    ENCLAVE_KMS_KEY_ID (env in EIF) = arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+echo "    ENCLAVE_KMS_KEY_ID (env in EIF) = (not set, using SSM)"
 SSM_MIG_KEY=$(aws ssm get-parameter $LOCALSTACK --name "/dev/my-app/MigrationKMSKeyID" --query 'Parameter.Value' --output text 2>/dev/null || echo "(error)")
 echo "    /dev/my-app/MigrationKMSKeyID = ${SSM_MIG_KEY}"
 echo ""

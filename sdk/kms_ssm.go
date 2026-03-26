@@ -162,9 +162,16 @@ func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ci
 		return fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
 	}
 
+	fmt.Printf("DEBUG CiphertextForRecipient: %d bytes, first 20 hex: %x\n",
+		len(out.CiphertextForRecipient),
+		out.CiphertextForRecipient[:min(20, len(out.CiphertextForRecipient))])
+
 	plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
 	if err != nil {
-		return fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+		return fmt.Errorf("decrypt CiphertextForRecipient (%d bytes, prefix %x): %w",
+			len(out.CiphertextForRecipient),
+			out.CiphertextForRecipient[:min(10, len(out.CiphertextForRecipient))],
+			err)
 	}
 
 	secretHex := normalizeSecretHex(plaintext)
@@ -319,10 +326,8 @@ func getSecretSSMParamName(secretName string) string {
 	return fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secretName)
 }
 
-// getKMSKeyID returns the KMS key ID, checking SSM first (updated during
-// migration) then falling back to environment variables (baked into the EIF).
+// getKMSKeyID returns the KMS key ID from environment or SSM.
 func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
-	// Check SSM first — migration updates this param with the new key ID.
 	deployment := getDeployment()
 	appName := getAppName()
 	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
@@ -330,26 +335,17 @@ func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
 		Name:           aws.String(paramName),
 		WithDecryption: aws.Bool(false),
 	})
-	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
-		v := strings.TrimSpace(*out.Parameter.Value)
-		if v != "" && v != "UNSET" {
-			fmt.Printf("DEBUG getKMSKeyID: from SSM param=%s key_id=%s\n", paramName, v)
-			return v, nil
-		}
-	} else if err != nil {
-		fmt.Printf("DEBUG getKMSKeyID: SSM lookup failed param=%s error=%v\n", paramName, err)
+	if err != nil {
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
 	}
-
-	// Fallback to environment variables (build-time, baked into EIF).
-	if keyID := strings.TrimSpace(os.Getenv("ENCLAVE_KMS_KEY_ID")); keyID != "" {
-		fmt.Printf("DEBUG getKMSKeyID: from env var key_id=%s\n", keyID)
-		return keyID, nil
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", fmt.Errorf("KMS key ID not found in SSM parameter %s", paramName)
 	}
-	if keyID := strings.TrimSpace(os.Getenv("INTROSPECTOR_KMS_KEY_ID")); keyID != "" {
-		return keyID, nil
+	v := strings.TrimSpace(*out.Parameter.Value)
+	if v == "" || v == "UNSET" {
+		return "", fmt.Errorf("KMS key ID not set in SSM parameter %s (value: %q)", paramName, v)
 	}
-
-	return "", fmt.Errorf("KMS key ID not found in SSM parameter %s or environment", paramName)
+	return v, nil
 }
 
 // normalizeSecretHex normalizes the secret to a hex string.

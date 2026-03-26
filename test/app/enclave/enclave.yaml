@@ -2,19 +2,20 @@
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
+version: 0.0.1
 region: us-east-1                # AWS region
 account: "000000000000"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
+migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)
 
 # SDK coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.55"
-  hash: "sha256-mf/rMIJ6L1c6vkYuvNdksQOQObP8xn9N2apw2ie2XKU="
+  rev: "v0.0.56"
+  hash: "sha256-ALiMSs642iGMwVE6e5tvVXNwMO3w/mUikxu8ERHhX+M="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -34,7 +35,6 @@ app:
     # AWS services through gvproxy TAP via host.containers.internal (matches production path).
     # IMDS uses viproxy by default (127.0.0.1:80 → vsock 3:8002) — no override needed.
     AWS_ENDPOINT_URL_KMS: "http://host.containers.internal:4000"
-    ENCLAVE_KMS_KEY_ID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
     AWS_ENDPOINT_URL_SSM: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_STS: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"

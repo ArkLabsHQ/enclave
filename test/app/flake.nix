@@ -2,7 +2,7 @@
   description = "Nitro Enclave - reproducible build";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -67,7 +67,8 @@
 
           src = ./.;
 
-          vendorHash = appCfg.nix_vendor_hash;
+          vendorHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
+          proxyVendor = true;
 
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";

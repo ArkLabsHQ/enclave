@@ -39,7 +39,7 @@ echo "=== Migration tests ==="
 echo ""
 
 # --- Pre-conditions ---
-echo "[1/5] Verify secret was initialized by enclave Init"
+echo "[1/6] Verify secret was initialized by enclave Init"
 SECRET_CT=$(ssm_get "$PREFIX/signing-key/Ciphertext")
 if [ -n "$SECRET_CT" ] && [ "$SECRET_CT" != "UNSET" ]; then
   pass "signing-key ciphertext exists in SSM"
@@ -58,7 +58,7 @@ fi
 echo "  Old KMS key: $OLD_KEY_ID"
 
 # --- Step 1: Create migration KMS key ---
-echo "[2/5] Create migration KMS key"
+echo "[2/6] Create migration KMS key"
 NEW_KEY_ARN=$($KMS create-key --description "migration test key" --query 'KeyMetadata.Arn')
 if [ -n "$NEW_KEY_ARN" ]; then
   pass "Created migration KMS key: $NEW_KEY_ARN"
@@ -70,13 +70,13 @@ else
 fi
 
 # --- Step 2: Store migration params in SSM ---
-echo "[3/5] Store migration params in SSM"
+echo "[3/6] Store migration params in SSM"
 $SSM put-parameter --name "$PREFIX/MigrationKMSKeyID" --value "$NEW_KEY_ARN" --type String --overwrite >/dev/null
 $SSM put-parameter --name "$PREFIX/MigrationOldKMSKeyID" --value "$OLD_KEY_ID" --type String --overwrite >/dev/null
 pass "Migration KMS key IDs stored in SSM"
 
 # --- Step 3: Call export-key ---
-echo "[4/5] Call POST /v1/export-key"
+echo "[4/6] Call POST /v1/export-key"
 EXPORT_HTTP_CODE=$(curl -sk --max-time 30 -o /tmp/export-response.json -w '%{http_code}' \
   -X POST "${BASE_URL}/v1/export-key" 2>/dev/null || echo "000")
 

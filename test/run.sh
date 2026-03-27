@@ -178,17 +178,29 @@ else
   echo "  Building v1 EIF (version ${ORIG_VERSION})..."
   (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
-  echo "  v1 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr.json" | cut -c1-16)..."
+  V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
+  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v1.json"
+  echo "  v1 PCR0: ${V1_PCR0:0:16}..."
 
-  echo "  Building v2 EIF (version 0.0.2) for migration..."
+  # Build v2 with previous_pcr0 set to v1's PCR0.
+  # This exercises the SDK's previousPCR0 validation during v2 Init:
+  # the enclave checks that ENCLAVE_PREVIOUS_PCR0 (baked from enclave.yaml)
+  # matches MigrationPreviousPCR0 in SSM (stored by v1's export-key).
+  echo "  Building v2 EIF (version 0.0.2, previous_pcr0=${V1_PCR0:0:16}...)..."
   sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
+  if grep -q '^previous_pcr0:' "$ENCLAVE_YAML"; then
+    sed -i "s/^previous_pcr0: .*/previous_pcr0: \"${V1_PCR0}\"/" "$ENCLAVE_YAML"
+  else
+    echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
+  fi
   (cd app && "$ENCLAVE_CLI" build --local)
   cp "${ARTIFACTS}/image.eif" "${ARTIFACTS}/image-v2.eif"
   cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v2.json"
   echo "  v2 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr-v2.json" | cut -c1-16)..."
 
-  # Restore v1 as the active EIF.
+  # Restore v1 as the active EIF (genesis for first boot).
   sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
+  sed -i '/^previous_pcr0:/d' "$ENCLAVE_YAML"
   (cd app && "$ENCLAVE_CLI" build --local)
   echo "  Restored v1"
 fi
@@ -390,15 +402,34 @@ else
 fi
 
 # Verify previous_pcr0 was updated (no longer "genesis" after export-key).
-PREV_PCR0=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null \
-  | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
+POST_MIG_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+PREV_PCR0=$(echo "$POST_MIG_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
 if [ -n "$PREV_PCR0" ] && [ "$PREV_PCR0" != "genesis" ]; then
   echo "  PASS: previous_pcr0 updated after migration (${PREV_PCR0:0:16}...)"
-elif [ "$PREV_PCR0" = "genesis" ]; then
-  echo "  INFO: previous_pcr0 still genesis (expected for first migration)"
 else
-  echo "  WARN: could not read previous_pcr0"
+  echo "  FAIL: previous_pcr0 should not be genesis after migration (got: ${PREV_PCR0:-empty})" >&2
+  exit 1
 fi
+
+# Verify previous_pcr0 matches v1 PCR0 from build artifacts.
+V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
+if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json" ]; then
+  V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json"
+fi
+if [ -f "$V1_PCR0_FILE" ]; then
+  EXPECTED_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
+  if [ -n "$EXPECTED_PCR0" ]; then
+    # PCR0 from enclave-info is lowercase, normalize for comparison.
+    PREV_PCR0_LOWER=$(echo "$PREV_PCR0" | tr '[:upper:]' '[:lower:]')
+    EXPECTED_PCR0_LOWER=$(echo "$EXPECTED_PCR0" | tr '[:upper:]' '[:lower:]')
+    if [ "$PREV_PCR0_LOWER" = "$EXPECTED_PCR0_LOWER" ]; then
+      echo "  PASS: previous_pcr0 matches v1 build PCR0"
+    else
+      echo "  WARN: previous_pcr0 mismatch with v1 build (enclave=${PREV_PCR0:0:32}... build=${EXPECTED_PCR0:0:32}...)"
+    fi
+  fi
+fi
+
 
 # Verify static secrets decrypted from new KMS key.
 SECRETS_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/secrets" 2>/dev/null || echo "")

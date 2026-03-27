@@ -31,6 +31,7 @@ All hashes are computed from the local git repo — no fetch from GitHub.`,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
 	cmd.Flags().String("language", "", "Set app language: go, nodejs, dotnet")
+	cmd.Flags().String("commit", "", "Use specific commit SHA instead of HEAD")
 	return cmd
 }
 
@@ -50,12 +51,17 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("[setup] Detected repo: %s/%s\n", owner, repo)
 
-	// 2. Get HEAD commit SHA.
-	rev, err := gitRevParseHEAD(root)
+	// 2. Resolve commit SHA (from --commit flag or HEAD).
+	rev, err := resolveCommit(cmd, root)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[setup] HEAD commit: %s\n", rev)
+	commitFlag, _ := cmd.Flags().GetString("commit")
+	if commitFlag != "" {
+		fmt.Printf("[setup] Using commit: %s\n", rev)
+	} else {
+		fmt.Printf("[setup] HEAD commit: %s\n", rev)
+	}
 
 	// 3. Load config for nix image and sub-packages.
 	cfg, err := loadConfig()
@@ -356,6 +362,26 @@ func gitRevParseHEAD(root string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// gitRevParseCommit validates and normalizes a commitish to a full SHA.
+func gitRevParseCommit(root, commitish string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--verify", commitish+"^{commit}")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("commit %q not found in local repo: %w", commitish, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// resolveCommit returns the commit SHA from --commit flag or HEAD.
+func resolveCommit(cmd *cobra.Command, root string) (string, error) {
+	commitFlag, _ := cmd.Flags().GetString("commit")
+	if commitFlag != "" {
+		return gitRevParseCommit(root, commitFlag)
+	}
+	return gitRevParseHEAD(root)
+}
+
 // computeNixHash computes the SRI hash that matches Nix's fetchFromGitHub
 // by creating a git archive locally and hashing it with nix hash path.
 func computeNixHash(root string, rev string) (string, error) {
@@ -405,7 +431,10 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 	}
 	switch language {
 	case "nodejs":
-		return `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
+		return `let
+    flake = builtins.getFlake (toString ./.);
+    pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+  in pkgs.buildNpmPackage {
     pname = "app"; version = "0.0.1"; src = ./.;
     npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
   }`
@@ -415,7 +444,10 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 			nixPkgs = append(nixPkgs, q+p+q)
 		}
 		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-		return fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+		return fmt.Sprintf(`let
+    flake = builtins.getFlake (toString ./.);
+    pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+  in pkgs.buildGoModule {
     pname = "app"; version = "0.0.1"; src = ./.;
     subPackages = %s; vendorHash = "";
     env.CGO_ENABLED = "0"; doCheck = false;

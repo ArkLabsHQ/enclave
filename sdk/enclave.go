@@ -160,8 +160,25 @@ func (e *Enclave) Init(ctx context.Context) error {
 		e.dynamicSecretsCount.Store(int64(count))
 	}
 
+	// Verify and set previous PCR0.
+	expectedPCR0 := os.Getenv("ENCLAVE_PREVIOUS_PCR0")
+	if expectedPCR0 == "" {
+		expectedPCR0 = "genesis"
+	}
+	ssmPCR0 := ""
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
-		e.previousPCR0 = pcr0
+		ssmPCR0 = pcr0
+	}
+	if expectedPCR0 != "genesis" {
+		if ssmPCR0 == "" || ssmPCR0 == "UNSET" {
+			return fmt.Errorf("previous_pcr0 is %q but no migration has occurred (SSM has no value)", expectedPCR0)
+		}
+		if expectedPCR0 != ssmPCR0 {
+			return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave.yaml), got %q (from SSM)", expectedPCR0, ssmPCR0)
+		}
+	}
+	if ssmPCR0 != "" && ssmPCR0 != "UNSET" {
+		e.previousPCR0 = ssmPCR0
 	}
 	if attestDoc, err := readMigrationPreviousPCR0Attestation(ctx); err == nil {
 		e.previousPCR0Attestation = attestDoc

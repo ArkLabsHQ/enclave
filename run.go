@@ -65,6 +65,7 @@ func synthCDKStack(cfg *Config, root string) error {
 		AppName:      cfg.Name,
 		Secrets:           cfg.Secrets,
 		MigrationCooldown: cfg.MigrationCooldown,
+		PreviousPCR0:      cfg.PreviousPCR0,
 		Local:             local,
 	})
 

@@ -455,6 +455,7 @@ ENCLAVE_KMS_KEY_ID=${__KMS_KEY_ID__}
 ENCLAVE_DEPLOYMENT=${__DEV_MODE__}
 ENCLAVE_AWS_REGION=${__REGION__}
 ENCLAVE_MIGRATION_COOLDOWN=${__MIGRATION_COOLDOWN__}
+ENCLAVE_PREVIOUS_PCR0=${__PREVIOUS_PCR0__}
 EOF
 
 systemctl enable --now enclave-watchdog.service
@@ -469,7 +470,7 @@ const frameworkFlakeNix = `{
   description = "Nitro Enclave - reproducible build";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -532,7 +533,8 @@ const frameworkFlakeNix = `{
             hash = appCfg.nix_hash;
           };
 
-          vendorHash = appCfg.nix_vendor_hash;
+          vendorHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
+          proxyVendor = true;
 
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
@@ -632,6 +634,7 @@ const frameworkFlakeNix = `{
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -667,7 +670,7 @@ const frameworkFlakeNixNodejs = `{
   description = "Nitro Enclave - reproducible build (Node.js)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -733,7 +736,7 @@ const frameworkFlakeNixNodejs = `{
             hash = appCfg.nix_hash;
           };
 
-          npmDepsHash = appCfg.nix_vendor_hash;
+          npmDepsHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
           dontNpmBuild = true;
           doCheck = false;
         };
@@ -835,6 +838,7 @@ LAUNCHER
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -1366,6 +1370,7 @@ const frameworkFlakeNixDotnet = `{
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
           ` + "${appEnvLines}" + `

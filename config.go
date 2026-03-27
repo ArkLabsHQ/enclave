@@ -35,6 +35,7 @@ type Config struct {
 	InstanceType      string         `yaml:"instance_type"`
 	NixImage          string         `yaml:"nix_image"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
+	PreviousPCR0      string         `yaml:"previous_pcr0"`
 }
 
 type AppConfig struct {
@@ -111,6 +112,9 @@ func loadConfig() (*Config, error) {
 	}
 	if _, err := time.ParseDuration(cfg.MigrationCooldown); err != nil {
 		return nil, fmt.Errorf("%s: invalid migration_cooldown %q: %w", configFile, cfg.MigrationCooldown, err)
+	}
+	if cfg.PreviousPCR0 == "" {
+		cfg.PreviousPCR0 = "genesis"
 	}
 	// Validate required fields.
 	if cfg.Name == "" {

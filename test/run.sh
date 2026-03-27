@@ -191,6 +191,7 @@ else
   if grep -q '^previous_pcr0:' "$ENCLAVE_YAML"; then
     sed -i "s/^previous_pcr0: .*/previous_pcr0: \"${V1_PCR0}\"/" "$ENCLAVE_YAML"
   else
+    echo "" >> "$ENCLAVE_YAML"
     echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
   fi
   (cd app && "$ENCLAVE_CLI" build --local)

@@ -14,8 +14,8 @@ migration_cooldown: "1m"         # Cooldown before migration proceeds (for testi
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.57"
-  hash: "sha256-z5Kx7flR1YHbn++J66Y5MntneSLFN6n48q21Woj2Jek="
+  rev: "v0.0.58"
+  hash: "sha256-/4KCDSkDv/vC2mP0bBQ55T+tjWhJo7xfR/VpzKkAUqw="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -24,9 +24,9 @@ app:
 
   nix_owner: "ArkLabsHQ"
   nix_repo: "introspector-enclave"
-  nix_rev: "71819a26cb922aafa206bd5ab4b0828b4bcf1b6c"
-  nix_hash: "sha256-hJJ2FGOJm8qwG5cVLVUSyVnFt4vIi9KxpWTtg5EdRgs="
-  nix_vendor_hash: "sha256-qXVmH7vthrkgAVvaxAHdaTuZ0yeZsnkbcboytzbE13s="
+  nix_rev: "01e1caa74a01d2ce1b0b322f1ccc3fbd2450c69d"
+  nix_hash: "sha256-KytvlwE+91TmHeQmo7E2PdwLfNZN6jTE++VSRVwiiPM="
+  nix_vendor_hash: "sha256-Qb+fEpMI21oy93Nuu5Tw2n91PKByVv6qeWNuF6JtytE="
   nix_sub_packages:
     - "cmd"
   binary_name: "test-app"
@@ -45,3 +45,4 @@ app:
 secrets:
   - name: signing_key
     env_var: SIGNING_KEY
+

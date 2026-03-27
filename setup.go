@@ -431,10 +431,7 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 	}
 	switch language {
 	case "nodejs":
-		return `let
-    flake = builtins.getFlake (toString ./.);
-    pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
-  in pkgs.buildNpmPackage {
+		return `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
     pname = "app"; version = "0.0.1"; src = ./.;
     npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
   }`
@@ -444,12 +441,9 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 			nixPkgs = append(nixPkgs, q+p+q)
 		}
 		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-		return fmt.Sprintf(`let
-    flake = builtins.getFlake (toString ./.);
-    pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
-  in pkgs.buildGoModule {
+		return fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
     pname = "app"; version = "0.0.1"; src = ./.;
-    subPackages = %s; vendorHash = "";
+    subPackages = %s; vendorHash = ""; proxyVendor = true;
     env.CGO_ENABLED = "0"; doCheck = false;
   }`, nixSubPkgs)
 	}

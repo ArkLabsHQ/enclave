@@ -110,7 +110,7 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		PCR0:     pcr0,
 		Exported: exported,
 	}
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // readMigrationPreviousPCR0 reads the previous enclave's PCR0 from SSM.
@@ -264,7 +264,7 @@ func getPCR0() string {
 	if err != nil {
 		return ""
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	attestDoc, _, err := buildAttestationDocument(session)
 	if err != nil {

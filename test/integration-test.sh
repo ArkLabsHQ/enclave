@@ -19,7 +19,7 @@ echo "=== Integration tests against $BASE_URL ==="
 echo ""
 
 # Test 1: Health endpoint returns 200 (Init must be complete).
-echo "[1/17] Health check"
+echo "[1/20] Health check"
 HEALTH_CODE=$($CURL -o /dev/null -w '%{http_code}' "${BASE_URL}/health" 2>/dev/null || echo "000")
 if [ "$HEALTH_CODE" = "200" ]; then
   pass "Health endpoint returns 200"
@@ -28,7 +28,7 @@ else
 fi
 
 # Test 2: Enclave info returns valid JSON with required fields.
-echo "[2/17] Enclave info"
+echo "[2/20] Enclave info"
 INFO=$($CURL "${BASE_URL}/v1/enclave-info" 2>/dev/null || echo "")
 if [ -n "$INFO" ] && echo "$INFO" | jq -e '.version' >/dev/null 2>&1; then
   pass "Enclave info returns valid JSON"
@@ -37,7 +37,7 @@ else
 fi
 
 # Test 3: Init completed successfully (no error field).
-echo "[3/17] Init status"
+echo "[3/20] Init status"
 if [ -n "$INFO" ]; then
   INIT_ERR=$(echo "$INFO" | jq -r '.error // empty' 2>/dev/null || echo "")
   if [ -z "$INIT_ERR" ]; then
@@ -54,7 +54,7 @@ fi
 # X-Attestation-Signature and X-Attestation-Pubkey headers, and verifies
 # the Schnorr signature over sha256(response_body).
 # This implicitly validates the attestation pubkey is present and correctly formatted.
-echo "[4/17] Attestation signature verification"
+echo "[4/20] Attestation signature verification"
 ATTEST_RESP=$($CURL "${BASE_URL}/test/attestation" 2>/dev/null || echo "")
 if [ -n "$ATTEST_RESP" ] && echo "$ATTEST_RESP" | jq -e '.signature_valid == true' >/dev/null 2>&1; then
   ATTEST_PUBKEY=$(echo "$ATTEST_RESP" | jq -r '.pubkey // empty' 2>/dev/null || echo "")
@@ -64,7 +64,7 @@ else
 fi
 
 # Test 5: SDK version present.
-echo "[5/17] SDK version"
+echo "[5/20] SDK version"
 if [ -n "$INFO" ]; then
   VERSION=$(echo "$INFO" | jq -r '.version // empty' 2>/dev/null || echo "")
   if [ -n "$VERSION" ]; then
@@ -77,7 +77,7 @@ else
 fi
 
 # Test 6: App endpoint responds through nitriding proxy.
-echo "[6/17] App proxy"
+echo "[6/20] App proxy"
 APP_RESP=$($CURL "${BASE_URL}/" 2>/dev/null || echo "")
 if [ -n "$APP_RESP" ] && echo "$APP_RESP" | jq -e '.app == "test-enclave-app"' >/dev/null 2>&1; then
   pass "App responds through proxy"
@@ -86,7 +86,7 @@ else
 fi
 
 # Test 7: KMS secrets loaded (SIGNING_KEY env var set inside enclave).
-echo "[7/17] KMS secrets"
+echo "[7/20] KMS secrets"
 SECRETS_RESP=$($CURL "${BASE_URL}/test/secrets" 2>/dev/null || echo "")
 if [ -n "$SECRETS_RESP" ] && echo "$SECRETS_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   KEY_LEN=$(echo "$SECRETS_RESP" | jq -r '.signing_key.length // 0' 2>/dev/null || echo "0")
@@ -96,7 +96,7 @@ else
 fi
 
 # Test 8: Storage round-trip (put → get → verify → delete via S3+KMS).
-echo "[8/17] Storage round-trip"
+echo "[8/20] Storage round-trip"
 STORAGE_RESP=$($CURL "${BASE_URL}/test/storage" 2>/dev/null || echo "")
 if [ -n "$STORAGE_RESP" ] && echo "$STORAGE_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
   pass "Storage round-trip (put/get/delete)"
@@ -105,7 +105,7 @@ else
 fi
 
 # Test 9: previous_pcr0 is "genesis" on first boot (no prior enclave).
-echo "[9/17] Previous PCR0"
+echo "[9/20] Previous PCR0"
 if [ -n "$INFO" ]; then
   PREV_PCR0=$(echo "$INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
   if [ "$PREV_PCR0" = "genesis" ]; then
@@ -120,7 +120,7 @@ else
 fi
 
 # Test 10: Dynamic secrets round-trip (PUT → GET → LIST → DELETE).
-echo "[10/17] Dynamic secrets"
+echo "[10/20] Dynamic secrets"
 DYN_RESP=$($CURL "${BASE_URL}/test/dynamic-secrets" 2>/dev/null || echo "")
 if [ -n "$DYN_RESP" ] && echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
   DYN_LISTED=$(echo "$DYN_RESP" | jq -r '.listed // false' 2>/dev/null || echo "false")
@@ -129,18 +129,48 @@ else
   fail "Dynamic secrets" "${DYN_RESP:0:120}"
 fi
 
-# Test 11: PCR secret pubkey derivation (verify PCR 16 extension data).
-echo "[11/17] PCR secret pubkey extension"
+# Test 11: PCR secret derivation + attestation document PCR16 verification.
+# Verifies SIGNING_KEY → pubkey → extension data derivation and that PCR16
+# in the attestation document matches the expected value (extended + locked by SDK).
+echo "[11/20] PCR secret derivation + PCR16 verification"
 PCR_RESP=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
-if [ -n "$PCR_RESP" ] && echo "$PCR_RESP" | jq -e '.derivation_valid == true' >/dev/null 2>&1; then
-  PCR_EXT=$(echo "$PCR_RESP" | jq -r '.expected_extension // empty' 2>/dev/null || echo "")
-  pass "PCR 16 extension derivation valid (hash: ${PCR_EXT:0:16}...)"
+if [ -n "$PCR_RESP" ] && echo "$PCR_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+  PCR_COUNT=$(echo "$PCR_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
+  PCR16_VERIFIED=$(echo "$PCR_RESP" | jq -r '.pcr16_verified // false' 2>/dev/null || echo "false")
+  PCR16_PRESENT=$(echo "$PCR_RESP" | jq -r '.pcr16_present // false' 2>/dev/null || echo "false")
+  if [ "$PCR16_VERIFIED" = "true" ]; then
+    pass "PCR derivation valid, PCR16 verified from attestation doc (${PCR_COUNT} PCRs)"
+  elif [ "$PCR16_PRESENT" = "true" ]; then
+    fail "PCR16 present but value mismatch" "$(echo "$PCR_RESP" | jq -c '{expected_pcr16,actual_pcr16}')"
+  else
+    fail "PCR16 missing from attestation doc (lock failed?)" "$(echo "$PCR_RESP" | jq -c '{pcr_count,pcr16_present}')"
+  fi
 else
-  fail "PCR secret pubkey" "${PCR_RESP:0:120}"
+  fail "PCR secret derivation" "${PCR_RESP:0:120}"
 fi
 
-# Test 12: Storage persistence (write a known key for post-migration verification).
-echo "[12/17] Storage persistence (write phase)"
+# Test 12: Full attestation document structure verification.
+# Fetches raw attestation doc, parses COSE Sign1 + CBOR, verifies PCR map exists,
+# PCR0 is present and non-zero, and PCR16 matches expected value (locked by SDK).
+echo "[12/20] Attestation document structure"
+ATTEST_DOC_RESP=$($CURL "${BASE_URL}/test/attestation-document" 2>/dev/null || echo "")
+if [ -n "$ATTEST_DOC_RESP" ] && echo "$ATTEST_DOC_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+  PCR_COUNT=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
+  PCR0_NONZERO=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr0_nonzero // false' 2>/dev/null || echo "false")
+  PCR16_OK=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr16_verified // false' 2>/dev/null || echo "false")
+  if [ "$PCR0_NONZERO" != "true" ]; then
+    fail "PCR0 is zero or missing" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr0_present,pcr0_nonzero}')"
+  elif [ "$PCR16_OK" != "true" ]; then
+    fail "PCR16 verification failed" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr16_verified,pcr16}')"
+  else
+    pass "Attestation doc: ${PCR_COUNT} PCRs, PCR0 valid, PCR16 verified"
+  fi
+else
+  fail "Attestation document" "${ATTEST_DOC_RESP:0:120}"
+fi
+
+# Test 13: Storage persistence (write a known key for post-migration verification).
+echo "[13/20] Storage persistence (write phase)"
 PERSIST_RESP=$($CURL "${BASE_URL}/test/storage-persistence" 2>/dev/null || echo "")
 if [ -n "$PERSIST_RESP" ] && echo "$PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
   PHASE=$(echo "$PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
@@ -149,8 +179,8 @@ else
   fail "Storage persistence" "${PERSIST_RESP:0:120}"
 fi
 
-# Test 13: Dynamic secret persistence (write a known secret for post-migration verification).
-echo "[13/17] Dynamic secret persistence (write phase)"
+# Test 14: Dynamic secret persistence (write a known secret for post-migration verification).
+echo "[14/20] Dynamic secret persistence (write phase)"
 DYN_PERSIST_RESP=$($CURL "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
 if [ -n "$DYN_PERSIST_RESP" ] && echo "$DYN_PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
   DYN_PHASE=$(echo "$DYN_PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
@@ -159,8 +189,8 @@ else
   fail "Dynamic secret persistence" "${DYN_PERSIST_RESP:0:120}"
 fi
 
-# Test 14: Attestation persistence (write pubkey + PCR16 hash for post-migration verification).
-echo "[14/17] Attestation persistence (write phase)"
+# Test 15: Attestation persistence (write pubkey + PCR16 hash for post-migration verification).
+echo "[15/20] Attestation persistence (write phase)"
 ATTEST_PERSIST=$($CURL "${BASE_URL}/test/attestation-persistence" 2>/dev/null || echo "")
 if [ -n "$ATTEST_PERSIST" ] && echo "$ATTEST_PERSIST" | jq -e '.phase' >/dev/null 2>&1; then
   ATTEST_PHASE=$(echo "$ATTEST_PERSIST" | jq -r '.phase' 2>/dev/null || echo "")
@@ -170,13 +200,24 @@ else
   fail "Attestation persistence" "${ATTEST_PERSIST:0:120}"
 fi
 
-# Test 15: Schnorr signature still valid (sanity check before migration).
-echo "[15/17] Pre-migration signature check"
+# Test 16: Schnorr signature still valid (sanity check before migration).
+echo "[16/20] Pre-migration signature check"
 ATTEST2=$($CURL "${BASE_URL}/test/attestation" 2>/dev/null || echo "")
 if [ -n "$ATTEST2" ] && echo "$ATTEST2" | jq -e '.signature_valid == true' >/dev/null 2>&1; then
   pass "Schnorr signature valid (pre-migration baseline)"
 else
   fail "Pre-migration signature" "${ATTEST2:0:120}"
+fi
+
+# Test 17: Attestation binding (pubkey → UserData in attestation doc).
+# Verifies the full chain: X-Attestation-Pubkey signs responses, and
+# SHA256(pubkey) is bound to the NSM attestation document via UserData.
+echo "[17/20] Attestation binding (pubkey → UserData)"
+BINDING_RESP=$($CURL "${BASE_URL}/test/attestation-binding" 2>/dev/null || echo "")
+if [ -n "$BINDING_RESP" ] && echo "$BINDING_RESP" | jq -e '.binding_valid == true' >/dev/null 2>&1; then
+  pass "Attestation pubkey bound to NSM document (SHA256(pubkey) == UserData)"
+else
+  fail "Attestation binding" "${BINDING_RESP:0:120}"
 fi
 
 # --- Prometheus scraping tests ---
@@ -205,8 +246,8 @@ else
   echo "  Warning: prometheus binary not found, skipping Prometheus tests"
 fi
 
-# Test 16: Prometheus scrapes enclave metrics successfully.
-echo "[16/17] Prometheus scrape targets"
+# Test 18: Prometheus scrapes enclave metrics successfully.
+echo "[18/20] Prometheus scrape targets"
 if [ -n "$PROM_PID" ]; then
   TARGETS_UP=$(curl -sf "${PROM_URL}/api/v1/targets" 2>/dev/null \
     | jq '[.data.activeTargets[] | select(.health == "up")] | length' 2>/dev/null || echo "0")
@@ -219,8 +260,8 @@ else
   fail "Prometheus scrape" "prometheus not running"
 fi
 
-# Test 17: Prometheus has enclave application metrics (from /v1/metrics).
-echo "[17/17] Prometheus enclave metrics"
+# Test 19: Prometheus has enclave application metrics (from /v1/metrics).
+echo "[19/20] Prometheus enclave metrics"
 if [ -n "$PROM_PID" ]; then
   # Query for one of the enclave_ prefixed counters.
   METRIC_VAL=$(curl -sf "${PROM_URL}/api/v1/query?query=enclave_http_requests_total" 2>/dev/null \
@@ -239,6 +280,15 @@ if [ -n "$PROM_PID" ]; then
   fi
 else
   fail "Prometheus enclave metrics" "prometheus not running"
+fi
+
+# Test 20: Attestation still works after all tests (NSM stability).
+echo "[20/20] Attestation stability check"
+PCR_RESP2=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
+if [ -n "$PCR_RESP2" ] && echo "$PCR_RESP2" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+  pass "Attestation stable after all tests"
+else
+  fail "Attestation stability" "${PCR_RESP2:0:120}"
 fi
 
 # Clean up Prometheus.

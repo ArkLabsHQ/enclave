@@ -31,13 +31,15 @@ type EIFBuildConfig struct {
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
 type buildConfigJSON struct {
-	Name    string                 `json:"name"`
-	Version string                 `json:"version"`
-	Region  string                 `json:"region"`
-	Prefix  string                 `json:"prefix"`
-	App     buildConfigAppJSON     `json:"app"`
-	Secrets []buildConfigSecretJSON `json:"secrets"`
-	SDK     buildConfigSDKJSON     `json:"sdk"`
+	Name    string                  `json:"name"`
+	Version string                  `json:"version"`
+	Region  string                  `json:"region"`
+	Prefix  string                  `json:"prefix"`
+	App               buildConfigAppJSON      `json:"app"`
+	Secrets           []buildConfigSecretJSON `json:"secrets"`
+	SDK               buildConfigSDKJSON      `json:"sdk"`
+	MigrationCooldown string                  `json:"migration_cooldown"`
+	PreviousPCR0      string                  `json:"previous_pcr0"`
 }
 
 type buildConfigAppJSON struct {
@@ -87,6 +89,19 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	root, err := findRepoRoot()
 	if err != nil {
 		return err
+	}
+
+	// Warn if vendor/ is git-tracked (causes stale dependency issues in Nix).
+	vendorPath := filepath.Join(root, "vendor")
+	if _, statErr := os.Stat(vendorPath); statErr == nil {
+		gitLsCmd := exec.Command("git", "ls-files", "vendor/")
+		gitLsCmd.Dir = root
+		if lsOut, lsErr := gitLsCmd.Output(); lsErr == nil && len(strings.TrimSpace(string(lsOut))) > 0 {
+			fmt.Println("[build] Warning: vendor/ directory is tracked by git.")
+			fmt.Println("        This may cause stale dependency issues in Nix builds.")
+			fmt.Println("        Consider adding 'vendor/' to .gitignore and running:")
+			fmt.Println("          git rm -r --cached vendor/")
+		}
 	}
 
 	// Generate build-config.json for Nix to read.
@@ -146,10 +161,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 	// Convert secrets config.
 	var secrets []buildConfigSecretJSON
 	for _, s := range cfg.Secrets {
-		secrets = append(secrets, buildConfigSecretJSON{
-			Name:   s.Name,
-			EnvVar: s.EnvVar,
-		})
+		secrets = append(secrets, buildConfigSecretJSON(s))
 	}
 
 	bc := buildConfigJSON{
@@ -175,6 +187,8 @@ func generateBuildConfig(cfg *Config, root string) error {
 			Hash:       cfg.SDK.Hash,
 			VendorHash: cfg.SDK.VendorHash,
 		},
+		MigrationCooldown: cfg.MigrationCooldown,
+		PreviousPCR0:      cfg.PreviousPCR0,
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")

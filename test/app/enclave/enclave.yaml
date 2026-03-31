@@ -2,19 +2,20 @@
 # Edit this file then run: enclave init
 
 name: my-app                     # App name (used in stack name, EIF name)
-version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
+version: 0.0.1
 region: us-east-1                # AWS region
 account: "000000000000"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
+migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)
 
 # SDK coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.48"
-  hash: "sha256-ED/SuJskeJgyH6OvnpWoSTvPa4/vFiJurTwOY4fLd0k="
+  rev: "v0.0.58"
+  hash: "sha256-/4KCDSkDv/vC2mP0bBQ55T+tjWhJo7xfR/VpzKkAUqw="
   vendor_hash: "sha256-pn7BpRe6csX8LnK5NEGXktC+RkoaKg/ZZpJ6SLcP1dE="
 
 app:
@@ -23,9 +24,9 @@ app:
 
   nix_owner: "ArkLabsHQ"
   nix_repo: "introspector-enclave"
-  nix_rev: "b8dde40c6c283457302d49ba994d054c901d7a0d"
-  nix_hash: "sha256-GpbMVFyH7vUyvFKgJTK65bQMJpKNmNyt2wCp66n018g="
-  nix_vendor_hash: "sha256-WdVx9ubksR0UWsz/hLo3ATT+sEbcKnYAATqJYD/zm4M="
+  nix_rev: "01e1caa74a01d2ce1b0b322f1ccc3fbd2450c69d"
+  nix_hash: "sha256-KytvlwE+91TmHeQmo7E2PdwLfNZN6jTE++VSRVwiiPM="
+  nix_vendor_hash: "sha256-Qb+fEpMI21oy93Nuu5Tw2n91PKByVv6qeWNuF6JtytE="
   nix_sub_packages:
     - "cmd"
   binary_name: "test-app"
@@ -34,12 +35,14 @@ app:
     # AWS services through gvproxy TAP via host.containers.internal (matches production path).
     # IMDS uses viproxy by default (127.0.0.1:80 → vsock 3:8002) — no override needed.
     AWS_ENDPOINT_URL_KMS: "http://host.containers.internal:4000"
-    ENCLAVE_KMS_KEY_ID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
     AWS_ENDPOINT_URL_SSM: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_STS: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"
+    AWS_ACCESS_KEY_ID: "test"
+    AWS_SECRET_ACCESS_KEY: "test"
 
 # One secret for testing KMS secret init and migration.
 secrets:
-  - name: signing-key
+  - name: signing_key
     env_var: SIGNING_KEY
+

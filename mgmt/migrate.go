@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
@@ -71,7 +70,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	totalSteps := 9
 	emit := func(step int, status, msg string) {
 		slog.Info("migrate step", "step", step, "total", totalSteps, "status", status, "msg", msg)
-		json.NewEncoder(w).Encode(migrateStatus{
+		_ = json.NewEncoder(w).Encode(migrateStatus{
 			Step:    step,
 			Total:   totalSteps,
 			Status:  status,
@@ -84,6 +83,59 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	emitErr := func(step int, msg string) {
 		emit(step, "error", msg)
+	}
+
+	// Step 0: Cooldown period (if configured).
+	if s.migrationCooldown > 0 {
+		requestedAt := time.Now().UTC()
+		if err := s.putParam(ctx, "MigrationRequestedAt", requestedAt.Format(time.RFC3339)); err != nil {
+			emitErr(0, fmt.Sprintf("store MigrationRequestedAt: %v", err))
+			return
+		}
+
+		s.migrationAbortMu.Lock()
+		s.migrationAbort = make(chan struct{})
+		abortCh := s.migrationAbort
+		s.migrationAbortMu.Unlock()
+
+		emit(0, "cooldown", fmt.Sprintf("Migration cooldown: %s (abort via POST /migrate/abort)", s.migrationCooldown))
+		deadline := requestedAt.Add(s.migrationCooldown)
+
+		// Scale tick interval: 1min for cooldowns > 1h, 10s otherwise.
+		tickInterval := 10 * time.Second
+		if s.migrationCooldown > time.Hour {
+			tickInterval = time.Minute
+		}
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+
+		aborted := false
+		for time.Now().UTC().Before(deadline) {
+			select {
+			case <-abortCh:
+				aborted = true
+			case <-ctx.Done():
+				aborted = true
+			case <-ticker.C:
+			}
+			if aborted {
+				break
+			}
+			remaining := time.Until(deadline).Round(time.Second)
+			emit(0, "cooldown", fmt.Sprintf("Cooldown: %s remaining", remaining))
+		}
+
+		s.resetParam(ctx, "MigrationRequestedAt")
+
+		s.migrationAbortMu.Lock()
+		s.migrationAbort = nil
+		s.migrationAbortMu.Unlock()
+
+		if aborted {
+			emit(0, "aborted", "Migration aborted during cooldown")
+			return
+		}
+		emit(0, "cooldown", "Cooldown expired, proceeding with migration")
 	}
 
 	// Step 1: Read current KMS key ID from SSM.
@@ -148,8 +200,9 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	policy := buildTransitionalPolicy(roleARN, fmt.Sprintf("arn:aws:iam::%s:root", accountID))
 	_, err = s.kms.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-		KeyId:  aws.String(newKMSKeyID),
-		Policy: aws.String(policy),
+		KeyId:      aws.String(newKMSKeyID),
+		Policy:     aws.String(policy),
+		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		rollbackKey()
@@ -278,7 +331,7 @@ func (s *server) callExportKey(ctx context.Context, migrationKeyID string) error
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("export-key returned %d: %s", resp.StatusCode, string(body))
@@ -343,7 +396,7 @@ func (s *server) putParam(ctx context.Context, name, value string) error {
 }
 
 func (s *server) resetParam(ctx context.Context, name string) {
-	s.putParam(ctx, name, "UNSET")
+	_ = s.putParam(ctx, name, "UNSET")
 }
 
 func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) error {
@@ -354,7 +407,7 @@ func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) 
 	if err != nil {
 		return fmt.Errorf("S3 GetObject: %w", err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	tmp := destPath + ".tmp"
 	f, err := os.Create(tmp)
@@ -362,12 +415,12 @@ func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) 
 		return err
 	}
 	if _, err := io.Copy(f, out.Body); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, destPath)
@@ -448,26 +501,45 @@ func buildTransitionalPolicy(ec2RoleARN, accountRoot string) string {
 }`, ec2RoleARN, accountRoot)
 }
 
+// handleMigrateAbort cancels a migration that is in the cooldown phase.
+func (s *server) handleMigrateAbort(w http.ResponseWriter, r *http.Request) {
+	s.migrationAbortMu.Lock()
+	ch := s.migrationAbort
+	s.migrationAbortMu.Unlock()
+
+	if ch == nil {
+		http.Error(w, `{"error":"no migration in cooldown"}`, http.StatusConflict)
+		return
+	}
+
+	select {
+	case <-ch:
+		http.Error(w, `{"error":"migration already past cooldown or aborted"}`, http.StatusConflict)
+	default:
+		close(ch)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "aborted",
+			"message": "migration cooldown aborted",
+		})
+	}
+}
+
 // copyFile copies src to dst as a fallback when rename fails (cross-device).
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	return out.Close()
 }
-
-// Suppress unused import warnings.
-var (
-	_ kmstypes.KeyState
-)

@@ -88,9 +88,24 @@ func getFrameworkFiles(language string) []frameworkFile {
 			Content: frameworkVerifyWorkflow,
 		},
 		{
+			RelPath: ".github/workflows/build-eif.yml",
+			Mode:    0644,
+			Content: frameworkBuildEIFWorkflow,
+		},
+		{
 			RelPath: "enclave/.gitignore",
 			Mode:    0644,
 			Content: frameworkGitignore,
+		},
+		{
+			RelPath: "enclave/dokploy/docker-compose.yml",
+			Mode:    0644,
+			Content: frameworkDokployCompose,
+		},
+		{
+			RelPath: "enclave/dokploy/seed.yaml",
+			Mode:    0644,
+			Content: frameworkDokploySeedYaml,
 		},
 	}
 }
@@ -439,6 +454,8 @@ ENCLAVE_NITRIDING_FQDN=example.com
 ENCLAVE_KMS_KEY_ID=${__KMS_KEY_ID__}
 ENCLAVE_DEPLOYMENT=${__DEV_MODE__}
 ENCLAVE_AWS_REGION=${__REGION__}
+ENCLAVE_MIGRATION_COOLDOWN=${__MIGRATION_COOLDOWN__}
+ENCLAVE_PREVIOUS_PCR0=${__PREVIOUS_PCR0__}
 EOF
 
 systemctl enable --now enclave-watchdog.service
@@ -453,7 +470,7 @@ const frameworkFlakeNix = `{
   description = "Nitro Enclave - reproducible build";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -516,7 +533,8 @@ const frameworkFlakeNix = `{
             hash = appCfg.nix_hash;
           };
 
-          vendorHash = appCfg.nix_vendor_hash;
+          vendorHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
+          proxyVendor = true;
 
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
@@ -615,6 +633,8 @@ const frameworkFlakeNix = `{
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -650,7 +670,7 @@ const frameworkFlakeNixNodejs = `{
   description = "Nitro Enclave - reproducible build (Node.js)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
@@ -716,7 +736,7 @@ const frameworkFlakeNixNodejs = `{
             hash = appCfg.nix_hash;
           };
 
-          npmDepsHash = appCfg.nix_vendor_hash;
+          npmDepsHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
           dontNpmBuild = true;
           doCheck = false;
         };
@@ -817,6 +837,8 @@ LAUNCHER
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -1347,6 +1369,8 @@ const frameworkFlakeNixDotnet = `{
           AWS_REGION=` + "${region}" + `
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
+          ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
           ` + "${appEnvLines}" + `
@@ -1552,3 +1576,247 @@ jobs:
           git push origin gh-pages
 `
 
+// GitHub Actions workflow — builds the EIF and uploads to a GitHub Release.
+// Triggered on push when enclave-related files change, or manually.
+// Dokploy (or any CI/CD tool) can pull the EIF from the "eif-latest" release
+// to run QEMU enclave tests on a bare metal instance without needing Nix locally.
+const frameworkBuildEIFWorkflow = `name: Build EIF
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'enclave/**'
+      - 'flake.nix'
+      - 'flake.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-eif:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install enclave CLI
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - name: Pull Nix Docker image
+        run: docker pull nixos/nix:2.24.9
+
+      - name: Build EIF
+        run: enclave build
+
+      - name: Extract PCR values
+        id: pcr
+        run: |
+          PCR0=$(jq -r '.PCR0 // .pcr0' enclave/artifacts/pcr.json)
+          echo "pcr0=${PCR0}" >> "$GITHUB_OUTPUT"
+          echo "PCR0: ${PCR0:0:32}..."
+
+      - name: Upload EIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclave-eif
+          path: |
+            enclave/artifacts/image.eif
+            enclave/artifacts/pcr.json
+          retention-days: 7
+
+      - name: Upload to latest release
+        env:
+          GH_TOKEN: ` + "${{ github.token }}" + `
+          PCR0: ` + "${{ steps.pcr.outputs.pcr0 }}" + `
+          COMMIT_SHA: ` + "${{ github.sha }}" + `
+        run: |
+          TAG="eif-latest"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "EIF (latest)" \
+            --notes "Auto-built EIF from commit ${COMMIT_SHA::8}
+          PCR0: ${PCR0}" \
+            --prerelease \
+            enclave/artifacts/image.eif \
+            enclave/artifacts/pcr.json
+`
+
+const frameworkDokployCompose = `# Dokploy-compatible compose file for local QEMU enclave deployment.
+#
+# Dokploy connects to the GitHub repo and deploys this stack on push.
+# The EIF is downloaded automatically from the "eif-latest" GitHub Release
+# (built by .github/workflows/build-eif.yml).
+#
+# Setup in Dokploy:
+#   1. Create a "Compose" project
+#   2. Connect to your GitHub repo
+#   3. Set compose path: enclave/dokploy/docker-compose.yml
+#   4. Set env var GITHUB_REPO (e.g. owner/repo)
+#   5. Optionally set GITHUB_TOKEN for private repos
+#   6. Deploy
+#
+# Manual usage:
+#   GITHUB_REPO=owner/repo docker compose up
+
+services:
+  # --- EIF Downloader ---
+  # Downloads the latest EIF from GitHub Releases before the enclave starts.
+  eif-downloader:
+    image: curlimages/curl:latest
+    user: "0:0"
+    volumes:
+      - eif-artifacts:/artifacts
+    environment:
+      GITHUB_REPO: "${GITHUB_REPO}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "=== Downloading EIF from GitHub Releases ==="
+        REPO="$${GITHUB_REPO}"
+        TAG="eif-latest"
+
+        if [ -n "$${GITHUB_TOKEN}" ]; then
+          AUTH_HEADER="Authorization: token $${GITHUB_TOKEN}"
+        else
+          AUTH_HEADER="X-No-Auth: true"
+        fi
+
+        RELEASE_URL="https://api.github.com/repos/$${REPO}/releases/tags/$${TAG}"
+        echo "  Fetching release: $${RELEASE_URL}"
+
+        ASSETS=$(curl -sfL -H "$${AUTH_HEADER}" "$${RELEASE_URL}" | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4)
+
+        if [ -z "$${ASSETS}" ]; then
+          echo "ERROR: No assets found in release $${TAG}"
+          echo "Has the build-eif workflow run? Check: https://github.com/$${REPO}/releases/tag/$${TAG}"
+          exit 1
+        fi
+
+        mkdir -p /artifacts
+        for URL in $${ASSETS}; do
+          FILENAME=$(basename "$${URL}")
+          echo "  Downloading: $${FILENAME}"
+          curl -sfL -H "$${AUTH_HEADER}" -o "/artifacts/$${FILENAME}" "$${URL}"
+        done
+
+        echo "  Downloaded:"
+        ls -lh /artifacts/
+        echo "=== EIF download complete ==="
+
+  # --- Mock AWS Services ---
+
+  local-kms:
+    image: nsmithuk/local-kms
+    ports:
+      - "8080:8080"
+    environment:
+      KMS_REGION: us-east-1
+      KMS_ACCOUNT_ID: "123456789012"
+    volumes:
+      - ./seed.yaml:/init/seed.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  kms-proxy:
+    image: ghcr.io/arklabshq/enclave-kms-proxy:latest
+    ports:
+      - "4000:4000"
+    environment:
+      UPSTREAM_KMS_URL: "http://local-kms:8080"
+      LISTEN_ADDR: ":4000"
+    depends_on:
+      local-kms:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/ || exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: ssm,sts,s3,cloudformation,iam
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mock-imds:
+    image: ghcr.io/arklabshq/enclave-mock-imds:latest
+    ports:
+      - "1338:1338"
+    environment:
+      LISTEN_ADDR: ":1338"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:1338/latest/api/token || exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- QEMU Enclave ---
+  # Boots the EIF in QEMU with nitro-enclave emulation.
+  # Requires privileged mode for KVM + vsock access.
+
+  enclave:
+    image: ghcr.io/arklabshq/enclave-runner:latest
+    privileged: true
+    network_mode: host
+    devices:
+      - /dev/kvm:/dev/kvm
+      - /dev/vsock:/dev/vsock
+    volumes:
+      - eif-artifacts:/eif
+    depends_on:
+      eif-downloader:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+      mock-imds:
+        condition: service_healthy
+      kms-proxy:
+        condition: service_healthy
+    environment:
+      BOOT_TIMEOUT: "120"
+    command: ["boot-qemu.sh", "/eif/image.eif"]
+    restart: unless-stopped
+
+volumes:
+  eif-artifacts:
+`
+
+const frameworkDokploySeedYaml = `# Default KMS seed for local development.
+# local-kms loads this at startup to create a pre-seeded encryption key.
+# Customize the KeyId and alias to match your enclave.yaml configuration.
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: "test-key-id"
+          Description: "Local development enclave key"
+          KeyUsage: ENCRYPT_DECRYPT
+        BackingKeys:
+          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+Aliases:
+  - AliasName: alias/test-enclave-key
+    TargetKeyId: "test-key-id"
+`

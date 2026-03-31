@@ -36,7 +36,7 @@ var (
 
 type contentInfo struct {
 	ContentType asn1.ObjectIdentifier
-	Content     asn1.RawValue `asn1:"explicit,tag:0"`
+	Content     envelopedData `asn1:"explicit,tag:0"`
 }
 
 type envelopedData struct {
@@ -97,8 +97,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a Decrypt call with Recipient.
 		target := r.Header.Get("X-Amz-Target")
+		// Check if this is a Decrypt call with Recipient.
 		if target == "TrentService.Decrypt" && r.Method == http.MethodPost {
 			handleDecrypt(w, r, upstream, proxy)
 			return
@@ -280,14 +280,9 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 		EncryptedContentInfo: eci,
 	}
 
-	edBytes, err := asn1.Marshal(ed)
-	if err != nil {
-		return nil, fmt.Errorf("marshal enveloped data: %w", err)
-	}
-
 	ci := contentInfo{
 		ContentType: oidEnvelopedData,
-		Content:     asn1.RawValue{FullBytes: edBytes},
+		Content:     ed,
 	}
 
 	return asn1.Marshal(ci)

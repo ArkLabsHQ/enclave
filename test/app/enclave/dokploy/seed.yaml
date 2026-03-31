@@ -1,0 +1,16 @@
+# Default KMS seed for local development.
+# local-kms loads this at startup to create a pre-seeded encryption key.
+# Customize the KeyId and alias to match your enclave.yaml configuration.
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: "test-key-id"
+          Description: "Local development enclave key"
+          KeyUsage: ENCRYPT_DECRYPT
+        BackingKeys:
+          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+Aliases:
+  - AliasName: alias/test-enclave-key
+    TargetKeyId: "test-key-id"

@@ -162,7 +162,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -303,7 +303,7 @@ func fetchManifestRaw(ctx context.Context, manifestURL string) (*Manifest, []byt
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetch manifest: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

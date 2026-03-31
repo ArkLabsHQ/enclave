@@ -30,23 +30,16 @@
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
         # signing middleware. The user's app is just a plain HTTP server.
-        # Set SDK_LOCAL_PATH to use a local checkout instead of fetching from GitHub.
-        sdkSrc = let localPath = builtins.getEnv "SDK_LOCAL_PATH"; in
-          if localPath != "" then
-            builtins.path { path = localPath; name = "source"; }
-          else
-            pkgs.fetchFromGitHub {
-              owner = "ArkLabsHQ";
-              repo = "introspector-enclave";
-              rev = sdkCfg.rev;
-              hash = sdkCfg.hash;
-            };
-
         enclave-supervisor = pkgs.buildGoModule {
           pname = "enclave-supervisor";
           version = buildCfg.version;
 
-          src = sdkSrc;
+          src = pkgs.fetchFromGitHub {
+            owner = "ArkLabsHQ";
+            repo = "introspector-enclave";
+            rev = sdkCfg.rev;
+            hash = sdkCfg.hash;
+          };
 
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
@@ -60,12 +53,17 @@
           doCheck = false;
         };
 
-        # User's app — built from local source (test skeleton).
+        # User's app — fetched from GitHub. No SDK dependency needed.
         upstream-app = pkgs.buildGoModule {
           pname = appCfg.binary_name;
           version = buildCfg.version;
 
-          src = ./.;
+          src = pkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
 
           vendorHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
           proxyVendor = true;
@@ -168,6 +166,7 @@
           ENCLAVE_APP_NAME=${buildCfg.name}
           ENCLAVE_SECRETS_CONFIG=${secretsCfgJson}
           ENCLAVE_MIGRATION_COOLDOWN=${buildCfg.migration_cooldown or "0s"}
+          ENCLAVE_PREVIOUS_PCR0=${buildCfg.previous_pcr0 or "genesis"}
           ENCLAVE_DEPLOYMENT=${deployment}
           ${appEnvLines}
         '';

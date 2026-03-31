@@ -22,8 +22,10 @@ type NitroIntrospectorStackProps struct {
 	Deployment   string
 	RepoRoot     string
 	InstanceType string
-	AppName      string
-	Secrets      []SecretConfig
+	AppName           string
+	Secrets           []SecretConfig
+	MigrationCooldown string
+	PreviousPCR0      string
 	// Local skips VPC, EC2, S3 assets, and ECR — for deploying to localstack.
 	Local bool
 }
@@ -33,6 +35,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	repoRoot := "."
 	instanceType := "m6i.xlarge"
 	appName := "app"
+	migrationCooldown := "0s"
+	previousPCR0 := "genesis"
 	local := false
 	var secrets []SecretConfig
 	stackProps := awscdk.StackProps{}
@@ -52,6 +56,12 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		}
 		secrets = props.Secrets
 		local = props.Local
+		if props.MigrationCooldown != "" {
+			migrationCooldown = props.MigrationCooldown
+		}
+		if props.PreviousPCR0 != "" {
+			previousPCR0 = props.PreviousPCR0
+		}
 	}
 
 	stack := awscdk.NewStack(scope, jsii.String(id), &stackProps)
@@ -328,6 +338,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 			"__MGMT_SYSTEMD_S3_URL__":         mgmtSystemd.S3ObjectUrl(),
 			"__REGION__":                      stack.Region(),
 			"__KMS_KEY_ID__":                  encryptionKey.KeyId(),
+			"__MIGRATION_COOLDOWN__":          jsii.String(migrationCooldown),
+			"__PREVIOUS_PCR0__":               jsii.String(previousPCR0),
 		}
 
 		userDataRaw := awscdk.Fn_Sub(jsii.String(ReadFileOrPanic(repoPath("enclave/user_data/user_data"))), &mappings)

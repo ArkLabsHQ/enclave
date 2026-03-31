@@ -43,7 +43,7 @@ func VerifyManifestProvenance(ctx context.Context, repo string, manifestBytes []
 	if err != nil {
 		return fmt.Errorf("attestations API: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
@@ -96,7 +96,7 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -272,7 +272,7 @@ func fetchEnclaveInfo(ctx context.Context, httpClient *http.Client, baseURL stri
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

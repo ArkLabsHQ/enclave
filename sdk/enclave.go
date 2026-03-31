@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -49,6 +51,12 @@ type Enclave struct {
 	s3Client   *s3.Client
 	bucketName string
 	dek        []byte // 32-byte plaintext AES-256 key, in memory only
+
+	// Migration cooldown cache (avoids hammering SSM on every enclave-info call).
+	cooldownMu        sync.Mutex
+	cooldownPending   bool
+	cooldownRemaining int // seconds
+	cooldownFetchedAt time.Time
 }
 
 // New creates an Enclave that is safe to use immediately for serving
@@ -93,7 +101,7 @@ func secureRandom(b []byte) (int, error) {
 		// Not in an enclave (no /dev/nsm) — crypto/rand is fine on normal Linux.
 		return rand.Read(b)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 	// In an enclave — NSM hardware RNG is the only trustworthy source.
 	return session.Read(b)
 }
@@ -152,8 +160,25 @@ func (e *Enclave) Init(ctx context.Context) error {
 		e.dynamicSecretsCount.Store(int64(count))
 	}
 
+	// Verify and set previous PCR0.
+	expectedPCR0 := os.Getenv("ENCLAVE_PREVIOUS_PCR0")
+	if expectedPCR0 == "" {
+		expectedPCR0 = "genesis"
+	}
+	ssmPCR0 := ""
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
-		e.previousPCR0 = pcr0
+		ssmPCR0 = pcr0
+	}
+	if expectedPCR0 != "genesis" {
+		if ssmPCR0 == "" || ssmPCR0 == "UNSET" {
+			return fmt.Errorf("previous_pcr0 is %q but no migration has occurred (SSM has no value)", expectedPCR0)
+		}
+		if expectedPCR0 != ssmPCR0 {
+			return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave.yaml), got %q (from SSM)", expectedPCR0, ssmPCR0)
+		}
+	}
+	if ssmPCR0 != "" && ssmPCR0 != "UNSET" {
+		e.previousPCR0 = ssmPCR0
 	}
 	if attestDoc, err := readMigrationPreviousPCR0Attestation(ctx); err == nil {
 		e.previousPCR0Attestation = attestDoc
@@ -221,7 +246,7 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 // handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
 func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprint(w, enclaveMetrics.PrometheusText())
+	_, _ = fmt.Fprint(w, enclaveMetrics.PrometheusText())
 }
 
 // Middleware returns an http.Handler that signs all responses with the
@@ -251,7 +276,7 @@ func (e *Enclave) Middleware(next http.Handler) http.Handler {
 		}
 
 		w.WriteHeader(rec.status)
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 }
 
@@ -296,7 +321,7 @@ func (e *Enclave) generateAttestationKey() error {
 	if err != nil {
 		return fmt.Errorf("POST /enclave/hash: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -336,6 +361,9 @@ func (e *Enclave) extendPCRsWithSecretPubkeys(secrets []SecretDef) error {
 		if err := extendPCR(pcrIndex, hash[:]); err != nil {
 			return fmt.Errorf("extend PCR%d with secret %q pubkey: %w", pcrIndex, s.Name, err)
 		}
+		if err := lockPCR(pcrIndex); err != nil {
+			return fmt.Errorf("lock PCR%d after secret %q: %w", pcrIndex, s.Name, err)
+		}
 	}
 	return nil
 }
@@ -363,7 +391,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 
 	if !e.initDone.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(struct {
+		_ = json.NewEncoder(w).Encode(struct {
 			Version      string `json:"version"`
 			PreviousPCR0 string `json:"previous_pcr0"`
 			Initializing bool   `json:"initializing"`
@@ -377,23 +405,119 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(struct {
-		Version                 string           `json:"version"`
-		PreviousPCR0            string           `json:"previous_pcr0"`
-		PreviousPCR0Attestation string           `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey       string           `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets          int64            `json:"dynamic_secrets"`
-		Metrics                 map[string]int64 `json:"metrics"`
-		Error                   string           `json:"error,omitempty"`
+	cooldownSeconds, cooldownRemaining, migrationPending := e.getMigrationCooldownStatus(r.Context())
+
+	_ = json.NewEncoder(w).Encode(struct {
+		Version                    string           `json:"version"`
+		PreviousPCR0               string           `json:"previous_pcr0"`
+		PreviousPCR0Attestation    string           `json:"previous_pcr0_attestation,omitempty"`
+		AttestationPubkey          string           `json:"attestation_pubkey,omitempty"`
+		DynamicSecrets             int64            `json:"dynamic_secrets"`
+		Metrics                    map[string]int64 `json:"metrics"`
+		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
+		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
+		MigrationPending           bool             `json:"migration_pending"`
+		Error                      string           `json:"error,omitempty"`
 	}{
-		Version:                 Version,
-		PreviousPCR0:            e.previousPCR0,
-		PreviousPCR0Attestation: e.previousPCR0Attestation,
-		AttestationPubkey:       e.AttestationPubkey(),
-		DynamicSecrets:          e.dynamicSecretsCount.Load(),
-		Metrics:                 enclaveMetrics.Snapshot(),
-		Error:                   e.InitError(),
+		Version:                    Version,
+		PreviousPCR0:               e.previousPCR0,
+		PreviousPCR0Attestation:    e.previousPCR0Attestation,
+		AttestationPubkey:          e.AttestationPubkey(),
+		DynamicSecrets:             e.dynamicSecretsCount.Load(),
+		Metrics:                    enclaveMetrics.Snapshot(),
+		MigrationCooldownSeconds:   cooldownSeconds,
+		MigrationCooldownRemaining: cooldownRemaining,
+		MigrationPending:           migrationPending,
+		Error:                      e.InitError(),
 	})
+}
+
+// getMigrationCooldownStatus returns the configured cooldown duration, remaining
+// seconds, and whether a migration is pending. Results are cached for 5 seconds
+// to avoid hammering SSM on frequent enclave-info calls.
+func (e *Enclave) getMigrationCooldownStatus(ctx context.Context) (configuredSeconds int, remainingSeconds int, pending bool) {
+	cooldownStr := os.Getenv("ENCLAVE_MIGRATION_COOLDOWN")
+	if cooldownStr == "" {
+		cooldownStr = "0s"
+	}
+	cooldown, err := time.ParseDuration(cooldownStr)
+	if err != nil {
+		return 0, 0, false
+	}
+	configuredSeconds = int(cooldown.Seconds())
+
+	// No cooldown configured — skip SSM check entirely.
+	if cooldown == 0 {
+		return 0, 0, false
+	}
+
+	// Return cached result if fresh.
+	e.cooldownMu.Lock()
+	if time.Since(e.cooldownFetchedAt) < 5*time.Second {
+		remaining := e.cooldownRemaining
+		pend := e.cooldownPending
+		e.cooldownMu.Unlock()
+		return configuredSeconds, remaining, pend
+	}
+	e.cooldownMu.Unlock()
+
+	// Fetch MigrationRequestedAt from SSM.
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return configuredSeconds, 0, false
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+
+	requestedAtStr, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationRequestedAt", deployment, appName))
+	if err != nil || requestedAtStr == "" {
+		e.cooldownMu.Lock()
+		e.cooldownPending = false
+		e.cooldownRemaining = 0
+		e.cooldownFetchedAt = time.Now()
+		e.cooldownMu.Unlock()
+		return configuredSeconds, 0, false
+	}
+
+	requestedAt, err := time.Parse(time.RFC3339, requestedAtStr)
+	if err != nil {
+		return configuredSeconds, 0, false
+	}
+
+	deadline := requestedAt.Add(cooldown)
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	e.cooldownMu.Lock()
+	e.cooldownPending = true
+	e.cooldownRemaining = int(remaining.Seconds())
+	e.cooldownFetchedAt = time.Now()
+	e.cooldownMu.Unlock()
+
+	return configuredSeconds, int(remaining.Seconds()), true
+}
+
+// lockPCR locks a PCR via the NSM, making it read-only.
+func lockPCR(index uint) error {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return fmt.Errorf("open NSM session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	resp, err := session.Send(&request.LockPCR{
+		Index: uint16(index),
+	})
+	if err != nil {
+		return fmt.Errorf("LockPCR(%d): %w", index, err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("LockPCR(%d): NSM error: %s", index, resp.Error)
+	}
+	return nil
 }
 
 // extendPCR extends a PCR with the given data via the NSM.
@@ -402,7 +526,7 @@ func extendPCR(index uint, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	resp, err := session.Send(&request.ExtendPCR{
 		Index: uint16(index),

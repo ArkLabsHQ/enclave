@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,8 +32,10 @@ type Config struct {
 	App          AppConfig      `yaml:"app"`
 	Secrets      []SecretConfig `yaml:"secrets"`
 	SDK          SDKConfig      `yaml:"sdk"`
-	InstanceType string         `yaml:"instance_type"`
-	NixImage     string         `yaml:"nix_image"`
+	InstanceType      string         `yaml:"instance_type"`
+	NixImage          string         `yaml:"nix_image"`
+	MigrationCooldown string         `yaml:"migration_cooldown"`
+	PreviousPCR0      string         `yaml:"previous_pcr0"`
 }
 
 type AppConfig struct {
@@ -79,7 +82,7 @@ func loadConfig() (*Config, error) {
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w\nRun 'enclave init' to create one.", configPath, err)
+		return nil, fmt.Errorf("cannot read %s: %w (run 'enclave init' to create one)", configPath, err)
 	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -103,6 +106,15 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.App.Language == "" {
 		cfg.App.Language = "go"
+	}
+	if cfg.MigrationCooldown == "" {
+		cfg.MigrationCooldown = "0s"
+	}
+	if _, err := time.ParseDuration(cfg.MigrationCooldown); err != nil {
+		return nil, fmt.Errorf("%s: invalid migration_cooldown %q: %w", configFile, cfg.MigrationCooldown, err)
+	}
+	if cfg.PreviousPCR0 == "" {
+		cfg.PreviousPCR0 = "genesis"
 	}
 	// Validate required fields.
 	if cfg.Name == "" {
@@ -195,7 +207,7 @@ type CDKOutputs map[string]map[string]string
 func loadCDKOutputs(root string) (CDKOutputs, error) {
 	data, err := os.ReadFile(filepath.Join(root, "enclave", "cdk-outputs.json"))
 	if err != nil {
-		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w\nRun 'enclave deploy' first.", err)
+		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w (run 'enclave deploy' first)", err)
 	}
 	var outputs CDKOutputs
 	if err := json.Unmarshal(data, &outputs); err != nil {

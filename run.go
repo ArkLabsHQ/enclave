@@ -63,8 +63,10 @@ func synthCDKStack(cfg *Config, root string) error {
 		RepoRoot:     absRoot,
 		InstanceType: cfg.InstanceType,
 		AppName:      cfg.Name,
-		Secrets:      cfg.Secrets,
-		Local:        local,
+		Secrets:           cfg.Secrets,
+		MigrationCooldown: cfg.MigrationCooldown,
+		PreviousPCR0:      cfg.PreviousPCR0,
+		Local:             local,
 	})
 
 	app.Synth(nil)

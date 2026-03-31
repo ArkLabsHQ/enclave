@@ -26,9 +26,9 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// Proxy nitriding's Prometheus metrics.
 	resp, err := http.Get(nitridingMetricsURL)
 	if err == nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode == http.StatusOK {
-			io.Copy(w, resp.Body)
+			_, _ = io.Copy(w, resp.Body)
 		}
 	}
 
@@ -36,21 +36,21 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	appResp, err := enclaveMetricsClient.Get(enclaveURL + "/v1/metrics")
 	if err == nil {
-		defer appResp.Body.Close()
+		defer func() { _ = appResp.Body.Close() }()
 		if appResp.StatusCode == http.StatusOK {
-			fmt.Fprintln(w)
-			io.Copy(w, appResp.Body)
+			_, _ = fmt.Fprintln(w)
+			_, _ = io.Copy(w, appResp.Body)
 		}
 	}
 
 	// Append host-level enclave metrics.
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "# HELP enclave_host_up Whether the enclave is running (1) or stopped (0).")
-	fmt.Fprintln(w, "# TYPE enclave_host_up gauge")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "# HELP enclave_host_up Whether the enclave is running (1) or stopped (0).")
+	_, _ = fmt.Fprintln(w, "# TYPE enclave_host_up gauge")
 
 	enclaves, err := describeEnclaves()
 	if err != nil || len(enclaves) == 0 {
-		fmt.Fprintln(w, "enclave_host_up 0")
+		_, _ = fmt.Fprintln(w, "enclave_host_up 0")
 		return
 	}
 
@@ -60,13 +60,13 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		running = 1
 	}
 
-	fmt.Fprintf(w, "enclave_host_up %d\n", running)
+	_, _ = fmt.Fprintf(w, "enclave_host_up %d\n", running)
 
-	fmt.Fprintln(w, "# HELP enclave_host_memory_mib Memory allocated to the enclave in MiB.")
-	fmt.Fprintln(w, "# TYPE enclave_host_memory_mib gauge")
-	fmt.Fprintf(w, "enclave_host_memory_mib %d\n", enc.MemoryMiB)
+	_, _ = fmt.Fprintln(w, "# HELP enclave_host_memory_mib Memory allocated to the enclave in MiB.")
+	_, _ = fmt.Fprintln(w, "# TYPE enclave_host_memory_mib gauge")
+	_, _ = fmt.Fprintf(w, "enclave_host_memory_mib %d\n", enc.MemoryMiB)
 
-	fmt.Fprintln(w, "# HELP enclave_host_cpu_count Number of vCPUs allocated to the enclave.")
-	fmt.Fprintln(w, "# TYPE enclave_host_cpu_count gauge")
-	fmt.Fprintf(w, "enclave_host_cpu_count %d\n", enc.CPUCount)
+	_, _ = fmt.Fprintln(w, "# HELP enclave_host_cpu_count Number of vCPUs allocated to the enclave.")
+	_, _ = fmt.Fprintln(w, "# TYPE enclave_host_cpu_count gauge")
+	_, _ = fmt.Fprintf(w, "enclave_host_cpu_count %d\n", enc.CPUCount)
 }

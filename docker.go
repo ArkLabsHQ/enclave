@@ -20,7 +20,7 @@ func runContainer(ctx context.Context, image, command, hostDir, containerDir str
 	if err != nil {
 		return fmt.Errorf("connect to Docker: %w", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
@@ -40,7 +40,7 @@ func runContainer(ctx context.Context, image, command, hostDir, containerDir str
 	containerID := resp.ID
 
 	// Ensure cleanup.
-	defer cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	defer func() { _ = cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}) }()
 
 	// Set up wait channel before starting to avoid race.
 	waitCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
@@ -58,9 +58,9 @@ func runContainer(ctx context.Context, image, command, hostDir, containerDir str
 	if err != nil {
 		return fmt.Errorf("attach to container logs: %w", err)
 	}
-	defer logReader.Close()
+	defer func() { _ = logReader.Close() }()
 
-	stdcopy.StdCopy(os.Stdout, os.Stderr, logReader)
+	_, _ = stdcopy.StdCopy(os.Stdout, os.Stderr, logReader)
 
 	// Wait for exit.
 	select {

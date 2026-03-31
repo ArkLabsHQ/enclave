@@ -129,6 +129,12 @@ wait_for_enclave() {
   if [ $SECONDS -ge "$init_timeout" ]; then
     echo "Error: Init did not complete within ${init_timeout}s${label:+ ($label)}" >&2
     curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || true
+    echo ""
+    echo "  Boot log (errors and init):"
+    grep -i 'error\|fail\|init\|KMS\|secret\|policy\|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -30 | sed 's/^/    /' || echo "    (no boot log)"
+    echo ""
+    echo "  SDK init logs (Application says):"
+    grep 'Application says' /tmp/boot-qemu.log 2>/dev/null | head -30 | sed 's/^/    /' || echo "    (none)"
     exit 1
   fi
 }
@@ -145,30 +151,64 @@ if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
 fi
 
 # Step 0: Build test EIF from skeleton app.
-echo "=== [0/7] Building test EIF from skeleton app ==="
+echo "=== [0/9] Building test EIF from skeleton app ==="
 if [ -n "$EIF_PATH" ] && [ -f "$EIF_PATH" ]; then
   echo "  Using provided EIF: $EIF_PATH"
 elif [ "$IN_DOCKER" = true ]; then
-  # Inside Docker: use pre-built EIF from mounted volume (built on host).
+  # Inside Docker: use pre-built EIFs from mounted volume (built on host).
   if [ -f "app/enclave/artifacts/image.eif" ]; then
     EIF_PATH="app/enclave/artifacts/image.eif"
     echo "  Using pre-built EIF: $EIF_PATH"
+    if [ -f "app/enclave/artifacts/image-v2.eif" ]; then
+      echo "  Migration EIF: app/enclave/artifacts/image-v2.eif"
+    else
+      echo "  WARN: No migration EIF (image-v2.eif) — Step 7 will reuse same EIF"
+    fi
   else
     echo "  Error: EIF must be pre-built when running inside Docker" >&2
     echo "  Build it on the host first: cd test/app && enclave build --local" >&2
     exit 1
   fi
 else
-  # On host: always rebuild to ensure latest source is included.
-  echo "  Source: test/app/"
+  # On host: build v1 EIF, then v2 with different version for migration testing.
+  ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+  ARTIFACTS="${SCRIPT_DIR}/app/enclave/artifacts"
+  ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
+
+  echo "  Building v1 EIF (version ${ORIG_VERSION})..."
   (cd app && "$ENCLAVE_CLI" build --local)
   EIF_PATH="app/enclave/artifacts/image.eif"
-  echo "  Built: $EIF_PATH"
+  V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
+  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v1.json"
+  echo "  v1 PCR0: ${V1_PCR0:0:16}..."
+
+  # Build v2 with previous_pcr0 set to v1's PCR0.
+  # This exercises the SDK's previousPCR0 validation during v2 Init:
+  # the enclave checks that ENCLAVE_PREVIOUS_PCR0 (baked from enclave.yaml)
+  # matches MigrationPreviousPCR0 in SSM (stored by v1's export-key).
+  echo "  Building v2 EIF (version 0.0.2, previous_pcr0=${V1_PCR0:0:16}...)..."
+  sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
+  if grep -q '^previous_pcr0:' "$ENCLAVE_YAML"; then
+    sed -i "s/^previous_pcr0: .*/previous_pcr0: \"${V1_PCR0}\"/" "$ENCLAVE_YAML"
+  else
+    echo "" >> "$ENCLAVE_YAML"
+    echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
+  fi
+  (cd app && "$ENCLAVE_CLI" build --local)
+  cp "${ARTIFACTS}/image.eif" "${ARTIFACTS}/image-v2.eif"
+  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v2.json"
+  echo "  v2 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr-v2.json" | cut -c1-16)..."
+
+  # Restore v1 as the active EIF (genesis for first boot).
+  sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
+  sed -i '/^previous_pcr0:/d' "$ENCLAVE_YAML"
+  (cd app && "$ENCLAVE_CLI" build --local)
+  echo "  Restored v1"
 fi
 echo ""
 
 # Step 1: Start mock services (skipped inside Docker — compose handles it).
-echo "=== [1/7] Starting mock services ==="
+echo "=== [1/9] Starting mock services ==="
 if [ "$IN_DOCKER" = true ]; then
   echo "  Skipped (services managed by docker compose)"
 else
@@ -178,7 +218,7 @@ fi
 echo ""
 
 # Step 2: Deploy CDK stack to localstack and start mgmt server.
-echo "=== [2/7] Deploying local CDK stack to localstack ==="
+echo "=== [2/9] Deploying local CDK stack to localstack ==="
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
@@ -190,6 +230,14 @@ export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 
 "$ENCLAVE_CLI" deploy
 
+# CDK created a KMS key in localstack, but we use local-kms for real KMS ops.
+# Overwrite SSM with the local-kms seeded key ID so the enclave uses it.
+LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
+aws ssm put-parameter $LOCALSTACK \
+  --name "/dev/my-app/KMSKeyID" --value "test-key-id" \
+  --type String --overwrite --no-cli-pager
+echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
+
 # Start mgmt server on the host (like production EC2 host).
 # Configured with stop/start commands that manage boot-qemu.sh via PID file.
 echo "  Starting mgmt server..."
@@ -198,6 +246,7 @@ ENCLAVE_AWS_REGION=us-east-1 \
 ENCLAVE_DEPLOYMENT=dev \
 ENCLAVE_APP_NAME=my-app \
 ENCLAVE_MGMT_ADDR="127.0.0.1:8444" \
+ENCLAVE_MIGRATION_COOLDOWN="1m" \
 ENCLAVE_URL="https://127.0.0.1:8443" \
 ENCLAVE_EIF_PATH="$EIF_ABS_PATH" \
 ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3" \
@@ -220,31 +269,129 @@ echo "  Mgmt server running (PID $MGMT_PID) on http://127.0.0.1:8444"
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).
-echo "=== [3/7] Booting enclave in QEMU ==="
+echo "=== [3/9] Booting enclave in QEMU ==="
 ./boot-qemu.sh "$EIF_PATH" &
 wait_for_enclave "initial boot"
 echo ""
 
 # Step 4: Run integration tests.
-echo "=== [4/7] Running integration tests ==="
+echo "=== [4/9] Running integration tests ==="
 ./integration-test.sh
 echo ""
 
-# Step 5: Run migration via enclave deploy (upgrade detection).
-# The enclave is running with secrets initialized, so a second deploy
-# detects upgrade mode and exercises the full migration code path:
-# CLI uploads EIF to S3 → calls mgmt POST /migrate → mgmt orchestrates
-# KMS key creation, export-key, ciphertext adoption, EIF download,
-# stops old enclave, starts new enclave with migrated KMS key.
-echo "=== [5/7] Running migration (enclave deploy upgrade) ==="
-"$ENCLAVE_CLI" deploy
+# Step 5: Verify migration cooldown fields in enclave-info (pre-migration).
+echo "=== [5/9] Migration cooldown: pre-migration check ==="
+COOLDOWN_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+COOLDOWN_SEC=$(echo "$COOLDOWN_INFO" | jq -r '.migration_cooldown_seconds // -1' 2>/dev/null || echo "-1")
+MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "missing" end' 2>/dev/null || echo "missing")
+if echo "$COOLDOWN_INFO" | jq -e 'has("migration_cooldown_seconds")' >/dev/null 2>&1; then
+  echo "  PASS: migration_cooldown_seconds=${COOLDOWN_SEC}, migration_pending=${MIG_PENDING}"
+else
+  echo "  FAIL: migration_cooldown_seconds missing from enclave-info" >&2
+  exit 1
+fi
+if [ "$MIG_PENDING" = "false" ]; then
+  echo "  PASS: No migration pending before deploy"
+else
+  echo "  FAIL: migration_pending should be false before deploy (got: ${MIG_PENDING})" >&2
+  exit 1
+fi
 echo ""
 
-# Step 6: Wait for restarted enclave and verify migration survival.
-# mgmt already stopped and restarted the enclave in step 5 (via boot-qemu.sh).
+# Step 6: Migration cooldown abort test.
+# Start a deploy in the background (enters 5s cooldown), verify pending=true,
+# abort, verify pending=false.
+echo "=== [6/9] Migration cooldown: abort test ==="
+MGMT_URL="http://localhost:${MGMT_PORT:-8444}"
+
+# Export AWS endpoints so the CLI can reach localstack (enclave.yaml uses
+# host.containers.internal which only works inside the QEMU enclave).
+export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
+export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
+export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
+export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
+
+# Start a real deploy in the background. With the deploy.go fix, the CLI
+# detects upgrade mode (KMSKeyID exists in SSM from Step 2), calls POST /migrate
+# on the mgmt server, which enters cooldown before any destructive steps.
+"$ENCLAVE_CLI" deploy > /tmp/deploy-abort-test.log 2>&1 &
+DEPLOY_PID=$!
+
+# Poll for migration_pending=true (timeout 30s).
+echo "  Waiting for migration_pending=true..."
+MIG_PENDING="false"
+for i in $(seq 1 30); do
+  COOLDOWN_INFO=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+  MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "false" end' 2>/dev/null || echo "false")
+  if [ "$MIG_PENDING" = "true" ]; then
+    COOLDOWN_REM=$(echo "$COOLDOWN_INFO" | jq -r '.migration_cooldown_remaining // 0' 2>/dev/null || echo "0")
+    echo "  PASS: migration_pending=true after ${i}s (remaining=${COOLDOWN_REM}s)"
+    break
+  fi
+  sleep 1
+done
+if [ "$MIG_PENDING" != "true" ]; then
+  echo "  FAIL: migration_pending never became true (timed out after 30s)" >&2
+  echo "  Last enclave-info response:"
+  echo "$COOLDOWN_INFO" | jq . 2>/dev/null | sed 's/^/    /' || echo "    (not valid JSON)"
+  echo "  Deploy log (full):"
+  cat /tmp/deploy-abort-test.log 2>/dev/null | sed 's/^/    /'
+  exit 1
+fi
+
+# Abort the migration.
+ABORT_CODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "${MGMT_URL}/migrate/abort" 2>/dev/null || echo "000")
+if [ "$ABORT_CODE" = "200" ]; then
+  echo "  PASS: Migration aborted (HTTP 200)"
+else
+  echo "  FAIL: Abort returned HTTP ${ABORT_CODE}" >&2
+  exit 1
+fi
+
+# Wait for the aborted deploy to exit.
+wait "$DEPLOY_PID" 2>/dev/null || true
+
+# Poll for migration_pending=false (timeout 15s, accounts for 5s SSM cache).
+echo "  Waiting for migration_pending=false..."
+MIG_PENDING="true"
+for i in $(seq 1 15); do
+  COOLDOWN_INFO=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+  MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "false" end' 2>/dev/null || echo "false")
+  if [ "$MIG_PENDING" = "false" ]; then
+    echo "  PASS: migration_pending=false after abort (${i}s)"
+    break
+  fi
+  sleep 1
+done
+if [ "$MIG_PENDING" != "false" ]; then
+  echo "  FAIL: migration_pending still true after abort (timed out after 15s)" >&2
+  exit 1
+fi
+echo ""
+
+# Step 7: Deploy migration with a different EIF (different PCR0).
+# A real migration deploys new code with a different PCR0. The second EIF
+# must be pre-built on the host (see build-migration-eif.sh) and placed at
+# app/enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
+echo "=== [7/9] Running migration (enclave deploy upgrade) ==="
+MIGRATION_EIF="${SCRIPT_DIR}/app/enclave/artifacts/image-v2.eif"
+if [ -f "$MIGRATION_EIF" ]; then
+  echo "  Using migration EIF: $MIGRATION_EIF"
+  cp "$MIGRATION_EIF" "${SCRIPT_DIR}/app/enclave/artifacts/image.eif"
+  # Update pcr.json with the v2 PCR0.
+  if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" ]; then
+    cp "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
+  fi
+else
+  echo "  WARN: No migration EIF found (image-v2.eif), reusing same EIF"
+fi
+"$ENCLAVE_CLI" deploy
+
+# Step 8: Wait for restarted enclave and verify migration survival.
+# mgmt already stopped and restarted the enclave in step 7 (via boot-qemu.sh).
 # The new enclave must decrypt secrets from the NEW KMS key and re-import
 # the storage DEK from migrated ciphertexts.
-echo "=== [6/7] Post-migration verification ==="
+echo "=== [8/9] Post-migration verification ==="
 wait_for_enclave "post-migration restart"
 HTTP_CODE=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
   "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
@@ -256,15 +403,34 @@ else
 fi
 
 # Verify previous_pcr0 was updated (no longer "genesis" after export-key).
-PREV_PCR0=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null \
-  | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
+POST_MIG_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+PREV_PCR0=$(echo "$POST_MIG_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
 if [ -n "$PREV_PCR0" ] && [ "$PREV_PCR0" != "genesis" ]; then
   echo "  PASS: previous_pcr0 updated after migration (${PREV_PCR0:0:16}...)"
-elif [ "$PREV_PCR0" = "genesis" ]; then
-  echo "  INFO: previous_pcr0 still genesis (expected for first migration)"
 else
-  echo "  WARN: could not read previous_pcr0"
+  echo "  FAIL: previous_pcr0 should not be genesis after migration (got: ${PREV_PCR0:-empty})" >&2
+  exit 1
 fi
+
+# Verify previous_pcr0 matches v1 PCR0 from build artifacts.
+V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
+if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json" ]; then
+  V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json"
+fi
+if [ -f "$V1_PCR0_FILE" ]; then
+  EXPECTED_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
+  if [ -n "$EXPECTED_PCR0" ]; then
+    # PCR0 from enclave-info is lowercase, normalize for comparison.
+    PREV_PCR0_LOWER=$(echo "$PREV_PCR0" | tr '[:upper:]' '[:lower:]')
+    EXPECTED_PCR0_LOWER=$(echo "$EXPECTED_PCR0" | tr '[:upper:]' '[:lower:]')
+    if [ "$PREV_PCR0_LOWER" = "$EXPECTED_PCR0_LOWER" ]; then
+      echo "  PASS: previous_pcr0 matches v1 build PCR0"
+    else
+      echo "  WARN: previous_pcr0 mismatch with v1 build (enclave=${PREV_PCR0:0:32}... build=${EXPECTED_PCR0:0:32}...)"
+    fi
+  fi
+fi
+
 
 # Verify static secrets decrypted from new KMS key.
 SECRETS_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/secrets" 2>/dev/null || echo "")
@@ -335,9 +501,9 @@ else
   echo "  WARN: Could not verify dynamic secret persistence: ${DYN_PERSIST_RESP:0:120}"
 fi
 
-# Step 7: Final enclave info.
+# Step 9: Final enclave info.
 echo ""
-echo "=== [7/7] Final enclave info ==="
+echo "=== [9/9] Final enclave info ==="
 FINAL_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 if [ -n "$FINAL_INFO" ] && echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1; then
   echo "  PASS: Enclave info valid"

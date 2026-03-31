@@ -63,7 +63,7 @@ func runCurl(cmd *cobra.Command, args []string) error {
 		stack := cfg.stackName()
 		elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
 		if elasticIP == "" {
-			return fmt.Errorf("ElasticIP not found in cdk-outputs.json\nRun 'enclave deploy' first, or use --base-url to specify the endpoint.")
+			return fmt.Errorf("ElasticIP not found in cdk-outputs.json (run 'enclave deploy' first, or use --base-url to specify the endpoint)")
 		}
 		baseURL = "https://" + elasticIP
 	}
@@ -110,7 +110,7 @@ func runCurl(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "< %s\n", resp.Status)

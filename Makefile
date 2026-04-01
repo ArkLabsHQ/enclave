@@ -27,8 +27,8 @@ install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
 test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
-	cd test/app && enclave build --local
-	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
+	cd test/app && /tmp/enclave-test build --local
+	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
 	if grep -q '^previous_pcr0:' test/app/enclave/enclave.yaml; then \
@@ -37,12 +37,15 @@ test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
 	fi
-	cd test/app && enclave build --local
-	cp test/app/enclave/artifacts/image.eif test/app/enclave/artifacts/image-v2.eif
-	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v2.json
+	cd test/app && /tmp/enclave-test build --local
+	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
+	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
-	cd test/app && enclave build --local
+	cd test/app && /tmp/enclave-test build --local
+	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
+	cp /tmp/image-v2.eif test/app/enclave/artifacts/image-v2.eif
+	cp /tmp/pcr-v2.json test/app/enclave/artifacts/pcr-v2.json
 
 test-run: ## Run integration tests (requires test-build first)
 	cd test && docker compose --profile test run --build test-runner

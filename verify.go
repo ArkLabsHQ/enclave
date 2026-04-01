@@ -56,15 +56,14 @@ func runVerify(cmd *cobra.Command, args []string) error {
 
 	baseURL, _ := cmd.Flags().GetString("base-url")
 	if baseURL == "" {
-		outputs, err := loadCDKOutputs(root)
+		outputs, err := loadTofuOutputs(root)
 		if err != nil {
 			return err
 		}
 
-		stack := cfg.stackName()
-		elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
+		elasticIP := outputs.getOutput("elastic_ip")
 		if elasticIP == "" {
-			return fmt.Errorf("ElasticIP not found in cdk-outputs.json (use --base-url to override)")
+			return fmt.Errorf("elastic_ip not found in tofu outputs (use --base-url to override)")
 		}
 
 		baseURL = "https://" + elasticIP

@@ -1,7 +1,6 @@
 package introspector_enclave
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,8 +56,8 @@ type AppConfig struct {
 // at boot via KMS attestation. The decrypted value is passed to the
 // upstream app as the specified environment variable.
 type SecretConfig struct {
-	Name   string `yaml:"name"`    // SSM parameter name component
-	EnvVar string `yaml:"env_var"` // Env var passed to upstream app
+	Name   string `yaml:"name" json:"name"`       // SSM parameter name component
+	EnvVar string `yaml:"env_var" json:"env_var"` // Env var passed to upstream app
 }
 
 // SDKConfig defines the SDK coordinates for the enclave supervisor binary.
@@ -189,9 +188,6 @@ func (c *Config) validateSDK() error {
 func (c *Config) configEnv() []string {
 	env := os.Environ()
 	env = append(env,
-		"CDK_DEPLOY_REGION="+c.Region,
-		"CDK_DEPLOY_ACCOUNT="+c.Account,
-		"CDK_PREFIX="+c.Prefix,
 		"VERSION="+c.Version,
 		"AWS_REGION="+c.Region,
 	)
@@ -199,40 +195,6 @@ func (c *Config) configEnv() []string {
 		env = append(env, "AWS_PROFILE="+c.Profile)
 	}
 	return env
-}
-
-// CDKOutputs represents the structure of cdk-outputs.json.
-type CDKOutputs map[string]map[string]string
-
-func loadCDKOutputs(root string) (CDKOutputs, error) {
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "cdk-outputs.json"))
-	if err != nil {
-		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w (run 'enclave deploy' first)", err)
-	}
-	var outputs CDKOutputs
-	if err := json.Unmarshal(data, &outputs); err != nil {
-		return nil, fmt.Errorf("invalid cdk-outputs.json: %w", err)
-	}
-	return outputs, nil
-}
-
-// getOutput reads a value from CDK outputs, trying multiple key variants.
-func (o CDKOutputs) getOutput(stackName string, keys ...string) string {
-	stack, ok := o[stackName]
-	if !ok {
-		return ""
-	}
-	for _, key := range keys {
-		if v, ok := stack[key]; ok && v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// stackName returns the CDK stack name from the config.
-func (c *Config) stackName() string {
-	return c.Prefix + "Nitro" + c.Name
 }
 
 // findAppRoot returns the root directory of the app (parent of enclave/).

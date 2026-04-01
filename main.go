@@ -24,13 +24,12 @@ func Execute() {
 		setupCmd(),
 		updateCmd(),
 		buildCmd(),
-		deployCmd(),
+		tfvarsCmd(),
 		startCmd(),
 		stopCmd(),
 		verifyCmd(),
 		statusCmd(),
 		curlCmd(),
-		destroyCmd(),
 		generateCmd(),
 	)
 

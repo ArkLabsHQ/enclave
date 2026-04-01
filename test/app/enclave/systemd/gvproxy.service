@@ -1,16 +1,17 @@
 [Unit]
-Description=Start gvproxy docker container on boot
-After=docker.service
-Requires=docker.service
+Description=gvproxy outbound networking for Nitro Enclave
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/docker run --restart=unless-stopped -d --name gvproxy \
-  --privileged --security-opt seccomp=unconfined \
-  -e GVPROXY_FORWARD_PORTS="443 7073 9090" \
-  -p 443:443 -p 7073:7073 -p 9090:9090 \
-  gvproxy:latest
-RemainAfterExit=yes
+Type=simple
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gvproxy
+EnvironmentFile=/etc/environment
+ExecStart=/home/ec2-user/app/gvproxy/start.sh
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

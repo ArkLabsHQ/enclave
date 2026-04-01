@@ -1,23 +1,26 @@
 .vscode
 build/
 bin/
-enclave/cdk.out/
-builder/cdk.out/
-
 # Nix build outputs
 enclave/artifacts/
 flake_result
 flake_result-*
 enclave-image.tar.gz
 
-# CDK outputs
-enclave/cdk-outputs.json
-cdk-local.out/
-test/cdk-local.out/
-test/cdk-local-outputs.json
-
 # Generated build config (from enclave.yaml for Nix)
 enclave/build-config.json
+
+# OpenTofu
+enclave/tofu/.terraform/
+enclave/tofu/.terraform.lock.hcl
+enclave/tofu/terraform.tfstate*
+enclave/tofu/terraform.tfvars.json
+enclave/tofu/tofu-outputs.json
+enclave/tofu/provider_override.tf
+enclave/tofu/backend_override.tf
+
+# Test logs
+test/tofu-*.log
 
 # Enclave CLI config (contains account IDs)
 enclave.yaml

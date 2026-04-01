@@ -131,15 +131,30 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("build management server: %w", err)
 	}
 
+	// Build the host-side gvproxy binary for outbound networking.
+	if err := buildGvproxyBinary(root); err != nil {
+		return fmt.Errorf("build gvproxy: %w", err)
+	}
+
+	// Generate terraform.tfvars.json so tofu apply can be run directly.
+	if err := writeTofuVars(cfg, root); err != nil {
+		return fmt.Errorf("generate tfvars: %w", err)
+	}
+
 	fmt.Println()
 	fmt.Println("[build] Done:")
-	fmt.Printf("  PCR0: %s\n", pcrs.PCR0)
-	fmt.Printf("  PCR1: %s\n", pcrs.PCR1)
-	fmt.Printf("  PCR2: %s\n", pcrs.PCR2)
-	fmt.Printf("  EIF:  enclave/artifacts/image.eif\n")
-	fmt.Printf("  Mgmt: enclave/artifacts/enclave-mgmt\n")
+	fmt.Printf("  PCR0:    %s\n", pcrs.PCR0)
+	fmt.Printf("  PCR1:    %s\n", pcrs.PCR1)
+	fmt.Printf("  PCR2:    %s\n", pcrs.PCR2)
+	fmt.Printf("  EIF:     enclave/artifacts/image.eif\n")
+	fmt.Printf("  Mgmt:    enclave/artifacts/enclave-mgmt\n")
+	fmt.Printf("  Gvproxy: enclave/artifacts/gvproxy\n")
+	fmt.Printf("  Tfvars:  enclave/tofu/terraform.tfvars.json\n")
 	fmt.Println()
-	fmt.Println("Next: enclave deploy")
+	fmt.Println("Next:")
+	fmt.Println("  cd enclave/tofu")
+	fmt.Println("  tofu init")
+	fmt.Println("  tofu apply")
 	return nil
 }
 
@@ -376,6 +391,29 @@ func buildMgmtBinary(cfg *Config, root string) error {
 	dst := filepath.Join(outDir, "enclave-mgmt")
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("rename mgmt binary: %w", err)
+	}
+
+	return nil
+}
+
+// buildGvproxyBinary cross-compiles the gvproxy binary for Linux amd64
+// and places it in enclave/artifacts/. This replaces the Docker-based
+// gvproxy container — the binary runs directly on the EC2 host.
+func buildGvproxyBinary(root string) error {
+	outDir := filepath.Join(root, "enclave", "artifacts")
+	fmt.Println("[build] Building gvproxy binary...")
+
+	modulePath := "github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.7.4"
+	cmd := exec.Command("go", "install", "-trimpath", modulePath)
+	cmd.Env = append(os.Environ(),
+		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		"GOBIN="+outDir,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("go install gvproxy: %w", err)
 	}
 
 	return nil

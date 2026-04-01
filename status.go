@@ -31,7 +31,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	outputs, err := loadCDKOutputs(root)
+	outputs, err := loadTofuOutputs(root)
 	if err != nil {
 		return err
 	}
@@ -42,14 +42,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	stack := cfg.stackName()
-	instanceID := outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
-	kmsKeyID := outputs.getOutput(stack, "KMSKeyID", "KmsKeyId", "KMS Key ID")
-	elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
+	instanceID := outputs.getOutput("instance_id")
+	kmsKeyID := outputs.getOutput("kms_key_id")
+	elasticIP := outputs.getOutput("elastic_ip")
 
 	fmt.Println("Enclave Status")
 	fmt.Println("==============")
-	fmt.Printf("  Stack:       %s\n", stack)
+	fmt.Printf("  Deployment:  %s-%s\n", cfg.Prefix, cfg.Name)
 	fmt.Printf("  Region:      %s\n", cfg.Region)
 	fmt.Printf("  Instance ID: %s\n", instanceID)
 	fmt.Printf("  Elastic IP:  %s\n", elasticIP)

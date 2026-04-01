@@ -8,21 +8,6 @@ import (
 	"path/filepath"
 )
 
-// runCmd runs an external command with the given environment, streaming
-// stdout/stderr to the terminal. Returns an error if the command fails.
-func runCmd(name string, args []string, dir string, env []string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s failed: %w", name, err)
-	}
-	return nil
-}
-
 // tofuVars represents the variables passed to OpenTofu via terraform.tfvars.json.
 type tofuVars struct {
 	Region            string         `json:"region"`
@@ -181,4 +166,3 @@ func readPCR0FromArtifacts(root string) string {
 	}
 	return pcrs.PCR0
 }
-

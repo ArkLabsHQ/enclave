@@ -139,18 +139,6 @@ resource "aws_vpc_endpoint" "ssm" {
   tags = { Name = "${local.prefix}-ssm-endpoint" }
 }
 
-resource "aws_vpc_endpoint" "ecr" {
-  count = var.local ? 0 : 1
-
-  vpc_id              = aws_vpc.main[0].id
-  service_name        = "com.amazonaws.${var.region}.ecr.api"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
-  private_dns_enabled = true
-
-  tags = { Name = "${local.prefix}-ecr-endpoint" }
-}
-
 resource "aws_vpc_endpoint" "s3" {
   count = var.local ? 0 : 1
 

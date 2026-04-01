@@ -21,7 +21,7 @@ resource "null_resource" "kms_state_cleanup" {
 
   provisioner "local-exec" {
     when       = destroy
-    command    = "tofu state rm aws_kms_key.encryption aws_kms_key_policy.encryption 2>/dev/null || true"
+    command    = "tofu state rm module.enclave.aws_kms_key.encryption module.enclave.aws_kms_key_policy.encryption 2>/dev/null || true"
     on_failure = continue
   }
 }

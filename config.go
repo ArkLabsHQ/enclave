@@ -22,15 +22,15 @@ var reservedEnvPrefixes = []string{"ENCLAVE_", "AWS_"}
 const configFile = "enclave/enclave.yaml"
 
 type Config struct {
-	Name         string         `yaml:"name"`
-	Version      string         `yaml:"version"`
-	Region       string         `yaml:"region"`
-	Account      string         `yaml:"account"`
-	Prefix       string         `yaml:"prefix"`
-	Profile      string         `yaml:"profile"`
-	App          AppConfig      `yaml:"app"`
-	Secrets      []SecretConfig `yaml:"secrets"`
-	SDK          SDKConfig      `yaml:"sdk"`
+	Name              string         `yaml:"name"`
+	Version           string         `yaml:"version"`
+	Region            string         `yaml:"region"`
+	Account           string         `yaml:"account"`
+	Prefix            string         `yaml:"prefix"`
+	Profile           string         `yaml:"profile"`
+	App               AppConfig      `yaml:"app"`
+	Secrets           []SecretConfig `yaml:"secrets"`
+	SDK               SDKConfig      `yaml:"sdk"`
 	InstanceType      string         `yaml:"instance_type"`
 	NixImage          string         `yaml:"nix_image"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
@@ -181,35 +181,6 @@ func (c *Config) validateSDK() error {
 		return fmt.Errorf("%s: 'sdk.vendor_hash' is required (Go vendor hash)", configFile)
 	}
 	return nil
-}
-
-// configEnv returns environment variables derived from the config, suitable
-// for passing to scripts.
-func (c *Config) configEnv() []string {
-	env := os.Environ()
-	env = append(env,
-		"VERSION="+c.Version,
-		"AWS_REGION="+c.Region,
-	)
-	if c.Profile != "" {
-		env = append(env, "AWS_PROFILE="+c.Profile)
-	}
-	return env
-}
-
-// findAppRoot returns the root directory of the app (parent of enclave/).
-// When ENCLAVE_CONFIG is set, derives it from the config path (go up 2 levels
-// from .../enclave/enclave.yaml). Otherwise falls back to findRepoRoot().
-func findAppRoot() (string, error) {
-	if configPath := os.Getenv("ENCLAVE_CONFIG"); configPath != "" {
-		abs, err := filepath.Abs(configPath)
-		if err != nil {
-			return "", err
-		}
-		// configPath = .../enclave/enclave.yaml → go up 2 levels
-		return filepath.Dir(filepath.Dir(abs)), nil
-	}
-	return findRepoRoot()
 }
 
 // findRepoRoot walks up from cwd looking for enclave.yaml or .git.

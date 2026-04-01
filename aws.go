@@ -2,7 +2,6 @@ package introspector_enclave
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
@@ -85,38 +83,6 @@ func (ac *awsClients) getInstanceState(ctx context.Context, instanceID string) (
 		return "", fmt.Errorf("instance %s not found", instanceID)
 	}
 	return string(out.Reservations[0].Instances[0].State.Name), nil
-}
-
-func (ac *awsClients) waitInstanceReady(ctx context.Context, instanceID string) error {
-	waiter := ec2.NewInstanceStatusOkWaiter(ac.ec2Client)
-	return waiter.Wait(ctx, &ec2.DescribeInstanceStatusInput{
-		InstanceIds: []string{instanceID},
-	}, 10*time.Minute)
-}
-
-// --- SSM ---
-
-func (ac *awsClients) getParameter(ctx context.Context, name string) (string, error) {
-	out, err := ac.ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
-		Name: aws.String(name),
-	})
-	if err != nil {
-		return "", err
-	}
-	if out.Parameter == nil || out.Parameter.Value == nil {
-		return "", nil
-	}
-	return *out.Parameter.Value, nil
-}
-
-func (ac *awsClients) putParameter(ctx context.Context, name, value string) error {
-	_, err := ac.ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(name),
-		Value:     aws.String(value),
-		Type:      ssmtypes.ParameterTypeString,
-		Overwrite: aws.Bool(true),
-	})
-	return err
 }
 
 // runOnHost runs commands on the EC2 host via SSM Run Command and waits for completion.
@@ -194,50 +160,4 @@ func (ac *awsClients) runCommandOutput(ctx context.Context, instanceID, command 
 		}
 	}
 	return ""
-}
-
-// --- S3 ---
-
-func (ac *awsClients) ensureBucket(ctx context.Context, bucket string) error {
-	input := &s3.CreateBucketInput{
-		Bucket: aws.String(bucket),
-	}
-	if ac.region != "us-east-1" {
-		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
-			LocationConstraint: s3types.BucketLocationConstraint(ac.region),
-		}
-	}
-	_, err := ac.s3Client.CreateBucket(ctx, input)
-	if err != nil {
-		var baoby *s3types.BucketAlreadyOwnedByYou
-		var bae *s3types.BucketAlreadyExists
-		if errors.As(err, &baoby) || errors.As(err, &bae) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-func (ac *awsClients) putBucketPolicy(ctx context.Context, bucket, policy string) error {
-	_, err := ac.s3Client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
-		Bucket: aws.String(bucket),
-		Policy: aws.String(policy),
-	})
-	return err
-}
-
-func (ac *awsClients) uploadFile(ctx context.Context, bucket, key, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	_, err = ac.s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   f,
-	})
-	return err
 }

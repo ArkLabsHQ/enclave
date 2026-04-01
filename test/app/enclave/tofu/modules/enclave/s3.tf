@@ -2,7 +2,6 @@ locals {
   # When local paths are set, use them directly. Otherwise download from GitHub Release.
   use_local      = var.eif_path != ""
   artifacts_dir  = "${path.module}/.artifacts"
-  auth_header    = var.github_token != "" ? "-H \"Authorization: Bearer ${var.github_token}\"" : ""
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
@@ -20,11 +19,16 @@ resource "null_resource" "download_artifacts" {
 
   provisioner "local-exec" {
     command = <<-EOT
+      AUTH=""
+      [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
       mkdir -p ${local.artifacts_dir}
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/enclave-mgmt ${local.release_base}/enclave-mgmt
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/enclave-mgmt ${local.release_base}/enclave-mgmt
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
     EOT
+    environment = {
+      GITHUB_TOKEN = var.github_token
+    }
   }
 }
 

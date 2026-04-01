@@ -458,7 +458,7 @@ resource "null_resource" "kms_state_cleanup" {
 
   provisioner "local-exec" {
     when       = destroy
-    command    = "tofu state rm aws_kms_key.encryption aws_kms_key_policy.encryption 2>/dev/null || true"
+    command    = "tofu state rm module.enclave.aws_kms_key.encryption module.enclave.aws_kms_key_policy.encryption 2>/dev/null || true"
     on_failure = continue
   }
 }
@@ -742,7 +742,6 @@ const tofuModuleEnclaveS3 = `locals {
   # When local paths are set, use them directly. Otherwise download from GitHub Release.
   use_local      = var.eif_path != ""
   artifacts_dir  = "${path.module}/.artifacts"
-  auth_header    = var.github_token != "" ? "-H \"Authorization: Bearer ${var.github_token}\"" : ""
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
@@ -760,11 +759,16 @@ resource "null_resource" "download_artifacts" {
 
   provisioner "local-exec" {
     command = <<-EOT
+      AUTH=""
+      [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
       mkdir -p ${local.artifacts_dir}
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/enclave-mgmt ${local.release_base}/enclave-mgmt
-      curl -sfL ${local.auth_header} -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/enclave-mgmt ${local.release_base}/enclave-mgmt
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
     EOT
+    environment = {
+      GITHUB_TOKEN = var.github_token
+    }
   }
 }
 
@@ -1022,18 +1026,6 @@ resource "aws_vpc_endpoint" "ssm" {
   private_dns_enabled = true
 
   tags = { Name = "${local.prefix}-ssm-endpoint" }
-}
-
-resource "aws_vpc_endpoint" "ecr" {
-  count = var.local ? 0 : 1
-
-  vpc_id              = aws_vpc.main[0].id
-  service_name        = "com.amazonaws.${var.region}.ecr.api"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
-  private_dns_enabled = true
-
-  tags = { Name = "${local.prefix}-ecr-endpoint" }
 }
 
 resource "aws_vpc_endpoint" "s3" {
@@ -1464,7 +1456,6 @@ move "aws_route_table_association.private[0]"   "module.enclave.aws_route_table_
 move "aws_route_table_association.private_b[0]" "module.enclave.aws_route_table_association.private_b[0]"
 move "aws_vpc_endpoint.kms[0]"                  "module.enclave.aws_vpc_endpoint.kms[0]"
 move "aws_vpc_endpoint.ssm[0]"                  "module.enclave.aws_vpc_endpoint.ssm[0]"
-move "aws_vpc_endpoint.ecr[0]"                  "module.enclave.aws_vpc_endpoint.ecr[0]"
 move "aws_vpc_endpoint.s3[0]"                   "module.enclave.aws_vpc_endpoint.s3[0]"
 
 echo ""

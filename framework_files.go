@@ -10,7 +10,7 @@ type frameworkFile struct {
 }
 
 // getFrameworkFiles returns the list of framework files to scaffold.
-// These are required by CDK deploy (cdk.go) and Nix build (flake.nix).
+// These are required by OpenTofu deploy and Nix build (flake.nix).
 // The language parameter selects the correct flake.nix template.
 func getFrameworkFiles(language string) []frameworkFile {
 	flakeNix := frameworkFlakeNix // default: Go
@@ -31,11 +31,6 @@ func getFrameworkFiles(language string) []frameworkFile {
 			RelPath: "enclave/start.sh",
 			Mode:    0755,
 			Content: frameworkStartSh,
-		},
-		{
-			RelPath: "enclave/gvproxy/Dockerfile",
-			Mode:    0644,
-			Content: frameworkGvproxyDockerfile,
 		},
 		{
 			RelPath: "enclave/gvproxy/start.sh",
@@ -68,9 +63,93 @@ func getFrameworkFiles(language string) []frameworkFile {
 			Content: frameworkMgmtService,
 		},
 		{
-			RelPath: "enclave/user_data/user_data",
+			RelPath: "enclave/tofu/modules/enclave/templates/user_data.sh.tftpl",
 			Mode:    0644,
 			Content: frameworkUserData,
+		},
+		// OpenTofu root module.
+		{
+			RelPath: "enclave/tofu/main.tf",
+			Mode:    0644,
+			Content: tofuRootMain,
+		},
+		{
+			RelPath: "enclave/tofu/variables.tf",
+			Mode:    0644,
+			Content: tofuRootVariables,
+		},
+		{
+			RelPath: "enclave/tofu/outputs.tf",
+			Mode:    0644,
+			Content: tofuRootOutputs,
+		},
+		// OpenTofu enclave module.
+		{
+			RelPath: "enclave/tofu/modules/enclave/main.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveMain,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/variables.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveVariables,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/outputs.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveOutputs,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/kms.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveKMS,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/iam.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveIAM,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/ssm.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveSSM,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/s3.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveS3,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/vpc.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveVPC,
+		},
+		{
+			RelPath: "enclave/tofu/modules/enclave/ec2.tf",
+			Mode:    0644,
+			Content: tofuModuleEnclaveEC2,
+		},
+		// OpenTofu backend bootstrap module.
+		{
+			RelPath: "enclave/tofu/modules/backend/main.tf",
+			Mode:    0644,
+			Content: tofuModuleBackendMain,
+		},
+		{
+			RelPath: "enclave/tofu/modules/backend/variables.tf",
+			Mode:    0644,
+			Content: tofuModuleBackendVariables,
+		},
+		{
+			RelPath: "enclave/tofu/modules/backend/outputs.tf",
+			Mode:    0644,
+			Content: tofuModuleBackendOutputs,
+		},
+		// State migration script.
+		{
+			RelPath: "enclave/tofu/migrate-state.sh",
+			Mode:    0755,
+			Content: tofuMigrateState,
 		},
 		{
 			RelPath: ".github/workflows/deploy-enclave.yml",
@@ -117,9 +196,12 @@ artifacts/
 # Generated build config (from enclave.yaml for Nix)
 build-config.json
 
-# CDK outputs (contains account-specific IDs)
-cdk-outputs.json
-cdk.out/
+# OpenTofu state and outputs (contains account-specific IDs)
+tofu-outputs.json
+terraform.tfvars.json
+terraform.tfstate
+terraform.tfstate.backup
+.terraform/
 
 # Nix build symlinks
 result
@@ -171,30 +253,6 @@ echo "nameserver 192.168.127.1" > /etc/resolv.conf
 
 # Start nitriding in background (it will set up networking via gvproxy)
 exec /app/nitriding ${NITRIDING_ARGS} -appcmd "/app/enclave-supervisor"
-`
-
-// Gvproxy Docker image — builds gvproxy binary for forwarding ports into the enclave.
-const frameworkGvproxyDockerfile = `# Gvproxy container for forwarding HTTP ports into the enclave.
-FROM golang:1.25.5 AS builder
-
-ARG GVPROXY_VERSION=v0.7.4
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-  go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@${GVPROXY_VERSION}
-
-FROM alpine:3.20
-
-RUN apk update && apk upgrade
-RUN apk --no-cache add curl
-
-WORKDIR /app
-
-COPY --from=builder /go/bin/gvproxy /app/gvproxy
-COPY enclave/gvproxy/start.sh /app/start.sh
-
-CMD ["/app/start.sh"]
 `
 
 // Gvproxy entrypoint — starts gvproxy and sets up port forwarding.
@@ -318,20 +376,21 @@ TimeoutSec=0
 WantedBy=multi-user.target
 `
 
-// Systemd unit — gvproxy Docker container for outbound networking.
+// Systemd unit — gvproxy binary for outbound networking.
 const frameworkGvproxyService = `[Unit]
-Description=Start gvproxy docker container on boot
-After=docker.service
-Requires=docker.service
+Description=gvproxy outbound networking for Nitro Enclave
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/docker run --restart=unless-stopped -d --name gvproxy \
-  --privileged --security-opt seccomp=unconfined \
-  -e GVPROXY_FORWARD_PORTS="443 7073 9090" \
-  -p 443:443 -p 7073:7073 -p 9090:9090 \
-  gvproxy:latest
-RemainAfterExit=yes
+Type=simple
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gvproxy
+EnvironmentFile=/etc/environment
+ExecStart=/home/ec2-user/app/gvproxy/start.sh
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -358,7 +417,8 @@ WantedBy=multi-user.target
 `
 
 // EC2 user_data cloud-init — installs dependencies, downloads EIF, configures services.
-// Template variables (e.g. ${__REGION__}) are resolved by CDK Fn::Sub at deploy time.
+// Template variables (e.g. ${region}) are resolved by OpenTofu templatefile() at deploy time.
+// Shell variables use $$ escaping to avoid OpenTofu interpolation.
 const frameworkUserData = `Content-Type: multipart/mixed; boundary="//"
 MIME-Version: 1.0
 
@@ -394,18 +454,18 @@ CPU_KEY=cpu_count
 DEFAULT_MEM=6144
 DEFAULT_CPU=2
 
-sed -r "s/^(\s*$MEM_KEY\s*:\s*).*/\1$DEFAULT_MEM/" -i "$ALLOCATOR_YAML"
-sed -r "s/^(\s*$CPU_KEY\s*:\s*).*/\1$DEFAULT_CPU/" -i "$ALLOCATOR_YAML"
+sed -r "s/^(\s*$$MEM_KEY\s*:\s*).*/\1$$DEFAULT_MEM/" -i "$$ALLOCATOR_YAML"
+sed -r "s/^(\s*$$CPU_KEY\s*:\s*).*/\1$$DEFAULT_CPU/" -i "$$ALLOCATOR_YAML"
 
 VSOCK_PROXY_YAML=/etc/nitro_enclaves/vsock-proxy.yaml
-cat <<EOF > $VSOCK_PROXY_YAML
+cat <<EOF > $$VSOCK_PROXY_YAML
 allowlist:
-- {address: kms.${__REGION__}.amazonaws.com, port: 443}
-- {address: kms-fips.${__REGION__}.amazonaws.com, port: 443}
-- {address: ssm.${__REGION__}.amazonaws.com, port: 443}
-- {address: ssm-fips.${__REGION__}.amazonaws.com, port: 443}
-- {address: sts.${__REGION__}.amazonaws.com, port: 443}
-- {address: s3.${__REGION__}.amazonaws.com, port: 443}
+- {address: kms.${region}.amazonaws.com, port: 443}
+- {address: kms-fips.${region}.amazonaws.com, port: 443}
+- {address: ssm.${region}.amazonaws.com, port: 443}
+- {address: ssm-fips.${region}.amazonaws.com, port: 443}
+- {address: sts.${region}.amazonaws.com, port: 443}
+- {address: s3.${region}.amazonaws.com, port: 443}
 - {address: 169.254.169.254, port: 80}
 
 EOF
@@ -422,40 +482,38 @@ if [[ ! -d ./app/server ]]; then
 fi
 
 # Download pre-built EIF from S3 (built reproducibly with Nix)
-aws s3 cp ${__EIF_S3_URL__} /home/ec2-user/app/server/enclave.eif
+aws s3 cp ${eif_s3_url} /home/ec2-user/app/server/enclave.eif
 chmod 644 /home/ec2-user/app/server/enclave.eif
 chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 
-# Pull gvproxy image for outbound networking
-ACCOUNT_ID=$( aws sts get-caller-identity | jq -r '.Account' )
-REGION=$(TOKEN=` + "`" + `curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` + "`" + ` && curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/placement/region)
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-docker pull ${__GVPROXY_IMAGE_URI__}
-docker tag ${__GVPROXY_IMAGE_URI__} gvproxy:latest
+# Download gvproxy binary for outbound networking
+aws s3 cp ${gvproxy_binary_s3_url} /home/ec2-user/app/gvproxy/gvproxy
+chmod +x /home/ec2-user/app/gvproxy/gvproxy
+chown -R ec2-user:ec2-user /home/ec2-user/app/gvproxy
 
-aws s3 cp ${__ENCLAVE_INIT_S3_URL__} /home/ec2-user/app/enclave_init.sh
+aws s3 cp ${enclave_init_s3_url} /home/ec2-user/app/enclave_init.sh
 chmod +x /home/ec2-user/app/enclave_init.sh
 
-aws s3 cp ${__ENCLAVE_INIT_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-watchdog.service
-aws s3 cp ${__IMDS_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-imds-proxy.service
-aws s3 cp ${__GVPROXY_SYSTEMD_S3_URL__} /etc/systemd/system/gvproxy.service
+aws s3 cp ${enclave_init_systemd_s3_url} /etc/systemd/system/enclave-watchdog.service
+aws s3 cp ${imds_systemd_s3_url} /etc/systemd/system/enclave-imds-proxy.service
+aws s3 cp ${gvproxy_systemd_s3_url} /etc/systemd/system/gvproxy.service
 
 # Download management server binary and systemd unit
-aws s3 cp ${__MGMT_BINARY_S3_URL__} /home/ec2-user/app/enclave-mgmt
+aws s3 cp ${mgmt_binary_s3_url} /home/ec2-user/app/enclave-mgmt
 chmod +x /home/ec2-user/app/enclave-mgmt
 chown ec2-user:ec2-user /home/ec2-user/app/enclave-mgmt
-aws s3 cp ${__MGMT_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-mgmt.service
+aws s3 cp ${mgmt_systemd_s3_url} /etc/systemd/system/enclave-mgmt.service
 
 cat <<EOF >> /etc/environment
-ENCLAVE_APP_NAME=${__APP_NAME__}
+ENCLAVE_APP_NAME=${app_name}
 EIF_PATH=/home/ec2-user/app/server/enclave.eif
 ENCLAVE_NITRIDING_ENABLED=true
 ENCLAVE_NITRIDING_FQDN=example.com
-ENCLAVE_KMS_KEY_ID=${__KMS_KEY_ID__}
-ENCLAVE_DEPLOYMENT=${__DEV_MODE__}
-ENCLAVE_AWS_REGION=${__REGION__}
-ENCLAVE_MIGRATION_COOLDOWN=${__MIGRATION_COOLDOWN__}
-ENCLAVE_PREVIOUS_PCR0=${__PREVIOUS_PCR0__}
+ENCLAVE_KMS_KEY_ID=${kms_key_id}
+ENCLAVE_DEPLOYMENT=${dev_mode}
+ENCLAVE_AWS_REGION=${region}
+ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
+ENCLAVE_PREVIOUS_PCR0=${previous_pcr0}
 EOF
 
 systemctl enable --now enclave-watchdog.service
@@ -906,8 +964,8 @@ jobs:
           role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
           aws-region: ` + "${{ vars.AWS_REGION }}" + `
 
-      - name: Install AWS CDK
-        run: npm install -g aws-cdk
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
 
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9
@@ -918,7 +976,9 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          enclave deploy
+          cd enclave/tofu
+          tofu init
+          tofu apply -auto-approve
 
           # Extract deployment outputs for manifest and verification.
           pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
@@ -928,12 +988,7 @@ jobs:
           echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
           echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
 
-          # Extract Elastic IP from CDK outputs.
-          elastic_ip=$(jq -r 'to_entries[0].value | .ElasticIP // .["Elastic IP"] // empty' enclave/cdk-outputs.json 2>/dev/null || echo "")
-          echo "elastic_ip=${elastic_ip}" >> "$GITHUB_OUTPUT"
-
       - name: Publish deployment manifest
-        if: steps.deploy.outputs.elastic_ip != ''
         continue-on-error: true
         env:
           PCR0: ` + "${{ steps.deploy.outputs.pcr0 }}" + `
@@ -1178,19 +1233,11 @@ jobs:
           role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
           aws-region: ` + "${{ vars.AWS_REGION }}" + `
 
-      - name: Install AWS CDK
-        run: npm install -g aws-cdk
-
-      - name: Destroy stack
+      - name: Destroy infrastructure
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
-          # CDK stack synthesis references asset paths (EIF + mgmt binary).
-          # They must exist even for destroy. Empty placeholders are sufficient.
-          mkdir -p enclave/artifacts
-          touch enclave/artifacts/image.eif
-          touch enclave/artifacts/enclave-mgmt
-          enclave destroy --force
+          cd enclave/tofu
+          tofu init
+          tofu destroy -auto-approve
 `
 
 // Nix flake for .NET apps — uses buildDotnetModule with self-contained publish.
@@ -1416,9 +1463,10 @@ on:
 permissions:
   contents: write
 
-# All verification inputs (base_url, PCR values) are read from the
-# deployment manifest published by the deploy workflow. No repo
-# variables needed.
+# Verification inputs (base_url, PCR values) are read from the
+# deployment manifest published by the deploy workflow. If base_url
+# is not in the manifest (e.g. build-only), set the ENCLAVE_BASE_URL
+# repository variable as a fallback.
 
 jobs:
   verify:
@@ -1443,7 +1491,7 @@ jobs:
             exit 1
           }
 
-          base_url=$(jq -r '.base_url' deployment.json)
+          base_url=$(jq -r '.base_url // empty' deployment.json)
           pcr0=$(jq -r '.pcr0' deployment.json)
           pcr1=$(jq -r '.pcr1' deployment.json)
           pcr2=$(jq -r '.pcr2' deployment.json)
@@ -1454,8 +1502,9 @@ jobs:
 
       - name: Verify attestation
         id: verify
+        if: steps.manifest.outputs.base_url != '' || vars.ENCLAVE_BASE_URL != ''
         env:
-          BASE_URL: ` + "${{ steps.manifest.outputs.base_url }}" + `
+          BASE_URL: ` + "${{ steps.manifest.outputs.base_url || vars.ENCLAVE_BASE_URL }}" + `
           PCR0: ` + "${{ steps.manifest.outputs.pcr0 }}" + `
         run: |
           output=$(enclave verify \
@@ -1628,6 +1677,8 @@ jobs:
           path: |
             enclave/artifacts/image.eif
             enclave/artifacts/pcr.json
+            enclave/artifacts/enclave-mgmt
+            enclave/artifacts/gvproxy
           retention-days: 7
 
       - name: Upload to latest release
@@ -1644,7 +1695,52 @@ jobs:
           PCR0: ${PCR0}" \
             --prerelease \
             enclave/artifacts/image.eif \
-            enclave/artifacts/pcr.json
+            enclave/artifacts/pcr.json \
+            enclave/artifacts/enclave-mgmt \
+            enclave/artifacts/gvproxy
+
+      - name: Publish build manifest
+        continue-on-error: true
+        env:
+          GH_TOKEN: ` + "${{ github.token }}" + `
+          REPO: ` + "${{ github.repository }}" + `
+          COMMIT_SHA: ` + "${{ github.sha }}" + `
+        run: |
+          PCR0=$(jq -r '.PCR0 // .pcr0' enclave/artifacts/pcr.json)
+          PCR1=$(jq -r '.PCR1 // .pcr1' enclave/artifacts/pcr.json)
+          PCR2=$(jq -r '.PCR2 // .pcr2' enclave/artifacts/pcr.json)
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="build-$(date -u +%Y%m%d-%H%M%S)"
+
+          jq -n \
+            --arg pcr0 "$PCR0" \
+            --arg pcr1 "$PCR1" \
+            --arg pcr2 "$PCR2" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg commit "$COMMIT_SHA" \
+            --arg repo "$REPO" \
+            '{pcr0: $pcr0, pcr1: $pcr1, pcr2: $pcr2, timestamp: $timestamp, commit: $commit, repo: $repo}' \
+            > deployment.json
+
+          # Create a timestamped build release with the manifest.
+          gh release create "$TAG" deployment.json \
+            --title "Build ${TAG}" \
+            --notes "Build manifest from commit ${COMMIT_SHA::8}
+          **PCR0:** ${PCR0}"
+
+          # Update the 'latest' release so the verify workflow can find it.
+          # Only update if no deploy manifest exists yet (deploy takes precedence).
+          if ! gh release view latest --json assets -q '.assets[].name' 2>/dev/null | grep -q deployment.json; then
+            gh release delete latest --yes 2>/dev/null || true
+            git push origin :refs/tags/latest 2>/dev/null || true
+            gh release create latest deployment.json \
+              --title "Latest Build" \
+              --notes "Build manifest (no deploy yet). Updated by each build.
+
+          **PCR0:** ${PCR0}
+          **Built:** ${TIMESTAMP}
+          **Commit:** ${COMMIT_SHA}"
+          fi
 `
 
 const frameworkDokployCompose = `# Dokploy-compatible compose file for local QEMU enclave deployment.

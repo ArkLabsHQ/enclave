@@ -48,13 +48,77 @@ echo "  CLI:  $ENCLAVE_CLI"
 echo "  Mgmt: $ENCLAVE_MGMT"
 echo ""
 
+# --- OpenTofu helpers ---
+TOFU_DIR="${SCRIPT_DIR}/app/enclave/tofu"
+LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
+export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+tofu_apply() {
+  # Always regenerate tfvars — paths differ between host and Docker.
+  echo "  Generating terraform.tfvars.json..."
+
+  # Ensure artifact placeholders exist for tofu's filemd5() (local mode
+  # doesn't actually use these S3 objects — the enclave boots from QEMU).
+  mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
+  for f in image.eif enclave-mgmt gvproxy; do
+    [ -f "${SCRIPT_DIR}/app/enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/enclave/artifacts/$f"
+  done
+
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tfvars)
+
+  # Replace S3 backend with local backend for testing.
+  sed -i 's/backend "s3" {}/backend "local" {}/' "${TOFU_DIR}/main.tf"
+
+  # Override provider to point at localstack.
+  cat > "${TOFU_DIR}/provider_override.tf" <<'OVERRIDE'
+provider "aws" {
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+  endpoints {
+    s3  = "http://127.0.0.1:4566"
+    ssm = "http://127.0.0.1:4566"
+    sts = "http://127.0.0.1:4566"
+    iam = "http://127.0.0.1:4566"
+    kms = "http://127.0.0.1:4566"
+    ec2 = "http://127.0.0.1:4566"
+  }
+}
+OVERRIDE
+
+  # Clean previous init state.
+  rm -rf "${TOFU_DIR}/.terraform" 2>/dev/null || true
+
+  echo "  tofu init..."
+  tofu -chdir="$TOFU_DIR" init -input=false > ${SCRIPT_DIR}/tofu-init.log 2>&1 || { cat ${SCRIPT_DIR}/tofu-init.log; return 1; }
+  echo "  tofu apply..."
+  tofu -chdir="$TOFU_DIR" apply -auto-approve -input=false -compact-warnings > ${SCRIPT_DIR}/tofu-apply.log 2>&1 || { echo "  tofu apply FAILED:"; tail -20 ${SCRIPT_DIR}/tofu-apply.log; return 1; }
+  echo "  tofu apply OK (log: ${SCRIPT_DIR}/tofu-apply.log)"
+}
+
+tofu_destroy() {
+  # Ensure provider override + tfvars exist for destroy to work.
+  if [ -f "${TOFU_DIR}/terraform.tfstate" ]; then
+    tofu -chdir="$TOFU_DIR" destroy -auto-approve -input=false > ${SCRIPT_DIR}/tofu-destroy.log 2>&1 || true
+  fi
+  # Restore S3 backend in main.tf (test changed it to local).
+  sed -i 's/backend "local" {}/backend "s3" {}/' "${TOFU_DIR}/main.tf" 2>/dev/null || true
+  rm -f "${TOFU_DIR}/terraform.tfstate"* "${TOFU_DIR}/provider_override.tf" 2>/dev/null || true
+  rm -rf "${TOFU_DIR}/.terraform" "${TOFU_DIR}/.artifacts" 2>/dev/null || true
+}
+
 EIF_PATH="${1:-}"
 MGMT_PID=""
 
 cleanup() {
   echo ""
   echo "=== Tearing down ==="
-  "$ENCLAVE_CLI" destroy --force 2>/dev/null || true
+  tofu_destroy
   # Kill mgmt server.
   [ -n "${MGMT_PID:-}" ] && kill "$MGMT_PID" 2>/dev/null && wait "$MGMT_PID" 2>/dev/null || true
   # Kill enclave (boot-qemu.sh) via PID file.
@@ -217,22 +281,16 @@ else
 fi
 echo ""
 
-# Step 2: Deploy CDK stack to localstack and start mgmt server.
-echo "=== [2/9] Deploying local CDK stack to localstack ==="
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-export LOCAL_DEPLOYMENT=true
-export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
+# Step 2: Deploy to localstack via OpenTofu and start mgmt server.
+echo "=== [2/9] Deploying to localstack via tofu ==="
 
-# Clean up any stale state from previous runs (KMS keys locked to old PCR0).
-"$ENCLAVE_CLI" destroy --force 2>/dev/null || true
+# Clean up any stale state from previous runs.
+tofu_destroy
 
-"$ENCLAVE_CLI" deploy
+tofu_apply
 
-# CDK created a KMS key in localstack, but we use local-kms for real KMS ops.
+# Tofu created a KMS key in localstack, but we use local-kms for real KMS ops.
 # Overwrite SSM with the local-kms seeded key ID so the enclave uses it.
-LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
 aws ssm put-parameter $LOCALSTACK \
   --name "/dev/my-app/KMSKeyID" --value "test-key-id" \
   --type String --overwrite --no-cli-pager
@@ -299,22 +357,26 @@ fi
 echo ""
 
 # Step 6: Migration cooldown abort test.
-# Start a deploy in the background (enters 5s cooldown), verify pending=true,
+# Start a migration in the background (enters cooldown), verify pending=true,
 # abort, verify pending=false.
 echo "=== [6/9] Migration cooldown: abort test ==="
 MGMT_URL="http://localhost:${MGMT_PORT:-8444}"
 
-# Export AWS endpoints so the CLI can reach localstack (enclave.yaml uses
-# host.containers.internal which only works inside the QEMU enclave).
 export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
 
-# Start a real deploy in the background. With the deploy.go fix, the CLI
-# detects upgrade mode (KMSKeyID exists in SSM from Step 2), calls POST /migrate
-# on the mgmt server, which enters cooldown before any destructive steps.
-"$ENCLAVE_CLI" deploy > /tmp/deploy-abort-test.log 2>&1 &
+# Trigger migration directly via mgmt server in the background.
+# (Not via tofu — we need to abort mid-migration, which tofu can't do.)
+ABORT_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
+aws s3 mb "s3://${ABORT_EIF_BUCKET}" $LOCALSTACK 2>/dev/null || true
+aws s3 cp "$EIF_PATH" "s3://${ABORT_EIF_BUCKET}/image.eif" $LOCALSTACK 2>/dev/null
+ABORT_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json")
+curl -sf -X POST "${MGMT_URL}/migrate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"eif_bucket\":\"${ABORT_EIF_BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"${ABORT_PCR0}\",\"secret_names\":[\"signing_key\"]}" \
+  > /tmp/deploy-abort-test.log 2>&1 &
 DEPLOY_PID=$!
 
 # Poll for migration_pending=true (timeout 30s).
@@ -385,7 +447,13 @@ if [ -f "$MIGRATION_EIF" ]; then
 else
   echo "  WARN: No migration EIF found (image-v2.eif), reusing same EIF"
 fi
-"$ENCLAVE_CLI" deploy
+
+# Re-apply with the new EIF — tofu detects expected_pcr0 changed and triggers
+# enclave_migration_local, which calls the mgmt server to perform live migration.
+echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" | cut -c1-16)..."
+tofu_apply
+echo "  tofu apply log (migration lines):"
+grep -i 'migrat\|trigger\|null_resource\|local-exec\|curl\|skip' ${SCRIPT_DIR}/tofu-apply.log 2>/dev/null | sed 's/^/    /' || echo "    (no migration lines found)"
 
 # Step 8: Wait for restarted enclave and verify migration survival.
 # mgmt already stopped and restarted the enclave in step 7 (via boot-qemu.sh).

@@ -4,9 +4,15 @@ artifacts/
 # Generated build config (from enclave.yaml for Nix)
 build-config.json
 
-# CDK outputs (contains account-specific IDs)
-cdk-outputs.json
-cdk.out/
+# OpenTofu state and outputs (contains account-specific IDs)
+tofu-outputs.json
+terraform.tfvars.json
+terraform.tfstate
+terraform.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+provider_override.tf
+backend_override.tf
 
 # Nix build symlinks
 result

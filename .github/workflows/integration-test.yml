@@ -42,7 +42,7 @@ jobs:
 
           # Build v1 EIF.
           /tmp/enclave-cli build --local
-          cp enclave/artifacts/pcr.json enclave/artifacts/pcr-v1.json
+          cp enclave/artifacts/pcr.json /tmp/pcr-v1.json
           V1_PCR0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
 
           # Build v2 EIF with previous_pcr0 set to v1's PCR0.
@@ -50,13 +50,18 @@ jobs:
           echo "" >> enclave/enclave.yaml
           echo "previous_pcr0: \"${V1_PCR0}\"" >> enclave/enclave.yaml
           /tmp/enclave-cli build --local
-          cp enclave/artifacts/image.eif enclave/artifacts/image-v2.eif
-          cp enclave/artifacts/pcr.json enclave/artifacts/pcr-v2.json
+          cp enclave/artifacts/image.eif /tmp/image-v2.eif
+          cp enclave/artifacts/pcr.json /tmp/pcr-v2.json
 
           # Restore v1 as the active EIF.
           sed -i 's/^version: .*/version: 0.0.1/' enclave/enclave.yaml
           sed -i '/^previous_pcr0:/d' enclave/enclave.yaml
           /tmp/enclave-cli build --local
+
+          # Copy v1/v2 artifacts back (enclave build wipes artifacts/ each time).
+          cp /tmp/pcr-v1.json enclave/artifacts/pcr-v1.json
+          cp /tmp/image-v2.eif enclave/artifacts/image-v2.eif
+          cp /tmp/pcr-v2.json enclave/artifacts/pcr-v2.json
 
       - name: Run integration test
         run: cd test && docker compose --profile test run --build test-runner

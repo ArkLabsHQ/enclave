@@ -46,24 +46,19 @@ func runCurl(cmd *cobra.Command, args []string) error {
 	baseURL, _ := cmd.Flags().GetString("base-url")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 
-	// Discover endpoint from CDK outputs if not overridden.
+	// Discover endpoint from tofu outputs if not overridden.
 	if baseURL == "" {
 		root, err := findRepoRoot()
 		if err != nil {
 			return err
 		}
-		cfg, err := loadConfig()
+		outputs, err := loadTofuOutputs(root)
 		if err != nil {
 			return err
 		}
-		outputs, err := loadCDKOutputs(root)
-		if err != nil {
-			return err
-		}
-		stack := cfg.stackName()
-		elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
+		elasticIP := outputs.getOutput("elastic_ip")
 		if elasticIP == "" {
-			return fmt.Errorf("ElasticIP not found in cdk-outputs.json (run 'enclave deploy' first, or use --base-url to specify the endpoint)")
+			return fmt.Errorf("elastic_ip not found in tofu outputs (run 'tofu apply' first, or use --base-url to specify the endpoint)")
 		}
 		baseURL = "https://" + elasticIP
 	}

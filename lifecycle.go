@@ -49,7 +49,7 @@ func enclaveLifecycleAction(action string) error {
 		return err
 	}
 
-	outputs, err := loadCDKOutputs(root)
+	outputs, err := loadTofuOutputs(root)
 	if err != nil {
 		return err
 	}
@@ -60,10 +60,9 @@ func enclaveLifecycleAction(action string) error {
 		return err
 	}
 
-	stack := cfg.stackName()
-	instanceID := outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
+	instanceID := outputs.getOutput("instance_id")
 	if instanceID == "" {
-		return fmt.Errorf("InstanceID not found in cdk-outputs.json")
+		return fmt.Errorf("instance_id not found in tofu outputs")
 	}
 
 	curlCmd := fmt.Sprintf("curl -sf -X POST http://localhost:8443/%s", action)

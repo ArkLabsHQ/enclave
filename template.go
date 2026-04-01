@@ -388,7 +388,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-enclave deploy
+cd enclave/tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
@@ -481,7 +481,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-enclave deploy
+cd enclave/tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
@@ -676,7 +676,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-enclave deploy
+cd enclave/tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.

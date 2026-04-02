@@ -16,8 +16,8 @@ enclave/tofu/.terraform.lock.hcl
 enclave/tofu/terraform.tfstate*
 enclave/tofu/terraform.tfvars.json
 enclave/tofu/tofu-outputs.json
+enclave/tofu/backend.tf
 enclave/tofu/provider_override.tf
-enclave/tofu/backend_override.tf
 
 # Test logs
 test/tofu-*.log

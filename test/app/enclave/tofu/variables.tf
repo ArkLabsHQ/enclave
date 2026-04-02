@@ -139,6 +139,11 @@ variable "gvproxy_service_path" {
   type        = string
 }
 
+variable "gvproxy_start_script_path" {
+  description = "Local path to gvproxy start.sh script."
+  type        = string
+}
+
 variable "mgmt_service_path" {
   description = "Local path to enclave-mgmt.service."
   type        = string

@@ -422,15 +422,26 @@ func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read enclave info: %w", err)
 	}
 
 	var info enclaveInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := json.Unmarshal(body, &info); err != nil {
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
 		return nil, fmt.Errorf("decode enclave info: %w", err)
 	}
+
+	if resp.StatusCode != http.StatusOK {
+		if info.Error != "" {
+			return &info, fmt.Errorf("enclave init error: %s", info.Error)
+		}
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 	if info.Error != "" {
 		return &info, fmt.Errorf("enclave init error: %s", info.Error)
 	}

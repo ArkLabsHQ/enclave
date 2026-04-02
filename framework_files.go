@@ -279,7 +279,8 @@ if [ -S "${VSOCK_SOCKET}" ]; then
 fi
 
 # Start gvproxy in the background.
-/app/gvproxy -listen vsock://:1024 -listen unix://"${VSOCK_SOCKET}" &
+GVPROXY_BIN="${GVPROXY_BIN:-/home/ec2-user/app/gvproxy/gvproxy}"
+"${GVPROXY_BIN}" -listen vsock://:1024 -listen unix://"${VSOCK_SOCKET}" &
 GVPROXY_PID=$!
 
 # Wait for gvproxy to start.
@@ -454,11 +455,11 @@ CPU_KEY=cpu_count
 DEFAULT_MEM=6144
 DEFAULT_CPU=2
 
-sed -r "s/^(\s*$$MEM_KEY\s*:\s*).*/\1$$DEFAULT_MEM/" -i "$$ALLOCATOR_YAML"
-sed -r "s/^(\s*$$CPU_KEY\s*:\s*).*/\1$$DEFAULT_CPU/" -i "$$ALLOCATOR_YAML"
+sed -r "s/^(\s*$MEM_KEY\s*:\s*).*/\1$DEFAULT_MEM/" -i "$ALLOCATOR_YAML"
+sed -r "s/^(\s*$CPU_KEY\s*:\s*).*/\1$DEFAULT_CPU/" -i "$ALLOCATOR_YAML"
 
 VSOCK_PROXY_YAML=/etc/nitro_enclaves/vsock-proxy.yaml
-cat <<EOF > $$VSOCK_PROXY_YAML
+cat <<EOF > $VSOCK_PROXY_YAML
 allowlist:
 - {address: kms.${region}.amazonaws.com, port: 443}
 - {address: kms-fips.${region}.amazonaws.com, port: 443}
@@ -486,9 +487,11 @@ aws s3 cp ${eif_s3_url} /home/ec2-user/app/server/enclave.eif
 chmod 644 /home/ec2-user/app/server/enclave.eif
 chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 
-# Download gvproxy binary for outbound networking
+# Download gvproxy binary and start script for outbound networking
 aws s3 cp ${gvproxy_binary_s3_url} /home/ec2-user/app/gvproxy/gvproxy
+aws s3 cp ${gvproxy_start_script_s3_url} /home/ec2-user/app/gvproxy/start.sh
 chmod +x /home/ec2-user/app/gvproxy/gvproxy
+chmod +x /home/ec2-user/app/gvproxy/start.sh
 chown -R ec2-user:ec2-user /home/ec2-user/app/gvproxy
 
 aws s3 cp ${enclave_init_s3_url} /home/ec2-user/app/enclave_init.sh
@@ -514,6 +517,9 @@ ENCLAVE_DEPLOYMENT=${dev_mode}
 ENCLAVE_AWS_REGION=${region}
 ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
 ENCLAVE_PREVIOUS_PCR0=${previous_pcr0}
+MEMORY_MIB=4320
+CPU_COUNT=2
+GVPROXY_FORWARD_PORTS=443 7073
 EOF
 
 systemctl enable --now enclave-watchdog.service

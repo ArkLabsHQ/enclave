@@ -33,26 +33,17 @@ resource "aws_iam_role_policy" "enclave" {
 }
 
 data "aws_iam_policy_document" "enclave" {
-  # S3: read all uploaded assets.
+  # S3: read all uploaded assets (including new EIFs uploaded during migration).
   statement {
     sid = "S3AssetRead"
     actions = [
       "s3:GetObject",
       "s3:GetBucketLocation",
     ]
-    resources = concat(
-      [aws_s3_bucket.assets.arn],
-      [for obj in [
-        aws_s3_object.enclave_eif,
-        aws_s3_object.enclave_init,
-        aws_s3_object.watchdog_systemd,
-        aws_s3_object.imds_systemd,
-        aws_s3_object.gvproxy_systemd,
-        aws_s3_object.mgmt_binary,
-        aws_s3_object.mgmt_systemd,
-        aws_s3_object.gvproxy_binary,
-      ] : "${aws_s3_bucket.assets.arn}/${obj.key}"],
-    )
+    resources = [
+      aws_s3_bucket.assets.arn,
+      "${aws_s3_bucket.assets.arn}/*",
+    ]
   }
 
   # S3: read/write on persistent storage bucket.
@@ -112,7 +103,22 @@ data "aws_iam_policy_document" "enclave" {
       "kms:DescribeKey",
       "kms:PutKeyPolicy",
       "kms:GetKeyPolicy",
+      "kms:ScheduleKeyDeletion",
     ]
     resources = [aws_kms_key.encryption.arn]
+  }
+
+  # KMS: create new keys for migration.
+  statement {
+    sid       = "KMSCreateKey"
+    actions   = ["kms:CreateKey", "kms:TagResource"]
+    resources = ["*"]
+  }
+
+  # STS: get caller identity for building transitional KMS policies.
+  statement {
+    sid       = "STSAccess"
+    actions   = ["sts:GetCallerIdentity"]
+    resources = ["*"]
   }
 }

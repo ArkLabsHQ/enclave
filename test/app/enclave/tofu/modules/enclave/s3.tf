@@ -93,6 +93,13 @@ resource "aws_s3_object" "mgmt_binary" {
   etag       = local.use_local ? filemd5(local.mgmt_source) : null
 }
 
+resource "aws_s3_object" "gvproxy_start_script" {
+  bucket = aws_s3_bucket.assets.id
+  key    = "gvproxy-start.sh"
+  source = var.gvproxy_start_script_path
+  etag   = filemd5(var.gvproxy_start_script_path)
+}
+
 resource "aws_s3_object" "gvproxy_binary" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id

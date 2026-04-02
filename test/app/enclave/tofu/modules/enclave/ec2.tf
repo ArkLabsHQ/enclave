@@ -109,6 +109,7 @@ resource "aws_instance" "nitro" {
     mgmt_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}"
     mgmt_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_systemd.key}"
     gvproxy_binary_s3_url        = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_binary.key}"
+    gvproxy_start_script_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_start_script.key}"
     migration_cooldown           = var.migration_cooldown
     previous_pcr0                = var.previous_pcr0
   })
@@ -141,17 +142,19 @@ resource "aws_instance" "nitro" {
 
 # SSM parameters for instance metadata (used by upgrade detection + destroy).
 resource "aws_ssm_parameter" "instance_id" {
-  count = var.local ? 0 : 1
-  name  = "/${var.deployment}/${var.app_name}/InstanceID"
-  type  = "String"
-  value = aws_instance.nitro[0].id
+  count     = var.local ? 0 : 1
+  name      = "/${var.deployment}/${var.app_name}/InstanceID"
+  type      = "String"
+  value     = aws_instance.nitro[0].id
+  overwrite = true
 }
 
 resource "aws_ssm_parameter" "elastic_ip" {
-  count = var.local ? 0 : 1
-  name  = "/${var.deployment}/${var.app_name}/ElasticIP"
-  type  = "String"
-  value = aws_eip.instance[0].public_ip
+  count     = var.local ? 0 : 1
+  name      = "/${var.deployment}/${var.app_name}/ElasticIP"
+  type      = "String"
+  value     = aws_eip.instance[0].public_ip
+  overwrite = true
 }
 
 # Elastic IP for stable public address across reboots.
@@ -209,12 +212,17 @@ resource "null_resource" "enclave_migration" {
       fi
 
       echo "Triggering migration..."
-      MIGRATE_CMD="curl -sf -X POST http://localhost:8443/migrate -H Content-Type:application/json -d '{\"eif_bucket\":\"$BUCKET\",\"eif_key\":\"$EIF_KEY\",\"pcr0\":\"$PCR0\",\"secret_names\":$SECRETS}'"
+      MIGRATE_BODY=$(jq -nc --arg b "$BUCKET" --arg k "$EIF_KEY" --arg p "$PCR0" --argjson s "$SECRETS" \
+        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
+      MIGRATE_CMD="curl -sf -X POST http://localhost:8443/migrate -H Content-Type:application/json -d '$MIGRATE_BODY'"
+      TMPFILE=$(mktemp)
+      jq -nc --arg cmd "$MIGRATE_CMD" '{"commands":[$cmd]}' > "$TMPFILE"
       aws ssm send-command \
         --instance-ids "$INSTANCE_ID" \
         --document-name AWS-RunShellScript \
-        --parameters "{\"commands\":[\"$MIGRATE_CMD\"]}" \
+        --parameters "file://$TMPFILE" \
         --region "$REGION" --output text
+      rm -f "$TMPFILE"
     EOT
   }
 

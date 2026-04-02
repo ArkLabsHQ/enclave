@@ -122,6 +122,7 @@ resource "aws_vpc_endpoint" "kms" {
   service_name        = "com.amazonaws.${var.region}.kms"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
+  security_group_ids  = [aws_security_group.nitro[0].id]
   private_dns_enabled = true
 
   tags = { Name = "${local.prefix}-kms-endpoint" }
@@ -134,6 +135,7 @@ resource "aws_vpc_endpoint" "ssm" {
   service_name        = "com.amazonaws.${var.region}.ssm"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
+  security_group_ids  = [aws_security_group.nitro[0].id]
   private_dns_enabled = true
 
   tags = { Name = "${local.prefix}-ssm-endpoint" }
@@ -145,7 +147,7 @@ resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main[0].id
   service_name      = "com.amazonaws.${var.region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.private[0].id]
+  route_table_ids   = [aws_route_table.public[0].id, aws_route_table.private[0].id]
 
   tags = { Name = "${local.prefix}-s3-endpoint" }
 }

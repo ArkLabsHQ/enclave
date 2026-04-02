@@ -11,28 +11,20 @@ resource "aws_kms_key" "encryption" {
   description         = "${local.prefix} enclave encryption key"
 }
 
-# Remove KMS key from state on destroy. The key policy is locked to PCR0
-# after first boot, so tofu cannot delete it. Key deletion is scheduled
-# by the instance's destroy provisioner via the mgmt server.
-resource "null_resource" "kms_state_cleanup" {
-  triggers = {
-    key_id = aws_kms_key.encryption.id
-  }
-
-  provisioner "local-exec" {
-    when       = destroy
-    command    = "tofu state rm module.enclave.aws_kms_key.encryption module.enclave.aws_kms_key_policy.encryption 2>/dev/null || true"
-    on_failure = continue
-  }
-}
-
 # Initial key policy: grants the EC2 instance role encrypt/decrypt + policy
 # management. The enclave replaces this policy at runtime with a PCR0-locked
-# version via selfApplyKMSPolicy().
+# version via selfApplyKMSPolicy(). The locked policy preserves DescribeKey
+# for the account root so tofu can still refresh this resource.
 resource "aws_kms_key_policy" "encryption" {
   key_id = aws_kms_key.encryption.id
 
   policy = data.aws_iam_policy_document.kms_key_policy.json
+
+  # The enclave replaces the policy at runtime with a PCR0-locked version.
+  # Ignore changes so tofu doesn't try to revert it on subsequent applies.
+  lifecycle {
+    ignore_changes = [policy]
+  }
 }
 
 data "aws_iam_policy_document" "kms_key_policy" {

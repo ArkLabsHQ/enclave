@@ -65,9 +65,11 @@ aws s3 cp ${eif_s3_url} /home/ec2-user/app/server/enclave.eif
 chmod 644 /home/ec2-user/app/server/enclave.eif
 chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 
-# Download gvproxy binary for outbound networking
+# Download gvproxy binary and start script for outbound networking
 aws s3 cp ${gvproxy_binary_s3_url} /home/ec2-user/app/gvproxy/gvproxy
+aws s3 cp ${gvproxy_start_script_s3_url} /home/ec2-user/app/gvproxy/start.sh
 chmod +x /home/ec2-user/app/gvproxy/gvproxy
+chmod +x /home/ec2-user/app/gvproxy/start.sh
 chown -R ec2-user:ec2-user /home/ec2-user/app/gvproxy
 
 aws s3 cp ${enclave_init_s3_url} /home/ec2-user/app/enclave_init.sh
@@ -93,6 +95,9 @@ ENCLAVE_DEPLOYMENT=${dev_mode}
 ENCLAVE_AWS_REGION=${region}
 ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
 ENCLAVE_PREVIOUS_PCR0=${previous_pcr0}
+MEMORY_MIB=4320
+CPU_COUNT=2
+GVPROXY_FORWARD_PORTS=443 7073
 EOF
 
 systemctl enable --now enclave-watchdog.service

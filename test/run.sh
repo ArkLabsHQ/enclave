@@ -69,8 +69,14 @@ tofu_apply() {
 
   (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tfvars)
 
-  # Replace S3 backend with local backend for testing.
-  sed -i 's/backend "s3" {}/backend "local" {}/' "${TOFU_DIR}/main.tf"
+  # Write local backend config for testing (enclave build generates S3 backend.tf for production).
+  cat > "${TOFU_DIR}/backend.tf" <<BACKEND
+terraform {
+  backend "local" {
+    path = "${TOFU_DIR}/terraform.tfstate"
+  }
+}
+BACKEND
 
   # Override provider to point at localstack.
   cat > "${TOFU_DIR}/provider_override.tf" <<'OVERRIDE'
@@ -106,9 +112,7 @@ tofu_destroy() {
   if [ -f "${TOFU_DIR}/terraform.tfstate" ]; then
     tofu -chdir="$TOFU_DIR" destroy -auto-approve -input=false > ${SCRIPT_DIR}/tofu-destroy.log 2>&1 || true
   fi
-  # Restore S3 backend in main.tf (test changed it to local).
-  sed -i 's/backend "local" {}/backend "s3" {}/' "${TOFU_DIR}/main.tf" 2>/dev/null || true
-  rm -f "${TOFU_DIR}/terraform.tfstate"* "${TOFU_DIR}/provider_override.tf" 2>/dev/null || true
+  rm -f "${TOFU_DIR}/terraform.tfstate"* "${TOFU_DIR}/provider_override.tf" "${TOFU_DIR}/backend.tf" 2>/dev/null || true
   rm -rf "${TOFU_DIR}/.terraform" "${TOFU_DIR}/.artifacts" 2>/dev/null || true
 }
 

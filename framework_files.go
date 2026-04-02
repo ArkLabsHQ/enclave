@@ -482,8 +482,14 @@ if [[ ! -d ./app/server ]]; then
   chown -R ec2-user:ec2-user ./app
 fi
 
-# Download pre-built EIF from S3 (built reproducibly with Nix)
-aws s3 cp ${eif_s3_url} /home/ec2-user/app/server/enclave.eif
+# Wait for IAM policy to propagate before downloading from S3.
+# The inline policy depends on the KMS key, so it may be created after the
+# EC2 instance boots. IAM is eventually consistent — retry until it works.
+for attempt in 1 2 3 4 5 6; do
+  aws s3 cp ${eif_s3_url} /home/ec2-user/app/server/enclave.eif && break
+  echo "S3 download failed (attempt $attempt), waiting for IAM propagation..."
+  sleep 10
+done
 chmod 644 /home/ec2-user/app/server/enclave.eif
 chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 

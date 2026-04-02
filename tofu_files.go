@@ -642,9 +642,10 @@ locals {
 resource "aws_ssm_parameter" "secret_ciphertext" {
   for_each = local.secrets_map
 
-  name  = "/${var.deployment}/${var.app_name}/${each.key}/Ciphertext"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/${each.key}/Ciphertext"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -655,9 +656,10 @@ resource "aws_ssm_parameter" "secret_ciphertext" {
 resource "aws_ssm_parameter" "secret_migration" {
   for_each = local.secrets_map
 
-  name  = "/${var.deployment}/${var.app_name}/Migration/${each.key}/Ciphertext"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/Migration/${each.key}/Ciphertext"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -667,9 +669,10 @@ resource "aws_ssm_parameter" "secret_migration" {
 # Shared migration parameters (one per deployment, not per secret).
 
 resource "aws_ssm_parameter" "migration_kms_key_id" {
-  name  = "/${var.deployment}/${var.app_name}/MigrationKMSKeyID"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/MigrationKMSKeyID"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -677,9 +680,10 @@ resource "aws_ssm_parameter" "migration_kms_key_id" {
 }
 
 resource "aws_ssm_parameter" "migration_previous_pcr0" {
-  name  = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -687,10 +691,11 @@ resource "aws_ssm_parameter" "migration_previous_pcr0" {
 }
 
 resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
-  name  = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0Attestation"
-  type  = "String"
-  tier  = "Advanced"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0Attestation"
+  type      = "String"
+  tier      = "Advanced"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -698,9 +703,10 @@ resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
 }
 
 resource "aws_ssm_parameter" "migration_old_kms_key_id" {
-  name  = "/${var.deployment}/${var.app_name}/MigrationOldKMSKeyID"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/MigrationOldKMSKeyID"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -709,23 +715,26 @@ resource "aws_ssm_parameter" "migration_old_kms_key_id" {
 
 # KMS key ID (auto-populated with the actual key ID).
 resource "aws_ssm_parameter" "kms_key_id" {
-  name  = "/${var.deployment}/${var.app_name}/KMSKeyID"
-  type  = "String"
-  value = aws_kms_key.encryption.key_id
+  name      = "/${var.deployment}/${var.app_name}/KMSKeyID"
+  type      = "String"
+  value     = aws_kms_key.encryption.key_id
+  overwrite = true
 }
 
 # Storage bucket name.
 resource "aws_ssm_parameter" "storage_bucket_name" {
-  name  = "/${var.deployment}/${var.app_name}/StorageBucketName"
-  type  = "String"
-  value = aws_s3_bucket.storage.id
+  name      = "/${var.deployment}/${var.app_name}/StorageBucketName"
+  type      = "String"
+  value     = aws_s3_bucket.storage.id
+  overwrite = true
 }
 
 # Storage data encryption key (DEK).
 resource "aws_ssm_parameter" "storage_dek" {
-  name  = "/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -734,9 +743,10 @@ resource "aws_ssm_parameter" "storage_dek" {
 
 # Migration storage DEK.
 resource "aws_ssm_parameter" "migration_storage_dek" {
-  name  = "/${var.deployment}/${var.app_name}/Migration/StorageDEK/Ciphertext"
-  type  = "String"
-  value = "UNSET"
+  name      = "/${var.deployment}/${var.app_name}/Migration/StorageDEK/Ciphertext"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
 
   lifecycle {
     ignore_changes = [value]
@@ -1135,6 +1145,9 @@ resource "aws_security_group_rule" "all_egress" {
 # Nitro Enclave EC2 instance.
 resource "aws_instance" "nitro" {
   count = var.local ? 0 : 1
+
+  # Wait for IAM policy before booting — user_data downloads from S3 immediately.
+  depends_on = [aws_iam_role_policy.enclave]
 
   ami                  = data.aws_ami.al2023[0].id
   instance_type        = var.instance_type

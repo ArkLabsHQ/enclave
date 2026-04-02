@@ -212,7 +212,7 @@ func buildKMSPolicy(accountID, ec2RoleARN, pcr0 string) string {
       "Sid": "AllowAccountDescribe",
       "Effect": "Allow",
       "Principal": {"AWS": "arn:aws:iam::%s:root"},
-      "Action": "kms:DescribeKey",
+      "Action": ["kms:DescribeKey", "kms:GetKeyPolicy"],
       "Resource": "*"
     },
     {

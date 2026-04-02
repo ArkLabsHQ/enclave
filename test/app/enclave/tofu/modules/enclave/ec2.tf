@@ -79,6 +79,9 @@ resource "aws_security_group_rule" "all_egress" {
 resource "aws_instance" "nitro" {
   count = var.local ? 0 : 1
 
+  # Wait for IAM policy before booting — user_data downloads from S3 immediately.
+  depends_on = [aws_iam_role_policy.enclave]
+
   ami                  = data.aws_ami.al2023[0].id
   instance_type        = var.instance_type
   subnet_id            = aws_subnet.public[0].id

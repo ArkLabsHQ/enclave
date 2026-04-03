@@ -103,7 +103,7 @@ resource "aws_instance" "nitro" {
     region                       = var.region
     dev_mode                     = var.deployment
     app_name                     = var.app_name
-    kms_key_id                   = aws_kms_key.encryption.key_id
+    kms_key_id                   = local.kms_key_id
     eif_s3_url                   = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     enclave_init_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_init.key}"
     enclave_init_systemd_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.watchdog_systemd.key}"

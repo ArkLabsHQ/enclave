@@ -1,61 +1,93 @@
 # KMS encryption key for enclave secrets.
 #
-# The enclave self-applies a PCR0-locked key policy at first boot, removing
-# PutKeyPolicy from everyone. After locking, only the enclave (via the mgmt
-# server) can schedule key deletion. The instance destroy provisioner handles
-# this automatically. The KMS key is then removed from state so tofu destroy
-# doesn't try (and fail) to delete it.
+# Created via AWS CLI (null_resource) instead of a native tofu resource
+# because the enclave locks the key policy to PCR0 at first boot, and the
+# mgmt server replaces the key entirely during migration. Tofu cannot
+# refresh a locked key (DescribeKey/GetKeyPolicy/GetKeyRotationStatus all
+# fail with AccessDenied), so the key must not exist as a tofu resource.
+#
+# The key ID is stored in SSM and read back via a data source. All other
+# resources reference locals.kms_key_id / locals.kms_key_arn.
+# Key deletion is handled by the mgmt server's destroy provisioner.
 
-resource "aws_kms_key" "encryption" {
-  enable_key_rotation = true
-  description         = "${local.prefix} enclave encryption key"
-}
+resource "null_resource" "kms_key" {
+  # Only runs once per deployment. The mgmt server handles key rotation
+  # during migration (creates new keys, updates SSM).
+  triggers = {
+    deployment = var.deployment
+    app_name   = var.app_name
+  }
 
-# Initial key policy: grants the EC2 instance role encrypt/decrypt + policy
-# management. The enclave replaces this policy at runtime with a PCR0-locked
-# version via selfApplyKMSPolicy(). The locked policy preserves DescribeKey
-# for the account root so tofu can still refresh this resource.
-resource "aws_kms_key_policy" "encryption" {
-  key_id = aws_kms_key.encryption.id
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
 
-  policy = data.aws_iam_policy_document.kms_key_policy.json
+      # Check if a key already exists in SSM (idempotent).
+      EXISTING=$(aws ssm get-parameter \
+        --name "/${var.deployment}/${var.app_name}/KMSKeyID" \
+        --region ${var.region} --query 'Parameter.Value' --output text 2>/dev/null || echo "UNSET")
+      if [ "$EXISTING" != "UNSET" ] && [ -n "$EXISTING" ]; then
+        echo "KMS key already exists in SSM: $EXISTING"
+        exit 0
+      fi
 
-  # The enclave replaces the policy at runtime with a PCR0-locked version.
-  # Ignore changes so tofu doesn't try to revert it on subsequent applies.
-  lifecycle {
-    ignore_changes = [policy]
+      # Create the key.
+      KEY_ID=$(aws kms create-key \
+        --description "${local.prefix} enclave encryption key" \
+        --region ${var.region} \
+        --tags TagKey=AppName,TagValue=${var.app_name} TagKey=Deployment,TagValue=${var.deployment} TagKey=ManagedBy,TagValue=opentofu \
+        --query 'KeyMetadata.KeyId' --output text)
+      echo "Created KMS key: $KEY_ID"
+
+      # Apply initial key policy.
+      POLICY='${jsonencode({
+        Version = "2012-10-17"
+        Statement = [
+          {
+            Sid       = "AllowRootAccount"
+            Effect    = "Allow"
+            Principal = { AWS = "arn:aws:iam::${var.account}:root" }
+            Action    = "kms:*"
+            Resource  = "*"
+          },
+          {
+            Sid       = "AllowInstanceRole"
+            Effect    = "Allow"
+            Principal = { AWS = aws_iam_role.instance.arn }
+            Action = [
+              "kms:Encrypt",
+              "kms:Decrypt",
+              "kms:GenerateDataKey",
+              "kms:DescribeKey",
+              "kms:PutKeyPolicy",
+              "kms:GetKeyPolicy",
+            ]
+            Resource = "*"
+          },
+        ]
+      })}'
+
+      aws kms put-key-policy --key-id "$KEY_ID" --policy-name default \
+        --policy "$POLICY" --region ${var.region}
+
+      # Store in SSM.
+      aws ssm put-parameter \
+        --name "/${var.deployment}/${var.app_name}/KMSKeyID" \
+        --value "$KEY_ID" --type String --overwrite \
+        --region ${var.region} --no-cli-pager
+
+      echo "KMS key $KEY_ID stored in SSM"
+    EOT
   }
 }
 
-data "aws_iam_policy_document" "kms_key_policy" {
-  # Allow the account root full key management (required by AWS).
-  statement {
-    sid    = "AllowRootAccount"
-    effect = "Allow"
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:aws:iam::${var.account}:root"]
-    }
-    actions   = ["kms:*"]
-    resources = ["*"]
-  }
+# Read the KMS key ID from SSM (written by null_resource.kms_key or mgmt server).
+data "aws_ssm_parameter" "kms_key_id_lookup" {
+  name       = "/${var.deployment}/${var.app_name}/KMSKeyID"
+  depends_on = [null_resource.kms_key]
+}
 
-  # Allow the EC2 instance role to encrypt/decrypt and manage key policy.
-  statement {
-    sid    = "AllowInstanceRole"
-    effect = "Allow"
-    principals {
-      type        = "AWS"
-      identifiers = [aws_iam_role.instance.arn]
-    }
-    actions = [
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:GenerateDataKey",
-      "kms:DescribeKey",
-      "kms:PutKeyPolicy",
-      "kms:GetKeyPolicy",
-    ]
-    resources = ["*"]
-  }
+locals {
+  kms_key_id  = data.aws_ssm_parameter.kms_key_id_lookup.value
+  kms_key_arn = "arn:aws:kms:${var.region}:${var.account}:key/${local.kms_key_id}"
 }

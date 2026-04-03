@@ -5,7 +5,8 @@ output "ec2_role_arn" {
 
 output "kms_key_id" {
   description = "KMS encryption key ID."
-  value       = aws_kms_key.encryption.key_id
+  value       = local.kms_key_id
+  sensitive   = true
 }
 
 output "instance_id" {

@@ -68,6 +68,17 @@ resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
   }
 }
 
+resource "aws_ssm_parameter" "migration_requested_at" {
+  name      = "/${var.deployment}/${var.app_name}/MigrationRequestedAt"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 resource "aws_ssm_parameter" "migration_old_kms_key_id" {
   name      = "/${var.deployment}/${var.app_name}/MigrationOldKMSKeyID"
   type      = "String"
@@ -79,13 +90,8 @@ resource "aws_ssm_parameter" "migration_old_kms_key_id" {
   }
 }
 
-# KMS key ID (auto-populated with the actual key ID).
-resource "aws_ssm_parameter" "kms_key_id" {
-  name      = "/${var.deployment}/${var.app_name}/KMSKeyID"
-  type      = "String"
-  value     = aws_kms_key.encryption.key_id
-  overwrite = true
-}
+# KMS key ID — managed by null_resource.kms_key (kms.tf) and the mgmt server
+# during migration. Not a tofu resource because the value changes outside tofu.
 
 # Storage bucket name.
 resource "aws_ssm_parameter" "storage_bucket_name" {

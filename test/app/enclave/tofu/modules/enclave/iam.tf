@@ -77,6 +77,7 @@ data "aws_iam_policy_document" "enclave" {
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_old_kms_key_id.arn,
+        aws_ssm_parameter.migration_requested_at.arn,
         aws_ssm_parameter.storage_dek.arn,
         aws_ssm_parameter.migration_storage_dek.arn,
       ],
@@ -88,8 +89,16 @@ data "aws_iam_policy_document" "enclave" {
     sid     = "SSMReadOnly"
     actions = ["ssm:GetParameter"]
     resources = [
-      aws_ssm_parameter.kms_key_id.arn,
       aws_ssm_parameter.storage_bucket_name.arn,
+    ]
+  }
+
+  # SSM: KMSKeyID needs read+write (mgmt server updates it during migration).
+  statement {
+    sid     = "SSMKMSKeyID"
+    actions = ["ssm:GetParameter", "ssm:PutParameter"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/KMSKeyID",
     ]
   }
 
@@ -104,14 +113,9 @@ data "aws_iam_policy_document" "enclave" {
       "kms:PutKeyPolicy",
       "kms:GetKeyPolicy",
       "kms:ScheduleKeyDeletion",
+      "kms:CreateKey",
+      "kms:TagResource",
     ]
-    resources = [aws_kms_key.encryption.arn]
-  }
-
-  # KMS: create new keys for migration.
-  statement {
-    sid       = "KMSCreateKey"
-    actions   = ["kms:CreateKey", "kms:TagResource"]
     resources = ["*"]
   }
 

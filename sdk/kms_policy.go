@@ -79,9 +79,7 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		return fmt.Errorf("resolve IAM role ARN: %w", err)
 	}
 
-	accountID := *identity.Account
-
-	policy := buildKMSPolicy(accountID, roleARN, pcr0)
+	policy := buildKMSPolicy(roleARN, pcr0)
 
 	// Retry with backoff to handle IAM propagation delay on fresh deploy.
 	// BypassPolicyLockoutSafetyCheck is required because we're removing
@@ -203,18 +201,10 @@ func parseActions(raw json.RawMessage) []string {
 // the EC2 role, GetKeyPolicy allows the enclave to verify the lock on reboot,
 // and ScheduleKeyDeletion is allowed for old-key cleanup during migration.
 // No PutKeyPolicy is granted to anyone — the key is immutably locked to this PCR0.
-// The account root is granted DescribeKey so tofu and IAM users can inspect the key.
-func buildKMSPolicy(accountID, ec2RoleARN, pcr0 string) string {
+func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
 	return fmt.Sprintf(`{
   "Version": "2012-10-17",
   "Statement": [
-    {
-      "Sid": "AllowAccountDescribe",
-      "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::%s:root"},
-      "Action": ["kms:DescribeKey", "kms:GetKeyPolicy"],
-      "Resource": "*"
-    },
     {
       "Sid": "EnclaveDecryptWithAttestation",
       "Effect": "Allow",
@@ -231,7 +221,7 @@ func buildKMSPolicy(accountID, ec2RoleARN, pcr0 string) string {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %q},
-      "Action": ["kms:Encrypt", "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
+      "Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
       "Resource": "*"
     },
     {
@@ -242,5 +232,5 @@ func buildKMSPolicy(accountID, ec2RoleARN, pcr0 string) string {
       "Resource": "*"
     }
   ]
-}`, accountID, ec2RoleARN, pcr0, ec2RoleARN, ec2RoleARN)
+}`, ec2RoleARN, pcr0, ec2RoleARN, ec2RoleARN)
 }

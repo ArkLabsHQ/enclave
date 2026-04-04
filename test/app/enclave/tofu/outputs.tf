@@ -8,6 +8,7 @@ output "ec2_role_arn" {
 output "kms_key_id" {
   description = "KMS encryption key ID."
   value       = module.enclave.kms_key_id
+  sensitive   = true
 }
 
 output "instance_id" {

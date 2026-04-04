@@ -55,6 +55,12 @@ export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+# AWS CLI endpoint overrides for localstack — needed by null_resource local-exec
+# provisioners which bypass the tofu provider config.
+export AWS_ENDPOINT_URL_KMS="${AWS_ENDPOINT_URL_KMS:-http://127.0.0.1:4566}"
+export AWS_ENDPOINT_URL_SSM="${AWS_ENDPOINT_URL_SSM:-http://127.0.0.1:4566}"
+export AWS_ENDPOINT_URL_STS="${AWS_ENDPOINT_URL_STS:-http://127.0.0.1:4566}"
+export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-http://127.0.0.1:4566}"
 
 tofu_apply() {
   # Always regenerate tfvars — paths differ between host and Docker.

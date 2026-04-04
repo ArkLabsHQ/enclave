@@ -55,12 +55,18 @@ RUN make DESTDIR=/qemu-install install
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 curl jq ca-certificates procps psmisc \
+      python3 curl jq ca-certificates procps psmisc unzip \
       libglib2.0-0 libpixman-1-0 libfdt1 libcap-ng0 \
       libslirp0 liburing2 \
       libcbor0.8 libgnutls30 \
-      awscli nodejs npm wget \
+      nodejs npm wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Install AWS CLI v2 (supports per-service endpoint env vars like AWS_ENDPOINT_URL_KMS).
+RUN curl -sf "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip \
+    && unzip -q /tmp/awscli.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscli.zip /tmp/aws
 
 # Install OpenTofu for infrastructure deployment.
 RUN wget -qO- https://github.com/opentofu/opentofu/releases/download/v1.9.0/tofu_1.9.0_linux_amd64.tar.gz \

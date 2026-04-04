@@ -1,0 +1,40 @@
+{
+  "name": "introspector-enclave-client",
+  "version": "0.1.0",
+  "description": "Verified HTTP client for AWS Nitro Enclave attestation",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "nitro",
+    "enclave",
+    "attestation",
+    "aws",
+    "verified"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArkLabsHQ/introspector-enclave"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^1.7.3",
+    "@noble/secp256k1": "^2.2.3",
+    "@peculiar/x509": "^1.12.3",
+    "cbor-x": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.3"
+  }
+}

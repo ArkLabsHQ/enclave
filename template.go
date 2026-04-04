@@ -19,7 +19,7 @@ func generateCmd() *cobra.Command {
 }
 
 func generateTemplateCmd() *cobra.Command {
-	var golang, nodejs, dotnet bool
+	var golang, nodejs, dotnet, rust bool
 
 	cmd := &cobra.Command{
 		Use:   "template [output-dir]",
@@ -41,8 +41,10 @@ Push the result to GitHub and mark it as a template repository
 				language = "nodejs"
 			case dotnet:
 				language = "dotnet"
+			case rust:
+				language = "rust"
 			default:
-				return fmt.Errorf("specify a language: --golang, --nodejs, or --dotnet")
+				return fmt.Errorf("specify a language: --golang, --nodejs, --dotnet, or --rust")
 			}
 
 			outDir := "."
@@ -56,6 +58,7 @@ Push the result to GitHub and mark it as a template repository
 	cmd.Flags().BoolVar(&golang, "golang", false, "Generate a Go app template")
 	cmd.Flags().BoolVar(&nodejs, "nodejs", false, "Generate a Node.js app template")
 	cmd.Flags().BoolVar(&dotnet, "dotnet", false, "Generate a .NET app template")
+	cmd.Flags().BoolVar(&rust, "rust", false, "Generate a Rust app template")
 	return cmd
 }
 
@@ -109,6 +112,17 @@ func runGenerateTemplate(outDir, language string) error {
 			{"MyEnclaveApp.csproj", dotnetCsproj, 0644},
 			{"NuGet.config", dotnetNugetConfig, 0644},
 			{"README.md", templateReadmeDotnet, 0644},
+		}
+	case "rust":
+		cfgTemplate = rustConfigTemplate
+		appFiles = []struct {
+			relPath string
+			content string
+			mode    os.FileMode
+		}{
+			{"src/main.rs", rustMainRs, 0644},
+			{"Cargo.toml", rustCargoToml, 0644},
+			{"README.md", templateReadmeRust, 0644},
 		}
 	default: // "go"
 		cfgTemplate = golangConfigTemplate
@@ -732,4 +746,113 @@ enclave build
 ` + "```" + `
 
 See [Introspector Enclave documentation](https://github.com/ArkLabsHQ/introspector-enclave) for the full reference.
+`
+
+// --- Rust templates ---
+
+const rustConfigTemplate = `# Enclave configuration
+# Edit this file then run: enclave init
+
+name: my-app                     # App name (used in stack name, EIF name)
+version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
+region: us-east-1                # AWS region
+account: ""                      # AWS account ID (required)
+prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+instance_type: m6i.xlarge        # EC2 instance type
+nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
+migration_cooldown: "1m"         # Cooldown before migration proceeds
+
+# SDK coordinates for the enclave supervisor binary.
+sdk:
+  rev: ""                        # SDK version (e.g. "v0.0.62")
+  hash: ""                       # nix-prefetch-url --unpack (SRI hash)
+  vendor_hash: ""                # Go vendor hash for SDK
+
+app:
+  language: "rust"               # App language: go, nodejs, dotnet, rust
+  source: nix
+
+  nix_owner: ""                  # GitHub owner (required)
+  nix_repo: ""                   # GitHub repo name (required)
+  nix_rev: ""                    # Git commit SHA (required)
+  nix_hash: ""                   # Nix source hash (required)
+  nix_vendor_hash: ""            # Cargo.lock hash (required)
+  binary_name: ""                # Output binary name (defaults to 'name')
+
+  env:
+    # MY_APP_DATA_DIR: /app/data
+
+secrets:
+  - name: signing_key
+    env_var: APP_SIGNING_KEY
+`
+
+var rustMainRs = `use std::env;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+fn main() {
+    let port = env::var("ENCLAVE_APP_PORT").unwrap_or_else(|_| "7074".to_string());
+    let addr = format!("127.0.0.1:{}", port);
+
+    let listener = TcpListener::bind(&addr).expect("Failed to bind");
+    println!("Enclave app listening on {}", addr);
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Accept error: {}", e);
+                continue;
+            }
+        };
+
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        let body = "{\"status\":\"ok\"}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+}
+`
+
+const rustCargoToml = `[package]
+name = "my-enclave-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "my-enclave-app"
+path = "src/main.rs"
+`
+
+const templateReadmeRust = `# My Enclave App
+
+A Rust application running inside an AWS Nitro Enclave with automatic
+attestation, encrypted secrets, and response signing.
+
+## Quick Start
+
+1. Edit enclave/enclave.yaml with your AWS account and app details
+2. Set up the SDK and compute hashes:
+   enclave setup --language rust
+3. Build the enclave image:
+   enclave build
+4. Deploy:
+   enclave deploy
+
+## Updating Dependencies
+
+After changing Cargo.toml or Cargo.lock:
+   cargo update
+   git add -A && git commit -m "update deps" && git push
+   enclave setup --language rust
+   enclave build
+
+See https://github.com/ArkLabsHQ/introspector-enclave for the full reference.
 `

@@ -30,7 +30,7 @@ All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
-	cmd.Flags().String("language", "", "Set app language: go, nodejs, dotnet")
+	cmd.Flags().String("language", "", "Set app language: go, nodejs, dotnet, rust")
 	cmd.Flags().String("commit", "", "Use specific commit SHA instead of HEAD")
 	return cmd
 }
@@ -73,10 +73,10 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	language := cfg.App.Language
 	if languageFlag != "" {
 		switch languageFlag {
-		case "go", "nodejs", "dotnet":
+		case "go", "nodejs", "dotnet", "rust":
 			language = languageFlag
 		default:
-			return fmt.Errorf("unsupported language: %s (supported: go, nodejs, dotnet)", languageFlag)
+			return fmt.Errorf("unsupported language: %s (supported: go, nodejs, dotnet, rust)", languageFlag)
 		}
 	}
 
@@ -434,6 +434,11 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 		return `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
     pname = "app"; version = "0.0.1"; src = ./.;
     npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
+  }`
+	case "rust":
+		return `let pkgs = import <nixpkgs> {}; in pkgs.rustPlatform.buildRustPackage {
+    pname = "app"; version = "0.0.1"; src = ./.;
+    cargoHash = ""; doCheck = false;
   }`
 	default: // "go"
 		var nixPkgs []string

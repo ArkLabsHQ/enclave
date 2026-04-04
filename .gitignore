@@ -40,6 +40,13 @@ mgmt/mgmt
 # Go vendor directory
 vendor/
 
+# Rust build output
+client-rs/target/
+
+# TypeScript build output
+client-ts/node_modules/
+client-ts/dist/
+
 # Example folder (not used in production) /examples/
 example/
 

@@ -481,7 +481,7 @@ Edit ` + "`enclave/enclave.yaml`" + `:
 ### 3. Set up app hashes
 
 ` + "```sh" + `
-enclave setup --language nodejs
+enclave setup
 ` + "```" + `
 
 This auto-detects your GitHub remote and computes all Nix hashes (including npm deps hash).
@@ -539,7 +539,7 @@ enclave build
 ` + "```sh" + `
 npm install                # updates package-lock.json
 git add -A && git commit -m "update deps" && git push
-enclave setup --language nodejs   # full: recomputes all hashes including npm deps hash
+enclave setup   # full: recomputes all hashes including npm deps hash
 enclave build
 ` + "```" + `
 
@@ -677,7 +677,7 @@ Edit ` + "`enclave/enclave.yaml`" + `:
 ### 3. Set up app hashes
 
 ` + "```sh" + `
-enclave setup --language dotnet
+enclave setup
 ` + "```" + `
 
 This auto-detects your GitHub remote and computes all Nix hashes (including NuGet deps hash).
@@ -741,7 +741,7 @@ enclave build
 ` + "```sh" + `
 dotnet restore
 git add -A && git commit -m "update deps" && git push
-enclave setup --language dotnet   # full: recomputes all hashes including NuGet deps hash
+enclave setup   # full: recomputes all hashes including NuGet deps hash
 enclave build
 ` + "```" + `
 
@@ -840,7 +840,7 @@ attestation, encrypted secrets, and response signing.
 
 1. Edit enclave/enclave.yaml with your AWS account and app details
 2. Set up the SDK and compute hashes:
-   enclave setup --language rust
+   enclave setup
 3. Build the enclave image:
    enclave build
 4. Deploy:
@@ -851,7 +851,7 @@ attestation, encrypted secrets, and response signing.
 After changing Cargo.toml or Cargo.lock:
    cargo update
    git add -A && git commit -m "update deps" && git push
-   enclave setup --language rust
+   enclave setup
    enclave build
 
 See https://github.com/ArkLabsHQ/introspector-enclave for the full reference.

@@ -23,14 +23,12 @@ nix_hash, and nix_vendor_hash, and updates enclave/enclave.yaml.
 By default, runs hash computation inside a Docker container (same nixos
 image as 'enclave build'). Use --local to use the host nix installation.
 
-Use --language to set the app language and generate the correct flake.nix.
-Supported languages: go (default), nodejs, dotnet.
+The app language is read from enclave.yaml (set via 'enclave init --language').
 
 All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
-	cmd.Flags().String("language", "", "Set app language: go, nodejs, dotnet, rust")
 	cmd.Flags().String("commit", "", "Use specific commit SHA instead of HEAD")
 	return cmd
 }
@@ -42,7 +40,6 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 
 	local, _ := cmd.Flags().GetBool("local")
-	languageFlag, _ := cmd.Flags().GetString("language")
 
 	// 1. Detect owner/repo from git remote.
 	owner, repo, err := detectGitRemote(root)
@@ -69,31 +66,12 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// If --language flag is provided, update config and rewrite flake.nix.
+	// Read language from enclave.yaml (set via 'enclave init --language').
 	language := cfg.App.Language
-	if languageFlag != "" {
-		switch languageFlag {
-		case "go", "nodejs", "dotnet", "rust":
-			language = languageFlag
-		default:
-			return fmt.Errorf("unsupported language: %s (supported: go, nodejs, dotnet, rust)", languageFlag)
-		}
+	if language == "" {
+		language = "go"
 	}
-
-	// Update language in enclave.yaml if changed.
-	if language != cfg.App.Language || languageFlag != "" {
-		cfgPath := filepath.Join(root, configFile)
-		data, err := os.ReadFile(cfgPath)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", configFile, err)
-		}
-		content := string(data)
-		content = replaceYAMLValue(content, "language", language)
-		if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
-			return fmt.Errorf("write %s: %w", configFile, err)
-		}
-		fmt.Printf("[setup] Set language: %s\n", language)
-	}
+	fmt.Printf("[setup] Language: %s\n", language)
 
 	// Rewrite flake.nix to match the language.
 	for _, f := range getFrameworkFiles(language) {

@@ -30,7 +30,7 @@ sdk:
   vendor_hash: ""                # Go vendor hash (required)
 
 app:
-  language: "go"                 # App language: go, nodejs, dotnet
+  language: "go"                 # App language: go, nodejs, dotnet, rust
   source: nix                    # "nix" = fetch from GitHub via Nix
 
   # GitHub coordinates for the app to run inside the enclave.
@@ -63,13 +63,18 @@ secrets:
 `
 
 func initCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Validate enclave.yaml or create a template",
 		Long: `Reads and validates enclave.yaml in the current directory.
-If no enclave.yaml exists, writes a commented template as a starting point.`,
+If no enclave.yaml exists, writes a commented template as a starting point.
+
+Use --language to set the app language (go, nodejs, dotnet, rust).
+The language is stored in enclave.yaml and used by all other commands.`,
 		RunE: runInit,
 	}
+	cmd.Flags().String("language", "go", "App language: go, nodejs, dotnet, rust")
+	return cmd
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -80,14 +85,39 @@ func runInit(cmd *cobra.Command, args []string) error {
 	cfgPath := filepath.Join(cwd, configFile)
 
 	// If enclave/enclave.yaml doesn't exist, create the directory, write the
-	// config template, and scaffold all framework files needed by CDK and Nix.
+	// config template, and scaffold all framework files needed by Nix and tofu.
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		language, _ := cmd.Flags().GetString("language")
+		switch language {
+		case "go", "nodejs", "dotnet", "rust":
+			// valid
+		default:
+			return fmt.Errorf("unsupported language: %s (supported: go, nodejs, dotnet, rust)", language)
+		}
+
 		enclaveDir := filepath.Join(cwd, "enclave")
 		if err := os.MkdirAll(enclaveDir, 0755); err != nil {
 			return fmt.Errorf("create enclave/ directory: %w", err)
 		}
-		// Substitute SDK coordinates if baked in via ldflags (release builds).
+
+		// Select the config template based on language.
 		cfg := configTemplate
+		switch language {
+		case "nodejs":
+			cfg = strings.Replace(cfg,
+				`  language: "go"                 # App language: go, nodejs, dotnet, rust`,
+				`  language: "nodejs"             # App language: go, nodejs, dotnet, rust`, 1)
+		case "dotnet":
+			cfg = strings.Replace(cfg,
+				`  language: "go"                 # App language: go, nodejs, dotnet, rust`,
+				`  language: "dotnet"             # App language: go, nodejs, dotnet, rust`, 1)
+		case "rust":
+			cfg = strings.Replace(cfg,
+				`  language: "go"                 # App language: go, nodejs, dotnet, rust`,
+				`  language: "rust"               # App language: go, nodejs, dotnet, rust`, 1)
+		}
+
+		// Substitute SDK coordinates if baked in via ldflags (release builds).
 		if sdkRev != "" {
 			cfg = strings.Replace(cfg,
 				`  rev: ""                        # SDK git commit SHA (required)`,
@@ -102,10 +132,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", configFile, err)
 		}
-		fmt.Printf("Created %s\n", configFile)
+		fmt.Printf("Created %s (language: %s)\n", configFile, language)
 
-		// Write framework files (gvproxy, systemd units, scripts, user_data, start.sh).
-		for _, f := range getFrameworkFiles("go") {
+		// Write framework files (flake.nix, gvproxy, systemd units, scripts, user_data, start.sh).
+		for _, f := range getFrameworkFiles(language) {
 			destPath := filepath.Join(cwd, f.RelPath)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 				return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
@@ -120,8 +150,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("Edit enclave/enclave.yaml with your app and SDK details.")
 		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No SDK imports needed — the supervisor handles attestation automatically.")
-		fmt.Println("Set 'app.language' to your language (go, nodejs, dotnet) and run 'enclave setup --language <lang>'.")
-		fmt.Println("Then run 'enclave init' again to validate.")
+		fmt.Println("Then run 'enclave setup' to compute hashes and 'enclave build' to build.")
 		return nil
 	}
 

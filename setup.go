@@ -241,7 +241,7 @@ git config --global --add safe.directory /src
 
 # Compute source hash using nix-prefetch-url to match fetchFromGitHub
 SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>/dev/null | tail -1)
-SOURCE_HASH=$(nix hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
+SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
 # Compute deps hash via trial build
@@ -540,7 +540,7 @@ git config --global --add safe.directory /src
 
 # Compute source hash using nix-prefetch-url to match fetchFromGitHub
 SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>/dev/null | tail -1)
-SOURCE_HASH=$(nix hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
+SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
 # Seed empty deps.json so nugetDeps is a path (enables fetch-deps passthru)

@@ -177,7 +177,7 @@ func computeNixHashDocker(root, rev, nixImage string) (string, error) {
 
 	script := fmt.Sprintf(`set -e
 git config --global --add safe.directory /src
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>/dev/null | tail -1)
+SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
 SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
 echo "$SOURCE_HASH" > /src/%s
 `, tarballURL, resultFile)

@@ -240,7 +240,7 @@ func computeHashesDocker(root, rev string, subPackages []string, nixImage string
 git config --global --add safe.directory /src
 
 # Compute source hash using nix-prefetch-url to match fetchFromGitHub
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>/dev/null | tail -1)
+SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
 SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
@@ -539,7 +539,7 @@ func computeHashesDotnetDocker(root, rev, nixImage string) (nixHash string, err 
 git config --global --add safe.directory /src
 
 # Compute source hash using nix-prefetch-url to match fetchFromGitHub
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>/dev/null | tail -1)
+SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
 SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 

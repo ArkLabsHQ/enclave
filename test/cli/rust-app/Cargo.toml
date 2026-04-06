@@ -3,6 +3,6 @@ name = "cli-test-rust-app"
 version = "0.0.1"
 edition = "2021"
 
-# commit2: uncomment to add serde dependency
-# [dependencies]
-# serde = "1"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

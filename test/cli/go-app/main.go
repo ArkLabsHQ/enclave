@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"os"
 
-	// commit2: uncomment the next line and add to go.mod
-	// "golang.org/x/text/language"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 func main() {
@@ -15,8 +15,10 @@ func main() {
 		port = "7074"
 	}
 
+	title := cases.Title(language.English).String("hello enclave")
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"status":"ok"}`)
+		fmt.Fprintf(w, `{"status":"ok","message":"%s"}`, title)
 	})
 
 	fmt.Printf("listening on :%s\n", port)

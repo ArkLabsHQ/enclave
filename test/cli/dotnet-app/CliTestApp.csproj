@@ -7,11 +7,9 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
   </PropertyGroup>
-
-  <!-- commit2: uncomment to add Newtonsoft.Json dependency -->
-  <!--
+  
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
-  -->
+ 
 </Project>

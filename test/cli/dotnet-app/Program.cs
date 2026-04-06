@@ -1,9 +1,7 @@
 using System;
 using System.Net;
 using System.Text;
-
-// commit2: uncomment and add Newtonsoft.Json to .csproj
-// using Newtonsoft.Json;
+using Newtonsoft.Json;
 
 class Program
 {
@@ -18,7 +16,9 @@ class Program
         while (true)
         {
             var ctx = listener.GetContext();
-            var body = Encoding.UTF8.GetBytes("{\"status\":\"ok\"}");
+            var response = new { status = "ok" };
+            var json = JsonConvert.SerializeObject(response);
+            var body = Encoding.UTF8.GetBytes(json);
             ctx.Response.ContentType = "application/json";
             ctx.Response.OutputStream.Write(body, 0, body.Length);
             ctx.Response.Close();

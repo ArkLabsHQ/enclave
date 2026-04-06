@@ -225,7 +225,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 func computeHashesDocker(root, rev string, subPackages []string, nixImage string, language string) (nixHash, vendorHash string, err error) {
 	resultFile := ".enclave-setup-result"
 
-	trialBuildExpr := buildTrialExpr(language, subPackages, true)
+	trialBuildExpr := buildTrialExpr(language, subPackages, false)
 
 	// Shell script that runs inside the container.
 	// Writes results to a file in the mounted volume so the host can read them.

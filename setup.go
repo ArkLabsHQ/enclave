@@ -243,7 +243,7 @@ echo "nix_hash=$SOURCE_HASH" > /src/%s
 VENDOR_OUTPUT=$(nix build --impure --no-link \
   --extra-experimental-features 'nix-command flakes' \
   --expr '%s' 2>&1 || true)
-VENDOR_HASH=$(echo "$VENDOR_OUTPUT" | grep 'got:' | awk '{print $2}')
+VENDOR_HASH=$(echo "$VENDOR_OUTPUT" | grep 'got:' | sed 's/.*got: *//')
 if [ -n "$VENDOR_HASH" ]; then
   echo "vendor_hash=$VENDOR_HASH" >> /src/%s
 else

@@ -227,21 +227,16 @@ func computeHashesDocker(root, rev string, subPackages []string, nixImage string
 
 	trialBuildExpr := buildTrialExpr(language, subPackages, true)
 
-	// Load config to get GitHub owner/repo for the tarball URL.
-	cfg, cfgErr := loadConfig()
-	if cfgErr != nil {
-		return "", "", fmt.Errorf("load config: %w", cfgErr)
-	}
-	tarballURL := fmt.Sprintf("https://github.com/%s/%s/archive/%s.tar.gz", cfg.App.NixOwner, cfg.App.NixRepo, rev)
-
 	// Shell script that runs inside the container.
 	// Writes results to a file in the mounted volume so the host can read them.
 	script := fmt.Sprintf(`set -e
 git config --global --add safe.directory /src
 
-# Compute source hash using nix-prefetch-url to match fetchFromGitHub
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
+# Compute source hash from local git archive.
+TMPDIR=$(mktemp -d)
+git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
+SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
+rm -rf "$TMPDIR"
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
 # Compute deps hash via trial build
@@ -254,7 +249,7 @@ if [ -n "$VENDOR_HASH" ]; then
 else
   echo "vendor_err=Could not extract deps hash" >> /src/%s
 fi
-`, tarballURL, resultFile, trialBuildExpr, resultFile, resultFile)
+`, rev, resultFile, trialBuildExpr, resultFile, resultFile)
 
 	// Run inside Docker using the existing runContainer function.
 	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
@@ -367,40 +362,42 @@ func resolveCommit(cmd *cobra.Command, root string) (string, error) {
 }
 
 // computeNixHash computes the SRI hash that matches Nix's fetchFromGitHub
-// by using nix-prefetch-url --unpack on the same GitHub tarball URL that
-// fetchFromGitHub downloads. This ensures the hash matches exactly.
+// by creating a git archive locally and hashing it with nix hash path.
 func computeNixHash(root string, rev string) (string, error) {
-	// Load config to get GitHub owner/repo for the tarball URL.
-	cfg, err := loadConfig()
+	tmpDir, err := os.MkdirTemp("", "enclave-setup-*")
 	if err != nil {
-		return "", fmt.Errorf("load config for hash computation: %w", err)
+		return "", fmt.Errorf("create temp dir: %w", err)
 	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	owner := cfg.App.NixOwner
-	repo := cfg.App.NixRepo
-	if owner == "" || repo == "" {
-		return "", fmt.Errorf("nix_owner and nix_repo must be set in enclave.yaml")
-	}
+	// git archive --format=tar.gz --prefix=source/ <rev> | tar xz -C tmpDir
+	archiveCmd := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
+	archiveCmd.Dir = root
 
-	url := fmt.Sprintf("https://github.com/%s/%s/archive/%s.tar.gz", owner, repo, rev)
-
-	// nix-prefetch-url --unpack --type sha256 <url> produces the old base32 hash.
-	prefetchCmd := exec.Command("nix-prefetch-url", "--unpack", "--type", "sha256", url)
-	prefetchCmd.Dir = root
-	out, err := prefetchCmd.Output()
+	tarCmd := exec.Command("tar", "xz", "-C", tmpDir)
+	tarCmd.Stdin, err = archiveCmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("nix-prefetch-url: %w", err)
+		return "", fmt.Errorf("pipe setup: %w", err)
 	}
-	base32Hash := strings.TrimSpace(string(out))
 
-	// Convert to SRI format (sha256-...) to match what fetchFromGitHub expects.
-	convertCmd := exec.Command("nix", "hash", "convert", "--hash-algo", "sha256", "--to", "sri", base32Hash)
-	sriOut, err := convertCmd.Output()
+	if err := tarCmd.Start(); err != nil {
+		return "", fmt.Errorf("start tar: %w", err)
+	}
+	if err := archiveCmd.Run(); err != nil {
+		return "", fmt.Errorf("git archive: %w", err)
+	}
+	if err := tarCmd.Wait(); err != nil {
+		return "", fmt.Errorf("tar extract: %w", err)
+	}
+
+	// nix hash path tmpDir/source
+	hashCmd := exec.Command("nix", "hash", "path", filepath.Join(tmpDir, "source"))
+	out, err := hashCmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("nix hash convert: %w", err)
+		return "", fmt.Errorf("nix hash path: %w", err)
 	}
 
-	return strings.TrimSpace(string(sriOut)), nil
+	return strings.TrimSpace(string(out)), nil
 }
 
 // buildTrialExpr returns a Nix expression for a trial build with an empty deps
@@ -528,19 +525,14 @@ func generateDotnetDeps(root string) error {
 func computeHashesDotnetDocker(root, rev, nixImage string) (nixHash string, err error) {
 	resultFile := ".enclave-setup-result"
 
-	// Load config to get GitHub owner/repo for the tarball URL.
-	cfg, cfgErr := loadConfig()
-	if cfgErr != nil {
-		return "", fmt.Errorf("load config: %w", cfgErr)
-	}
-	tarballURL := fmt.Sprintf("https://github.com/%s/%s/archive/%s.tar.gz", cfg.App.NixOwner, cfg.App.NixRepo, rev)
-
 	script := fmt.Sprintf(`set -e
 git config --global --add safe.directory /src
 
-# Compute source hash using nix-prefetch-url to match fetchFromGitHub
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
+# Compute source hash from local git archive.
+TMPDIR=$(mktemp -d)
+git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
+SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
+rm -rf "$TMPDIR"
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
 # Seed empty deps.json so nugetDeps is a path (enables fetch-deps passthru)
@@ -567,7 +559,7 @@ if [ -x ./result ]; then
 else
   echo "deps_err=fetch-deps script not built" >> /src/%s
 fi
-`, tarballURL, resultFile, resultFile, resultFile, resultFile)
+`, rev, resultFile, resultFile, resultFile, resultFile)
 
 	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
 		return "", fmt.Errorf("docker setup failed: %w", err)

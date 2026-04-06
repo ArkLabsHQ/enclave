@@ -168,19 +168,14 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 func computeNixHashDocker(root, rev, nixImage string) (string, error) {
 	resultFile := ".enclave-update-result"
 
-	// Load config to get GitHub owner/repo for the tarball URL.
-	cfg, cfgErr := loadConfig()
-	if cfgErr != nil {
-		return "", fmt.Errorf("load config: %w", cfgErr)
-	}
-	tarballURL := fmt.Sprintf("https://github.com/%s/%s/archive/%s.tar.gz", cfg.App.NixOwner, cfg.App.NixRepo, rev)
-
 	script := fmt.Sprintf(`set -e
 git config --global --add safe.directory /src
-SOURCE_HASH_BASE32=$(nix-prefetch-url --unpack --type sha256 "%s" 2>&1 | tail -1)
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$SOURCE_HASH_BASE32")
+TMPDIR=$(mktemp -d)
+git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
+SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
+rm -rf "$TMPDIR"
 echo "$SOURCE_HASH" > /src/%s
-`, tarballURL, resultFile)
+`, rev, resultFile)
 
 	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
 		return "", fmt.Errorf("docker hash computation failed: %w", err)

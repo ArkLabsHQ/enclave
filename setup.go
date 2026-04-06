@@ -246,7 +246,7 @@ nix build --impure --no-link \
   --log-format raw \
   --expr '%s' > /tmp/vendor.log 2>&1 || true
 # grep is available in the Nix image; extract "got: sha256-..." line.
-VENDOR_LINE=$(grep -o 'sha256-[^[:space:]]*' /tmp/vendor.log || true)
+VENDOR_LINE=$(grep 'got:' /tmp/vendor.log | grep -o 'sha256-[^[:space:]]*' || true)
 VENDOR_HASH="$VENDOR_LINE"
 if [ -n "$VENDOR_HASH" ]; then
   echo "vendor_hash=$VENDOR_HASH" >> /src/%s

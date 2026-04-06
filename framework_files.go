@@ -594,7 +594,7 @@ const frameworkFlakeNix = `{
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           ldflags = [
             "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=` + "${version}" + `"
           ];
@@ -619,7 +619,7 @@ const frameworkFlakeNix = `{
           proxyVendor = true;
 
           subPackages = appCfg.nix_sub_packages;
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
           doCheck = false;
@@ -650,7 +650,7 @@ const frameworkFlakeNix = `{
 
           vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
 
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           doCheck = false;
 
@@ -674,7 +674,7 @@ const frameworkFlakeNix = `{
           vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
 
           subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
 
           postInstall = ''
             mv $out/bin/example $out/bin/proxy
@@ -796,7 +796,7 @@ const frameworkFlakeNixNodejs = `{
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           ldflags = [
             "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=` + "${version}" + `"
           ];
@@ -841,7 +841,7 @@ const frameworkFlakeNixNodejs = `{
 
           vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
 
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           doCheck = false;
 
@@ -865,7 +865,7 @@ const frameworkFlakeNixNodejs = `{
           vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
 
           subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
 
           postInstall = ''
             mv $out/bin/example $out/bin/proxy
@@ -1312,7 +1312,7 @@ const frameworkFlakeNixDotnet = `{
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           ldflags = [
             "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=` + "${version}" + `"
           ];
@@ -1368,7 +1368,7 @@ const frameworkFlakeNixDotnet = `{
 
           vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
 
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           doCheck = false;
 
@@ -1392,7 +1392,7 @@ const frameworkFlakeNixDotnet = `{
           vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
 
           subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
 
           postInstall = ''
             mv $out/bin/example $out/bin/proxy
@@ -1520,7 +1520,7 @@ const frameworkFlakeNixRust = `{
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           ldflags = [
             "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=` + "${version}" + `"
           ];
@@ -1572,7 +1572,7 @@ const frameworkFlakeNixRust = `{
 
           vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
 
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           doCheck = false;
 
@@ -1595,7 +1595,7 @@ const frameworkFlakeNixRust = `{
           vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
 
           subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
+          CGO_ENABLED = "0";
 
           postInstall = ''
             mv $out/bin/example $out/bin/proxy

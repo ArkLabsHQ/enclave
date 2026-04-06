@@ -433,7 +433,7 @@ func buildTrialExpr(language string, subPackages []string, escaped bool) string 
 		return fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
     pname = "app"; version = "0.0.1"; src = ./.;
     subPackages = %s; vendorHash = ""; proxyVendor = true;
-    env.CGO_ENABLED = "0"; doCheck = false;
+    CGO_ENABLED = "0"; doCheck = false;
   }`, nixSubPkgs)
 	}
 }

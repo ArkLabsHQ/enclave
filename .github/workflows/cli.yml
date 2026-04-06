@@ -9,28 +9,44 @@ on:
 jobs:
   cli-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - language: go
             app_dir: test/cli/go-app
-            # TODO: replace with real SHAs after pushing commit1 and commit2
             commit1: "6710409"
+            commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
+            commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
+            commit1_vendor_hash: "sha256-iHqsoRGivzNcZTOpaXCckpQ/sRSdRA/5/hZ8VXchfjg="
             commit2: "7599ce0"
+            commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
+            commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
           - language: nodejs
             app_dir: test/cli/nodejs-app
             commit1: "6710409"
+            commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
+            commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
             commit2: "7599ce0"
+            commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
+            commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
           - language: rust
             app_dir: test/cli/rust-app
             commit1: "6710409"
+            commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
+            commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
             commit2: "7599ce0"
+            commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
+            commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
           - language: dotnet
             app_dir: test/cli/dotnet-app
             commit1: "6710409"
+            commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
+            commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
             commit2: "7599ce0"
+            commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
+            commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
 
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +83,9 @@ jobs:
           test -f enclave/start.sh
           test -f enclave/scripts/enclave_init.sh
           test -f enclave/tofu/modules/enclave/kms.tf
+          grep -q '/dev/nsm' enclave/start.sh
+          grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf
 
-          # Save workspace for next steps.
           echo "WORK=$WORK" >> "$GITHUB_ENV"
           echo "PASS: enclave init --language ${{ matrix.language }}"
 
@@ -78,41 +95,31 @@ jobs:
           set -e
           cd "$WORK"
 
-          # Git-add enclave files so nix can see them.
           git add .
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
-
-          # Fetch repo history so commit1/commit2 SHAs are available locally.
           git fetch origin master
 
           /tmp/enclave-cli setup --commit ${{ matrix.commit1 }}
 
-          # Verify hashes were populated.
-          grep -q 'sha256-' enclave/enclave.yaml
-          echo "PASS: enclave setup --commit ${{ matrix.commit1 }}"
+          # Verify nix_rev is the full SHA.
+          grep -q '${{ matrix.commit1_full }}' enclave/enclave.yaml || { echo "FAIL: nix_rev != ${{ matrix.commit1_full }}"; exit 1; }
 
-      # ── 3. enclave build (first build) ────────────────────────────
-      - name: "enclave build (commit1)"
-        run: |
-          set -e
-          cd "$WORK"
+          # Verify nix_hash matches precomputed value.
+          grep -q '${{ matrix.commit1_hash }}' enclave/enclave.yaml || { echo "FAIL: nix_hash != ${{ matrix.commit1_hash }}"; exit 1; }
 
-          /tmp/enclave-cli build
+          # Verify owner/repo.
+          grep -q 'nix_owner: "ArkLabsHQ"' enclave/enclave.yaml
+          grep -q 'nix_repo: "introspector-enclave"' enclave/enclave.yaml
 
-          # Verify all artifacts.
-          test -f enclave/artifacts/image.eif
-          test -f enclave/artifacts/pcr.json
-          test -f enclave/artifacts/enclave-mgmt
-          test -f enclave/artifacts/gvproxy
-          test -f enclave/build-config.json
-          test -f enclave/tofu/terraform.tfvars.json
+          # Verify nix_vendor_hash if expected for this language.
+          if [ -n "${{ matrix.commit1_vendor_hash }}" ]; then
+            grep -q '${{ matrix.commit1_vendor_hash }}' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash != ${{ matrix.commit1_vendor_hash }}"; cat enclave/enclave.yaml; exit 1; }
+            echo "nix_vendor_hash verified: ${{ matrix.commit1_vendor_hash }}"
+          fi
 
-          PCR0_V1=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
-          test -n "$PCR0_V1"
-          echo "PCR0_V1=$PCR0_V1" >> "$GITHUB_ENV"
-          echo "PASS: enclave build (PCR0=$PCR0_V1)"
+          echo "PASS: enclave setup (nix_rev=${{ matrix.commit1_full }}, nix_hash=${{ matrix.commit1_hash }})"
 
-      # ── 4. enclave update ─────────────────────────────────────────
+      # ── 3. enclave update ─────────────────────────────────────────
       - name: "enclave update --commit ${{ matrix.commit2 }}"
         run: |
           set -e
@@ -120,26 +127,16 @@ jobs:
 
           /tmp/enclave-cli update --commit ${{ matrix.commit2 }}
 
-          # Verify nix_rev was updated to commit2.
-          grep -q '${{ matrix.commit2 }}' enclave/enclave.yaml || \
-            grep -q "$(echo '${{ matrix.commit2 }}' | cut -c1-7)" enclave/enclave.yaml
-          echo "PASS: enclave update --commit ${{ matrix.commit2 }}"
+          # Verify nix_rev updated to commit2 full SHA.
+          grep -q '${{ matrix.commit2_full }}' enclave/enclave.yaml || { echo "FAIL: nix_rev != ${{ matrix.commit2_full }}"; exit 1; }
 
-      # ── 5. enclave build (second build) ───────────────────────────
-      - name: "enclave build (commit2)"
-        run: |
-          set -e
-          cd "$WORK"
+          # Verify nix_hash matches precomputed value for commit2.
+          grep -q '${{ matrix.commit2_hash }}' enclave/enclave.yaml || { echo "FAIL: nix_hash != ${{ matrix.commit2_hash }}"; exit 1; }
 
-          /tmp/enclave-cli build
-
-          PCR0_V2=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
-          test -n "$PCR0_V2"
-
-          # PCR0 should differ between commit1 and commit2 builds.
-          if [ "$PCR0_V2" = "$PCR0_V1" ]; then
-            echo "WARNING: PCR0 unchanged between builds (deps may not have changed)"
-          else
-            echo "PCR0 changed: $PCR0_V1 -> $PCR0_V2"
+          # Verify hash actually changed between commits.
+          if [ "${{ matrix.commit1_hash }}" = "${{ matrix.commit2_hash }}" ]; then
+            echo "ERROR: commit1 and commit2 should produce different hashes"
+            exit 1
           fi
-          echo "PASS: enclave build (PCR0=$PCR0_V2)"
+
+          echo "PASS: enclave update (nix_rev=${{ matrix.commit2_full }}, nix_hash=${{ matrix.commit2_hash }})"

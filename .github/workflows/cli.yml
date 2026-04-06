@@ -87,6 +87,10 @@ jobs:
           git add .
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
 
+          # Fetch both commits from the remote (they exist in the real repo
+          # but not in this temp dir's local history).
+          git fetch origin ${{ matrix.commit1 }} ${{ matrix.commit2 }}
+
           /tmp/enclave-cli setup --commit ${{ matrix.commit1 }}
 
           # Verify hashes were populated.

@@ -1,0 +1,149 @@
+name: CLI Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  cli-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            app_dir: test/cli/go-app
+            # TODO: replace with real SHAs after pushing commit1 and commit2
+            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
+            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+          - language: nodejs
+            app_dir: test/cli/nodejs-app
+            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
+            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+          - language: rust
+            app_dir: test/cli/rust-app
+            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
+            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+          - language: dotnet
+            app_dir: test/cli/dotnet-app
+            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
+            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-25.11
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build enclave CLI
+        run: go build -o /tmp/enclave-cli ./cmd/enclave
+
+      # ── 1. enclave init ───────────────────────────────────────────
+      - name: "enclave init --language ${{ matrix.language }}"
+        run: |
+          set -e
+          WORK=$(mktemp -d)
+          cp -r ${{ matrix.app_dir }}/. "$WORK/"
+          cd "$WORK"
+
+          # Init a git repo (setup needs git remote).
+          git init
+          git remote add origin https://github.com/ArkLabsHQ/introspector-enclave.git
+          git add .
+          git -c user.email=ci@test -c user.name=CI commit -m "init"
+
+          /tmp/enclave-cli init --language ${{ matrix.language }}
+
+          # Verify key files.
+          test -f enclave/enclave.yaml
+          test -f flake.nix
+          test -f enclave/start.sh
+          test -f enclave/scripts/enclave_init.sh
+          test -f enclave/tofu/modules/enclave/kms.tf
+          grep -q '/dev/nsm' enclave/start.sh
+          grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf
+
+          # Save workspace for next steps.
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          echo "PASS: enclave init --language ${{ matrix.language }}"
+
+      # ── 2. enclave setup ──────────────────────────────────────────
+      - name: "enclave setup --commit ${{ matrix.commit1 }}"
+        run: |
+          set -e
+          cd "$WORK"
+
+          # Git-add enclave files so nix can see them.
+          git add .
+          git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
+
+          /tmp/enclave-cli setup --commit ${{ matrix.commit1 }}
+
+          # Verify hashes were populated.
+          grep -q 'sha256-' enclave/enclave.yaml
+          echo "PASS: enclave setup --commit ${{ matrix.commit1 }}"
+
+      # ── 3. enclave build (first build) ────────────────────────────
+      - name: "enclave build (commit1)"
+        run: |
+          set -e
+          cd "$WORK"
+
+          /tmp/enclave-cli build
+
+          # Verify all artifacts.
+          test -f enclave/artifacts/image.eif
+          test -f enclave/artifacts/pcr.json
+          test -f enclave/artifacts/enclave-mgmt
+          test -f enclave/artifacts/gvproxy
+          test -f enclave/build-config.json
+          test -f enclave/tofu/terraform.tfvars.json
+
+          PCR0_V1=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
+          test -n "$PCR0_V1"
+          echo "PCR0_V1=$PCR0_V1" >> "$GITHUB_ENV"
+          echo "PASS: enclave build (PCR0=$PCR0_V1)"
+
+      # ── 4. enclave update ─────────────────────────────────────────
+      - name: "enclave update --commit ${{ matrix.commit2 }}"
+        run: |
+          set -e
+          cd "$WORK"
+
+          /tmp/enclave-cli update --commit ${{ matrix.commit2 }}
+
+          # Verify nix_rev was updated to commit2.
+          grep -q '${{ matrix.commit2 }}' enclave/enclave.yaml || \
+            grep -q "$(echo '${{ matrix.commit2 }}' | cut -c1-7)" enclave/enclave.yaml
+          echo "PASS: enclave update --commit ${{ matrix.commit2 }}"
+
+      # ── 5. enclave build (second build) ───────────────────────────
+      - name: "enclave build (commit2)"
+        run: |
+          set -e
+          cd "$WORK"
+
+          /tmp/enclave-cli build
+
+          PCR0_V2=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
+          test -n "$PCR0_V2"
+
+          # PCR0 should differ between commit1 and commit2 builds.
+          if [ "$PCR0_V2" = "$PCR0_V1" ]; then
+            echo "WARNING: PCR0 unchanged between builds (deps may not have changed)"
+          else
+            echo "PCR0 changed: $PCR0_V1 -> $PCR0_V2"
+          fi
+          echo "PASS: enclave build (PCR0=$PCR0_V2)"

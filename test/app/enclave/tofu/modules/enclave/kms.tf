@@ -16,6 +16,7 @@ resource "null_resource" "kms_key" {
   triggers = {
     deployment = var.deployment
     app_name   = var.app_name
+    region     = var.region
   }
 
   provisioner "local-exec" {
@@ -77,6 +78,37 @@ resource "null_resource" "kms_key" {
         --region ${var.region} --no-cli-pager
 
       echo "KMS key $KEY_ID stored in SSM"
+    EOT
+  }
+
+  # On destroy: schedule the KMS key for deletion and remove the SSM pointer
+  # so that a subsequent apply creates a fresh key.
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      set -e
+      REGION="${lookup(self.triggers, "region", "us-east-1")}"
+      DEPLOYMENT="${self.triggers.deployment}"
+      APP_NAME="${self.triggers.app_name}"
+
+      KEY_ID=$(aws ssm get-parameter \
+        --name "/$DEPLOYMENT/$APP_NAME/KMSKeyID" \
+        --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || echo "UNSET")
+
+      if [ "$KEY_ID" != "UNSET" ] && [ -n "$KEY_ID" ]; then
+        echo "Scheduling KMS key $KEY_ID for deletion (7-day window)..."
+        aws kms schedule-key-deletion \
+          --key-id "$KEY_ID" \
+          --pending-window-in-days 7 \
+          --region "$REGION" 2>/dev/null || echo "Key already pending deletion or not found"
+
+        echo "Removing KMSKeyID SSM parameter..."
+        aws ssm delete-parameter \
+          --name "/$DEPLOYMENT/$APP_NAME/KMSKeyID" \
+          --region "$REGION" 2>/dev/null || echo "SSM parameter already removed"
+      else
+        echo "No KMS key found in SSM — nothing to clean up"
+      fi
     EOT
   }
 }

@@ -2,6 +2,16 @@
 
 set -e
 
+# Seed kernel entropy pool from Nitro Security Module (NSM).
+# The enclave starts with an empty entropy pool and /dev/random blocks until
+# entropy is available. The SDK bypasses this via direct NSM calls, but user
+# apps that read from /dev/random or /dev/urandom (e.g. OpenSSL, libsodium)
+# will hang without seeding.
+if [ -e /dev/nsm ]; then
+  dd if=/dev/nsm of=/dev/urandom bs=256 count=1 2>/dev/null || true
+  dd if=/dev/nsm of=/dev/random  bs=256 count=1 2>/dev/null || true
+fi
+
 # Start viproxy for IMDS access before nitriding sets up full networking
 if [ "${ENCLAVE_VIPROXY_ENABLED:-true}" = "true" ]; then
   VIPROXY_IN_ADDRS="${ENCLAVE_VIPROXY_IN_ADDRS:-127.0.0.1:80}"

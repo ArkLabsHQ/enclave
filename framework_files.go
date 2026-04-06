@@ -215,6 +215,16 @@ const frameworkStartSh = `#!/bin/sh
 
 set -e
 
+# Seed kernel entropy pool from Nitro Security Module (NSM).
+# The enclave starts with an empty entropy pool and /dev/random blocks until
+# entropy is available. The SDK bypasses this via direct NSM calls, but user
+# apps that read from /dev/random or /dev/urandom (e.g. OpenSSL, libsodium)
+# will hang without seeding.
+if [ -e /dev/nsm ]; then
+  dd if=/dev/nsm of=/dev/urandom bs=256 count=1 2>/dev/null || true
+  dd if=/dev/nsm of=/dev/random  bs=256 count=1 2>/dev/null || true
+fi
+
 # Start viproxy for IMDS access before nitriding sets up full networking
 if [ "${ENCLAVE_VIPROXY_ENABLED:-true}" = "true" ]; then
   VIPROXY_IN_ADDRS="${ENCLAVE_VIPROXY_IN_ADDRS:-127.0.0.1:80}"
@@ -594,7 +604,7 @@ const frameworkFlakeNix = `{
         };
 
         # User's app — fetched from GitHub. No SDK dependency needed.
-        upstream-app = pkgs.buildGoModule {
+        upstream-app = pkgs.buildGoModule ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
 
@@ -622,7 +632,9 @@ const frameworkFlakeNix = `{
               fi
             done
           '';
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
         # Nitriding TLS termination daemon.
         nitriding = pkgs.buildGoModule {
@@ -797,7 +809,7 @@ const frameworkFlakeNixNodejs = `{
         nodejs = pkgs.nodejs_22;
 
         # User's Node.js app — fetched from GitHub. No SDK dependency needed.
-        upstream-app = pkgs.buildNpmPackage {
+        upstream-app = pkgs.buildNpmPackage ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
 
@@ -811,7 +823,9 @@ const frameworkFlakeNixNodejs = `{
           npmDepsHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
           dontNpmBuild = true;
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
         # Nitriding TLS termination daemon.
         nitriding = pkgs.buildGoModule {
@@ -1308,7 +1322,7 @@ const frameworkFlakeNixDotnet = `{
         };
 
         # User's .NET app — fetched from GitHub. No SDK dependency needed.
-        upstream-app = pkgs.buildDotnetModule {
+        upstream-app = pkgs.buildDotnetModule ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
 
@@ -1336,7 +1350,9 @@ const frameworkFlakeNixDotnet = `{
           dotnetPublishFlags = [ "/p:PublishAot=true" "/p:StripSymbols=true" ];
 
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
         # Nitriding TLS termination daemon.
         nitriding = pkgs.buildGoModule {
@@ -1514,7 +1530,7 @@ const frameworkFlakeNixRust = `{
         };
 
         # User's Rust app — fetched from GitHub. No SDK dependency needed.
-        upstream-app = pkgs.rustPlatform.buildRustPackage {
+        upstream-app = pkgs.rustPlatform.buildRustPackage ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
 
@@ -1537,7 +1553,11 @@ const frameworkFlakeNixRust = `{
               fi
             done
           '';
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source";
+          cargoRoot = appCfg.nix_subdir;
+          buildAndTestSubdir = appCfg.nix_subdir;
+        } else {}));
 
         nitriding = pkgs.buildGoModule {
           pname = "nitriding-daemon";

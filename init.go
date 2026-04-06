@@ -43,6 +43,7 @@ app:
   nix_vendor_hash: ""            # Go vendor hash (required)
   nix_sub_packages:              # Go sub-packages to build
     - "."
+  nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
   # Environment variables baked into the EIF.

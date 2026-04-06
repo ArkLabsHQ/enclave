@@ -215,6 +215,7 @@ app:
   nix_vendor_hash: ""            # Go vendor hash (required)
   nix_sub_packages:              # Go sub-packages to build
     - "cmd"
+  nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
   # Environment variables baked into the EIF.
@@ -297,6 +298,7 @@ app:
   nix_rev: ""                    # Git commit SHA (required)
   nix_hash: ""                   # Nix source hash: nix-prefetch-url --unpack (required)
   nix_vendor_hash: ""            # npm deps hash (required)
+  nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Package name from package.json (defaults to 'name')
 
   # Environment variables baked into the EIF.
@@ -581,6 +583,7 @@ app:
   nix_hash: ""                   # Nix source hash: nix-prefetch-url --unpack (required)
   nix_project_file: "MyEnclaveApp.csproj"  # .csproj file to build (required)
   # NuGet deps: run 'enclave setup' to generate deps.json (used by flake.nix)
+  nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
   # Environment variables baked into the EIF.
@@ -777,6 +780,7 @@ app:
   nix_rev: ""                    # Git commit SHA (required)
   nix_hash: ""                   # Nix source hash (required)
   nix_vendor_hash: ""            # Cargo.lock hash (required)
+  nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
   env:

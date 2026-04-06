@@ -24,7 +24,6 @@ func Execute() {
 		setupCmd(),
 		updateCmd(),
 		buildCmd(),
-		tfvarsCmd(),
 		startCmd(),
 		stopCmd(),
 		verifyCmd(),

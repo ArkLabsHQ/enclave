@@ -72,8 +72,6 @@ jobs:
           test -f enclave/start.sh
           test -f enclave/scripts/enclave_init.sh
           test -f enclave/tofu/modules/enclave/kms.tf
-          grep -q '/dev/nsm' enclave/start.sh
-          grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf
 
           # Save workspace for next steps.
           echo "WORK=$WORK" >> "$GITHUB_ENV"

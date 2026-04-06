@@ -126,3 +126,51 @@ func TestGetFrameworkFilesNodejsUnchanged(t *testing.T) {
 	}
 	t.Error("expected flake.nix in Node.js framework files")
 }
+
+func TestGetFrameworkFilesRust(t *testing.T) {
+	files := getFrameworkFiles("rust")
+	var foundFlake bool
+	for _, f := range files {
+		if f.RelPath == "flake.nix" {
+			foundFlake = true
+			if !strings.Contains(f.Content, "buildRustPackage") {
+				t.Error("Rust flake.nix should use buildRustPackage")
+			}
+			if strings.Contains(f.Content, "buildDotnetModule") {
+				t.Error("Rust flake.nix should NOT contain buildDotnetModule")
+			}
+		}
+	}
+	if !foundFlake {
+		t.Error("expected flake.nix in Rust framework files")
+	}
+}
+
+func TestRunGenerateTemplateGolang(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := runGenerateTemplate(tmpDir, "go"); err != nil {
+		t.Fatalf("runGenerateTemplate(go): %v", err)
+	}
+
+	expectedFiles := []string{
+		"flake.nix",
+		"enclave/enclave.yaml",
+		"enclave/start.sh",
+	}
+
+	for _, name := range expectedFiles {
+		path := filepath.Join(tmpDir, name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("expected file %s to exist", name)
+		}
+	}
+
+	cfgData, err := os.ReadFile(filepath.Join(tmpDir, "enclave", "enclave.yaml"))
+	if err != nil {
+		t.Fatalf("read enclave.yaml: %v", err)
+	}
+	if !strings.Contains(string(cfgData), `language: "go"`) {
+		t.Error("enclave.yaml should have language: go")
+	}
+}

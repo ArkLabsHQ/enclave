@@ -33,7 +33,8 @@ Requires 'nix' in PATH, or falls back to Docker for hash computation.`,
 		RunE: runUpdate,
 	}
 	cmd.Flags().Bool("skip-deps", false, "Skip vendor/deps hash recomputation (code-only changes)")
-	cmd.Flags().String("commit", "", "Use specific commit SHA instead of HEAD")
+	cmd.Flags().String("commit", "", "Git commit SHA to compute hashes for (required)")
+	_ = cmd.MarkFlagRequired("commit")
 	return cmd
 }
 

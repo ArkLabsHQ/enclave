@@ -29,7 +29,8 @@ All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
-	cmd.Flags().String("commit", "", "Use specific commit SHA instead of HEAD")
+	cmd.Flags().String("commit", "", "Git commit SHA to compute hashes for (required)")
+	_ = cmd.MarkFlagRequired("commit")
 	return cmd
 }
 

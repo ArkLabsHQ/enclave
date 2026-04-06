@@ -239,14 +239,19 @@ SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/s
 rm -rf "$TMPDIR"
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
-# Compute deps hash via trial build
-VENDOR_OUTPUT=$(nix build --impure --no-link \
+# Compute deps hash via trial build.
+# Use --log-format raw to strip ANSI escape codes.
+nix build --impure --no-link \
   --extra-experimental-features 'nix-command flakes' \
-  --expr '%s' 2>&1 || true)
-VENDOR_HASH=$(echo "$VENDOR_OUTPUT" | grep 'got:' | while read -r line; do echo "${line##*got: }"; done)
+  --log-format raw \
+  --expr '%s' > /tmp/vendor.log 2>&1 || true
+# grep is available in the Nix image; extract "got: sha256-..." line.
+VENDOR_LINE=$(grep -o 'sha256-[^[:space:]]*' /tmp/vendor.log || true)
+VENDOR_HASH="$VENDOR_LINE"
 if [ -n "$VENDOR_HASH" ]; then
   echo "vendor_hash=$VENDOR_HASH" >> /src/%s
 else
+  cat /tmp/vendor.log >&2
   echo "vendor_err=Could not extract deps hash" >> /src/%s
 fi
 `, rev, resultFile, trialBuildExpr, resultFile, resultFile)

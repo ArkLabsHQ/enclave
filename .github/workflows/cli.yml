@@ -17,20 +17,20 @@ jobs:
           - language: go
             app_dir: test/cli/go-app
             # TODO: replace with real SHAs after pushing commit1 and commit2
-            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
-            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+            commit1: "6710409"
+            commit2: "7599ce0"
           - language: nodejs
             app_dir: test/cli/nodejs-app
-            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
-            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+            commit1: "6710409"
+            commit2: "7599ce0"
           - language: rust
             app_dir: test/cli/rust-app
-            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
-            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+            commit1: "6710409"
+            commit2: "7599ce0"
           - language: dotnet
             app_dir: test/cli/dotnet-app
-            commit1: "2d74b72784f2f6486dfb5e5d75c3120f39f39428"
-            commit2: "9bf75d70e06c30354e4911cb2bc526312ecc0413"
+            commit1: "6710409"
+            commit2: "7599ce0"
 
     steps:
       - uses: actions/checkout@v4

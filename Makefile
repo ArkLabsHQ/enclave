@@ -22,7 +22,72 @@ build: ## Build the enclave CLI with SDK hashes baked in
 install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
 	go install -ldflags '$(LDFLAGS)' ./cmd/enclave
 
-.PHONY: test test-build test-run
+.PHONY: test-cli _test-cli-lang test test-build test-run
+
+# ── CLI tests (mirrors .github/workflows/cli.yml) ──────────────
+# Requires: go, nix (with nixpkgs=channel:nixos-25.11 on NIX_PATH)
+CLI_BIN    := /tmp/enclave-cli
+COMMIT1    := 6710409
+COMMIT1_FULL := 67104090b28d8a5358dd036e2454881643735a3f
+COMMIT1_HASH := sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous=
+COMMIT1_VENDOR_HASH_GO := sha256-UA4Oc/fkprVH/9dZm7T0RQlfHzOwW1F3nUYTydOp0VE=
+COMMIT2    := 7599ce0
+COMMIT2_FULL := 7599ce0474a8fdee97dd18625f3a4258813d7815
+COMMIT2_HASH := sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE=
+
+LANGUAGES  := go nodejs rust dotnet
+APP_DIR_go     := test/cli/go-app
+APP_DIR_nodejs := test/cli/nodejs-app
+APP_DIR_rust   := test/cli/rust-app
+APP_DIR_dotnet := test/cli/dotnet-app
+
+test-cli: ## Run CLI tests for all languages (init, setup, update)
+	go build -o $(CLI_BIN) ./cmd/enclave
+	@for lang in $(LANGUAGES); do \
+		echo "=== CLI test: $$lang ==="; \
+		$(MAKE) --no-print-directory _test-cli-lang LANG=$$lang || exit 1; \
+		echo "PASS: $$lang"; echo; \
+	done
+	@echo "All CLI tests passed."
+
+_test-cli-lang:
+	$(eval APP_DIR := $(APP_DIR_$(LANG)))
+	@set -e; \
+	REPO_ROOT=$$(cd $(CURDIR) && pwd); \
+	WORK=$$(mktemp -d); \
+	cp -r $(APP_DIR)/. "$$WORK/"; \
+	cd "$$WORK"; \
+	git init -q; \
+	git remote add origin https://github.com/ArkLabsHQ/introspector-enclave.git; \
+	git add .; \
+	git -c user.email=ci@test -c user.name=CI commit -q -m "init"; \
+	echo "[test] enclave init --language $(LANG)"; \
+	$(CLI_BIN) init --language $(LANG); \
+	test -f enclave/enclave.yaml; \
+	test -f flake.nix; \
+	test -f enclave/start.sh; \
+	test -f enclave/scripts/enclave_init.sh; \
+	test -f enclave/tofu/modules/enclave/kms.tf; \
+	grep -q '/dev/nsm' enclave/start.sh; \
+	grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf; \
+	echo "[test] enclave setup --local --commit $(COMMIT1)"; \
+	git add .; \
+	git -c user.email=ci@test -c user.name=CI commit -q -m "add enclave files"; \
+	git fetch -q "$$REPO_ROOT" master; \
+	$(CLI_BIN) setup --local --commit $(COMMIT1); \
+	grep -q '$(COMMIT1_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
+	grep -q '$(COMMIT1_HASH)' enclave/enclave.yaml || { echo "FAIL: nix_hash"; exit 1; }; \
+	grep -q 'nix_owner: "ArkLabsHQ"' enclave/enclave.yaml; \
+	grep -q 'nix_repo: "introspector-enclave"' enclave/enclave.yaml; \
+	if [ "$(LANG)" = "go" ]; then \
+		grep -q '$(COMMIT1_VENDOR_HASH_GO)' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash"; cat enclave/enclave.yaml; exit 1; }; \
+	fi; \
+	echo "[test] enclave update --commit $(COMMIT2)"; \
+	$(CLI_BIN) update --commit $(COMMIT2); \
+	grep -q '$(COMMIT2_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
+	grep -q '$(COMMIT2_HASH)' enclave/enclave.yaml || { echo "FAIL: nix_hash"; exit 1; }; \
+	if [ "$(COMMIT1_HASH)" = "$(COMMIT2_HASH)" ]; then echo "ERROR: hashes should differ"; exit 1; fi; \
+	rm -rf "$$WORK"
 
 test: test-build test-run ## Build test EIFs and run integration tests
 

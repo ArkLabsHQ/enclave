@@ -1,0 +1,31 @@
+name: Release Rust Client
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" client-rs/Cargo.toml
+          echo "Version set to ${VERSION}"
+
+      - name: Build
+        run: cargo build --release -p enclave-client
+
+      - name: Test
+        run: cargo test -p enclave-client

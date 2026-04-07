@@ -61,9 +61,10 @@ jobs:
           echo "vendor_hash=${VENDOR_HASH}" >> "$GITHUB_OUTPUT"
           echo "Vendor hash: ${VENDOR_HASH}"
 
-      - name: Update sdk-hashes.json and commit
+      - name: Update versions and sdk-hashes.json
         run: |
           TAG="${{ inputs.version }}"
+          VERSION="${TAG#v}"
           VENDOR_HASH="${{ steps.vendor.outputs.vendor_hash }}"
 
           jq -n \
@@ -75,7 +76,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sdk-hashes.json
-          git commit -m "sdk hashes for ${TAG}"
+          git commit -m "release ${TAG}"
 
       - name: Compute real source hash and finalize
         run: |
@@ -181,7 +182,7 @@ jobs:
             enclave-cli-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
 
   create-release:
-    needs: build-cli
+    needs: [build-cli]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

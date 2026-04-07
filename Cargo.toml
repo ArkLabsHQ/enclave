@@ -1,0 +1,3 @@
+[workspace]
+members = ["client-rs"]
+resolver = "2"

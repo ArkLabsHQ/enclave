@@ -1,0 +1,52 @@
+name: Release TypeScript Client
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sync version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd client-ts
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+          echo "Version set to ${VERSION}"
+
+      - name: Build
+        run: |
+          cd client-ts
+          npm ci
+          npm run build
+
+      - name: Test
+        run: |
+          cd client-ts
+          npm test
+
+      - name: Package and upload to release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd client-ts
+          npm pack
+          mv *.tgz "../enclave-client-ts-${VERSION}.tgz"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: enclave-client-ts-*.tgz

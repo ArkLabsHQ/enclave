@@ -103,14 +103,20 @@ func TestCLI_Build(t *testing.T) {
 	// Init a git repo (build needs it).
 	gitInit := exec.Command("git", "init")
 	gitInit.Dir = dir
-	gitInit.Run()
+	if err := gitInit.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	gitAdd := exec.Command("git", "add", ".")
 	gitAdd.Dir = dir
-	gitAdd.Run()
+	if err := gitAdd.Run(); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
 	gitCommit := exec.Command("git", "-c", "user.email=test@test.com",
 		"-c", "user.name=Test", "commit", "-m", "init")
 	gitCommit.Dir = dir
-	gitCommit.Run()
+	if err := gitCommit.Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
 
 	// Run enclave build --local.
 	buildCmd := exec.Command(bin, "build", "--local")

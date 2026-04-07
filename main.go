@@ -30,6 +30,7 @@ func Execute() {
 		statusCmd(),
 		curlCmd(),
 		generateCmd(),
+		tfvarsCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

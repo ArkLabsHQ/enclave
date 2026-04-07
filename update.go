@@ -122,9 +122,14 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 				}
 				vendorHash = "deps.json"
 			} else {
-				nixHash, vendorHash, err = computeHashesDocker(root, rev, subPackages, nixImage, language)
-				if err != nil {
-					return err
+				var vendorErr error
+				nixHash, vendorHash, vendorErr = computeHashesDocker(root, rev, subPackages, nixImage, language)
+				if nixHash == "" && vendorErr != nil {
+					return vendorErr
+				}
+				if vendorErr != nil {
+					fmt.Printf("[update] Warning: could not compute vendor hash: %v\n", vendorErr)
+					fmt.Println("[update] Will update other fields; you may need to fill nix_vendor_hash manually.")
 				}
 			}
 		}

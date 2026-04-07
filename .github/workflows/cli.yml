@@ -19,7 +19,7 @@ jobs:
             commit1: "6710409"
             commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
             commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
-            commit1_vendor_hash: "sha256-iHqsoRGivzNcZTOpaXCckpQ/sRSdRA/5/hZ8VXchfjg="
+            commit1_vendor_hash: "sha256-UA4Oc/fkprVH/9dZm7T0RQlfHzOwW1F3nUYTydOp0VE="
             commit2: "7599ce0"
             commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
             commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
@@ -39,9 +39,14 @@ jobs:
             commit2: "7599ce0"
             commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
             commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
-          # dotnet skipped: .NET 10 SDK not yet in nixpkgs channel used by Docker image.
-          # Re-enable once nixos/nix image ships with nixpkgs that includes sdk_10_0_1xx.
-
+          - language: dotnet
+            app_dir: test/cli/dotnet-app
+            commit1: "6710409"
+            commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
+            commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
+            commit2: "7599ce0"
+            commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
+            commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
     steps:
       - uses: actions/checkout@v4
 
@@ -49,8 +54,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Pull Nix Docker image
-        run: docker pull nixos/nix:2.24.9
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-25.11
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build enclave CLI
         run: go build -o /tmp/enclave-cli ./cmd/enclave
@@ -93,7 +103,7 @@ jobs:
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
           git fetch origin master
 
-          /tmp/enclave-cli setup --commit ${{ matrix.commit1 }}
+          /tmp/enclave-cli setup --local --commit ${{ matrix.commit1 }}
 
           # Verify nix_rev is the full SHA.
           grep -q '${{ matrix.commit1_full }}' enclave/enclave.yaml || { echo "FAIL: nix_rev != ${{ matrix.commit1_full }}"; exit 1; }

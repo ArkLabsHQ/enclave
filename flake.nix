@@ -44,7 +44,7 @@
           sourceRoot = "source/sdk";
           vendorHash = sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
-          CGO_ENABLED = "0";
+          env.CGO_ENABLED = "0";
           ldflags = [
             "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=${version}"
           ];
@@ -69,7 +69,7 @@
           proxyVendor = true;
 
           subPackages = appCfg.nix_sub_packages;
-          CGO_ENABLED = "0";
+          env.CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
           doCheck = false;
@@ -98,7 +98,7 @@
 
           vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
 
-          CGO_ENABLED = "0";
+          env.CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
           doCheck = false;
 
@@ -122,7 +122,7 @@
           vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
 
           subPackages = [ "example" ];
-          CGO_ENABLED = "0";
+          env.CGO_ENABLED = "0";
 
           postInstall = ''
             mv $out/bin/example $out/bin/proxy

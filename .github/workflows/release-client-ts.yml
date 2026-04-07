@@ -1,9 +1,11 @@
 name: Release TypeScript Client
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag version (e.g. v0.0.29)'
+        required: true
 
 permissions:
   contents: write
@@ -14,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ inputs.version }}
 
       - uses: actions/setup-node@v4
         with:
@@ -22,7 +24,8 @@ jobs:
 
       - name: Sync version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
           cd client-ts
           npm version "${VERSION}" --no-git-tag-version --allow-same-version
           echo "Version set to ${VERSION}"
@@ -40,7 +43,8 @@ jobs:
 
       - name: Package and upload to release
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
           cd client-ts
           npm pack
           mv *.tgz "../enclave-client-ts-${VERSION}.tgz"
@@ -48,5 +52,5 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.version }}
           files: enclave-client-ts-*.tgz

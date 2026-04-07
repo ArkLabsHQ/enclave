@@ -1,9 +1,11 @@
 name: Release Rust Client
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag version (e.g. v0.0.29)'
+        required: true
 
 permissions:
   contents: write
@@ -14,13 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ inputs.version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Sync version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
           sed -i "s/^version = .*/version = \"${VERSION}\"/" client-rs/Cargo.toml
           echo "Version set to ${VERSION}"
 

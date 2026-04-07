@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 /// Construct the GitHub Releases URL for a deployment manifest.
 ///
 /// ```
-/// use introspector_enclave_client::manifest_url;
+/// use enclave_client::manifest_url;
 /// let url = manifest_url("myorg/my-app", "latest");
 /// assert_eq!(url, "https://github.com/myorg/my-app/releases/download/latest/deployment.json");
 /// ```

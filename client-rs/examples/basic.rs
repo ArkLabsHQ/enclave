@@ -1,4 +1,4 @@
-use introspector_enclave_client::{Client, Options};
+use enclave_client::{Client, Options};
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {

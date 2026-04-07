@@ -8,7 +8,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! use introspector_enclave_client::{Client, Options};
+//! use enclave_client::{Client, Options};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +23,7 @@
 //!
 //!     // Option B: From deployment manifest (GitHub Releases).
 //!     let client = Client::from_manifest(
-//!         &introspector_enclave_client::manifest_url("myorg/my-app", "latest"),
+//!         &enclave_client::manifest_url("myorg/my-app", "latest"),
 //!         Options::default(),
 //!     ).await?;
 //!

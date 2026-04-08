@@ -37,7 +37,7 @@ services:
     ports:
       - "4566:4566"
     environment:
-      SERVICES: ssm,sts,s3,cloudformation,iam
+      SERVICES: ssm,sts,s3,cloudformation,iam,logs
       LOCALSTACK_ACKNOWLEDGE_ACCOUNT_REQUIREMENT: "1"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]

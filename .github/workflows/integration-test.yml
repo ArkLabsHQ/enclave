@@ -38,6 +38,7 @@ jobs:
       - name: Build test EIFs
         run: |
           go build -o /tmp/enclave-cli ./cmd/enclave
+          export SDK_LOCAL_PATH=$GITHUB_WORKSPACE
           cd test/app
 
           # Build v1 EIF.

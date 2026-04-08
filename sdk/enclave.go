@@ -43,7 +43,6 @@ type Enclave struct {
 	previousPCR0            string
 	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
-	initError               atomic.Value // stores string, updated progressively during init
 	mgmtToken               string       // bearer token for management endpoints (empty = no auth)
 	dynamicSecretsCount     atomic.Int64 // count of loaded dynamic secrets, for enclave-info
 
@@ -51,6 +50,10 @@ type Enclave struct {
 	s3Client   *s3.Client
 	bucketName string
 	dek        []byte // 32-byte plaintext AES-256 key, in memory only
+
+	// Log buffer for structured log entries from the app.
+	logBuffer  *LogBuffer
+	logShipCh  chan LogEntry // buffered channel for CloudWatch shipper (nil when disabled)
 
 	// Migration cooldown cache (avoids hammering SSM on every enclave-info call).
 	cooldownMu        sync.Mutex
@@ -67,7 +70,16 @@ func New() (*Enclave, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate mgmt token: %w", err)
 	}
-	return &Enclave{previousPCR0: "genesis", mgmtToken: token}, nil
+	var shipCh chan LogEntry
+	if cloudwatchLogsEnabled() {
+		shipCh = make(chan LogEntry, 1000)
+	}
+	return &Enclave{
+		previousPCR0: "genesis",
+		mgmtToken:    token,
+		logBuffer:  NewLogBuffer(logBufferSize()),
+		logShipCh:  shipCh,
+	}, nil
 }
 
 // MgmtToken returns the management token for authenticating internal API calls.
@@ -119,38 +131,38 @@ func (e *Enclave) Init(ctx context.Context) error {
 
 	secrets, err := loadSecretsConfig()
 	if err != nil {
-		e.setInitError(fmt.Sprintf("load secrets config: %s", err))
+		slog.Error("load secrets config", "error", err)
 		return fmt.Errorf("load secrets config: %w", err)
 	}
 	e.secrets = secrets
 
 	if err := e.generateAttestationKey(); err != nil {
-		e.setInitError(fmt.Sprintf("generate attestation key: %s", err))
+		slog.Error("generate attestation key", "error", err)
 		return fmt.Errorf("generate attestation key: %w", err)
 	}
 
-	e.setInitError("applying KMS policy")
+	slog.Info("applying KMS policy")
 	if err := selfApplyKMSPolicy(ctx); err != nil {
-		e.setInitError(fmt.Sprintf("apply KMS policy: %s", err))
+		slog.Error("apply KMS policy", "error", err)
 		return fmt.Errorf("apply KMS policy: %w", err)
 	}
 
 	if len(secrets) > 0 {
-		e.setInitError("waiting for KMS secrets")
+		slog.Info("waiting for KMS secrets")
 		if err := e.waitForSecretsFromKMS(ctx, secrets); err != nil {
-			e.setInitError(fmt.Sprintf("load secrets from KMS: %s", err))
+			slog.Error("load secrets from KMS", "error", err)
 			return fmt.Errorf("load secrets from KMS: %w", err)
 		}
 
 		if err := e.extendPCRsWithSecretPubkeys(secrets); err != nil {
-			e.setInitError(fmt.Sprintf("extend PCRs with secret pubkeys: %s", err))
+			slog.Error("extend PCRs with secret pubkeys", "error", err)
 			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 		}
 	}
 
-	e.setInitError("initializing storage")
+	slog.Info("initializing storage")
 	if err := e.initStorage(ctx); err != nil {
-		e.setInitError(fmt.Sprintf("init storage: %s", err))
+		slog.Error("init storage", "error", err)
 		return fmt.Errorf("init storage: %w", err)
 	}
 
@@ -185,21 +197,25 @@ func (e *Enclave) Init(ctx context.Context) error {
 	}
 
 	deleteOldKMSKey(ctx)
-	e.setInitError("") // clear — init succeeded
+	slog.Info("init completed successfully")
+
+	// Start CloudWatch log shipper if enabled.
+	if e.logShipCh != nil {
+		go e.runLogShipper(ctx)
+	}
+
 	return nil
 }
 
-// setInitError stores an init error message atomically.
-func (e *Enclave) setInitError(msg string) {
-	e.initError.Store(msg)
+
+// GetLogBuffer returns the log buffer for use by the slog handler.
+func (e *Enclave) GetLogBuffer() *LogBuffer {
+	return e.logBuffer
 }
 
-// InitError returns the initialization error/status message, or empty string on success.
-func (e *Enclave) InitError() string {
-	if v := e.initError.Load(); v != nil {
-		return v.(string)
-	}
-	return ""
+// GetLogShipCh returns the CloudWatch log shipping channel (may be nil).
+func (e *Enclave) GetLogShipCh() chan LogEntry {
+	return e.logShipCh
 }
 
 // IsReady returns true after Init has completed (success or failure).
@@ -229,6 +245,8 @@ func (e *Enclave) AttestationPubkey() string {
 //	GET    /v1/secrets/{name}
 //	DELETE /v1/secrets/{name}
 //	GET    /v1/secrets
+//	POST   /v1/logs
+//	GET    /v1/logs
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("GET /v1/metrics", handlePrometheusMetrics)
@@ -241,6 +259,8 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/secrets/{name}", e.handleSecretGet)
 	mux.HandleFunc("DELETE /v1/secrets/{name}", e.handleSecretDelete)
 	mux.HandleFunc("GET /v1/secrets", e.handleSecretList)
+	mux.HandleFunc("POST /v1/logs", e.handleLogPost)
+	mux.HandleFunc("GET /v1/logs", e.handleLogGet)
 }
 
 // handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
@@ -395,12 +415,10 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 			Version      string `json:"version"`
 			PreviousPCR0 string `json:"previous_pcr0"`
 			Initializing bool   `json:"initializing"`
-			Error        string `json:"error,omitempty"`
 		}{
 			Version:      Version,
-			PreviousPCR0: "genesis", // safe: migration PCR0 is only loaded during Init
+			PreviousPCR0: "genesis",
 			Initializing: true,
-			Error:        e.InitError(),
 		})
 		return
 	}
@@ -417,7 +435,6 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
 		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
 		MigrationPending           bool             `json:"migration_pending"`
-		Error                      string           `json:"error,omitempty"`
 	}{
 		Version:                    Version,
 		PreviousPCR0:               e.previousPCR0,
@@ -428,7 +445,6 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,
-		Error:                      e.InitError(),
 	})
 }
 

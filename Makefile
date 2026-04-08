@@ -92,7 +92,7 @@ _test-cli-lang:
 test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
-	cd test/app && enclave build --local
+	cd test/app && ../../enclave-cli build --local
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \

@@ -36,12 +36,14 @@ func TestVerifyRealAttestationDocument(t *testing.T) {
 	// Certificate may have expired but signature should be OK.
 	if result == nil {
 		t.Fatalf("nitrite.Verify returned nil result: %v", err)
+		return
 	}
 	if !result.SignatureOK {
 		t.Fatalf("attestation signature not OK: %v", err)
 	}
 	if result.Document == nil {
 		t.Fatal("attestation document is nil")
+		return
 	}
 
 	// Verify PCR0 matches expected value.

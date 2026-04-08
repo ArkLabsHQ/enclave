@@ -11,7 +11,7 @@ LDFLAGS := -X $(MODULE).sdkRev=$(SDK_REV) \
            -X $(MODULE).sdkHash=$(SDK_HASH) \
            -X $(MODULE).sdkVendorHash=$(SDK_VENDOR_HASH)
 
-.PHONY: build install help
+.PHONY: build install help lint
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -21,6 +21,12 @@ build: ## Build the enclave CLI with SDK hashes baked in
 
 install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
 	go install -ldflags '$(LDFLAGS)' ./cmd/enclave
+
+lint: ## Run golangci-lint on all modules (matches CI)
+	golangci-lint run ./...
+	cd sdk && golangci-lint run ./...
+	cd mgmt && golangci-lint run ./...
+	cd client && golangci-lint run ./...
 
 .PHONY: test-cli _test-cli-lang test test-build test-run
 

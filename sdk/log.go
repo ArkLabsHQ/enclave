@@ -370,8 +370,5 @@ func ensureLogGroupAndStream(ctx context.Context, client *cloudwatchlogs.Client,
 // isAlreadyExists checks if a CloudWatch error indicates the resource already exists.
 func isAlreadyExists(err error) bool {
 	var alreadyGroup *cwltypes.ResourceAlreadyExistsException
-	if errors.As(err, &alreadyGroup) {
-		return true
-	}
-	return false
+	return errors.As(err, &alreadyGroup)
 }

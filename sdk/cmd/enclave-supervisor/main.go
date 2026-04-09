@@ -33,6 +33,9 @@ func main() {
 		sdk.NewBufferHandler(enc.GetLogBuffer(), enc.GetLogShipCh()),
 	))
 
+	// Set up metrics: OTEL instruments + runtime/proc collector.
+	sdk.InitMetrics()
+
 	// Set up tracing: supervisor spans go directly into the SpanBuffer.
 	shutdownTracing := sdk.StartSupervisorTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
 

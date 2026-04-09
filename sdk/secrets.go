@@ -98,14 +98,14 @@ func (e *Enclave) StoreSecret(ctx context.Context, name, envVar, value string) e
 		return fmt.Errorf("marshal secret: %w", err)
 	}
 
-	enclaveMetrics.SecretWrites.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.SecretWrites, "secret_writes_total")
 	slog.Info("secret stored", "name", name, "env_var", envVar)
 	return e.Store(ctx, secretsPrefix+name, data)
 }
 
 // LoadSecret retrieves and decrypts a dynamic secret.
 func (e *Enclave) LoadSecret(ctx context.Context, name string) (*DynamicSecret, error) {
-	enclaveMetrics.SecretReads.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.SecretReads, "secret_reads_total")
 	data, err := e.Load(ctx, secretsPrefix+name)
 	if err != nil {
 		return nil, err
@@ -119,7 +119,7 @@ func (e *Enclave) LoadSecret(ctx context.Context, name string) (*DynamicSecret, 
 
 // DeleteSecret removes a dynamic secret from storage.
 func (e *Enclave) DeleteSecret(ctx context.Context, name string) error {
-	enclaveMetrics.SecretDeletes.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.SecretDeletes, "secret_deletes_total")
 	slog.Info("secret deleted", "name", name)
 	return e.Delete(ctx, secretsPrefix+name)
 }

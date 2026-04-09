@@ -121,6 +121,7 @@ func main() {
 	mux.HandleFunc("POST /migrate/abort", mgmt.handleMigrateAbort)
 	mux.HandleFunc("GET /enclave-logs", mgmt.handleLogs)
 	mux.HandleFunc("GET /enclave-traces", mgmt.handleTraces)
+	mux.HandleFunc("GET /enclave-metrics", mgmt.handleEnclaveMetrics)
 
 	addr := envOrDefault("ENCLAVE_MGMT_ADDR", "127.0.0.1:8443")
 

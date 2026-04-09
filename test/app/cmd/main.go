@@ -26,9 +26,12 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otellog "go.opentelemetry.io/otel/log"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	otelTrace "go.opentelemetry.io/otel/trace"
 )
@@ -44,6 +47,9 @@ type attestationPayload struct {
 // The test app calls back to it for storage/secrets management.
 var supervisorURL string
 
+// appRequestCounter is an OTEL counter incremented on each request.
+var appRequestCounter otelmetric.Int64Counter
+
 func main() {
 	port := os.Getenv("ENCLAVE_APP_PORT")
 	if port == "" {
@@ -56,25 +62,45 @@ func main() {
 	}
 	supervisorURL = "http://127.0.0.1:" + proxyPort
 
-	// Set up OTEL tracing: export spans to the supervisor's /v1/enclave-traces endpoint.
+	// Set up OTEL tracing + metrics: export to the supervisor's endpoints.
 	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
 	if token != "" {
 		ctx := context.Background()
+		headers := map[string]string{"Authorization": "Bearer " + token}
+
+		// Tracing exporter.
 		traceExporter, err := otlptracehttp.New(ctx,
 			otlptracehttp.WithEndpoint("127.0.0.1:"+proxyPort),
 			otlptracehttp.WithURLPath("/v1/enclave-traces"),
 			otlptracehttp.WithInsecure(),
-			otlptracehttp.WithHeaders(map[string]string{
-				"Authorization": "Bearer " + token,
-			}),
+			otlptracehttp.WithHeaders(headers),
 		)
 		if err == nil {
 			tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExporter))
 			otel.SetTracerProvider(tp)
 			defer func() { _ = tp.Shutdown(ctx) }()
-			log.Printf("OTEL tracing enabled (exporting to %s/v1/traces)", supervisorURL)
-		} else {
-			log.Printf("OTEL tracing setup failed: %v", err)
+			log.Printf("OTEL tracing enabled")
+		}
+
+		// Metrics exporter.
+		metricExporter, err := otlpmetrichttp.New(ctx,
+			otlpmetrichttp.WithEndpoint("127.0.0.1:"+proxyPort),
+			otlpmetrichttp.WithURLPath("/v1/enclave-metrics"),
+			otlpmetrichttp.WithInsecure(),
+			otlpmetrichttp.WithHeaders(headers),
+		)
+		if err == nil {
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(
+				sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(5*time.Second)),
+			))
+			otel.SetMeterProvider(mp)
+			defer func() { _ = mp.Shutdown(ctx) }()
+
+			meter := mp.Meter("test-app")
+			appRequestCounter, _ = meter.Int64Counter("test_app_requests_total",
+				otelmetric.WithDescription("Total requests handled by the test app"),
+			)
+			log.Printf("OTEL metrics enabled")
 		}
 	}
 
@@ -110,6 +136,11 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		otelTrace.WithAttributes(attribute.String("app", "test-enclave-app")),
 	)
 	defer span.End()
+
+	// Increment app metric counter.
+	if appRequestCounter != nil {
+		appRequestCounter.Add(r.Context(), 1)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

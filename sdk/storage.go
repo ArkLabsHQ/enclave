@@ -151,7 +151,7 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 			return nil, err
 		}
 
-		enclaveMetrics.KMSOperations.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.KMSOperations, "kms_operations_total")
 		out, err := kmsClient.Decrypt(ctx, &kms.DecryptInput{
 			KeyId:          aws.String(keyID),
 			CiphertextBlob: ciphertext,
@@ -162,7 +162,7 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 		})
 		_ = session.Close()
 		if err != nil {
-			enclaveMetrics.KMSErrors.Add(1)
+			enclaveMetrics.Inc(enclaveMetrics.KMSErrors, "kms_errors_total")
 			lastErr = err
 			continue
 		}
@@ -183,9 +183,9 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 
 // Store encrypts data with the DEK and persists it to S3.
 func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
-	enclaveMetrics.StorageWrites.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.StorageWrites, "storage_writes_total")
 	if e.dek == nil {
-		enclaveMetrics.StorageErrors.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
 		return fmt.Errorf("storage not initialized")
 	}
 
@@ -216,7 +216,7 @@ func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
 		Body:   bytes.NewReader(blob),
 	})
 	if err != nil {
-		enclaveMetrics.StorageErrors.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
 		return fmt.Errorf("S3 put: %w", err)
 	}
 	return nil
@@ -225,9 +225,9 @@ func (e *Enclave) Store(ctx context.Context, key string, data []byte) error {
 // Load retrieves and decrypts data from S3.
 // Returns ErrNotFound if the key does not exist.
 func (e *Enclave) Load(ctx context.Context, key string) ([]byte, error) {
-	enclaveMetrics.StorageReads.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.StorageReads, "storage_reads_total")
 	if e.dek == nil {
-		enclaveMetrics.StorageErrors.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
@@ -275,9 +275,9 @@ func (e *Enclave) Load(ctx context.Context, key string) ([]byte, error) {
 
 // Delete removes a key from storage.
 func (e *Enclave) Delete(ctx context.Context, key string) error {
-	enclaveMetrics.StorageDeletes.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.StorageDeletes, "storage_deletes_total")
 	if e.s3Client == nil {
-		enclaveMetrics.StorageErrors.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
 		return fmt.Errorf("storage not initialized")
 	}
 

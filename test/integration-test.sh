@@ -7,7 +7,6 @@ HOST_TLS_PORT="${HOST_TLS_PORT:-8443}"
 MGMT_PORT="${MGMT_PORT:-8444}"
 BASE_URL="${ENCLAVE_URL:-https://localhost:${HOST_TLS_PORT}}"
 CURL="curl -sk --max-time 10"
-PROM_URL="http://localhost:9191"
 PASSED=0
 FAILED=0
 TOTAL=0
@@ -19,7 +18,7 @@ echo "=== Integration tests against $BASE_URL ==="
 echo ""
 
 # Test 1: Health endpoint returns 200 (Init must be complete).
-echo "[1/27] Health check"
+echo "[1/28] Health check"
 HEALTH_CODE=$($CURL -o /dev/null -w '%{http_code}' "${BASE_URL}/health" 2>/dev/null || echo "000")
 if [ "$HEALTH_CODE" = "200" ]; then
   pass "Health endpoint returns 200"
@@ -28,7 +27,7 @@ else
 fi
 
 # Test 2: Enclave info returns valid JSON with required fields.
-echo "[2/27] Enclave info"
+echo "[2/28] Enclave info"
 INFO=$($CURL "${BASE_URL}/v1/enclave-info" 2>/dev/null || echo "")
 if [ -n "$INFO" ] && echo "$INFO" | jq -e '.version' >/dev/null 2>&1; then
   pass "Enclave info returns valid JSON"
@@ -37,7 +36,7 @@ else
 fi
 
 # Test 3: Init completed successfully (no error field).
-echo "[3/27] Init status"
+echo "[3/28] Init status"
 if [ -n "$INFO" ]; then
   INIT_ERR=$(echo "$INFO" | jq -r '.error // empty' 2>/dev/null || echo "")
   if [ -z "$INIT_ERR" ]; then
@@ -54,7 +53,7 @@ fi
 # X-Attestation-Signature and X-Attestation-Pubkey headers, and verifies
 # the Schnorr signature over sha256(response_body).
 # This implicitly validates the attestation pubkey is present and correctly formatted.
-echo "[4/27] Attestation signature verification"
+echo "[4/28] Attestation signature verification"
 ATTEST_RESP=$($CURL "${BASE_URL}/test/attestation" 2>/dev/null || echo "")
 if [ -n "$ATTEST_RESP" ] && echo "$ATTEST_RESP" | jq -e '.signature_valid == true' >/dev/null 2>&1; then
   ATTEST_PUBKEY=$(echo "$ATTEST_RESP" | jq -r '.pubkey // empty' 2>/dev/null || echo "")
@@ -64,7 +63,7 @@ else
 fi
 
 # Test 5: SDK version present.
-echo "[5/27] SDK version"
+echo "[5/28] SDK version"
 if [ -n "$INFO" ]; then
   VERSION=$(echo "$INFO" | jq -r '.version // empty' 2>/dev/null || echo "")
   if [ -n "$VERSION" ]; then
@@ -77,7 +76,7 @@ else
 fi
 
 # Test 6: App endpoint responds through nitriding proxy.
-echo "[6/27] App proxy"
+echo "[6/28] App proxy"
 APP_RESP=$($CURL "${BASE_URL}/" 2>/dev/null || echo "")
 if [ -n "$APP_RESP" ] && echo "$APP_RESP" | jq -e '.app == "test-enclave-app"' >/dev/null 2>&1; then
   pass "App responds through proxy"
@@ -86,7 +85,7 @@ else
 fi
 
 # Test 7: KMS secrets loaded (SIGNING_KEY env var set inside enclave).
-echo "[7/27] KMS secrets"
+echo "[7/28] KMS secrets"
 SECRETS_RESP=$($CURL "${BASE_URL}/test/secrets" 2>/dev/null || echo "")
 if [ -n "$SECRETS_RESP" ] && echo "$SECRETS_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   KEY_LEN=$(echo "$SECRETS_RESP" | jq -r '.signing_key.length // 0' 2>/dev/null || echo "0")
@@ -96,7 +95,7 @@ else
 fi
 
 # Test 8: Storage round-trip (put → get → verify → delete via S3+KMS).
-echo "[8/27] Storage round-trip"
+echo "[8/28] Storage round-trip"
 STORAGE_RESP=$($CURL "${BASE_URL}/test/storage" 2>/dev/null || echo "")
 if [ -n "$STORAGE_RESP" ] && echo "$STORAGE_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
   pass "Storage round-trip (put/get/delete)"
@@ -105,7 +104,7 @@ else
 fi
 
 # Test 9: previous_pcr0 is "genesis" on first boot (no prior enclave).
-echo "[9/27] Previous PCR0"
+echo "[9/28] Previous PCR0"
 if [ -n "$INFO" ]; then
   PREV_PCR0=$(echo "$INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
   if [ "$PREV_PCR0" = "genesis" ]; then
@@ -120,7 +119,7 @@ else
 fi
 
 # Test 10: Dynamic secrets round-trip (PUT → GET → LIST → DELETE).
-echo "[10/27] Dynamic secrets"
+echo "[10/28] Dynamic secrets"
 DYN_RESP=$($CURL "${BASE_URL}/test/dynamic-secrets" 2>/dev/null || echo "")
 if [ -n "$DYN_RESP" ] && echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
   DYN_LISTED=$(echo "$DYN_RESP" | jq -r '.listed // false' 2>/dev/null || echo "false")
@@ -132,7 +131,7 @@ fi
 # Test 11: PCR secret derivation + attestation document PCR16 verification.
 # Verifies SIGNING_KEY → pubkey → extension data derivation and that PCR16
 # in the attestation document matches the expected value (extended + locked by SDK).
-echo "[11/27] PCR secret derivation + PCR16 verification"
+echo "[11/28] PCR secret derivation + PCR16 verification"
 PCR_RESP=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
 if [ -n "$PCR_RESP" ] && echo "$PCR_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   PCR_COUNT=$(echo "$PCR_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
@@ -152,7 +151,7 @@ fi
 # Test 12: Full attestation document structure verification.
 # Fetches raw attestation doc, parses COSE Sign1 + CBOR, verifies PCR map exists,
 # PCR0 is present and non-zero, and PCR16 matches expected value (locked by SDK).
-echo "[12/27] Attestation document structure"
+echo "[12/28] Attestation document structure"
 ATTEST_DOC_RESP=$($CURL "${BASE_URL}/test/attestation-document" 2>/dev/null || echo "")
 if [ -n "$ATTEST_DOC_RESP" ] && echo "$ATTEST_DOC_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   PCR_COUNT=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
@@ -170,7 +169,7 @@ else
 fi
 
 # Test 13: Storage persistence (write a known key for post-migration verification).
-echo "[13/27] Storage persistence (write phase)"
+echo "[13/28] Storage persistence (write phase)"
 PERSIST_RESP=$($CURL "${BASE_URL}/test/storage-persistence" 2>/dev/null || echo "")
 if [ -n "$PERSIST_RESP" ] && echo "$PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
   PHASE=$(echo "$PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
@@ -180,7 +179,7 @@ else
 fi
 
 # Test 14: Dynamic secret persistence (write a known secret for post-migration verification).
-echo "[14/27] Dynamic secret persistence (write phase)"
+echo "[14/28] Dynamic secret persistence (write phase)"
 DYN_PERSIST_RESP=$($CURL "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
 if [ -n "$DYN_PERSIST_RESP" ] && echo "$DYN_PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
   DYN_PHASE=$(echo "$DYN_PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
@@ -190,7 +189,7 @@ else
 fi
 
 # Test 15: Attestation persistence (write pubkey + PCR16 hash for post-migration verification).
-echo "[15/27] Attestation persistence (write phase)"
+echo "[15/28] Attestation persistence (write phase)"
 ATTEST_PERSIST=$($CURL "${BASE_URL}/test/attestation-persistence" 2>/dev/null || echo "")
 if [ -n "$ATTEST_PERSIST" ] && echo "$ATTEST_PERSIST" | jq -e '.phase' >/dev/null 2>&1; then
   ATTEST_PHASE=$(echo "$ATTEST_PERSIST" | jq -r '.phase' 2>/dev/null || echo "")
@@ -201,7 +200,7 @@ else
 fi
 
 # Test 16: Schnorr signature still valid (sanity check before migration).
-echo "[16/27] Pre-migration signature check"
+echo "[16/28] Pre-migration signature check"
 ATTEST2=$($CURL "${BASE_URL}/test/attestation" 2>/dev/null || echo "")
 if [ -n "$ATTEST2" ] && echo "$ATTEST2" | jq -e '.signature_valid == true' >/dev/null 2>&1; then
   pass "Schnorr signature valid (pre-migration baseline)"
@@ -212,74 +211,12 @@ fi
 # Test 17: Attestation binding (pubkey → UserData in attestation doc).
 # Verifies the full chain: X-Attestation-Pubkey signs responses, and
 # SHA256(pubkey) is bound to the NSM attestation document via UserData.
-echo "[17/27] Attestation binding (pubkey → UserData)"
+echo "[17/28] Attestation binding (pubkey → UserData)"
 BINDING_RESP=$($CURL "${BASE_URL}/test/attestation-binding" 2>/dev/null || echo "")
 if [ -n "$BINDING_RESP" ] && echo "$BINDING_RESP" | jq -e '.binding_valid == true' >/dev/null 2>&1; then
   pass "Attestation pubkey bound to NSM document (SHA256(pubkey) == UserData)"
 else
   fail "Attestation binding" "${BINDING_RESP:0:120}"
-fi
-
-# --- Prometheus scraping tests ---
-# Start Prometheus with a 2s scrape interval, wait for at least one scrape cycle,
-# then query the Prometheus HTTP API to verify metrics were ingested.
-PROM_PID=""
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-if command -v prometheus &>/dev/null; then
-  PROM_DATA_DIR=$(mktemp -d)
-  prometheus \
-    --config.file="${SCRIPT_DIR}/prometheus.yml" \
-    --storage.tsdb.path="$PROM_DATA_DIR" \
-    --web.listen-address=":9191" \
-    --log.level=warn &
-  PROM_PID=$!
-  sleep 1
-  if ! kill -0 "$PROM_PID" 2>/dev/null; then
-    echo "  Warning: Prometheus failed to start, skipping Prometheus tests"
-    PROM_PID=""
-  else
-    # Wait for at least one scrape cycle (2s interval + margin).
-    sleep 6
-  fi
-else
-  echo "  Warning: prometheus binary not found, skipping Prometheus tests"
-fi
-
-# Test 18: Prometheus scrapes enclave metrics successfully.
-echo "[18/27] Prometheus scrape targets"
-if [ -n "$PROM_PID" ]; then
-  TARGETS_UP=$(curl -sf "${PROM_URL}/api/v1/targets" 2>/dev/null \
-    | jq '[.data.activeTargets[] | select(.health == "up")] | length' 2>/dev/null || echo "0")
-  if [ "$TARGETS_UP" -ge 1 ]; then
-    pass "Prometheus scraped $TARGETS_UP target(s) successfully"
-  else
-    fail "Prometheus scrape" "no targets up (got $TARGETS_UP)"
-  fi
-else
-  fail "Prometheus scrape" "prometheus not running"
-fi
-
-# Test 19: Prometheus has enclave application metrics (from /v1/metrics).
-echo "[19/27] Prometheus enclave metrics"
-if [ -n "$PROM_PID" ]; then
-  # Query for one of the enclave_ prefixed counters.
-  METRIC_VAL=$(curl -sf "${PROM_URL}/api/v1/query?query=enclave_http_requests_total" 2>/dev/null \
-    | jq '.data.result | length' 2>/dev/null || echo "0")
-  if [ "$METRIC_VAL" -ge 1 ]; then
-    pass "enclave_http_requests_total present in Prometheus"
-  else
-    # Try the host gauge as fallback (mgmt endpoint).
-    HOST_UP=$(curl -sf "${PROM_URL}/api/v1/query?query=enclave_host_up" 2>/dev/null \
-      | jq '.data.result | length' 2>/dev/null || echo "0")
-    if [ "$HOST_UP" -ge 1 ]; then
-      pass "enclave_host_up present in Prometheus (app metrics may need more scrapes)"
-    else
-      fail "Prometheus enclave metrics" "no enclave_* metrics found"
-    fi
-  fi
-else
-  fail "Prometheus enclave metrics" "prometheus not running"
 fi
 
 # --- Log tests ---
@@ -288,7 +225,7 @@ fi
 MGMT_URL="http://localhost:${MGMT_PORT}"
 
 # Test 20: Log POST (app → supervisor) + GET via mgmt server.
-echo "[20/27] Log round-trip via mgmt server"
+echo "[18/28] Log round-trip via mgmt server"
 # First, have the test app POST log entries to the supervisor.
 LOG_POST=$($CURL "${BASE_URL}/test/logs" 2>/dev/null || echo "")
 if [ -z "$LOG_POST" ] || ! echo "$LOG_POST" | jq -e '.post == "ok"' >/dev/null 2>&1; then
@@ -307,7 +244,7 @@ else
 fi
 
 # Test 21: Log level filtering via mgmt server.
-echo "[21/27] Log level filtering via mgmt server"
+echo "[19/28] Log level filtering via mgmt server"
 LOG_FILTERED=$(curl -s --max-time 10 "${MGMT_URL}/enclave-logs?level=warn" 2>/dev/null)
 if [ -z "$LOG_FILTERED" ]; then LOG_FILTERED="[]"; fi
 FILTERED_COUNT=$(echo "$LOG_FILTERED" | jq 'length' 2>/dev/null || echo "0")
@@ -319,7 +256,7 @@ else
 fi
 
 # Test 22: Log POST requires auth token.
-echo "[22/27] Log auth enforcement"
+echo "[20/28] Log auth enforcement"
 if [ -n "$LOG_POST" ] && echo "$LOG_POST" | jq -e '.auth_enforced == true' >/dev/null 2>&1; then
   pass "Log POST requires auth (401 without token)"
 else
@@ -327,7 +264,7 @@ else
 fi
 
 # Test 23: CloudWatch Logs history (supervisor ships logs → mgmt queries CloudWatch).
-echo "[23/27] CloudWatch Logs log history"
+echo "[21/28] CloudWatch Logs log history"
 # Wait for the supervisor's log shipper to flush (5s interval + margin).
 sleep 8
 CW_HISTORY=$(curl -s --max-time 10 "${MGMT_URL}/enclave-logs?history=true" 2>/dev/null)
@@ -347,7 +284,7 @@ fi
 # supervisor's /v1/traces buffer via the mgmt proxy.
 
 # Test 24: Make a request to trigger app spans, then verify via mgmt /enclave-traces.
-echo "[24/27] App trace spans via mgmt server"
+echo "[22/28] App trace spans via mgmt server"
 # Make a request to the app — otelhttp creates a span, handleRoot creates a child.
 $CURL "${BASE_URL}/" >/dev/null 2>&1
 # OTEL batcher flushes every 5s by default. Wait for it.
@@ -363,7 +300,7 @@ else
 fi
 
 # Test 25: Supervisor spans present (init stages).
-echo "[25/27] Supervisor init spans"
+echo "[23/28] Supervisor init spans"
 SUP_SPANS=$(echo "$SPAN_GET" | jq '[.[] | select(.source == "supervisor")] | length' 2>/dev/null || echo "0")
 INIT_SPAN=$(echo "$SPAN_GET" | jq '[.[] | select(.name == "init" and .source == "supervisor")] | length' 2>/dev/null || echo "0")
 if [ "$SUP_SPANS" -ge 1 ] && [ "$INIT_SPAN" -ge 1 ]; then
@@ -373,7 +310,7 @@ else
 fi
 
 # Test 26: App and supervisor spans share the buffer.
-echo "[26/27] Mixed app + supervisor spans in buffer"
+echo "[24/28] Mixed app + supervisor spans in buffer"
 APP_SPANS=$(echo "$SPAN_GET" | jq '[.[] | select(.source == "app")] | length' 2>/dev/null || echo "0")
 if [ "$APP_SPANS" -ge 2 ] && [ "$SUP_SPANS" -ge 1 ]; then
   pass "Mixed spans (app=$APP_SPANS, supervisor=$SUP_SPANS, total=$SPAN_TOTAL)"
@@ -381,20 +318,48 @@ else
   fail "Mixed spans" "app=$APP_SPANS supervisor=$SUP_SPANS total=$SPAN_TOTAL"
 fi
 
-# Test 27: Attestation still works after all tests (NSM stability).
-echo "[27/27] Attestation stability check"
+# --- Metrics tests ---
+
+# Test 27: Metric snapshot via mgmt server.
+echo "[25/28] Metric snapshot via mgmt server"
+# Wait for runtime collector + OTEL metric batcher to flush.
+sleep 7
+METRIC_GET=$(curl -s --max-time 10 "${MGMT_URL}/enclave-metrics" 2>/dev/null)
+if [ -z "$METRIC_GET" ]; then METRIC_GET="{}"; fi
+HAS_SUPERVISOR=$(echo "$METRIC_GET" | jq 'has("supervisor")' 2>/dev/null || echo "false")
+HAS_RUNTIME=$(echo "$METRIC_GET" | jq 'has("runtime")' 2>/dev/null || echo "false")
+if [ "$HAS_SUPERVISOR" = "true" ] && [ "$HAS_RUNTIME" = "true" ]; then
+  pass "Metric snapshot has supervisor + runtime sections"
+else
+  fail "Metric snapshot" "supervisor=$HAS_SUPERVISOR runtime=$HAS_RUNTIME (body=${METRIC_GET:0:200})"
+fi
+
+# Test 28: Supervisor counters present in snapshot.
+echo "[26/28] Supervisor metric counters"
+HTTP_REQ=$(echo "$METRIC_GET" | jq '.supervisor.http_requests_total // 0' 2>/dev/null || echo "0")
+if [ "$HTTP_REQ" -ge 1 ]; then
+  pass "Supervisor http_requests_total=$HTTP_REQ"
+else
+  fail "Supervisor counters" "http_requests_total=$HTTP_REQ"
+fi
+
+# Test 29: Runtime metrics present (goroutines, heap).
+echo "[27/28] Runtime metrics"
+GOROUTINES=$(echo "$METRIC_GET" | jq '.runtime.goroutines // 0' 2>/dev/null || echo "0")
+HEAP=$(echo "$METRIC_GET" | jq '.runtime.heap_alloc_bytes // 0' 2>/dev/null || echo "0")
+if [ "$GOROUTINES" -ge 1 ] && [ "$HEAP" -ge 1 ]; then
+  pass "Runtime metrics (goroutines=$GOROUTINES, heap=$HEAP)"
+else
+  fail "Runtime metrics" "goroutines=$GOROUTINES heap=$HEAP"
+fi
+
+# Test 30: Attestation still works after all tests (NSM stability).
+echo "[28/28] Attestation stability check"
 PCR_RESP2=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
 if [ -n "$PCR_RESP2" ] && echo "$PCR_RESP2" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   pass "Attestation stable after all tests"
 else
   fail "Attestation stability" "${PCR_RESP2:0:120}"
-fi
-
-# Clean up Prometheus.
-if [ -n "$PROM_PID" ]; then
-  kill "$PROM_PID" 2>/dev/null || true
-  wait "$PROM_PID" 2>/dev/null || true
-  rm -rf "$PROM_DATA_DIR"
 fi
 
 echo ""

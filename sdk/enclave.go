@@ -260,7 +260,8 @@ func (e *Enclave) AttestationPubkey() string {
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
 //	GET    /v1/enclave-info
-//	GET    /v1/metrics
+//	POST   /v1/enclave-metrics
+//	GET    /v1/enclave-metrics
 //	POST   /v1/export-key
 //	PUT    /v1/storage/{key...}
 //	GET    /v1/storage/{key...}
@@ -276,7 +277,8 @@ func (e *Enclave) AttestationPubkey() string {
 //	GET    /v1/enclave-traces
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
-	mux.HandleFunc("GET /v1/metrics", handlePrometheusMetrics)
+	mux.HandleFunc("POST /v1/enclave-metrics", e.handleMetricPost)
+	mux.HandleFunc("GET /v1/enclave-metrics", e.handleMetricGet)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
 	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
@@ -292,11 +294,6 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-traces", e.handleSpanGet)
 }
 
-// handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
-func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = fmt.Fprint(w, enclaveMetrics.PrometheusText())
-}
 
 // Middleware returns an http.Handler that signs all responses with the
 // ephemeral attestation key using BIP-340 Schnorr signatures.
@@ -460,7 +457,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0Attestation    string           `json:"previous_pcr0_attestation,omitempty"`
 		AttestationPubkey          string           `json:"attestation_pubkey,omitempty"`
 		DynamicSecrets             int64            `json:"dynamic_secrets"`
-		Metrics                    map[string]int64 `json:"metrics"`
+		Metrics                    map[string]any `json:"metrics"`
 		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
 		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
 		MigrationPending           bool             `json:"migration_pending"`
@@ -470,7 +467,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0Attestation:    e.previousPCR0Attestation,
 		AttestationPubkey:          e.AttestationPubkey(),
 		DynamicSecrets:             e.dynamicSecretsCount.Load(),
-		Metrics:                    enclaveMetrics.Snapshot(),
+		Metrics:                    enclaveMetrics.MetricsSnapshot(),
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,

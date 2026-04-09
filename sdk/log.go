@@ -179,7 +179,7 @@ func (e *Enclave) handleLogPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	e.logBuffer.Add(entries...)
-	enclaveMetrics.LogEntries.Add(int64(len(entries)))
+	enclaveMetrics.IncBy(enclaveMetrics.LogEntries, "log_entries_total", int64(len(entries)))
 
 	// Forward to CloudWatch shipper if enabled.
 	if e.logShipCh != nil {

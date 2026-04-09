@@ -66,7 +66,7 @@ func (h *bufferHandler) Handle(ctx context.Context, r slog.Record) error {
 
 	// Insert into buffer.
 	h.buf.Add(entry)
-	enclaveMetrics.LogEntries.Add(1)
+	enclaveMetrics.Inc(enclaveMetrics.LogEntries, "log_entries_total")
 
 	// Forward to CloudWatch shipper if available.
 	if h.shipCh != nil {

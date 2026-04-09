@@ -26,7 +26,7 @@ app:
   nix_repo: "introspector-enclave"
   nix_rev: "01e1caa74a01d2ce1b0b322f1ccc3fbd2450c69d"
   nix_hash: "sha256-KytvlwE+91TmHeQmo7E2PdwLfNZN6jTE++VSRVwiiPM="
-  nix_vendor_hash: "sha256-QPUsEr54DWRch22abbyFZ+1HYToSgSeMtkrwgTcG+g4="
+  nix_vendor_hash: "sha256-hB3FY2TTv1t7udonVKaWboXbA+x1JOv1ZeCfCzNRNC4="
   nix_sub_packages:
     - "cmd"
   binary_name: "test-app"
@@ -47,6 +47,7 @@ app:
 secrets:
   - name: signing_key
     env_var: SIGNING_KEY
+
 
 
 

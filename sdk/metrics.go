@@ -20,6 +20,7 @@ type Metrics struct {
 	SecretReads     atomic.Int64
 	SecretWrites    atomic.Int64
 	SecretDeletes   atomic.Int64
+	LogEntries    atomic.Int64
 }
 
 // enclaveMetrics is the global metrics instance.
@@ -44,6 +45,7 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"secret_reads":    m.SecretReads.Load(),
 		"secret_writes":   m.SecretWrites.Load(),
 		"secret_deletes":  m.SecretDeletes.Load(),
+		"log_entries":   m.LogEntries.Load(),
 	}
 }
 
@@ -69,6 +71,7 @@ func (m *Metrics) PrometheusText() string {
 		{"enclave_secret_reads_total", "Total dynamic secret read operations.", "counter", m.SecretReads.Load},
 		{"enclave_secret_writes_total", "Total dynamic secret write operations.", "counter", m.SecretWrites.Load},
 		{"enclave_secret_deletes_total", "Total dynamic secret delete operations.", "counter", m.SecretDeletes.Load},
+		{"enclave_log_entries_total", "Total log entries accepted.", "counter", m.LogEntries.Load},
 	}
 
 	var b strings.Builder

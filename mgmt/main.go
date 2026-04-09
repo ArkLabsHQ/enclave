@@ -7,6 +7,7 @@
 //   - POST /stop                     — stop the enclave (via watchdog service)
 //   - POST /schedule-key-deletion    — schedule KMS key for deletion
 //   - POST /migrate                  — full locked-key migration (create key, export, restart)
+//   - GET  /logs                     — proxied log entries from enclave supervisor
 //
 // The server listens on 127.0.0.1:8443 (plain HTTP, localhost only).
 // Security: only reachable from the host itself. External access requires
@@ -27,6 +28,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -90,6 +92,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	var cwlClient *cloudwatchlogs.Client
+	if ep := os.Getenv("AWS_ENDPOINT_URL_LOGS"); ep != "" {
+		cwlClient = cloudwatchlogs.NewFromConfig(awsCfg, func(o *cloudwatchlogs.Options) { o.BaseEndpoint = aws.String(ep) })
+	} else {
+		cwlClient = cloudwatchlogs.NewFromConfig(awsCfg)
+	}
+
 	mgmt := &server{
 		deployment:        deployment,
 		appName:           appName,
@@ -98,6 +107,7 @@ func main() {
 		kms:               kmsClient,
 		s3Client:          s3Client,
 		stsClient:         stsClient,
+		cwlClient:         cwlClient,
 		migrationCooldown: cooldown,
 	}
 
@@ -109,6 +119,7 @@ func main() {
 	mux.HandleFunc("POST /schedule-key-deletion", mgmt.handleScheduleKeyDeletion)
 	mux.HandleFunc("POST /migrate", mgmt.handleMigrate)
 	mux.HandleFunc("POST /migrate/abort", mgmt.handleMigrateAbort)
+	mux.HandleFunc("GET /logs", mgmt.handleLogs)
 
 	addr := envOrDefault("ENCLAVE_MGMT_ADDR", "127.0.0.1:8443")
 
@@ -142,6 +153,7 @@ type server struct {
 	kms               *kms.Client
 	s3Client          *s3.Client
 	stsClient         *sts.Client
+	cwlClient         *cloudwatchlogs.Client
 	migrateMu         sync.Mutex
 	migrationCooldown time.Duration
 	migrationAbort    chan struct{}

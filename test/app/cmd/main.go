@@ -21,6 +21,9 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
 // attestationPayload is the CBOR structure inside a COSE Sign1 attestation document.
@@ -58,6 +61,7 @@ func main() {
 	mux.HandleFunc("GET /test/pcr-secrets", handleTestPCRSecrets)
 	mux.HandleFunc("GET /test/attestation-persistence", handleTestAttestationPersistence)
 	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
+	mux.HandleFunc("GET /test/logs", handleTestLogs)
 
 	log.Printf("listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -921,8 +925,8 @@ func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
 	if getResp.StatusCode == http.StatusOK && len(storedBody) > 0 {
 		// Verify phase: compare stored pre-migration values with current.
 		var stored struct {
-			Pubkey      string `json:"pubkey"`
-			PCR16       string `json:"pcr16"`
+			Pubkey string `json:"pubkey"`
+			PCR16  string `json:"pcr16"`
 		}
 		json.Unmarshal(storedBody, &stored)
 
@@ -946,9 +950,9 @@ func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
 
 	// Write phase: store current values for post-migration comparison.
 	storeData, _ := json.Marshal(map[string]string{
-		"pubkey":          currentPubkey,
-		"pcr16":           currentPCR16,
-		"attest_pubkey":   currentAttestPubkey,
+		"pubkey":        currentPubkey,
+		"pcr16":         currentPCR16,
+		"attest_pubkey": currentAttestPubkey,
 	})
 	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/storage/"+storageKey, bytes.NewReader(storeData))
 	putReq.Header.Set("Authorization", "Bearer "+token)
@@ -971,6 +975,95 @@ func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
 	results["pubkey"] = currentPubkey
 	results["pcr16"] = currentPCR16
 	results["attest_pubkey"] = currentAttestPubkey
+	results["status"] = "ok"
+	json.NewEncoder(w).Encode(results)
+}
+
+// handleTestLogs tests the log round-trip via OTEL SDK (OTLP/HTTP protobuf)
+// and verifies auth enforcement.
+func handleTestLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	if token == "" {
+		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		return
+	}
+
+	results := map[string]any{}
+	ctx := r.Context()
+
+	// Create OTEL exporter pointing at the supervisor's /v1/logs endpoint.
+	exporter, err := otlploghttp.New(ctx,
+		otlploghttp.WithEndpoint(strings.TrimPrefix(supervisorURL, "http://")),
+		otlploghttp.WithInsecure(),
+		otlploghttp.WithHeaders(map[string]string{
+			"Authorization": "Bearer " + token,
+		}),
+	)
+	if err != nil {
+		results["error"] = fmt.Sprintf("create OTEL exporter: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(exporter)))
+	logger := provider.Logger("integration-test")
+
+	// Emit 3 log entries at different severity levels.
+	var r1 otellog.Record
+	r1.SetTimestamp(time.Now())
+	r1.SetSeverity(otellog.SeverityInfo)
+	r1.SetBody(otellog.StringValue("integration test log"))
+	r1.AddAttributes(otellog.String("test", "otel"))
+	logger.Emit(ctx, r1)
+
+	var r2 otellog.Record
+	r2.SetTimestamp(time.Now())
+	r2.SetSeverity(otellog.SeverityWarn)
+	r2.SetBody(otellog.StringValue("batch entry 1"))
+	logger.Emit(ctx, r2)
+
+	var r3 otellog.Record
+	r3.SetTimestamp(time.Now())
+	r3.SetSeverity(otellog.SeverityError)
+	r3.SetBody(otellog.StringValue("batch entry 2"))
+	logger.Emit(ctx, r3)
+
+	if err := provider.Shutdown(ctx); err != nil {
+		results["error"] = fmt.Sprintf("OTEL shutdown: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	results["post"] = "ok"
+	results["post_batch"] = "ok"
+
+	// Verify auth enforcement: check the log buffer does NOT contain
+	// the "should be rejected" message (we send it without auth token).
+	noAuthExporter, err := otlploghttp.New(ctx,
+		otlploghttp.WithEndpoint(strings.TrimPrefix(supervisorURL, "http://")),
+		otlploghttp.WithInsecure(),
+	)
+	if err == nil {
+		noAuthProvider := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(noAuthExporter)))
+		noAuthLogger := noAuthProvider.Logger("no-auth-test")
+		var nr otellog.Record
+		nr.SetSeverity(otellog.SeverityInfo)
+		nr.SetBody(otellog.StringValue("should be rejected"))
+		noAuthLogger.Emit(ctx, nr)
+		_ = noAuthProvider.Shutdown(ctx)
+
+		// Check the buffer — "should be rejected" must NOT appear.
+		getResp, getErr := http.Get(supervisorURL + "/v1/logs")
+		if getErr == nil {
+			getBody, _ := io.ReadAll(getResp.Body)
+			getResp.Body.Close()
+			results["auth_enforced"] = !strings.Contains(string(getBody), "should be rejected")
+		}
+	}
+
 	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
 }

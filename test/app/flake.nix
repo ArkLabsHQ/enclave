@@ -42,6 +42,8 @@
               hash = sdkCfg.hash;
             };
 
+        sdkLocal = builtins.getEnv "SDK_LOCAL_PATH" != "";
+
         enclave-supervisor = pkgs.buildGoModule {
           pname = "enclave-supervisor";
           version = buildCfg.version;
@@ -49,7 +51,7 @@
           src = sdkSrc;
 
           sourceRoot = "source/sdk";
-          vendorHash = sdkCfg.vendor_hash;
+          vendorHash = if sdkLocal then null else sdkCfg.vendor_hash;
           subPackages = [ "cmd/enclave-supervisor" ];
           env.CGO_ENABLED = "0";
           ldflags = [

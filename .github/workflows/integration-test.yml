@@ -38,7 +38,10 @@ jobs:
       - name: Build test EIFs
         run: |
           go build -o /tmp/enclave-cli ./cmd/enclave
-          cd test/app
+          export SDK_LOCAL_PATH=$GITHUB_WORKSPACE
+
+          # Vendor SDK dependencies (vendor/ is gitignored, Nix needs it when using local source).
+          cd $SDK_LOCAL_PATH/sdk && go mod vendor && cd $GITHUB_WORKSPACE/test/app
 
           # Build v1 EIF.
           /tmp/enclave-cli build --local

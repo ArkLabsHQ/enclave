@@ -18,18 +18,24 @@ import (
 )
 
 func main() {
-	sdk.InitLogging()
+	// 1. Create enclave (instant — no blocking work).
+	enc, err := sdk.New()
+	if err != nil {
+		sdk.InitLogging() // fallback for early errors
+		slog.Error("create enclave failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Set up logging: every slog call writes to both stderr (JSON) and the
+	// LogBuffer (queryable via GET /v1/logs). Must happen before Init() so
+	// init stages are captured.
+	slog.SetDefault(slog.New(
+		sdk.NewBufferHandler(enc.GetLogBuffer(), enc.GetLogShipCh()),
+	))
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// 1. Create enclave (instant — no blocking work).
-	enc, err := sdk.New()
-	if err != nil {
-		slog.Error("create enclave failed", "error", err)
-		os.Exit(1)
-	}
 
 	// 2. Ports.
 	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")
@@ -47,18 +53,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		if !enc.IsReady() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"status": "initializing",
-				"error":  enc.InitError(),
-			})
-			return
-		}
-		if enc.InitError() != "" {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"status": "degraded",
-				"error":  enc.InitError(),
-			})
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "initializing"})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})

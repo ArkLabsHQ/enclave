@@ -26,7 +26,7 @@ app:
   nix_repo: "introspector-enclave"
   nix_rev: "01e1caa74a01d2ce1b0b322f1ccc3fbd2450c69d"
   nix_hash: "sha256-KytvlwE+91TmHeQmo7E2PdwLfNZN6jTE++VSRVwiiPM="
-  nix_vendor_hash: "sha256-Qb+fEpMI21oy93Nuu5Tw2n91PKByVv6qeWNuF6JtytE="
+  nix_vendor_hash: "sha256-yvqx/wUO5m7PFtJwXEtVNLTO0HJXe2yKL4E2PwPn/fo="
   nix_sub_packages:
     - "cmd"
   binary_name: "test-app"
@@ -40,11 +40,18 @@ app:
     AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
+    ENCLAVE_LOG_CLOUDWATCH: "true"
+    AWS_ENDPOINT_URL_LOGS: "http://host.containers.internal:4566"
 
 # One secret for testing KMS secret init and migration.
 secrets:
   - name: signing_key
     env_var: SIGNING_KEY
+
+
+
+
+
 
 
 

@@ -14,18 +14,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
-// handleLogs proxies log entries from the enclave supervisor (live),
-// or queries CloudWatch Logs for historical logs when ?history=true.
-// GET /enclave-logs?since=RFC3339&level=info&limit=100&history=true
-func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
+// handleTraces proxies trace spans from the enclave supervisor (live),
+// or queries CloudWatch Logs for historical spans when ?history=true.
+// GET /enclave-traces?since=RFC3339&limit=100&service=app|supervisor&history=true
+func (s *server) handleTraces(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("history") == "true" {
-		s.handleLogsHistory(w, r)
+		s.handleTracesHistory(w, r)
 		return
 	}
 
-	// Live pull from enclave supervisor (existing behavior).
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
-	u, err := url.Parse(enclaveURL + "/v1/enclave-logs")
+	u, err := url.Parse(enclaveURL + "/v1/enclave-traces")
 	if err != nil {
 		http.Error(w, `{"error":"bad enclave URL"}`, http.StatusInternalServerError)
 		return
@@ -45,11 +44,10 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// handleLogsHistory queries CloudWatch Logs for historical log entries.
-func (s *server) handleLogsHistory(w http.ResponseWriter, r *http.Request) {
-	logGroup := fmt.Sprintf("/enclave/%s/%s/logs", s.deployment, s.appName)
+// handleTracesHistory queries CloudWatch Logs for historical span entries.
+func (s *server) handleTracesHistory(w http.ResponseWriter, r *http.Request) {
+	logGroup := fmt.Sprintf("/enclave/%s/%s/traces", s.deployment, s.appName)
 
-	// Parse query params.
 	var startTime *int64
 	if since := r.URL.Query().Get("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339Nano, since); err == nil {
@@ -66,22 +64,12 @@ func (s *server) handleLogsHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	level := strings.ToLower(r.URL.Query().Get("level"))
+	service := strings.ToLower(r.URL.Query().Get("service"))
 
-	// Build filter pattern for level if specified.
 	var filterPattern *string
-	if level != "" {
-		// CloudWatch JSON filter: match level field.
-		// For severity filtering, we include all levels >= requested.
-		levels := levelAndAbove(level)
-		if len(levels) > 0 {
-			parts := make([]string, len(levels))
-			for i, l := range levels {
-				parts[i] = fmt.Sprintf(`$.level = %q`, l)
-			}
-			pattern := "{ " + strings.Join(parts, " || ") + " }"
-			filterPattern = aws.String(pattern)
-		}
+	if service != "" {
+		pattern := fmt.Sprintf(`{ $.source = %q }`, service)
+		filterPattern = aws.String(pattern)
 	}
 
 	input := &cloudwatchlogs.FilterLogEventsInput{
@@ -101,7 +89,6 @@ func (s *server) handleLogsHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse log events back into LogEntry format.
 	entries := make([]json.RawMessage, 0, len(result.Events))
 	for _, event := range result.Events {
 		if event.Message != nil {
@@ -111,20 +98,4 @@ func (s *server) handleLogsHistory(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entries)
-}
-
-// levelAndAbove returns the given level and all levels above it.
-func levelAndAbove(level string) []string {
-	order := []string{"debug", "info", "warn", "error"}
-	idx := -1
-	for i, l := range order {
-		if l == level {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		return nil
-	}
-	return order[idx:]
 }

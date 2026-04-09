@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -21,9 +22,15 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
-	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
 // attestationPayload is the CBOR structure inside a COSE Sign1 attestation document.
@@ -49,6 +56,28 @@ func main() {
 	}
 	supervisorURL = "http://127.0.0.1:" + proxyPort
 
+	// Set up OTEL tracing: export spans to the supervisor's /v1/enclave-traces endpoint.
+	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	if token != "" {
+		ctx := context.Background()
+		traceExporter, err := otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint("127.0.0.1:"+proxyPort),
+			otlptracehttp.WithURLPath("/v1/enclave-traces"),
+			otlptracehttp.WithInsecure(),
+			otlptracehttp.WithHeaders(map[string]string{
+				"Authorization": "Bearer " + token,
+			}),
+		)
+		if err == nil {
+			tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExporter))
+			otel.SetTracerProvider(tp)
+			defer func() { _ = tp.Shutdown(ctx) }()
+			log.Printf("OTEL tracing enabled (exporting to %s/v1/traces)", supervisorURL)
+		} else {
+			log.Printf("OTEL tracing setup failed: %v", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleRoot)
 	mux.HandleFunc("GET /test/secrets", handleTestSecrets)
@@ -63,11 +92,25 @@ func main() {
 	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
 	mux.HandleFunc("GET /test/logs", handleTestLogs)
 
+	// Wrap mux with otelhttp — every incoming request creates a span automatically.
+	handler := otelhttp.NewHandler(mux, "test-app",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}),
+	)
+
 	log.Printf("listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Create a child span to simulate app-level work.
+	tracer := otel.Tracer("test-app")
+	_, span := tracer.Start(r.Context(), "handleRoot.work",
+		otelTrace.WithAttributes(attribute.String("app", "test-enclave-app")),
+	)
+	defer span.End()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":     "ok",
@@ -1056,7 +1099,7 @@ func handleTestLogs(w http.ResponseWriter, r *http.Request) {
 		_ = noAuthProvider.Shutdown(ctx)
 
 		// Check the buffer — "should be rejected" must NOT appear.
-		getResp, getErr := http.Get(supervisorURL + "/v1/logs")
+		getResp, getErr := http.Get(supervisorURL + "/v1/enclave-logs")
 		if getErr == nil {
 			getBody, _ := io.ReadAll(getResp.Body)
 			getResp.Body.Close()

@@ -27,15 +27,19 @@ func main() {
 	}
 
 	// Set up logging: every slog call writes to both stderr (JSON) and the
-	// LogBuffer (queryable via GET /v1/logs). Must happen before Init() so
+	// LogBuffer (queryable via GET /v1/enclave-logs). Must happen before Init() so
 	// init stages are captured.
 	slog.SetDefault(slog.New(
 		sdk.NewBufferHandler(enc.GetLogBuffer(), enc.GetLogShipCh()),
 	))
 
+	// Set up tracing: supervisor spans go directly into the SpanBuffer.
+	shutdownTracing := sdk.StartSupervisorTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
+
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	defer func() { _ = shutdownTracing(ctx) }()
 
 	// 2. Ports.
 	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")

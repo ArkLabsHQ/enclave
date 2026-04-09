@@ -87,7 +87,7 @@ func runLog(level string, limit int, since string, asJSON bool, history bool) er
 		params.Set("history", "true")
 	}
 
-	curlURL := "http://localhost:8443/logs"
+	curlURL := "http://localhost:8443/enclave-logs"
 	if q := params.Encode(); q != "" {
 		curlURL += "?" + q
 	}

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -196,7 +197,7 @@ func (e *Enclave) handleLogPost(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogGet returns buffered log entries.
-// GET /v1/logs?since=RFC3339&level=info&limit=100
+// GET /v1/enclave-logs?since=RFC3339&level=info&limit=100
 // No auth required (read-only, same as metrics).
 func (e *Enclave) handleLogGet(w http.ResponseWriter, r *http.Request) {
 	var since time.Time
@@ -300,6 +301,9 @@ func (e *Enclave) runLogShipper(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
+		sort.Slice(batch, func(i, j int) bool {
+			return *batch[i].Timestamp < *batch[j].Timestamp
+		})
 		_, err := client.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
 			LogGroupName:  aws.String(logGroup),
 			LogStreamName: aws.String(logStream),

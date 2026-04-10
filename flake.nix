@@ -190,10 +190,31 @@
           env = enclaveEnv;
         };
 
+        # Vendor hash check — same as upstream-app but with vendorHash = ""
+        # to trigger hash mismatch. Used by `enclave setup` to discover the
+        # correct vendor hash. Always fails; the "got:" line has the answer.
+        vendor-hash-check = eifPkgs.buildGoModule {
+          pname = "vendor-hash-check";
+          version = buildCfg.version;
+
+          src = eifPkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
+
+          vendorHash = "";
+          proxyVendor = true;
+          subPackages = appCfg.nix_sub_packages;
+          env.CGO_ENABLED = "0";
+          doCheck = false;
+        };
+
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif;
+          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }

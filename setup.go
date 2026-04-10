@@ -3,7 +3,6 @@ package introspector_enclave
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -118,7 +117,25 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("[setup] nix_hash: %s\n", nixHash)
 
-	// 4. Compute vendor/deps hash via trial nix build.
+	// 4. Write nix_rev, nix_hash, owner, repo to enclave.yaml first
+	//    so the flake's vendor-hash-check can fetch the correct source.
+	{
+		cfgPath := filepath.Join(root, configFile)
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", configFile, err)
+		}
+		content := string(data)
+		content = replaceYAMLValue(content, "nix_rev", rev)
+		content = replaceYAMLValue(content, "nix_hash", nixHash)
+		content = replaceYAMLValue(content, "nix_owner", owner)
+		content = replaceYAMLValue(content, "nix_repo", repo)
+		if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", configFile, err)
+		}
+	}
+
+	// 5. Compute vendor/deps hash via trial nix build.
 	if language == "dotnet" {
 		fmt.Println("[setup] Generating NuGet deps.json...")
 		vendorErr = generateDotnetDeps(root)
@@ -412,22 +429,35 @@ func buildTrialExpr(language string, subPackages []string, escaped bool, nixpkgs
 	}
 }
 
-// computeVendorHash runs a trial nix build with an empty deps hash to discover
-// the expected hash. It reads the nixpkgs commit from flake.lock so the trial
-// build uses the exact same nixpkgs as `enclave build`, ensuring reproducibility.
+// computeVendorHash discovers the correct deps hash by running a trial build
+// using the project's flake. The flake exposes a `vendor-hash-check` package
+// that builds the app's Go modules with vendorHash = "", which always fails
+// and prints the correct hash. This ensures the hash matches the exact nixpkgs
+// pin in flake.lock — same Go version as `enclave build`.
 func computeVendorHash(root string, subPackages []string, language string) (string, error) {
-	// Read nixpkgs rev from flake.lock for exact pin.
-	nixpkgsRev := readNixpkgsRevFromLock(root)
+	// Generate build-config.json so the flake can read the app config.
+	cfg, err := loadConfig()
+	if err != nil {
+		return "", fmt.Errorf("load config for trial build: %w", err)
+	}
+	if err := generateBuildConfig(cfg, root); err != nil {
+		return "", fmt.Errorf("generate build-config.json: %w", err)
+	}
 
-	expr := buildTrialExpr(language, subPackages, false, nixpkgsRev)
+	// Ensure files are git-tracked (flakes only see tracked files).
+	ensureGitTracked(root, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+
+	configPath := filepath.Join(root, "enclave", "build-config.json")
+	absConfigPath, _ := filepath.Abs(configPath)
 
 	cmd := exec.Command("nix", "build",
 		"--impure",
 		"--no-link",
 		"--extra-experimental-features", "nix-command flakes",
-		"--expr", expr,
+		".#vendor-hash-check",
 	)
 	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "BUILD_CONFIG_PATH="+absConfigPath)
 
 	// We expect this to fail — we want the stderr output with the expected hash.
 	var stderr bytes.Buffer
@@ -442,34 +472,10 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 	matches := re.FindStringSubmatch(output)
 	if len(matches) < 2 {
 		fmt.Fprintf(os.Stderr, "\n[setup] Trial build output:\n%s\n", output)
-		return "", fmt.Errorf("could not extract vendor hash from trial build output (run a manual nix build with vendorHash = \"\" and look for the 'got:' line)")
+		return "", fmt.Errorf("could not extract vendor hash from trial build output")
 	}
 
 	return matches[1], nil
-}
-
-// readNixpkgsRevFromLock reads the nixpkgs locked revision from flake.lock.
-// Returns empty string if flake.lock doesn't exist or can't be parsed.
-func readNixpkgsRevFromLock(root string) string {
-	lockPath := filepath.Join(root, "flake.lock")
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		return ""
-	}
-	var lock struct {
-		Nodes map[string]struct {
-			Locked struct {
-				Rev string `json:"rev"`
-			} `json:"locked"`
-		} `json:"nodes"`
-	}
-	if err := json.Unmarshal(data, &lock); err != nil {
-		return ""
-	}
-	if node, ok := lock.Nodes["nixpkgs"]; ok && node.Locked.Rev != "" {
-		return node.Locked.Rev
-	}
-	return ""
 }
 
 // generateDotnetDeps generates a deps.json file for a .NET project using

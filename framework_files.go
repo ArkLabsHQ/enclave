@@ -740,10 +740,27 @@ const frameworkFlakeNix = `{
           env = enclaveEnv;
         };
 
+        # Vendor hash check — used by enclave setup to discover the correct hash.
+        vendor-hash-check = eifPkgs.buildGoModule {
+          pname = "vendor-hash-check";
+          version = buildCfg.version;
+          src = eifPkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
+          vendorHash = "";
+          proxyVendor = true;
+          subPackages = appCfg.nix_sub_packages;
+          env.CGO_ENABLED = "0";
+          doCheck = false;
+        };
+
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif;
+          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }
@@ -948,10 +965,27 @@ LAUNCHER
           env = enclaveEnv;
         };
 
+        # Vendor hash check — used by enclave setup to discover the correct hash.
+        vendor-hash-check = eifPkgs.buildGoModule {
+          pname = "vendor-hash-check";
+          version = buildCfg.version;
+          src = eifPkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
+          vendorHash = "";
+          proxyVendor = true;
+          subPackages = appCfg.nix_sub_packages;
+          env.CGO_ENABLED = "0";
+          doCheck = false;
+        };
+
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif;
+          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }
@@ -1474,10 +1508,27 @@ const frameworkFlakeNixDotnet = `{
           env = enclaveEnv;
         };
 
+        # Vendor hash check — used by enclave setup to discover the correct hash.
+        vendor-hash-check = eifPkgs.buildGoModule {
+          pname = "vendor-hash-check";
+          version = buildCfg.version;
+          src = eifPkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
+          vendorHash = "";
+          proxyVendor = true;
+          subPackages = appCfg.nix_sub_packages;
+          env.CGO_ENABLED = "0";
+          doCheck = false;
+        };
+
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif;
+          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }
@@ -1661,10 +1712,27 @@ const frameworkFlakeNixRust = `{
           env = enclaveEnv;
         };
 
+        # Vendor hash check — used by enclave setup to discover the correct hash.
+        vendor-hash-check = eifPkgs.buildGoModule {
+          pname = "vendor-hash-check";
+          version = buildCfg.version;
+          src = eifPkgs.fetchFromGitHub {
+            owner = appCfg.nix_owner;
+            repo = appCfg.nix_repo;
+            rev = appCfg.nix_rev;
+            hash = appCfg.nix_hash;
+          };
+          vendorHash = "";
+          proxyVendor = true;
+          subPackages = appCfg.nix_sub_packages;
+          env.CGO_ENABLED = "0";
+          doCheck = false;
+        };
+
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif;
+          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }

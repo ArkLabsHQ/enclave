@@ -103,7 +103,7 @@ jobs:
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
           git fetch origin master
 
-          /tmp/enclave-cli setup --local --commit ${{ matrix.commit1 }}
+          /tmp/enclave-cli setup --commit ${{ matrix.commit1 }}
 
           # Verify nix_rev is the full SHA.
           grep -q '${{ matrix.commit1_full }}' enclave/enclave.yaml || { echo "FAIL: nix_rev != ${{ matrix.commit1_full }}"; exit 1; }

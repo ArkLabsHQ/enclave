@@ -1,7 +1,6 @@
 package introspector_enclave
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,14 +18,6 @@ type PCRValues struct {
 	PCR0 string `json:"PCR0"`
 	PCR1 string `json:"PCR1"`
 	PCR2 string `json:"PCR2"`
-}
-
-// EIFBuildConfig holds the parameters needed to build an EIF.
-type EIFBuildConfig struct {
-	NixImage string
-	Version  string
-	Region   string
-	Prefix   string
 }
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
@@ -68,14 +59,12 @@ type buildConfigSDKJSON struct {
 }
 
 func buildCmd() *cobra.Command {
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Use:   "build",
 		Short: "Build the enclave image (EIF)",
-		Long:  "Builds a reproducible Enclave Image File using Docker + Nix.\nUse --local to build with a local Nix installation instead of Docker.",
+		Long:  "Builds a reproducible Enclave Image File using Nix.",
 		RunE:  runBuild,
 	}
-	cmd.Flags().Bool("local", false, "Build using local Nix instead of Docker")
-	return cmd
 }
 
 func runBuild(cmd *cobra.Command, args []string) error {
@@ -110,19 +99,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	local, _ := cmd.Flags().GetBool("local")
-
-	var pcrs *PCRValues
-	if local {
-		pcrs, err = BuildEIFLocal(cfg, root)
-	} else {
-		pcrs, err = BuildEIF(EIFBuildConfig{
-			NixImage: cfg.NixImage,
-			Version:  cfg.Version,
-			Region:   cfg.Region,
-			Prefix:   cfg.Prefix,
-		}, root)
-	}
+	pcrs, err := BuildEIF(cfg, root)
 	if err != nil {
 		return err
 	}
@@ -231,70 +208,8 @@ func ensureGitTracked(root string, paths ...string) {
 	_ = cmd.Run() // best-effort; ignore errors (e.g. no git repo)
 }
 
-// BuildEIF builds the enclave image (EIF) reproducibly using Docker + Nix.
-func BuildEIF(cfg EIFBuildConfig, root string) (*PCRValues, error) {
-	nixImage := cfg.NixImage
-	if nixImage == "" {
-		nixImage = DefaultNixImage
-	}
-
-	// 1. Clean and create artifacts directory.
-	artifactsDir := filepath.Join(root, "enclave", "artifacts")
-	if err := os.RemoveAll(artifactsDir); err != nil {
-		return nil, fmt.Errorf("clean artifacts: %w", err)
-	}
-	if err := os.MkdirAll(artifactsDir, 0755); err != nil {
-		return nil, fmt.Errorf("create artifacts dir: %w", err)
-	}
-
-	fmt.Printf("[build] Building EIF with %s (version=%s, region=%s, prefix=%s)\n",
-		nixImage, cfg.Version, cfg.Region, cfg.Prefix)
-
-	// 2. Ensure Nix-visible files are tracked by git (flakes only see tracked files).
-	ensureGitTracked(root, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
-
-	// 3. Run Nix build inside Docker container.
-	nixCmd := "git config --global --add safe.directory /src && " +
-		"nix build --impure --extra-experimental-features 'nix-command flakes' --out-link flake_result .#eif && " +
-		"cp flake_result/image.eif /src/enclave/artifacts/image.eif && " +
-		"cp flake_result/pcr.json /src/enclave/artifacts/pcr.json"
-
-	env := []string{
-		"VERSION=" + cfg.Version,
-		"AWS_REGION=" + cfg.Region,
-		"CDK_PREFIX=" + cfg.Prefix,
-	}
-
-	if err := runContainer(context.Background(), nixImage, nixCmd, root, "/src", env); err != nil {
-		return nil, fmt.Errorf("docker nix build failed: %w", err)
-	}
-
-	// 3. Verify artifacts exist.
-	pcrPath := filepath.Join(artifactsDir, "pcr.json")
-	if _, err := os.Stat(pcrPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("enclave/artifacts/pcr.json not found after build")
-	}
-	eifPath := filepath.Join(artifactsDir, "image.eif")
-	if _, err := os.Stat(eifPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("enclave/artifacts/image.eif not found after build")
-	}
-
-	// 4. Parse PCR values.
-	pcrData, err := os.ReadFile(pcrPath)
-	if err != nil {
-		return nil, fmt.Errorf("read pcr.json: %w", err)
-	}
-
-	var pcrs PCRValues
-	if err := json.Unmarshal(pcrData, &pcrs); err != nil {
-		return nil, fmt.Errorf("parse pcr.json: %w", err)
-	}
-
-	return &pcrs, nil
-}
-
-// BuildEIFLocal builds the EIF using a local Nix installation (no Docker).
-func BuildEIFLocal(cfg *Config, root string) (*PCRValues, error) {
+// BuildEIF builds the enclave image (EIF) reproducibly using Nix.
+func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 	// 1. Clean and create artifacts directory.
 	artifactsDir := filepath.Join(root, "enclave", "artifacts")
 	if err := os.RemoveAll(artifactsDir); err != nil {

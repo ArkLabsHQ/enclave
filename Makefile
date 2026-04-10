@@ -66,7 +66,7 @@ _test-cli-lang:
 	git init -q; \
 	git remote add origin https://github.com/ArkLabsHQ/introspector-enclave.git; \
 	git add .; \
-	git -c user.email=ci@test -c user.name=CI commit -q -m "init"; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "init"; \
 	echo "[test] enclave init --language $(LANG)"; \
 	$(CLI_BIN) init --language $(LANG); \
 	test -f enclave/enclave.yaml; \
@@ -76,11 +76,11 @@ _test-cli-lang:
 	test -f enclave/tofu/modules/enclave/kms.tf; \
 	grep -q '/dev/nsm' enclave/start.sh; \
 	grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf; \
-	echo "[test] enclave setup --local --commit $(COMMIT1)"; \
+	echo "[test] enclave setup --commit $(COMMIT1)"; \
 	git add .; \
-	git -c user.email=ci@test -c user.name=CI commit -q -m "add enclave files"; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "add enclave files"; \
 	git fetch -q "$$REPO_ROOT" master; \
-	$(CLI_BIN) setup --local --commit $(COMMIT1); \
+	$(CLI_BIN) setup --commit $(COMMIT1); \
 	grep -q '$(COMMIT1_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
 	grep -q '$(COMMIT1_HASH)' enclave/enclave.yaml || { echo "FAIL: nix_hash"; exit 1; }; \
 	grep -q 'nix_owner: "ArkLabsHQ"' enclave/enclave.yaml; \
@@ -88,6 +88,16 @@ _test-cli-lang:
 	if [ "$(LANG)" = "go" ]; then \
 		grep -q '$(COMMIT1_VENDOR_HASH_GO)' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash"; cat enclave/enclave.yaml; exit 1; }; \
 	fi; \
+	echo "[test] enclave build"; \
+	git add .; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "pre-build commit"; \
+	$(CLI_BIN) build || { echo "FAIL: enclave build"; exit 1; }; \
+	test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }; \
+	test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }; \
+	jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing from pcr.json"; exit 1; }; \
+	test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }; \
+	test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }; \
+	echo "[test] build artifacts verified"; \
 	echo "[test] enclave update --commit $(COMMIT2)"; \
 	$(CLI_BIN) update --commit $(COMMIT2); \
 	grep -q '$(COMMIT2_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
@@ -99,7 +109,7 @@ test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 	cd sdk && go mod vendor
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
@@ -109,12 +119,12 @@ test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
 	fi
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
 	cp /tmp/image-v2.eif test/app/enclave/artifacts/image-v2.eif
 	cp /tmp/pcr-v2.json test/app/enclave/artifacts/pcr-v2.json

@@ -1717,7 +1717,7 @@ const frameworkFlakeNixRust = `{
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
           cargoRoot = appCfg.nix_subdir;
           buildAndTestSubdir = appCfg.nix_subdir;
-        } else {}));
+        } else {});
 
       in
       {

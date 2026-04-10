@@ -459,19 +459,20 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "BUILD_CONFIG_PATH="+absConfigPath)
 
-	// We expect this to fail — we want the stderr output with the expected hash.
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Stdout = os.Stdout
+	// We expect this to fail — we want the error output with the expected hash.
+	// Capture both stdout and stderr since Nix may print the hash on either.
+	var output bytes.Buffer
+	cmd.Stderr = &output
+	cmd.Stdout = &output
 
 	_ = cmd.Run() // intentionally ignore error — we expect failure
 
-	// Parse "got:    sha256-..." from output.
-	output := stderr.String()
+	// Parse "got:    sha256-..." from combined output.
+	outputStr := output.String()
 	re := regexp.MustCompile(`got:\s+(sha256-\S+)`)
-	matches := re.FindStringSubmatch(output)
+	matches := re.FindStringSubmatch(outputStr)
 	if len(matches) < 2 {
-		fmt.Fprintf(os.Stderr, "\n[setup] Trial build output:\n%s\n", output)
+		fmt.Fprintf(os.Stderr, "\n[setup] Trial build output:\n%s\n", outputStr)
 		return "", fmt.Errorf("could not extract vendor hash from trial build output")
 	}
 

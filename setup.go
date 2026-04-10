@@ -454,6 +454,7 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 		"--impure",
 		"--no-link",
 		"--extra-experimental-features", "nix-command flakes",
+		"--option", "eval-cache", "false",
 		".#vendor-hash-check",
 	)
 	cmd.Dir = root

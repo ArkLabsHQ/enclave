@@ -200,7 +200,7 @@
           hash = appCfg.nix_hash;
         };
 
-        vendor-hash-check = (eifPkgs.buildGoModule {
+        vendor-hash-check = eifPkgs.buildGoModule ({
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = appSrc;
@@ -209,7 +209,7 @@
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
-        }) // (if (appCfg.nix_subdir or "") != "" then {
+        } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/${appCfg.nix_subdir}";
         } else {});
 

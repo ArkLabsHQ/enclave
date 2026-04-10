@@ -741,7 +741,7 @@ const frameworkFlakeNix = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.buildGoModule {
+        vendor-hash-check = eifPkgs.buildGoModule ({
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -968,7 +968,7 @@ LAUNCHER
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.buildNpmPackage {
+        vendor-hash-check = eifPkgs.buildNpmPackage ({
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -980,7 +980,7 @@ LAUNCHER
           npmDepsHash = "";
           dontNpmBuild = true;
           doCheck = false;
-        }) // (if (appCfg.nix_subdir or "") != "" then {
+        } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
 
@@ -1702,7 +1702,7 @@ const frameworkFlakeNixRust = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.rustPlatform.buildRustPackage {
+        vendor-hash-check = eifPkgs.rustPlatform.buildRustPackage ({
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -1713,11 +1713,11 @@ const frameworkFlakeNixRust = `{
           };
           cargoHash = "";
           doCheck = false;
-        }) // (if (appCfg.nix_subdir or "") != "" then {
-          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source";
           cargoRoot = appCfg.nix_subdir;
           buildAndTestSubdir = appCfg.nix_subdir;
-        } else {});
+        } else {}));
 
       in
       {

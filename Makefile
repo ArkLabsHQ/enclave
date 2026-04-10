@@ -80,6 +80,7 @@ _test-cli-lang:
 	git add .; \
 	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "add enclave files"; \
 	git fetch -q "$$REPO_ROOT" master; \
+	sed -i 's/nix_subdir: ""/nix_subdir: "test\/cli\/$(LANG)-app"/' enclave/enclave.yaml; \
 	$(CLI_BIN) setup --commit $(COMMIT1); \
 	grep -q '$(COMMIT1_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
 	grep -q '$(COMMIT1_HASH)' enclave/enclave.yaml || { echo "FAIL: nix_hash"; exit 1; }; \

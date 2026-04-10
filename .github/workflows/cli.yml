@@ -19,7 +19,7 @@ jobs:
             commit1: "6710409"
             commit1_full: "67104090b28d8a5358dd036e2454881643735a3f"
             commit1_hash: "sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous="
-            commit1_vendor_hash: "sha256-UA4Oc/fkprVH/9dZm7T0RQlfHzOwW1F3nUYTydOp0VE="
+            commit1_vendor_hash: "sha256-iHqsoRGivzNcZTOpaXCckpQ/sRSdRA/5/hZ8VXchfjg="
             commit2: "7599ce0"
             commit2_full: "7599ce0474a8fdee97dd18625f3a4258813d7815"
             commit2_hash: "sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE="
@@ -99,6 +99,9 @@ jobs:
           set -e
           cd "$WORK"
 
+          # Set nix_subdir so the flake builds from the app subdirectory.
+          sed -i 's/nix_subdir: ""/nix_subdir: "test\/cli\/${{ matrix.language }}-app"/' enclave/enclave.yaml
+
           git add .
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"
           git fetch origin master
@@ -123,7 +126,27 @@ jobs:
 
           echo "PASS: enclave setup (nix_rev=${{ matrix.commit1_full }}, nix_hash=${{ matrix.commit1_hash }})"
 
-      # ── 3. enclave update ─────────────────────────────────────────
+      # ── 3. enclave build ──────────────────────────────────────────
+      - name: "enclave build"
+        run: |
+          set -e
+          cd "$WORK"
+
+          git add .
+          git -c user.email=ci@test -c user.name=CI commit -m "pre-build" || true
+
+          /tmp/enclave-cli build
+
+          # Verify artifacts.
+          test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }
+          test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }
+          jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing"; exit 1; }
+          test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }
+          test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }
+
+          echo "PASS: enclave build (artifacts verified)"
+
+      # ── 4. enclave update ─────────────────────────────────────────
       - name: "enclave update --commit ${{ matrix.commit2 }}"
         run: |
           set -e

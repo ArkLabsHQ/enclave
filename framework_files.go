@@ -741,7 +741,7 @@ const frameworkFlakeNix = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.buildGoModule {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -755,7 +755,9 @@ const frameworkFlakeNix = `{
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
       in
       {
@@ -966,7 +968,7 @@ LAUNCHER
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.buildGoModule {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -980,7 +982,9 @@ LAUNCHER
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
       in
       {
@@ -1509,7 +1513,7 @@ const frameworkFlakeNixDotnet = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.buildGoModule {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -1523,7 +1527,9 @@ const frameworkFlakeNixDotnet = `{
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
       in
       {
@@ -1713,7 +1719,7 @@ const frameworkFlakeNixRust = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.buildGoModule {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -1727,7 +1733,9 @@ const frameworkFlakeNixRust = `{
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
-        };
+        } // (if (appCfg.nix_subdir or "") != "" then {
+          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+        } else {}));
 
       in
       {

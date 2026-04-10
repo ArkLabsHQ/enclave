@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -21,9 +22,18 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
-	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	otellog "go.opentelemetry.io/otel/log"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
 // attestationPayload is the CBOR structure inside a COSE Sign1 attestation document.
@@ -37,6 +47,9 @@ type attestationPayload struct {
 // The test app calls back to it for storage/secrets management.
 var supervisorURL string
 
+// appRequestCounter is an OTEL counter incremented on each request.
+var appRequestCounter otelmetric.Int64Counter
+
 func main() {
 	port := os.Getenv("ENCLAVE_APP_PORT")
 	if port == "" {
@@ -48,6 +61,48 @@ func main() {
 		proxyPort = "7073"
 	}
 	supervisorURL = "http://127.0.0.1:" + proxyPort
+
+	// Set up OTEL tracing + metrics: export to the supervisor's endpoints.
+	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	if token != "" {
+		ctx := context.Background()
+		headers := map[string]string{"Authorization": "Bearer " + token}
+
+		// Tracing exporter.
+		traceExporter, err := otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint("127.0.0.1:"+proxyPort),
+			otlptracehttp.WithURLPath("/v1/enclave-traces"),
+			otlptracehttp.WithInsecure(),
+			otlptracehttp.WithHeaders(headers),
+		)
+		if err == nil {
+			tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExporter))
+			otel.SetTracerProvider(tp)
+			defer func() { _ = tp.Shutdown(ctx) }()
+			log.Printf("OTEL tracing enabled")
+		}
+
+		// Metrics exporter.
+		metricExporter, err := otlpmetrichttp.New(ctx,
+			otlpmetrichttp.WithEndpoint("127.0.0.1:"+proxyPort),
+			otlpmetrichttp.WithURLPath("/v1/enclave-metrics"),
+			otlpmetrichttp.WithInsecure(),
+			otlpmetrichttp.WithHeaders(headers),
+		)
+		if err == nil {
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(
+				sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(5*time.Second)),
+			))
+			otel.SetMeterProvider(mp)
+			defer func() { _ = mp.Shutdown(ctx) }()
+
+			meter := mp.Meter("test-app")
+			appRequestCounter, _ = meter.Int64Counter("test_app_requests_total",
+				otelmetric.WithDescription("Total requests handled by the test app"),
+			)
+			log.Printf("OTEL metrics enabled")
+		}
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleRoot)
@@ -63,11 +118,30 @@ func main() {
 	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
 	mux.HandleFunc("GET /test/logs", handleTestLogs)
 
+	// Wrap mux with otelhttp — every incoming request creates a span automatically.
+	handler := otelhttp.NewHandler(mux, "test-app",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}),
+	)
+
 	log.Printf("listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Create a child span to simulate app-level work.
+	tracer := otel.Tracer("test-app")
+	_, span := tracer.Start(r.Context(), "handleRoot.work",
+		otelTrace.WithAttributes(attribute.String("app", "test-enclave-app")),
+	)
+	defer span.End()
+
+	// Increment app metric counter.
+	if appRequestCounter != nil {
+		appRequestCounter.Add(r.Context(), 1)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":     "ok",
@@ -1056,7 +1130,7 @@ func handleTestLogs(w http.ResponseWriter, r *http.Request) {
 		_ = noAuthProvider.Shutdown(ctx)
 
 		// Check the buffer — "should be rejected" must NOT appear.
-		getResp, getErr := http.Get(supervisorURL + "/v1/logs")
+		getResp, getErr := http.Get(supervisorURL + "/v1/enclave-logs")
 		if getErr == nil {
 			getBody, _ := io.ReadAll(getResp.Body)
 			getResp.Body.Close()

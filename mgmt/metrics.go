@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,14 +33,19 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Proxy enclave application metrics (Prometheus format from supervisor).
+	// Proxy enclave application metrics (JSON from supervisor, converted to Prometheus text).
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
-	appResp, err := enclaveMetricsClient.Get(enclaveURL + "/v1/metrics")
+	appResp, err := enclaveMetricsClient.Get(enclaveURL + "/v1/enclave-metrics")
 	if err == nil {
-		defer func() { _ = appResp.Body.Close() }()
-		if appResp.StatusCode == http.StatusOK {
+		body, _ := io.ReadAll(appResp.Body)
+		_ = appResp.Body.Close()
+		if appResp.StatusCode == http.StatusOK && len(body) > 0 {
 			_, _ = fmt.Fprintln(w)
-			_, _ = io.Copy(w, appResp.Body)
+			// Convert JSON metrics to Prometheus text format.
+			var snapshot map[string]any
+			if json.Unmarshal(body, &snapshot) == nil {
+				writePrometheusFromSnapshot(w, snapshot)
+			}
 		}
 	}
 
@@ -69,4 +75,19 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintln(w, "# HELP enclave_host_cpu_count Number of vCPUs allocated to the enclave.")
 	_, _ = fmt.Fprintln(w, "# TYPE enclave_host_cpu_count gauge")
 	_, _ = fmt.Fprintf(w, "enclave_host_cpu_count %d\n", enc.CPUCount)
+}
+
+// writePrometheusFromSnapshot converts a JSON metric snapshot to Prometheus text format.
+func writePrometheusFromSnapshot(w http.ResponseWriter, snapshot map[string]any) {
+	for section, metrics := range snapshot {
+		switch m := metrics.(type) {
+		case map[string]any:
+			for name, val := range m {
+				metricName := fmt.Sprintf("enclave_%s_%s", section, name)
+				metricName = strings.ReplaceAll(metricName, ".", "_")
+				_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", metricName)
+				_, _ = fmt.Fprintf(w, "%s %v\n", metricName, val)
+			}
+		}
+	}
 }

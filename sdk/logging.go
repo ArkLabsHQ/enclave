@@ -29,9 +29,9 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 			"status", sw.status,
 			"duration_ms", duration.Milliseconds(),
 		)
-		enclaveMetrics.HTTPRequests.Add(1)
+		enclaveMetrics.Inc(enclaveMetrics.HTTPRequests, "http_requests_total")
 		if sw.status >= 400 {
-			enclaveMetrics.HTTPErrors.Add(1)
+			enclaveMetrics.Inc(enclaveMetrics.HTTPErrors, "http_errors_total")
 		}
 	})
 }

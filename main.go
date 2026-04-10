@@ -32,6 +32,8 @@ func Execute() {
 		generateCmd(),
 		tfvarsCmd(),
 		logCmd(),
+		traceCmd(),
+		metricsCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

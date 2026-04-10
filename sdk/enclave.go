@@ -55,6 +55,10 @@ type Enclave struct {
 	logBuffer  *LogBuffer
 	logShipCh  chan LogEntry // buffered channel for CloudWatch shipper (nil when disabled)
 
+	// Span buffer for distributed trace spans.
+	spanBuffer *SpanBuffer
+	spanShipCh chan SpanEntry // buffered channel for CloudWatch span shipper (nil when disabled)
+
 	// Migration cooldown cache (avoids hammering SSM on every enclave-info call).
 	cooldownMu        sync.Mutex
 	cooldownPending   bool
@@ -70,15 +74,19 @@ func New() (*Enclave, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate mgmt token: %w", err)
 	}
-	var shipCh chan LogEntry
+	var logCh chan LogEntry
+	var spanCh chan SpanEntry
 	if cloudwatchLogsEnabled() {
-		shipCh = make(chan LogEntry, 1000)
+		logCh = make(chan LogEntry, 1000)
+		spanCh = make(chan SpanEntry, 1000)
 	}
 	return &Enclave{
 		previousPCR0: "genesis",
 		mgmtToken:    token,
-		logBuffer:  NewLogBuffer(logBufferSize()),
-		logShipCh:  shipCh,
+		logBuffer:    NewLogBuffer(logBufferSize()),
+		logShipCh:    logCh,
+		spanBuffer:   NewSpanBuffer(spanBufferSize()),
+		spanShipCh:   spanCh,
 	}, nil
 }
 
@@ -128,6 +136,9 @@ func secureRandom(b []byte) (int, error) {
 // read all fields safely.
 func (e *Enclave) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
+
+	ctx, initSpan := SupervisorSpan(ctx, "init")
+	defer initSpan.End()
 
 	secrets, err := loadSecretsConfig()
 	if err != nil {
@@ -198,10 +209,14 @@ func (e *Enclave) Init(ctx context.Context) error {
 
 	deleteOldKMSKey(ctx)
 	slog.Info("init completed successfully")
+	SpanOK(initSpan)
 
-	// Start CloudWatch log shipper if enabled.
+	// Start CloudWatch shippers if enabled.
 	if e.logShipCh != nil {
 		go e.runLogShipper(ctx)
+	}
+	if e.spanShipCh != nil {
+		go e.runSpanShipper(ctx)
 	}
 
 	return nil
@@ -216,6 +231,16 @@ func (e *Enclave) GetLogBuffer() *LogBuffer {
 // GetLogShipCh returns the CloudWatch log shipping channel (may be nil).
 func (e *Enclave) GetLogShipCh() chan LogEntry {
 	return e.logShipCh
+}
+
+// GetSpanBuffer returns the span buffer.
+func (e *Enclave) GetSpanBuffer() *SpanBuffer {
+	return e.spanBuffer
+}
+
+// GetSpanShipCh returns the CloudWatch span shipping channel (may be nil).
+func (e *Enclave) GetSpanShipCh() chan SpanEntry {
+	return e.spanShipCh
 }
 
 // IsReady returns true after Init has completed (success or failure).
@@ -235,7 +260,8 @@ func (e *Enclave) AttestationPubkey() string {
 // RegisterRoutes adds enclave management endpoints to the mux:
 //
 //	GET    /v1/enclave-info
-//	GET    /v1/metrics
+//	POST   /v1/enclave-metrics
+//	GET    /v1/enclave-metrics
 //	POST   /v1/export-key
 //	PUT    /v1/storage/{key...}
 //	GET    /v1/storage/{key...}
@@ -246,10 +272,13 @@ func (e *Enclave) AttestationPubkey() string {
 //	DELETE /v1/secrets/{name}
 //	GET    /v1/secrets
 //	POST   /v1/logs
-//	GET    /v1/logs
+//	GET    /v1/enclave-logs
+//	POST   /v1/enclave-traces
+//	GET    /v1/enclave-traces
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
-	mux.HandleFunc("GET /v1/metrics", handlePrometheusMetrics)
+	mux.HandleFunc("POST /v1/enclave-metrics", e.handleMetricPost)
+	mux.HandleFunc("GET /v1/enclave-metrics", e.handleMetricGet)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
 	mux.HandleFunc("PUT /v1/storage/{key...}", e.handleStoragePut)
 	mux.HandleFunc("GET /v1/storage/{key...}", e.handleStorageGet)
@@ -260,14 +289,11 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/secrets/{name}", e.handleSecretDelete)
 	mux.HandleFunc("GET /v1/secrets", e.handleSecretList)
 	mux.HandleFunc("POST /v1/logs", e.handleLogPost)
-	mux.HandleFunc("GET /v1/logs", e.handleLogGet)
+	mux.HandleFunc("GET /v1/enclave-logs", e.handleLogGet)
+	mux.HandleFunc("POST /v1/enclave-traces", e.handleSpanPost)
+	mux.HandleFunc("GET /v1/enclave-traces", e.handleSpanGet)
 }
 
-// handlePrometheusMetrics returns enclave application metrics in Prometheus text format.
-func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = fmt.Fprint(w, enclaveMetrics.PrometheusText())
-}
 
 // Middleware returns an http.Handler that signs all responses with the
 // ephemeral attestation key using BIP-340 Schnorr signatures.
@@ -431,7 +457,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0Attestation    string           `json:"previous_pcr0_attestation,omitempty"`
 		AttestationPubkey          string           `json:"attestation_pubkey,omitempty"`
 		DynamicSecrets             int64            `json:"dynamic_secrets"`
-		Metrics                    map[string]int64 `json:"metrics"`
+		Metrics                    map[string]any `json:"metrics"`
 		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
 		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
 		MigrationPending           bool             `json:"migration_pending"`
@@ -441,7 +467,7 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0Attestation:    e.previousPCR0Attestation,
 		AttestationPubkey:          e.AttestationPubkey(),
 		DynamicSecrets:             e.dynamicSecretsCount.Load(),
-		Metrics:                    enclaveMetrics.Snapshot(),
+		Metrics:                    enclaveMetrics.MetricsSnapshot(),
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,

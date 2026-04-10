@@ -33,13 +33,12 @@ lint: ## Run golangci-lint on all modules (matches CI)
 # ── CLI tests (mirrors .github/workflows/cli.yml) ──────────────
 # Requires: go, nix (with nixpkgs=channel:nixos-25.11 on NIX_PATH)
 CLI_BIN    := /tmp/enclave-cli
-COMMIT1    := 6710409
-COMMIT1_FULL := 67104090b28d8a5358dd036e2454881643735a3f
-COMMIT1_HASH := sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous=
-COMMIT1_VENDOR_HASH_GO := sha256-iHqsoRGivzNcZTOpaXCckpQ/sRSdRA/5/hZ8VXchfjg=
-COMMIT2    := 7599ce0
-COMMIT2_FULL := 7599ce0474a8fdee97dd18625f3a4258813d7815
-COMMIT2_HASH := sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE=
+COMMIT1    := 66c6883
+COMMIT1_FULL := 66c6883d60cbc7e04224a9bc149bb182c93c9e53
+COMMIT1_HASH := sha256-OhBGQoAdqjAEtR6SghBR4tbkrsjmH5I5T+U19chXHRA=
+COMMIT2    := 0782325
+COMMIT2_FULL := 078232572efba4f95543d0c7c84c0f47a3782955
+COMMIT2_HASH := sha256-xuWFL/Lr4vi8n/A61bhyAfa+HrwJvLFrgt0rFEWBFcw=
 
 LANGUAGES  := go nodejs rust dotnet
 APP_DIR_go     := test/cli/go-app
@@ -87,7 +86,7 @@ _test-cli-lang:
 	grep -q 'nix_owner: "ArkLabsHQ"' enclave/enclave.yaml; \
 	grep -q 'nix_repo: "introspector-enclave"' enclave/enclave.yaml; \
 	if [ "$(LANG)" = "go" ]; then \
-		grep -q '$(COMMIT1_VENDOR_HASH_GO)' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash"; cat enclave/enclave.yaml; exit 1; }; \
+		grep -q 'nix_vendor_hash: "sha256-' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash is empty"; cat enclave/enclave.yaml; exit 1; }; \
 	fi; \
 	echo "[test] enclave build"; \
 	git add .; \

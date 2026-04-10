@@ -968,7 +968,7 @@ LAUNCHER
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.buildNpmPackage {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -977,12 +977,10 @@ LAUNCHER
             rev = appCfg.nix_rev;
             hash = appCfg.nix_hash;
           };
-          vendorHash = "";
-          proxyVendor = true;
-          subPackages = appCfg.nix_sub_packages;
-          env.CGO_ENABLED = "0";
+          npmDepsHash = "";
+          dontNpmBuild = true;
           doCheck = false;
-        } // (if (appCfg.nix_subdir or "") != "" then {
+        }) // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
 
@@ -1513,23 +1511,8 @@ const frameworkFlakeNixDotnet = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.buildGoModule {
-          pname = "vendor-hash-check";
-          version = buildCfg.version;
-          src = eifPkgs.fetchFromGitHub {
-            owner = appCfg.nix_owner;
-            repo = appCfg.nix_repo;
-            rev = appCfg.nix_rev;
-            hash = appCfg.nix_hash;
-          };
-          vendorHash = "";
-          proxyVendor = true;
-          subPackages = appCfg.nix_sub_packages;
-          env.CGO_ENABLED = "0";
-          doCheck = false;
-        } // (if (appCfg.nix_subdir or "") != "" then {
-          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
-        } else {}));
+        # .NET uses fetch-deps for deps.json — no hash-based vendor check.
+        vendor-hash-check = eifPkgs.runCommand "vendor-hash-check-noop" {} "echo noop > $out";
 
       in
       {
@@ -1719,7 +1702,7 @@ const frameworkFlakeNixRust = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = (eifPkgs.buildGoModule {
+        vendor-hash-check = (eifPkgs.rustPlatform.buildRustPackage {
           pname = "vendor-hash-check";
           version = buildCfg.version;
           src = eifPkgs.fetchFromGitHub {
@@ -1728,13 +1711,12 @@ const frameworkFlakeNixRust = `{
             rev = appCfg.nix_rev;
             hash = appCfg.nix_hash;
           };
-          vendorHash = "";
-          proxyVendor = true;
-          subPackages = appCfg.nix_sub_packages;
-          env.CGO_ENABLED = "0";
+          cargoHash = "";
           doCheck = false;
-        } // (if (appCfg.nix_subdir or "") != "" then {
+        }) // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+          cargoRoot = appCfg.nix_subdir;
+          buildAndTestSubdir = appCfg.nix_subdir;
         } else {}));
 
       in

@@ -40,6 +40,7 @@ jobs:
             commit2_hash: "sha256-xuWFL/Lr4vi8n/A61bhyAfa+HrwJvLFrgt0rFEWBFcw="
           - language: dotnet
             app_dir: test/cli/dotnet-app
+            binary_name: "CliTestApp"
             commit1: "66c6883"
             commit1_full: "66c6883d60cbc7e04224a9bc149bb182c93c9e53"
             commit1_hash: "sha256-OhBGQoAdqjAEtR6SghBR4tbkrsjmH5I5T+U19chXHRA="
@@ -100,6 +101,11 @@ jobs:
 
           # Set nix_subdir so the flake builds from the app subdirectory.
           sed -i 's/nix_subdir: ""/nix_subdir: "test\/cli\/${{ matrix.language }}-app"/' enclave/enclave.yaml
+
+          # Set binary_name if specified (e.g. dotnet projects have a fixed output name).
+          if [ -n "${{ matrix.binary_name }}" ]; then
+            sed -i 's/binary_name: ""/binary_name: "${{ matrix.binary_name }}"/' enclave/enclave.yaml
+          fi
 
           git add .
           git -c user.email=ci@test -c user.name=CI commit -m "add enclave files"

@@ -397,7 +397,7 @@ func computeNixHash(root string, rev string) (string, error) {
 // hash. When built, Nix will fail and print the expected hash in a "got:" line.
 // If escaped is true, quotes are backslash-escaped (for embedding in shell scripts).
 // If nixpkgsRev is non-empty, it pins nixpkgs to that exact commit for reproducibility.
-func buildTrialExpr(language string, subPackages []string, escaped bool, nixpkgsRev ...string) string {
+func buildTrialExpr(language string, subPackages []string, escaped bool) string {
 	q := `"`
 	if escaped {
 		q = `\"`
@@ -424,7 +424,7 @@ func buildTrialExpr(language string, subPackages []string, escaped bool, nixpkgs
 		return fmt.Sprintf(nixpkgsImport+` pkgs.buildGoModule {
     pname = "app"; version = "0.0.1"; src = ./.;
     subPackages = %s; vendorHash = ""; proxyVendor = true;
-    CGO_ENABLED = "0"; doCheck = false;
+    env.CGO_ENABLED = "0"; doCheck = false;
   }`, nixSubPkgs)
 	}
 }

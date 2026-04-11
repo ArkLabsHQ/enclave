@@ -160,7 +160,7 @@ migration_cooldown: 30m
 ### 2.3 Build (`enclave build`)
 
 ```
-enclave build [--local]
+enclave build
     │
     ├─ 1. Load enclave.yaml, validate SDK fields (rev, hash, vendor_hash)
     │
@@ -182,8 +182,7 @@ enclave build [--local]
     │   │     cp flake_result/pcr.json  /src/enclave/artifacts/pcr.json
     │   │   "
     │   │
-    │   └─ [--local: Native Nix build]
-    │       BUILD_CONFIG_PATH=./enclave/build-config.json \
+    │   └─  BUILD_CONFIG_PATH=./enclave/build-config.json \
     │       nix build --impure ... --out-link flake_result .#eif
     │
     ├─ 5. Nix Flake Execution (inside Docker or locally)

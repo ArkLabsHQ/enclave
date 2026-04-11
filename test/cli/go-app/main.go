@@ -1,12 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 )
 
 func main() {
@@ -15,10 +13,12 @@ func main() {
 		port = "7074"
 	}
 
-	title := cases.Title(language.English).String("hello enclave")
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"status":"ok","message":"%s"}`, title)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": "Hello Enclave",
+		})
 	})
 
 	fmt.Printf("listening on :%s\n", port)

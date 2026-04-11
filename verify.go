@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -73,7 +74,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	pcr0, _ := cmd.Flags().GetString("expected-pcr0")
 
 	if verifyBuild, _ := cmd.Flags().GetBool("verify-build"); verifyBuild && pcr0 == "" {
-		derived, err := buildAndExtractPCR0(root, cfg.Version, cfg.Region, cfg.NixImage)
+		derived, err := buildAndExtractPCR0(root, cfg.Version, cfg.Region)
 		if err != nil {
 			return fmt.Errorf("build verification failed: %w", err)
 		}
@@ -483,7 +484,7 @@ func shortErr(err error) string {
 	return s
 }
 
-func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, error) {
+func buildAndExtractPCR0(repoPath, version, region string) (string, error) {
 	absRepo, err := filepath.Abs(repoPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve repo path: %w", err)
@@ -493,10 +494,7 @@ func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, er
 	_ = os.RemoveAll(resultPath)
 	_ = os.MkdirAll(resultPath, 0o755)
 
-	fmt.Println("[verify] Building EIF via NixOS Docker (reproducible)...")
-	if nixImage == "" {
-		nixImage = "nixos/nix:2.24.9"
-	}
+	fmt.Println("[verify] Building EIF with Nix (reproducible)...")
 	if version == "" {
 		version = "0.0.1"
 	}
@@ -504,19 +502,43 @@ func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, er
 		region = "us-east-1"
 	}
 
-	nixCmd := "git config --global --add safe.directory /src && " +
-		"nix build --impure --extra-experimental-features 'nix-command flakes' " +
-		"--option download-attempts 3 --out-link flake_result .#eif && " +
-		"cp flake_result/image.eif /src/enclave/artifacts/image.eif && " +
-		"cp flake_result/pcr.json /src/enclave/artifacts/pcr.json"
+	configPath := filepath.Join(absRepo, "enclave", "build-config.json")
+	absConfigPath, _ := filepath.Abs(configPath)
 
-	env := []string{
-		"VERSION=" + version,
-		"AWS_REGION=" + region,
+	ensureGitTracked(absRepo, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+
+	nixCmd := exec.Command("nix", "build",
+		"--impure",
+		"--extra-experimental-features", "nix-command flakes",
+		"--option", "download-attempts", "3",
+		"--out-link", "flake_result",
+		".#eif",
+	)
+	nixCmd.Dir = absRepo
+	nixCmd.Stdout = os.Stdout
+	nixCmd.Stderr = os.Stderr
+	nixCmd.Env = append(os.Environ(),
+		"BUILD_CONFIG_PATH="+absConfigPath,
+		"VERSION="+version,
+		"AWS_REGION="+region,
+	)
+
+	if err := nixCmd.Run(); err != nil {
+		return "", fmt.Errorf("nix build failed: %w", err)
 	}
 
-	if err := runContainer(context.Background(), nixImage, nixCmd, absRepo, "/src", env); err != nil {
-		return "", fmt.Errorf("docker nix build failed: %w", err)
+	// Copy artifacts from flake_result.
+	resultLink := filepath.Join(absRepo, "flake_result")
+	for _, name := range []string{"image.eif", "pcr.json"} {
+		src := filepath.Join(resultLink, name)
+		dst := filepath.Join(resultPath, name)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return "", fmt.Errorf("read flake_result/%s: %w", name, err)
+		}
+		if err := os.WriteFile(dst, data, 0644); err != nil {
+			return "", fmt.Errorf("write artifacts/%s: %w", name, err)
+		}
 	}
 
 	pcrPath := filepath.Join(resultPath, "pcr.json")

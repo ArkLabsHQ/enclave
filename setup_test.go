@@ -1,7 +1,6 @@
 package introspector_enclave
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -124,55 +123,3 @@ func TestReplaceYAMLValue(t *testing.T) {
 	}
 }
 
-func TestBuildTrialExpr(t *testing.T) {
-	tests := []struct {
-		name        string
-		language    string
-		subPackages []string
-		wantContain string
-	}{
-		{
-			name:        "go default",
-			language:    "go",
-			subPackages: []string{"."},
-			wantContain: "buildGoModule",
-		},
-		{
-			name:        "go multiple subpackages",
-			language:    "go",
-			subPackages: []string{"cmd/server", "cmd/worker"},
-			wantContain: `"cmd/server"`,
-		},
-		{
-			name:        "nodejs",
-			language:    "nodejs",
-			subPackages: nil,
-			wantContain: "buildNpmPackage",
-		},
-		{
-			name:        "rust",
-			language:    "rust",
-			subPackages: nil,
-			wantContain: "buildRustPackage",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			expr := buildTrialExpr(tt.language, tt.subPackages, false)
-			if !strings.Contains(expr, tt.wantContain) {
-				t.Errorf("expression does not contain %q:\n%s", tt.wantContain, expr)
-			}
-		})
-	}
-
-	// Test escaped mode produces escaped quotes.
-	escaped := buildTrialExpr("go", []string{"."}, true)
-	if !strings.Contains(escaped, `\"."\"`) {
-		// The escaped mode wraps subpackages in \"...\".
-		// Check that escaped quotes are present.
-		if !strings.Contains(escaped, `\"`) {
-			t.Error("escaped mode should contain escaped quotes")
-		}
-	}
-}

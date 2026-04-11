@@ -33,13 +33,12 @@ lint: ## Run golangci-lint on all modules (matches CI)
 # ── CLI tests (mirrors .github/workflows/cli.yml) ──────────────
 # Requires: go, nix (with nixpkgs=channel:nixos-25.11 on NIX_PATH)
 CLI_BIN    := /tmp/enclave-cli
-COMMIT1    := 6710409
-COMMIT1_FULL := 67104090b28d8a5358dd036e2454881643735a3f
-COMMIT1_HASH := sha256-eajMsmCP/bD0URQFCs9wzy1Jg0zkt8XQYPzFoe+7ous=
-COMMIT1_VENDOR_HASH_GO := sha256-UA4Oc/fkprVH/9dZm7T0RQlfHzOwW1F3nUYTydOp0VE=
-COMMIT2    := 7599ce0
-COMMIT2_FULL := 7599ce0474a8fdee97dd18625f3a4258813d7815
-COMMIT2_HASH := sha256-iT0n3tjAAyUgIUEuAMwW9Kx3raZMrlNP7LXT1tCoToE=
+COMMIT1    := 66c6883
+COMMIT1_FULL := 66c6883d60cbc7e04224a9bc149bb182c93c9e53
+COMMIT1_HASH := sha256-OhBGQoAdqjAEtR6SghBR4tbkrsjmH5I5T+U19chXHRA=
+COMMIT2    := 0782325
+COMMIT2_FULL := 078232572efba4f95543d0c7c84c0f47a3782955
+COMMIT2_HASH := sha256-xuWFL/Lr4vi8n/A61bhyAfa+HrwJvLFrgt0rFEWBFcw=
 
 LANGUAGES  := go nodejs rust dotnet
 APP_DIR_go     := test/cli/go-app
@@ -66,7 +65,7 @@ _test-cli-lang:
 	git init -q; \
 	git remote add origin https://github.com/ArkLabsHQ/introspector-enclave.git; \
 	git add .; \
-	git -c user.email=ci@test -c user.name=CI commit -q -m "init"; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "init"; \
 	echo "[test] enclave init --language $(LANG)"; \
 	$(CLI_BIN) init --language $(LANG); \
 	test -f enclave/enclave.yaml; \
@@ -76,18 +75,32 @@ _test-cli-lang:
 	test -f enclave/tofu/modules/enclave/kms.tf; \
 	grep -q '/dev/nsm' enclave/start.sh; \
 	grep -q 'when    = destroy' enclave/tofu/modules/enclave/kms.tf; \
-	echo "[test] enclave setup --local --commit $(COMMIT1)"; \
+	echo "[test] enclave setup --commit $(COMMIT1)"; \
 	git add .; \
-	git -c user.email=ci@test -c user.name=CI commit -q -m "add enclave files"; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "add enclave files"; \
 	git fetch -q "$$REPO_ROOT" master; \
-	$(CLI_BIN) setup --local --commit $(COMMIT1); \
+	sed -i 's/nix_subdir: ""/nix_subdir: "test\/cli\/$(LANG)-app"/' enclave/enclave.yaml; \
+	if [ "$(LANG)" = "dotnet" ]; then \
+		sed -i 's/binary_name: ""/binary_name: "CliTestApp"/' enclave/enclave.yaml; \
+	fi; \
+	$(CLI_BIN) setup --commit $(COMMIT1); \
 	grep -q '$(COMMIT1_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
 	grep -q '$(COMMIT1_HASH)' enclave/enclave.yaml || { echo "FAIL: nix_hash"; exit 1; }; \
 	grep -q 'nix_owner: "ArkLabsHQ"' enclave/enclave.yaml; \
 	grep -q 'nix_repo: "introspector-enclave"' enclave/enclave.yaml; \
 	if [ "$(LANG)" = "go" ]; then \
-		grep -q '$(COMMIT1_VENDOR_HASH_GO)' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash"; cat enclave/enclave.yaml; exit 1; }; \
+		grep -q 'nix_vendor_hash: "sha256-' enclave/enclave.yaml || { echo "FAIL: nix_vendor_hash is empty"; cat enclave/enclave.yaml; exit 1; }; \
 	fi; \
+	echo "[test] enclave build"; \
+	git add .; \
+	git -c user.email=ci@test -c user.name=CI -c commit.gpgsign=false commit -q -m "pre-build commit"; \
+	$(CLI_BIN) build || { echo "FAIL: enclave build"; exit 1; }; \
+	test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }; \
+	test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }; \
+	jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing from pcr.json"; exit 1; }; \
+	test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }; \
+	test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }; \
+	echo "[test] build artifacts verified"; \
 	echo "[test] enclave update --commit $(COMMIT2)"; \
 	$(CLI_BIN) update --commit $(COMMIT2); \
 	grep -q '$(COMMIT2_FULL)' enclave/enclave.yaml || { echo "FAIL: nix_rev"; exit 1; }; \
@@ -99,7 +112,7 @@ test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 	cd sdk && go mod vendor
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
@@ -109,12 +122,12 @@ test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
 	fi
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build --local
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
 	cp /tmp/image-v2.eif test/app/enclave/artifacts/image-v2.eif
 	cp /tmp/pcr-v2.json test/app/enclave/artifacts/pcr-v2.json

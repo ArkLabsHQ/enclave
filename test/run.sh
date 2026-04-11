@@ -240,7 +240,7 @@ elif [ "$IN_DOCKER" = true ]; then
     fi
   else
     echo "  Error: EIF must be pre-built when running inside Docker" >&2
-    echo "  Build it on the host first: cd test/app && enclave build --local" >&2
+    echo "  Build it on the host first: cd test/app && enclave build" >&2
     exit 1
   fi
 else
@@ -250,7 +250,7 @@ else
   ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
 
   echo "  Building v1 EIF (version ${ORIG_VERSION})..."
-  (cd app && "$ENCLAVE_CLI" build --local)
+  (cd app && "$ENCLAVE_CLI" build)
   EIF_PATH="app/enclave/artifacts/image.eif"
   V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
   cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v1.json"
@@ -268,7 +268,7 @@ else
     echo "" >> "$ENCLAVE_YAML"
     echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
   fi
-  (cd app && "$ENCLAVE_CLI" build --local)
+  (cd app && "$ENCLAVE_CLI" build)
   cp "${ARTIFACTS}/image.eif" "${ARTIFACTS}/image-v2.eif"
   cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v2.json"
   echo "  v2 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr-v2.json" | cut -c1-16)..."
@@ -276,7 +276,7 @@ else
   # Restore v1 as the active EIF (genesis for first boot).
   sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
   sed -i '/^previous_pcr0:/d' "$ENCLAVE_YAML"
-  (cd app && "$ENCLAVE_CLI" build --local)
+  (cd app && "$ENCLAVE_CLI" build)
   echo "  Restored v1"
 fi
 echo ""

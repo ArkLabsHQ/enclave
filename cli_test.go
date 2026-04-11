@@ -77,7 +77,7 @@ func TestCLI_Init(t *testing.T) {
 	}
 }
 
-// TestCLI_Build builds the CLI and runs "enclave build --local" using the
+// TestCLI_Build builds the CLI and runs "enclave build" using the
 // test/app project. Requires Nix.
 func TestCLI_Build(t *testing.T) {
 	requireCmd(t, "nix")
@@ -118,12 +118,12 @@ func TestCLI_Build(t *testing.T) {
 		t.Fatalf("git commit: %v", err)
 	}
 
-	// Run enclave build --local.
-	buildCmd := exec.Command(bin, "build", "--local")
+	// Run enclave build.
+	buildCmd := exec.Command(bin, "build")
 	buildCmd.Dir = dir
 	out, err := buildCmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("enclave build --local failed:\n%s", out)
+		t.Fatalf("enclave build failed:\n%s", out)
 	}
 
 	// Verify artifacts were created.

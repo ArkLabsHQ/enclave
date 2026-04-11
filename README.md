@@ -119,7 +119,7 @@ The `setup` command auto-detects your GitHub remote and computes all nix hashes:
 ```sh
 enclave setup                          # Go app (default), runs in Docker
 enclave setup --language nodejs        # Node.js app (writes correct flake.nix)
-enclave setup --local                  # uses local nix installation
+enclave setup                  # uses local nix installation
 ```
 
 This populates `nix_owner`, `nix_repo`, `nix_rev`, `nix_hash`, and `nix_vendor_hash` in `enclave/enclave.yaml` from your local git state.
@@ -206,7 +206,7 @@ Running `init` again when `enclave.yaml` already exists validates all fields and
 
 ```sh
 enclave build              # build EIF via Docker + Nix (reproducible)
-enclave build --local      # build EIF using local Nix installation
+enclave build      # build EIF using local Nix installation
 ```
 
 Outputs `artifacts/image.eif` and `artifacts/pcr.json` with PCR0, PCR1, PCR2 measurements.
@@ -328,10 +328,10 @@ make install   # install to $GOPATH/bin
 | `enclave generate template --dotnet` | Generate a complete .NET enclave app template |
 | `enclave setup` | Auto-populate app nix hashes from git remote |
 | `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite flake.nix |
-| `enclave setup --local` | Use local Nix instead of Docker for hash computation |
+| `enclave setup` | Use Nix for hash computation |
 | `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
-| `enclave build --local` | Build EIF using local Nix instead of Docker |
+| `enclave build` |  |
 | `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |
 | `enclave verify` | Verify attestation document and PCR0 against local build |
 | `enclave status` | Show deployment status |
@@ -546,7 +546,7 @@ The test suite runs a full enclave inside QEMU (`-M nitro-enclave`) with mock AW
 ```sh
 # 1. Build the test EIF (requires Nix)
 go build -o /tmp/enclave-cli ./cmd/enclave
-cd test/app && /tmp/enclave-cli build --local
+cd test/app && /tmp/enclave-cli build 
 
 # 2. Run all tests
 cd test && docker compose --profile test run --build test-runner

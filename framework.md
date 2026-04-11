@@ -85,7 +85,7 @@ On subsequent runs, validates the configuration and reports errors.
 
 ### 2. `enclave setup` — Auto-Populate Nix Hashes
 
-Detects the GitHub remote, computes Nix source and vendor hashes for the user's app, and writes them to `enclave.yaml`. Runs via Docker by default or locally with `--local`.
+Detects the GitHub remote, computes Nix source and vendor hashes for the user's app, and writes them to `enclave.yaml`.
 
 ### 3. `enclave build` — Reproducible EIF Build
 

@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const DefaultNixImage = "nixos/nix:2.24.9"
 
 // PCRValues holds the PCR measurements from a built EIF.
 type PCRValues struct {

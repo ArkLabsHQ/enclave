@@ -1,12 +1,10 @@
 package introspector_enclave
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -29,7 +27,7 @@ only code (not dependencies) has changed.
 
 Use --commit to specify a commit SHA instead of HEAD.
 
-Requires 'nix' in PATH, or falls back to Docker for hash computation.`,
+Requires 'nix' in PATH for hash computation.`,
 		RunE: runUpdate,
 	}
 	cmd.Flags().Bool("skip-deps", false, "Skip vendor/deps hash recomputation (code-only changes)")
@@ -74,65 +72,35 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. Compute nix source hash and (optionally) vendor hash.
-	var nixHash, vendorHash string
-	if _, err := exec.LookPath("nix"); err == nil {
-		fmt.Println("[update] Computing nix source hash (local)...")
-		nixHash, err = computeNixHash(root, rev)
-		if err != nil {
-			return err
-		}
+	if _, err := exec.LookPath("nix"); err != nil {
+		return fmt.Errorf("nix is required but not found in PATH; install from https://nixos.org")
+	}
 
-		if !skipDeps {
-			if language == "dotnet" {
-				fmt.Println("[update] Generating NuGet deps.json (local)...")
-				if dErr := generateDotnetDeps(root); dErr != nil {
-					fmt.Printf("[update] Warning: could not generate deps.json: %v\n", dErr)
-				} else {
-					vendorHash = "deps.json"
-				}
+	var nixHash, vendorHash string
+	fmt.Println("[update] Computing nix source hash (local)...")
+	nixHash, err = computeNixHash(root, rev)
+	if err != nil {
+		return err
+	}
+
+	if !skipDeps {
+		if language == "dotnet" {
+			fmt.Println("[update] Generating NuGet deps.json...")
+			if dErr := generateDotnetDeps(root); dErr != nil {
+				fmt.Printf("[update] Warning: could not generate deps.json: %v\n", dErr)
 			} else {
-				fmt.Println("[update] Computing deps hash (local trial nix build)...")
-				vendorHash, err = computeVendorHash(root, subPackages, language)
-				if err != nil {
-					fmt.Printf("[update] Warning: could not compute vendor hash: %v\n", err)
-					fmt.Println("[update] Will update other fields; you may need to fill nix_vendor_hash manually.")
-				}
+				vendorHash = "deps.json"
 			}
 		} else {
-			fmt.Println("[update] Skipping deps hash (--skip-deps)")
+			fmt.Println("[update] Computing deps hash (local trial nix build)...")
+			vendorHash, err = computeVendorHash(root, subPackages, language)
+			if err != nil {
+				fmt.Printf("[update] Warning: could not compute vendor hash: %v\n", err)
+				fmt.Println("[update] Will update other fields; you may need to fill nix_vendor_hash manually.")
+			}
 		}
 	} else {
-		fmt.Println("[update] nix not found locally, using Docker...")
-		nixImage := cfg.NixImage
-		if nixImage == "" {
-			nixImage = DefaultNixImage
-		}
-
-		if skipDeps {
-			fmt.Println("[update] Skipping deps hash (--skip-deps)")
-			nixHash, err = computeNixHashDocker(root, rev, nixImage)
-			if err != nil {
-				return err
-			}
-		} else {
-			if language == "dotnet" {
-				nixHash, err = computeHashesDotnetDocker(root, rev, nixImage)
-				if err != nil {
-					return err
-				}
-				vendorHash = "deps.json"
-			} else {
-				var vendorErr error
-				nixHash, vendorHash, vendorErr = computeHashesDocker(root, rev, subPackages, nixImage, language)
-				if nixHash == "" && vendorErr != nil {
-					return vendorErr
-				}
-				if vendorErr != nil {
-					fmt.Printf("[update] Warning: could not compute vendor hash: %v\n", vendorErr)
-					fmt.Println("[update] Will update other fields; you may need to fill nix_vendor_hash manually.")
-				}
-			}
-		}
+		fmt.Println("[update] Skipping deps hash (--skip-deps)")
 	}
 	fmt.Printf("[update] nix_hash: %s\n", nixHash)
 	if vendorHash != "" && vendorHash != "deps.json" {
@@ -169,35 +137,3 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// computeNixHashDocker computes the nix source hash inside a Docker container.
-func computeNixHashDocker(root, rev, nixImage string) (string, error) {
-	resultFile := ".enclave-update-result"
-
-	script := fmt.Sprintf(`set -e
-git config --global --add safe.directory /src
-TMPDIR=$(mktemp -d)
-git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
-rm -rf "$TMPDIR"
-echo "$SOURCE_HASH" > /src/%s
-`, rev, resultFile)
-
-	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
-		return "", fmt.Errorf("docker hash computation failed: %w", err)
-	}
-
-	resultPath := filepath.Join(root, resultFile)
-	defer func() { _ = os.Remove(resultPath) }()
-
-	data, err := os.ReadFile(resultPath)
-	if err != nil {
-		return "", fmt.Errorf("read hash result: %w", err)
-	}
-
-	hash := strings.TrimSpace(string(data))
-	if hash == "" {
-		return "", fmt.Errorf("empty hash from Docker computation")
-	}
-
-	return hash, nil
-}

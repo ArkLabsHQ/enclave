@@ -32,7 +32,6 @@ type Config struct {
 	Secrets           []SecretConfig `yaml:"secrets"`
 	SDK               SDKConfig      `yaml:"sdk"`
 	InstanceType      string         `yaml:"instance_type"`
-	NixImage          string         `yaml:"nix_image"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
 	PreviousPCR0      string         `yaml:"previous_pcr0"`
 }

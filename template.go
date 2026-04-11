@@ -190,7 +190,6 @@ region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
-nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
 # SDK coordinates for the enclave supervisor binary.
@@ -275,7 +274,6 @@ region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
-nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
 # SDK coordinates for the enclave supervisor binary.
@@ -559,7 +557,6 @@ region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
-nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
 # SDK coordinates for the enclave supervisor binary.
@@ -762,7 +759,6 @@ region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
-nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
 # SDK coordinates for the enclave supervisor binary.

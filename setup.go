@@ -2,7 +2,6 @@ package introspector_enclave
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -207,77 +206,6 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// computeHashesDocker runs nix hash + vendor hash computation inside a Docker
-// container using the same nixos image as 'enclave build'.
-// Results are written to .enclave-setup-result in the mounted directory.
-func computeHashesDocker(root, rev string, subPackages []string, nixImage string, language string) (nixHash, vendorHash string, err error) {
-	resultFile := ".enclave-setup-result"
-
-	trialBuildExpr := buildTrialExpr(language, subPackages, false)
-
-	// Shell script that runs inside the container.
-	// Writes results to a file in the mounted volume so the host can read them.
-	script := fmt.Sprintf(`set -e
-git config --global --add safe.directory /src
-
-# Compute source hash from local git archive.
-TMPDIR=$(mktemp -d)
-git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
-rm -rf "$TMPDIR"
-echo "nix_hash=$SOURCE_HASH" > /src/%s
-
-# Compute deps hash via trial build.
-# Use --log-format raw to strip ANSI escape codes.
-nix build --impure --no-link \
-  --extra-experimental-features 'nix-command flakes' \
-  --log-format raw \
-  --expr '%s' > /tmp/vendor.log 2>&1 || true
-# grep is available in the Nix image; extract "got: sha256-..." line.
-VENDOR_LINE=$(grep 'got:' /tmp/vendor.log | grep -o 'sha256-[^[:space:]]*' || true)
-VENDOR_HASH="$VENDOR_LINE"
-if [ -n "$VENDOR_HASH" ]; then
-  echo "vendor_hash=$VENDOR_HASH" >> /src/%s
-else
-  cat /tmp/vendor.log >&2
-  echo "vendor_err=Could not extract deps hash" >> /src/%s
-fi
-`, rev, resultFile, trialBuildExpr, resultFile, resultFile)
-
-	// Run inside Docker using the existing runContainer function.
-	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
-		return "", "", fmt.Errorf("docker setup failed: %w", err)
-	}
-
-	// Read results from the file written by the container.
-	resultPath := filepath.Join(root, resultFile)
-	defer func() { _ = os.Remove(resultPath) }()
-
-	data, err := os.ReadFile(resultPath)
-	if err != nil {
-		return "", "", fmt.Errorf("read setup results: %w", err)
-	}
-
-	results := string(data)
-	for _, line := range strings.Split(results, "\n") {
-		if strings.HasPrefix(line, "nix_hash=") {
-			nixHash = strings.TrimPrefix(line, "nix_hash=")
-		}
-		if strings.HasPrefix(line, "vendor_hash=") {
-			vendorHash = strings.TrimPrefix(line, "vendor_hash=")
-		}
-	}
-
-	if nixHash == "" {
-		return "", "", fmt.Errorf("could not compute nix_hash in Docker container")
-	}
-
-	if vendorHash == "" {
-		return nixHash, "", fmt.Errorf("could not extract vendor hash from Docker trial build")
-	}
-
-	return nixHash, vendorHash, nil
-}
 
 // detectGitRemote parses the origin remote URL to extract GitHub owner and repo.
 func detectGitRemote(root string) (owner, repo string, err error) {
@@ -393,41 +321,6 @@ func computeNixHash(root string, rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// buildTrialExpr returns a Nix expression for a trial build with an empty deps
-// hash. When built, Nix will fail and print the expected hash in a "got:" line.
-// If escaped is true, quotes are backslash-escaped (for embedding in shell scripts).
-// If nixpkgsRev is non-empty, it pins nixpkgs to that exact commit for reproducibility.
-func buildTrialExpr(language string, subPackages []string, escaped bool) string {
-	q := `"`
-	if escaped {
-		q = `\"`
-	}
-	nixpkgsImport := `let pkgs = import <nixpkgs> {}; in`
-
-	switch language {
-	case "nodejs":
-		return nixpkgsImport + ` pkgs.buildNpmPackage {
-    pname = "app"; version = "0.0.1"; src = ./.;
-    npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
-  }`
-	case "rust":
-		return nixpkgsImport + ` pkgs.rustPlatform.buildRustPackage {
-    pname = "app"; version = "0.0.1"; src = ./.;
-    cargoHash = ""; doCheck = false;
-  }`
-	default: // "go"
-		var nixPkgs []string
-		for _, p := range subPackages {
-			nixPkgs = append(nixPkgs, q+p+q)
-		}
-		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-		return fmt.Sprintf(nixpkgsImport+` pkgs.buildGoModule {
-    pname = "app"; version = "0.0.1"; src = ./.;
-    subPackages = %s; vendorHash = ""; proxyVendor = true;
-    env.CGO_ENABLED = "0"; doCheck = false;
-  }`, nixSubPkgs)
-	}
-}
 
 // computeVendorHash discovers the correct deps hash by running a trial build
 // using the project's flake. The flake exposes a `vendor-hash-check` package
@@ -532,82 +425,6 @@ func generateDotnetDeps(root string) error {
 	return nil
 }
 
-// computeHashesDotnetDocker computes the nix source hash and generates deps.json
-// for a .NET project inside a Docker container.
-func computeHashesDotnetDocker(root, rev, nixImage string) (nixHash string, err error) {
-	resultFile := ".enclave-setup-result"
-
-	script := fmt.Sprintf(`set -e
-git config --global --add safe.directory /src
-
-# Compute source hash from local git archive.
-TMPDIR=$(mktemp -d)
-git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
-SOURCE_HASH=$(nix --extra-experimental-features nix-command hash path "$TMPDIR/source")
-rm -rf "$TMPDIR"
-echo "nix_hash=$SOURCE_HASH" > /src/%s
-
-# Seed empty deps.json so nugetDeps is a path (enables fetch-deps passthru)
-echo '[]' > /src/deps.json
-
-# Generate deps.json via fetch-deps
-nix build --impure \
-  --extra-experimental-features 'nix-command flakes' \
-  --expr 'let pkgs = import <nixpkgs> {}; in (pkgs.buildDotnetModule {
-    pname = "app"; version = "0.0.1"; src = ./.;
-    dotnet-sdk = pkgs.dotnetCorePackages.sdk_10_0_1xx;
-    dotnet-runtime = pkgs.dotnetCorePackages.aspnetcore_10_0;
-    nugetDeps = ./deps.json;
-    doCheck = false;
-  }).passthru.fetch-deps' 2>&1 || true
-
-if [ -x ./result ]; then
-  ./result /src/deps.json 2>&1
-  if [ -f /src/deps.json ]; then
-    echo "deps_ok=true" >> /src/%s
-  else
-    echo "deps_err=deps.json not generated" >> /src/%s
-  fi
-else
-  echo "deps_err=fetch-deps script not built" >> /src/%s
-fi
-`, rev, resultFile, resultFile, resultFile, resultFile)
-
-	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
-		return "", fmt.Errorf("docker setup failed: %w", err)
-	}
-
-	resultPath := filepath.Join(root, resultFile)
-	defer func() { _ = os.Remove(resultPath) }()
-
-	data, err := os.ReadFile(resultPath)
-	if err != nil {
-		return "", fmt.Errorf("read setup results: %w", err)
-	}
-
-	var depsOK bool
-	results := string(data)
-	for _, line := range strings.Split(results, "\n") {
-		if strings.HasPrefix(line, "nix_hash=") {
-			nixHash = strings.TrimPrefix(line, "nix_hash=")
-		}
-		if strings.HasPrefix(line, "deps_ok=") {
-			depsOK = true
-		}
-	}
-
-	if nixHash == "" {
-		return "", fmt.Errorf("could not compute nix_hash in Docker container")
-	}
-	if nixHash != "" {
-		fmt.Printf("[setup] nix_hash: %s\n", nixHash)
-	}
-	if !depsOK {
-		return nixHash, fmt.Errorf("could not generate deps.json in Docker container")
-	}
-
-	return nixHash, nil
-}
 
 // replaceYAMLValue replaces the value of a YAML key in-place, preserving
 // the rest of the line (indentation, inline comments).

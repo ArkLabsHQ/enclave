@@ -121,7 +121,7 @@ resource "aws_vpc_endpoint" "kms" {
   vpc_id              = aws_vpc.main[0].id
   service_name        = "com.amazonaws.${var.region}.kms"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
+  subnet_ids          = [aws_subnet.private[0].id]
   security_group_ids  = [aws_security_group.nitro[0].id]
   private_dns_enabled = true
 
@@ -134,7 +134,7 @@ resource "aws_vpc_endpoint" "ssm" {
   vpc_id              = aws_vpc.main[0].id
   service_name        = "com.amazonaws.${var.region}.ssm"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private[0].id, aws_subnet.private_b[0].id]
+  subnet_ids          = [aws_subnet.private[0].id]
   security_group_ids  = [aws_security_group.nitro[0].id]
   private_dns_enabled = true
 

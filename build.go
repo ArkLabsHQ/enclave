@@ -282,9 +282,29 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 
 // buildMgmtBinary cross-compiles the host-side management server from the SDK
 // for Linux amd64 and places the binary in enclave/artifacts/.
+//
+// If MGMT_LOCAL_PATH is set, the binary is built from local source (go build
+// ./mgmt inside that path) instead of fetched from the module proxy. Mirrors
+// SDK_LOCAL_PATH for the enclave supervisor flake. Used by integration tests
+// that need to exercise unreleased mgmt changes against an unreleased SDK.
 func buildMgmtBinary(cfg *Config, root string) error {
 	outDir := filepath.Join(root, "enclave", "artifacts")
 	fmt.Println("[build] Building management server binary...")
+
+	if localPath := os.Getenv("MGMT_LOCAL_PATH"); localPath != "" {
+		dst := filepath.Join(outDir, "enclave-mgmt")
+		cmd := exec.Command("go", "build", "-trimpath", "-o", dst, "./mgmt")
+		cmd.Dir = localPath
+		cmd.Env = append(os.Environ(),
+			"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("go build mgmt (local path %s): %w", localPath, err)
+		}
+		return nil
+	}
 
 	// Install the mgmt binary from the SDK at the configured version.
 	// GOBIN controls where the binary is placed.

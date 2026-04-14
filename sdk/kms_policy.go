@@ -160,7 +160,7 @@ func parseKMSPolicyState(policyJSON, pcr0 string) (hasPCR0, hasPutKeyPolicy bool
 			if ops, ok := condOps.(map[string]interface{}); ok {
 				for key, val := range ops {
 					if strings.Contains(strings.ToLower(key), "pcr0") {
-						if s, ok := val.(string); ok && s == pcr0 {
+						if s, ok := val.(string); ok && strings.EqualFold(s, pcr0) {
 							hasPCR0 = true
 						}
 					}

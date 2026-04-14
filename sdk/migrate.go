@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hf/nsm"
 )
 
@@ -28,12 +29,15 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body — caller must provide the migration key ID.
+	// Parse request body — caller provides the migration key ID and the new
+	// enclave's PCR0 (used to lock the migration key's Decrypt policy before
+	// any ciphertext is produced).
 	var req struct {
 		MigrationKeyID string `json:"migration_key_id"`
+		NewPCR0        string `json:"new_pcr0"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MigrationKeyID == "" {
-		http.Error(w, "migration_key_id is required in request body", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MigrationKeyID == "" || req.NewPCR0 == "" {
+		http.Error(w, "migration_key_id and new_pcr0 are required in request body", http.StatusBadRequest)
 		return
 	}
 
@@ -61,6 +65,54 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	kmsClient := newKMSClient(awsCfg)
+
+	// Lock the migration key to the new enclave's PCR0 BEFORE encrypting under
+	// it. The mgmt server created this key with a bootstrap policy that grants
+	// only kms:PutKeyPolicy / kms:GetKeyPolicy / kms:ScheduleKeyDeletion to the
+	// EC2 role; installing the final locked policy here ensures that once a
+	// ciphertext exists, no principal can mutate the policy to grant itself
+	// Decrypt. Idempotent: if a previous attempt already locked the policy to
+	// this PCR0 we skip PutKeyPolicy (which would fail — the locked policy
+	// grants PutKeyPolicy to no one) and fall through to re-encrypt.
+	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
+		KeyId:      aws.String(migrationKeyID),
+		PolicyName: aws.String("default"),
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("get migration key policy: %v", err), http.StatusInternalServerError)
+		return
+	}
+	currentPolicyText := ""
+	if currentPolicy.Policy != nil {
+		currentPolicyText = *currentPolicy.Policy
+	}
+	alreadyLocked, _ := parseKMSPolicyState(currentPolicyText, req.NewPCR0)
+	if alreadyLocked {
+		slog.Info("migration key already locked to target PCR0, skipping PutKeyPolicy", "key_id", migrationKeyID, "new_pcr0", req.NewPCR0[:min(16, len(req.NewPCR0))])
+	} else {
+		stsClient := sts.NewFromConfig(awsCfg)
+		identity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("sts get-caller-identity: %v", err), http.StatusInternalServerError)
+			return
+		}
+		roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("resolve IAM role ARN: %v", err), http.StatusInternalServerError)
+			return
+		}
+		lockedPolicy := buildKMSPolicy(roleARN, req.NewPCR0)
+		if _, err := kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
+			KeyId:                          aws.String(migrationKeyID),
+			Policy:                         aws.String(lockedPolicy),
+			PolicyName:                     aws.String("default"),
+			BypassPolicyLockoutSafetyCheck: true,
+		}); err != nil {
+			http.Error(w, fmt.Sprintf("lock migration key policy: %v", err), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("applied PCR0-locked policy to migration key", "key_id", migrationKeyID, "new_pcr0", req.NewPCR0[:min(16, len(req.NewPCR0))])
+	}
 
 	var exported []string
 	for _, secret := range e.secrets {

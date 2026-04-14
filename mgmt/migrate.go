@@ -226,8 +226,12 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	emit(4, "progress", "Migration KMS key IDs stored in SSM")
 
 	// Step 5: Call export-key on the running enclave.
+	// The enclave replaces the transitional policy with the final PCR0-locked
+	// policy (targeting the new enclave's PCR0) before encrypting any secret
+	// under this key, so no decryptable ciphertext can exist under a policy
+	// mutable by mgmt.
 	emit(5, "progress", "Calling export-key on old enclave...")
-	if err := s.callExportKey(ctx, newKMSKeyID); err != nil {
+	if err := s.callExportKey(ctx, newKMSKeyID, req.PCR0); err != nil {
 		rollbackKey()
 		emitErr(5, fmt.Sprintf("export-key failed: %v", err))
 		return
@@ -313,7 +317,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 // callExportKey calls POST /v1/export-key on the running enclave.
 // The enclave URL defaults to https://127.0.0.1:443 but can be overridden
 // via ENCLAVE_URL for testing (e.g. https://127.0.0.1:8443 via gvproxy).
-func (s *server) callExportKey(ctx context.Context, migrationKeyID string) error {
+func (s *server) callExportKey(ctx context.Context, migrationKeyID, newPCR0 string) error {
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -321,7 +325,7 @@ func (s *server) callExportKey(ctx context.Context, migrationKeyID string) error
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	body := fmt.Sprintf(`{"migration_key_id":%q}`, migrationKeyID)
+	body := fmt.Sprintf(`{"migration_key_id":%q,"new_pcr0":%q}`, migrationKeyID, newPCR0)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/export-key", strings.NewReader(body))
 	if err != nil {
 		return err
@@ -459,9 +463,10 @@ func assumedRoleARNToRoleARN(arn string) string {
 }
 
 // buildTransitionalPolicy returns a KMS key policy for locked-key migration.
-// Grants Encrypt + PutKeyPolicy to the EC2 role (so the new enclave can self-apply
-// PCR0-restricted Decrypt during Init) and admin to the account root.
-// Intentionally omits Decrypt — only the new enclave can add that.
+// Grants Encrypt + PutKeyPolicy to the EC2 role (so the running enclave can
+// replace this policy with the final PCR0-locked one before encrypting) and
+// admin to the account root. Intentionally omits Decrypt — the running enclave
+// adds that, gated on the new enclave's PCR0, inside handleExportKey.
 func buildTransitionalPolicy(ec2RoleARN, accountRoot string) string {
 	return fmt.Sprintf(`{
   "Version": "2012-10-17",

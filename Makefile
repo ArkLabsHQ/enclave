@@ -112,7 +112,7 @@ test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 	cd sdk && go mod vendor
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
@@ -122,15 +122,28 @@ test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
 	fi
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
 	cp /tmp/image-v2.eif test/app/enclave/artifacts/image-v2.eif
 	cp /tmp/pcr-v2.json test/app/enclave/artifacts/pcr-v2.json
 
 test-run: ## Run integration tests (requires test-build first)
+	cd test && docker compose --profile test down -v
 	cd test && docker compose --profile test run --build test-runner
+
+.PHONY: test-build-docker test-docker
+test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)
+	docker build --platform=linux/amd64 -t introspector-enclave-builder .
+	docker run --rm --platform=linux/amd64 \
+	  -e HOST_UID=$(shell id -u) \
+	  -e HOST_GID=$(shell id -g) \
+	  -v "$(CURDIR):/workspace" \
+	  -w /workspace \
+	  introspector-enclave-builder
+
+test-docker: test-build-docker test-run ## Build and run tests in containers (test-run needs vsock_loopback — Linux hosts only)

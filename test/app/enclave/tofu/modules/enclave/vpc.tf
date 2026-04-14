@@ -114,7 +114,13 @@ resource "aws_route_table_association" "private_b" {
 }
 
 # VPC endpoints — keep traffic to AWS services inside the VPC.
-
+#
+# Single-AZ on purpose: the Nitro parent instance is placed in public[0] /
+# private[0] (AZ-a only), so adding an endpoint ENI in AZ-b would be paid-for
+# capacity no traffic can reach. private_b exists only so resources that
+# require a multi-AZ subnet group (future RDS, ALB, etc.) can be added without
+# an apply-time VPC redesign. If the parent instance ever becomes multi-AZ,
+# add aws_subnet.private_b[0].id back to subnet_ids below.
 resource "aws_vpc_endpoint" "kms" {
   count = var.local ? 0 : 1
 

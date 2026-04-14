@@ -40,6 +40,17 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "migration_key_id and new_pcr0 are required in request body", http.StatusBadRequest)
 		return
 	}
+	// Reject malformed PCR0 before touching KMS — a non-hex or wrong-length
+	// value would still be accepted by PutKeyPolicy as an opaque condition
+	// string, permanently locking the key to a value no enclave can attest to.
+	if len(req.NewPCR0) != 96 {
+		http.Error(w, "new_pcr0 must be 96 hex characters (SHA-384)", http.StatusBadRequest)
+		return
+	}
+	if _, err := hex.DecodeString(req.NewPCR0); err != nil {
+		http.Error(w, "new_pcr0 must be valid hex", http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 	deployment := getDeployment()
@@ -90,7 +101,7 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	if alreadyLocked {
 		slog.Info("migration key already locked to target PCR0, skipping PutKeyPolicy", "key_id", migrationKeyID, "new_pcr0", req.NewPCR0[:min(16, len(req.NewPCR0))])
 	} else {
-		stsClient := sts.NewFromConfig(awsCfg)
+		stsClient := newSTSClient(awsCfg)
 		identity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 		if err != nil {
 			http.Error(w, fmt.Sprintf("sts get-caller-identity: %v", err), http.StatusInternalServerError)

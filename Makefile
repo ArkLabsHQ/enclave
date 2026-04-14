@@ -140,8 +140,8 @@ test-run: ## Run integration tests (requires test-build first)
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)
 	docker build --platform=linux/amd64 -t introspector-enclave-builder .
 	docker run --rm --platform=linux/amd64 \
-	  --user "$(shell id -u):$(shell id -g)" \
-	  -e HOME=/tmp \
+	  -e HOST_UID=$(shell id -u) \
+	  -e HOST_GID=$(shell id -g) \
 	  -v "$(CURDIR):/workspace" \
 	  -w /workspace \
 	  introspector-enclave-builder

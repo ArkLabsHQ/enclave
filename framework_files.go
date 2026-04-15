@@ -579,6 +579,10 @@ const frameworkFlakeNix = `{
         region = buildCfg.region;
         deployment = buildCfg.prefix;
 
+        # Resolve user-supplied package names from enclave.yaml
+        # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
+        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
         # signing middleware. The user's app is just a plain HTTP server.
@@ -625,6 +629,9 @@ const frameworkFlakeNix = `{
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
 
           postInstall = ''
             # Rename whatever was built to the configured binary name.
@@ -755,6 +762,9 @@ const frameworkFlakeNix = `{
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
         } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
@@ -802,6 +812,10 @@ const frameworkFlakeNixNodejs = `{
         region = buildCfg.region;
         deployment = buildCfg.prefix;
 
+        # Resolve user-supplied package names from enclave.yaml
+        # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
+        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
         # signing middleware. The user's app is just a plain HTTP server.
@@ -846,6 +860,9 @@ const frameworkFlakeNixNodejs = `{
           npmDepsHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
           dontNpmBuild = true;
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
         } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
@@ -980,6 +997,9 @@ LAUNCHER
           npmDepsHash = "";
           dontNpmBuild = true;
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
         } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
@@ -1339,6 +1359,10 @@ const frameworkFlakeNixDotnet = `{
         region = buildCfg.region;
         deployment = buildCfg.prefix;
 
+        # Resolve user-supplied package names from enclave.yaml
+        # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
+        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+
         # Enclave supervisor — built from the SDK repo.
         enclave-supervisor = eifPkgs.buildGoModule {
           pname = "enclave-supervisor";
@@ -1392,6 +1416,9 @@ const frameworkFlakeNixDotnet = `{
           dotnetPublishFlags = [ "/p:PublishAot=true" "/p:StripSymbols=true" ];
 
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
         } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
@@ -1553,6 +1580,10 @@ const frameworkFlakeNixRust = `{
         region = buildCfg.region;
         deployment = buildCfg.prefix;
 
+        # Resolve user-supplied package names from enclave.yaml
+        # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
+        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+
         # Enclave supervisor — built from the SDK repo.
         enclave-supervisor = eifPkgs.buildGoModule {
           pname = "enclave-supervisor";
@@ -1592,6 +1623,9 @@ const frameworkFlakeNixRust = `{
           cargoHash = if appCfg.nix_vendor_hash == "" then "" else appCfg.nix_vendor_hash;
 
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
 
           postInstall = ''
             # Rename whatever was built to the configured binary name.
@@ -1713,6 +1747,9 @@ const frameworkFlakeNixRust = `{
           };
           cargoHash = "";
           doCheck = false;
+
+          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
         } // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source";
           cargoRoot = appCfg.nix_subdir;

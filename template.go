@@ -217,6 +217,11 @@ app:
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
+  # Extra nixpkgs attrs added to the build sandbox.
+  # Names must match attr paths in nixpkgs (e.g. "openssl", "pkg-config").
+  nix_build_inputs: []           # Link-time libs (e.g. ["openssl", "zlib"])
+  nix_native_build_inputs: []    # Build-time tools (e.g. ["pkg-config", "protobuf"])
+
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
@@ -298,6 +303,11 @@ app:
   nix_vendor_hash: ""            # npm deps hash (required)
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Package name from package.json (defaults to 'name')
+
+  # Extra nixpkgs attrs added to the build sandbox.
+  # Names must match attr paths in nixpkgs (e.g. "python3", "pkg-config").
+  nix_build_inputs: []           # Link-time libs (e.g. ["openssl", "cairo"])
+  nix_native_build_inputs: []    # Build-time tools (e.g. ["python3", "pkg-config"])
 
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}
@@ -583,6 +593,11 @@ app:
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
 
+  # Extra nixpkgs attrs added to the build sandbox.
+  # Names must match attr paths in nixpkgs (e.g. "icu", "openssl").
+  nix_build_inputs: []           # Link-time libs (e.g. ["icu", "openssl"])
+  nix_native_build_inputs: []    # Build-time tools
+
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
@@ -778,6 +793,11 @@ app:
   nix_vendor_hash: ""            # Cargo.lock hash (required)
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
+
+  # Extra nixpkgs attrs added to the build sandbox.
+  # Names must match attr paths in nixpkgs (e.g. "openssl", "protobuf").
+  nix_build_inputs: []           # Link-time libs (e.g. ["openssl", "zlib"])
+  nix_native_build_inputs: []    # Build-time tools (e.g. ["pkg-config", "protobuf"])
 
   env:
     # MY_APP_DATA_DIR: /app/data

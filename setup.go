@@ -291,9 +291,22 @@ func computeNixHash(root string, rev string) (string, error) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
+	// Resolve the git top-level. In a monorepo, `root` (where enclave.yaml
+	// lives) can be a subdirectory of the git repo, and `git archive <rev>`
+	// run from a subdirectory archives only that subtree — producing a hash
+	// that never matches fetchFromGitHub, which always fetches the full-repo
+	// tarball from GitHub.
+	topCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	topCmd.Dir = root
+	topOut, err := topCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
+	}
+	gitTop := strings.TrimSpace(string(topOut))
+
 	// git archive --format=tar.gz --prefix=source/ <rev> | tar xz -C tmpDir
 	archiveCmd := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
-	archiveCmd.Dir = root
+	archiveCmd.Dir = gitTop
 
 	tarCmd := exec.Command("tar", "xz", "-C", tmpDir)
 	tarCmd.Stdin, err = archiveCmd.StdoutPipe()

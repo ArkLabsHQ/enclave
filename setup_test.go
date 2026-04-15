@@ -1,6 +1,10 @@
 package introspector_enclave
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -123,3 +127,122 @@ func TestReplaceYAMLValue(t *testing.T) {
 	}
 }
 
+// TestComputeNixHash_MonorepoUsesRepoRoot guards against the regression
+// where `git archive` was run with cwd set to the enclave.yaml directory.
+// In a monorepo layout (git root != enclave config dir) that caused
+// `git archive` to archive only the subtree, producing a hash that did
+// not match what fetchFromGitHub computes for the full repo tarball.
+//
+// The fix resolves `git rev-parse --show-toplevel` and uses that as cwd.
+//
+// This test creates a repo with the enclave config in a subdirectory,
+// computes the hash via the function-under-test, and compares it to the
+// hash of the full repo archive. They must match.
+func TestComputeNixHash_MonorepoUsesRepoRoot(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if _, err := exec.LookPath("nix"); err != nil {
+		t.Skip("nix not available")
+	}
+	if _, err := exec.LookPath("tar"); err != nil {
+		t.Skip("tar not available")
+	}
+
+	repo := t.TempDir()
+
+	// Minimal repo with a top-level file AND a subdirectory containing
+	// enclave.yaml (the monorepo shape that previously triggered the bug).
+	if err := os.WriteFile(filepath.Join(repo, "top.txt"), []byte("repo-root-content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(repo, "server", "enclave")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "enclave.yaml"), []byte("name: test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runIn := func(dir, name string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	runIn(repo, "git", "init", "-q")
+	runIn(repo, "git", "-c", "user.email=t@t", "-c", "user.name=T", "add", ".")
+	runIn(repo, "git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-q", "-m", "init")
+
+	revOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := strings.TrimSpace(string(revOut))
+
+	// Simulate the buggy caller: pass the subdirectory (where enclave.yaml
+	// lives) as the "root" argument. The fix should still produce the
+	// full-repo hash by resolving the git top-level internally.
+	got, err := computeNixHash(filepath.Join(repo, "server"), rev)
+	if err != nil {
+		t.Fatalf("computeNixHash: %v", err)
+	}
+
+	// Expected = hash of the full repo via git archive run at the git top.
+	expTmp := t.TempDir()
+	archive := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
+	archive.Dir = repo
+	extract := exec.Command("tar", "xz", "-C", expTmp)
+	extract.Stdin, err = archive.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := extract.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := extract.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	wantOut, err := exec.Command("nix", "hash", "path", filepath.Join(expTmp, "source")).Output()
+	if err != nil {
+		t.Fatalf("nix hash path: %v", err)
+	}
+	want := strings.TrimSpace(string(wantOut))
+
+	if got != want {
+		t.Errorf("computeNixHash from subdir = %q, want full-repo hash %q", got, want)
+	}
+
+	// Sanity check: the subtree-only hash must DIFFER from the full-repo hash
+	// (otherwise this test can't detect the regression).
+	subTmp := t.TempDir()
+	subArchive := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
+	subArchive.Dir = filepath.Join(repo, "server")
+	subExtract := exec.Command("tar", "xz", "-C", subTmp)
+	subExtract.Stdin, err = subArchive.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := subExtract.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := subArchive.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := subExtract.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	subHashOut, err := exec.Command("nix", "hash", "path", filepath.Join(subTmp, "source")).Output()
+	if err != nil {
+		t.Fatalf("nix hash path (subtree): %v", err)
+	}
+	subHash := strings.TrimSpace(string(subHashOut))
+	if subHash == want {
+		t.Fatal("test setup is broken: subtree hash equals full-repo hash, cannot detect regression")
+	}
+}

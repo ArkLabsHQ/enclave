@@ -44,11 +44,13 @@ type AppConfig struct {
 	NixRev         string            `yaml:"nix_rev"`
 	NixHash        string            `yaml:"nix_hash"`
 	NixVendorHash  string            `yaml:"nix_vendor_hash"`
-	NixSubPackages []string          `yaml:"nix_sub_packages"`
-	NixProjectFile string            `yaml:"nix_project_file"`
-	NixSubdir      string            `yaml:"nix_subdir"`
-	BinaryName     string            `yaml:"binary_name"`
-	Env            map[string]string `yaml:"env"`
+	NixSubPackages       []string          `yaml:"nix_sub_packages"`
+	NixProjectFile       string            `yaml:"nix_project_file"`
+	NixSubdir            string            `yaml:"nix_subdir"`
+	NixBuildInputs       []string          `yaml:"nix_build_inputs"`
+	NixNativeBuildInputs []string          `yaml:"nix_native_build_inputs"`
+	BinaryName           string            `yaml:"binary_name"`
+	Env                  map[string]string `yaml:"env"`
 }
 
 // SecretConfig defines a secret managed by KMS inside the enclave.

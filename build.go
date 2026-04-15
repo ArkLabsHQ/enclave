@@ -33,17 +33,19 @@ type buildConfigJSON struct {
 }
 
 type buildConfigAppJSON struct {
-	Language       string            `json:"language"`
-	NixOwner       string            `json:"nix_owner"`
-	NixRepo        string            `json:"nix_repo"`
-	NixRev         string            `json:"nix_rev"`
-	NixHash        string            `json:"nix_hash"`
-	NixVendorHash  string            `json:"nix_vendor_hash"`
-	NixSubPackages []string          `json:"nix_sub_packages"`
-	NixProjectFile string            `json:"nix_project_file"`
-	NixSubdir      string            `json:"nix_subdir"`
-	BinaryName     string            `json:"binary_name"`
-	Env            map[string]string `json:"env"`
+	Language             string            `json:"language"`
+	NixOwner             string            `json:"nix_owner"`
+	NixRepo              string            `json:"nix_repo"`
+	NixRev               string            `json:"nix_rev"`
+	NixHash              string            `json:"nix_hash"`
+	NixVendorHash        string            `json:"nix_vendor_hash"`
+	NixSubPackages       []string          `json:"nix_sub_packages"`
+	NixProjectFile       string            `json:"nix_project_file"`
+	NixSubdir            string            `json:"nix_subdir"`
+	NixBuildInputs       []string          `json:"nix_build_inputs"`
+	NixNativeBuildInputs []string          `json:"nix_native_build_inputs"`
+	BinaryName           string            `json:"binary_name"`
+	Env                  map[string]string `json:"env"`
 }
 
 type buildConfigSecretJSON struct {
@@ -135,6 +137,16 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// nonNilStrings returns an empty slice when xs is nil so JSON marshalling
+// emits "[]" instead of "null". Nix's builtins.fromJSON would otherwise
+// decode a missing/null field to null, breaking list operations downstream.
+func nonNilStrings(xs []string) []string {
+	if xs == nil {
+		return []string{}
+	}
+	return xs
+}
+
 // generateBuildConfig writes build-config.json from enclave.yaml config.
 // Template variables in env values ({{region}}, {{prefix}}, {{version}}) are substituted.
 func generateBuildConfig(cfg *Config, root string) error {
@@ -162,17 +174,19 @@ func generateBuildConfig(cfg *Config, root string) error {
 		Region:  cfg.Region,
 		Prefix:  cfg.Prefix,
 		App: buildConfigAppJSON{
-			Language:       cfg.App.Language,
-			NixOwner:       cfg.App.NixOwner,
-			NixRepo:        cfg.App.NixRepo,
-			NixRev:         cfg.App.NixRev,
-			NixHash:        cfg.App.NixHash,
-			NixVendorHash:  cfg.App.NixVendorHash,
-			NixSubPackages: cfg.App.NixSubPackages,
-			NixProjectFile: cfg.App.NixProjectFile,
-			NixSubdir:      cfg.App.NixSubdir,
-			BinaryName:     cfg.App.BinaryName,
-			Env:            resolvedEnv,
+			Language:             cfg.App.Language,
+			NixOwner:             cfg.App.NixOwner,
+			NixRepo:              cfg.App.NixRepo,
+			NixRev:               cfg.App.NixRev,
+			NixHash:              cfg.App.NixHash,
+			NixVendorHash:        cfg.App.NixVendorHash,
+			NixSubPackages:       cfg.App.NixSubPackages,
+			NixProjectFile:       cfg.App.NixProjectFile,
+			NixSubdir:            cfg.App.NixSubdir,
+			NixBuildInputs:       nonNilStrings(cfg.App.NixBuildInputs),
+			NixNativeBuildInputs: nonNilStrings(cfg.App.NixNativeBuildInputs),
+			BinaryName:           cfg.App.BinaryName,
+			Env:                  resolvedEnv,
 		},
 		Secrets: secrets,
 		SDK: buildConfigSDKJSON{

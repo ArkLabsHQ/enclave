@@ -79,6 +79,60 @@ sdk:
 	}
 }
 
+func TestLoadConfig_BuildInputs(t *testing.T) {
+	writeConfig(t, `
+name: myapp
+region: us-east-1
+app:
+  language: rust
+  nix_build_inputs:
+    - openssl
+    - zlib
+  nix_native_build_inputs:
+    - pkg-config
+    - protobuf
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if got, want := cfg.App.NixBuildInputs, []string{"openssl", "zlib"}; !equalStrings(got, want) {
+		t.Errorf("NixBuildInputs = %v, want %v", got, want)
+	}
+	if got, want := cfg.App.NixNativeBuildInputs, []string{"pkg-config", "protobuf"}; !equalStrings(got, want) {
+		t.Errorf("NixNativeBuildInputs = %v, want %v", got, want)
+	}
+}
+
+func TestLoadConfig_BuildInputsOmitted(t *testing.T) {
+	writeConfig(t, `
+name: myapp
+region: us-east-1
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.App.NixBuildInputs != nil {
+		t.Errorf("NixBuildInputs = %v, want nil when omitted", cfg.App.NixBuildInputs)
+	}
+	if cfg.App.NixNativeBuildInputs != nil {
+		t.Errorf("NixNativeBuildInputs = %v, want nil when omitted", cfg.App.NixNativeBuildInputs)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLoadConfig_Defaults(t *testing.T) {
 	writeConfig(t, `
 name: minimal

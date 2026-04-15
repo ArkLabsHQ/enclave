@@ -82,6 +82,25 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("[update] nix_hash: %s\n", nixHash)
+
+	// Write nix_rev + nix_hash to enclave.yaml FIRST so the flake's
+	// vendor-hash-check fetches the new source (not the old commit).
+	// Without this, computeVendorHash would vendor the OLD Cargo.lock
+	// and return a stale hash. See setup.go for the mirroring pattern.
+	cfgPath := filepath.Join(root, configFile)
+	{
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", configFile, err)
+		}
+		content := string(data)
+		content = replaceYAMLValue(content, "nix_rev", rev)
+		content = replaceYAMLValue(content, "nix_hash", nixHash)
+		if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", configFile, err)
+		}
+	}
 
 	if !skipDeps {
 		if language == "dotnet" {
@@ -102,27 +121,21 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Println("[update] Skipping deps hash (--skip-deps)")
 	}
-	fmt.Printf("[update] nix_hash: %s\n", nixHash)
 	if vendorHash != "" && vendorHash != "deps.json" {
 		fmt.Printf("[update] nix_vendor_hash: %s\n", vendorHash)
 	}
 
-	// 3. Update enclave.yaml.
-	cfgPath := filepath.Join(root, configFile)
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", configFile, err)
-	}
-
-	content := string(data)
-	content = replaceYAMLValue(content, "nix_rev", rev)
-	content = replaceYAMLValue(content, "nix_hash", nixHash)
+	// Write nix_vendor_hash if it was computed.
 	if vendorHash != "" && language != "dotnet" {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", configFile, err)
+		}
+		content := string(data)
 		content = replaceYAMLValue(content, "nix_vendor_hash", vendorHash)
-	}
-
-	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
-		return fmt.Errorf("write %s: %w", configFile, err)
+		if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", configFile, err)
+		}
 	}
 
 	fmt.Println()

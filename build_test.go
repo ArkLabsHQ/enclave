@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -130,5 +132,102 @@ func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
 	}
 	if bc.App.Env["DEPLOY_VERSION"] != "2.0.0" {
 		t.Errorf("{{version}} not resolved: got %q", bc.App.Env["DEPLOY_VERSION"])
+	}
+}
+
+func TestNonNilStrings(t *testing.T) {
+	if got := nonNilStrings(nil); !reflect.DeepEqual(got, []string{}) {
+		t.Errorf("nonNilStrings(nil) = %v, want []", got)
+	}
+	in := []string{"openssl", "protobuf"}
+	if got := nonNilStrings(in); !reflect.DeepEqual(got, in) {
+		t.Errorf("nonNilStrings(%v) = %v, want %v", in, got, in)
+	}
+	if got := nonNilStrings([]string{}); !reflect.DeepEqual(got, []string{}) {
+		t.Errorf("nonNilStrings([]) = %v, want []", got)
+	}
+}
+
+// TestGenerateBuildConfig_BuildInputs verifies that user-supplied
+// nix_build_inputs / nix_native_build_inputs flow through into the
+// generated build-config.json.
+func TestGenerateBuildConfig_BuildInputs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "enclave"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Name:    "app",
+		Version: "1.0.0",
+		Region:  "us-east-1",
+		App: AppConfig{
+			BinaryName:           "app",
+			NixBuildInputs:       []string{"openssl", "zlib"},
+			NixNativeBuildInputs: []string{"pkg-config", "protobuf"},
+		},
+		MigrationCooldown: "0s",
+		PreviousPCR0:      "genesis",
+	}
+
+	if err := generateBuildConfig(cfg, root); err != nil {
+		t.Fatalf("generateBuildConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var bc buildConfigJSON
+	if err := json.Unmarshal(data, &bc); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(bc.App.NixBuildInputs, []string{"openssl", "zlib"}) {
+		t.Errorf("NixBuildInputs = %v, want [openssl zlib]", bc.App.NixBuildInputs)
+	}
+	if !reflect.DeepEqual(bc.App.NixNativeBuildInputs, []string{"pkg-config", "protobuf"}) {
+		t.Errorf("NixNativeBuildInputs = %v, want [pkg-config protobuf]", bc.App.NixNativeBuildInputs)
+	}
+}
+
+// TestGenerateBuildConfig_BuildInputsNeverNull ensures that when the user
+// omits the two fields in enclave.yaml (so the slices are nil in Go),
+// the generated JSON contains empty arrays rather than null. The flake's
+// resolveInputs helper expects a list, not null.
+func TestGenerateBuildConfig_BuildInputsNeverNull(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "enclave"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Name:              "app",
+		Version:           "1.0.0",
+		Region:            "us-east-1",
+		App:               AppConfig{BinaryName: "app"}, // NixBuildInputs: nil, NixNativeBuildInputs: nil
+		MigrationCooldown: "0s",
+		PreviousPCR0:      "genesis",
+	}
+
+	if err := generateBuildConfig(cfg, root); err != nil {
+		t.Fatalf("generateBuildConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := string(data)
+	if !strings.Contains(raw, `"nix_build_inputs": []`) {
+		t.Errorf("expected empty array for nix_build_inputs, got JSON:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"nix_native_build_inputs": []`) {
+		t.Errorf("expected empty array for nix_native_build_inputs, got JSON:\n%s", raw)
+	}
+	if strings.Contains(raw, `"nix_build_inputs": null`) || strings.Contains(raw, `"nix_native_build_inputs": null`) {
+		t.Errorf("JSON must not emit null for build-input lists, got:\n%s", raw)
 	}
 }

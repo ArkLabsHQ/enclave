@@ -174,3 +174,63 @@ func TestRunGenerateTemplateGolang(t *testing.T) {
 		t.Error("enclave.yaml should have language: go")
 	}
 }
+
+// TestFlakeTemplatesHaveBuildInputsPlumbing asserts that every language
+// flake template exposes nix_build_inputs / nix_native_build_inputs via
+// a resolveInputs helper and wires them into the upstream-app derivation.
+// Without this, user-supplied build inputs in enclave.yaml would be
+// silently ignored and builds that need native deps (openssl, protoc,
+// cairo, ...) would fail.
+func TestFlakeTemplatesHaveBuildInputsPlumbing(t *testing.T) {
+	for _, lang := range []string{"go", "nodejs", "dotnet", "rust"} {
+		t.Run(lang, func(t *testing.T) {
+			files := getFrameworkFiles(lang)
+			var flake string
+			for _, f := range files {
+				if f.RelPath == "flake.nix" {
+					flake = f.Content
+					break
+				}
+			}
+			if flake == "" {
+				t.Fatalf("no flake.nix in %s framework files", lang)
+			}
+
+			wants := []string{
+				"resolveInputs = names:",
+				"nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or [])",
+				"buildInputs = resolveInputs (appCfg.nix_build_inputs or [])",
+			}
+			for _, w := range wants {
+				if !strings.Contains(flake, w) {
+					t.Errorf("%s flake.nix missing: %q", lang, w)
+				}
+			}
+		})
+	}
+}
+
+// TestEnclaveYamlTemplatesDocumentBuildInputs asserts that every scaffolded
+// enclave.yaml exposes the two new fields with a default of [] so users
+// discover them without having to read the docs.
+func TestEnclaveYamlTemplatesDocumentBuildInputs(t *testing.T) {
+	for _, lang := range []string{"go", "nodejs", "dotnet", "rust"} {
+		t.Run(lang, func(t *testing.T) {
+			tmp := t.TempDir()
+			if err := runGenerateTemplate(tmp, lang); err != nil {
+				t.Fatalf("runGenerateTemplate(%s): %v", lang, err)
+			}
+			data, err := os.ReadFile(filepath.Join(tmp, "enclave", "enclave.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			yaml := string(data)
+			if !strings.Contains(yaml, "nix_build_inputs: []") {
+				t.Errorf("%s enclave.yaml missing nix_build_inputs: []", lang)
+			}
+			if !strings.Contains(yaml, "nix_native_build_inputs: []") {
+				t.Errorf("%s enclave.yaml missing nix_native_build_inputs: []", lang)
+			}
+		})
+	}
+}

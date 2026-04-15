@@ -581,7 +581,7 @@ const frameworkFlakeNix = `{
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
-        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+        resolveInputs = names: map (n: eifPkgs.${n}) names;
 
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
@@ -814,7 +814,7 @@ const frameworkFlakeNixNodejs = `{
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
-        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+        resolveInputs = names: map (n: eifPkgs.${n}) names;
 
         # Enclave supervisor — built from the SDK repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
@@ -1361,7 +1361,7 @@ const frameworkFlakeNixDotnet = `{
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
-        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+        resolveInputs = names: map (n: eifPkgs.${n}) names;
 
         # Enclave supervisor — built from the SDK repo.
         enclave-supervisor = eifPkgs.buildGoModule {
@@ -1582,7 +1582,7 @@ const frameworkFlakeNixRust = `{
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
-        resolveInputs = names: map (n: eifPkgs.${n}) (names or []);
+        resolveInputs = names: map (n: eifPkgs.${n}) names;
 
         # Enclave supervisor — built from the SDK repo.
         enclave-supervisor = eifPkgs.buildGoModule {

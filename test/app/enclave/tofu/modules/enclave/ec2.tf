@@ -215,8 +215,12 @@ resource "null_resource" "enclave_migration" {
       fi
 
       echo "Triggering migration..."
-      MIGRATE_BODY=$(jq -nc --arg b "$BUCKET" --arg k "$EIF_KEY" --arg p "$PCR0" --argjson s "$SECRETS" \
-        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
+      MGMT_BUCKET="${aws_s3_bucket.assets.id}"
+      MGMT_KEY="${aws_s3_object.mgmt_binary_staging.key}"
+      MIGRATE_BODY=$(jq -nc \
+        --arg b "$BUCKET" --arg k "$EIF_KEY" --arg p "$PCR0" --argjson s "$SECRETS" \
+        --arg mb "$MGMT_BUCKET" --arg mk "$MGMT_KEY" \
+        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s, mgmt_binary_bucket:$mb, mgmt_binary_key:$mk}')
       MIGRATE_CMD="curl -sf -X POST http://localhost:8443/migrate -H Content-Type:application/json -d '$MIGRATE_BODY'"
       TMPFILE=$(mktemp)
       jq -nc --arg cmd "$MIGRATE_CMD" '{"commands":[$cmd]}' > "$TMPFILE"
@@ -230,6 +234,31 @@ resource "null_resource" "enclave_migration" {
   }
 
   depends_on = [aws_instance.nitro, aws_s3_object.enclave_eif]
+}
+
+# Promote the staging mgmt binary onto the canonical key after a successful
+# enclave migration. Runs only when enclave_migration fires and succeeds, so
+# the canonical key (used by cloud-init on future instance launches) stays
+# pinned to the last-known-good binary until the live migration proves the
+# new one boots.
+resource "null_resource" "promote_mgmt_binary" {
+  count = var.local ? 0 : 1
+
+  triggers = {
+    eif_key       = aws_s3_object.enclave_eif.key
+    expected_pcr0 = var.expected_pcr0
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws s3 cp \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary_staging.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}" \
+        --region "${var.region}"
+    EOT
+  }
+
+  depends_on = [null_resource.enclave_migration]
 }
 
 # Automatic migration (local mode) — triggers when expected_pcr0 changes.
@@ -252,9 +281,31 @@ resource "null_resource" "enclave_migration_local" {
       curl -sf "$${MGMT_URL}/health" >/dev/null 2>&1 || { echo "No mgmt server, skipping migration."; exit 0; }
 
       echo "Triggering local migration..."
+      MGMT_KEY="${aws_s3_object.mgmt_binary_staging.key}"
       curl -sf -X POST "$${MGMT_URL}/migrate" \
         -H 'Content-Type: application/json' \
-        -d "{\"eif_bucket\":\"$${BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"$${PCR0}\",\"secret_names\":$${SECRETS}}"
+        -d "{\"eif_bucket\":\"$${BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"$${PCR0}\",\"secret_names\":$${SECRETS},\"mgmt_binary_bucket\":\"$${BUCKET}\",\"mgmt_binary_key\":\"$${MGMT_KEY}\"}"
     EOT
   }
+}
+
+# Promote the staging mgmt binary onto the canonical key after a successful
+# local-mode migration. Mirrors null_resource.promote_mgmt_binary for non-local.
+resource "null_resource" "promote_mgmt_binary_local" {
+  count = var.local && var.expected_pcr0 != "" ? 1 : 0
+
+  triggers = {
+    expected_pcr0 = var.expected_pcr0
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws s3 cp \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary_staging.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}" \
+        --region "${var.region}"
+    EOT
+  }
+
+  depends_on = [null_resource.enclave_migration_local]
 }

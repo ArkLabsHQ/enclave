@@ -38,6 +38,12 @@ elif command -v go &>/dev/null; then
   echo "Building enclave CLI and mgmt server..."
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cmd/enclave)
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_MGMT" ./mgmt/)
+  # Seed the artifacts dir with the real v1 mgmt binary so the first
+  # tofu_apply uploads it (not an empty placeholder) to the staging S3
+  # key. Step 7 later overwrites this file with a v2 variant to force
+  # Step 10 down the swap path.
+  mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
+  cp "$ENCLAVE_MGMT" "${SCRIPT_DIR}/app/enclave/artifacts/enclave-mgmt"
 else
   echo "Error: neither pre-built binaries (enclave-cli, enclave-mgmt) nor Go compiler found" >&2
   exit 1
@@ -129,8 +135,14 @@ cleanup() {
   echo ""
   echo "=== Tearing down ==="
   tofu_destroy
-  # Kill mgmt server.
-  [ -n "${MGMT_PID:-}" ] && kill "$MGMT_PID" 2>/dev/null && wait "$MGMT_PID" 2>/dev/null || true
+  # Kill mgmt supervisor (which TERM-traps and kills its child mgmt).
+  [ -n "${MGMT_PID:-}" ] && kill -TERM "$MGMT_PID" 2>/dev/null && wait "$MGMT_PID" 2>/dev/null || true
+  # Belt-and-suspenders: if the supervisor's child survived, kill it too.
+  if [ -f /tmp/enclave-mgmt.pid ]; then
+    kill "$(cat /tmp/enclave-mgmt.pid)" 2>/dev/null || true
+    rm -f /tmp/enclave-mgmt.pid
+  fi
+  rm -f /tmp/mgmt-supervisor.sh
   # Kill enclave (boot-qemu.sh) via PID file.
   if [ -f /tmp/enclave-boot.pid ]; then
     kill "$(cat /tmp/enclave-boot.pid)" 2>/dev/null || true
@@ -308,33 +320,64 @@ echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
 
 # Start mgmt server on the host (like production EC2 host).
 # Configured with stop/start commands that manage boot-qemu.sh via PID file.
+# We run mgmt under a tiny supervisor script that loops "run mgmt; wait;
+# relaunch" — the test's analog of systemd Restart=always in production.
+# This lets ENCLAVE_MGMT_RESTART_CMD just kill the current mgmt process; the
+# supervisor resurrects it with the updated on-disk binary.
 echo "  Starting mgmt server..."
 EIF_ABS_PATH="$(realpath "$EIF_PATH")"
-ENCLAVE_AWS_REGION=us-east-1 \
-ENCLAVE_DEPLOYMENT=dev \
-ENCLAVE_APP_NAME=my-app \
-ENCLAVE_MGMT_ADDR="127.0.0.1:8444" \
-ENCLAVE_MIGRATION_COOLDOWN="1m" \
-ENCLAVE_URL="https://127.0.0.1:8443" \
-ENCLAVE_EIF_PATH="$EIF_ABS_PATH" \
-ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3" \
-ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} > /tmp/boot-qemu.log 2>&1 &" \
-AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000" \
-AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566" \
-AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566" \
-AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566" \
-AWS_ENDPOINT_URL_LOGS="http://127.0.0.1:4566" \
-AWS_ACCESS_KEY_ID=test \
-AWS_SECRET_ACCESS_KEY=test \
-  "$ENCLAVE_MGMT" &
+
+MGMT_PIDFILE=/tmp/enclave-mgmt.pid
+MGMT_SUPERVISOR=/tmp/mgmt-supervisor.sh
+cat > "$MGMT_SUPERVISOR" <<'SUPER'
+#!/usr/bin/env bash
+set -u
+MGMT_BIN="$1"
+PIDFILE="$2"
+child=""
+trap '[ -n "$child" ] && kill -TERM "$child" 2>/dev/null; [ -n "$child" ] && wait "$child" 2>/dev/null; rm -f "$PIDFILE"; exit 0' TERM INT
+while :; do
+  "$MGMT_BIN" &
+  child=$!
+  echo "$child" > "$PIDFILE"
+  wait "$child" 2>/dev/null || true
+  sleep 1
+done
+SUPER
+chmod +x "$MGMT_SUPERVISOR"
+
+export ENCLAVE_AWS_REGION=us-east-1
+export ENCLAVE_DEPLOYMENT=dev
+export ENCLAVE_APP_NAME=my-app
+export ENCLAVE_MGMT_ADDR="127.0.0.1:8444"
+export ENCLAVE_MIGRATION_COOLDOWN="1m"
+export ENCLAVE_URL="https://127.0.0.1:8443"
+export ENCLAVE_EIF_PATH="$EIF_ABS_PATH"
+export ENCLAVE_MGMT_BINARY_PATH="$ENCLAVE_MGMT"
+export ENCLAVE_MGMT_RESTART_CMD="kill \$(cat $MGMT_PIDFILE)"
+export ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3"
+export ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} > /tmp/boot-qemu.log 2>&1 &"
+export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
+export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
+export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
+export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
+export AWS_ENDPOINT_URL_LOGS="http://127.0.0.1:4566"
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+
+"$MGMT_SUPERVISOR" "$ENCLAVE_MGMT" "$MGMT_PIDFILE" &
 MGMT_PID=$!
 sleep 2
 
 if ! kill -0 "$MGMT_PID" 2>/dev/null; then
-  echo "Error: mgmt server failed to start" >&2
+  echo "Error: mgmt supervisor failed to start" >&2
   exit 1
 fi
-echo "  Mgmt server running (PID $MGMT_PID) on http://127.0.0.1:8444"
+if [ ! -s "$MGMT_PIDFILE" ]; then
+  echo "Error: mgmt pidfile not populated by supervisor" >&2
+  exit 1
+fi
+echo "  Mgmt supervisor running (PID $MGMT_PID), mgmt child PID $(cat "$MGMT_PIDFILE") on http://127.0.0.1:8444"
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).
@@ -462,9 +505,60 @@ fi
 # Re-apply with the new EIF — tofu detects expected_pcr0 changed and triggers
 # enclave_migration_local, which calls the mgmt server to perform live migration.
 echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" | cut -c1-16)..."
+
+# Snapshot the current mgmt child PID so we can verify Step 10 actually
+# restarted it (supervisor writes new child's PID back to the pidfile).
+PRE_MIGRATION_MGMT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+echo "  Pre-migration mgmt PID: $PRE_MIGRATION_MGMT_PID"
 tofu_apply
 echo "  tofu apply log (migration lines):"
 grep -i 'migrat\|trigger\|null_resource\|local-exec\|curl\|skip' ${SCRIPT_DIR}/tofu-apply.log 2>/dev/null | sed 's/^/    /' || echo "    (no migration lines found)"
+
+# Step 10 always swaps + restarts; assert it ran.
+if ! grep -q "Mgmt binary replaced" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
+  echo "  FAIL: Step 10 did not run — no 'Mgmt binary replaced' NDJSON line in tofu-apply.log" >&2
+  exit 1
+fi
+echo "  PASS: Step 10 replaced the mgmt binary"
+
+# Wait for scheduleMgmtRestart (2s detached sleep) to run the restart cmd,
+# for mgmt to exit, and for the supervisor to relaunch it with the new binary.
+POST_MIGRATION_MGMT_PID=""
+for i in $(seq 1 15); do
+  sleep 1
+  CURRENT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_MIGRATION_MGMT_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
+    POST_MIGRATION_MGMT_PID="$CURRENT_PID"
+    break
+  fi
+done
+if [ -z "$POST_MIGRATION_MGMT_PID" ]; then
+  echo "  FAIL: supervisor did not relaunch mgmt within 15s (pidfile=$(cat "$MGMT_PIDFILE" 2>/dev/null), pre=$PRE_MIGRATION_MGMT_PID)" >&2
+  exit 1
+fi
+echo "  PASS: mgmt restarted ($PRE_MIGRATION_MGMT_PID → $POST_MIGRATION_MGMT_PID)"
+
+# Sanity-check the new mgmt process serves requests.
+if curl -sf --max-time 5 "http://127.0.0.1:8444/health" >/dev/null 2>&1; then
+  echo "  PASS: restarted mgmt server answering /health"
+else
+  echo "  FAIL: restarted mgmt server not responding on /health" >&2
+  exit 1
+fi
+
+# Verify the CLI promoted the staging object onto the canonical enclave-mgmt
+# key after the migration succeeded (null_resource.promote_mgmt_binary_local).
+ASSETS_BUCKET=$(aws s3api list-buckets $LOCALSTACK --query "Buckets[?starts_with(Name, 'dev-my-app-assets-')].Name | [0]" --output text 2>/dev/null || echo "")
+if [ -n "$ASSETS_BUCKET" ] && [ "$ASSETS_BUCKET" != "None" ]; then
+  if aws s3api head-object $LOCALSTACK --bucket "$ASSETS_BUCKET" --key "enclave-mgmt" >/dev/null 2>&1; then
+    echo "  PASS: Canonical enclave-mgmt S3 key promoted"
+  else
+    echo "  FAIL: Canonical enclave-mgmt S3 key not found in $ASSETS_BUCKET" >&2
+    exit 1
+  fi
+else
+  echo "  WARN: assets bucket not found — skipping canonical-promotion check"
+fi
 
 # Step 8: Wait for restarted enclave and verify migration survival.
 # mgmt already stopped and restarted the enclave in step 7 (via boot-qemu.sh).

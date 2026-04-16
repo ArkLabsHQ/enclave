@@ -93,6 +93,26 @@ resource "aws_s3_object" "mgmt_binary" {
   etag       = local.use_local ? filemd5(local.mgmt_source) : null
 }
 
+# Staging copy used for in-place mgmt migration. Each tofu apply overwrites
+# this object with the freshly-built binary; the migration null_resource
+# points the running mgmt server at this key. On migration success the
+# promote_mgmt_binary null_resource copies it onto the canonical key above,
+# so instance reboots come up on the new version. If migration fails the
+# canonical key stays on the last-known-good binary.
+#
+# Recovery: if a newly deployed mgmt binary crash-loops under systemd,
+# SSM into the host and run
+#   aws s3 cp s3://<assets>/enclave-mgmt /home/ec2-user/app/enclave-mgmt
+#   systemctl restart enclave-mgmt
+# to roll back to the canonical (last-known-good) binary.
+resource "aws_s3_object" "mgmt_binary_staging" {
+  depends_on = [null_resource.download_artifacts]
+  bucket     = aws_s3_bucket.assets.id
+  key        = "enclave-mgmt-staging"
+  source     = local.mgmt_source
+  etag       = local.use_local ? filemd5(local.mgmt_source) : null
+}
+
 resource "aws_s3_object" "gvproxy_start_script" {
   bucket = aws_s3_bucket.assets.id
   key    = "gvproxy-start.sh"

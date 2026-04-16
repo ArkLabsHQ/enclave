@@ -22,12 +22,15 @@ import (
 )
 
 const eifPath = "/home/ec2-user/app/server/enclave.eif"
+const mgmtBinaryPath = "/home/ec2-user/app/enclave-mgmt"
 
 type migrateRequest struct {
-	EIFBucket   string   `json:"eif_bucket"`
-	EIFKey      string   `json:"eif_key"`
-	PCR0        string   `json:"pcr0"`
-	SecretNames []string `json:"secret_names"`
+	EIFBucket        string   `json:"eif_bucket"`
+	EIFKey           string   `json:"eif_key"`
+	PCR0             string   `json:"pcr0"`
+	SecretNames      []string `json:"secret_names"`
+	MgmtBinaryBucket string   `json:"mgmt_binary_bucket,omitempty"`
+	MgmtBinaryKey    string   `json:"mgmt_binary_key,omitempty"`
 }
 
 type migrateStatus struct {
@@ -61,13 +64,17 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"secret_names is required"}`, http.StatusBadRequest)
 		return
 	}
+	if (req.MgmtBinaryBucket == "") != (req.MgmtBinaryKey == "") {
+		http.Error(w, `{"error":"mgmt_binary_bucket and mgmt_binary_key must be set together"}`, http.StatusBadRequest)
+		return
+	}
 
 	// Set up streaming response.
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
-	totalSteps := 9
+	totalSteps := 10
 	emit := func(step int, status, msg string) {
 		slog.Info("migrate step", "step", step, "total", totalSteps, "status", status, "msg", msg)
 		_ = json.NewEncoder(w).Encode(migrateStatus{
@@ -275,7 +282,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	// enclave keeps running and we can retry the migration.
 	emit(8, "progress", "Downloading new EIF from S3...")
 	tmpEIF := "/tmp/new-enclave.eif"
-	if err := s.downloadEIF(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
+	if err := s.downloadS3Object(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
 		emitErr(8, fmt.Sprintf("download EIF: %v", err))
 		return
 	}
@@ -310,8 +317,35 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	for _, name := range req.SecretNames {
 		s.resetParam(ctx, "Migration/"+name+"/Ciphertext")
 	}
+	emit(9, "progress", "Migration parameters cleaned up")
 
-	emit(9, "complete", fmt.Sprintf("Migration complete. New KMS key: %s", newKMSKeyID))
+	// Step 10: Optional mgmt binary self-update. Runs last so a failure here
+	// leaves enclave state (KMS/SSM) fully migrated; the canonical mgmt binary
+	// on S3 is untouched until the CLI promotes the staged object after this
+	// request returns successfully.
+	if req.MgmtBinaryBucket != "" && req.MgmtBinaryKey != "" {
+		emit(10, "progress", "Downloading new mgmt binary...")
+		binPath := envOrDefault("ENCLAVE_MGMT_BINARY_PATH", mgmtBinaryPath)
+		stagePath := binPath + ".new"
+		if err := s.downloadS3Object(ctx, req.MgmtBinaryBucket, req.MgmtBinaryKey, stagePath); err != nil {
+			emitErr(10, fmt.Sprintf("download mgmt binary: %v", err))
+			return
+		}
+		if err := os.Chmod(stagePath, 0o755); err != nil {
+			_ = os.Remove(stagePath)
+			emitErr(10, fmt.Sprintf("chmod mgmt binary: %v", err))
+			return
+		}
+		if err := os.Rename(stagePath, binPath); err != nil {
+			_ = os.Remove(stagePath)
+			emitErr(10, fmt.Sprintf("replace mgmt binary: %v", err))
+			return
+		}
+		emit(10, "progress", "Mgmt binary replaced; scheduling restart")
+		scheduleMgmtRestart()
+	}
+
+	emit(10, "complete", fmt.Sprintf("Migration complete. New KMS key: %s", newKMSKeyID))
 }
 
 // callExportKey calls POST /v1/export-key on the running enclave.
@@ -403,7 +437,7 @@ func (s *server) resetParam(ctx context.Context, name string) {
 	_ = s.putParam(ctx, name, "UNSET")
 }
 
-func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) error {
+func (s *server) downloadS3Object(ctx context.Context, bucket, key, destPath string) error {
 	out, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -428,6 +462,24 @@ func (s *server) downloadEIF(ctx context.Context, bucket, key, destPath string) 
 		return err
 	}
 	return os.Rename(tmp, destPath)
+}
+
+// scheduleMgmtRestart spawns a detached process that restarts the mgmt
+// server after a short delay. The delay lets the current HTTP response flush
+// before the stop signal arrives; setsid detaches the helper from mgmt's
+// process group so the restart command is not itself killed when mgmt stops.
+//
+// The restart command is configurable via ENCLAVE_MGMT_RESTART_CMD, mirroring
+// ENCLAVE_STOP_CMD / ENCLAVE_START_CMD for the enclave itself. The default
+// targets the systemd unit used in production; tests override it.
+func scheduleMgmtRestart() {
+	restartCmd := envOrDefault("ENCLAVE_MGMT_RESTART_CMD", "systemctl restart enclave-mgmt.service")
+	cmd := exec.Command("setsid", "sh", "-c", "sleep 2 && "+restartCmd)
+	if err := cmd.Start(); err != nil {
+		slog.Error("failed to schedule mgmt restart", "error", err)
+		return
+	}
+	_ = cmd.Process.Release()
 }
 
 // getCallerRole returns the IAM role ARN and account ID from STS.

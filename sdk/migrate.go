@@ -1,7 +1,10 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +20,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hf/nsm"
 )
+
+// migrationPCRIndex is the PCR register reserved for the migration handoff
+// commitment. During export-key, the old enclave extends this PCR with the
+// new enclave's PCR0 before generating the attestation document. This
+// cryptographically binds "I (PCR0=A) committed to handing off to PCR0=B"
+// inside a single NSM-signed attestation. PCR31 is chosen to avoid collision
+// with secret pubkeys which occupy PCR16 upwards.
+const migrationPCRIndex = 31
 
 // handleExportKey handles POST /v1/export-key.
 // Exports all configured secrets encrypted with a temporary migration KMS key.
@@ -159,6 +170,20 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Commit the new enclave's PCR0 into PCR31 so the attestation document
+	// cryptographically binds this handoff: "I (PCR0=A) am handing off to
+	// PCR0=B." PCR31 is then locked — nothing in this enclave's remaining
+	// lifetime can alter the commitment.
+	newPCR0Bytes, _ := hex.DecodeString(req.NewPCR0) // already validated above
+	if err := extendPCR(migrationPCRIndex, newPCR0Bytes); err != nil {
+		http.Error(w, fmt.Sprintf("extend PCR%d with new_pcr0: %v", migrationPCRIndex, err), http.StatusInternalServerError)
+		return
+	}
+	if err := lockPCR(migrationPCRIndex); err != nil {
+		http.Error(w, fmt.Sprintf("lock PCR%d: %v", migrationPCRIndex, err), http.StatusInternalServerError)
+		return
+	}
+
 	pcr0, _, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -241,7 +266,36 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 	return pcr0, attestDocB64, nil
 }
 
+// verifyPCR31Commitment checks that the previous enclave's attestation
+// document committed to handing off to THIS enclave's PCR0 by extending
+// PCR31. Returns nil if the commitment matches, or an error explaining
+// the mismatch.
+func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
+	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
+	if err != nil {
+		return fmt.Errorf("decode attestation base64: %w", err)
+	}
 
+	pcr31, err := extractPCRFromAttestation(attestDoc, migrationPCRIndex)
+	if err != nil {
+		return fmt.Errorf("extract PCR%d: %w", migrationPCRIndex, err)
+	}
+
+	// NSM extend computes SHA384(old_value || data). PCR31 starts as 48 zero
+	// bytes, so after one extension with new_pcr0_bytes the value is
+	// SHA384(zeros_48 || new_pcr0_bytes).
+	myPCR0Bytes, err := hex.DecodeString(myPCR0)
+	if err != nil {
+		return fmt.Errorf("decode own PCR0 hex: %w", err)
+	}
+	expected := sha512.Sum384(append(make([]byte, 48), myPCR0Bytes...))
+
+	if !bytes.Equal(pcr31, expected[:]) {
+		return fmt.Errorf("PCR%d mismatch: old enclave committed to a different target PCR0", migrationPCRIndex)
+	}
+
+	return nil
+}
 
 // deleteOldKMSKey checks if MigrationOldKMSKeyID is set in SSM. If so,
 // schedules the old KMS key for deletion and clears the parameter.

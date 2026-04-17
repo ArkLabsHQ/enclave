@@ -205,6 +205,16 @@ func (e *Enclave) Init(ctx context.Context) error {
 	}
 	if attestDoc, err := readMigrationPreviousPCR0Attestation(ctx); err == nil {
 		e.previousPCR0Attestation = attestDoc
+
+		// Verify that the previous enclave committed to handing off to THIS
+		// enclave by checking PCR31 in the attestation document. A mismatch
+		// means either a rogue new_pcr0 was injected or the old enclave
+		// predates the commitment feature (PCR31 all zeros).
+		if err := verifyPCR31Commitment(attestDoc, getPCR0()); err != nil {
+			slog.Warn("PCR31 migration commitment verification failed", "error", err)
+		} else {
+			slog.Info("PCR31 migration commitment verified")
+		}
 	}
 
 	deleteOldKMSKey(ctx)
@@ -382,8 +392,8 @@ func (e *Enclave) generateAttestationKey() error {
 func (e *Enclave) extendPCRsWithSecretPubkeys(secrets []SecretDef) error {
 	for i, s := range secrets {
 		pcrIndex := uint(16) + uint(i)
-		if pcrIndex > 31 {
-			return fmt.Errorf("secret %q: PCR index %d exceeds 31", s.Name, pcrIndex)
+		if pcrIndex >= migrationPCRIndex {
+			return fmt.Errorf("secret %q: PCR index %d would collide with migration PCR (PCR%d)", s.Name, pcrIndex, migrationPCRIndex)
 		}
 
 		secretHex := os.Getenv(s.EnvVar)

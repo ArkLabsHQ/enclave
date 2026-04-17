@@ -254,12 +254,20 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	emit(6, "progress", fmt.Sprintf("All %d migration ciphertexts found", len(req.SecretNames)))
 
-	// Step 7: Adopt ciphertexts and update KMS key ID.
+	// Step 7: Adopt ciphertexts (secrets + storage DEK) and update KMS key ID.
 	emit(7, "progress", "Adopting migration ciphertexts...")
 	for _, name := range req.SecretNames {
 		ct, _ := s.getParam(ctx, "Migration/"+name+"/Ciphertext")
 		if err := s.putParam(ctx, name+"/Ciphertext", ct); err != nil {
 			emitErr(7, fmt.Sprintf("copy ciphertext for %s: %v", name, err))
+			return
+		}
+	}
+	// Adopt the storage DEK alongside secrets — same format (base64 KMS
+	// ciphertext), already encrypted under the new key by exportStorageDEK.
+	if dekCT, _ := s.getParam(ctx, "Migration/StorageDEK/Ciphertext"); dekCT != "" && dekCT != "UNSET" {
+		if err := s.putParam(ctx, "StorageDEK/Ciphertext", dekCT); err != nil {
+			emitErr(7, fmt.Sprintf("copy StorageDEK ciphertext: %v", err))
 			return
 		}
 	}
@@ -317,6 +325,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	for _, name := range req.SecretNames {
 		s.resetParam(ctx, "Migration/"+name+"/Ciphertext")
 	}
+	s.resetParam(ctx, "Migration/StorageDEK/Ciphertext")
 	emit(9, "progress", "Migration parameters cleaned up")
 
 	// Step 10: Optional mgmt binary self-update. Runs last so a failure here

@@ -62,31 +62,11 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 		return fmt.Errorf("get KMS key ID: %w", err)
 	}
 
-	// Check for migrated DEK first (from a previous enclave version).
-	migParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
-	if migCiphertext, err := loadCiphertextFromSSM(ctx, ssmClient, migParam); err == nil && migCiphertext != "" {
-		dek, err := decryptDEK(ctx, kmsClient, keyID, migCiphertext)
-		if err != nil {
-			return fmt.Errorf("decrypt migrated DEK: %w", err)
-		}
-		e.dek = dek
-
-		// Adopt: store as primary DEK and clear migration param.
-		primaryParam := fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext", deployment, appName)
-		reEncrypted, err := encryptWithKMS(ctx, kmsClient, keyID, dek)
-		if err != nil {
-			return fmt.Errorf("re-encrypt DEK: %w", err)
-		}
-		if err := storeCiphertextInSSM(ctx, ssmClient, primaryParam, reEncrypted); err != nil {
-			return fmt.Errorf("store adopted DEK: %w", err)
-		}
-		if err := storeCiphertextInSSM(ctx, ssmClient, migParam, "UNSET"); err != nil {
-			slog.Warn("clear migrated DEK param failed", "error", err)
-		}
-		return nil
-	}
-
 	// Load or generate primary DEK.
+	// During migration the mgmt server copies Migration/StorageDEK/Ciphertext
+	// into the primary location and clears the migration param, so the enclave
+	// always finds the DEK here regardless of whether it's a fresh boot or
+	// post-migration restart.
 	primaryParam := fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext", deployment, appName)
 	ciphertextB64, err := loadCiphertextFromSSM(ctx, ssmClient, primaryParam)
 	if err != nil {

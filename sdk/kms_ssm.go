@@ -209,30 +209,40 @@ func buildAttestationDocument(session *nsm.Session) ([]byte, *rsa.PrivateKey, er
 
 // extractPCR0FromAttestation parses the attestation document and returns PCR0 as hex.
 func extractPCR0FromAttestation(attestationDoc []byte) (string, error) {
+	pcr, err := extractPCRFromAttestation(attestationDoc, 0)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(pcr), nil
+}
+
+// extractPCRFromAttestation parses a COSE Sign1 attestation document and
+// returns the raw bytes for the given PCR index.
+func extractPCRFromAttestation(attestationDoc []byte, index uint) ([]byte, error) {
 	var coseSign1 []cbor.RawMessage
 	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
-		return "", fmt.Errorf("unmarshal COSE Sign1: %w", err)
+		return nil, fmt.Errorf("unmarshal COSE Sign1: %w", err)
 	}
 	if len(coseSign1) < 3 {
-		return "", fmt.Errorf("invalid COSE Sign1 structure")
+		return nil, fmt.Errorf("invalid COSE Sign1 structure")
 	}
 
 	var payload []byte
 	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
-		return "", fmt.Errorf("unmarshal COSE payload: %w", err)
+		return nil, fmt.Errorf("unmarshal COSE payload: %w", err)
 	}
 
 	var doc attestationDocument
 	if err := cbor.Unmarshal(payload, &doc); err != nil {
-		return "", fmt.Errorf("unmarshal attestation document: %w", err)
+		return nil, fmt.Errorf("unmarshal attestation document: %w", err)
 	}
 
-	pcr0, ok := doc.PCRs[0]
+	pcr, ok := doc.PCRs[index]
 	if !ok {
-		return "", fmt.Errorf("PCR0 not found in attestation document")
+		return nil, fmt.Errorf("PCR%d not found in attestation document", index)
 	}
 
-	return hex.EncodeToString(pcr0), nil
+	return pcr, nil
 }
 
 // getAttestationDocumentB64 generates a minimal NSM attestation document (without

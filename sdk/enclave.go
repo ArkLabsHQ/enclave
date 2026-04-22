@@ -41,8 +41,9 @@ type Enclave struct {
 	attestationKey          *btcec.PrivateKey
 	secrets                 []SecretDef
 	previousPCR0            string
-	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
+	previousPCR0Attestation string       // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
+	initOK                  atomic.Bool  // true only if Init completed successfully
 	mgmtToken               string       // bearer token for management endpoints (empty = no auth)
 	dynamicSecretsCount     atomic.Int64 // count of loaded dynamic secrets, for enclave-info
 
@@ -52,8 +53,8 @@ type Enclave struct {
 	dek        []byte // 32-byte plaintext AES-256 key, in memory only
 
 	// Log buffer for structured log entries from the app.
-	logBuffer  *LogBuffer
-	logShipCh  chan LogEntry // buffered channel for CloudWatch shipper (nil when disabled)
+	logBuffer *LogBuffer
+	logShipCh chan LogEntry // buffered channel for CloudWatch shipper (nil when disabled)
 
 	// Span buffer for distributed trace spans.
 	spanBuffer *SpanBuffer
@@ -152,15 +153,66 @@ func (e *Enclave) Init(ctx context.Context) error {
 		return fmt.Errorf("generate attestation key: %w", err)
 	}
 
+	// Verify previous PCR0 BEFORE any irreversible operations.
+	// selfApplyKMSPolicy permanently locks the KMS key to the current PCR0,
+	// and initStorage may generate a fresh DEK. Both are irreversible —
+	// checking first prevents a silent revert to a fresh deployment when
+	// previous_pcr0 is wrong.
+	expectedPreviousPCR0 := os.Getenv("ENCLAVE_PREVIOUS_PCR0")
+	if expectedPreviousPCR0 == "" {
+		expectedPreviousPCR0 = "genesis"
+	}
+
+	// Classify boot role from declarative SSM flags. Any enclave that boots
+	// with MigrationKMSKeyID set but is NOT the target must run the abort path.
+	migrationKeyID := ""
+	if mkid, err := readMigrationKMSKeyID(ctx); err == nil {
+		migrationKeyID = mkid
+	}
+	migrationTargetPCR0 := ""
+	if tgt, err := readMigrationTargetPCR0(ctx); err == nil {
+		migrationTargetPCR0 = tgt
+	}
+	ownPCR0 := getPCR0()
+	role := classifyBootRole(migrationKeyID != "", ownPCR0, migrationTargetPCR0)
+
+	if role == BootRoleAbortMigration {
+		slog.Warn("aborting in-progress migration — this enclave is not the target",
+			"migration_key", migrationKeyID[:min(16, len(migrationKeyID))],
+			"target_pcr0", migrationTargetPCR0[:min(16, len(migrationTargetPCR0))],
+			"own_pcr0", ownPCR0[:min(16, len(ownPCR0))])
+		if err := abortOrphanedMigration(ctx, expectedPreviousPCR0); err != nil {
+			return fmt.Errorf("abort orphaned migration: %w", err)
+		}
+		migrationKeyID = ""
+		role = BootRoleNoMigration
+	}
+
+	paramPrefix := ""
+	if role == BootRoleNewEnclave {
+		paramPrefix = "Migration/"
+		slog.Info("migration mode active — reading from Migration/* staging", "key", migrationKeyID[:min(16, len(migrationKeyID))])
+	}
+
+	// Primary-mode verification: baked ENCLAVE_PREVIOUS_PCR0 must match SSM.
+	previousPCR0 := "genesis"
+	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
+		previousPCR0 = pcr0
+	}
+	if expectedPreviousPCR0 != previousPCR0 {
+		return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave config), got %q (from SSM)", expectedPreviousPCR0, previousPCR0)
+	}
+	e.previousPCR0 = previousPCR0
+
 	slog.Info("applying KMS policy")
-	if err := selfApplyKMSPolicy(ctx); err != nil {
+	if err := selfApplyKMSPolicy(ctx, migrationKeyID); err != nil {
 		slog.Error("apply KMS policy", "error", err)
 		return fmt.Errorf("apply KMS policy: %w", err)
 	}
 
 	if len(secrets) > 0 {
 		slog.Info("waiting for KMS secrets")
-		if err := e.waitForSecretsFromKMS(ctx, secrets); err != nil {
+		if err := e.waitForSecretsFromKMS(ctx, secrets, migrationKeyID, paramPrefix); err != nil {
 			slog.Error("load secrets from KMS", "error", err)
 			return fmt.Errorf("load secrets from KMS: %w", err)
 		}
@@ -172,7 +224,7 @@ func (e *Enclave) Init(ctx context.Context) error {
 	}
 
 	slog.Info("initializing storage")
-	if err := e.initStorage(ctx); err != nil {
+	if err := e.initStorage(ctx, migrationKeyID, paramPrefix); err != nil {
 		slog.Error("init storage", "error", err)
 		return fmt.Errorf("init storage: %w", err)
 	}
@@ -183,26 +235,7 @@ func (e *Enclave) Init(ctx context.Context) error {
 		e.dynamicSecretsCount.Store(int64(count))
 	}
 
-	// Verify and set previous PCR0.
-	expectedPCR0 := os.Getenv("ENCLAVE_PREVIOUS_PCR0")
-	if expectedPCR0 == "" {
-		expectedPCR0 = "genesis"
-	}
-	ssmPCR0 := ""
-	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
-		ssmPCR0 = pcr0
-	}
-	if expectedPCR0 != "genesis" {
-		if ssmPCR0 == "" || ssmPCR0 == "UNSET" {
-			return fmt.Errorf("previous_pcr0 is %q but no migration has occurred (SSM has no value)", expectedPCR0)
-		}
-		if expectedPCR0 != ssmPCR0 {
-			return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave.yaml), got %q (from SSM)", expectedPCR0, ssmPCR0)
-		}
-	}
-	if ssmPCR0 != "" && ssmPCR0 != "UNSET" {
-		e.previousPCR0 = ssmPCR0
-	}
+	// Load migration attestation (after storage is ready).
 	if attestDoc, err := readMigrationPreviousPCR0Attestation(ctx); err == nil {
 		e.previousPCR0Attestation = attestDoc
 
@@ -217,7 +250,20 @@ func (e *Enclave) Init(ctx context.Context) error {
 		}
 	}
 
+	// Atomic commit: if we're in migration mode, promote Migration/* to
+	// primary and clear MigrationKMSKeyID in a single ordered sequence. After
+	// this, the enclave is in primary mode and the migration is committed.
+	if migrationKeyID != "" {
+		slog.Info("promoting migration staging to primary")
+		if err := promoteMigrationToPrimary(ctx, secrets, migrationKeyID); err != nil {
+			slog.Error("promote migration to primary", "error", err)
+			return fmt.Errorf("promote migration: %w", err)
+		}
+		slog.Info("migration committed")
+	}
+
 	deleteOldKMSKey(ctx)
+	e.initOK.Store(true)
 	slog.Info("init completed successfully")
 	SpanOK(initSpan)
 
@@ -231,7 +277,6 @@ func (e *Enclave) Init(ctx context.Context) error {
 
 	return nil
 }
-
 
 // GetLogBuffer returns the log buffer for use by the slog handler.
 func (e *Enclave) GetLogBuffer() *LogBuffer {
@@ -253,9 +298,10 @@ func (e *Enclave) GetSpanShipCh() chan SpanEntry {
 	return e.spanShipCh
 }
 
-// IsReady returns true after Init has completed (success or failure).
+// IsReady returns true only if Init has completed successfully. /health
+// returns 503 otherwise, distinguishing "failed" from "ready".
 func (e *Enclave) IsReady() bool {
-	return e.initDone.Load()
+	return e.initOK.Load()
 }
 
 // AttestationPubkey returns the hex-encoded compressed public key of the
@@ -303,7 +349,6 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/enclave-traces", e.handleSpanPost)
 	mux.HandleFunc("GET /v1/enclave-traces", e.handleSpanGet)
 }
-
 
 // Middleware returns an http.Handler that signs all responses with the
 // ephemeral attestation key using BIP-340 Schnorr signatures.
@@ -462,15 +507,15 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	cooldownSeconds, cooldownRemaining, migrationPending := e.getMigrationCooldownStatus(r.Context())
 
 	_ = json.NewEncoder(w).Encode(struct {
-		Version                    string           `json:"version"`
-		PreviousPCR0               string           `json:"previous_pcr0"`
-		PreviousPCR0Attestation    string           `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey          string           `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets             int64            `json:"dynamic_secrets"`
+		Version                    string         `json:"version"`
+		PreviousPCR0               string         `json:"previous_pcr0"`
+		PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
+		AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
+		DynamicSecrets             int64          `json:"dynamic_secrets"`
 		Metrics                    map[string]any `json:"metrics"`
-		MigrationCooldownSeconds   int              `json:"migration_cooldown_seconds"`
-		MigrationCooldownRemaining int              `json:"migration_cooldown_remaining,omitempty"`
-		MigrationPending           bool             `json:"migration_pending"`
+		MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
+		MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
+		MigrationPending           bool           `json:"migration_pending"`
 	}{
 		Version:                    Version,
 		PreviousPCR0:               e.previousPCR0,

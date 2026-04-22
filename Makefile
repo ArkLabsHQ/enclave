@@ -110,11 +110,14 @@ _test-cli-lang:
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
-test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
+test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with WRONG previousPCR0 for rollback test)
 	cd sdk && go mod vendor
+	# Build v1 once and stash; re-using the same artifact for the final v1 copy
+	# keeps v2's baked predecessor PCR0 consistent with the running v1.
 	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
+	cp test/app/enclave/artifacts/image.eif /tmp/image-v1.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
-	V1_PCR0=$$(jq -r '.PCR0' test/app/enclave/artifacts/pcr.json) && \
+	V1_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v1.json) && \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
 	if grep -q '^previous_pcr0:' test/app/enclave/enclave.yaml; then \
 		sed -i "s/^previous_pcr0: .*/previous_pcr0: \"$$V1_PCR0\"/" test/app/enclave/enclave.yaml; \
@@ -125,16 +128,27 @@ test-build:  ## Build test EIFs (v1 + v2 for migration with previousPCR0)
 	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
+	# v3: deliberately wrong previous_pcr0 for the rollback test.
+	WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff" && \
+	sed -i 's/^version: .*/version: 0.0.3/' test/app/enclave/enclave.yaml && \
+	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$WRONG_PCR0\"|" test/app/enclave/enclave.yaml
+	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
+	cp test/app/enclave/artifacts/image.eif /tmp/image-v3.eif
+	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v3.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
-	cp test/app/enclave/artifacts/pcr.json test/app/enclave/artifacts/pcr-v1.json
+	cp /tmp/image-v1.eif test/app/enclave/artifacts/image.eif
+	cp /tmp/pcr-v1.json test/app/enclave/artifacts/pcr.json
+	cp /tmp/image-v1.eif test/app/enclave/artifacts/image-v1.eif
+	cp /tmp/pcr-v1.json test/app/enclave/artifacts/pcr-v1.json
 	cp /tmp/image-v2.eif test/app/enclave/artifacts/image-v2.eif
 	cp /tmp/pcr-v2.json test/app/enclave/artifacts/pcr-v2.json
+	cp /tmp/image-v3.eif test/app/enclave/artifacts/image-v3.eif
+	cp /tmp/pcr-v3.json test/app/enclave/artifacts/pcr-v3.json
 
 test-run: ## Run integration tests (requires test-build first)
 	cd test && docker compose --profile test down -v
-	cd test && docker compose --profile test run --build test-runner
+	cd test && docker compose --profile test run test-runner
 
 .PHONY: test-build-docker test-docker
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)

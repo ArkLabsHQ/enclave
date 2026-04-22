@@ -31,18 +31,29 @@ type attestationDocument struct {
 
 // waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
 // Times out after 5 minutes to prevent infinite retries on broken KMS.
-func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef) error {
+//
+// keyID specifies the KMS key to decrypt under. Pass empty string to use the
+// primary key from SSM. paramPrefix is inserted between the app name and the
+// secret name in the SSM param path — use "Migration/" for migration mode,
+// empty string for primary mode.
+//
+// In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
+// generates a fresh secret — the Migration/* params MUST exist or Init fails.
+// Generating a fresh secret in migration mode would orphan the real data.
+func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef, keyID, paramPrefix string) error {
 	const timeout = 5 * time.Minute
 	interval := 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	migrationMode := paramPrefix != "" && keyID != ""
+
 	var lastErr error
 	for {
 		allLoaded := true
 		for _, s := range secrets {
-			if err := initializeOrLoadSecret(ctx, s); err != nil {
+			if err := loadSecret(ctx, s, keyID, paramPrefix, migrationMode); err != nil {
 				lastErr = fmt.Errorf("secret %s: %w", s.Name, err)
 				allLoaded = false
 				break
@@ -68,10 +79,11 @@ func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef
 	}
 }
 
-// initializeOrLoadSecret checks SSM for existing ciphertext for a secret.
-// If not found, generates 32 random bytes, encrypts with KMS, and stores in SSM.
-// If found, decrypts using KMS with attestation.
-func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
+// loadSecret loads one secret's ciphertext from SSM and decrypts it with KMS.
+// In primary mode (migrationMode=false), generates a fresh secret if missing.
+// In migration mode (migrationMode=true), returns an error if the ciphertext
+// is missing — NEVER generates fresh, which would orphan the real data.
+func loadSecret(ctx context.Context, secret SecretDef, keyID, paramPrefix string, migrationMode bool) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -80,10 +92,13 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	ssmClient := newSSMClient(awsCfg)
 	kmsClient := newKMSClient(awsCfg)
 
-	paramName := getSecretSSMParamName(secret.Name)
-	keyID, err := getKMSKeyID(ctx, ssmClient)
-	if err != nil {
-		return fmt.Errorf("get KMS key ID: %w", err)
+	paramName := getSecretSSMParamNameWithPrefix(secret.Name, paramPrefix)
+
+	if keyID == "" {
+		keyID, err = getKMSKeyID(ctx, ssmClient)
+		if err != nil {
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 	if keyID == "" {
 		return fmt.Errorf("KMS key ID is empty")
@@ -95,6 +110,9 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	}
 
 	if ciphertextB64 == "" {
+		if migrationMode {
+			return fmt.Errorf("migration ciphertext missing at %s — cannot generate fresh (would orphan data)", paramName)
+		}
 		return generateAndStoreSecret(ctx, kmsClient, ssmClient, keyID, paramName, secret.EnvVar)
 	}
 
@@ -322,11 +340,18 @@ func loadCiphertextFromSSM(ctx context.Context, ssmClient *ssm.Client, paramName
 	return value, nil
 }
 
-// getSecretSSMParamName returns the SSM parameter name for a secret's ciphertext.
+// getSecretSSMParamName returns the SSM parameter name for a secret's ciphertext
+// in primary storage.
 func getSecretSSMParamName(secretName string) string {
+	return getSecretSSMParamNameWithPrefix(secretName, "")
+}
+
+// getSecretSSMParamNameWithPrefix returns the SSM parameter name for a secret's
+// ciphertext. Pass "" for primary storage, "Migration/" for migration staging.
+func getSecretSSMParamNameWithPrefix(secretName, prefix string) string {
 	deployment := getDeployment()
 	appName := getAppName()
-	return fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secretName)
+	return fmt.Sprintf("/%s/%s/%s%s/Ciphertext", deployment, appName, prefix, secretName)
 }
 
 // getKMSKeyID returns the KMS key ID from environment or SSM.

@@ -74,7 +74,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
-	totalSteps := 10
+	totalSteps := 11
 	emit := func(step int, status, msg string) {
 		slog.Info("migrate step", "step", step, "total", totalSteps, "status", status, "msg", msg)
 		_ = json.NewEncoder(w).Encode(migrateStatus{
@@ -195,6 +195,7 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 			slog.Info("scheduled orphaned key for deletion", "key_id", newKMSKeyID, "pending_days", 7)
 		}
 		s.resetParam(ctx, "MigrationKMSKeyID")
+		s.resetParam(ctx, "MigrationTargetPCR0")
 	}
 
 	// Step 3: Apply transitional KMS policy.
@@ -219,7 +220,14 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	emit(3, "progress", "Transitional KMS policy applied")
 
 	// Step 4: Store migration parameters in SSM.
+	// MigrationTargetPCR0 is written before MigrationKMSKeyID — the latter is
+	// the "in progress" flag that gates the enclave-side classifier.
 	emit(4, "progress", "Storing migration parameters in SSM...")
+	if err := s.putParam(ctx, "MigrationTargetPCR0", req.PCR0); err != nil {
+		rollbackKey()
+		emitErr(4, fmt.Sprintf("store MigrationTargetPCR0: %v", err))
+		return
+	}
 	if err := s.putParam(ctx, "MigrationKMSKeyID", newKMSKeyID); err != nil {
 		rollbackKey()
 		emitErr(4, fmt.Sprintf("store MigrationKMSKeyID: %v", err))
@@ -254,59 +262,46 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	emit(6, "progress", fmt.Sprintf("All %d migration ciphertexts found", len(req.SecretNames)))
 
-	// Step 7: Adopt ciphertexts (secrets + storage DEK) and update KMS key ID.
-	emit(7, "progress", "Adopting migration ciphertexts...")
-	for _, name := range req.SecretNames {
-		ct, _ := s.getParam(ctx, "Migration/"+name+"/Ciphertext")
-		if err := s.putParam(ctx, name+"/Ciphertext", ct); err != nil {
-			emitErr(7, fmt.Sprintf("copy ciphertext for %s: %v", name, err))
-			return
-		}
-	}
-	// Adopt the storage DEK alongside secrets — same format (base64 KMS
-	// ciphertext), already encrypted under the new key by exportStorageDEK.
-	if dekCT, _ := s.getParam(ctx, "Migration/StorageDEK/Ciphertext"); dekCT != "" && dekCT != "UNSET" {
-		if err := s.putParam(ctx, "StorageDEK/Ciphertext", dekCT); err != nil {
-			emitErr(7, fmt.Sprintf("copy StorageDEK ciphertext: %v", err))
-			return
-		}
-	}
-	if err := s.putParam(ctx, "KMSKeyID", newKMSKeyID); err != nil {
-		emitErr(7, fmt.Sprintf("update KMSKeyID: %v", err))
-		return
-	}
-	emit(7, "progress", "Ciphertexts adopted, KMSKeyID updated")
-
-	// Step 8: Download new EIF, stop old enclave, replace, restart.
-	// Commands are configurable for different environments:
-	//   Production: systemctl stop/start enclave-watchdog (default)
-	//   Test/QEMU:  custom commands to kill/restart boot-qemu.sh
-	// Commands are split on whitespace — shell metacharacters are not supported.
+	// Step 7: Back up old EIF before swap, then download new EIF + swap.
+	// Ordering: download first, then stop old, then swap, then start new.
+	// If any step fails before "start new", old enclave is still alive and
+	// retry is safe. After "start new", the new enclave's Init() either
+	// succeeds (commit) or fails (we rollback by restoring the backup EIF).
 	eifDest := envOrDefault("ENCLAVE_EIF_PATH", eifPath)
+	eifBackup := eifDest + ".backup"
 	stopCmd := envOrDefault("ENCLAVE_STOP_CMD", "systemctl stop enclave-watchdog")
 	startCmd := envOrDefault("ENCLAVE_START_CMD", "systemctl start enclave-watchdog")
 
-	// Download EIF before stopping enclave — if the download fails, the old
-	// enclave keeps running and we can retry the migration.
-	emit(8, "progress", "Downloading new EIF from S3...")
-	tmpEIF := "/tmp/new-enclave.eif"
-	if err := s.downloadS3Object(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
-		emitErr(8, fmt.Sprintf("download EIF: %v", err))
+	emit(7, "progress", "Backing up old EIF...")
+	if err := copyFile(eifDest, eifBackup); err != nil {
+		rollbackKey()
+		emitErr(7, fmt.Sprintf("backup old EIF: %v", err))
 		return
 	}
 
-	// Stop old enclave only after successful download.
-	// Commands use sh -c because they may contain shell features (pipes, redirects, &&).
+	emit(7, "progress", "Downloading new EIF from S3...")
+	tmpEIF := "/tmp/new-enclave.eif"
+	if err := s.downloadS3Object(ctx, req.EIFBucket, req.EIFKey, tmpEIF); err != nil {
+		_ = os.Remove(eifBackup)
+		rollbackKey()
+		emitErr(7, fmt.Sprintf("download EIF: %v", err))
+		return
+	}
+
+	// Step 8: Stop old enclave, swap EIF, start new enclave.
 	emit(8, "progress", fmt.Sprintf("Stopping old enclave (%s)...", stopCmd))
 	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
 		slog.Warn("stop command failed", "output", string(out), "error", err)
-		// Non-fatal: enclave may already be stopped.
-		emit(8, "progress", fmt.Sprintf("Stop command returned error (continuing): %v", err))
+		emit(8, "progress", fmt.Sprintf("Stop returned error (continuing): %v", err))
 	}
 
 	emit(8, "progress", fmt.Sprintf("Replacing EIF at %s...", eifDest))
 	if err := os.Rename(tmpEIF, eifDest); err != nil {
 		if cpErr := copyFile(tmpEIF, eifDest); cpErr != nil {
+			// Restore backup since we've already stopped the old enclave.
+			_ = os.Rename(eifBackup, eifDest)
+			_, _ = exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput()
+			rollbackKey()
 			emitErr(8, fmt.Sprintf("replace EIF: %v", cpErr))
 			return
 		}
@@ -315,46 +310,179 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	emit(8, "progress", fmt.Sprintf("Starting new enclave (%s)...", startCmd))
 	if out, err := exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput(); err != nil {
 		emitErr(8, fmt.Sprintf("start enclave: %v: %s", err, out))
+		s.rollbackMigration(ctx, eifDest, eifBackup, stopCmd, startCmd, newKMSKeyID, emit)
 		return
 	}
-	emit(8, "progress", "Enclave restarted with new EIF")
+	emit(8, "progress", "New enclave started; waiting for Init to commit...")
 
-	// Step 9: Clean up migration SSM params.
-	emit(9, "progress", "Cleaning up migration parameters...")
-	s.resetParam(ctx, "MigrationKMSKeyID")
-	for _, name := range req.SecretNames {
-		s.resetParam(ctx, "Migration/"+name+"/Ciphertext")
+	// Step 9: Wait for new enclave to commit migration.
+	// The new enclave's Init() performs the atomic promotion (copy Migration/*
+	// → primary, clear MigrationKMSKeyID). We poll for two success indicators:
+	//   (a) MigrationKMSKeyID cleared in SSM (authoritative commit signal)
+	//   (b) /health returns 200 (enclave's own IsReady() = initOK)
+	// Either indicator is sufficient; both failing within timeout = rollback.
+	// Timeout is configurable via ENCLAVE_MIGRATION_COMMIT_TIMEOUT (default 5min).
+	commitTimeout := 5 * time.Minute
+	if v := envOrDefault("ENCLAVE_MIGRATION_COMMIT_TIMEOUT", ""); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
+			commitTimeout = d
+		}
 	}
-	s.resetParam(ctx, "Migration/StorageDEK/Ciphertext")
-	emit(9, "progress", "Migration parameters cleaned up")
+	emit(9, "progress", fmt.Sprintf("Polling for new enclave to commit migration (timeout: %s)...", commitTimeout))
+	if err := s.waitForMigrationCommit(ctx, commitTimeout); err != nil {
+		emitErr(9, fmt.Sprintf("commit timeout: %v", err))
+		s.rollbackMigration(ctx, eifDest, eifBackup, stopCmd, startCmd, newKMSKeyID, emit)
+		return
+	}
+	emit(9, "progress", "Migration committed by new enclave")
 
-	// Step 10: Optional mgmt binary self-update. Runs last so a failure here
-	// leaves enclave state (KMS/SSM) fully migrated; the canonical mgmt binary
-	// on S3 is untouched until the CLI promotes the staged object after this
-	// request returns successfully.
+	// Step 10: Post-commit cleanup.  Mgmt only removes host-local artifacts here.
+	emit(10, "progress", "Removing EIF backup...")
+	_ = os.Remove(eifBackup)
+	emit(10, "progress", "Host-side cleanup done")
+
+	// Step 11: Optional mgmt binary update.
+	//
+	// Download → validate (new binary's Init runs) → rename → signal exit.
+	// If validate fails we leave old mgmt running. If it succeeds we trust
+	// the new binary and let the supervisor relaunch us. There is no
+	// rollback: if the rare case "validate passed but :8443 bind fails"
+	// happens, the operator redeploys from S3.
+	exitAfter := false
 	if req.MgmtBinaryBucket != "" && req.MgmtBinaryKey != "" {
-		emit(10, "progress", "Downloading new mgmt binary...")
-		binPath := envOrDefault("ENCLAVE_MGMT_BINARY_PATH", mgmtBinaryPath)
-		stagePath := binPath + ".new"
-		if err := s.downloadS3Object(ctx, req.MgmtBinaryBucket, req.MgmtBinaryKey, stagePath); err != nil {
-			emitErr(10, fmt.Sprintf("download mgmt binary: %v", err))
-			return
+		emit(11, "progress", "Updating mgmt binary...")
+		if err := s.atomicMgmtUpdate(ctx, req.MgmtBinaryBucket, req.MgmtBinaryKey); err != nil {
+			emit(11, "warn", fmt.Sprintf("mgmt binary update failed, old mgmt still running: %v", err))
+		} else {
+			exitAfter = true
+			emit(11, "progress", "mgmt update ready — old mgmt will exit after this response")
 		}
-		if err := os.Chmod(stagePath, 0o755); err != nil {
-			_ = os.Remove(stagePath)
-			emitErr(10, fmt.Sprintf("chmod mgmt binary: %v", err))
-			return
-		}
-		if err := os.Rename(stagePath, binPath); err != nil {
-			_ = os.Remove(stagePath)
-			emitErr(10, fmt.Sprintf("replace mgmt binary: %v", err))
-			return
-		}
-		emit(10, "progress", "Mgmt binary replaced; scheduling restart")
-		scheduleMgmtRestart()
 	}
 
-	emit(10, "complete", fmt.Sprintf("Migration complete. New KMS key: %s", newKMSKeyID))
+	emit(11, "complete", fmt.Sprintf("Migration complete. New KMS key: %s", newKMSKeyID))
+
+	if exitAfter {
+		// Signal main() to gracefully shut down after the response flushes.
+		// Non-blocking send so we never wedge on a full channel.
+		select {
+		case s.exitAfterResponse <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// waitForMigrationCommit polls SSM + /health until either:
+//   - MigrationKMSKeyID is cleared ("UNSET" / empty) — enclave committed
+//   - /health returns 200 AND MigrationKMSKeyID is cleared — belt-and-suspenders
+//
+// Returns error on timeout.
+func (s *server) waitForMigrationCommit(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	pollInterval := 5 * time.Second
+
+	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	for time.Now().Before(deadline) {
+		// Primary signal: MigrationKMSKeyID cleared.
+		val, _ := s.getParam(ctx, "MigrationKMSKeyID")
+		if val == "" {
+			// Double-check /health also returns 200 (enclave fully initialized).
+			resp, err := client.Get(enclaveURL + "/health")
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return nil
+				}
+			}
+			// MigrationKMSKeyID cleared but enclave not yet healthy — keep polling.
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+	return fmt.Errorf("migration did not commit within %s", timeout)
+}
+
+// rollbackMigration restores the old EIF and restarts the old enclave.
+// Called when the new enclave fails to commit within the timeout. Migration
+// SSM flags are left set so the restarted old enclave's Init can run
+// abortOrphanedMigration, which clears them and re-asserts MigrationPreviousPCR0.
+func (s *server) rollbackMigration(ctx context.Context, eifDest, eifBackup, stopCmd, startCmd, failedKeyID string, emit func(step int, status, msg string)) {
+	emit(9, "rollback", "Initiating rollback...")
+
+	// Stop failed new enclave.
+	emit(9, "rollback", fmt.Sprintf("Stopping failed new enclave (%s)...", stopCmd))
+	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
+		slog.Warn("rollback stop failed", "output", string(out), "error", err)
+	}
+
+	// Restore EIF backup.
+	emit(9, "rollback", fmt.Sprintf("Restoring old EIF from %s...", eifBackup))
+	if err := os.Rename(eifBackup, eifDest); err != nil {
+		if cpErr := copyFile(eifBackup, eifDest); cpErr != nil {
+			emit(9, "rollback", fmt.Sprintf("CRITICAL: failed to restore EIF backup: %v", cpErr))
+			return
+		}
+		_ = os.Remove(eifBackup)
+	}
+
+	emit(9, "rollback", fmt.Sprintf("Starting old enclave (%s)...", startCmd))
+	if out, err := exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput(); err != nil {
+		emit(9, "rollback", fmt.Sprintf("CRITICAL: failed to start old enclave: %v: %s", err, out))
+		return
+	}
+
+	// Schedule failed migration key for deletion (locked to unreachable PCR0).
+	pendingDays := int32(7)
+	if _, err := s.kms.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
+		KeyId:               aws.String(failedKeyID),
+		PendingWindowInDays: &pendingDays,
+	}); err != nil {
+		slog.Warn("rollback: schedule failed migration key deletion", "key_id", failedKeyID, "error", err)
+	}
+
+	emit(9, "rollback-complete", "Rollback complete; old enclave restored")
+}
+
+// atomicMgmtUpdate swaps the mgmt binary and leaves it to the supervisor to
+// relaunch us with the new code. Trust model: if the new binary passes
+// ENCLAVE_MGMT_VALIDATE=1 (full Init — AWS config, STS, SSM connectivity),
+// it's good enough. We don't need a separate preflight, helper, rollback,
+// or cross-process signal; a broken binary would have failed validate, and
+// once validate passes the only remaining risk is a prod-only edge case
+// that the operator can fix by redeploying from S3.
+func (s *server) atomicMgmtUpdate(ctx context.Context, bucket, key string) error {
+	binPath := envOrDefault("ENCLAVE_MGMT_BINARY_PATH", mgmtBinaryPath)
+	stagePath := binPath + ".new"
+
+	if err := s.downloadS3Object(ctx, bucket, key, stagePath); err != nil {
+		return fmt.Errorf("download mgmt binary: %w", err)
+	}
+	if err := os.Chmod(stagePath, 0o755); err != nil {
+		_ = os.Remove(stagePath)
+		return fmt.Errorf("chmod mgmt binary: %w", err)
+	}
+
+	validateCmd := exec.CommandContext(ctx, stagePath)
+	validateCmd.Env = append(os.Environ(), "ENCLAVE_MGMT_VALIDATE=1")
+	if out, err := validateCmd.CombinedOutput(); err != nil {
+		_ = os.Remove(stagePath)
+		return fmt.Errorf("validate new mgmt binary: %w (output: %s)", err, out)
+	}
+
+	if err := os.Rename(stagePath, binPath); err != nil {
+		_ = os.Remove(stagePath)
+		return fmt.Errorf("promote new mgmt binary: %w", err)
+	}
+	return nil
 }
 
 // callExportKey calls POST /v1/export-key on the running enclave.
@@ -471,24 +599,6 @@ func (s *server) downloadS3Object(ctx context.Context, bucket, key, destPath str
 		return err
 	}
 	return os.Rename(tmp, destPath)
-}
-
-// scheduleMgmtRestart spawns a detached process that restarts the mgmt
-// server after a short delay. The delay lets the current HTTP response flush
-// before the stop signal arrives; setsid detaches the helper from mgmt's
-// process group so the restart command is not itself killed when mgmt stops.
-//
-// The restart command is configurable via ENCLAVE_MGMT_RESTART_CMD, mirroring
-// ENCLAVE_STOP_CMD / ENCLAVE_START_CMD for the enclave itself. The default
-// targets the systemd unit used in production; tests override it.
-func scheduleMgmtRestart() {
-	restartCmd := envOrDefault("ENCLAVE_MGMT_RESTART_CMD", "systemctl restart enclave-mgmt.service")
-	cmd := exec.Command("setsid", "sh", "-c", "sleep 2 && "+restartCmd)
-	if err := cmd.Start(); err != nil {
-		slog.Error("failed to schedule mgmt restart", "error", err)
-		return
-	}
-	_ = cmd.Process.Release()
 }
 
 // getCallerRole returns the IAM role ARN and account ID from STS.

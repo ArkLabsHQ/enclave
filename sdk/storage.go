@@ -37,7 +37,17 @@ const nonceSize = 12
 //
 // If no storage bucket is provisioned (StorageBucketName param missing),
 // storage is silently disabled — Store/Load/Delete return errors.
-func (e *Enclave) initStorage(ctx context.Context) error {
+//
+// keyID specifies the KMS key for DEK operations. Pass empty string to read
+// the primary key from SSM. paramPrefix is inserted between appName and
+// "StorageDEK" in the SSM path — use "Migration/" for migration mode,
+// empty string for primary mode.
+//
+// In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
+// generates a fresh DEK — the Migration/StorageDEK param MUST exist or Init
+// fails. Generating a fresh DEK in migration mode would orphan all S3 data
+// encrypted under the real DEK.
+func (e *Enclave) initStorage(ctx context.Context, keyID, paramPrefix string) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -57,23 +67,25 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 	e.bucketName = bucketName
 
 	kmsClient := newKMSClient(awsCfg)
-	keyID, err := getKMSKeyID(ctx, ssmClient)
-	if err != nil {
-		return fmt.Errorf("get KMS key ID: %w", err)
+	if keyID == "" {
+		keyID, err = getKMSKeyID(ctx, ssmClient)
+		if err != nil {
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 
-	// Load or generate primary DEK.
-	// During migration the mgmt server copies Migration/StorageDEK/Ciphertext
-	// into the primary location and clears the migration param, so the enclave
-	// always finds the DEK here regardless of whether it's a fresh boot or
-	// post-migration restart.
-	primaryParam := fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext", deployment, appName)
-	ciphertextB64, err := loadCiphertextFromSSM(ctx, ssmClient, primaryParam)
+	migrationMode := paramPrefix != ""
+	dekParam := fmt.Sprintf("/%s/%s/%sStorageDEK/Ciphertext", deployment, appName, paramPrefix)
+
+	ciphertextB64, err := loadCiphertextFromSSM(ctx, ssmClient, dekParam)
 	if err != nil {
 		return fmt.Errorf("load DEK from SSM: %w", err)
 	}
 
 	if ciphertextB64 == "" {
+		if migrationMode {
+			return fmt.Errorf("migration DEK missing at %s — cannot generate fresh (would orphan S3 data)", dekParam)
+		}
 		// First boot: generate a new DEK.
 		out, err := kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 			KeyId:   aws.String(keyID),
@@ -85,7 +97,7 @@ func (e *Enclave) initStorage(ctx context.Context) error {
 		e.dek = out.Plaintext
 
 		encoded := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
-		if err := storeCiphertextInSSM(ctx, ssmClient, primaryParam, encoded); err != nil {
+		if err := storeCiphertextInSSM(ctx, ssmClient, dekParam, encoded); err != nil {
 			return fmt.Errorf("store DEK: %w", err)
 		}
 		return nil

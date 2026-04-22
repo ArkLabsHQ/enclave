@@ -90,6 +90,17 @@ resource "aws_ssm_parameter" "migration_old_kms_key_id" {
   }
 }
 
+resource "aws_ssm_parameter" "migration_target_pcr0" {
+  name      = "/${var.deployment}/${var.app_name}/MigrationTargetPCR0"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # KMS key ID — managed by null_resource.kms_key (kms.tf) and the mgmt server
 # during migration. Not a tofu resource because the value changes outside tofu.
 

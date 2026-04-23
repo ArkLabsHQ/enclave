@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-
 // PCRValues holds the PCR measurements from a built EIF.
 type PCRValues struct {
 	PCR0 string `json:"PCR0"`
@@ -21,10 +20,10 @@ type PCRValues struct {
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
 type buildConfigJSON struct {
-	Name    string                  `json:"name"`
-	Version string                  `json:"version"`
-	Region  string                  `json:"region"`
-	Prefix  string                  `json:"prefix"`
+	Name              string                  `json:"name"`
+	Version           string                  `json:"version"`
+	Region            string                  `json:"region"`
+	Prefix            string                  `json:"prefix"`
 	App               buildConfigAppJSON      `json:"app"`
 	Secrets           []buildConfigSecretJSON `json:"secrets"`
 	SDK               buildConfigSDKJSON      `json:"sdk"`

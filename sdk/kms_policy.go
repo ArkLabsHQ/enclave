@@ -18,21 +18,28 @@ import (
 // derives its role ARN and account ID via STS, and calls PutKeyPolicy to
 // restrict Decrypt to its own attestation identity.
 //
+// keyID specifies which KMS key to operate on. Pass empty string to use the
+// primary key from SSM (/{deployment}/{appName}/KMSKeyID). In migration mode,
+// callers pass the migration key ID so the enclave operates on the transitional
+// key that was already locked by the old enclave's handleExportKey.
+//
 // This is idempotent: if the policy already contains the correct PCR0, or if
 // the key is locked (no PutKeyPolicy permission), the function returns nil.
-func selfApplyKMSPolicy(ctx context.Context) error {
+func selfApplyKMSPolicy(ctx context.Context, keyID string) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ssmClient := newSSMClient(awsCfg)
 	kmsClient := newKMSClient(awsCfg)
 	stsClient := newSTSClient(awsCfg)
 
-	keyID, err := getKMSKeyID(ctx, ssmClient)
-	if err != nil {
-		return fmt.Errorf("get KMS key ID: %w", err)
+	if keyID == "" {
+		ssmClient := newSSMClient(awsCfg)
+		keyID, err = getKMSKeyID(ctx, ssmClient)
+		if err != nil {
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 
 	// Get own PCR0 from NSM hardware.

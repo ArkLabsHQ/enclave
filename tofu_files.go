@@ -651,6 +651,7 @@ data "aws_iam_policy_document" "enclave" {
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_old_kms_key_id.arn,
+        aws_ssm_parameter.migration_target_pcr0.arn,
         aws_ssm_parameter.migration_requested_at.arn,
         aws_ssm_parameter.storage_dek.arn,
         aws_ssm_parameter.migration_storage_dek.arn,
@@ -801,6 +802,17 @@ resource "aws_ssm_parameter" "migration_requested_at" {
 
 resource "aws_ssm_parameter" "migration_old_kms_key_id" {
   name      = "/${var.deployment}/${var.app_name}/MigrationOldKMSKeyID"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "migration_target_pcr0" {
+  name      = "/${var.deployment}/${var.app_name}/MigrationTargetPCR0"
   type      = "String"
   value     = "UNSET"
   overwrite = true

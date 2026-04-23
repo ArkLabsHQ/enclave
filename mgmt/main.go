@@ -53,6 +53,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate mode: run init checks and exit without binding HTTP. Used by
+	// the atomic mgmt binary self-update flow to verify the new binary can
+	// authenticate with AWS before replacing the live binary.
+	if os.Getenv("ENCLAVE_MGMT_VALIDATE") == "1" {
+		validateCtx, validateCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer validateCancel()
+		if err := runValidation(validateCtx, awsCfg, deployment, appName); err != nil {
+			slog.Error("validation failed", "error", err)
+			os.Exit(2)
+		}
+		slog.Info("validation passed")
+		os.Exit(0)
+	}
+
 	// AWS clients with optional endpoint overrides for testing with mock services.
 	var ssmClient *ssm.Client
 	if ep := os.Getenv("AWS_ENDPOINT_URL_SSM"); ep != "" {
@@ -109,10 +123,12 @@ func main() {
 		stsClient:         stsClient,
 		cwlClient:         cwlClient,
 		migrationCooldown: cooldown,
+		exitAfterResponse: make(chan struct{}, 1),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", mgmt.handleHealth)
+	mux.HandleFunc("GET /mgmt/health", mgmt.handleMgmtHealth)
 	mux.HandleFunc("GET /metrics", mgmt.handleMetrics)
 	mux.HandleFunc("POST /start", mgmt.handleStart)
 	mux.HandleFunc("POST /stop", mgmt.handleStop)
@@ -134,7 +150,16 @@ func main() {
 	}
 
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+			// SIGINT/SIGTERM — normal shutdown.
+		case <-mgmt.exitAfterResponse:
+			// handleMigrate finished a successful mgmt-binary update and is
+			// handing off to the supervisor-relaunched new binary. Give the
+			// HTTP response a moment to flush before tearing down.
+			slog.Info("mgmt update handoff — shutting down so supervisor relaunches new binary")
+			time.Sleep(500 * time.Millisecond)
+		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -160,6 +185,13 @@ type server struct {
 	migrationCooldown time.Duration
 	migrationAbort    chan struct{}
 	migrationAbortMu  sync.Mutex
+
+	// exitAfterResponse is signalled by atomicMgmtUpdate when the new mgmt
+	// binary is ready to take over. main() selects on this to gracefully
+	// shut down after the current HTTP response flushes, letting the
+	// supervisor relaunch with the new binary. Buffer 1 + non-blocking
+	// sends ensure the handler can't wedge.
+	exitAfterResponse chan struct{}
 }
 
 func (s *server) ssmParam(name string) string {

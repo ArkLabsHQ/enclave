@@ -54,6 +54,18 @@ echo "  CLI:  $ENCLAVE_CLI"
 echo "  Mgmt: $ENCLAVE_MGMT"
 echo ""
 
+# Reset image.eif to pristine v1; migration test-runs overwrite it.
+V1_EIF="${SCRIPT_DIR}/app/enclave/artifacts/image-v1.eif"
+if [ -f "$V1_EIF" ]; then
+  echo "  Resetting image.eif to pristine v1..."
+  cp -f "$V1_EIF" "${SCRIPT_DIR}/app/enclave/artifacts/image.eif"
+  cp -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json" \
+        "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" 2>/dev/null || true
+fi
+rm -f "${SCRIPT_DIR}/app/enclave/artifacts/image.eif.backup"
+: > /tmp/boot-qemu.log
+
+
 # --- OpenTofu helpers ---
 TOFU_DIR="${SCRIPT_DIR}/app/enclave/tofu"
 LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
@@ -351,12 +363,14 @@ export ENCLAVE_DEPLOYMENT=dev
 export ENCLAVE_APP_NAME=my-app
 export ENCLAVE_MGMT_ADDR="127.0.0.1:8444"
 export ENCLAVE_MIGRATION_COOLDOWN="1m"
+# Shorten commit-poll timeout so rollback tests don't wait 5min for the default.
+export ENCLAVE_MIGRATION_COMMIT_TIMEOUT="45s"
 export ENCLAVE_URL="https://127.0.0.1:8443"
 export ENCLAVE_EIF_PATH="$EIF_ABS_PATH"
 export ENCLAVE_MGMT_BINARY_PATH="$ENCLAVE_MGMT"
 export ENCLAVE_MGMT_RESTART_CMD="kill \$(cat $MGMT_PIDFILE)"
 export ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3"
-export ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} > /tmp/boot-qemu.log 2>&1 &"
+export ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} >> /tmp/boot-qemu.log 2>&1 &"
 export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
@@ -514,15 +528,33 @@ tofu_apply
 echo "  tofu apply log (migration lines):"
 grep -i 'migrat\|trigger\|null_resource\|local-exec\|curl\|skip' ${SCRIPT_DIR}/tofu-apply.log 2>/dev/null | sed 's/^/    /' || echo "    (no migration lines found)"
 
-# Step 10 always swaps + restarts; assert it ran.
-if ! grep -q "Mgmt binary replaced" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
-  echo "  FAIL: Step 10 did not run — no 'Mgmt binary replaced' NDJSON line in tofu-apply.log" >&2
+# Report migration rollback directly — mgmt-update won't have run, so the
+# "mgmt update ready" check below would only surface the symptom.
+if grep -q '"status":"rollback-complete"' "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
+  echo "  FAIL: migration rolled back — happy-path migration was expected to commit" >&2
+  echo "  Rollback reason (from tofu-apply.log):" >&2
+  grep -E '"status":"(error|rollback)"' "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
+  echo "  v2 init errors (from /tmp/boot-qemu.log):" >&2
+  grep -E 'enclave init failed|ERROR|previous_pcr0|migration|promote|KMS|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -20 | sed 's/^/    /' >&2 \
+    || echo "    (boot-qemu.log empty or unavailable)" >&2
+  echo "  Full tofu-apply.log tail:" >&2
+  tail -30 "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
   exit 1
 fi
-echo "  PASS: Step 10 replaced the mgmt binary"
 
-# Wait for scheduleMgmtRestart (2s detached sleep) to run the restart cmd,
-# for mgmt to exit, and for the supervisor to relaunch it with the new binary.
+# Mgmt binary update: handler emits "mgmt update ready" after validate passes.
+if ! grep -q "mgmt update ready" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
+  echo "  FAIL: mgmt update did not complete — no 'mgmt update ready' NDJSON line" >&2
+  echo "  Last 30 lines of tofu-apply.log:" >&2
+  tail -30 "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
+  exit 1
+fi
+echo "  PASS: mgmt update ready — validate passed and binary was swapped"
+
+# Wait for scheduleMgmtAtomicRestart (2s detached sleep + systemctl restart)
+# to run the restart cmd, for mgmt to exit, and for the supervisor to relaunch
+# it with the new binary. The helper also polls /mgmt/health and rolls back
+# on failure, but since validate passed and the binary is healthy, no rollback.
 POST_MIGRATION_MGMT_PID=""
 for i in $(seq 1 15); do
   sleep 1
@@ -674,9 +706,200 @@ else
   echo "  WARN: Could not verify dynamic secret persistence: ${DYN_PERSIST_RESP:0:120}"
 fi
 
-# Step 9: Final enclave info.
+# Step 8.5: Verify new atomic-migration observability endpoints and CLI commands.
 echo ""
-echo "=== [9/9] Final enclave info ==="
+echo "=== [8.5/9] Atomic migration observability checks ==="
+
+# /mgmt/health — AWS auth + SSM + enclave reachability + migration lock state.
+MGMT_HEALTH_CODE=$(curl -s --max-time 5 -o /tmp/mgmt-health.json -w '%{http_code}' \
+  "http://127.0.0.1:8444/mgmt/health" 2>/dev/null || echo "000")
+if [ "$MGMT_HEALTH_CODE" = "200" ]; then
+  MGMT_HEALTH_STATUS=$(jq -r '.status // empty' /tmp/mgmt-health.json 2>/dev/null || echo "")
+  if [ "$MGMT_HEALTH_STATUS" = "ok" ]; then
+    echo "  PASS: /mgmt/health reports ok"
+  else
+    echo "  FAIL: /mgmt/health returned status=$MGMT_HEALTH_STATUS" >&2
+    cat /tmp/mgmt-health.json >&2
+    exit 1
+  fi
+else
+  echo "  FAIL: /mgmt/health HTTP $MGMT_HEALTH_CODE" >&2
+  cat /tmp/mgmt-health.json 2>/dev/null >&2
+  exit 1
+fi
+
+# After a successful migration, MigrationKMSKeyID must be cleared (= atomic
+# commit happened inside the new enclave's Init). This is the most important
+# post-migration invariant.
+POST_MIG_KEY=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/MigrationKMSKeyID" \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$POST_MIG_KEY" ] || [ "$POST_MIG_KEY" = "UNSET" ]; then
+  echo "  PASS: MigrationKMSKeyID cleared after commit (= atomic migration succeeded)"
+else
+  echo "  FAIL: MigrationKMSKeyID still set after migration (got: $POST_MIG_KEY)" >&2
+  exit 1
+fi
+
+# Verify Migration/* staging params were cleaned up.
+STAGING_SECRET=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/Migration/signing_key/Ciphertext" \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$STAGING_SECRET" ] || [ "$STAGING_SECRET" = "UNSET" ]; then
+  echo "  PASS: Migration staging ciphertexts cleaned up"
+else
+  echo "  WARN: Migration/signing_key/Ciphertext still present (length=${#STAGING_SECRET})"
+fi
+
+# `enclave migration-status` CLI command — should report committed state.
+if [ -x "$ENCLAVE_CLI" ]; then
+  (cd app && "$ENCLAVE_CLI" migration-status > /tmp/migration-status.out 2>&1) || true
+  if grep -q "Phase:.*committed" /tmp/migration-status.out 2>/dev/null; then
+    echo "  PASS: 'enclave migration-status' reports committed state"
+  else
+    echo "  WARN: 'enclave migration-status' did not report committed phase"
+    sed 's/^/    /' /tmp/migration-status.out 2>/dev/null | head -10
+  fi
+fi
+
+
+# Step 9: Rollback test — migration with wrong previous_pcr0.
+# Build a v3 EIF with an intentionally WRONG baked-in previous_pcr0 and trigger
+# a migration. The new enclave's Init() PCR0 check must fail, mgmt's commit
+# poll must time out, and rollback must restore v2 with all data intact.
+# Skipped inside Docker (no Nix toolchain to build v3).
+echo ""
+echo "=== [9/10] Rollback test: migration with wrong previous_pcr0 ==="
+
+ARTIFACTS="${SCRIPT_DIR}/app/enclave/artifacts"
+V3_EIF="${ARTIFACTS}/image-v3.eif"
+V3_PCR_FILE="${ARTIFACTS}/pcr-v3.json"
+
+# Require pre-built v3 artifacts (produced by `make test-build`).
+# This works identically in Docker and on the host — no Nix needed at test-run.
+if [ ! -f "$V3_EIF" ] || [ ! -f "$V3_PCR_FILE" ]; then
+  echo "  FAIL: v3 artifacts not found (run 'make test-build' to build them)" >&2
+  echo "  expected: $V3_EIF, $V3_PCR_FILE" >&2
+  exit 1
+fi
+
+V2_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
+V3_PCR0=$(jq -r '.PCR0' "$V3_PCR_FILE")
+echo "  v2 PCR0: ${V2_PCR0:0:16}... (currently running)"
+echo "  v3 PCR0: ${V3_PCR0:0:16}... (baked-in previous_pcr0 = 0000...ff — deliberately wrong)"
+
+ROLLBACK_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
+aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /dev/null 2>&1 || {
+  echo "  FAIL: could not upload v3 EIF" >&2
+  exit 1
+}
+
+MIGRATE_BODY=$(jq -nc \
+  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$V3_PCR0" \
+  --argjson s '["signing_key"]' \
+  '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
+
+echo "  Triggering migration v2 → v3 (expecting rollback)..."
+curl -s --max-time 180 -X POST "${MGMT_URL}/migrate" \
+  -H 'Content-Type: application/json' -d "$MIGRATE_BODY" \
+  > /tmp/rollback-migrate.log 2>&1 || true
+
+if grep -q '"status":"rollback"' /tmp/rollback-migrate.log 2>/dev/null; then
+  echo "  PASS: Migration emitted rollback status"
+else
+  echo "  FAIL: No rollback status in migration response" >&2
+  echo "  Last 20 NDJSON lines:" >&2
+  tail -20 /tmp/rollback-migrate.log | sed 's/^/    /' >&2
+  exit 1
+fi
+
+# A healthy v2 boot after rollback implies abortOrphanedMigration ran.
+wait_for_enclave "post-rollback"
+
+# Verify rollback restored v2 by checking previous_pcr0 — the abort path
+# re-asserts it from the baked predecessor, so it should equal pcr-v1.json.
+V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr-v1.json")
+POST_ROLLBACK_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
+POST_ROLLBACK_PREV=$(echo "$POST_ROLLBACK_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
+V1_LOWER=$(echo "$V1_PCR0" | tr '[:upper:]' '[:lower:]')
+POST_LOWER=$(echo "$POST_ROLLBACK_PREV" | tr '[:upper:]' '[:lower:]')
+if [ -n "$POST_LOWER" ] && [ "$V1_LOWER" = "$POST_LOWER" ]; then
+  echo "  PASS: v2 restored after rollback (previous_pcr0 matches baked v1)"
+else
+  echo "  FAIL: previous_pcr0 after rollback (${POST_ROLLBACK_PREV:0:16}...) != v1 (${V1_PCR0:0:16}...)" >&2
+  exit 1
+fi
+
+# Data must survive rollback unchanged.
+ROLLBACK_STORAGE=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage" 2>/dev/null || echo "")
+if echo "$ROLLBACK_STORAGE" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+  echo "  PASS: v2 storage round-trip works after rollback (DEK intact)"
+else
+  echo "  FAIL: v2 storage broken after rollback: ${ROLLBACK_STORAGE:0:120}" >&2
+  exit 1
+fi
+
+ROLLBACK_SECRETS=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/secrets" 2>/dev/null || echo "")
+if echo "$ROLLBACK_SECRETS" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+  echo "  PASS: v2 static secrets still decryptable after rollback"
+else
+  echo "  FAIL: v2 secrets broken after rollback: ${ROLLBACK_SECRETS:0:120}" >&2
+  exit 1
+fi
+
+
+# Step 9.5: Mgmt supervisor resilience — SIGKILL mgmt and verify the
+# supervisor relaunches it and it reconnects to AWS/enclave cleanly.
+# This is the foundation that mid-migration crash recovery relies on:
+# if mgmt dies mid-handleMigrate, a new mgmt must come up with fresh
+# state (mgmt is stateless; all migration state lives in SSM).
+echo ""
+echo "=== [9.5/10] Mgmt supervisor resilience ==="
+PRE_KILL_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+if [ -z "$PRE_KILL_PID" ]; then
+  echo "  FAIL: mgmt PID file missing" >&2
+  exit 1
+fi
+echo "  Killing mgmt (PID $PRE_KILL_PID) with SIGKILL..."
+kill -KILL "$PRE_KILL_PID" 2>/dev/null || true
+
+POST_KILL_PID=""
+for i in $(seq 1 15); do
+  sleep 1
+  CURRENT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_KILL_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
+    POST_KILL_PID="$CURRENT_PID"
+    break
+  fi
+done
+if [ -n "$POST_KILL_PID" ]; then
+  echo "  PASS: Supervisor relaunched mgmt ($PRE_KILL_PID → $POST_KILL_PID)"
+else
+  echo "  FAIL: Supervisor did not relaunch mgmt within 15s" >&2
+  exit 1
+fi
+
+# New mgmt must serve /health (enclave status) and /mgmt/health (its own
+# AWS connectivity). Both are prerequisites for resuming any in-progress
+# migration after a crash.
+HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/health" 2>/dev/null || echo "000")
+if [ "$HEALTH_CODE" = "200" ]; then
+  echo "  PASS: Relaunched mgmt serves /health"
+else
+  echo "  FAIL: Relaunched mgmt /health returned $HEALTH_CODE" >&2
+  exit 1
+fi
+
+MGMT_HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/mgmt/health" 2>/dev/null || echo "000")
+if [ "$MGMT_HEALTH_CODE" = "200" ]; then
+  echo "  PASS: Relaunched mgmt has working AWS/SSM/enclave connectivity (/mgmt/health)"
+else
+  echo "  FAIL: Relaunched mgmt /mgmt/health returned $MGMT_HEALTH_CODE" >&2
+  exit 1
+fi
+
+echo ""
+echo "=== [10/10] Final enclave info ==="
 FINAL_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 if [ -n "$FINAL_INFO" ] && echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1; then
   echo "  PASS: Enclave info valid"

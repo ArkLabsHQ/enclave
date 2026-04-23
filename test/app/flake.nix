@@ -175,6 +175,7 @@
           ENCLAVE_SECRETS_CONFIG=${secretsCfgJson}
           ENCLAVE_MIGRATION_COOLDOWN=${buildCfg.migration_cooldown or "0s"}
           ENCLAVE_DEPLOYMENT=${deployment}
+          ENCLAVE_PREVIOUS_PCR0=${buildCfg.previous_pcr0 or "genesis"}
           ${appEnvLines}
         '';
 

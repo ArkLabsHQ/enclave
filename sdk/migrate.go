@@ -1,7 +1,10 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +21,14 @@ import (
 	"github.com/hf/nsm"
 )
 
+// migrationPCRIndex is the PCR register reserved for the migration handoff
+// commitment. During export-key, the old enclave extends this PCR with the
+// new enclave's PCR0 before generating the attestation document. This
+// cryptographically binds "I (PCR0=A) committed to handing off to PCR0=B"
+// inside a single NSM-signed attestation. PCR31 is chosen to avoid collision
+// with secret pubkeys which occupy PCR16 upwards.
+const migrationPCRIndex = 31
+
 // handleExportKey handles POST /v1/export-key.
 // Exports all configured secrets encrypted with a temporary migration KMS key.
 // Authorization: the endpoint only operates when MigrationKMSKeyID is set in SSM
@@ -26,6 +37,10 @@ import (
 func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	if !e.initDone.Load() {
 		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.initOK.Load() {
+		http.Error(w, "enclave init failed — export-key refused to prevent state corruption", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -159,6 +174,20 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Commit the new enclave's PCR0 into PCR31 so the attestation document
+	// cryptographically binds this handoff: "I (PCR0=A) am handing off to
+	// PCR0=B." PCR31 is then locked — nothing in this enclave's remaining
+	// lifetime can alter the commitment.
+	newPCR0Bytes, _ := hex.DecodeString(req.NewPCR0) // already validated above
+	if err := extendPCR(migrationPCRIndex, newPCR0Bytes); err != nil {
+		http.Error(w, fmt.Sprintf("extend PCR%d with new_pcr0: %v", migrationPCRIndex, err), http.StatusInternalServerError)
+		return
+	}
+	if err := lockPCR(migrationPCRIndex); err != nil {
+		http.Error(w, fmt.Sprintf("lock PCR%d: %v", migrationPCRIndex, err), http.StatusInternalServerError)
+		return
+	}
+
 	pcr0, _, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -201,6 +230,293 @@ func readMigrationPreviousPCR0Attestation(ctx context.Context) (string, error) {
 	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName))
 }
 
+// readMigrationKMSKeyID reads the migration KMS key ID from SSM. A non-empty
+// value indicates the enclave is booting in migration mode and should read
+// secrets/DEK from the Migration/* staging params instead of primary params.
+func readMigrationKMSKeyID(ctx context.Context) (string, error) {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return "", err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
+}
+
+// readMigrationTargetPCR0 reads the PCR0 of the enclave mgmt expects to
+// complete the in-progress migration. Written by mgmt before export-key;
+// cleared by the new enclave at commit and by any booting enclave that finds
+// itself orphaned in a failed-migration state. The value IS the authoritative
+// role tag — no side-effect inference required.
+func readMigrationTargetPCR0(ctx context.Context) (string, error) {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return "", err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationTargetPCR0", deployment, appName))
+}
+
+// putMigrationPreviousPCR0 writes MigrationPreviousPCR0 in SSM. Used by the
+// self-heal path in Init to restore consistency on rollback (when SSM was
+// overwritten by a prior failed migration's export-key).
+func putMigrationPreviousPCR0(ctx context.Context, pcr0 string) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)),
+		Value:     aws.String(pcr0),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// promoteMigrationToPrimary copies Migration/* ciphertexts to primary SSM
+// params and clears MigrationKMSKeyID as the atomic commit. Called by the new
+// enclave at the end of migration-mode Init() after all decryption succeeds.
+//
+// Ordering is critical: clear MigrationKMSKeyID LAST. While it's set, Init()
+// reads from Migration/*; when cleared, Init() reads from primary. Each SSM
+// PutParameter is atomic, and all copies use Overwrite:true — if any step
+// fails, MigrationKMSKeyID stays set and the next retry re-runs idempotently.
+func promoteMigrationToPrimary(ctx context.Context, secrets []SecretDef, migrationKeyID string) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+
+	// Stage 1: copy each secret's ciphertext from Migration/ to primary.
+	for _, s := range secrets {
+		src := fmt.Sprintf("/%s/%s/Migration/%s/Ciphertext", deployment, appName, s.Name)
+		dst := fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, s.Name)
+		ct, err := loadCiphertextFromSSM(ctx, ssmClient, src)
+		if err != nil {
+			return fmt.Errorf("read migration ciphertext %s: %w", s.Name, err)
+		}
+		if ct == "" {
+			return fmt.Errorf("migration ciphertext missing at %s", src)
+		}
+		if err := storeCiphertextInSSM(ctx, ssmClient, dst, ct); err != nil {
+			return fmt.Errorf("promote secret %s: %w", s.Name, err)
+		}
+	}
+
+	// Stage 2: copy StorageDEK ciphertext if present (enclaves without a
+	// storage bucket skip this).
+	dekSrc := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
+	dekDst := fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext", deployment, appName)
+	dekCT, err := loadCiphertextFromSSM(ctx, ssmClient, dekSrc)
+	if err != nil {
+		return fmt.Errorf("read migration DEK: %w", err)
+	}
+	if dekCT != "" {
+		if err := storeCiphertextInSSM(ctx, ssmClient, dekDst, dekCT); err != nil {
+			return fmt.Errorf("promote DEK: %w", err)
+		}
+	}
+
+	// Stage 3: point primary KMSKeyID at the migration key.
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
+		Value:     aws.String(migrationKeyID),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return fmt.Errorf("promote KMSKeyID: %w", err)
+	}
+
+	// Stage 4: clear MigrationTargetPCR0. Done BEFORE the MigrationKMSKeyID
+	// clear so a crash between these two writes leaves MigrationKMSKeyID set
+	// but target cleared — any rebooting enclave then falls to the abort path
+	// (ownPCR0 != "" target), which is safe. The inverse ordering would leave
+	// MigrationKMSKeyID cleared (commit signal observed by mgmt) while target
+	// still set, which is also safe but noisy on the next migration.
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationTargetPCR0", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return fmt.Errorf("clear MigrationTargetPCR0: %w", err)
+	}
+
+	// Stage 5: atomic commit — clear MigrationKMSKeyID.
+	// This single SSM write flips the enclave from migration mode to primary
+	// mode on its next boot. Everything before this is idempotently retryable.
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return fmt.Errorf("commit (clear MigrationKMSKeyID): %w", err)
+	}
+
+	// Stage 6 (post-commit cleanup): clear Migration/* staging, best-effort.
+	// The atomic commit already succeeded; orphaned staging entries are
+	// harmless and will be overwritten by the next migration attempt.
+	for _, s := range secrets {
+		param := fmt.Sprintf("/%s/%s/Migration/%s/Ciphertext", deployment, appName, s.Name)
+		if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+			Name:      aws.String(param),
+			Value:     aws.String("UNSET"),
+			Type:      ssmtypes.ParameterTypeString,
+			Overwrite: aws.Bool(true),
+		}); err != nil {
+			slog.Warn("post-commit cleanup: clear staging ciphertext failed", "param", param, "error", err)
+		}
+	}
+	dekParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(dekParam),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		slog.Warn("post-commit cleanup: clear staging DEK failed", "param", dekParam, "error", err)
+	}
+
+	return nil
+}
+
+// clearMigrationTargetPCR0 resets MigrationTargetPCR0 to "UNSET".
+func clearMigrationTargetPCR0(ctx context.Context) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationTargetPCR0", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// clearMigrationKMSKeyID resets MigrationKMSKeyID to "UNSET". Used by the
+// abort-orphaned path to remove the "migration in progress" flag so the
+// booting enclave falls into primary mode on the next step.
+func clearMigrationKMSKeyID(ctx context.Context) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// clearMigrationOldKMSKeyID resets MigrationOldKMSKeyID to "UNSET". The abort
+// path uses this to prevent deleteOldKMSKey in the next-successful boot from
+// targeting a key from the failed migration attempt.
+func clearMigrationOldKMSKeyID(ctx context.Context) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// MigrationBootRole classifies a booting enclave from two declarative SSM
+// flags: MigrationKMSKeyID (in-progress) + MigrationTargetPCR0 (who should finish).
+type MigrationBootRole int
+
+const (
+	BootRoleNoMigration    MigrationBootRole = iota // MigrationKMSKeyID empty
+	BootRoleNewEnclave                              // ownPCR0 == MigrationTargetPCR0
+	BootRoleAbortMigration                          // migration in progress, not the target
+)
+
+// classifyBootRole decides the boot role. Empty ownPCR0 (NSM unavailable)
+// is treated as abort, since we can't prove we're the target.
+func classifyBootRole(migrationInProgress bool, ownPCR0, migrationTargetPCR0 string) MigrationBootRole {
+	if !migrationInProgress {
+		return BootRoleNoMigration
+	}
+	if ownPCR0 != "" && migrationTargetPCR0 != "" && ownPCR0 == migrationTargetPCR0 {
+		return BootRoleNewEnclave
+	}
+	return BootRoleAbortMigration
+}
+
+// abortOrphanedMigration wipes every migration-specific SSM flag and
+// re-asserts the baked predecessor PCR0. Called when this enclave boots
+// with migration in progress but is NOT the declared target. Re-asserting
+// MigrationPreviousPCR0 is safe because expectedPreviousPCR0 is baked into
+// the EIF and bound to our own PCR0 measurement.
+func abortOrphanedMigration(ctx context.Context, expectedPreviousPCR0 string) error {
+	if err := putMigrationPreviousPCR0(ctx, expectedPreviousPCR0); err != nil {
+		return fmt.Errorf("restore MigrationPreviousPCR0: %w", err)
+	}
+	if err := clearMigrationPreviousPCR0Attestation(ctx); err != nil {
+		return fmt.Errorf("clear MigrationPreviousPCR0Attestation: %w", err)
+	}
+	if err := clearMigrationOldKMSKeyID(ctx); err != nil {
+		return fmt.Errorf("clear MigrationOldKMSKeyID: %w", err)
+	}
+	if err := clearMigrationTargetPCR0(ctx); err != nil {
+		return fmt.Errorf("clear MigrationTargetPCR0: %w", err)
+	}
+	// Atomic abort commit — clearing this flips future boots out of the abort path.
+	if err := clearMigrationKMSKeyID(ctx); err != nil {
+		return fmt.Errorf("clear MigrationKMSKeyID: %w", err)
+	}
+	return nil
+}
+
+// clearMigrationPreviousPCR0Attestation resets the attestation SSM param to
+// "UNSET". Called by the self-heal path after overwriting MigrationPreviousPCR0
+// — the stale attestation no longer matches the restored value.
+func clearMigrationPreviousPCR0Attestation(ctx context.Context) error {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := newSSMClient(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)),
+		Value:     aws.String("UNSET"),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+		Tier:      ssmtypes.ParameterTierAdvanced,
+	})
+	return err
+}
+
 // storePCR0WithAttestation stores both the plain PCR0 and a cryptographic
 // attestation document in SSM. The attestation document is a COSE Sign1
 // structure signed by AWS Nitro hardware, proving the PCR0 value.
@@ -241,10 +557,52 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 	return pcr0, attestDocB64, nil
 }
 
+// verifyPCR31Commitment checks that the previous enclave's attestation
+// document committed to handing off to THIS enclave's PCR0 by extending
+// PCR31. Returns nil if the commitment matches, or an error explaining
+// the mismatch.
+func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
+	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
+	if err != nil {
+		return fmt.Errorf("decode attestation base64: %w", err)
+	}
 
+	pcr31, err := extractPCRFromAttestation(attestDoc, migrationPCRIndex)
+	if err != nil {
+		return fmt.Errorf("extract PCR%d: %w", migrationPCRIndex, err)
+	}
+
+	// NSM extend computes SHA384(old_value || data). PCR31 starts as 48 zero
+	// bytes, so after one extension with new_pcr0_bytes the value is
+	// SHA384(zeros_48 || new_pcr0_bytes).
+	myPCR0Bytes, err := hex.DecodeString(myPCR0)
+	if err != nil {
+		return fmt.Errorf("decode own PCR0 hex: %w", err)
+	}
+	expected := sha512.Sum384(append(make([]byte, 48), myPCR0Bytes...))
+
+	if !bytes.Equal(pcr31, expected[:]) {
+		return fmt.Errorf("PCR%d mismatch: old enclave committed to a different target PCR0", migrationPCRIndex)
+	}
+
+	return nil
+}
+
+// shouldRefuseKeyDeletion is the pure safety predicate used by deleteOldKMSKey:
+// refuses to schedule deletion when the "old" key ID matches the current
+// primary key ID. This guards against a corrupted state where a failed
+// migration attempt left MigrationOldKMSKeyID pointing at the current primary.
+func shouldRefuseKeyDeletion(oldKeyID, currentKeyID string) bool {
+	return oldKeyID != "" && oldKeyID == currentKeyID
+}
 
 // deleteOldKMSKey checks if MigrationOldKMSKeyID is set in SSM. If so,
 // schedules the old KMS key for deletion and clears the parameter.
+//
+// Safety: refuses to delete if MigrationOldKMSKeyID == current KMSKeyID.
+// This guards against a corrupted state where a failed migration attempt
+// left MigrationOldKMSKeyID pointing at the current primary key (which
+// would cause this function to delete the key we're actively using).
 func deleteOldKMSKey(ctx context.Context) {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
@@ -258,6 +616,28 @@ func deleteOldKMSKey(ctx context.Context) {
 	oldKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName))
 	if err != nil {
 		return // no old key to delete — normal case
+	}
+
+	// Safety check: never delete the current primary key.
+	currentKeyID, err := getKMSKeyID(ctx, ssmClient)
+	if err != nil {
+		slog.Warn("deleteOldKMSKey: cannot read current KMSKeyID, skipping deletion for safety", "error", err)
+		return
+	}
+	if shouldRefuseKeyDeletion(oldKeyID, currentKeyID) {
+		slog.Error("deleteOldKMSKey: MigrationOldKMSKeyID matches current KMSKeyID, refusing deletion",
+			"key_id", oldKeyID)
+		// Clear the stale param to prevent future confusion. The key stays alive.
+		_, putErr := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+			Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
+			Value:     aws.String("UNSET"),
+			Type:      ssmtypes.ParameterTypeString,
+			Overwrite: aws.Bool(true),
+		})
+		if putErr != nil {
+			slog.Warn("deleteOldKMSKey: failed to clear stale MigrationOldKMSKeyID", "error", putErr)
+		}
+		return
 	}
 
 	kmsClient := newKMSClient(awsCfg)

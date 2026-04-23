@@ -31,18 +31,29 @@ type attestationDocument struct {
 
 // waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
 // Times out after 5 minutes to prevent infinite retries on broken KMS.
-func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef) error {
+//
+// keyID specifies the KMS key to decrypt under. Pass empty string to use the
+// primary key from SSM. paramPrefix is inserted between the app name and the
+// secret name in the SSM param path — use "Migration/" for migration mode,
+// empty string for primary mode.
+//
+// In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
+// generates a fresh secret — the Migration/* params MUST exist or Init fails.
+// Generating a fresh secret in migration mode would orphan the real data.
+func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef, keyID, paramPrefix string) error {
 	const timeout = 5 * time.Minute
 	interval := 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	migrationMode := paramPrefix != "" && keyID != ""
+
 	var lastErr error
 	for {
 		allLoaded := true
 		for _, s := range secrets {
-			if err := initializeOrLoadSecret(ctx, s); err != nil {
+			if err := loadSecret(ctx, s, keyID, paramPrefix, migrationMode); err != nil {
 				lastErr = fmt.Errorf("secret %s: %w", s.Name, err)
 				allLoaded = false
 				break
@@ -68,10 +79,11 @@ func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef
 	}
 }
 
-// initializeOrLoadSecret checks SSM for existing ciphertext for a secret.
-// If not found, generates 32 random bytes, encrypts with KMS, and stores in SSM.
-// If found, decrypts using KMS with attestation.
-func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
+// loadSecret loads one secret's ciphertext from SSM and decrypts it with KMS.
+// In primary mode (migrationMode=false), generates a fresh secret if missing.
+// In migration mode (migrationMode=true), returns an error if the ciphertext
+// is missing — NEVER generates fresh, which would orphan the real data.
+func loadSecret(ctx context.Context, secret SecretDef, keyID, paramPrefix string, migrationMode bool) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -80,10 +92,13 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	ssmClient := newSSMClient(awsCfg)
 	kmsClient := newKMSClient(awsCfg)
 
-	paramName := getSecretSSMParamName(secret.Name)
-	keyID, err := getKMSKeyID(ctx, ssmClient)
-	if err != nil {
-		return fmt.Errorf("get KMS key ID: %w", err)
+	paramName := getSecretSSMParamNameWithPrefix(secret.Name, paramPrefix)
+
+	if keyID == "" {
+		keyID, err = getKMSKeyID(ctx, ssmClient)
+		if err != nil {
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 	if keyID == "" {
 		return fmt.Errorf("KMS key ID is empty")
@@ -95,6 +110,9 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	}
 
 	if ciphertextB64 == "" {
+		if migrationMode {
+			return fmt.Errorf("migration ciphertext missing at %s — cannot generate fresh (would orphan data)", paramName)
+		}
 		return generateAndStoreSecret(ctx, kmsClient, ssmClient, keyID, paramName, secret.EnvVar)
 	}
 
@@ -209,30 +227,40 @@ func buildAttestationDocument(session *nsm.Session) ([]byte, *rsa.PrivateKey, er
 
 // extractPCR0FromAttestation parses the attestation document and returns PCR0 as hex.
 func extractPCR0FromAttestation(attestationDoc []byte) (string, error) {
+	pcr, err := extractPCRFromAttestation(attestationDoc, 0)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(pcr), nil
+}
+
+// extractPCRFromAttestation parses a COSE Sign1 attestation document and
+// returns the raw bytes for the given PCR index.
+func extractPCRFromAttestation(attestationDoc []byte, index uint) ([]byte, error) {
 	var coseSign1 []cbor.RawMessage
 	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
-		return "", fmt.Errorf("unmarshal COSE Sign1: %w", err)
+		return nil, fmt.Errorf("unmarshal COSE Sign1: %w", err)
 	}
 	if len(coseSign1) < 3 {
-		return "", fmt.Errorf("invalid COSE Sign1 structure")
+		return nil, fmt.Errorf("invalid COSE Sign1 structure")
 	}
 
 	var payload []byte
 	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
-		return "", fmt.Errorf("unmarshal COSE payload: %w", err)
+		return nil, fmt.Errorf("unmarshal COSE payload: %w", err)
 	}
 
 	var doc attestationDocument
 	if err := cbor.Unmarshal(payload, &doc); err != nil {
-		return "", fmt.Errorf("unmarshal attestation document: %w", err)
+		return nil, fmt.Errorf("unmarshal attestation document: %w", err)
 	}
 
-	pcr0, ok := doc.PCRs[0]
+	pcr, ok := doc.PCRs[index]
 	if !ok {
-		return "", fmt.Errorf("PCR0 not found in attestation document")
+		return nil, fmt.Errorf("PCR%d not found in attestation document", index)
 	}
 
-	return hex.EncodeToString(pcr0), nil
+	return pcr, nil
 }
 
 // getAttestationDocumentB64 generates a minimal NSM attestation document (without
@@ -312,11 +340,12 @@ func loadCiphertextFromSSM(ctx context.Context, ssmClient *ssm.Client, paramName
 	return value, nil
 }
 
-// getSecretSSMParamName returns the SSM parameter name for a secret's ciphertext.
-func getSecretSSMParamName(secretName string) string {
+// getSecretSSMParamNameWithPrefix returns the SSM parameter name for a secret's
+// ciphertext. Pass "" for primary storage, "Migration/" for migration staging.
+func getSecretSSMParamNameWithPrefix(secretName, prefix string) string {
 	deployment := getDeployment()
 	appName := getAppName()
-	return fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secretName)
+	return fmt.Sprintf("/%s/%s/%s%s/Ciphertext", deployment, appName, prefix, secretName)
 }
 
 // getKMSKeyID returns the KMS key ID from environment or SSM.

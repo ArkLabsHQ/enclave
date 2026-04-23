@@ -15,7 +15,7 @@ require (
 	github.com/aws/smithy-go v1.24.2
 	github.com/btcsuite/btcd/btcec/v2 v2.3.5
 	github.com/edgebitio/nitro-enclaves-sdk-go v1.0.0
-	github.com/fxamacker/cbor/v2 v2.9.0
+	github.com/fxamacker/cbor/v2 v2.9.1
 	github.com/hf/nsm v0.0.0-20220930140112-cd181bd646b9
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/metric v1.43.0

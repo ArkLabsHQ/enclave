@@ -477,10 +477,6 @@ func classifyBootRole(migrationInProgress bool, ownPCR0, migrationTargetPCR0 str
 // MigrationPreviousPCR0 is safe because expectedPreviousPCR0 is baked into
 // the EIF and bound to our own PCR0 measurement.
 func abortOrphanedMigration(ctx context.Context, expectedPreviousPCR0 string) error {
-	// Restore + tidy first, clear the "in-progress" flag LAST. This mirrors the
-	// new-enclave commit (primary writes → clear MigrationKMSKeyID last) so a
-	// crash mid-abort leaves MigrationKMSKeyID set, and the next boot re-enters
-	// the abort path via the classifier — no stuck state.
 	if err := putMigrationPreviousPCR0(ctx, expectedPreviousPCR0); err != nil {
 		return fmt.Errorf("restore MigrationPreviousPCR0: %w", err)
 	}

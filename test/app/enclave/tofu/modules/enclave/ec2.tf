@@ -109,8 +109,8 @@ resource "aws_instance" "nitro" {
     enclave_init_systemd_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.watchdog_systemd.key}"
     imds_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.imds_systemd.key}"
     gvproxy_systemd_s3_url       = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_systemd.key}"
-    mgmt_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}"
-    mgmt_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_systemd.key}"
+    supervisor_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
+    supervisor_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_systemd.key}"
     gvproxy_binary_s3_url        = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_binary.key}"
     gvproxy_start_script_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_start_script.key}"
     migration_cooldown           = var.migration_cooldown
@@ -127,7 +127,7 @@ resource "aws_instance" "nitro" {
     command = "aws ec2 wait instance-status-ok --instance-ids ${self.id} --region ${var.region}"
   }
 
-  # On destroy: stop enclave + schedule KMS key deletion via mgmt server.
+  # On destroy: stop enclave + schedule KMS key deletion via supervisor.
   # Must run while the instance is still alive (before EC2 termination).
   provisioner "local-exec" {
     when    = destroy
@@ -177,10 +177,10 @@ resource "aws_eip_association" "instance" {
 
 # Automatic migration — triggers when the EIF changes (new PCR0).
 # On first apply this is a no-op (no running enclave to migrate).
-# On subsequent applies with a new EIF, it calls the mgmt server to
+# On subsequent applies with a new EIF, it calls the supervisor to
 # perform a live migration (export keys, swap EIF, restart enclave).
 # Automatic migration (production) — triggers when EIF changes.
-# Uses SSM to call the mgmt server on the EC2 instance.
+# Uses SSM to call the supervisor on the EC2 instance.
 resource "null_resource" "enclave_migration" {
   count = var.local ? 0 : 1
 
@@ -215,12 +215,12 @@ resource "null_resource" "enclave_migration" {
       fi
 
       echo "Triggering migration..."
-      MGMT_BUCKET="${aws_s3_bucket.assets.id}"
-      MGMT_KEY="${aws_s3_object.mgmt_binary_staging.key}"
+      SUPERVISOR_BUCKET="${aws_s3_bucket.assets.id}"
+      SUPERVISOR_KEY="${aws_s3_object.supervisor_binary_staging.key}"
       MIGRATE_BODY=$(jq -nc \
         --arg b "$BUCKET" --arg k "$EIF_KEY" --arg p "$PCR0" --argjson s "$SECRETS" \
-        --arg mb "$MGMT_BUCKET" --arg mk "$MGMT_KEY" \
-        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s, mgmt_binary_bucket:$mb, mgmt_binary_key:$mk}')
+        --arg mb "$SUPERVISOR_BUCKET" --arg mk "$SUPERVISOR_KEY" \
+        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s, supervisor_binary_bucket:$mb, supervisor_binary_key:$mk}')
       MIGRATE_CMD="curl -sf -X POST http://localhost:8443/migrate -H Content-Type:application/json -d '$MIGRATE_BODY'"
       TMPFILE=$(mktemp)
       jq -nc --arg cmd "$MIGRATE_CMD" '{"commands":[$cmd]}' > "$TMPFILE"
@@ -236,12 +236,12 @@ resource "null_resource" "enclave_migration" {
   depends_on = [aws_instance.nitro, aws_s3_object.enclave_eif]
 }
 
-# Promote the staging mgmt binary onto the canonical key after a successful
+# Promote the staging supervisor binary onto the canonical key after a successful
 # enclave migration. Runs only when enclave_migration fires and succeeds, so
 # the canonical key (used by cloud-init on future instance launches) stays
 # pinned to the last-known-good binary until the live migration proves the
 # new one boots.
-resource "null_resource" "promote_mgmt_binary" {
+resource "null_resource" "promote_supervisor_binary" {
   count = var.local ? 0 : 1
 
   triggers = {
@@ -252,8 +252,8 @@ resource "null_resource" "promote_mgmt_binary" {
   provisioner "local-exec" {
     command = <<-EOT
       aws s3 cp \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary_staging.key}" \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary_staging.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}" \
         --region "${var.region}"
     EOT
   }
@@ -262,7 +262,7 @@ resource "null_resource" "promote_mgmt_binary" {
 }
 
 # Automatic migration (local mode) — triggers when expected_pcr0 changes.
-# Calls the mgmt server directly via HTTP (no EC2/SSM in local mode).
+# Calls the supervisor directly via HTTP (no EC2/SSM in local mode).
 resource "null_resource" "enclave_migration_local" {
   count = var.local && var.expected_pcr0 != "" ? 1 : 0
 
@@ -272,26 +272,26 @@ resource "null_resource" "enclave_migration_local" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      MGMT_URL="${var.mgmt_url}"
+      SUPERVISOR_URL="${var.supervisor_url}"
       BUCKET="${aws_s3_bucket.assets.id}"
       PCR0="${var.expected_pcr0}"
       SECRETS='${jsonencode([for s in var.secrets : s.name])}'
 
-      # Skip on first deploy (mgmt server not running yet).
-      curl -sf "$${MGMT_URL}/health" >/dev/null 2>&1 || { echo "No mgmt server, skipping migration."; exit 0; }
+      # Skip on first deploy (supervisor not running yet).
+      curl -sf "$${SUPERVISOR_URL}/health" >/dev/null 2>&1 || { echo "No supervisor, skipping migration."; exit 0; }
 
       echo "Triggering local migration..."
-      MGMT_KEY="${aws_s3_object.mgmt_binary_staging.key}"
-      curl -sf -X POST "$${MGMT_URL}/migrate" \
+      SUPERVISOR_KEY="${aws_s3_object.supervisor_binary_staging.key}"
+      curl -sf -X POST "$${SUPERVISOR_URL}/migrate" \
         -H 'Content-Type: application/json' \
-        -d "{\"eif_bucket\":\"$${BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"$${PCR0}\",\"secret_names\":$${SECRETS},\"mgmt_binary_bucket\":\"$${BUCKET}\",\"mgmt_binary_key\":\"$${MGMT_KEY}\"}"
+        -d "{\"eif_bucket\":\"$${BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"$${PCR0}\",\"secret_names\":$${SECRETS},\"supervisor_binary_bucket\":\"$${BUCKET}\",\"supervisor_binary_key\":\"$${SUPERVISOR_KEY}\"}"
     EOT
   }
 }
 
-# Promote the staging mgmt binary onto the canonical key after a successful
-# local-mode migration. Mirrors null_resource.promote_mgmt_binary for non-local.
-resource "null_resource" "promote_mgmt_binary_local" {
+# Promote the staging supervisor binary onto the canonical key after a successful
+# local-mode migration. Mirrors null_resource.promote_supervisor_binary for non-local.
+resource "null_resource" "promote_supervisor_binary_local" {
   count = var.local && var.expected_pcr0 != "" ? 1 : 0
 
   triggers = {
@@ -301,8 +301,8 @@ resource "null_resource" "promote_mgmt_binary_local" {
   provisioner "local-exec" {
     command = <<-EOT
       aws s3 cp \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary_staging.key}" \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.mgmt_binary.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary_staging.key}" \
+        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}" \
         --region "${var.region}"
     EOT
   }

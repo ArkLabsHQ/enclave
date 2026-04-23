@@ -3,8 +3,6 @@ name: CLI Tests
 on:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
 
 jobs:
   cli-test:
@@ -63,7 +61,7 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build enclave CLI
-        run: go build -o /tmp/enclave-cli ./cmd/enclave
+        run: go build -o /tmp/enclave-cli ./cli/cmd/enclave
 
       # ── 1. enclave init ───────────────────────────────────────────
       - name: "enclave init --language ${{ matrix.language }}"
@@ -150,7 +148,7 @@ jobs:
           test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }
           test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }
           jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing"; exit 1; }
-          test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }
+          test -f enclave/artifacts/supervisor || { echo "FAIL: supervisor missing"; exit 1; }
           test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }
 
           echo "PASS: enclave build (artifacts verified)"

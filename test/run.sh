@@ -28,30 +28,30 @@ if ! command -v vhost-device-vsock &>/dev/null || ! command -v qemu-system-x86_6
 fi
 
 # Use pre-built binaries (Docker test-runner) or build from source (nix develop).
-if command -v enclave-cli &>/dev/null && command -v enclave-mgmt &>/dev/null; then
+if command -v enclave-cli &>/dev/null && command -v supervisor &>/dev/null; then
   ENCLAVE_CLI="$(command -v enclave-cli)"
-  ENCLAVE_MGMT="$(command -v enclave-mgmt)"
+  ENCLAVE_SUPERVISOR="$(command -v supervisor)"
   echo "Using pre-built binaries"
 elif command -v go &>/dev/null; then
   ENCLAVE_CLI="/tmp/enclave-cli"
-  ENCLAVE_MGMT="/tmp/enclave-mgmt"
-  echo "Building enclave CLI and mgmt server..."
-  (cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cmd/enclave)
-  (cd "$REPO_ROOT" && go build -o "$ENCLAVE_MGMT" ./mgmt/)
-  # Seed the artifacts dir with the real v1 mgmt binary so the first
+  ENCLAVE_SUPERVISOR="/tmp/supervisor"
+  echo "Building enclave CLI and supervisor..."
+  (cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cli/cmd/enclave)
+  (cd "$REPO_ROOT" && go build -o "$ENCLAVE_SUPERVISOR" ./supervisor/cmd/supervisor)
+  # Seed the artifacts dir with the real v1 supervisor binary so the first
   # tofu_apply uploads it (not an empty placeholder) to the staging S3
   # key. Step 7 later overwrites this file with a v2 variant to force
   # Step 10 down the swap path.
   mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
-  cp "$ENCLAVE_MGMT" "${SCRIPT_DIR}/app/enclave/artifacts/enclave-mgmt"
+  cp "$ENCLAVE_SUPERVISOR" "${SCRIPT_DIR}/app/enclave/artifacts/supervisor"
 else
-  echo "Error: neither pre-built binaries (enclave-cli, enclave-mgmt) nor Go compiler found" >&2
+  echo "Error: neither pre-built binaries (enclave-cli, supervisor) nor Go compiler found" >&2
   exit 1
 fi
 
 
 echo "  CLI:  $ENCLAVE_CLI"
-echo "  Mgmt: $ENCLAVE_MGMT"
+echo "  Supervisor: $ENCLAVE_SUPERVISOR"
 echo ""
 
 # Reset image.eif to pristine v1; migration test-runs overwrite it.
@@ -87,7 +87,7 @@ tofu_apply() {
   # Ensure artifact placeholders exist for tofu's filemd5() (local mode
   # doesn't actually use these S3 objects — the enclave boots from QEMU).
   mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
-  for f in image.eif enclave-mgmt gvproxy; do
+  for f in image.eif supervisor gvproxy; do
     [ -f "${SCRIPT_DIR}/app/enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/enclave/artifacts/$f"
   done
 
@@ -141,20 +141,20 @@ tofu_destroy() {
 }
 
 EIF_PATH="${1:-}"
-MGMT_PID=""
+SUP_PID=""
 
 cleanup() {
   echo ""
   echo "=== Tearing down ==="
   tofu_destroy
-  # Kill mgmt supervisor (which TERM-traps and kills its child mgmt).
-  [ -n "${MGMT_PID:-}" ] && kill -TERM "$MGMT_PID" 2>/dev/null && wait "$MGMT_PID" 2>/dev/null || true
+  # Kill supervisor relauncher (which TERM-traps and kills its child supervisor).
+  [ -n "${SUP_PID:-}" ] && kill -TERM "$SUP_PID" 2>/dev/null && wait "$SUP_PID" 2>/dev/null || true
   # Belt-and-suspenders: if the supervisor's child survived, kill it too.
-  if [ -f /tmp/enclave-mgmt.pid ]; then
-    kill "$(cat /tmp/enclave-mgmt.pid)" 2>/dev/null || true
-    rm -f /tmp/enclave-mgmt.pid
+  if [ -f /tmp/supervisor.pid ]; then
+    kill "$(cat /tmp/supervisor.pid)" 2>/dev/null || true
+    rm -f /tmp/supervisor.pid
   fi
-  rm -f /tmp/mgmt-supervisor.sh
+  rm -f /tmp/supervisor-relauncher.sh
   # Kill enclave (boot-qemu.sh) via PID file.
   if [ -f /tmp/enclave-boot.pid ]; then
     kill "$(cat /tmp/enclave-boot.pid)" 2>/dev/null || true
@@ -231,7 +231,7 @@ wait_for_enclave() {
     echo "  Boot log (errors and init):"
     grep -i 'error\|fail\|init\|KMS\|secret\|policy\|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -30 | sed 's/^/    /' || echo "    (no boot log)"
     echo ""
-    echo "  SDK init logs (Application says):"
+    echo "  runtime init logs (Application says):"
     grep 'Application says' /tmp/boot-qemu.log 2>/dev/null | head -30 | sed 's/^/    /' || echo "    (none)"
     exit 1
   fi
@@ -281,7 +281,7 @@ else
   echo "  v1 PCR0: ${V1_PCR0:0:16}..."
 
   # Build v2 with previous_pcr0 set to v1's PCR0.
-  # This exercises the SDK's previousPCR0 validation during v2 Init:
+  # This exercises the runtime's previousPCR0 validation during v2 Init:
   # the enclave checks that ENCLAVE_PREVIOUS_PCR0 (baked from enclave.yaml)
   # matches MigrationPreviousPCR0 in SSM (stored by v1's export-key).
   echo "  Building v2 EIF (version 0.0.2, previous_pcr0=${V1_PCR0:0:16}...)..."
@@ -315,7 +315,7 @@ else
 fi
 echo ""
 
-# Step 2: Deploy to localstack via OpenTofu and start mgmt server.
+# Step 2: Deploy to localstack via OpenTofu and start supervisor.
 echo "=== [2/9] Deploying to localstack via tofu ==="
 
 # Clean up any stale state from previous runs.
@@ -330,45 +330,45 @@ aws ssm put-parameter $LOCALSTACK \
   --type String --overwrite --no-cli-pager
 echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
 
-# Start mgmt server on the host (like production EC2 host).
+# Start supervisor on the host (like production EC2 host).
 # Configured with stop/start commands that manage boot-qemu.sh via PID file.
-# We run mgmt under a tiny supervisor script that loops "run mgmt; wait;
+# We run supervisor under a tiny relauncher script that loops "run supervisor; wait;
 # relaunch" — the test's analog of systemd Restart=always in production.
-# This lets ENCLAVE_MGMT_RESTART_CMD just kill the current mgmt process; the
+# This lets ENCLAVE_SUPERVISOR_RESTART_CMD just kill the current supervisor process; the
 # supervisor resurrects it with the updated on-disk binary.
-echo "  Starting mgmt server..."
+echo "  Starting supervisor..."
 EIF_ABS_PATH="$(realpath "$EIF_PATH")"
 
-MGMT_PIDFILE=/tmp/enclave-mgmt.pid
-MGMT_SUPERVISOR=/tmp/mgmt-supervisor.sh
-cat > "$MGMT_SUPERVISOR" <<'SUPER'
+SUPERVISOR_PIDFILE=/tmp/supervisor.pid
+SUP_RELAUNCHER=/tmp/supervisor-relauncher.sh
+cat > "$SUP_RELAUNCHER" <<'SUPER'
 #!/usr/bin/env bash
 set -u
-MGMT_BIN="$1"
+SUP_BIN="$1"
 PIDFILE="$2"
 child=""
 trap '[ -n "$child" ] && kill -TERM "$child" 2>/dev/null; [ -n "$child" ] && wait "$child" 2>/dev/null; rm -f "$PIDFILE"; exit 0' TERM INT
 while :; do
-  "$MGMT_BIN" &
+  "$SUP_BIN" &
   child=$!
   echo "$child" > "$PIDFILE"
   wait "$child" 2>/dev/null || true
   sleep 1
 done
 SUPER
-chmod +x "$MGMT_SUPERVISOR"
+chmod +x "$SUP_RELAUNCHER"
 
 export ENCLAVE_AWS_REGION=us-east-1
 export ENCLAVE_DEPLOYMENT=dev
 export ENCLAVE_APP_NAME=my-app
-export ENCLAVE_MGMT_ADDR="127.0.0.1:8444"
+export ENCLAVE_SUPERVISOR_ADDR="127.0.0.1:8444"
 export ENCLAVE_MIGRATION_COOLDOWN="1m"
 # Shorten commit-poll timeout so rollback tests don't wait 5min for the default.
 export ENCLAVE_MIGRATION_COMMIT_TIMEOUT="45s"
 export ENCLAVE_URL="https://127.0.0.1:8443"
 export ENCLAVE_EIF_PATH="$EIF_ABS_PATH"
-export ENCLAVE_MGMT_BINARY_PATH="$ENCLAVE_MGMT"
-export ENCLAVE_MGMT_RESTART_CMD="kill \$(cat $MGMT_PIDFILE)"
+export ENCLAVE_SUPERVISOR_BINARY_PATH="$ENCLAVE_SUPERVISOR"
+export ENCLAVE_SUPERVISOR_RESTART_CMD="kill \$(cat $SUPERVISOR_PIDFILE)"
 export ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3"
 export ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} >> /tmp/boot-qemu.log 2>&1 &"
 export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
@@ -379,19 +379,19 @@ export AWS_ENDPOINT_URL_LOGS="http://127.0.0.1:4566"
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 
-"$MGMT_SUPERVISOR" "$ENCLAVE_MGMT" "$MGMT_PIDFILE" &
-MGMT_PID=$!
+"$SUP_RELAUNCHER" "$ENCLAVE_SUPERVISOR" "$SUPERVISOR_PIDFILE" &
+SUP_PID=$!
 sleep 2
 
-if ! kill -0 "$MGMT_PID" 2>/dev/null; then
-  echo "Error: mgmt supervisor failed to start" >&2
+if ! kill -0 "$SUP_PID" 2>/dev/null; then
+  echo "Error: supervisor relauncher failed to start" >&2
   exit 1
 fi
-if [ ! -s "$MGMT_PIDFILE" ]; then
-  echo "Error: mgmt pidfile not populated by supervisor" >&2
+if [ ! -s "$SUPERVISOR_PIDFILE" ]; then
+  echo "Error: supervisor pidfile not populated by relauncher" >&2
   exit 1
 fi
-echo "  Mgmt supervisor running (PID $MGMT_PID), mgmt child PID $(cat "$MGMT_PIDFILE") on http://127.0.0.1:8444"
+echo "  Supervisor relauncher running (PID $SUP_PID), supervisor child PID $(cat "$SUPERVISOR_PIDFILE") on http://127.0.0.1:8444"
 echo ""
 
 # Step 3: Boot enclave in QEMU (runs in background).
@@ -428,20 +428,20 @@ echo ""
 # Start a migration in the background (enters cooldown), verify pending=true,
 # abort, verify pending=false.
 echo "=== [6/9] Migration cooldown: abort test ==="
-MGMT_URL="http://localhost:${MGMT_PORT:-8444}"
+SUPERVISOR_URL="http://localhost:${SUPERVISOR_PORT:-8444}"
 
 export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
 
-# Trigger migration directly via mgmt server in the background.
+# Trigger migration directly via supervisor in the background.
 # (Not via tofu — we need to abort mid-migration, which tofu can't do.)
 ABORT_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
 aws s3 mb "s3://${ABORT_EIF_BUCKET}" $LOCALSTACK 2>/dev/null || true
 aws s3 cp "$EIF_PATH" "s3://${ABORT_EIF_BUCKET}/image.eif" $LOCALSTACK 2>/dev/null
 ABORT_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json")
-curl -sf -X POST "${MGMT_URL}/migrate" \
+curl -sf -X POST "${SUPERVISOR_URL}/migrate" \
   -H 'Content-Type: application/json' \
   -d "{\"eif_bucket\":\"${ABORT_EIF_BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"${ABORT_PCR0}\",\"secret_names\":[\"signing_key\"]}" \
   > /tmp/deploy-abort-test.log 2>&1 &
@@ -470,7 +470,7 @@ if [ "$MIG_PENDING" != "true" ]; then
 fi
 
 # Abort the migration.
-ABORT_CODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "${MGMT_URL}/migrate/abort" 2>/dev/null || echo "000")
+ABORT_CODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "${SUPERVISOR_URL}/migrate/abort" 2>/dev/null || echo "000")
 if [ "$ABORT_CODE" = "200" ]; then
   echo "  PASS: Migration aborted (HTTP 200)"
 else
@@ -517,19 +517,19 @@ else
 fi
 
 # Re-apply with the new EIF — tofu detects expected_pcr0 changed and triggers
-# enclave_migration_local, which calls the mgmt server to perform live migration.
+# enclave_migration_local, which calls the supervisor to perform live migration.
 echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" | cut -c1-16)..."
 
-# Snapshot the current mgmt child PID so we can verify Step 10 actually
+# Snapshot the current supervisor child PID so we can verify Step 10 actually
 # restarted it (supervisor writes new child's PID back to the pidfile).
-PRE_MIGRATION_MGMT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
-echo "  Pre-migration mgmt PID: $PRE_MIGRATION_MGMT_PID"
+PRE_MIGRATION_SUP_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
+echo "  Pre-migration supervisor PID: $PRE_MIGRATION_SUP_PID"
 tofu_apply
 echo "  tofu apply log (migration lines):"
 grep -i 'migrat\|trigger\|null_resource\|local-exec\|curl\|skip' ${SCRIPT_DIR}/tofu-apply.log 2>/dev/null | sed 's/^/    /' || echo "    (no migration lines found)"
 
-# Report migration rollback directly — mgmt-update won't have run, so the
-# "mgmt update ready" check below would only surface the symptom.
+# Report migration rollback directly — supervisor-update won't have run, so the
+# "supervisor update ready" check below would only surface the symptom.
 if grep -q '"status":"rollback-complete"' "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
   echo "  FAIL: migration rolled back — happy-path migration was expected to commit" >&2
   echo "  Rollback reason (from tofu-apply.log):" >&2
@@ -542,50 +542,50 @@ if grep -q '"status":"rollback-complete"' "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/
   exit 1
 fi
 
-# Mgmt binary update: handler emits "mgmt update ready" after validate passes.
-if ! grep -q "mgmt update ready" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
-  echo "  FAIL: mgmt update did not complete — no 'mgmt update ready' NDJSON line" >&2
+# Supervisor binary update: handler emits "supervisor update ready" after validate passes.
+if ! grep -q "supervisor update ready" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
+  echo "  FAIL: supervisor update did not complete — no 'supervisor update ready' NDJSON line" >&2
   echo "  Last 30 lines of tofu-apply.log:" >&2
   tail -30 "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
   exit 1
 fi
-echo "  PASS: mgmt update ready — validate passed and binary was swapped"
+echo "  PASS: supervisor update ready — validate passed and binary was swapped"
 
-# Wait for scheduleMgmtAtomicRestart (2s detached sleep + systemctl restart)
-# to run the restart cmd, for mgmt to exit, and for the supervisor to relaunch
-# it with the new binary. The helper also polls /mgmt/health and rolls back
+# Wait for scheduleSupervisorAtomicRestart (2s detached sleep + systemctl restart)
+# to run the restart cmd, for supervisor to exit, and for the supervisor to relaunch
+# it with the new binary. The helper also polls /supervisor/health and rolls back
 # on failure, but since validate passed and the binary is healthy, no rollback.
-POST_MIGRATION_MGMT_PID=""
+POST_MIGRATION_SUP_PID=""
 for i in $(seq 1 15); do
   sleep 1
-  CURRENT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
-  if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_MIGRATION_MGMT_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
-    POST_MIGRATION_MGMT_PID="$CURRENT_PID"
+  CURRENT_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_MIGRATION_SUP_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
+    POST_MIGRATION_SUP_PID="$CURRENT_PID"
     break
   fi
 done
-if [ -z "$POST_MIGRATION_MGMT_PID" ]; then
-  echo "  FAIL: supervisor did not relaunch mgmt within 15s (pidfile=$(cat "$MGMT_PIDFILE" 2>/dev/null), pre=$PRE_MIGRATION_MGMT_PID)" >&2
+if [ -z "$POST_MIGRATION_SUP_PID" ]; then
+  echo "  FAIL: relauncher did not relaunch supervisor within 15s (pidfile=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null), pre=$PRE_MIGRATION_SUP_PID)" >&2
   exit 1
 fi
-echo "  PASS: mgmt restarted ($PRE_MIGRATION_MGMT_PID → $POST_MIGRATION_MGMT_PID)"
+echo "  PASS: supervisor restarted ($PRE_MIGRATION_SUP_PID → $POST_MIGRATION_SUP_PID)"
 
-# Sanity-check the new mgmt process serves requests.
+# Sanity-check the new supervisor process serves requests.
 if curl -sf --max-time 5 "http://127.0.0.1:8444/health" >/dev/null 2>&1; then
-  echo "  PASS: restarted mgmt server answering /health"
+  echo "  PASS: restarted supervisor answering /health"
 else
-  echo "  FAIL: restarted mgmt server not responding on /health" >&2
+  echo "  FAIL: restarted supervisor not responding on /health" >&2
   exit 1
 fi
 
-# Verify the CLI promoted the staging object onto the canonical enclave-mgmt
-# key after the migration succeeded (null_resource.promote_mgmt_binary_local).
+# Verify the CLI promoted the staging object onto the canonical supervisor
+# key after the migration succeeded (null_resource.promote_supervisor_binary_local).
 ASSETS_BUCKET=$(aws s3api list-buckets $LOCALSTACK --query "Buckets[?starts_with(Name, 'dev-my-app-assets-')].Name | [0]" --output text 2>/dev/null || echo "")
 if [ -n "$ASSETS_BUCKET" ] && [ "$ASSETS_BUCKET" != "None" ]; then
-  if aws s3api head-object $LOCALSTACK --bucket "$ASSETS_BUCKET" --key "enclave-mgmt" >/dev/null 2>&1; then
-    echo "  PASS: Canonical enclave-mgmt S3 key promoted"
+  if aws s3api head-object $LOCALSTACK --bucket "$ASSETS_BUCKET" --key "supervisor" >/dev/null 2>&1; then
+    echo "  PASS: Canonical supervisor S3 key promoted"
   else
-    echo "  FAIL: Canonical enclave-mgmt S3 key not found in $ASSETS_BUCKET" >&2
+    echo "  FAIL: Canonical supervisor S3 key not found in $ASSETS_BUCKET" >&2
     exit 1
   fi
 else
@@ -593,7 +593,7 @@ else
 fi
 
 # Step 8: Wait for restarted enclave and verify migration survival.
-# mgmt already stopped and restarted the enclave in step 7 (via boot-qemu.sh).
+# supervisor already stopped and restarted the enclave in step 7 (via boot-qemu.sh).
 # The new enclave must decrypt secrets from the NEW KMS key and re-import
 # the storage DEK from migrated ciphertexts.
 echo "=== [8/9] Post-migration verification ==="
@@ -710,21 +710,21 @@ fi
 echo ""
 echo "=== [8.5/9] Atomic migration observability checks ==="
 
-# /mgmt/health — AWS auth + SSM + enclave reachability + migration lock state.
-MGMT_HEALTH_CODE=$(curl -s --max-time 5 -o /tmp/mgmt-health.json -w '%{http_code}' \
-  "http://127.0.0.1:8444/mgmt/health" 2>/dev/null || echo "000")
-if [ "$MGMT_HEALTH_CODE" = "200" ]; then
-  MGMT_HEALTH_STATUS=$(jq -r '.status // empty' /tmp/mgmt-health.json 2>/dev/null || echo "")
-  if [ "$MGMT_HEALTH_STATUS" = "ok" ]; then
-    echo "  PASS: /mgmt/health reports ok"
+# /supervisor/health — AWS auth + SSM + enclave reachability + migration lock state.
+SUP_HEALTH_CODE=$(curl -s --max-time 5 -o /tmp/supervisor-health.json -w '%{http_code}' \
+  "http://127.0.0.1:8444/supervisor/health" 2>/dev/null || echo "000")
+if [ "$SUP_HEALTH_CODE" = "200" ]; then
+  SUP_HEALTH_STATUS=$(jq -r '.status // empty' /tmp/supervisor-health.json 2>/dev/null || echo "")
+  if [ "$SUP_HEALTH_STATUS" = "ok" ]; then
+    echo "  PASS: /supervisor/health reports ok"
   else
-    echo "  FAIL: /mgmt/health returned status=$MGMT_HEALTH_STATUS" >&2
-    cat /tmp/mgmt-health.json >&2
+    echo "  FAIL: /supervisor/health returned status=$SUP_HEALTH_STATUS" >&2
+    cat /tmp/supervisor-health.json >&2
     exit 1
   fi
 else
-  echo "  FAIL: /mgmt/health HTTP $MGMT_HEALTH_CODE" >&2
-  cat /tmp/mgmt-health.json 2>/dev/null >&2
+  echo "  FAIL: /supervisor/health HTTP $SUP_HEALTH_CODE" >&2
+  cat /tmp/supervisor-health.json 2>/dev/null >&2
   exit 1
 fi
 
@@ -765,7 +765,7 @@ fi
 
 # Step 9: Rollback test — migration with wrong previous_pcr0.
 # Build a v3 EIF with an intentionally WRONG baked-in previous_pcr0 and trigger
-# a migration. The new enclave's Init() PCR0 check must fail, mgmt's commit
+# a migration. The new enclave's Init() PCR0 check must fail, supervisor's commit
 # poll must time out, and rollback must restore v2 with all data intact.
 # Skipped inside Docker (no Nix toolchain to build v3).
 echo ""
@@ -800,7 +800,7 @@ MIGRATE_BODY=$(jq -nc \
   '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
 
 echo "  Triggering migration v2 → v3 (expecting rollback)..."
-curl -s --max-time 180 -X POST "${MGMT_URL}/migrate" \
+curl -s --max-time 180 -X POST "${SUPERVISOR_URL}/migrate" \
   -H 'Content-Type: application/json' -d "$MIGRATE_BODY" \
   > /tmp/rollback-migrate.log 2>&1 || true
 
@@ -848,53 +848,53 @@ else
 fi
 
 
-# Step 9.5: Mgmt supervisor resilience — SIGKILL mgmt and verify the
+# Step 9.5: Supervisor resilience — SIGKILL supervisor and verify the
 # supervisor relaunches it and it reconnects to AWS/enclave cleanly.
 # This is the foundation that mid-migration crash recovery relies on:
-# if mgmt dies mid-handleMigrate, a new mgmt must come up with fresh
-# state (mgmt is stateless; all migration state lives in SSM).
+# if supervisor dies mid-handleMigrate, a new supervisor must come up with fresh
+# state (supervisor is stateless; all migration state lives in SSM).
 echo ""
-echo "=== [9.5/10] Mgmt supervisor resilience ==="
-PRE_KILL_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+echo "=== [9.5/10] Supervisor resilience ==="
+PRE_KILL_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
 if [ -z "$PRE_KILL_PID" ]; then
-  echo "  FAIL: mgmt PID file missing" >&2
+  echo "  FAIL: supervisor PID file missing" >&2
   exit 1
 fi
-echo "  Killing mgmt (PID $PRE_KILL_PID) with SIGKILL..."
+echo "  Killing supervisor (PID $PRE_KILL_PID) with SIGKILL..."
 kill -KILL "$PRE_KILL_PID" 2>/dev/null || true
 
 POST_KILL_PID=""
 for i in $(seq 1 15); do
   sleep 1
-  CURRENT_PID=$(cat "$MGMT_PIDFILE" 2>/dev/null || echo "")
+  CURRENT_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
   if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_KILL_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
     POST_KILL_PID="$CURRENT_PID"
     break
   fi
 done
 if [ -n "$POST_KILL_PID" ]; then
-  echo "  PASS: Supervisor relaunched mgmt ($PRE_KILL_PID → $POST_KILL_PID)"
+  echo "  PASS: Relauncher restored supervisor ($PRE_KILL_PID → $POST_KILL_PID)"
 else
-  echo "  FAIL: Supervisor did not relaunch mgmt within 15s" >&2
+  echo "  FAIL: Relauncher did not restore supervisor within 15s" >&2
   exit 1
 fi
 
-# New mgmt must serve /health (enclave status) and /mgmt/health (its own
+# New supervisor must serve /health (enclave status) and /supervisor/health (its own
 # AWS connectivity). Both are prerequisites for resuming any in-progress
 # migration after a crash.
 HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/health" 2>/dev/null || echo "000")
 if [ "$HEALTH_CODE" = "200" ]; then
-  echo "  PASS: Relaunched mgmt serves /health"
+  echo "  PASS: Relaunched supervisor serves /health"
 else
-  echo "  FAIL: Relaunched mgmt /health returned $HEALTH_CODE" >&2
+  echo "  FAIL: Relaunched supervisor /health returned $HEALTH_CODE" >&2
   exit 1
 fi
 
-MGMT_HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/mgmt/health" 2>/dev/null || echo "000")
-if [ "$MGMT_HEALTH_CODE" = "200" ]; then
-  echo "  PASS: Relaunched mgmt has working AWS/SSM/enclave connectivity (/mgmt/health)"
+SUP_HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/supervisor/health" 2>/dev/null || echo "000")
+if [ "$SUP_HEALTH_CODE" = "200" ]; then
+  echo "  PASS: Relaunched supervisor has working AWS/SSM/enclave connectivity (/supervisor/health)"
 else
-  echo "  FAIL: Relaunched mgmt /mgmt/health returned $MGMT_HEALTH_CODE" >&2
+  echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE" >&2
   exit 1
 fi
 

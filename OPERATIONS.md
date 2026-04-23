@@ -4,8 +4,8 @@
 
 The Simple Enclave framework runs three components:
 
-1. **Enclave supervisor** (`enclave-supervisor`) — runs inside the Nitro Enclave. Manages attestation keys, KMS secrets, encrypted storage, and proxies requests to your app.
-2. **Management server** (`mgmt`) — runs on the EC2 host at `127.0.0.1:8443`. Provides health checks, metrics, start/stop, key deletion, and migration endpoints.
+1. **Runtime** (`runtime`) — runs inside the Nitro Enclave. Manages attestation keys, KMS secrets, encrypted storage, and proxies requests to your app.
+2. **Supervisor** (`supervisor`) — runs on the EC2 host at `127.0.0.1:8443`. Provides health checks, metrics, start/stop, key deletion, and migration endpoints.
 3. **Your application** — runs inside the enclave as a child process of the supervisor.
 
 
@@ -17,14 +17,14 @@ All components output JSON-structured logs to stderr via `log/slog`. Log fields 
 
 - `time`, `level`, `msg` — standard slog fields
 - `method`, `path`, `status`, `duration_ms` — HTTP request logs (supervisor)
-- `step`, `total`, `status`, `msg` — migration progress (mgmt)
+- `step`, `total`, `status`, `msg` — migration progress (supervisor)
 - `key_id`, `pcr0`, `error` — KMS/attestation operations
 
 Logs are written to the systemd journal and can be viewed with:
 
 ```bash
 journalctl -u enclave-watchdog -f        # enclave (supervisor + app)
-journalctl -u enclave-mgmt -f            # management server
+journalctl -u supervisor -f            # management server
 ```
 
 ### Metrics

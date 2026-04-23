@@ -43,7 +43,7 @@ type attestationPayload struct {
 	Nonce    []byte          `cbor:"nonce"`
 }
 
-// supervisorURL is the internal URL of the enclave-supervisor.
+// supervisorURL is the internal URL of the runtime.
 // The test app calls back to it for storage/secrets management.
 var supervisorURL string
 
@@ -63,7 +63,7 @@ func main() {
 	supervisorURL = "http://127.0.0.1:" + proxyPort
 
 	// Set up OTEL tracing + metrics: export to the supervisor's endpoints.
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token != "" {
 		ctx := context.Background()
 		headers := map[string]string{"Authorization": "Bearer " + token}
@@ -266,9 +266,9 @@ func handleTestSecrets(w http.ResponseWriter, r *http.Request) {
 func handleTestStorage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -344,9 +344,9 @@ func handleTestStorage(w http.ResponseWriter, r *http.Request) {
 func handleTestStoragePersistence(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -408,9 +408,9 @@ func handleTestStoragePersistence(w http.ResponseWriter, r *http.Request) {
 func handleTestDynamicSecrets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -519,9 +519,9 @@ func handleTestDynamicSecrets(w http.ResponseWriter, r *http.Request) {
 func handleTestDynamicSecretPersistence(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -931,9 +931,9 @@ func fetchAttestationDoc() (*attestationPayload, error) {
 func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -1058,9 +1058,9 @@ func handleTestAttestationPersistence(w http.ResponseWriter, r *http.Request) {
 func handleTestLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
 		return
 	}
 

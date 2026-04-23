@@ -18,17 +18,17 @@ RUN git clone --depth 1 --branch vhost-device-vsock-v0.3.0 \
       https://github.com/rust-vmm/vhost-device.git .
 RUN cargo build --release -p vhost-device-vsock
 
-# --- Stage 2: Build gvproxy v0.8.6 + enclave CLI + mgmt ---
+# --- Stage 2: Build gvproxy v0.8.6 + enclave CLI + supervisor ---
 # Build context must be the repo root (set in docker-compose.yml) so we can
-# access go.mod and all Go source for building the CLI and mgmt binaries.
+# access go.mod and all Go source for building the CLI and supervisor binaries.
 FROM golang:1.25-bookworm AS go-build
 RUN go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.8.6
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /enclave-cli ./cmd/enclave
-RUN CGO_ENABLED=0 go build -trimpath -o /enclave-mgmt ./mgmt/
+RUN CGO_ENABLED=0 go build -trimpath -o /enclave-cli ./cli/cmd/enclave
+RUN CGO_ENABLED=0 go build -trimpath -o /supervisor ./supervisor/cmd/supervisor
 
 # --- Stage 3: Build QEMU 9.2.4 (x86_64 system emulator only) ---
 FROM debian:bookworm AS qemu-build
@@ -75,7 +75,7 @@ RUN wget -qO- https://github.com/opentofu/opentofu/releases/download/v1.9.0/tofu
 COPY --from=vsock-build /src/target/release/vhost-device-vsock /usr/local/bin/
 COPY --from=go-build /go/bin/gvproxy /usr/local/bin/
 COPY --from=go-build /enclave-cli /usr/local/bin/enclave-cli
-COPY --from=go-build /enclave-mgmt /usr/local/bin/enclave-mgmt
+COPY --from=go-build /supervisor /usr/local/bin/supervisor
 COPY --from=qemu-build /qemu-install/usr/local/ /usr/local/
 
 COPY test/boot-qemu.sh /usr/local/bin/boot-qemu.sh

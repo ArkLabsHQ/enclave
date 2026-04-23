@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  sdk-hashes:
+  runtime-hashes:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,28 +40,28 @@ jobs:
       - name: Compute vendor hash
         id: vendor
         run: |
-          cd sdk
+          cd runtime
           OUTPUT=$(nix build --impure \
             --extra-experimental-features 'nix-command flakes' \
             --expr '
               let pkgs = import <nixpkgs> {};
               in pkgs.buildGoModule {
-                pname = "enclave-supervisor";
+                pname = "runtime";
                 version = "dev";
                 src = ./.;
-                subPackages = ["cmd/enclave-supervisor"];
+                subPackages = ["cmd/runtime"];
                 vendorHash = "";
                 doCheck = false;
               }
             ' 2>&1 || true)
           VENDOR_HASH=$(echo "$OUTPUT" | grep 'got:' | awk '{print $2}')
           if [ -z "$VENDOR_HASH" ]; then
-            VENDOR_HASH=$(jq -r '.vendor_hash' ../sdk-hashes.json)
+            VENDOR_HASH=$(jq -r '.vendor_hash' ../cli/runtime-hashes.json)
           fi
           echo "vendor_hash=${VENDOR_HASH}" >> "$GITHUB_OUTPUT"
           echo "Vendor hash: ${VENDOR_HASH}"
 
-      - name: Update versions and sdk-hashes.json
+      - name: Update versions and runtime-hashes.json
         run: |
           TAG="${{ inputs.version }}"
           VERSION="${TAG#v}"
@@ -71,11 +71,11 @@ jobs:
             --arg rev "$TAG" \
             --arg hash "placeholder" \
             --arg vendor_hash "$VENDOR_HASH" \
-            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > sdk-hashes.json
+            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > cli/runtime-hashes.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sdk-hashes.json
+          git add cli/runtime-hashes.json
           git commit -m "release ${TAG}"
 
       - name: Compute real source hash and finalize
@@ -94,14 +94,14 @@ jobs:
             --arg rev "$TAG" \
             --arg hash "$SOURCE_HASH" \
             --arg vendor_hash "$VENDOR_HASH" \
-            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > sdk-hashes.json
+            '{rev: $rev, hash: $hash, vendor_hash: $vendor_hash}' > cli/runtime-hashes.json
 
-          git add sdk-hashes.json
+          git add cli/runtime-hashes.json
           git commit --amend --no-edit
           git tag -f "$TAG"
 
-          echo "Final sdk-hashes.json:"
-          cat sdk-hashes.json
+          echo "Final runtime-hashes.json:"
+          cat cli/runtime-hashes.json
 
       - name: Push commit and tag
         run: |
@@ -112,26 +112,26 @@ jobs:
 
       - name: Verify build
         run: |
-          cd sdk
-          VENDOR_HASH=$(jq -r '.vendor_hash' ../sdk-hashes.json)
+          cd runtime
+          VENDOR_HASH=$(jq -r '.vendor_hash' ../cli/runtime-hashes.json)
           nix build --impure \
             --extra-experimental-features 'nix-command flakes' \
             --expr "
               let pkgs = import <nixpkgs> {};
               in pkgs.buildGoModule {
-                pname = \"enclave-supervisor\";
+                pname = \"runtime\";
                 version = \"${{ inputs.version }}\";
                 src = ./.;
-                subPackages = [\"cmd/enclave-supervisor\"];
+                subPackages = [\"cmd/runtime\"];
                 vendorHash = \"${VENDOR_HASH}\";
                 tags = [\"netgo\"];
                 doCheck = false;
               }
             "
-          echo "enclave-supervisor built successfully."
+          echo "runtime built successfully."
 
   build-cli:
-    needs: sdk-hashes
+    needs: runtime-hashes
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -161,16 +161,16 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           MODULE=github.com/ArkLabsHQ/introspector-enclave
-          HASHES_FILE=sdk-hashes.json
+          HASHES_FILE=cli/runtime-hashes.json
 
-          SDK_REV=$(jq -r '.rev' "$HASHES_FILE" 2>/dev/null || echo "")
-          SDK_HASH=$(jq -r '.hash' "$HASHES_FILE" 2>/dev/null || echo "")
-          SDK_VENDOR_HASH=$(jq -r '.vendor_hash' "$HASHES_FILE" 2>/dev/null || echo "")
+          RUNTIME_REV=$(jq -r '.rev' "$HASHES_FILE" 2>/dev/null || echo "")
+          RUNTIME_HASH=$(jq -r '.hash' "$HASHES_FILE" 2>/dev/null || echo "")
+          RUNTIME_VENDOR_HASH=$(jq -r '.vendor_hash' "$HASHES_FILE" 2>/dev/null || echo "")
 
-          LDFLAGS="-X ${MODULE}.sdkRev=${SDK_REV} -X ${MODULE}.sdkHash=${SDK_HASH} -X ${MODULE}.sdkVendorHash=${SDK_VENDOR_HASH}"
+          LDFLAGS="-X ${MODULE}/cli.runtimeRev=${RUNTIME_REV} -X ${MODULE}/cli.runtimeHash=${RUNTIME_HASH} -X ${MODULE}/cli.runtimeVendorHash=${RUNTIME_VENDOR_HASH}"
 
           OUTPUT="enclave-cli-${GOOS}-${GOARCH}"
-          go build -ldflags "${LDFLAGS}" -o "${OUTPUT}" ./cmd/enclave
+          go build -ldflags "${LDFLAGS}" -o "${OUTPUT}" ./cli/cmd/enclave
           sha256sum "${OUTPUT}" > "${OUTPUT}.sha256"
 
       - name: Upload artifact

@@ -14,7 +14,7 @@ set -euo pipefail
 
 EIF_PATH="${1:?Usage: $0 <path-to-eif>}"
 
-# Write PID file so external processes (e.g. mgmt server) can stop us.
+# Write PID file so external processes (e.g. supervisor) can stop us.
 echo $$ > /tmp/enclave-boot.pid
 
 if [ ! -f "$EIF_PATH" ]; then
@@ -119,7 +119,7 @@ fi
 # gvproxy listens on AF_VSOCK port 1024 + a Unix management socket.
 echo "=== Starting gvproxy ==="
 echo "  vsock:  AF_VSOCK port 1024"
-echo "  mgmt:   $GVPROXY_SOCKET"
+echo "  supervisor:   $GVPROXY_SOCKET"
 
 gvproxy \
   -listen "vsock://:1024" \

@@ -1,31 +1,31 @@
-HASHES_FILE := sdk-hashes.json
+HASHES_FILE := cli/runtime-hashes.json
 
-# Read cached hashes from sdk-hashes.json (if it exists).
-SDK_REV        = $(shell jq -r '.rev'         $(HASHES_FILE) 2>/dev/null)
-SDK_HASH       = $(shell jq -r '.hash'        $(HASHES_FILE) 2>/dev/null)
-SDK_VENDOR_HASH = $(shell jq -r '.vendor_hash' $(HASHES_FILE) 2>/dev/null)
+# Read cached hashes from runtime-hashes.json (if it exists).
+RUNTIME_REV        = $(shell jq -r '.rev'         $(HASHES_FILE) 2>/dev/null)
+RUNTIME_HASH       = $(shell jq -r '.hash'        $(HASHES_FILE) 2>/dev/null)
+RUNTIME_VENDOR_HASH = $(shell jq -r '.vendor_hash' $(HASHES_FILE) 2>/dev/null)
 
 MODULE  := github.com/ArkLabsHQ/introspector-enclave
 
-LDFLAGS := -X $(MODULE).sdkRev=$(SDK_REV) \
-           -X $(MODULE).sdkHash=$(SDK_HASH) \
-           -X $(MODULE).sdkVendorHash=$(SDK_VENDOR_HASH)
+LDFLAGS := -X $(MODULE)/cli.runtimeRev=$(RUNTIME_REV) \
+           -X $(MODULE)/cli.runtimeHash=$(RUNTIME_HASH) \
+           -X $(MODULE)/cli.runtimeVendorHash=$(RUNTIME_VENDOR_HASH)
 
 .PHONY: build install help lint
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
 
-build: ## Build the enclave CLI with SDK hashes baked in
-	go build -ldflags '$(LDFLAGS)' -o enclave-cli ./cmd/enclave
+build: ## Build the enclave CLI with runtime hashes baked in
+	go build -ldflags '$(LDFLAGS)' -o enclave-cli ./cli/cmd/enclave
 
-install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
-	go install -ldflags '$(LDFLAGS)' ./cmd/enclave
+install: ## Install the enclave CLI to $GOPATH/bin with runtime hashes baked in
+	go install -ldflags '$(LDFLAGS)' ./cli/cmd/enclave
 
 lint: ## Run golangci-lint on all modules (matches CI)
 	golangci-lint run ./...
-	cd sdk && golangci-lint run ./...
-	cd mgmt && golangci-lint run ./...
+	cd runtime && golangci-lint run ./...
+	cd supervisor && golangci-lint run ./...
 	cd client && golangci-lint run ./...
 
 .PHONY: test-cli _test-cli-lang test test-build test-run
@@ -47,7 +47,7 @@ APP_DIR_rust   := test/cli/rust-app
 APP_DIR_dotnet := test/cli/dotnet-app
 
 test-cli: ## Run CLI tests for all languages (init, setup, update)
-	go build -o $(CLI_BIN) ./cmd/enclave
+	go build -o $(CLI_BIN) ./cli/cmd/enclave
 	@for lang in $(LANGUAGES); do \
 		echo "=== CLI test: $$lang ==="; \
 		$(MAKE) --no-print-directory _test-cli-lang LANG=$$lang || exit 1; \
@@ -98,7 +98,7 @@ _test-cli-lang:
 	test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }; \
 	test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }; \
 	jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing from pcr.json"; exit 1; }; \
-	test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }; \
+	test -f enclave/artifacts/supervisor || { echo "FAIL: supervisor binary missing"; exit 1; }; \
 	test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }; \
 	echo "[test] build artifacts verified"; \
 	echo "[test] enclave update --commit $(COMMIT2)"; \
@@ -111,10 +111,10 @@ _test-cli-lang:
 test: test-build test-run ## Build test EIFs and run integration tests
 
 test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with WRONG previousPCR0 for rollback test)
-	cd sdk && go mod vendor
+	cd runtime && go mod vendor
 	# Build v1 once and stash; re-using the same artifact for the final v1 copy
 	# keeps v2's baked predecessor PCR0 consistent with the running v1.
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v1.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v1.json
 	V1_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v1.json) && \
@@ -125,14 +125,14 @@ test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
 	fi
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v2.json
 	# v3: deliberately wrong previous_pcr0 for the rollback test.
 	WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff" && \
 	sed -i 's/^version: .*/version: 0.0.3/' test/app/enclave/enclave.yaml && \
 	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$WRONG_PCR0\"|" test/app/enclave/enclave.yaml
-	cd test/app && SDK_LOCAL_PATH=$(CURDIR) MGMT_LOCAL_PATH=$(CURDIR) enclave build
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) enclave build
 	cp test/app/enclave/artifacts/image.eif /tmp/image-v3.eif
 	cp test/app/enclave/artifacts/pcr.json /tmp/pcr-v3.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml

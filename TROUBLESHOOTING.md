@@ -45,7 +45,7 @@
 | Component | Location | Command |
 |-----------|----------|---------|
 | Enclave supervisor | systemd journal | `journalctl -u enclave-watchdog -f` |
-| Management server | systemd journal | `journalctl -u enclave-mgmt -f` |
+| Management server | systemd journal | `journalctl -u supervisor -f` |
 | nitriding (TLS proxy) | Inside enclave, stdout | Appears in supervisor logs |
 | CDK deploy | Terminal output | Check `cdk-outputs.json` for stack outputs |
 

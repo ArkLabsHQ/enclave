@@ -16,8 +16,14 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Unit tests (root)
-        run: go test -v -race -count=1 .
+      - name: Unit tests (cli)
+        run: go test -v -race -count=1 ./cli/...
+
+      - name: Unit tests (runtime)
+        run: cd runtime && go test -v -race -count=1 ./...
+
+      - name: Unit tests (supervisor)
+        run: go test -v -race -count=1 ./supervisor/...
 
       - name: Unit tests (client)
         run: cd client && go test -v -race -count=1 ./...

@@ -24,40 +24,40 @@
           if p != "" then p else "./enclave/build-config.json";
         buildCfg = builtins.fromJSON (builtins.readFile configPath);
         appCfg = buildCfg.app;
-        sdkCfg = buildCfg.sdk;
+        runtimeCfg = buildCfg.runtime;
 
         # Fall back to env vars for backwards compatibility.
         version = buildCfg.version;
         region = buildCfg.region;
         deployment = buildCfg.prefix;
 
-        # Enclave supervisor — built from the SDK repo.
+        # Enclave supervisor — built from the runtime repo.
         # Handles attestation, secrets, PCR extension, reverse proxy with
         # signing middleware. The user's app is just a plain HTTP server.
-        enclave-supervisor = eifPkgs.buildGoModule {
-          pname = "enclave-supervisor";
+        runtime = eifPkgs.buildGoModule {
+          pname = "runtime";
           version = buildCfg.version;
 
           src = eifPkgs.fetchFromGitHub {
             owner = "ArkLabsHQ";
             repo = "introspector-enclave";
-            rev = sdkCfg.rev;
-            hash = sdkCfg.hash;
+            rev = runtimeCfg.rev;
+            hash = runtimeCfg.hash;
           };
 
-          sourceRoot = "source/sdk";
-          vendorHash = sdkCfg.vendor_hash;
-          subPackages = [ "cmd/enclave-supervisor" ];
+          sourceRoot = "source/runtime";
+          vendorHash = runtimeCfg.vendor_hash;
+          subPackages = [ "cmd/runtime" ];
           env.CGO_ENABLED = "0";
           ldflags = [
-            "-X" "github.com/ArkLabsHQ/introspector-enclave/sdk.Version=${version}"
+            "-X" "github.com/ArkLabsHQ/introspector-enclave/runtime.Version=${version}"
           ];
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
           doCheck = false;
         };
 
-        # User's app — fetched from GitHub. No SDK dependency needed.
+        # User's app — fetched from GitHub. No runtime dependency needed.
         upstream-app = eifPkgs.buildGoModule {
           pname = appCfg.binary_name;
           version = buildCfg.version;
@@ -137,7 +137,7 @@
         appDir = eifPkgs.runCommand "enclave-app" { } ''
           mkdir -p $out/app/data
           cp ${upstream-app}/bin/${appCfg.binary_name} $out/app/${appCfg.binary_name}
-          cp ${enclave-supervisor}/bin/enclave-supervisor $out/app/enclave-supervisor
+          cp ${runtime}/bin/runtime $out/app/runtime
           cp ${nitriding}/bin/nitriding $out/app/nitriding
           cp ${viproxy}/bin/proxy $out/app/proxy
           install -m 0755 ${./enclave/start.sh} $out/app/start.sh
@@ -216,7 +216,7 @@
       in
       {
         packages = {
-          inherit upstream-app enclave-supervisor nitriding viproxy eif vendor-hash-check;
+          inherit upstream-app runtime nitriding viproxy eif vendor-hash-check;
           default = eif;
         };
       }

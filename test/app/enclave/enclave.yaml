@@ -10,10 +10,10 @@ instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)
 
-# SDK coordinates for the enclave supervisor binary.
+# Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
-# middleware automatically. Your app is a plain HTTP server with zero SDK imports.
-sdk:
+# middleware automatically. Your app is a plain HTTP server with zero runtime imports.
+runtime:
   rev: "v0.0.62"
   hash: "sha256-xa7ukVvTTXqHn7L4MOwVv+L8N20vO8MKiXrbj4Mvhjo="
   vendor_hash: "sha256-nj/KWLaYuxV67ytwoX5YnnWlGzsTKrm8TL7EpLPAC40="
@@ -47,6 +47,8 @@ app:
 secrets:
   - name: signing_key
     env_var: SIGNING_KEY
+
+
 
 
 

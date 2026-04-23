@@ -101,7 +101,7 @@ resource "aws_ssm_parameter" "migration_target_pcr0" {
   }
 }
 
-# KMS key ID — managed by null_resource.kms_key (kms.tf) and the mgmt server
+# KMS key ID — managed by null_resource.kms_key (kms.tf) and the supervisor
 # during migration. Not a tofu resource because the value changes outside tofu.
 
 # Storage bucket name.

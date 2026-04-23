@@ -32,7 +32,7 @@ introspector-client
 synth-local
 ./bin/
 *.eif
-mgmt/mgmt
+supervisor/supervisor
 
 # Temporary build artifacts
 /tmp/enclave-verify-*

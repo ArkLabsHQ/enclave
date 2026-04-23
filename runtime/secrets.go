@@ -1,0 +1,363 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+// envMu protects os.Setenv calls from concurrent access.
+var envMu sync.Mutex
+
+// DynamicSecret is the JSON envelope stored in S3 for each dynamic secret.
+type DynamicSecret struct {
+	Name      string `json:"name"`
+	EnvVar    string `json:"env_var,omitempty"`
+	Value     string `json:"value"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+// DynamicSecretInfo is the metadata-only view returned by list (no value).
+type DynamicSecretInfo struct {
+	Name      string `json:"name"`
+	EnvVar    string `json:"env_var,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+const secretsPrefix = "secrets/"
+
+// validSecretName matches alphanumeric, hyphens, underscores, dots. No slashes, no ..
+var validSecretName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// validateSecretName rejects path traversal, control chars, and invalid names.
+func validateSecretName(name string) error {
+	if name == "" {
+		return fmt.Errorf("secret name is required")
+	}
+	if strings.Contains(name, "..") || strings.Contains(name, "/") {
+		return fmt.Errorf("secret name must not contain '..' or '/'")
+	}
+	if !validSecretName.MatchString(name) {
+		return fmt.Errorf("secret name must be alphanumeric with hyphens, underscores, or dots")
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("secret name must be 256 characters or fewer")
+	}
+	return nil
+}
+
+// maxSecretValueSize is the maximum size of a dynamic secret value.
+// Env vars have OS-level limits (~128KB on Linux), so cap well below that.
+const maxSecretValueSize = 64 * 1024 // 64KB
+
+// StoreSecret encrypts and persists a dynamic secret.
+func (e *Runtime) StoreSecret(ctx context.Context, name, envVar, value string) error {
+	if err := validateSecretName(name); err != nil {
+		return err
+	}
+	if len(value) > maxSecretValueSize {
+		return fmt.Errorf("secret value too large (%d bytes, max %d)", len(value), maxSecretValueSize)
+	}
+
+	// Validate env_var doesn't collide with static secrets.
+	if envVar != "" {
+		for _, s := range e.secrets {
+			if s.EnvVar == envVar {
+				return fmt.Errorf("env_var %q conflicts with static secret %q", envVar, s.Name)
+			}
+		}
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Preserve created_at if updating an existing secret.
+	createdAt := now
+	if existing, err := e.LoadSecret(ctx, name); err == nil {
+		createdAt = existing.CreatedAt
+	}
+
+	secret := DynamicSecret{
+		Name:      name,
+		EnvVar:    envVar,
+		Value:     value,
+		CreatedAt: createdAt,
+		UpdatedAt: now,
+	}
+	data, err := json.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("marshal secret: %w", err)
+	}
+
+	enclaveMetrics.Inc(enclaveMetrics.SecretWrites, "secret_writes_total")
+	slog.Info("secret stored", "name", name, "env_var", envVar)
+	return e.Store(ctx, secretsPrefix+name, data)
+}
+
+// LoadSecret retrieves and decrypts a dynamic secret.
+func (e *Runtime) LoadSecret(ctx context.Context, name string) (*DynamicSecret, error) {
+	enclaveMetrics.Inc(enclaveMetrics.SecretReads, "secret_reads_total")
+	data, err := e.Load(ctx, secretsPrefix+name)
+	if err != nil {
+		return nil, err
+	}
+	var secret DynamicSecret
+	if err := json.Unmarshal(data, &secret); err != nil {
+		return nil, fmt.Errorf("unmarshal secret %q: %w", name, err)
+	}
+	return &secret, nil
+}
+
+// DeleteSecret removes a dynamic secret from storage.
+func (e *Runtime) DeleteSecret(ctx context.Context, name string) error {
+	enclaveMetrics.Inc(enclaveMetrics.SecretDeletes, "secret_deletes_total")
+	slog.Info("secret deleted", "name", name)
+	return e.Delete(ctx, secretsPrefix+name)
+}
+
+// ListSecrets returns the names of all dynamic secrets.
+func (e *Runtime) ListSecrets(ctx context.Context) ([]string, error) {
+	keys, err := e.List(ctx, secretsPrefix)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		names = append(names, strings.TrimPrefix(k, secretsPrefix))
+	}
+	return names, nil
+}
+
+// loadDynamicSecrets scans stored secrets and injects their env vars.
+// Returns the count of loaded secrets for enclave-info reporting.
+func (e *Runtime) loadDynamicSecrets(ctx context.Context) (int, error) {
+	if e.dek == nil {
+		return 0, nil // storage not initialized, skip
+	}
+	names, err := e.ListSecrets(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	seenEnvVars := make(map[string]string) // env_var → secret name
+	loaded := 0
+
+	for _, name := range names {
+		secret, err := e.LoadSecret(ctx, name)
+		if err != nil {
+			slog.Warn("skip dynamic secret", "name", name, "error", err)
+			continue
+		}
+		if secret.EnvVar != "" {
+			if prev, dup := seenEnvVars[secret.EnvVar]; dup {
+				slog.Warn("duplicate env_var in dynamic secrets", "prev", prev, "current", name, "env_var", secret.EnvVar)
+			}
+			seenEnvVars[secret.EnvVar] = name
+			_ = safeSetenv(secret.EnvVar, secret.Value)
+		}
+		loaded++
+	}
+	return loaded, nil
+}
+
+// checkRuntimeToken validates the Authorization: Bearer <token> header.
+func (e *Runtime) checkRuntimeToken(w http.ResponseWriter, r *http.Request) bool {
+	if e.runtimeToken == "" {
+		return true // no token configured, allow (backwards compat)
+	}
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "invalid Authorization format, expected Bearer token", http.StatusUnauthorized)
+		return false
+	}
+	if strings.TrimPrefix(auth, prefix) != e.runtimeToken {
+		http.Error(w, "invalid management token", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// handleSecretPut handles PUT /v1/secrets/{name}.
+func (e *Runtime) handleSecretPut(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.checkRuntimeToken(w, r) {
+		return
+	}
+
+	name := r.PathValue("name")
+	if err := validateSecretName(name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
+
+	var req struct {
+		EnvVar string `json:"env_var"`
+		Value  string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Value == "" {
+		http.Error(w, "value is required", http.StatusBadRequest)
+		return
+	}
+
+	// Check if this is a new secret (vs update) for count tracking.
+	_, existsErr := e.LoadSecret(r.Context(), name)
+	isNew := existsErr != nil
+
+	if err := e.StoreSecret(r.Context(), name, req.EnvVar, req.Value); err != nil {
+		if strings.Contains(err.Error(), "too large") {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	if isNew {
+		e.dynamicSecretsCount.Add(1)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}{Name: name, Status: "stored"})
+}
+
+// handleSecretGet handles GET /v1/secrets/{name}.
+func (e *Runtime) handleSecretGet(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.checkRuntimeToken(w, r) {
+		return
+	}
+
+	name := r.PathValue("name")
+	if err := validateSecretName(name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	secret, err := e.LoadSecret(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, "secret not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(secret)
+}
+
+// handleSecretDelete handles DELETE /v1/secrets/{name}.
+func (e *Runtime) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.checkRuntimeToken(w, r) {
+		return
+	}
+
+	name := r.PathValue("name")
+	if err := validateSecretName(name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Verify secret exists before deleting (for accurate count tracking).
+	if _, err := e.LoadSecret(r.Context(), name); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, "secret not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := e.DeleteSecret(r.Context(), name); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	e.dynamicSecretsCount.Add(-1)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}{Name: name, Status: "deleted"})
+}
+
+// handleSecretList handles GET /v1/secrets.
+// Returns metadata for each secret (name, env_var, timestamps) but not the value.
+func (e *Runtime) handleSecretList(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+	if !e.checkRuntimeToken(w, r) {
+		return
+	}
+
+	names, err := e.ListSecrets(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	secrets := make([]DynamicSecretInfo, 0, len(names))
+	for _, name := range names {
+		secret, err := e.LoadSecret(r.Context(), name)
+		if err != nil {
+			slog.Warn("skip secret in list", "name", name, "error", err)
+			continue
+		}
+		secrets = append(secrets, DynamicSecretInfo{
+			Name:      secret.Name,
+			EnvVar:    secret.EnvVar,
+			CreatedAt: secret.CreatedAt,
+			UpdatedAt: secret.UpdatedAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Secrets []DynamicSecretInfo `json:"secrets"`
+	}{Secrets: secrets})
+}
+
+// safeSetenv wraps os.Setenv with a mutex to prevent concurrent env mutations.
+func safeSetenv(key, value string) error {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Setenv(key, value)
+}

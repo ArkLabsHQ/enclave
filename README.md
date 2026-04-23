@@ -15,7 +15,7 @@ EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
   v                                       192.168.127.1
 Nitro Enclave ---------------------------------->+
   ├── nitriding             (TLS :443 -> :7073)
-  ├── enclave-supervisor    (reverse proxy :7073 -> :7074)
+  ├── runtime              (reverse proxy :7073 -> :7074)
   │     ├── attestation key + Schnorr signing
   │     ├── KMS secret decryption
   │     ├── PCR extension endpoints
@@ -27,7 +27,7 @@ Nitro Enclave ---------------------------------->+
 ### Boot Sequence
 
 1. **nitriding** starts, sets up the TAP network interface via gvproxy, and terminates TLS on port 443
-2. **enclave-supervisor** initializes:
+2. **runtime** initializes:
    - Decrypts secrets from KMS using a Nitro attestation document (PCR0-bound)
    - Sets decrypted secrets as environment variables
    - Generates an ephemeral secp256k1 attestation key
@@ -75,7 +75,7 @@ Your enclave app is a plain HTTP server — no SDK imports needed. The framework
 ### 1. Install the CLI
 
 ```sh
-go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 ```
 
 Or build from source with SDK hashes baked in:
@@ -306,10 +306,10 @@ SDK hashes are computed per release tag and baked into CLI builds via ldflags. T
 Releases are created via the **Release SDK Version** GitHub Actions workflow (`.github/workflows/sdk-hashes.yml`), triggered manually with a version input (e.g. `v0.0.29`):
 
 1. **Validate** — checks version format (`vX.Y.Z`) and that the tag doesn't already exist
-2. **Compute vendor hash** — runs a trial Nix build of `enclave-supervisor` to extract the Go vendor hash
+2. **Compute vendor hash** — runs a trial Nix build of `runtime` to extract the Go vendor hash
 3. **Compute source hash** — archives the repo at HEAD, computes `nix hash path` over the archive
 4. **Commit and tag** — writes `sdk-hashes.json`, commits, tags, and pushes to `master`
-5. **Verify build** — confirms `enclave-supervisor` builds successfully with the computed hashes
+5. **Verify build** — confirms `runtime` builds successfully with the computed hashes
 
 ### Building from source
 
@@ -356,7 +356,7 @@ The supervisor exposes management endpoints alongside proxied requests to your a
 | GET | `/enclave/attestation` | — | Nitro attestation document (served by nitriding) |
 | `*` | `/*` | — | All other requests proxied to your app on port 7074 |
 
-Endpoints marked **Token** require `Authorization: Bearer {token}` where the token is auto-generated at boot and passed to your app via the `ENCLAVE_MGMT_TOKEN` environment variable.
+Endpoints marked **Token** require `Authorization: Bearer {token}` where the token is auto-generated at boot and passed to your app via the `ENCLAVE_RUNTIME_TOKEN` environment variable.
 
 #### Internal Endpoints
 
@@ -364,7 +364,7 @@ These endpoints are used internally and are not exposed to external clients.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/v1/export-key` | — | Re-encrypt secrets for locked-key migration (gated by SSM parameter, called by mgmt server) |
+| POST | `/v1/export-key` | — | Re-encrypt secrets for locked-key migration (gated by SSM parameter, called by supervisor) |
 
 ### Response Signing
 
@@ -390,20 +390,20 @@ The enclave provides persistent encrypted storage backed by S3 with automatic KM
 ```sh
 # Store data
 curl -X PUT https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN" \
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
   -d 'binary data here'
 
 # Retrieve data
 curl https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 
 # List keys by prefix
 curl "https://your-enclave/v1/storage?prefix=my/" \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 
 # Delete
 curl -X DELETE https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 ```
 
 ### Dynamic Secrets
@@ -418,26 +418,26 @@ Runtime-configurable secrets stored in encrypted S3 (reuses the storage DEK). Un
 ```sh
 # Create a dynamic secret with env var binding
 curl -X PUT https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN" \
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"env_var": "API_TOKEN", "value": "sk-..."}'
 
 # List all secrets (metadata only, no values)
 curl https://your-enclave/v1/secrets \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 
 # Retrieve a secret
 curl https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 
 # Delete
 curl -X DELETE https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_MGMT_TOKEN"
+  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
 ```
 
 ### Management Server
 
-The host-side management server (`mgmt/`) runs on the EC2 instance at `127.0.0.1:8443` (plain HTTP, localhost only). Access it via [SSM Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html).
+The host-side supervisor (`supervisor/`) runs on the EC2 instance at `127.0.0.1:8443` (plain HTTP, localhost only). Access it via [SSM Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -590,12 +590,12 @@ cd test && nix develop . --command ./run.sh
 | Component | Port | Purpose |
 |-----------|------|---------|
 | Enclave (QEMU via gvproxy) | 8443 | TLS-terminated enclave |
-| Management server | 8444 | Host-side mgmt (migration orchestration) |
+|  Supervisor | 8444 | Host-side supervisor (migration orchestration) |
 | LocalStack | 4566 | S3, SSM, STS mock |
 | KMS proxy | 4000 | Custom KMS mock |
 | Mock IMDS | 1338 | EC2 instance metadata mock |
 
-The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost-device-vsock 0.3.0, gvproxy 0.8.6, and the CLI/mgmt binaries in a multi-stage build. QEMU 9.2 is the first version with the `nitro-enclave` machine type.
+The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost-device-vsock 0.3.0, gvproxy 0.8.6, and the CLI/supervisor binaries in a multi-stage build. QEMU 9.2 is the first version with the `nitro-enclave` machine type.
 
 ### Test Environment Variables
 
@@ -609,7 +609,7 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 
 ```
 .
-├── cmd/enclave/main.go          # CLI entry point
+├── cmd/enclave/main.go          # CLI (main package + all command code)
 ├── config.go                    # Config loading + validation
 ├── build.go                     # EIF build orchestration
 ├── setup.go                     # Auto-populate app nix hashes
@@ -624,16 +624,16 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 ├── version.go                   # SDK hash vars (set via ldflags)
 ├── Makefile                     # Build + hash computation targets
 ├── sdk-hashes.json              # Cached SDK Nix hashes
-├── sdk/                         # SDK module (built as enclave-supervisor)
+├── runtime/                     # Runtime (in-enclave library + binary)
 │   ├── enclave.go               # Init, attestation key, signing middleware, routes
 │   ├── kms_ssm.go               # KMS encrypt/decrypt, SSM storage
 │   ├── storage.go               # Encrypted storage (AES-256-GCM + S3)
 │   ├── secrets.go               # Dynamic secrets API
 │   ├── imds.go                  # IMDS credential fetching
 │   ├── migrate.go               # Key export for locked-key migration
-│   └── cmd/enclave-supervisor/
+│   └── cmd/runtime/
 │       └── main.go              # Standalone supervisor binary
-├── mgmt/                        # Host-side management server
+├── supervisor/                 # Host-side supervisor
 │   ├── main.go                  # Routes + server setup
 │   ├── health.go                # Health endpoint (nitro-cli describe)
 │   ├── enclave.go               # Start/stop via systemd
@@ -691,5 +691,5 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 | `ENCLAVE_APP_NAME` | App name (used in SSM path construction) | (from config) |
 | `ENCLAVE_KMS_KEY_ID` | KMS key ID override | (auto from SSM) |
 | `ENCLAVE_AWS_REGION` | AWS region for KMS/SSM | `us-east-1` |
-| `ENCLAVE_MGMT_TOKEN` | Bearer token for storage/secrets API auth | (auto-generated) |
+| `ENCLAVE_RUNTIME_TOKEN` | Bearer token for storage/secrets API auth | (auto-generated) |
 | `ENCLAVE_SECRETS_CONFIG` | JSON array of secret definitions (baked into EIF) | (from config) |

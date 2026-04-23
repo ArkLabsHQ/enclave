@@ -39,14 +39,14 @@ module "enclave" {
   migration_cooldown = var.migration_cooldown
   previous_pcr0     = var.previous_pcr0
   expected_pcr0     = var.expected_pcr0
-  mgmt_url          = var.mgmt_url
+  supervisor_url          = var.supervisor_url
   github_owner  = var.github_owner
   github_repo   = var.github_repo
   release_tag   = var.release_tag
   github_token  = var.github_token
 
   eif_path            = var.eif_path
-  mgmt_binary_path    = var.mgmt_binary_path
+  supervisor_binary_path    = var.supervisor_binary_path
   gvproxy_binary_path = var.gvproxy_binary_path
 
   enclave_init_script_path = var.enclave_init_script_path
@@ -54,5 +54,5 @@ module "enclave" {
   imds_proxy_service_path  = var.imds_proxy_service_path
   gvproxy_service_path      = var.gvproxy_service_path
   gvproxy_start_script_path = var.gvproxy_start_script_path
-  mgmt_service_path         = var.mgmt_service_path
+  supervisor_service_path         = var.supervisor_service_path
 }

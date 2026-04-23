@@ -5,7 +5,7 @@ locals {
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
-  mgmt_source    = local.use_local ? var.mgmt_binary_path : "${local.artifacts_dir}/enclave-mgmt"
+  supervisor_source    = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
   gvproxy_source = local.use_local ? var.gvproxy_binary_path : "${local.artifacts_dir}/gvproxy"
 }
 
@@ -23,7 +23,7 @@ resource "null_resource" "download_artifacts" {
       [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
       mkdir -p ${local.artifacts_dir}
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/enclave-mgmt ${local.release_base}/enclave-mgmt
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
     EOT
     environment = {
@@ -85,32 +85,32 @@ resource "aws_s3_object" "gvproxy_systemd" {
   etag   = filemd5(var.gvproxy_service_path)
 }
 
-resource "aws_s3_object" "mgmt_binary" {
+resource "aws_s3_object" "supervisor_binary" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
-  key        = "enclave-mgmt"
-  source     = local.mgmt_source
-  etag       = local.use_local ? filemd5(local.mgmt_source) : null
+  key        = "supervisor"
+  source     = local.supervisor_source
+  etag       = local.use_local ? filemd5(local.supervisor_source) : null
 }
 
-# Staging copy used for in-place mgmt migration. Each tofu apply overwrites
+# Staging copy used for in-place supervisor migration. Each tofu apply overwrites
 # this object with the freshly-built binary; the migration null_resource
-# points the running mgmt server at this key. On migration success the
-# promote_mgmt_binary null_resource copies it onto the canonical key above,
+# points the running supervisor at this key. On migration success the
+# promote_supervisor_binary null_resource copies it onto the canonical key above,
 # so instance reboots come up on the new version. If migration fails the
 # canonical key stays on the last-known-good binary.
 #
-# Recovery: if a newly deployed mgmt binary crash-loops under systemd,
+# Recovery: if a newly deployed supervisor binary crash-loops under systemd,
 # SSM into the host and run
-#   aws s3 cp s3://<assets>/enclave-mgmt /home/ec2-user/app/enclave-mgmt
-#   systemctl restart enclave-mgmt
+#   aws s3 cp s3://<assets>/supervisor /home/ec2-user/app/supervisor
+#   systemctl restart supervisor
 # to roll back to the canonical (last-known-good) binary.
-resource "aws_s3_object" "mgmt_binary_staging" {
+resource "aws_s3_object" "supervisor_binary_staging" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
-  key        = "enclave-mgmt-staging"
-  source     = local.mgmt_source
-  etag       = local.use_local ? filemd5(local.mgmt_source) : null
+  key        = "supervisor-staging"
+  source     = local.supervisor_source
+  etag       = local.use_local ? filemd5(local.supervisor_source) : null
 }
 
 resource "aws_s3_object" "gvproxy_start_script" {
@@ -128,11 +128,11 @@ resource "aws_s3_object" "gvproxy_binary" {
   etag       = local.use_local ? filemd5(local.gvproxy_source) : null
 }
 
-resource "aws_s3_object" "mgmt_systemd" {
+resource "aws_s3_object" "supervisor_systemd" {
   bucket = aws_s3_bucket.assets.id
-  key    = "enclave-mgmt.service"
-  source = var.mgmt_service_path
-  etag   = filemd5(var.mgmt_service_path)
+  key    = "supervisor.service"
+  source = var.supervisor_service_path
+  etag   = filemd5(var.supervisor_service_path)
 }
 
 # Persistent storage bucket for enclave data (Store/Load API).

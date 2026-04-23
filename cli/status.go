@@ -65,7 +65,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Query enclave health via the management server (best-effort).
+	// Query enclave health via the supervisor server (best-effort).
 	if instanceID != "" {
 		fmt.Println()
 		healthJSON := ac.runCommandOutput(ctx, instanceID,

@@ -128,7 +128,7 @@ variable "expected_pcr0" {
 }
 
 variable "supervisor_url" {
-  description = "Management server URL for local mode migrations."
+  description = "Supervisor server URL for local mode migrations."
   type        = string
   default     = "http://localhost:8444"
 }
@@ -330,7 +330,7 @@ variable "expected_pcr0" {
 }
 
 variable "supervisor_url" {
-  description = "Management server URL for local mode migrations (e.g. http://localhost:8444)."
+  description = "Supervisor server URL for local mode migrations (e.g. http://localhost:8444)."
   type        = string
   default     = "http://localhost:8444"
 }

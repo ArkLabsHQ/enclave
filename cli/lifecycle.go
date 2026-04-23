@@ -11,7 +11,7 @@ func startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
 		Short: "Start the enclave on the remote instance",
-		Long:  "Starts the Nitro Enclave via the management server on the EC2 instance.",
+		Long:  "Starts the Nitro Enclave via the supervisor server on the EC2 instance.",
 		RunE:  runStart,
 	}
 }
@@ -20,7 +20,7 @@ func stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the enclave on the remote instance",
-		Long:  "Stops the Nitro Enclave via the management server on the EC2 instance.",
+		Long:  "Stops the Nitro Enclave via the supervisor server on the EC2 instance.",
 		RunE:  runStop,
 	}
 }
@@ -33,7 +33,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	return enclaveLifecycleAction("stop")
 }
 
-// enclaveLifecycleAction calls the management server's start or stop endpoint
+// enclaveLifecycleAction calls the supervisor server's start or stop endpoint
 // on the EC2 instance via SSM Run Command.
 func enclaveLifecycleAction(action string) error {
 	cfg, err := loadConfig()

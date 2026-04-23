@@ -409,7 +409,7 @@ RestartSec=5
 WantedBy=multi-user.target
 `
 
-// Systemd unit — management server for health monitoring and guarded teardown.
+// Systemd unit — supervisor server for health monitoring and guarded teardown.
 const frameworkSupervisorService = `[Unit]
 Description=Enclave host supervisor
 After=network-online.target
@@ -519,7 +519,7 @@ aws s3 cp ${enclave_init_systemd_s3_url} /etc/systemd/system/enclave-watchdog.se
 aws s3 cp ${imds_systemd_s3_url} /etc/systemd/system/enclave-imds-proxy.service
 aws s3 cp ${gvproxy_systemd_s3_url} /etc/systemd/system/gvproxy.service
 
-# Download management server binary and systemd unit
+# Download supervisor server binary and systemd unit
 aws s3 cp ${supervisor_binary_s3_url} /home/ec2-user/app/supervisor
 chmod +x /home/ec2-user/app/supervisor
 chown ec2-user:ec2-user /home/ec2-user/app/supervisor

@@ -18,7 +18,7 @@ func metricsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "metrics",
 		Short: "Show enclave metrics",
-		Long:  "Retrieves metric snapshots from the enclave supervisor via the management server.",
+		Long:  "Retrieves metric snapshots from the enclave supervisor via the supervisor server.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMetricsCmd(source, asJSON)
 		},

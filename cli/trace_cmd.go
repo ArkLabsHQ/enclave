@@ -23,7 +23,7 @@ func traceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "trace",
 		Short: "Show enclave trace spans",
-		Long:  "Retrieves distributed trace spans from the enclave supervisor via the management server.\nUse --history to query CloudWatch Logs for past spans (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
+		Long:  "Retrieves distributed trace spans from the enclave supervisor via the supervisor server.\nUse --history to query CloudWatch Logs for past spans (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runTraceCmd(service, limit, since, asJSON, history)
 		},

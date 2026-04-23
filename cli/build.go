@@ -104,9 +104,9 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Build the host-side management server binary.
+	// Build the host-side supervisor server binary.
 	if err := buildSupervisorBinary(cfg, root); err != nil {
-		return fmt.Errorf("build management server: %w", err)
+		return fmt.Errorf("build supervisor server: %w", err)
 	}
 
 	// Build the host-side gvproxy binary for outbound networking.
@@ -293,7 +293,7 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 	return &pcrs, nil
 }
 
-// buildSupervisorBinary cross-compiles the host-side management server from the SDK
+// buildSupervisorBinary cross-compiles the host-side supervisor server from the SDK
 // for Linux amd64 and places the binary in enclave/artifacts/.
 //
 // If SUPERVISOR_LOCAL_PATH is set, the binary is built from local source (go build
@@ -302,7 +302,7 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 // that need to exercise unreleased supervisor changes against an unreleased SDK.
 func buildSupervisorBinary(cfg *Config, root string) error {
 	outDir := filepath.Join(root, "enclave", "artifacts")
-	fmt.Println("[build] Building management server binary...")
+	fmt.Println("[build] Building supervisor server binary...")
 
 	if localPath := os.Getenv("SUPERVISOR_LOCAL_PATH"); localPath != "" {
 		dst := filepath.Join(outDir, "supervisor")
@@ -319,9 +319,7 @@ func buildSupervisorBinary(cfg *Config, root string) error {
 		return nil
 	}
 
-	// Install the supervisor binary from the SDK at the configured version.
-	// GOBIN controls where the binary is placed.
-	modulePath := "github.com/ArkLabsHQ/introspector-enclave/supervisor@" + cfg.Runtime.Rev
+	modulePath := "github.com/ArkLabsHQ/introspector-enclave/supervisor/cmd/supervisor@" + cfg.Runtime.Rev
 	cmd := exec.Command("go", "install", "-trimpath", modulePath)
 	cmd.Env = append(os.Environ(),
 		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
@@ -333,15 +331,6 @@ func buildSupervisorBinary(cfg *Config, root string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("go install supervisor: %w", err)
 	}
-
-	// go install names the binary after the module directory ("cmd").
-	// Rename to "supervisor" for clarity on the host.
-	src := filepath.Join(outDir, "cmd")
-	dst := filepath.Join(outDir, "supervisor")
-	if err := os.Rename(src, dst); err != nil {
-		return fmt.Errorf("rename supervisor binary: %w", err)
-	}
-
 	return nil
 }
 

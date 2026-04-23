@@ -23,7 +23,7 @@ func logCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "log",
 		Short: "Show enclave application logs",
-		Long:  "Retrieves structured log entries from the enclave supervisor via the management server.\nUse --history to query CloudWatch Logs for past logs (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
+		Long:  "Retrieves structured log entries from the enclave supervisor via the supervisor server.\nUse --history to query CloudWatch Logs for past logs (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLog(level, limit, since, asJSON, history)
 		},

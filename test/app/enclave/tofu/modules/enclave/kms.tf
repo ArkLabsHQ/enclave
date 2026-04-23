@@ -2,16 +2,16 @@
 #
 # Created via AWS CLI (null_resource) instead of a native tofu resource
 # because the enclave locks the key policy to PCR0 at first boot, and the
-# mgmt server replaces the key entirely during migration. Tofu cannot
+# supervisor replaces the key entirely during migration. Tofu cannot
 # refresh a locked key (DescribeKey/GetKeyPolicy/GetKeyRotationStatus all
 # fail with AccessDenied), so the key must not exist as a tofu resource.
 #
 # The key ID is stored in SSM and read back via a data source. All other
 # resources reference locals.kms_key_id / locals.kms_key_arn.
-# Key deletion is handled by the mgmt server's destroy provisioner.
+# Key deletion is handled by the supervisor's destroy provisioner.
 
 resource "null_resource" "kms_key" {
-  # Only runs once per deployment. The mgmt server handles key rotation
+  # Only runs once per deployment. The supervisor handles key rotation
   # during migration (creates new keys, updates SSM).
   triggers = {
     deployment = var.deployment
@@ -113,7 +113,7 @@ resource "null_resource" "kms_key" {
   }
 }
 
-# Read the KMS key ID from SSM (written by null_resource.kms_key or mgmt server).
+# Read the KMS key ID from SSM (written by null_resource.kms_key or supervisor).
 data "aws_ssm_parameter" "kms_key_id_lookup" {
   name       = "/${var.deployment}/${var.app_name}/KMSKeyID"
   depends_on = [null_resource.kms_key]

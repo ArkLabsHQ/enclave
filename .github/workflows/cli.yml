@@ -150,7 +150,7 @@ jobs:
           test -f enclave/artifacts/image.eif || { echo "FAIL: image.eif missing"; exit 1; }
           test -f enclave/artifacts/pcr.json || { echo "FAIL: pcr.json missing"; exit 1; }
           jq -e '.PCR0' enclave/artifacts/pcr.json >/dev/null || { echo "FAIL: PCR0 missing"; exit 1; }
-          test -f enclave/artifacts/enclave-mgmt || { echo "FAIL: enclave-mgmt missing"; exit 1; }
+          test -f enclave/artifacts/supervisor || { echo "FAIL: supervisor missing"; exit 1; }
           test -f enclave/artifacts/gvproxy || { echo "FAIL: gvproxy missing"; exit 1; }
 
           echo "PASS: enclave build (artifacts verified)"

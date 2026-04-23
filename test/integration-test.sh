@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HOST_TLS_PORT="${HOST_TLS_PORT:-8443}"
-MGMT_PORT="${MGMT_PORT:-8444}"
+SUPERVISOR_PORT="${SUPERVISOR_PORT:-8444}"
 BASE_URL="${ENCLAVE_URL:-https://localhost:${HOST_TLS_PORT}}"
 CURL="curl -sk --max-time 10"
 PASSED=0
@@ -62,17 +62,17 @@ else
   fail "Attestation signature" "${ATTEST_RESP:0:120}"
 fi
 
-# Test 5: SDK version present.
-echo "[5/28] SDK version"
+# Test 5: runtime version present.
+echo "[5/28] runtime version"
 if [ -n "$INFO" ]; then
   VERSION=$(echo "$INFO" | jq -r '.version // empty' 2>/dev/null || echo "")
   if [ -n "$VERSION" ]; then
-    pass "SDK version: $VERSION"
+    pass "runtime version: $VERSION"
   else
-    fail "SDK version" "version field missing from enclave-info"
+    fail "runtime version" "version field missing from enclave-info"
   fi
 else
-  fail "SDK version" "could not fetch enclave-info"
+  fail "runtime version" "could not fetch enclave-info"
 fi
 
 # Test 6: App endpoint responds through nitriding proxy.
@@ -130,7 +130,7 @@ fi
 
 # Test 11: PCR secret derivation + attestation document PCR16 verification.
 # Verifies SIGNING_KEY → pubkey → extension data derivation and that PCR16
-# in the attestation document matches the expected value (extended + locked by SDK).
+# in the attestation document matches the expected value (extended + locked by runtime).
 echo "[11/28] PCR secret derivation + PCR16 verification"
 PCR_RESP=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
 if [ -n "$PCR_RESP" ] && echo "$PCR_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
@@ -150,7 +150,7 @@ fi
 
 # Test 12: Full attestation document structure verification.
 # Fetches raw attestation doc, parses COSE Sign1 + CBOR, verifies PCR map exists,
-# PCR0 is present and non-zero, and PCR16 matches expected value (locked by SDK).
+# PCR0 is present and non-zero, and PCR16 matches expected value (locked by runtime).
 echo "[12/28] Attestation document structure"
 ATTEST_DOC_RESP=$($CURL "${BASE_URL}/test/attestation-document" 2>/dev/null || echo "")
 if [ -n "$ATTEST_DOC_RESP" ] && echo "$ATTEST_DOC_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
@@ -222,35 +222,35 @@ fi
 # --- Log tests ---
 # The test app POSTs logs to the supervisor. We verify the full pipeline
 # by reading them back through the management server's /logs endpoint.
-MGMT_URL="http://localhost:${MGMT_PORT}"
+SUPERVISOR_URL="http://localhost:${SUPERVISOR_PORT}"
 
-# Test 20: Log POST (app → supervisor) + GET via mgmt server.
-echo "[18/28] Log round-trip via mgmt server"
+# Test 20: Log POST (app → supervisor) + GET via supervisor.
+echo "[18/28] Log round-trip via supervisor"
 # First, have the test app POST log entries to the supervisor.
 LOG_POST=$($CURL "${BASE_URL}/test/logs" 2>/dev/null || echo "")
 if [ -z "$LOG_POST" ] || ! echo "$LOG_POST" | jq -e '.post == "ok"' >/dev/null 2>&1; then
   fail "Log POST" "test app failed to post logs: ${LOG_POST:0:120}"
 else
-  # Now GET logs via the mgmt server (full pipeline: app → supervisor → mgmt).
-  LOG_GET=$(curl -s --max-time 10 "${MGMT_URL}/enclave-logs" 2>/dev/null)
+  # Now GET logs via the supervisor (full pipeline: app → supervisor → supervisor).
+  LOG_GET=$(curl -s --max-time 10 "${SUPERVISOR_URL}/enclave-logs" 2>/dev/null)
   if [ -z "$LOG_GET" ]; then LOG_GET="[]"; fi
   LOG_FOUND=$(echo "$LOG_GET" | jq '[.[] | select(.message == "integration test log" or .message == "batch entry 1" or .message == "batch entry 2")] | length' 2>/dev/null || echo "0")
   LOG_TOTAL=$(echo "$LOG_GET" | jq 'length' 2>/dev/null || echo "0")
   if [ "$LOG_FOUND" -ge 3 ]; then
-    pass "Log round-trip via mgmt (found=$LOG_FOUND, total=$LOG_TOTAL)"
+    pass "Log round-trip via supervisor (found=$LOG_FOUND, total=$LOG_TOTAL)"
   else
-    fail "Log round-trip via mgmt" "expected >= 3 entries, found $LOG_FOUND (total=$LOG_TOTAL)"
+    fail "Log round-trip via supervisor" "expected >= 3 entries, found $LOG_FOUND (total=$LOG_TOTAL)"
   fi
 fi
 
-# Test 21: Log level filtering via mgmt server.
-echo "[19/28] Log level filtering via mgmt server"
-LOG_FILTERED=$(curl -s --max-time 10 "${MGMT_URL}/enclave-logs?level=warn" 2>/dev/null)
+# Test 21: Log level filtering via supervisor.
+echo "[19/28] Log level filtering via supervisor"
+LOG_FILTERED=$(curl -s --max-time 10 "${SUPERVISOR_URL}/enclave-logs?level=warn" 2>/dev/null)
 if [ -z "$LOG_FILTERED" ]; then LOG_FILTERED="[]"; fi
 FILTERED_COUNT=$(echo "$LOG_FILTERED" | jq 'length' 2>/dev/null || echo "0")
 ALL_ABOVE_WARN=$(echo "$LOG_FILTERED" | jq 'all(.level == "warn" or .level == "error")' 2>/dev/null || echo "false")
 if [ "$FILTERED_COUNT" -ge 2 ] && [ "$ALL_ABOVE_WARN" = "true" ]; then
-  pass "Log level filter works via mgmt (filtered=$FILTERED_COUNT, all>=warn)"
+  pass "Log level filter works via supervisor (filtered=$FILTERED_COUNT, all>=warn)"
 else
   fail "Log level filtering" "filtered=$FILTERED_COUNT, all_above_warn=$ALL_ABOVE_WARN"
 fi
@@ -263,11 +263,11 @@ else
   fail "Log auth enforcement" "${LOG_POST:0:120}"
 fi
 
-# Test 23: CloudWatch Logs history (supervisor ships logs → mgmt queries CloudWatch).
+# Test 23: CloudWatch Logs history (supervisor ships logs → supervisor queries CloudWatch).
 echo "[21/28] CloudWatch Logs log history"
 # Wait for the supervisor's log shipper to flush (5s interval + margin).
 sleep 8
-CW_HISTORY=$(curl -s --max-time 10 "${MGMT_URL}/enclave-logs?history=true" 2>/dev/null)
+CW_HISTORY=$(curl -s --max-time 10 "${SUPERVISOR_URL}/enclave-logs?history=true" 2>/dev/null)
 if [ -z "$CW_HISTORY" ]; then CW_HISTORY="[]"; fi
 CW_COUNT=$(echo "$CW_HISTORY" | jq 'length' 2>/dev/null || echo "0")
 CW_FOUND=$(echo "$CW_HISTORY" | jq '[.[] | select(.message == "integration test log" or .message == "batch entry 1" or .message == "batch entry 2")] | length' 2>/dev/null || echo "0")
@@ -281,15 +281,15 @@ fi
 # The test app has OTEL tracing enabled at startup. Every HTTP request creates
 # a span automatically (via otelhttp). The app also creates child spans.
 # We trigger a request, wait for the OTEL batcher to flush, then check the
-# supervisor's /v1/traces buffer via the mgmt proxy.
+# supervisor's /v1/traces buffer via the supervisor proxy.
 
-# Test 24: Make a request to trigger app spans, then verify via mgmt /enclave-traces.
-echo "[22/28] App trace spans via mgmt server"
+# Test 24: Make a request to trigger app spans, then verify via supervisor /enclave-traces.
+echo "[22/28] App trace spans via supervisor"
 # Make a request to the app — otelhttp creates a span, handleRoot creates a child.
 $CURL "${BASE_URL}/" >/dev/null 2>&1
 # OTEL batcher flushes every 5s by default. Wait for it.
 sleep 7
-SPAN_GET=$(curl -sf --max-time 10 "${MGMT_URL}/enclave-traces" 2>/dev/null || echo "[]")
+SPAN_GET=$(curl -sf --max-time 10 "${SUPERVISOR_URL}/enclave-traces" 2>/dev/null || echo "[]")
 SPAN_ROOT=$(echo "$SPAN_GET" | jq '[.[] | select(.name == "GET /" and .source == "app")] | length' 2>/dev/null || echo "0")
 SPAN_CHILD=$(echo "$SPAN_GET" | jq '[.[] | select(.name == "handleRoot.work" and .source == "app")] | length' 2>/dev/null || echo "0")
 SPAN_TOTAL=$(echo "$SPAN_GET" | jq 'length' 2>/dev/null || echo "0")
@@ -320,11 +320,11 @@ fi
 
 # --- Metrics tests ---
 
-# Test 27: Metric snapshot via mgmt server.
-echo "[25/28] Metric snapshot via mgmt server"
+# Test 27: Metric snapshot via supervisor.
+echo "[25/28] Metric snapshot via supervisor"
 # Wait for runtime collector + OTEL metric batcher to flush.
 sleep 7
-METRIC_GET=$(curl -s --max-time 10 "${MGMT_URL}/enclave-metrics" 2>/dev/null)
+METRIC_GET=$(curl -s --max-time 10 "${SUPERVISOR_URL}/enclave-metrics" 2>/dev/null)
 if [ -z "$METRIC_GET" ]; then METRIC_GET="{}"; fi
 HAS_SUPERVISOR=$(echo "$METRIC_GET" | jq 'has("supervisor")' 2>/dev/null || echo "false")
 HAS_RUNTIME=$(echo "$METRIC_GET" | jq 'has("runtime")' 2>/dev/null || echo "false")

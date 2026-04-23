@@ -7,16 +7,12 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: gomod
-    directory: /sdk
+    directory: /runtime
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
 
   - package-ecosystem: gomod
-    directory: /mgmt
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
 
   - package-ecosystem: github-actions
     directory: /

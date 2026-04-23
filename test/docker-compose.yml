@@ -17,7 +17,7 @@ services:
   kms-proxy:
     build:
       context: ../
-      dockerfile: cmd/local-kms-proxy/Dockerfile
+      dockerfile: test/local-kms-proxy/Dockerfile
     ports:
       - "4000:4000"
     environment:
@@ -48,7 +48,7 @@ services:
   mock-imds:
     build:
       context: ../
-      dockerfile: cmd/mock-imds/Dockerfile
+      dockerfile: test/mock-imds/Dockerfile
     ports:
       - "1338:1338"
     environment:
@@ -79,6 +79,6 @@ services:
         condition: service_healthy
     environment:
       SKIP_MOCK_SERVICES: "1"
-      # Must match enclave.yaml name — the SDK reads ENCLAVE_APP_NAME for SSM paths.
+      # Must match enclave.yaml name — the runtime reads ENCLAVE_APP_NAME for SSM paths.
       ENCLAVE_APP_NAME: "test-app"
     command: ["./run.sh", "app/enclave/artifacts/image.eif"]

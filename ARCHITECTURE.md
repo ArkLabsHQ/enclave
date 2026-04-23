@@ -14,7 +14,7 @@
 10. [Storage System](#10-storage-system-s3--aes-256-gcm)
 11. [Dynamic Secrets](#11-dynamic-secrets)
 12. [Management API](#12-management-api-inside-enclave)
-13. [Host Management Server](#13-host-management-server-enclave-mgmt)
+13. [Host Supervisor](#13-host-supervisor)
 14. [Admin Access](#14-admin-access-flow)
 15. [Migration Flow](#15-migration-flow)
 16. [External Client Verification](#16-external-client-verification)
@@ -47,7 +47,7 @@
                               │  │  ┌─────────────────────────────────────┐  │  │
                               │  │  │         HOST SERVICES               │  │  │
                               │  │  │                                     │  │  │
-                              │  │  │  enclave-mgmt (127.0.0.1:8443)     │  │  │
+                              │  │  │  supervisor (127.0.0.1:8443)     │  │  │
                               │  │  │  gvproxy (Docker, vsock://:1024)   │  │  │
                               │  │  │  vsock-proxy (8002↔IMDS)           │  │  │
                               │  │  │  enclave-watchdog (nitro-cli)      │  │  │
@@ -58,7 +58,7 @@
                               │  │  │                                     │  │  │
                               │  │  │  viproxy ──→ IMDS (127.0.0.1:80)  │  │  │
                               │  │  │  nitriding (TLS on :443)           │  │  │
-                              │  │  │    └─→ enclave-supervisor (:7073)  │  │  │
+                              │  │  │    └─→ runtime (:7073)  │  │  │
                               │  │  │          └─→ user-app (:7074)     │  │  │
                               │  │  │                                     │  │  │
                               │  │  │  NSM (Hardware Attestation)         │  │  │
@@ -83,7 +83,7 @@
 | **CLI** | Root Go module (`cmd/enclave/`) | `init`, `build`, `deploy`, `verify`, `start`, `stop`, `destroy` |
 | **Nix Flake** | `flake.nix` | Deterministic EIF build (supervisor + app + nitriding + viproxy) |
 | **CDK Stack** | `cdk.go` | AWS infrastructure (KMS, SSM, EC2, VPC, S3, IAM) |
-| **enclave-mgmt** | `mgmt/` | Host-side management API (migration, start/stop) |
+| **supervisor** | `supervisor/` | Host-side API (migration, start/stop) |
 | **SDK Supervisor** | `sdk/` | In-enclave orchestrator (secrets, attestation, storage, HTTP) |
 | **Nitriding** | Third-party (Brave) | TLS termination, attestation document serving |
 | **Viproxy** | Third-party (Brave) | IMDS proxy over vsock |
@@ -189,9 +189,9 @@ enclave build
     │   │
     │   ├─ Read BUILD_CONFIG_PATH → parse build-config.json
     │   │
-    │   ├─ Build enclave-supervisor (SDK)
+    │   ├─ Build runtime
     │   │   └─ Fetch SDK from GitHub at sdk.rev
-    │   │   └─ buildGoModule → sdk/cmd/enclave-supervisor binary
+    │   │   └─ buildGoModule → runtime/cmd/runtime binary
     │   │   └─ ldflags: -X sdk.Version={version}
     │   │
     │   ├─ Build upstream app (user's application)
@@ -204,7 +204,7 @@ enclave build
     │   ├─ Build viproxy (Brave) — IMDS proxy
     │   │
     │   ├─ Assemble /app directory (enclaveRootfs)
-    │   │   ├─ /app/enclave-supervisor
+    │   │   ├─ /app/runtime
     │   │   ├─ /app/{binary_name}
     │   │   ├─ /app/nitriding
     │   │   ├─ /app/viproxy
@@ -229,9 +229,9 @@ enclave build
     │      PCR2 = SHA384(app binary)    — application identity
     │
     └─ 7. Build management binary
-           go install github.com/ArkLabsHQ/introspector-enclave/mgmt@{SDK.Rev}
+           go install github.com/ArkLabsHQ/introspector-enclave/supervisor/cmd@{SDK.Rev}
            GOOS=linux GOARCH=amd64 CGO_ENABLED=0
-           Output: enclave/artifacts/enclave-mgmt
+           Output: enclave/artifacts/supervisor
 ```
 
 **Key insight**: `ENCLAVE_SECRETS_CONFIG` is a JSON string baked into the EIF at build time. It tells the supervisor which secrets to fetch at runtime:
@@ -307,7 +307,7 @@ CDK Stack: NitroIntrospectorStack
 │   ├─ enclave/artifacts/image.eif         ← the enclave image
 │   ├─ enclave/scripts/enclave_init.sh     ← enclave startup script
 │   ├─ enclave/systemd/*.service           ← 4 systemd unit files
-│   └─ enclave/artifacts/enclave-mgmt      ← management binary
+│   └─ enclave/artifacts/supervisor      ← management binary
 │
 ├─ EC2 Instance
 │   ├─ Amazon Linux 2023
@@ -348,14 +348,14 @@ EC2 Instance Launch
     │
     ├─ 2. DOWNLOAD ASSETS FROM S3
     │   ├─ /home/ec2-user/app/server/enclave.eif    ← pre-built EIF
-    │   ├─ /home/ec2-user/app/enclave-mgmt          ← management binary
+    │   ├─ /home/ec2-user/app/supervisor          ← management binary
     │   ├─ /home/ec2-user/app/enclave_init.sh       ← enclave startup script
     │   ├─ Pull gvproxy Docker image from ECR
     │   └─ /etc/systemd/system/:
     │       ├─ enclave-watchdog.service
     │       ├─ enclave-imds-proxy.service
     │       ├─ gvproxy.service
-    │       └─ enclave-mgmt.service
+    │       └─ supervisor.service
     │
     ├─ 3. WRITE ENVIRONMENT (/etc/environment)
     │   ├─ ENCLAVE_APP_NAME={appName}
@@ -374,7 +374,7 @@ EC2 Instance Launch
         ├─ systemctl enable --now enclave-watchdog
         ├─ systemctl enable --now enclave-imds-proxy
         ├─ systemctl enable --now gvproxy
-        └─ systemctl enable --now enclave-mgmt
+        └─ systemctl enable --now supervisor
 ```
 
 ---
@@ -421,10 +421,10 @@ Port forwarding (host ↔ enclave):
 vsock listen: vsock://:1024 (host side, enclave connects to CID 3:1024)
 ```
 
-### enclave-mgmt.service
+### supervisor.service
 ```
 Purpose: Host-side management API for admin operations
-Command: /home/ec2-user/app/enclave-mgmt
+Command: /home/ec2-user/app/supervisor
 Listen: 127.0.0.1:8443 (localhost only)
 Access: Only via SSM Session Manager (IAM-gated)
 ```
@@ -466,7 +466,7 @@ When `nitro-cli run-enclave` launches the EIF, the entrypoint `/app/start.sh` ex
              -intport 8080 \
              -prometheus-port 9090 \
              -appwebsrv http://127.0.0.1:7073 \
-             -appcmd "/app/enclave-supervisor"
+             -appcmd "/app/runtime"
 
            Nitriding then:
              a. Generates self-signed TLS certificate
@@ -772,7 +772,7 @@ cmd := exec.Command("/app/" + binaryName)
 cmd.Env = append(os.Environ(),
     "ENCLAVE_APP_PORT=" + appPort,            // port the app should listen on (default 7074)
     "PORT=" + appPort,                         // convenience alias
-    "ENCLAVE_MGMT_TOKEN=" + enc.MgmtToken(),  // bearer token for supervisor API calls
+    "ENCLAVE_RUNTIME_TOKEN=" + enc.RuntimeToken(),  // bearer token for supervisor API calls
 )
 cmd.Stdout = os.Stdout
 cmd.Stderr = os.Stderr
@@ -795,7 +795,7 @@ case err := <-waitCh:
 
 ---
 
-### User App ↔ Supervisor Communication (ENCLAVE_MGMT_TOKEN)
+### User App ↔ Supervisor Communication (ENCLAVE_RUNTIME_TOKEN)
 
 The user app runs as a child process of the supervisor, both inside the same enclave. The supervisor exposes management APIs (storage, dynamic secrets) that the user app needs to call. Access is gated by a **bearer token** that is auto-generated at boot and passed to the app via environment variable.
 
@@ -806,14 +806,14 @@ Supervisor boot (sdk.New())
     │
     ├─ 1. Generate 32 random bytes (crypto/rand)
     │      token := hex.EncodeToString(randomBytes)  // 64 hex chars
-    │      Stored in: e.mgmtToken (in-memory only, never persisted)
+    │      Stored in: e.runtimeToken (in-memory only, never persisted)
     │
     ├─ 2. Supervisor starts HTTP server on :7073
     │      Management endpoints check this token on every request
     │
     └─ 3. Spawn user app with token in environment
            child.Env = append(os.Environ(),
-               "ENCLAVE_MGMT_TOKEN=" + enc.MgmtToken(),
+               "ENCLAVE_RUNTIME_TOKEN=" + enc.RuntimeToken(),
            )
            // Only the user app (child process) receives this token
            // It never leaves the enclave
@@ -821,20 +821,20 @@ Supervisor boot (sdk.New())
 
 #### How the User App Uses the Token
 
-The user app reads `ENCLAVE_MGMT_TOKEN` from its environment and includes it as a Bearer token in HTTP requests to the supervisor (localhost:7073):
+The user app reads `ENCLAVE_RUNTIME_TOKEN` from its environment and includes it as a Bearer token in HTTP requests to the supervisor (localhost:7073):
 
 ```
 User App                                    Supervisor (:7073)
    │                                              │
    │  PUT /v1/secrets/my-key                      │
-   │  Authorization: Bearer <ENCLAVE_MGMT_TOKEN>  │
+   │  Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>  │
    │  {"env_var":"MY_KEY","value":"secret123"}     │
    │ ────────────────────────────────────────────→ │
    │                                              │
    │  ← 201 {"name":"my-key","status":"stored"}   │
    │                                              │
    │  GET /v1/storage/cache/user/42               │
-   │  Authorization: Bearer <ENCLAVE_MGMT_TOKEN>  │
+   │  Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>  │
    │ ────────────────────────────────────────────→ │
    │                                              │
    │  ← 200 <decrypted bytes>                     │
@@ -844,9 +844,9 @@ User App                                    Supervisor (:7073)
 Example from the test app (`test/app/cmd/main.go`):
 
 ```go
-token := os.Getenv("ENCLAVE_MGMT_TOKEN")
+token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 if token == "" {
-    http.Error(w, `{"error":"ENCLAVE_MGMT_TOKEN not set"}`, 500)
+    http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, 500)
     return
 }
 
@@ -860,15 +860,15 @@ resp, _ := http.DefaultClient.Do(req)
 The supervisor validates the token on every protected request:
 
 ```
-checkMgmtToken(request)
+checkRuntimeToken(request)
     │
-    ├─ If e.mgmtToken == "" → ALLOW (backwards compat, no token configured)
+    ├─ If e.runtimeToken == "" → ALLOW (backwards compat, no token configured)
     │
     ├─ If Authorization header missing → 401 Unauthorized
     │
     ├─ If not "Bearer " prefix → 401 Unauthorized
     │
-    ├─ If token != e.mgmtToken → 403 Forbidden
+    ├─ If token != e.runtimeToken → 403 Forbidden
     │
     └─ Token matches → ALLOW
 ```
@@ -1163,7 +1163,7 @@ Encrypted content (DynamicSecret):
 #### Create/Update: `PUT /v1/secrets/{name}`
 
 ```
-Authorization: Bearer {ENCLAVE_MGMT_TOKEN}  (required if token is set)
+Authorization: Bearer {ENCLAVE_RUNTIME_TOKEN}  (required if token is set)
 
 Request body:
 {
@@ -1244,7 +1244,7 @@ On supervisor init, all dynamic secrets are loaded from storage:
 2. Count them → set dynamicSecretsCount
 3. (Values are NOT loaded into env vars automatically at boot)
 4. The user app must call GET /v1/secrets/{name} to retrieve values
-   using the ENCLAVE_MGMT_TOKEN for authentication
+   using the ENCLAVE_RUNTIME_TOKEN for authentication
 ```
 
 ---
@@ -1321,14 +1321,14 @@ Dynamic secrets CRUD. See [Section 11](#11-dynamic-secrets).
 
 ---
 
-## 13. Host Management Server (enclave-mgmt)
+## 13. Host Supervisor
 
-The `enclave-mgmt` binary runs on the EC2 host (NOT inside the enclave). It provides administrative operations.
+The `supervisor` binary runs on the EC2 host (NOT inside the enclave). It provides administrative operations.
 
 ```
 Listen: 127.0.0.1:8443 (localhost only)
 Access: AWS SSM Session Manager → port forwarding or shell
-Binary: /home/ec2-user/app/enclave-mgmt
+Binary: /home/ec2-user/app/supervisor
 ```
 
 ### Endpoints
@@ -1402,7 +1402,7 @@ Aborts an in-progress migration:
 │      --parameters portNumber=8443           │
 │    Then: curl http://localhost:8443/migrate  │
 │                                             │
-│  enclave-mgmt (127.0.0.1:8443)             │
+│  supervisor (127.0.0.1:8443)             │
 │       │                                     │
 │       ├─ systemctl start/stop enclave       │
 │       ├─ nitro-cli describe-enclaves        │
@@ -1444,10 +1444,10 @@ Migration is required when the enclave code changes (producing a new PCR0), beca
 
 ### Detailed Phase-by-Phase Flow
 
-#### Phase 1: Preparation (enclave-mgmt on host)
+#### Phase 1: Preparation (supervisor on host)
 
 ```
-Admin → POST /migrate → enclave-mgmt
+Admin → POST /migrate → supervisor
     │
     ├─ 1. Create NEW KMS key
     │      kms.CreateKey({ Description: "Migration key for {appName}" })
@@ -1464,7 +1464,7 @@ Admin → POST /migrate → enclave-mgmt
 #### Phase 2: Export (old enclave)
 
 ```
-enclave-mgmt → POST /v1/export-key → old enclave (via gvproxy)
+supervisor → POST /v1/export-key → old enclave (via gvproxy)
     │
     │  Request body:
     │  { "migration_key_id": "arn:aws:kms:...:key/new-key-id" }
@@ -1514,10 +1514,10 @@ enclave-mgmt → POST /v1/export-key → old enclave (via gvproxy)
                }
 ```
 
-#### Phase 3: Build & Deploy (enclave-mgmt on host)
+#### Phase 3: Build & Deploy (supervisor on host)
 
 ```
-enclave-mgmt orchestrates:
+supervisor orchestrates:
     │
     ├─ 1. Build new EIF (with updated code)
     │      New code → different binary → different PCR0
@@ -1810,7 +1810,7 @@ After initDone:  ALL responses are signed
 │  │     s3.{region}.amazonaws.com:443                             │    │
 │  └──────────────────────────────────────────────────────────────┘    │
 │                                                                      │
-│  enclave-mgmt ─── 127.0.0.1:8443 ←── SSM Session Manager           │
+│  supervisor ─── 127.0.0.1:8443 ←── SSM Session Manager           │
 │                                                                      │
 ├──────────────────────────────────────────────────────────────────────┤
 │                    NITRO ENCLAVE (CID 16)                            │
@@ -1867,7 +1867,7 @@ SDK AWS client → DNS (192.168.127.1 gvproxy) → gvproxy TAP
 **Admin → Management**:
 ```
 Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
-    → enclave-mgmt → (for enclave calls) gvproxy:7073 → supervisor:7073
+    → supervisor → (for enclave calls) gvproxy:7073 → supervisor:7073
 ```
 
 ---
@@ -1877,7 +1877,7 @@ Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
 ```
 1. INIT        enclave init → scaffold project (17 files + enclave.yaml)
 2. CONFIGURE   Edit enclave.yaml (secrets, app coordinates, SDK version)
-3. BUILD       enclave build → Nix → EIF (image.eif) + PCR values + mgmt binary
+3. BUILD       enclave build → Nix → EIF (image.eif) + PCR values + supervisor binary
 4. DEPLOY      enclave deploy → CDK → AWS resources + EC2 instance
 5. BOOTSTRAP   EC2 user_data → install packages, download assets, start services
 6. BOOT        nitro-cli run-enclave → start.sh → viproxy → nitriding → supervisor

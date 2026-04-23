@@ -19,11 +19,11 @@ jobs:
       - name: Go vet (root)
         run: go vet ./...
 
-      - name: Go vet (sdk)
-        run: cd sdk && go vet ./...
+      - name: Go vet (runtime)
+        run: cd runtime && go vet ./...
 
-      - name: Go vet (mgmt)
-        run: cd mgmt && go vet ./...
+      - name: Go vet (supervisor)
+        run: cd supervisor/cmd && go vet ./...
 
       - name: golangci-lint (root)
         uses: golangci/golangci-lint-action@v9
@@ -31,14 +31,14 @@ jobs:
           version: latest
           working-directory: .
 
-      - name: golangci-lint (sdk)
+      - name: golangci-lint (runtime)
         uses: golangci/golangci-lint-action@v9
         with:
           version: latest
-          working-directory: sdk
+          working-directory: runtime
 
-      - name: golangci-lint (mgmt)
+      - name: golangci-lint (supervisor)
         uses: golangci/golangci-lint-action@v9
         with:
           version: latest
-          working-directory: mgmt
+          working-directory: supervisor

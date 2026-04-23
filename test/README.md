@@ -97,7 +97,7 @@ Started via `docker compose up -d`:
 
 ```
 QEMU enclave (192.168.127.2)
-  |-- start.sh: launches viproxy, nitriding, enclave-supervisor
+  |-- start.sh: launches viproxy, nitriding, runtime
   |-- nitriding: sets up TAP via gvproxy, TLS on :443
   |-- DNS: 192.168.127.1 (gvproxy gateway)
   |-- vsock CID 3:1024 -> gvproxy on host

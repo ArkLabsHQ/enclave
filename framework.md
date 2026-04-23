@@ -32,7 +32,7 @@ The framework provides an **irreversible security guarantee**: once a KMS key is
 │  └──────────────────┬───────────────────────────┘            │
 │                     │                                        │
 │  ┌──────────────────▼───────────────────────────┐            │
-│  │  enclave-supervisor (SDK runtime)             │            │
+│  │  runtime             │            │
 │  │  • Secret loading (KMS + attestation)         │            │
 │  │  • Response signing (Schnorr BIP-340)         │            │
 │  │  • PCR management                            │            │
@@ -199,7 +199,7 @@ Each enclave records its predecessor's PCR0 and the hardware-signed attestation 
 
 ---
 
-## SDK Runtime (enclave-supervisor)
+## Runtime
 
 The supervisor is the main process inside the enclave. It:
 
@@ -252,7 +252,7 @@ The Nix flake (`flake.nix`) pins every dependency:
 | Component | Source |
 |-----------|--------|
 | **User app** | Fetched from GitHub at pinned commit + Nix hash |
-| **enclave-supervisor** | Fetched from GitHub at pinned SDK rev + hash |
+| **runtime** | Fetched from GitHub at pinned runtime rev + hash |
 | **nitriding** | Brave's TLS terminator at pinned commit |
 | **viproxy** | Brave's vsock proxy at pinned version |
 | **Base image** | busybox + CA certificates |

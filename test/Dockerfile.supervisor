@@ -1,0 +1,9 @@
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /supervisor ./supervisor/cmd/supervisor
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /supervisor /usr/local/bin/
+ENTRYPOINT ["supervisor"]

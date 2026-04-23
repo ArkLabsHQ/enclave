@@ -94,7 +94,7 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
-  # SSM: KMSKeyID needs read+write (mgmt server updates it during migration).
+  # SSM: KMSKeyID needs read+write (supervisor updates it during migration).
   statement {
     sid     = "SSMKMSKeyID"
     actions = ["ssm:GetParameter", "ssm:PutParameter"]

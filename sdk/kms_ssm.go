@@ -340,12 +340,6 @@ func loadCiphertextFromSSM(ctx context.Context, ssmClient *ssm.Client, paramName
 	return value, nil
 }
 
-// getSecretSSMParamName returns the SSM parameter name for a secret's ciphertext
-// in primary storage.
-func getSecretSSMParamName(secretName string) string {
-	return getSecretSSMParamNameWithPrefix(secretName, "")
-}
-
 // getSecretSSMParamNameWithPrefix returns the SSM parameter name for a secret's
 // ciphertext. Pass "" for primary storage, "Migration/" for migration staging.
 func getSecretSSMParamNameWithPrefix(secretName, prefix string) string {

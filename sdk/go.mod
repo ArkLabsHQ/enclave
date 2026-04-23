@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.68.0
-	github.com/aws/aws-sdk-go-v2/service/kms v1.49.5
+	github.com/aws/aws-sdk-go-v2/service/kms v1.50.4
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.3
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.56.4
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.9

@@ -174,13 +174,13 @@ func (c *Config) validateAccount() error {
 // that build the EIF (build, deploy), not for status/verify/destroy/lock.
 func (c *Config) validateRuntime() error {
 	if c.Runtime.Rev == "" {
-		return fmt.Errorf("%s: 'sdk.rev' is required (SDK commit SHA)", configFile)
+		return fmt.Errorf("%s: 'runtime.rev' is required (runtime commit SHA)", configFile)
 	}
 	if c.Runtime.Hash == "" {
-		return fmt.Errorf("%s: 'sdk.hash' is required (Nix source hash)", configFile)
+		return fmt.Errorf("%s: 'runtime.hash' is required (Nix source hash)", configFile)
 	}
 	if c.Runtime.VendorHash == "" {
-		return fmt.Errorf("%s: 'sdk.vendor_hash' is required (Go vendor hash)", configFile)
+		return fmt.Errorf("%s: 'runtime.vendor_hash' is required (Go vendor hash)", configFile)
 	}
 	return nil
 }

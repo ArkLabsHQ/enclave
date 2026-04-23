@@ -229,7 +229,7 @@ enclave build
     │      PCR2 = SHA384(app binary)    — application identity
     │
     └─ 7. Build management binary
-           go install github.com/ArkLabsHQ/introspector-enclave/supervisor/cmd@{SDK.Rev}
+           go install github.com/ArkLabsHQ/introspector-enclave/supervisor/cmd/supervisor@{Runtime.Rev}
            GOOS=linux GOARCH=amd64 CGO_ENABLED=0
            Output: enclave/artifacts/supervisor
 ```

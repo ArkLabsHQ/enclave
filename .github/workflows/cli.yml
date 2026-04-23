@@ -48,7 +48,7 @@ jobs:
             commit2_full: "078232572efba4f95543d0c7c84c0f47a3782955"
             commit2_hash: "sha256-xuWFL/Lr4vi8n/A61bhyAfa+HrwJvLFrgt0rFEWBFcw="
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v5
         with:

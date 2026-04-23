@@ -477,8 +477,15 @@ func classifyBootRole(migrationInProgress bool, ownPCR0, migrationTargetPCR0 str
 // MigrationPreviousPCR0 is safe because expectedPreviousPCR0 is baked into
 // the EIF and bound to our own PCR0 measurement.
 func abortOrphanedMigration(ctx context.Context, expectedPreviousPCR0 string) error {
-	if err := clearMigrationKMSKeyID(ctx); err != nil {
-		return fmt.Errorf("clear MigrationKMSKeyID: %w", err)
+	// Restore + tidy first, clear the "in-progress" flag LAST. This mirrors the
+	// new-enclave commit (primary writes → clear MigrationKMSKeyID last) so a
+	// crash mid-abort leaves MigrationKMSKeyID set, and the next boot re-enters
+	// the abort path via the classifier — no stuck state.
+	if err := putMigrationPreviousPCR0(ctx, expectedPreviousPCR0); err != nil {
+		return fmt.Errorf("restore MigrationPreviousPCR0: %w", err)
+	}
+	if err := clearMigrationPreviousPCR0Attestation(ctx); err != nil {
+		return fmt.Errorf("clear MigrationPreviousPCR0Attestation: %w", err)
 	}
 	if err := clearMigrationOldKMSKeyID(ctx); err != nil {
 		return fmt.Errorf("clear MigrationOldKMSKeyID: %w", err)
@@ -486,11 +493,9 @@ func abortOrphanedMigration(ctx context.Context, expectedPreviousPCR0 string) er
 	if err := clearMigrationTargetPCR0(ctx); err != nil {
 		return fmt.Errorf("clear MigrationTargetPCR0: %w", err)
 	}
-	if err := clearMigrationPreviousPCR0Attestation(ctx); err != nil {
-		return fmt.Errorf("clear MigrationPreviousPCR0Attestation: %w", err)
-	}
-	if err := putMigrationPreviousPCR0(ctx, expectedPreviousPCR0); err != nil {
-		return fmt.Errorf("restore MigrationPreviousPCR0: %w", err)
+	// Atomic abort commit — clearing this flips future boots out of the abort path.
+	if err := clearMigrationKMSKeyID(ctx); err != nil {
+		return fmt.Errorf("clear MigrationKMSKeyID: %w", err)
 	}
 	return nil
 }

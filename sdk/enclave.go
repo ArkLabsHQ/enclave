@@ -352,10 +352,12 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 
 // Middleware returns an http.Handler that signs all responses with the
 // ephemeral attestation key using BIP-340 Schnorr signatures.
-// Before init completes, responses pass through unsigned.
+// Responses pass through unsigned until Init completes successfully; a
+// failed Init leaves the enclave in a half-initialised state where signing
+// would be misleading, so we gate on initOK (matches IsReady / /health).
 func (e *Enclave) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !e.initDone.Load() || e.attestationKey == nil {
+		if !e.initOK.Load() || e.attestationKey == nil {
 			next.ServeHTTP(w, r)
 			return
 		}

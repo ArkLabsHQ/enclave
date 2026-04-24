@@ -49,8 +49,8 @@
             # vsock bridge: connects QEMU guest vsock to host Unix sockets.
             vhost-device-vsock
 
-            # gvproxy: outbound networking for the enclave via TAP over vsock.
-            pkgs.gvproxy
+            # gvproxy + IMDS vsock forwarder are embedded in the supervisor
+            # binary (supervisor/gvproxy.go, supervisor/imds_proxy.go).
 
             # Node.js for CDK synthesis (jsii) and cdklocal.
             pkgs.nodejs_20
@@ -66,12 +66,11 @@
             echo "Enclave test dev shell"
             echo "  QEMU:               $(qemu-system-x86_64 --version | head -1)"
             echo "  vhost-device-vsock:  ${vhost-device-vsock.version}"
-            echo "  gvproxy:             $(gvproxy --version 2>&1 | head -1 || echo 'available')"
             echo ""
             echo "Usage:"
-            echo "  ./run.sh <path-to-eif>     Run full test suite"
-            echo "  ./boot-qemu.sh <path-to-eif>  Boot enclave in QEMU"
-            echo "  ./integration-test.sh      Run integration tests against running enclave"
+            echo "  ./run.sh <path-to-eif>         Run full test suite"
+            echo "  ./run.sh --boot-only <eif>     Boot enclave in QEMU (launcher-shim)"
+            echo "  ./integration-test.sh          Run integration tests against running enclave"
           '';
         };
       }

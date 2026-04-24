@@ -24,6 +24,35 @@ import (
 const eifPath = "/home/ec2-user/app/server/enclave.eif"
 const supervisorBinaryPath = "/home/ec2-user/app/supervisor"
 
+// lifecycleStop terminates the enclave. If overrideCmd is non-empty (QEMU
+// test harness override via ENCLAVE_STOP_CMD) it's run as a shell command;
+// otherwise the in-process watchdog is asked to stop. Either way, the
+// watchdog's stopped latch is set so the poll loop doesn't race the caller.
+func (s *server) lifecycleStop(ctx context.Context, overrideCmd string) error {
+	if overrideCmd != "" {
+		s.watchdog.SetStopped(true)
+		out, err := exec.CommandContext(ctx, "sh", "-c", overrideCmd).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		return nil
+	}
+	return s.watchdog.StopOnce(ctx)
+}
+
+// lifecycleStart launches the enclave. Same override semantics as lifecycleStop.
+func (s *server) lifecycleStart(ctx context.Context, overrideCmd string) error {
+	if overrideCmd != "" {
+		out, err := exec.CommandContext(ctx, "sh", "-c", overrideCmd).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		s.watchdog.SetStopped(false)
+		return nil
+	}
+	return s.watchdog.StartOnce(ctx)
+}
+
 type migrateRequest struct {
 	EIFBucket        string   `json:"eif_bucket"`
 	EIFKey           string   `json:"eif_key"`
@@ -269,8 +298,11 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	// succeeds (commit) or fails (we rollback by restoring the backup EIF).
 	eifDest := envOrDefault("ENCLAVE_EIF_PATH", eifPath)
 	eifBackup := eifDest + ".backup"
-	stopCmd := envOrDefault("ENCLAVE_STOP_CMD", "systemctl stop enclave-watchdog")
-	startCmd := envOrDefault("ENCLAVE_START_CMD", "systemctl start enclave-watchdog")
+	// ENCLAVE_STOP_CMD / ENCLAVE_START_CMD let the QEMU test harness swap out
+	// nitro-cli for its own boot scripts (see test/run.sh). When unset, drive
+	// the in-process watchdog directly.
+	stopCmd := os.Getenv("ENCLAVE_STOP_CMD")
+	startCmd := os.Getenv("ENCLAVE_START_CMD")
 
 	emit(7, "progress", "Backing up old EIF...")
 	if err := copyFile(eifDest, eifBackup); err != nil {
@@ -289,9 +321,9 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 8: Stop old enclave, swap EIF, start new enclave.
-	emit(8, "progress", fmt.Sprintf("Stopping old enclave (%s)...", stopCmd))
-	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
-		slog.Warn("stop command failed", "output", string(out), "error", err)
+	emit(8, "progress", "Stopping old enclave...")
+	if err := s.lifecycleStop(ctx, stopCmd); err != nil {
+		slog.Warn("stop command failed", "error", err)
 		emit(8, "progress", fmt.Sprintf("Stop returned error (continuing): %v", err))
 	}
 
@@ -300,16 +332,16 @@ func (s *server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		if cpErr := copyFile(tmpEIF, eifDest); cpErr != nil {
 			// Restore backup since we've already stopped the old enclave.
 			_ = os.Rename(eifBackup, eifDest)
-			_, _ = exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput()
+			_ = s.lifecycleStart(ctx, startCmd)
 			rollbackKey()
 			emitErr(8, fmt.Sprintf("replace EIF: %v", cpErr))
 			return
 		}
 	}
 
-	emit(8, "progress", fmt.Sprintf("Starting new enclave (%s)...", startCmd))
-	if out, err := exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput(); err != nil {
-		emitErr(8, fmt.Sprintf("start enclave: %v: %s", err, out))
+	emit(8, "progress", "Starting new enclave...")
+	if err := s.lifecycleStart(ctx, startCmd); err != nil {
+		emitErr(8, fmt.Sprintf("start enclave: %v", err))
 		s.rollbackMigration(ctx, eifDest, eifBackup, stopCmd, startCmd, newKMSKeyID, emit)
 		return
 	}
@@ -419,9 +451,9 @@ func (s *server) rollbackMigration(ctx context.Context, eifDest, eifBackup, stop
 	emit(9, "rollback", "Initiating rollback...")
 
 	// Stop failed new enclave.
-	emit(9, "rollback", fmt.Sprintf("Stopping failed new enclave (%s)...", stopCmd))
-	if out, err := exec.CommandContext(ctx, "sh", "-c", stopCmd).CombinedOutput(); err != nil {
-		slog.Warn("rollback stop failed", "output", string(out), "error", err)
+	emit(9, "rollback", "Stopping failed new enclave...")
+	if err := s.lifecycleStop(ctx, stopCmd); err != nil {
+		slog.Warn("rollback stop failed", "error", err)
 	}
 
 	// Restore EIF backup.
@@ -434,9 +466,9 @@ func (s *server) rollbackMigration(ctx context.Context, eifDest, eifBackup, stop
 		_ = os.Remove(eifBackup)
 	}
 
-	emit(9, "rollback", fmt.Sprintf("Starting old enclave (%s)...", startCmd))
-	if out, err := exec.CommandContext(ctx, "sh", "-c", startCmd).CombinedOutput(); err != nil {
-		emit(9, "rollback", fmt.Sprintf("CRITICAL: failed to start old enclave: %v: %s", err, out))
+	emit(9, "rollback", "Starting old enclave...")
+	if err := s.lifecycleStart(ctx, startCmd); err != nil {
+		emit(9, "rollback", fmt.Sprintf("CRITICAL: failed to start old enclave: %v", err))
 		return
 	}
 

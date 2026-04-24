@@ -16,7 +16,7 @@
 - IMDS proxy not reachable (enclave can't get AWS credentials)
 
 **Fix**:
-1. Check supervisor logs: `journalctl -u enclave-watchdog`
+1. Check supervisor logs: `journalctl -u enclave-supervisor`
 2. Verify the KMS key policy allows Decrypt for the EC2 role with the current PCR0
 3. Verify IMDS is accessible: the enclave uses viproxy to reach the host's IMDS endpoint
 
@@ -24,7 +24,7 @@
 
 **Cause**: nitriding rejected the attestation key hash registration. This happens if the hash was already set (nitriding only accepts one hash registration per boot).
 
-**Fix**: This usually means the supervisor restarted without the enclave restarting. Restart the full enclave: `systemctl restart enclave-watchdog`.
+**Fix**: This usually means the supervisor restarted without the enclave restarting. Restart the full stack: `systemctl restart enclave-supervisor`.
 
 ### `migration already in progress`
 
@@ -44,22 +44,21 @@
 
 | Component | Location | Command |
 |-----------|----------|---------|
-| Enclave supervisor | systemd journal | `journalctl -u enclave-watchdog -f` |
-| Management server | systemd journal | `journalctl -u supervisor -f` |
-| nitriding (TLS proxy) | Inside enclave, stdout | Appears in supervisor logs |
+| Host supervisor (gvproxy, IMDS, lifecycle, management API) | systemd journal | `journalctl -u enclave-supervisor -f` |
+| In-enclave runtime (nitriding, app, runtime binary) | `GET /enclave-logs` via supervisor | Appears in supervisor's CloudWatch stream |
 | CDK deploy | Terminal output | Check `cdk-outputs.json` for stack outputs |
 
 All logs are JSON-structured. Use `jq` to filter:
 
 ```bash
 # Show only errors
-journalctl -u enclave-watchdog -o cat | jq 'select(.level == "ERROR")'
+journalctl -u enclave-supervisor -o cat | jq 'select(.level == "ERROR")'
 
 # Show KMS operations
-journalctl -u enclave-watchdog -o cat | jq 'select(.msg | contains("KMS"))'
+journalctl -u enclave-supervisor -o cat | jq 'select(.msg | contains("KMS"))'
 
 # Show HTTP requests slower than 1 second
-journalctl -u enclave-watchdog -o cat | jq 'select(.duration_ms > 1000)'
+journalctl -u enclave-supervisor -o cat | jq 'select(.duration_ms > 1000)'
 ```
 
 ## Debug Procedures

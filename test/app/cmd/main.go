@@ -807,26 +807,49 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
-	// Total 68 bytes. appKeyHash (our attestation pubkey hash) is at bytes 36:68.
+	// UserData format (nitriding v1.4.2):
+	//   "sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
+	// Total 79 bytes. appKeyHash at bytes 47:79.
 	results["user_data"] = hex.EncodeToString(doc.UserData)
 	results["user_data_length"] = len(doc.UserData)
 
-	if len(doc.UserData) < 68 {
-		results["error"] = fmt.Sprintf("UserData too short: %d bytes (need 68)", len(doc.UserData))
+	const (
+		hashPrefix = "sha256:"
+		hashSep    = ";"
+		tlsStart   = len(hashPrefix)
+		tlsEnd     = tlsStart + 32
+		sepStart   = tlsEnd
+		appPrefix  = sepStart + len(hashSep)
+		appStart   = appPrefix + len(hashPrefix)
+		appEnd     = appStart + 32
+	)
+
+	if len(doc.UserData) < appEnd {
+		results["error"] = fmt.Sprintf("UserData too short: %d bytes (need %d)", len(doc.UserData), appEnd)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	if !bytes.Equal(doc.UserData[:tlsStart], []byte(hashPrefix)) {
+		results["error"] = fmt.Sprintf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(doc.UserData[:tlsStart]))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	if string(doc.UserData[sepStart:appPrefix]) != hashSep {
+		results["error"] = fmt.Sprintf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(doc.UserData[sepStart:appPrefix]))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+	if !bytes.Equal(doc.UserData[appPrefix:appStart], []byte(hashPrefix)) {
+		results["error"] = fmt.Sprintf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(doc.UserData[appPrefix:appStart]))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
 
-	if doc.UserData[34] != 0x12 || doc.UserData[35] != 0x20 {
-		results["error"] = fmt.Sprintf("UserData missing multihash prefix at offset 34 (got %02x %02x)", doc.UserData[34], doc.UserData[35])
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
-	}
-
-	appKeyHash := doc.UserData[36:68]
+	appKeyHash := doc.UserData[appStart:appEnd]
 	results["app_key_hash"] = hex.EncodeToString(appKeyHash)
 
 	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal appKeyHash.

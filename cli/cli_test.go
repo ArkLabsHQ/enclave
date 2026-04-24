@@ -53,21 +53,23 @@ func TestCLI_Init(t *testing.T) {
 
 			// Verify critical framework files.
 			for _, f := range []string{
-				"flake.nix",
-				"enclave/start.sh",
-				"enclave/scripts/enclave_init.sh",
+				"enclave/flake.nix",
 				"enclave/tofu/modules/enclave/kms.tf",
+				"enclave/tofu/modules/enclave/templates/user_data.sh.tftpl",
 			} {
 				if _, err := os.Stat(filepath.Join(dir, f)); os.IsNotExist(err) {
 					t.Errorf("missing: %s", f)
 				}
 			}
-
-			// Verify start.sh has NSM entropy seeding.
-			startSh, _ := os.ReadFile(filepath.Join(dir, "enclave", "start.sh"))
-			if !strings.Contains(string(startSh), "/dev/nsm") {
-				t.Error("start.sh missing NSM entropy seeding")
+			// flake.nix at repo root must NOT exist post-refactor.
+			if _, err := os.Stat(filepath.Join(dir, "flake.nix")); err == nil {
+				t.Error("flake.nix found at repo root; should be under enclave/")
 			}
+
+			// enclave/start.sh is intentionally absent — entropy seeding is
+			// handled inside the runtime binary (vendored nitriding init()).
+			// enclave/systemd/ is intentionally absent — the supervisor systemd
+			// unit is inlined into user_data.sh.tftpl (deployment-owned).
 
 			// Verify kms.tf has destroy provisioner.
 			kmsTf, _ := os.ReadFile(filepath.Join(dir, "enclave", "tofu", "modules", "enclave", "kms.tf"))
@@ -129,11 +131,10 @@ func TestCLI_Build(t *testing.T) {
 
 	// Verify artifacts were created.
 	for _, artifact := range []string{
-		"enclave/artifacts/image.eif",
-		"enclave/artifacts/pcr.json",
-		"enclave/artifacts/supervisor",
-		"enclave/artifacts/gvproxy",
-		"enclave/build-config.json",
+		".enclave/artifacts/image.eif",
+		".enclave/artifacts/pcr.json",
+		".enclave/artifacts/supervisor",
+		".enclave/build-config.json",
 		"enclave/tofu/terraform.tfvars.json",
 	} {
 		if _, err := os.Stat(filepath.Join(dir, artifact)); os.IsNotExist(err) {

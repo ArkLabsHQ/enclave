@@ -502,17 +502,17 @@ func buildAndExtractPCR0(repoPath, version, region string) (string, error) {
 		region = "us-east-1"
 	}
 
-	configPath := filepath.Join(absRepo, "enclave", "build-config.json")
+	configPath := filepath.Join(absRepo, ".enclave", "build-config.json")
 	absConfigPath, _ := filepath.Abs(configPath)
 
-	ensureGitTracked(absRepo, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+	ensureGitTracked(absRepo, "enclave/flake.nix", "enclave/enclave.yaml")
 
 	nixCmd := exec.Command("nix", "build",
 		"--impure",
 		"--extra-experimental-features", "nix-command flakes",
 		"--option", "download-attempts", "3",
-		"--out-link", "flake_result",
-		".#eif",
+		"--out-link", ".enclave/result",
+		"./enclave#eif",
 	)
 	nixCmd.Dir = absRepo
 	nixCmd.Stdout = os.Stdout
@@ -527,14 +527,14 @@ func buildAndExtractPCR0(repoPath, version, region string) (string, error) {
 		return "", fmt.Errorf("nix build failed: %w", err)
 	}
 
-	// Copy artifacts from flake_result.
-	resultLink := filepath.Join(absRepo, "flake_result")
+	// Copy artifacts from .enclave/result/.
+	resultLink := filepath.Join(absRepo, ".enclave", "result")
 	for _, name := range []string{"image.eif", "pcr.json"} {
 		src := filepath.Join(resultLink, name)
 		dst := filepath.Join(resultPath, name)
 		data, err := os.ReadFile(src)
 		if err != nil {
-			return "", fmt.Errorf("read flake_result/%s: %w", name, err)
+			return "", fmt.Errorf("read .enclave/result/%s: %w", name, err)
 		}
 		if err := os.WriteFile(dst, data, 0644); err != nil {
 			return "", fmt.Errorf("write artifacts/%s: %w", name, err)

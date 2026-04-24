@@ -21,24 +21,15 @@ type tofuVars struct {
 	PreviousPCR0      string         `json:"previous_pcr0"`
 	ExpectedPCR0      string         `json:"expected_pcr0,omitempty"`
 
-	// GitHub Release coordinates for build artifacts (EIF, supervisor, gvproxy).
+	// GitHub Release coordinates for build artifacts (EIF, supervisor).
 	GithubOwner string `json:"github_owner"`
 	GithubRepo  string `json:"github_repo"`
 	ReleaseTag  string `json:"release_tag"`
 	GithubToken string `json:"github_token,omitempty"`
 
 	// Local artifact overrides (skip GitHub download when set).
-	EIFPath           string `json:"eif_path,omitempty"`
-	SupervisorBinaryPath    string `json:"supervisor_binary_path,omitempty"`
-	GvproxyBinaryPath string `json:"gvproxy_binary_path,omitempty"`
-
-	// Local asset file paths (scripts, systemd units — scaffolded by enclave init).
-	EnclaveInitScriptPath string `json:"enclave_init_script_path"`
-	WatchdogServicePath   string `json:"watchdog_service_path"`
-	IMDSProxyServicePath  string `json:"imds_proxy_service_path"`
-	GvproxyServicePath     string `json:"gvproxy_service_path"`
-	GvproxyStartScriptPath string `json:"gvproxy_start_script_path"`
-	SupervisorServicePath        string `json:"supervisor_service_path"`
+	EIFPath              string `json:"eif_path,omitempty"`
+	SupervisorBinaryPath string `json:"supervisor_binary_path,omitempty"`
 }
 
 // tofuDir returns the absolute path to the enclave/tofu/ directory.
@@ -70,16 +61,8 @@ func writeTofuVars(cfg *Config, root string) error {
 		ReleaseTag:  "eif-latest",
 
 		// CLI builds artifacts locally — use local paths, skip GitHub download.
-		EIFPath:           filepath.Join(absRoot, "enclave", "artifacts", "image.eif"),
-		SupervisorBinaryPath:    filepath.Join(absRoot, "enclave", "artifacts", "supervisor"),
-		GvproxyBinaryPath: filepath.Join(absRoot, "enclave", "artifacts", "gvproxy"),
-
-		EnclaveInitScriptPath: filepath.Join(absRoot, "enclave", "scripts", "enclave_init.sh"),
-		WatchdogServicePath:   filepath.Join(absRoot, "enclave", "systemd", "enclave-watchdog.service"),
-		IMDSProxyServicePath:  filepath.Join(absRoot, "enclave", "systemd", "enclave-imds-proxy.service"),
-		GvproxyServicePath:     filepath.Join(absRoot, "enclave", "systemd", "gvproxy.service"),
-		GvproxyStartScriptPath: filepath.Join(absRoot, "enclave", "gvproxy", "start.sh"),
-		SupervisorServicePath:        filepath.Join(absRoot, "enclave", "systemd", "supervisor.service"),
+		EIFPath:              filepath.Join(absRoot, ".enclave", "artifacts", "image.eif"),
+		SupervisorBinaryPath: filepath.Join(absRoot, ".enclave", "artifacts", "supervisor"),
 	}
 
 	data, err := json.MarshalIndent(vars, "", "  ")
@@ -174,10 +157,10 @@ func (o TofuOutputs) getOutput(key string) string {
 	return o[key]
 }
 
-// readPCR0FromArtifacts reads PCR0 from enclave/artifacts/pcr.json if it exists.
+// readPCR0FromArtifacts reads PCR0 from .enclave/artifacts/pcr.json if it exists.
 // Returns empty string if the file is missing (e.g. before first build).
 func readPCR0FromArtifacts(root string) string {
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "artifacts", "pcr.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".enclave", "artifacts", "pcr.json"))
 	if err != nil {
 		return ""
 	}

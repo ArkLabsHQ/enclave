@@ -54,3 +54,4 @@ bin/
 
 /target/
 .claude/
+.enclave/

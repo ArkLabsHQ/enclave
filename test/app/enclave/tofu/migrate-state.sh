@@ -46,8 +46,8 @@ move "aws_s3_object.enclave_init"              "module.enclave.aws_s3_object.enc
 move "aws_s3_object.watchdog_systemd"          "module.enclave.aws_s3_object.watchdog_systemd"
 move "aws_s3_object.imds_systemd"              "module.enclave.aws_s3_object.imds_systemd"
 move "aws_s3_object.gvproxy_systemd"           "module.enclave.aws_s3_object.gvproxy_systemd"
-move "aws_s3_object.supervisor_binary"         "module.enclave.aws_s3_object.supervisor_binary"
-move "aws_s3_object.supervisor_systemd"        "module.enclave.aws_s3_object.supervisor_systemd"
+move "aws_s3_object.supervisor_binary"               "module.enclave.aws_s3_object.supervisor_binary"
+move "aws_s3_object.supervisor_systemd"              "module.enclave.aws_s3_object.supervisor_systemd"
 move "aws_s3_bucket.storage"                   "module.enclave.aws_s3_bucket.storage"
 move "aws_s3_bucket_public_access_block.storage" "module.enclave.aws_s3_bucket_public_access_block.storage"
 move "aws_s3_bucket_policy.storage_ssl[0]"     "module.enclave.aws_s3_bucket_policy.storage_ssl[0]"
@@ -75,7 +75,6 @@ move "aws_route_table_association.private[0]"   "module.enclave.aws_route_table_
 move "aws_route_table_association.private_b[0]" "module.enclave.aws_route_table_association.private_b[0]"
 move "aws_vpc_endpoint.kms[0]"                  "module.enclave.aws_vpc_endpoint.kms[0]"
 move "aws_vpc_endpoint.ssm[0]"                  "module.enclave.aws_vpc_endpoint.ssm[0]"
-move "aws_vpc_endpoint.ecr[0]"                  "module.enclave.aws_vpc_endpoint.ecr[0]"
 move "aws_vpc_endpoint.s3[0]"                   "module.enclave.aws_vpc_endpoint.s3[0]"
 
 echo ""

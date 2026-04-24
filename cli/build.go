@@ -104,14 +104,10 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Build the host-side supervisor server binary.
+	// Build the host-side supervisor server binary. It embeds gvproxy and
+	// the IMDS AF_VSOCK forwarder, so no separate gvproxy binary is shipped.
 	if err := buildSupervisorBinary(cfg, root); err != nil {
 		return fmt.Errorf("build supervisor server: %w", err)
-	}
-
-	// Build the host-side gvproxy binary for outbound networking.
-	if err := buildGvproxyBinary(root); err != nil {
-		return fmt.Errorf("build gvproxy: %w", err)
 	}
 
 	// Generate terraform.tfvars.json so tofu apply can be run directly.
@@ -124,9 +120,8 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  PCR0:    %s\n", pcrs.PCR0)
 	fmt.Printf("  PCR1:    %s\n", pcrs.PCR1)
 	fmt.Printf("  PCR2:    %s\n", pcrs.PCR2)
-	fmt.Printf("  EIF:     enclave/artifacts/image.eif\n")
-	fmt.Printf("  Supervisor:    enclave/artifacts/supervisor\n")
-	fmt.Printf("  Gvproxy: enclave/artifacts/gvproxy\n")
+	fmt.Printf("  EIF:     .enclave/artifacts/image.eif\n")
+	fmt.Printf("  Supervisor: .enclave/artifacts/supervisor\n")
 	fmt.Printf("  Tfvars:  enclave/tofu/terraform.tfvars.json\n")
 	fmt.Println()
 	fmt.Println("Next:")
@@ -158,7 +153,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 		resolvedEnv[k] = v
 	}
 
-	// Add APP_BINARY_NAME so start.sh and the supervisor can find the app.
+	// Add APP_BINARY_NAME so the runtime can locate the user's app under /app/.
 	resolvedEnv["APP_BINARY_NAME"] = cfg.App.BinaryName
 
 	// Convert secrets config.
@@ -202,7 +197,11 @@ func generateBuildConfig(cfg *Config, root string) error {
 		return fmt.Errorf("marshal build-config.json: %w", err)
 	}
 
-	outPath := filepath.Join(root, "enclave", "build-config.json")
+	outDir := filepath.Join(root, ".enclave")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create .enclave dir: %w", err)
+	}
+	outPath := filepath.Join(outDir, "build-config.json")
 	if err := os.WriteFile(outPath, data, 0644); err != nil {
 		return fmt.Errorf("write build-config.json: %w", err)
 	}
@@ -222,8 +221,18 @@ func ensureGitTracked(root string, paths ...string) {
 
 // BuildEIF builds the enclave image (EIF) reproducibly using Nix.
 func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
-	// 1. Clean and create artifacts directory.
-	artifactsDir := filepath.Join(root, "enclave", "artifacts")
+	// Refuse to proceed if a pre-refactor flake.nix sits at root — it would
+	// be picked up by any ad-hoc `nix build .#eif` invocation and confuse
+	// reproducibility. Migration is one-line; we prompt rather than auto-move.
+	if _, err := os.Stat(filepath.Join(root, "flake.nix")); err == nil {
+		if _, err := os.Stat(filepath.Join(root, "enclave", "flake.nix")); os.IsNotExist(err) {
+			return nil, fmt.Errorf("legacy flake.nix at repo root. Move it: " +
+				"`mv flake.nix enclave/flake.nix && mv flake.lock enclave/flake.lock 2>/dev/null || true` then re-run")
+		}
+	}
+
+	// 1. Clean and create artifacts directory under .enclave/.
+	artifactsDir := filepath.Join(root, ".enclave", "artifacts")
 	if err := os.RemoveAll(artifactsDir); err != nil {
 		return nil, fmt.Errorf("clean artifacts: %w", err)
 	}
@@ -235,21 +244,21 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 		cfg.Version, cfg.Region, cfg.Prefix)
 
 	// 2. Ensure Nix-visible files are tracked by git (flakes only see tracked files).
-	ensureGitTracked(root, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+	ensureGitTracked(root, "enclave/flake.nix", "enclave/enclave.yaml")
 
-	configPath := filepath.Join(root, "enclave", "build-config.json")
+	configPath := filepath.Join(root, ".enclave", "build-config.json")
 	absConfigPath, err := filepath.Abs(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve build-config.json path: %w", err)
 	}
 
-	// 3. Run nix build locally.
+	// 3. Run nix build locally against ./enclave#eif.
 	nixCmd := exec.Command("nix", "build",
 		"--impure",
 		"--extra-experimental-features", "nix-command flakes",
 		"--option", "download-attempts", "3",
-		"--out-link", "flake_result",
-		".#eif",
+		"--out-link", ".enclave/result",
+		"./enclave#eif",
 	)
 	nixCmd.Dir = root
 	nixCmd.Stdout = os.Stdout
@@ -265,14 +274,14 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 		return nil, fmt.Errorf("nix build failed: %w", err)
 	}
 
-	// 3. Copy artifacts from flake_result/ to enclave/artifacts/.
-	resultLink := filepath.Join(root, "flake_result")
+	// 3. Copy artifacts from .enclave/result/ to .enclave/artifacts/.
+	resultLink := filepath.Join(root, ".enclave", "result")
 	for _, name := range []string{"image.eif", "pcr.json"} {
 		src := filepath.Join(resultLink, name)
 		dst := filepath.Join(artifactsDir, name)
 		data, err := os.ReadFile(src)
 		if err != nil {
-			return nil, fmt.Errorf("read flake_result/%s: %w", name, err)
+			return nil, fmt.Errorf("read .enclave/result/%s: %w", name, err)
 		}
 		if err := os.WriteFile(dst, data, 0644); err != nil {
 			return nil, fmt.Errorf("write artifacts/%s: %w", name, err)
@@ -294,14 +303,17 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 }
 
 // buildSupervisorBinary cross-compiles the host-side supervisor server from the SDK
-// for Linux amd64 and places the binary in enclave/artifacts/.
+// for Linux amd64 and places the binary in .enclave/artifacts/.
 //
 // If SUPERVISOR_LOCAL_PATH is set, the binary is built from local source (go build
 // ./supervisor/cmd/supervisor inside that path) instead of fetched from the module proxy. Mirrors
 // SDK_LOCAL_PATH for the enclave supervisor flake. Used by integration tests
 // that need to exercise unreleased supervisor changes against an unreleased SDK.
 func buildSupervisorBinary(cfg *Config, root string) error {
-	outDir := filepath.Join(root, "enclave", "artifacts")
+	outDir := filepath.Join(root, ".enclave", "artifacts")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create artifacts dir: %w", err)
+	}
 	fmt.Println("[build] Building supervisor server binary...")
 
 	if localPath := os.Getenv("SUPERVISOR_LOCAL_PATH"); localPath != "" {
@@ -334,25 +346,3 @@ func buildSupervisorBinary(cfg *Config, root string) error {
 	return nil
 }
 
-// buildGvproxyBinary cross-compiles the gvproxy binary for Linux amd64
-// and places it in enclave/artifacts/. This replaces the Docker-based
-// gvproxy container — the binary runs directly on the EC2 host.
-func buildGvproxyBinary(root string) error {
-	outDir := filepath.Join(root, "enclave", "artifacts")
-	fmt.Println("[build] Building gvproxy binary...")
-
-	modulePath := "github.com/containers/gvisor-tap-vsock/cmd/gvproxy@v0.7.4"
-	cmd := exec.Command("go", "install", "-trimpath", modulePath)
-	cmd.Env = append(os.Environ(),
-		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
-		"GOBIN="+outDir,
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("go install gvproxy: %w", err)
-	}
-
-	return nil
-}

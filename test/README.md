@@ -20,7 +20,7 @@ nix develop
 ./run.sh
 
 # Option B: Run with your own pre-built EIF.
-./run.sh ../enclave/artifacts/image.eif
+./run.sh ../.enclave/artifacts/image.eif
 ```
 
 Or run each step manually:
@@ -33,7 +33,7 @@ docker compose up -d --build --wait
 ./seed-ssm.sh
 
 # 3. Boot the enclave in QEMU (interactive, Ctrl+C to stop)
-./boot-qemu.sh app/enclave/artifacts/image.eif   # or your own EIF
+./boot-qemu.sh app/.enclave/artifacts/image.eif   # or your own EIF
 
 # 4. In another terminal: run smoke tests
 ./smoke-test.sh

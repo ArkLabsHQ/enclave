@@ -50,16 +50,8 @@ module "enclave" {
   release_tag   = var.release_tag
   github_token  = var.github_token
 
-  eif_path            = var.eif_path
-  supervisor_binary_path    = var.supervisor_binary_path
-  gvproxy_binary_path = var.gvproxy_binary_path
-
-  enclave_init_script_path = var.enclave_init_script_path
-  watchdog_service_path    = var.watchdog_service_path
-  imds_proxy_service_path  = var.imds_proxy_service_path
-  gvproxy_service_path      = var.gvproxy_service_path
-  gvproxy_start_script_path = var.gvproxy_start_script_path
-  supervisor_service_path         = var.supervisor_service_path
+  eif_path               = var.eif_path
+  supervisor_binary_path = var.supervisor_binary_path
 }
 `
 
@@ -176,43 +168,6 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
-variable "gvproxy_binary_path" {
-  description = "Local path to gvproxy binary. Overrides GitHub Release download."
-  type        = string
-  default     = ""
-}
-
-# --- Local asset file paths ---
-
-variable "enclave_init_script_path" {
-  description = "Local path to enclave_init.sh."
-  type        = string
-}
-
-variable "watchdog_service_path" {
-  description = "Local path to enclave-watchdog.service."
-  type        = string
-}
-
-variable "imds_proxy_service_path" {
-  description = "Local path to enclave-imds-proxy.service."
-  type        = string
-}
-
-variable "gvproxy_service_path" {
-  description = "Local path to gvproxy.service."
-  type        = string
-}
-
-variable "gvproxy_start_script_path" {
-  description = "Local path to gvproxy start.sh script."
-  type        = string
-}
-
-variable "supervisor_service_path" {
-  description = "Local path to supervisor.service."
-  type        = string
-}
 `
 
 const tofuRootOutputs = `# Root module outputs — re-exported from sub-modules.
@@ -336,7 +291,7 @@ variable "supervisor_url" {
 }
 
 # --- GitHub Release artifacts ---
-# Build artifacts (EIF, supervisor, gvproxy) are fetched from a GitHub Release
+# Build artifacts (EIF, supervisor) are fetched from a GitHub Release
 # at apply time using null_resource + curl — unless local path overrides are set.
 
 variable "github_owner" {
@@ -379,43 +334,6 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
-variable "gvproxy_binary_path" {
-  description = "Local path to gvproxy binary. Overrides GitHub Release download."
-  type        = string
-  default     = ""
-}
-
-# --- Local asset file paths ---
-
-variable "enclave_init_script_path" {
-  description = "Local path to enclave_init.sh."
-  type        = string
-}
-
-variable "watchdog_service_path" {
-  description = "Local path to enclave-watchdog.service."
-  type        = string
-}
-
-variable "imds_proxy_service_path" {
-  description = "Local path to enclave-imds-proxy.service."
-  type        = string
-}
-
-variable "gvproxy_service_path" {
-  description = "Local path to gvproxy.service."
-  type        = string
-}
-
-variable "gvproxy_start_script_path" {
-  description = "Local path to gvproxy start.sh script."
-  type        = string
-}
-
-variable "supervisor_service_path" {
-  description = "Local path to supervisor.service."
-  type        = string
-}
 `
 
 const tofuModuleEnclaveOutputs = `output "ec2_role_arn" {
@@ -864,9 +782,8 @@ const tofuModuleEnclaveS3 = `locals {
   artifacts_dir  = "${path.module}/.artifacts"
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
-  eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
-  supervisor_source    = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
-  gvproxy_source = local.use_local ? var.gvproxy_binary_path : "${local.artifacts_dir}/gvproxy"
+  eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
+  supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
 }
 
 # Download build artifacts from GitHub Release (skipped when local paths are set).
@@ -884,7 +801,6 @@ resource "null_resource" "download_artifacts" {
       mkdir -p ${local.artifacts_dir}
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
     EOT
     environment = {
       GITHUB_TOKEN = var.github_token
@@ -917,34 +833,6 @@ resource "aws_s3_object" "enclave_eif" {
   etag       = local.use_local ? filemd5(local.eif_source) : null
 }
 
-resource "aws_s3_object" "enclave_init" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave_init.sh"
-  source = var.enclave_init_script_path
-  etag   = filemd5(var.enclave_init_script_path)
-}
-
-resource "aws_s3_object" "watchdog_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-watchdog.service"
-  source = var.watchdog_service_path
-  etag   = filemd5(var.watchdog_service_path)
-}
-
-resource "aws_s3_object" "imds_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-imds-proxy.service"
-  source = var.imds_proxy_service_path
-  etag   = filemd5(var.imds_proxy_service_path)
-}
-
-resource "aws_s3_object" "gvproxy_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy.service"
-  source = var.gvproxy_service_path
-  etag   = filemd5(var.gvproxy_service_path)
-}
-
 resource "aws_s3_object" "supervisor_binary" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
@@ -973,27 +861,9 @@ resource "aws_s3_object" "supervisor_binary_staging" {
   etag       = local.use_local ? filemd5(local.supervisor_source) : null
 }
 
-resource "aws_s3_object" "gvproxy_start_script" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy-start.sh"
-  source = var.gvproxy_start_script_path
-  etag   = filemd5(var.gvproxy_start_script_path)
-}
-
-resource "aws_s3_object" "gvproxy_binary" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "gvproxy"
-  source     = local.gvproxy_source
-  etag       = local.use_local ? filemd5(local.gvproxy_source) : null
-}
-
-resource "aws_s3_object" "supervisor_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "supervisor.service"
-  source = var.supervisor_service_path
-  etag   = filemd5(var.supervisor_service_path)
-}
+# The enclave-supervisor.service systemd unit is inlined in user_data.sh.tftpl
+# via a heredoc — no separate S3 object. Keeps deployment concerns colocated
+# with the tofu module that owns them.
 
 # Persistent storage bucket for enclave data (Store/Load API).
 
@@ -1297,21 +1167,14 @@ resource "aws_instance" "nitro" {
   }
 
   user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    region                       = var.region
-    dev_mode                     = var.deployment
-    app_name                     = var.app_name
-    kms_key_id                   = local.kms_key_id
-    eif_s3_url                   = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
-    enclave_init_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_init.key}"
-    enclave_init_systemd_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.watchdog_systemd.key}"
-    imds_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.imds_systemd.key}"
-    gvproxy_systemd_s3_url       = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_systemd.key}"
-    supervisor_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
-    supervisor_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_systemd.key}"
-    gvproxy_binary_s3_url        = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_binary.key}"
-    gvproxy_start_script_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_start_script.key}"
-    migration_cooldown           = var.migration_cooldown
-    previous_pcr0                = var.previous_pcr0
+    region                    = var.region
+    dev_mode                  = var.deployment
+    app_name                  = var.app_name
+    kms_key_id                = local.kms_key_id
+    eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
+    supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
+    migration_cooldown        = var.migration_cooldown
+    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {

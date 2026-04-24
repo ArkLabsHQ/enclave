@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,9 +34,20 @@ type SecretDef struct {
 	EnvVar string `json:"env_var"`
 }
 
+// AttestationHashRegistrar registers the SHA-256 hash of the enclave
+// application's attestation public key with the in-process nitriding instance
+// so it's embedded in NSM attestation documents.
+//
+// Implemented by *nitriding.Enclave (see runtime/nitriding/setters.go).
+// Tests inject a fake.
+type AttestationHashRegistrar interface {
+	SetAttestationKeyHash(hash [32]byte)
+}
+
 // Runtime holds the initialized runtime state.
 type Runtime struct {
 	attestationKey          *btcec.PrivateKey
+	attestationRegistrar    AttestationHashRegistrar
 	secrets                 []SecretDef
 	previousPCR0            string
 	previousPCR0Attestation string       // base64-encoded COSE Sign1 attestation doc
@@ -396,8 +405,14 @@ func loadSecretsConfig() ([]SecretDef, error) {
 	return secrets, nil
 }
 
+// SetAttestationRegistrar wires the in-process nitriding enclave as the
+// recipient of the attestation key hash. Call this before Init.
+func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
+	e.attestationRegistrar = r
+}
+
 // generateAttestationKey creates an ephemeral secp256k1 keypair and registers
-// its public key hash with nitriding via POST /enclave/hash.
+// its public key hash with the in-process nitriding instance.
 func (e *Runtime) generateAttestationKey() error {
 	keyBytes := make([]byte, 32)
 	if _, err := secureRandom(keyBytes); err != nil {
@@ -410,27 +425,11 @@ func (e *Runtime) generateAttestationKey() error {
 	}
 	e.attestationKey = privKey
 
-	pubkeyBytes := privKey.PubKey().SerializeCompressed()
-	hash := sha256.Sum256(pubkeyBytes)
-	hashB64 := base64.StdEncoding.EncodeToString(hash[:])
-
-	nitridingPort := os.Getenv("ENCLAVE_NITRIDING_INT_PORT")
-	if nitridingPort == "" {
-		nitridingPort = "8080"
+	if e.attestationRegistrar == nil {
+		return fmt.Errorf("no attestation registrar wired; call SetAttestationRegistrar before Init")
 	}
-	nitridingURL := fmt.Sprintf("http://127.0.0.1:%s/enclave/hash", nitridingPort)
-
-	resp, err := http.Post(nitridingURL, "text/plain", strings.NewReader(hashB64))
-	if err != nil {
-		return fmt.Errorf("POST /enclave/hash: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST /enclave/hash status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
+	hash := sha256.Sum256(privKey.PubKey().SerializeCompressed())
+	e.attestationRegistrar.SetAttestationKeyHash(hash)
 	return nil
 }
 

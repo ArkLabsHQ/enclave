@@ -18,8 +18,152 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$(realpath "$0")"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
+
+# boot_qemu: bring up AF_VSOCK fabric (vhost-device-vsock + heartbeat),
+# then boot the EIF in QEMU emulating a Nitro Enclave. The supervisor,
+# running out-of-band, provides gvproxy (vsock:1024) and the IMDS
+# forwarder (vsock:8002) — see supervisor/gvproxy.go + supervisor/imds_proxy.go.
+#
+# Called two ways:
+#   1. From run.sh's main flow, via watchdog (ENCLAVE_START_CMD) in the
+#      supervisor — invokes this script with `--boot-only <eif>`.
+#   2. Directly from run.sh on wait_for_enclave (for manual invocation).
+boot_qemu() {
+  local eif_path="${1:?Usage: boot_qemu <path-to-eif>}"
+
+  echo $$ > /tmp/enclave-boot.pid
+
+  if [ ! -f "$eif_path" ]; then
+    echo "Error: EIF not found at $eif_path" >&2
+    return 1
+  fi
+  eif_path="$(realpath "$eif_path")"
+
+  local guest_cid="${GUEST_CID:-4}"
+  local memory="${MEMORY:-4G}"
+  local vsock_socket="/tmp/vhost${guest_cid}.socket"
+  local boot_timeout="${BOOT_TIMEOUT:-300}"
+  local host_tls_port="${HOST_TLS_PORT:-8443}"
+
+  local qemu_pid hb_pid vsock_pid
+  qemu_pid="" hb_pid="" vsock_pid=""
+
+  _boot_qemu_cleanup() {
+    echo "" 2>/dev/null
+    echo "=== Cleaning up ===" 2>/dev/null
+    [ -n "$qemu_pid" ] && kill "$qemu_pid" 2>/dev/null && echo "  Stopped QEMU ($qemu_pid)" 2>/dev/null
+    [ -n "$hb_pid" ] && kill "$hb_pid" 2>/dev/null && echo "  Stopped heartbeat ($hb_pid)" 2>/dev/null
+    [ -n "$vsock_pid" ] && kill "$vsock_pid" 2>/dev/null && echo "  Stopped vhost-device-vsock ($vsock_pid)" 2>/dev/null
+    rm -f "$vsock_socket" /tmp/enclave-boot.pid
+  }
+  trap _boot_qemu_cleanup EXIT
+
+  # Kill any stale processes from previous runs.
+  killall vhost-device-vsock 2>/dev/null || true
+  pkill -f heartbeat.py 2>/dev/null || true
+  sleep 0.5
+  rm -f "$vsock_socket"
+
+  if [ ! -e /dev/vsock ]; then
+    echo "Error: /dev/vsock not found. Load vsock + vsock_loopback kernel modules." >&2
+    return 1
+  fi
+
+  echo "=== Starting vhost-device-vsock ==="
+  echo "  CID:        $guest_cid"
+  echo "  Socket:     $vsock_socket"
+  echo "  Forward:    CID 1 (loopback)"
+  vhost-device-vsock \
+    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=1,forward-listen=9001+9002" &
+  vsock_pid=$!
+  sleep 1
+  if ! kill -0 "$vsock_pid" 2>/dev/null; then
+    echo "Error: vhost-device-vsock failed to start" >&2
+    return 1
+  fi
+
+  echo "=== Starting heartbeat responder ==="
+  python3 "$SCRIPT_DIR/heartbeat.py" &
+  hb_pid=$!
+  sleep 0.5
+  if ! kill -0 "$hb_pid" 2>/dev/null; then
+    echo "Error: heartbeat responder failed to start" >&2
+    return 1
+  fi
+
+  # gvproxy (L2 networking over vsock:1024) and the IMDS vsock forwarder
+  # (vsock:8002) are provided by the out-of-band supervisor. Port
+  # forwarding is configured via GVPROXY_FORWARD_PORTS (set below).
+
+  echo ""
+  echo "=== Booting QEMU enclave ==="
+  echo "  EIF:    $eif_path"
+  echo "  Memory: $memory"
+  local accel cpu_opt
+  if [ -e /dev/kvm ]; then
+    accel="--enable-kvm"
+    cpu_opt="-cpu host"
+    echo "  KVM:    enabled"
+  else
+    accel="-accel tcg"
+    cpu_opt="-cpu max"
+    echo "  KVM:    not available, using TCG (slow)"
+  fi
+  qemu-system-x86_64 \
+    -M "nitro-enclave,vsock=c,id=test-enclave" \
+    -kernel "$eif_path" \
+    -nographic \
+    -m "$memory" \
+    $accel \
+    $cpu_opt \
+    -chardev "socket,id=c,path=${vsock_socket}" &
+  qemu_pid=$!
+  echo "  PID:    $qemu_pid"
+  echo ""
+
+  # Wait for the enclave to become ready.
+  echo "=== Waiting for enclave to boot (timeout: ${boot_timeout}s) ==="
+  local seconds=0
+  while [ $seconds -lt "$boot_timeout" ]; do
+    if ! kill -0 "$qemu_pid" 2>/dev/null; then
+      echo "Error: QEMU exited unexpectedly" >&2
+      wait "$qemu_pid" || true
+      return 1
+    fi
+    local http_code
+    http_code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+      "https://localhost:${host_tls_port}/health" 2>/dev/null || echo "000")
+    if [ "$http_code" = "200" ] || [ "$http_code" = "503" ]; then
+      local health
+      health=$(curl -sk --max-time 5 "https://localhost:${host_tls_port}/health" 2>/dev/null || echo "{}")
+      echo "  Enclave responding (${seconds}s) — HTTP $http_code"
+      echo "  Health: $health"
+      echo ""
+      echo "=== Enclave running ==="
+      echo "  Health:        https://localhost:${host_tls_port}/health"
+      echo "  Enclave info:  https://localhost:${host_tls_port}/v1/enclave-info"
+      echo "  App:           https://localhost:${host_tls_port}/"
+      wait "$qemu_pid"
+      return 0
+    fi
+    sleep 2
+    seconds=$((seconds + 2))
+  done
+  echo "Error: Enclave did not become ready within ${boot_timeout}s" >&2
+  return 1
+}
+
+# Subcommand dispatch: when invoked as a launcher-shim (from the
+# supervisor's ENCLAVE_START_CMD), run just boot_qemu and exit. Avoids
+# re-running the main integration-test flow inside the launcher.
+if [ "${1:-}" = "--boot-only" ]; then
+  shift
+  boot_qemu "$@"
+  exit $?
+fi
 
 # Auto-enter Nix dev shell if required tools are missing.
 if ! command -v vhost-device-vsock &>/dev/null || ! command -v qemu-system-x86_64 &>/dev/null; then
@@ -42,8 +186,8 @@ elif command -v go &>/dev/null; then
   # tofu_apply uploads it (not an empty placeholder) to the staging S3
   # key. Step 7 later overwrites this file with a v2 variant to force
   # Step 10 down the swap path.
-  mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
-  cp "$ENCLAVE_SUPERVISOR" "${SCRIPT_DIR}/app/enclave/artifacts/supervisor"
+  mkdir -p "${SCRIPT_DIR}/app/.enclave/artifacts"
+  cp "$ENCLAVE_SUPERVISOR" "${SCRIPT_DIR}/app/.enclave/artifacts/supervisor"
 else
   echo "Error: neither pre-built binaries (enclave-cli, supervisor) nor Go compiler found" >&2
   exit 1
@@ -55,14 +199,14 @@ echo "  Supervisor: $ENCLAVE_SUPERVISOR"
 echo ""
 
 # Reset image.eif to pristine v1; migration test-runs overwrite it.
-V1_EIF="${SCRIPT_DIR}/app/enclave/artifacts/image-v1.eif"
+V1_EIF="${SCRIPT_DIR}/app/.enclave/artifacts/image-v1.eif"
 if [ -f "$V1_EIF" ]; then
   echo "  Resetting image.eif to pristine v1..."
-  cp -f "$V1_EIF" "${SCRIPT_DIR}/app/enclave/artifacts/image.eif"
-  cp -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json" \
-        "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" 2>/dev/null || true
+  cp -f "$V1_EIF" "${SCRIPT_DIR}/app/.enclave/artifacts/image.eif"
+  cp -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v1.json" \
+        "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" 2>/dev/null || true
 fi
-rm -f "${SCRIPT_DIR}/app/enclave/artifacts/image.eif.backup"
+rm -f "${SCRIPT_DIR}/app/.enclave/artifacts/image.eif.backup"
 : > /tmp/boot-qemu.log
 
 
@@ -86,9 +230,11 @@ tofu_apply() {
 
   # Ensure artifact placeholders exist for tofu's filemd5() (local mode
   # doesn't actually use these S3 objects — the enclave boots from QEMU).
-  mkdir -p "${SCRIPT_DIR}/app/enclave/artifacts"
-  for f in image.eif supervisor gvproxy; do
-    [ -f "${SCRIPT_DIR}/app/enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/enclave/artifacts/$f"
+  # Only image.eif and supervisor are uploaded now; gvproxy is vendored
+  # into the supervisor binary itself.
+  mkdir -p "${SCRIPT_DIR}/app/.enclave/artifacts"
+  for f in image.eif supervisor; do
+    [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/.enclave/artifacts/$f"
   done
 
   (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tfvars)
@@ -155,7 +301,7 @@ cleanup() {
     rm -f /tmp/supervisor.pid
   fi
   rm -f /tmp/supervisor-relauncher.sh
-  # Kill enclave (boot-qemu.sh) via PID file.
+  # Kill enclave (boot_qemu) via PID file.
   if [ -f /tmp/enclave-boot.pid ]; then
     kill "$(cat /tmp/enclave-boot.pid)" 2>/dev/null || true
     sleep 1
@@ -170,18 +316,18 @@ trap cleanup EXIT
 # Reads boot PID from /tmp/enclave-boot.pid to detect crashes.
 wait_for_enclave() {
   local label="${1:-}"
-  local boot_timeout="${BOOT_TIMEOUT:-90}"
+  local boot_timeout="${BOOT_TIMEOUT:-300}"
   local init_timeout="${INIT_TIMEOUT:-120}"
 
   echo "  Waiting for enclave boot (timeout: ${boot_timeout}s)..."
   SECONDS=0
   while [ $SECONDS -lt "$boot_timeout" ]; do
-    # Check if boot-qemu.sh is still running.
+    # Check if boot_qemu is still running.
     if [ -f /tmp/enclave-boot.pid ]; then
       local pid
       pid=$(cat /tmp/enclave-boot.pid)
       if ! kill -0 "$pid" 2>/dev/null; then
-        echo "Error: boot-qemu.sh exited unexpectedly${label:+ ($label)}" >&2
+        echo "Error: boot_qemu exited unexpectedly${label:+ ($label)}" >&2
         exit 1
       fi
     fi
@@ -206,7 +352,7 @@ wait_for_enclave() {
       local pid
       pid=$(cat /tmp/enclave-boot.pid)
       if ! kill -0 "$pid" 2>/dev/null; then
-        echo "Error: boot-qemu.sh exited unexpectedly${label:+ ($label)}" >&2
+        echo "Error: boot_qemu exited unexpectedly${label:+ ($label)}" >&2
         exit 1
       fi
     fi
@@ -254,11 +400,11 @@ if [ -n "$EIF_PATH" ] && [ -f "$EIF_PATH" ]; then
   echo "  Using provided EIF: $EIF_PATH"
 elif [ "$IN_DOCKER" = true ]; then
   # Inside Docker: use pre-built EIFs from mounted volume (built on host).
-  if [ -f "app/enclave/artifacts/image.eif" ]; then
-    EIF_PATH="app/enclave/artifacts/image.eif"
+  if [ -f "app/.enclave/artifacts/image.eif" ]; then
+    EIF_PATH="app/.enclave/artifacts/image.eif"
     echo "  Using pre-built EIF: $EIF_PATH"
-    if [ -f "app/enclave/artifacts/image-v2.eif" ]; then
-      echo "  Migration EIF: app/enclave/artifacts/image-v2.eif"
+    if [ -f "app/.enclave/artifacts/image-v2.eif" ]; then
+      echo "  Migration EIF: app/.enclave/artifacts/image-v2.eif"
     else
       echo "  WARN: No migration EIF (image-v2.eif) — Step 7 will reuse same EIF"
     fi
@@ -270,12 +416,12 @@ elif [ "$IN_DOCKER" = true ]; then
 else
   # On host: build v1 EIF, then v2 with different version for migration testing.
   ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
-  ARTIFACTS="${SCRIPT_DIR}/app/enclave/artifacts"
+  ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
   ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
 
   echo "  Building v1 EIF (version ${ORIG_VERSION})..."
   (cd app && "$ENCLAVE_CLI" build)
-  EIF_PATH="app/enclave/artifacts/image.eif"
+  EIF_PATH="app/.enclave/artifacts/image.eif"
   V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
   cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v1.json"
   echo "  v1 PCR0: ${V1_PCR0:0:16}..."
@@ -331,7 +477,7 @@ aws ssm put-parameter $LOCALSTACK \
 echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
 
 # Start supervisor on the host (like production EC2 host).
-# Configured with stop/start commands that manage boot-qemu.sh via PID file.
+# Configured with stop/start commands that manage boot_qemu via PID file.
 # We run supervisor under a tiny relauncher script that loops "run supervisor; wait;
 # relaunch" — the test's analog of systemd Restart=always in production.
 # This lets ENCLAVE_SUPERVISOR_RESTART_CMD just kill the current supervisor process; the
@@ -362,6 +508,16 @@ export ENCLAVE_AWS_REGION=us-east-1
 export ENCLAVE_DEPLOYMENT=dev
 export ENCLAVE_APP_NAME=my-app
 export ENCLAVE_SUPERVISOR_ADDR="127.0.0.1:8444"
+# The supervisor runs in-process gvproxy (vsock:1024) and IMDS forwarder
+# (vsock:8002) just as it does in prod. Only the enclave launcher differs:
+# QEMU stands in for nitro-cli via ENCLAVE_START_CMD below.
+#
+# Forward enclave TLS (443 inside) to unprivileged 8443 on the host so
+# the test can curl https://localhost:8443/health without root.
+export GVPROXY_FORWARD_PORTS="8443:443 7073 9090"
+# Point the in-process IMDS forwarder at mock-imds instead of the real
+# 169.254.169.254 (which isn't reachable from the test container).
+export IMDS_PROXY_TARGET="127.0.0.1:1338"
 export ENCLAVE_MIGRATION_COOLDOWN="1m"
 # Shorten commit-poll timeout so rollback tests don't wait 5min for the default.
 export ENCLAVE_MIGRATION_COMMIT_TIMEOUT="45s"
@@ -370,7 +526,7 @@ export ENCLAVE_EIF_PATH="$EIF_ABS_PATH"
 export ENCLAVE_SUPERVISOR_BINARY_PATH="$ENCLAVE_SUPERVISOR"
 export ENCLAVE_SUPERVISOR_RESTART_CMD="kill \$(cat $SUPERVISOR_PIDFILE)"
 export ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3"
-export ENCLAVE_START_CMD="cd ${SCRIPT_DIR} && nohup ./boot-qemu.sh ${EIF_ABS_PATH} >> /tmp/boot-qemu.log 2>&1 &"
+export ENCLAVE_START_CMD="nohup \"$SCRIPT_PATH\" --boot-only \"$EIF_ABS_PATH\" >> /tmp/boot-qemu.log 2>&1 &"
 export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
@@ -394,9 +550,10 @@ fi
 echo "  Supervisor relauncher running (PID $SUP_PID), supervisor child PID $(cat "$SUPERVISOR_PIDFILE") on http://127.0.0.1:8444"
 echo ""
 
-# Step 3: Boot enclave in QEMU (runs in background).
+# Step 3: The supervisor's watchdog launches the enclave via
+# ENCLAVE_START_CMD (→ boot_qemu) on its own. We just wait for it to
+# come up.
 echo "=== [3/9] Booting enclave in QEMU ==="
-./boot-qemu.sh "$EIF_PATH" &
 wait_for_enclave "initial boot"
 echo ""
 
@@ -440,7 +597,7 @@ export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
 ABORT_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
 aws s3 mb "s3://${ABORT_EIF_BUCKET}" $LOCALSTACK 2>/dev/null || true
 aws s3 cp "$EIF_PATH" "s3://${ABORT_EIF_BUCKET}/image.eif" $LOCALSTACK 2>/dev/null
-ABORT_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json")
+ABORT_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json")
 curl -sf -X POST "${SUPERVISOR_URL}/migrate" \
   -H 'Content-Type: application/json' \
   -d "{\"eif_bucket\":\"${ABORT_EIF_BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"${ABORT_PCR0}\",\"secret_names\":[\"signing_key\"]}" \
@@ -502,15 +659,15 @@ echo ""
 # Step 7: Deploy migration with a different EIF (different PCR0).
 # A real migration deploys new code with a different PCR0. The second EIF
 # must be pre-built on the host (see build-migration-eif.sh) and placed at
-# app/enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
+# app/.enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
 echo "=== [7/9] Running migration (enclave deploy upgrade) ==="
-MIGRATION_EIF="${SCRIPT_DIR}/app/enclave/artifacts/image-v2.eif"
+MIGRATION_EIF="${SCRIPT_DIR}/app/.enclave/artifacts/image-v2.eif"
 if [ -f "$MIGRATION_EIF" ]; then
   echo "  Using migration EIF: $MIGRATION_EIF"
-  cp "$MIGRATION_EIF" "${SCRIPT_DIR}/app/enclave/artifacts/image.eif"
+  cp "$MIGRATION_EIF" "${SCRIPT_DIR}/app/.enclave/artifacts/image.eif"
   # Update pcr.json with the v2 PCR0.
-  if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" ]; then
-    cp "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v2.json" "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
+  if [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" ]; then
+    cp "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json"
   fi
 else
   echo "  WARN: No migration EIF found (image-v2.eif), reusing same EIF"
@@ -518,7 +675,7 @@ fi
 
 # Re-apply with the new EIF — tofu detects expected_pcr0 changed and triggers
 # enclave_migration_local, which calls the supervisor to perform live migration.
-echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/enclave/artifacts/pcr.json" | cut -c1-16)..."
+echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" | cut -c1-16)..."
 
 # Snapshot the current supervisor child PID so we can verify Step 10 actually
 # restarted it (supervisor writes new child's PID back to the pidfile).
@@ -593,7 +750,7 @@ else
 fi
 
 # Step 8: Wait for restarted enclave and verify migration survival.
-# supervisor already stopped and restarted the enclave in step 7 (via boot-qemu.sh).
+# supervisor already stopped and restarted the enclave in step 7 (via boot_qemu).
 # The new enclave must decrypt secrets from the NEW KMS key and re-import
 # the storage DEK from migrated ciphertexts.
 echo "=== [8/9] Post-migration verification ==="
@@ -618,9 +775,9 @@ else
 fi
 
 # Verify previous_pcr0 matches v1 PCR0 from build artifacts.
-V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr.json"
-if [ -f "${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json" ]; then
-  V1_PCR0_FILE="${SCRIPT_DIR}/app/enclave/artifacts/pcr-v1.json"
+V1_PCR0_FILE="${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json"
+if [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v1.json" ]; then
+  V1_PCR0_FILE="${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v1.json"
 fi
 if [ -f "$V1_PCR0_FILE" ]; then
   EXPECTED_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
@@ -771,7 +928,7 @@ fi
 echo ""
 echo "=== [9/10] Rollback test: migration with wrong previous_pcr0 ==="
 
-ARTIFACTS="${SCRIPT_DIR}/app/enclave/artifacts"
+ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
 V3_EIF="${ARTIFACTS}/image-v3.eif"
 V3_PCR_FILE="${ARTIFACTS}/pcr-v3.json"
 

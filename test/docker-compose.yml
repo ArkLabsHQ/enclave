@@ -81,4 +81,4 @@ services:
       SKIP_MOCK_SERVICES: "1"
       # Must match enclave.yaml name — the runtime reads ENCLAVE_APP_NAME for SSM paths.
       ENCLAVE_APP_NAME: "test-app"
-    command: ["./run.sh", "app/enclave/artifacts/image.eif"]
+    command: ["./run.sh", "app/.enclave/artifacts/image.eif"]

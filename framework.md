@@ -16,13 +16,16 @@ The framework provides an **irreversible security guarantee**: once a KMS key is
 ┌─────────────────────────────▼────────────────────────────────┐
 │                   AWS EC2 Instance (Host)                     │
 │                                                              │
-│  ┌──────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ gvproxy  │  │ IMDS vsock   │  │  enclave-watchdog.svc  │ │
-│  │ (Docker) │  │ proxy :8002  │  │  (manages EIF)         │ │
-│  └────┬─────┘  └──────┬───────┘  └────────────────────────┘ │
-│       │ vsock:1024     │ vsock:3:8002                        │
-└───────┼────────────────┼────────────────────────────────────┘
-        │                │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │          enclave-supervisor.service (single binary)   │   │
+│  │   • gvproxy (in-process, vsock:1024)                  │   │
+│  │   • IMDS AF_VSOCK forwarder (vsock:2:8002 → IMDS:80)  │   │
+│  │   • Watchdog (nitro-cli run/terminate + restart loop) │   │
+│  │   • Management API (127.0.0.1:8443)                   │   │
+│  └───────────────────────────┬───────────────────────────┘   │
+│                              │ vsock                         │
+└──────────────────────────────┼───────────────────────────────┘
+                               │
 ┌───────▼────────────────▼────────────────────────────────────┐
 │              AWS Nitro Enclave (Isolated VM)                  │
 │                                                              │
@@ -72,14 +75,8 @@ Generates the `enclave/` directory with all framework files needed to build and 
 | File | Purpose |
 |------|---------|
 | `enclave.yaml` | Configuration (secrets, app source, region, etc.) |
-| `start.sh` | Enclave boot sequence |
-| `gvproxy/Dockerfile` | Outbound networking proxy |
-| `gvproxy/start.sh` | gvproxy startup |
-| `scripts/enclave_init.sh` | Host-side enclave launcher |
-| `systemd/enclave-watchdog.service` | Enclave lifecycle management |
-| `systemd/enclave-imds-proxy.service` | AWS credential forwarding |
-| `systemd/gvproxy.service` | Network proxy service |
-| `user_data/user_data` | EC2 cloud-init script |
+| `tofu/` | OpenTofu module scaffold (VPC, EC2, KMS, IAM, SSM, S3) |
+| `tofu/modules/enclave/templates/user_data.sh.tftpl` | EC2 cloud-init script — inlines the `enclave-supervisor.service` systemd unit, which runs the supervisor binary owning gvproxy, the IMDS forwarder, the enclave lifecycle watchdog, and the management API in one process |
 
 On subsequent runs, validates the configuration and reports errors.
 
@@ -93,7 +90,7 @@ Builds the Enclave Image File (EIF) using **Nix inside Docker** for full reprodu
 
 1. Generates `build-config.json` from `enclave.yaml`
 2. Runs `nix build .#eif` (fetches user app + SDK from GitHub, pins all dependencies)
-3. Outputs `enclave/artifacts/image.eif` + `enclave/artifacts/pcr.json` (PCR0/1/2 measurements)
+3. Outputs `.enclave/artifacts/image.eif` + `.enclave/artifacts/pcr.json` (PCR0/1/2 measurements)
 
 Anyone can rebuild the same EIF and get identical PCR values, proving the binary hasn't been tampered with.
 

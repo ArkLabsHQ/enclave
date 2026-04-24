@@ -12,7 +12,7 @@ func TestGetFrameworkFilesDotnet(t *testing.T) {
 
 	var foundFlake bool
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			foundFlake = true
 			if !strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("dotnet flake.nix should use buildDotnetModule")
@@ -38,9 +38,8 @@ func TestRunGenerateTemplateDotnet(t *testing.T) {
 	}
 
 	expectedFiles := []string{
-		"flake.nix",
+		"enclave/flake.nix",
 		"enclave/enclave.yaml",
-		"enclave/start.sh",
 		"Program.cs",
 		"MyEnclaveApp.csproj",
 		"NuGet.config",
@@ -101,7 +100,7 @@ func TestRunGenerateTemplateDotnet(t *testing.T) {
 func TestGetFrameworkFilesGoUnchanged(t *testing.T) {
 	files := getFrameworkFiles("go")
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			if strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("Go flake.nix should NOT contain buildDotnetModule")
 			}
@@ -114,7 +113,7 @@ func TestGetFrameworkFilesGoUnchanged(t *testing.T) {
 func TestGetFrameworkFilesNodejsUnchanged(t *testing.T) {
 	files := getFrameworkFiles("nodejs")
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			if strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("Node.js flake.nix should NOT contain buildDotnetModule")
 			}
@@ -131,7 +130,7 @@ func TestGetFrameworkFilesRust(t *testing.T) {
 	files := getFrameworkFiles("rust")
 	var foundFlake bool
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			foundFlake = true
 			if !strings.Contains(f.Content, "buildRustPackage") {
 				t.Error("Rust flake.nix should use buildRustPackage")
@@ -154,9 +153,8 @@ func TestRunGenerateTemplateGolang(t *testing.T) {
 	}
 
 	expectedFiles := []string{
-		"flake.nix",
+		"enclave/flake.nix",
 		"enclave/enclave.yaml",
-		"enclave/start.sh",
 	}
 
 	for _, name := range expectedFiles {
@@ -187,7 +185,7 @@ func TestFlakeTemplatesHaveBuildInputsPlumbing(t *testing.T) {
 			files := getFrameworkFiles(lang)
 			var flake string
 			for _, f := range files {
-				if f.RelPath == "flake.nix" {
+				if f.RelPath == "enclave/flake.nix" {
 					flake = f.Content
 					break
 				}

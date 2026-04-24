@@ -103,12 +103,8 @@ enclave init
 
 Both create:
 - `enclave/enclave.yaml` — main config file
-- `flake.nix` — Nix build definition (language-specific)
-- `enclave/start.sh` — enclave boot script
-- `enclave/gvproxy/` — network proxy config
-- `enclave/scripts/` — initialization scripts
-- `enclave/systemd/` — service unit files
-- `enclave/user_data/` — EC2 user data
+- `enclave/flake.nix` — Nix build definition (language-specific)
+- `enclave/tofu/` — OpenTofu module for deploy (the `enclave-supervisor.service` systemd unit is inlined into `tofu/modules/enclave/templates/user_data.sh.tftpl`)
 
 If built with `make build`, the `sdk:` section is auto-populated with the correct hashes.
 
@@ -118,7 +114,7 @@ The `setup` command auto-detects your GitHub remote and computes all nix hashes:
 
 ```sh
 enclave setup                          # Go app (default), runs in Docker
-enclave setup --language nodejs        # Node.js app (writes correct flake.nix)
+enclave setup --language nodejs        # Node.js app (writes correct enclave/flake.nix)
 enclave setup                  # uses local nix installation
 ```
 
@@ -327,7 +323,7 @@ make install   # install to $GOPATH/bin
 | `enclave generate template --nodejs` | Generate a complete Node.js enclave app template |
 | `enclave generate template --dotnet` | Generate a complete .NET enclave app template |
 | `enclave setup` | Auto-populate app nix hashes from git remote |
-| `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite flake.nix |
+| `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite enclave/flake.nix |
 | `enclave setup` | Use Nix for hash computation |
 | `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
@@ -443,8 +439,8 @@ The host-side supervisor (`supervisor/`) runs on the EC2 instance at `127.0.0.1:
 |--------|------|-------------|
 | GET | `/health` | Enclave status (running/stopped, CID, memory, CPU count) |
 | GET | `/metrics` | Prometheus metrics (nitriding + host-level gauges) |
-| POST | `/start` | Start enclave via `systemctl start enclave-watchdog` |
-| POST | `/stop` | Stop enclave via `systemctl stop enclave-watchdog` |
+| POST | `/start` | Launch the enclave via the in-process watchdog (`nitro-cli run-enclave`) |
+| POST | `/stop` | Terminate the enclave via the in-process watchdog (`nitro-cli terminate-enclave`) |
 | POST | `/migrate` | Full locked-key migration (streaming NDJSON progress) |
 | POST | `/schedule-key-deletion` | Schedule KMS key for 7-day deletion |
 

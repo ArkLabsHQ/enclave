@@ -45,14 +45,6 @@ module "enclave" {
   release_tag   = var.release_tag
   github_token  = var.github_token
 
-  eif_path            = var.eif_path
-  supervisor_binary_path    = var.supervisor_binary_path
-  gvproxy_binary_path = var.gvproxy_binary_path
-
-  enclave_init_script_path = var.enclave_init_script_path
-  watchdog_service_path    = var.watchdog_service_path
-  imds_proxy_service_path  = var.imds_proxy_service_path
-  gvproxy_service_path      = var.gvproxy_service_path
-  gvproxy_start_script_path = var.gvproxy_start_script_path
-  supervisor_service_path         = var.supervisor_service_path
+  eif_path               = var.eif_path
+  supervisor_binary_path = var.supervisor_binary_path
 }

@@ -134,7 +134,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("Created %s (language: %s)\n", configFile, language)
 
-		// Write framework files (flake.nix, gvproxy, systemd units, scripts, user_data, start.sh).
+		// Write framework files (flake.nix + tofu module; the supervisor.service
+		// unit is inlined into tofu/modules/enclave/templates/user_data.sh.tftpl).
 		for _, f := range getFrameworkFiles(language) {
 			destPath := filepath.Join(cwd, f.RelPath)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
@@ -144,6 +145,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("write %s: %w", f.RelPath, err)
 			}
 			fmt.Printf("Created %s\n", f.RelPath)
+		}
+
+		// Ensure .enclave/ (CLI-managed build outputs) is gitignored at root.
+		if err := ensureGitignoreEntry(cwd, ".enclave/"); err != nil {
+			return fmt.Errorf("update root .gitignore: %w", err)
 		}
 
 		fmt.Println()
@@ -228,4 +234,31 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("Next: enclave build")
 	return nil
+}
+
+// ensureGitignoreEntry appends `entry` to <dir>/.gitignore if it's not
+// already present. Creates the file if missing. Idempotent.
+func ensureGitignoreEntry(dir, entry string) error {
+	path := filepath.Join(dir, ".gitignore")
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == entry {
+			return nil
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+		if _, err := f.WriteString("\n"); err != nil {
+			return err
+		}
+	}
+	_, err = f.WriteString(entry + "\n")
+	return err
 }

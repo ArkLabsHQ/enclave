@@ -100,21 +100,14 @@ resource "aws_instance" "nitro" {
   }
 
   user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    region                       = var.region
-    dev_mode                     = var.deployment
-    app_name                     = var.app_name
-    kms_key_id                   = local.kms_key_id
-    eif_s3_url                   = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
-    enclave_init_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_init.key}"
-    enclave_init_systemd_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.watchdog_systemd.key}"
-    imds_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.imds_systemd.key}"
-    gvproxy_systemd_s3_url       = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_systemd.key}"
-    supervisor_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
-    supervisor_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_systemd.key}"
-    gvproxy_binary_s3_url        = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_binary.key}"
-    gvproxy_start_script_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_start_script.key}"
-    migration_cooldown           = var.migration_cooldown
-    previous_pcr0                = var.previous_pcr0
+    region                    = var.region
+    dev_mode                  = var.deployment
+    app_name                  = var.app_name
+    kms_key_id                = local.kms_key_id
+    eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
+    supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
+    migration_cooldown        = var.migration_cooldown
+    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {

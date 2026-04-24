@@ -59,13 +59,13 @@ variable "expected_pcr0" {
 }
 
 variable "supervisor_url" {
-  description = "Management server URL for local mode migrations (e.g. http://localhost:8444)."
+  description = "Supervisor server URL for local mode migrations (e.g. http://localhost:8444)."
   type        = string
   default     = "http://localhost:8444"
 }
 
 # --- GitHub Release artifacts ---
-# Build artifacts (EIF, supervisor, gvproxy) are fetched from a GitHub Release
+# Build artifacts (EIF, supervisor) are fetched from a GitHub Release
 # at apply time using null_resource + curl — unless local path overrides are set.
 
 variable "github_owner" {
@@ -108,40 +108,3 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
-variable "gvproxy_binary_path" {
-  description = "Local path to gvproxy binary. Overrides GitHub Release download."
-  type        = string
-  default     = ""
-}
-
-# --- Local asset file paths ---
-
-variable "enclave_init_script_path" {
-  description = "Local path to enclave_init.sh."
-  type        = string
-}
-
-variable "watchdog_service_path" {
-  description = "Local path to enclave-watchdog.service."
-  type        = string
-}
-
-variable "imds_proxy_service_path" {
-  description = "Local path to enclave-imds-proxy.service."
-  type        = string
-}
-
-variable "gvproxy_service_path" {
-  description = "Local path to gvproxy.service."
-  type        = string
-}
-
-variable "gvproxy_start_script_path" {
-  description = "Local path to gvproxy start.sh script."
-  type        = string
-}
-
-variable "supervisor_service_path" {
-  description = "Local path to supervisor.service."
-  type        = string
-}

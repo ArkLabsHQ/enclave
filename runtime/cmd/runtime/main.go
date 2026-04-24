@@ -15,6 +15,7 @@ import (
 	"time"
 
 	runtime "github.com/ArkLabsHQ/introspector-enclave/runtime"
+	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
 
 func main() {
@@ -43,6 +44,45 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	defer func() { _ = shutdownTracing(ctx) }()
+
+	// Point the Go DNS resolver at gvproxy's embedded DNS server. Nitriding's
+	// writeResolvconf writes /run/resolvconf/resolv.conf, but the enclave
+	// EIF rootfs doesn't symlink /etc/resolv.conf to that — so we write
+	// directly here before any code does name resolution. This replaces the
+	// `echo "nameserver …" > /etc/resolv.conf` that used to live in
+	// enclave/start.sh before the runtime absorbed the entrypoint.
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
+		// Best-effort; outside the enclave (e.g. local dev) /etc/ may be read-only.
+		slog.Debug("write /etc/resolv.conf", "error", err)
+	}
+
+	// Start the in-process IMDS vsock forwarder first so the AWS SDK calls
+	// nitriding makes during Start() (certcache, metrics) have working IMDS.
+	if err := runtime.StartViproxy(); err != nil {
+		slog.Error("viproxy start failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Build nitriding in-process. It terminates TLS on ENCLAVE_NITRIDING_EXT_PORT
+	// (443 by default) and reverse-proxies to the runtime's own proxy server
+	// on ENCLAVE_PROXY_PORT (7073). Replaces the former /app/nitriding daemon
+	// that used to exec this runtime as -appcmd.
+	nitCfg, err := runtime.BuildNitridingConfig()
+	if err != nil {
+		slog.Error("build nitriding config", "error", err)
+		os.Exit(1)
+	}
+	nitEnc, err := nitriding.NewEnclave(nitCfg)
+	if err != nil {
+		slog.Error("nitriding NewEnclave", "error", err)
+		os.Exit(1)
+	}
+	if err := nitEnc.Start(); err != nil {
+		slog.Error("nitriding start", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = nitEnc.Stop() }()
+	enc.SetAttestationRegistrar(nitEnc)
 
 	// 2. Ports.
 	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")

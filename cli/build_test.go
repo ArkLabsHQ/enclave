@@ -11,10 +11,7 @@ import (
 
 func TestGenerateBuildConfig(t *testing.T) {
 	root := t.TempDir()
-	// Create enclave/ directory (generateBuildConfig writes to enclave/build-config.json).
-	if err := os.MkdirAll(filepath.Join(root, "enclave"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	// generateBuildConfig creates .enclave/ itself; no MkdirAll needed.
 
 	cfg := &Config{
 		Name:    "testapp",
@@ -50,7 +47,7 @@ func TestGenerateBuildConfig(t *testing.T) {
 	}
 
 	// Read and parse the generated JSON.
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".enclave", "build-config.json"))
 	if err != nil {
 		t.Fatalf("read build-config.json: %v", err)
 	}
@@ -114,7 +111,7 @@ func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
 		t.Fatalf("generateBuildConfig: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".enclave", "build-config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +171,7 @@ func TestGenerateBuildConfig_BuildInputs(t *testing.T) {
 		t.Fatalf("generateBuildConfig: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".enclave", "build-config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +212,7 @@ func TestGenerateBuildConfig_BuildInputsNeverNull(t *testing.T) {
 		t.Fatalf("generateBuildConfig: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "build-config.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".enclave", "build-config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

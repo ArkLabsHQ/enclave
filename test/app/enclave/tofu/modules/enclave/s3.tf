@@ -4,9 +4,8 @@ locals {
   artifacts_dir  = "${path.module}/.artifacts"
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
-  eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
-  supervisor_source    = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
-  gvproxy_source = local.use_local ? var.gvproxy_binary_path : "${local.artifacts_dir}/gvproxy"
+  eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
+  supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
 }
 
 # Download build artifacts from GitHub Release (skipped when local paths are set).
@@ -24,7 +23,6 @@ resource "null_resource" "download_artifacts" {
       mkdir -p ${local.artifacts_dir}
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
     EOT
     environment = {
       GITHUB_TOKEN = var.github_token
@@ -57,34 +55,6 @@ resource "aws_s3_object" "enclave_eif" {
   etag       = local.use_local ? filemd5(local.eif_source) : null
 }
 
-resource "aws_s3_object" "enclave_init" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave_init.sh"
-  source = var.enclave_init_script_path
-  etag   = filemd5(var.enclave_init_script_path)
-}
-
-resource "aws_s3_object" "watchdog_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-watchdog.service"
-  source = var.watchdog_service_path
-  etag   = filemd5(var.watchdog_service_path)
-}
-
-resource "aws_s3_object" "imds_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-imds-proxy.service"
-  source = var.imds_proxy_service_path
-  etag   = filemd5(var.imds_proxy_service_path)
-}
-
-resource "aws_s3_object" "gvproxy_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy.service"
-  source = var.gvproxy_service_path
-  etag   = filemd5(var.gvproxy_service_path)
-}
-
 resource "aws_s3_object" "supervisor_binary" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
@@ -113,27 +83,9 @@ resource "aws_s3_object" "supervisor_binary_staging" {
   etag       = local.use_local ? filemd5(local.supervisor_source) : null
 }
 
-resource "aws_s3_object" "gvproxy_start_script" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy-start.sh"
-  source = var.gvproxy_start_script_path
-  etag   = filemd5(var.gvproxy_start_script_path)
-}
-
-resource "aws_s3_object" "gvproxy_binary" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "gvproxy"
-  source     = local.gvproxy_source
-  etag       = local.use_local ? filemd5(local.gvproxy_source) : null
-}
-
-resource "aws_s3_object" "supervisor_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "supervisor.service"
-  source = var.supervisor_service_path
-  etag   = filemd5(var.supervisor_service_path)
-}
+# The enclave-supervisor.service systemd unit is inlined in user_data.sh.tftpl
+# via a heredoc — no separate S3 object. Keeps deployment concerns colocated
+# with the tofu module that owns them.
 
 # Persistent storage bucket for enclave data (Store/Load API).
 

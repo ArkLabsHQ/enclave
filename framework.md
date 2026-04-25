@@ -98,6 +98,15 @@ invocation.
 | `tofu/modules/enclave/main.tf` | Merged resources: KMS, IAM, S3, SSM, VPC, EC2, with section banners |
 | `tofu/modules/enclave/templates/user_data.sh.tftpl` | EC2 cloud-init — inlines the `enclave-supervisor.service` systemd unit, which runs the supervisor binary owning gvproxy, the IMDS forwarder, the enclave lifecycle watchdog, and the management API in one process |
 
+**Artifact source.** By default `terraform.tfvars.json` points at
+`.enclave/artifacts/{image.eif,supervisor}` so tofu uploads what
+`enclave build` produced. With `--remote`, those paths are left empty
+and the module's bundled `null_resource.download_artifacts` curls
+`image.eif` and `supervisor` from
+`github.com/{app.nix_owner}/{app.nix_repo}/releases/download/{app.release_tag}/`
+at apply time before uploading to S3. The `release_tag` field in
+`enclave.yaml` (default `"eif-latest"`) selects which release to pull.
+
 ### 2. `enclave setup` — Auto-Populate Nix Hashes
 
 Detects the GitHub remote, computes Nix source and vendor hashes for the user's app, and writes them to `enclave.yaml`.

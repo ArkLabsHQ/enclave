@@ -51,6 +51,10 @@ type AppConfig struct {
 	NixNativeBuildInputs []string          `yaml:"nix_native_build_inputs"`
 	BinaryName           string            `yaml:"binary_name"`
 	Env                  map[string]string `yaml:"env"`
+	// ReleaseTag identifies the GitHub Release of nix_owner/nix_repo from
+	// which `enclave tofu --remote` downloads image.eif and supervisor.
+	// Defaults to "eif-latest" when unset.
+	ReleaseTag string `yaml:"release_tag"`
 }
 
 // SecretConfig defines a secret managed by KMS inside the enclave.
@@ -104,6 +108,9 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.App.Source == "" {
 		cfg.App.Source = "nix"
+	}
+	if cfg.App.ReleaseTag == "" {
+		cfg.App.ReleaseTag = "eif-latest"
 	}
 	if cfg.App.Language == "" {
 		cfg.App.Language = "go"

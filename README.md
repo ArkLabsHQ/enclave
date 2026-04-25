@@ -109,6 +109,11 @@ If built with `make build`, the `sdk:` section is auto-populated with the correc
 
 Run `enclave tofu` to generate the OpenTofu deployment module into `./tofu/`. It's a separate step so you can iterate on the build without regenerating (and clobbering customizations to) your infrastructure scaffold. Re-runs are safe — existing files are skipped. The `enclave-supervisor.service` systemd unit is inlined into `tofu/modules/enclave/templates/user_data.sh.tftpl`.
 
+Two artifact-source modes:
+
+- **Default** — `enclave tofu` writes `terraform.tfvars.json` pointing at the EIF and supervisor binary that `enclave build` produced under `.enclave/artifacts/`. Tofu uploads them to S3 directly. Best for fast iteration.
+- **Remote** — `enclave tofu --remote` leaves the local paths empty so tofu's bundled `null_resource` curls `image.eif` and `supervisor` from `github.com/<app.nix_owner>/<app.nix_repo>/releases/download/<app.release_tag>/` at apply time, then mirrors them to S3. Use this when a CI pipeline has already published a versioned GitHub Release. Pin a specific build by setting `release_tag: "eif-v1.2.3"` in `enclave.yaml`; default is `"eif-latest"`.
+
 ### 3. Set up app hashes
 
 The `setup` command auto-detects your GitHub remote and computes all nix hashes:
@@ -327,7 +332,7 @@ make install   # install to $GOPATH/bin
 | `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite enclave/flake.nix |
 | `enclave setup` | Use Nix for hash computation |
 | `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
-| `enclave tofu` | Generate OpenTofu deployment scaffold into ./tofu/ (merge-only-new) |
+| `enclave tofu` | Generate OpenTofu deployment scaffold into ./tofu/ (merge-only-new). Pass `--remote` to pull EIF + supervisor from a GitHub Release at apply time instead of from local files. |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
 | `enclave build` |  |
 | `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |

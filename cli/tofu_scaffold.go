@@ -12,16 +12,26 @@ import (
 // merge-only-new semantics: files that already exist are left untouched
 // so the user's customizations to kms.tf, ec2.tf, etc. survive re-runs.
 func tofuCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "tofu",
 		Short: "Generate the OpenTofu module scaffold into ./tofu/",
 		Long: `Writes the OpenTofu deployment scaffold (backend bootstrap, enclave
 module, state migration script, cloud-init template) into ./tofu/.
 
 Safe to re-run: existing files are skipped so local customizations are
-preserved. To regenerate a specific file, delete it first then re-run.`,
+preserved. To regenerate a specific file, delete it first then re-run.
+
+By default, terraform.tfvars.json points at the EIF and supervisor binary
+that 'enclave build' produced under .enclave/artifacts/ — tofu uploads
+those files directly to S3. Pass --remote to leave those paths empty so
+the tofu module pulls image.eif and supervisor from the GitHub Release
+identified by app.nix_owner / app.nix_repo / app.release_tag in
+enclave.yaml at apply time, then mirrors them to S3.`,
 		RunE: runTofuScaffold,
 	}
+	cmd.Flags().Bool("remote", false,
+		"Pull EIF + supervisor from the GitHub Release at apply time instead of using local files")
+	return cmd
 }
 
 func runTofuScaffold(cmd *cobra.Command, args []string) error {
@@ -30,12 +40,18 @@ func runTofuScaffold(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	remote, _ := cmd.Flags().GetBool("remote")
+
 	// Load config so writeTofuVars below can read region/app_name/secrets etc.
 	// loadConfig already returns a "(run 'enclave init' to create one)" hint
 	// when enclave.yaml is absent — no need to wrap further.
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
+	}
+	if remote && (cfg.App.NixOwner == "" || cfg.App.NixRepo == "") {
+		return fmt.Errorf("--remote requires app.nix_owner and app.nix_repo to be set in enclave.yaml " +
+			"(tofu pulls artifacts from github.com/<owner>/<repo>/releases/download/<release_tag>/)")
 	}
 	language := cfg.App.Language
 	if language == "" {
@@ -74,11 +90,16 @@ func runTofuScaffold(cmd *cobra.Command, args []string) error {
 	// additional flags. Always overwrites — tfvars is derived state, not
 	// user-editable scaffolding. Re-run after editing enclave.yaml or after
 	// `enclave build` (to pick up a fresh PCR0).
-	if err := writeTofuVars(cfg, root); err != nil {
+	if err := writeTofuVars(cfg, root, remote); err != nil {
 		return fmt.Errorf("write terraform.tfvars.json: %w", err)
 	}
-	fmt.Println("Wrote    tofu/terraform.tfvars.json (from enclave.yaml)")
-
-	fmt.Println("\nNext: enclave build  →  cd tofu && tofu init && tofu apply")
+	if remote {
+		fmt.Printf("Wrote    tofu/terraform.tfvars.json — remote artifacts: github.com/%s/%s @ %s\n",
+			cfg.App.NixOwner, cfg.App.NixRepo, cfg.App.ReleaseTag)
+		fmt.Println("\nNext: cd tofu && tofu init && tofu apply")
+	} else {
+		fmt.Println("Wrote    tofu/terraform.tfvars.json (from enclave.yaml)")
+		fmt.Println("\nNext: enclave build  →  cd tofu && tofu init && tofu apply")
+	}
 	return nil
 }

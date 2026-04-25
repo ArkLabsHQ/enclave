@@ -38,7 +38,13 @@ func tofuDir(root string) string {
 }
 
 // writeTofuVars writes the terraform.tfvars.json file from the config.
-func writeTofuVars(cfg *Config, root string) error {
+//
+// When remote is true, EIFPath and SupervisorBinaryPath are left empty so
+// the tofu module's null_resource.download_artifacts pulls image.eif and
+// supervisor from the GitHub Release at apply time
+// (see cli/tofu_files.go: locals.use_local). The github_owner/github_repo/
+// release_tag fields supply the URL coordinates.
+func writeTofuVars(cfg *Config, root string, remote bool) error {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("resolve repo root: %w", err)
@@ -58,11 +64,13 @@ func writeTofuVars(cfg *Config, root string) error {
 
 		GithubOwner: cfg.App.NixOwner,
 		GithubRepo:  cfg.App.NixRepo,
-		ReleaseTag:  "eif-latest",
+		ReleaseTag:  cfg.App.ReleaseTag,
+	}
 
-		// CLI builds artifacts locally — use local paths, skip GitHub download.
-		EIFPath:              filepath.Join(absRoot, ".enclave", "artifacts", "image.eif"),
-		SupervisorBinaryPath: filepath.Join(absRoot, ".enclave", "artifacts", "supervisor"),
+	if !remote {
+		// Local mode: point tofu at the artifacts produced by `enclave build`.
+		vars.EIFPath = filepath.Join(absRoot, ".enclave", "artifacts", "image.eif")
+		vars.SupervisorBinaryPath = filepath.Join(absRoot, ".enclave", "artifacts", "supervisor")
 	}
 
 	data, err := json.MarshalIndent(vars, "", "  ")

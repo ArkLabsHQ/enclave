@@ -44,6 +44,7 @@ app:
     - "."
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
 
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}

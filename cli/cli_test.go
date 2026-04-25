@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,6 +97,133 @@ func TestCLI_Init(t *testing.T) {
 				t.Error("modules/enclave/main.tf missing destroy provisioner")
 			}
 		})
+	}
+}
+
+// runEnclaveTofu runs `enclave init --language go && enclave tofu [args...]`
+// in a fresh temp dir and returns the parsed terraform.tfvars.json.
+func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[string]string) map[string]any {
+	t.Helper()
+	dir := t.TempDir()
+
+	initCmd := exec.Command(bin, "init", "--language", "go")
+	initCmd.Dir = dir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("enclave init failed:\n%s", out)
+	}
+
+	// Mutate enclave.yaml so nix_owner/nix_repo/release_tag are non-empty —
+	// `enclave tofu --remote` requires owner+repo, and the default release_tag
+	// from the loader is "eif-latest" but the scaffolded file pins it.
+	cfgPath := filepath.Join(dir, "enclave", "enclave.yaml")
+	cfg, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read enclave.yaml: %v", err)
+	}
+	updated := string(cfg)
+	for needle, replacement := range yamlEdits {
+		updated = strings.Replace(updated, needle, replacement, 1)
+	}
+	if err := os.WriteFile(cfgPath, []byte(updated), 0644); err != nil {
+		t.Fatalf("write enclave.yaml: %v", err)
+	}
+
+	tofuCmd := exec.Command(bin, append([]string{"tofu"}, tofuArgs...)...)
+	tofuCmd.Dir = dir
+	if out, err := tofuCmd.CombinedOutput(); err != nil {
+		t.Fatalf("enclave tofu %v failed:\n%s", tofuArgs, out)
+	}
+
+	tfvarsPath := filepath.Join(dir, "tofu", "terraform.tfvars.json")
+	tfvars, err := os.ReadFile(tfvarsPath)
+	if err != nil {
+		t.Fatalf("read tfvars: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(tfvars, &parsed); err != nil {
+		t.Fatalf("parse tfvars: %v", err)
+	}
+	return parsed
+}
+
+// TestCLI_Tofu_Default verifies that `enclave tofu` (no flag) populates
+// the local artifact paths so tofu uploads them straight from disk.
+func TestCLI_Tofu_Default(t *testing.T) {
+	binDir := t.TempDir()
+	bin := buildCLI(t, binDir)
+
+	parsed := runEnclaveTofu(t, bin, nil, map[string]string{
+		`nix_owner: ""`: `nix_owner: "ArkLabsHQ"`,
+		`nix_repo: ""`:  `nix_repo: "introspector-enclave"`,
+	})
+
+	if eifPath, _ := parsed["eif_path"].(string); eifPath == "" {
+		t.Error("default mode: expected eif_path to be populated, got empty")
+	}
+	if supPath, _ := parsed["supervisor_binary_path"].(string); supPath == "" {
+		t.Error("default mode: expected supervisor_binary_path to be populated, got empty")
+	}
+	// Round-trip: the scaffolded yaml's `release_tag: "eif-latest"` line
+	// flows through the loader into tfvars. Catches regressions where a
+	// future template edit drops the field and the loader's default
+	// silently masks it.
+	if tag, _ := parsed["release_tag"].(string); tag != "eif-latest" {
+		t.Errorf("default mode: release_tag=%q, want eif-latest (from scaffolded enclave.yaml)", tag)
+	}
+}
+
+// TestCLI_Tofu_Remote verifies that `enclave tofu --remote` leaves the
+// local paths empty (so the tofu module's null_resource downloads from
+// GitHub Release at apply time) and surfaces the user-pinned release_tag.
+func TestCLI_Tofu_Remote(t *testing.T) {
+	binDir := t.TempDir()
+	bin := buildCLI(t, binDir)
+
+	parsed := runEnclaveTofu(t, bin, []string{"--remote"}, map[string]string{
+		`nix_owner: ""`:             `nix_owner: "ArkLabsHQ"`,
+		`nix_repo: ""`:              `nix_repo: "introspector-enclave"`,
+		`release_tag: "eif-latest"`: `release_tag: "eif-v0.1.0"`,
+	})
+
+	if eifPath, _ := parsed["eif_path"].(string); eifPath != "" {
+		t.Errorf("--remote: expected empty eif_path, got %q", eifPath)
+	}
+	if supPath, _ := parsed["supervisor_binary_path"].(string); supPath != "" {
+		t.Errorf("--remote: expected empty supervisor_binary_path, got %q", supPath)
+	}
+	if owner, _ := parsed["github_owner"].(string); owner != "ArkLabsHQ" {
+		t.Errorf("--remote: github_owner=%q, want ArkLabsHQ", owner)
+	}
+	if repo, _ := parsed["github_repo"].(string); repo != "introspector-enclave" {
+		t.Errorf("--remote: github_repo=%q, want introspector-enclave", repo)
+	}
+	if tag, _ := parsed["release_tag"].(string); tag != "eif-v0.1.0" {
+		t.Errorf("--remote: release_tag=%q, want eif-v0.1.0 (pinned in enclave.yaml)", tag)
+	}
+}
+
+// TestCLI_Tofu_Remote_RequiresOwnerRepo verifies the early error when
+// --remote is used but the GitHub coords aren't set in enclave.yaml.
+func TestCLI_Tofu_Remote_RequiresOwnerRepo(t *testing.T) {
+	binDir := t.TempDir()
+	bin := buildCLI(t, binDir)
+	dir := t.TempDir()
+
+	initCmd := exec.Command(bin, "init", "--language", "go")
+	initCmd.Dir = dir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("enclave init failed:\n%s", out)
+	}
+
+	// Leave nix_owner/nix_repo as their scaffolded defaults ("").
+	tofuCmd := exec.Command(bin, "tofu", "--remote")
+	tofuCmd.Dir = dir
+	out, err := tofuCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected --remote without owner/repo to error, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "nix_owner") || !strings.Contains(string(out), "nix_repo") {
+		t.Errorf("error message should mention nix_owner/nix_repo, got: %s", out)
 	}
 }
 

@@ -30,6 +30,7 @@ app:
   nix_sub_packages:
     - "cmd"
   binary_name: "test-app"
+  release_tag: "eif-latest"
 
   env:
     # AWS services through gvproxy TAP via host.containers.internal (matches production path).

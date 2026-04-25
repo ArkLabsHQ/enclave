@@ -261,6 +261,12 @@ func (w *Watchdog) terminateEnclave() error {
 // queries nitro-cli describe-enclaves. In test (or any non-nitro-cli
 // environment) it falls back to polling ENCLAVE_URL/health — if the
 // enclave's TLS endpoint responds at all (200 or 503), it's alive.
+//
+// Production safety: the nitro-cli branch is the only path taken on a real
+// Nitro EC2 host (nitro-cli ships with the AL2023 nitro-enclaves-cli
+// package installed by user_data). The TLS-probe branch only triggers in
+// test/dev when nitro-cli is absent (e.g. the QEMU integration harness).
+// See the InsecureSkipVerify discussion below.
 func (w *Watchdog) isRunning() (bool, error) {
 	if _, err := exec.LookPath("nitro-cli"); err == nil {
 		enclaves, err := describeEnclaves()
@@ -274,7 +280,7 @@ func (w *Watchdog) isRunning() (bool, error) {
 		}
 		return false, nil
 	}
-	// No nitro-cli: use TLS health probe.
+	// No nitro-cli on PATH — test/dev fallback only.
 	url := os.Getenv("ENCLAVE_URL")
 	if url == "" {
 		// Can't tell; assume running so the poll loop doesn't thrash.
@@ -283,7 +289,11 @@ func (w *Watchdog) isRunning() (bool, error) {
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			// Liveness probe only — the enclave serves a self-signed cert
+			// (attestation-pinned, not registered with any CA). Verifying
+			// against a trust store is impossible by design. This branch is
+			// unreachable in production (nitro-cli is the path there).
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 		},
 	}
 	resp, err := client.Get(url + "/health")

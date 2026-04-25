@@ -44,14 +44,16 @@ jobs:
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
           enclave tofu
-          cd tofu
-          tofu init
-          tofu apply -auto-approve
+          # Stash the artifacts dir before the tofu run so the PCR reads below
+          # resolve to the right path regardless of current working directory.
+          ARTIFACTS="$PWD/.enclave/artifacts"
+          tofu -chdir=tofu init
+          tofu -chdir=tofu apply -auto-approve
 
           # Extract deployment outputs for manifest and verification.
-          pcr0=$(jq -r '.PCR0' .enclave/artifacts/pcr.json)
-          pcr1=$(jq -r '.PCR1' .enclave/artifacts/pcr.json)
-          pcr2=$(jq -r '.PCR2' .enclave/artifacts/pcr.json)
+          pcr0=$(jq -r '.PCR0' "$ARTIFACTS/pcr.json")
+          pcr1=$(jq -r '.PCR1' "$ARTIFACTS/pcr.json")
+          pcr2=$(jq -r '.PCR2' "$ARTIFACTS/pcr.json")
           echo "pcr0=${pcr0}" >> "$GITHUB_OUTPUT"
           echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
           echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"

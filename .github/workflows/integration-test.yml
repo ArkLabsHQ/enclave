@@ -40,9 +40,14 @@ jobs:
           go build -o /tmp/enclave-cli ./cli/cmd/enclave
           export RUNTIME_LOCAL_PATH=$GITHUB_WORKSPACE
           export SUPERVISOR_LOCAL_PATH=$GITHUB_WORKSPACE
+          # Build the test app from the workspace tree (mirrors `make test-build`)
+          # so the baked nix_rev/nix_hash in test/app/enclave/enclave.yaml don't
+          # need to be re-pinned on every change to test/app/.
+          export APP_LOCAL_PATH=$GITHUB_WORKSPACE/test/app
 
           # Vendor SDK dependencies (vendor/ is gitignored, Nix needs it when using local source).
           cd $RUNTIME_LOCAL_PATH/runtime && go mod vendor && cd $GITHUB_WORKSPACE/test/app
+          go mod vendor
 
           # Build v1 once; stash to /tmp so v2's baked predecessor PCR0 is
           # guaranteed to match the final installed v1.

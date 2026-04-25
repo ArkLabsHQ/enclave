@@ -105,7 +105,9 @@ func (w *Watchdog) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			w.terminateEnclave()
+			if err := w.terminateEnclave(); err != nil {
+				slog.Warn("enclave termination on shutdown failed", "error", err)
+			}
 			return nil
 		case <-ticker.C:
 		}

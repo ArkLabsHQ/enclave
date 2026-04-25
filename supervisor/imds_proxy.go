@@ -66,7 +66,7 @@ func runIMDSProxy(ctx context.Context) error {
 }
 
 func handleIMDSConn(ctx context.Context, src net.Conn, target string) {
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	dctx, cancel := context.WithTimeout(ctx, imdsDialTimeout)
 	defer cancel()
@@ -76,7 +76,7 @@ func handleIMDSConn(ctx context.Context, src net.Conn, target string) {
 		slog.Error("imds upstream dial failed", "target", target, "error", err)
 		return
 	}
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	errCh := make(chan error, 2)
 	go func() { _, err := io.Copy(dst, src); errCh <- err }()

@@ -32,9 +32,9 @@ type tofuVars struct {
 	SupervisorBinaryPath string `json:"supervisor_binary_path,omitempty"`
 }
 
-// tofuDir returns the absolute path to the enclave/tofu/ directory.
+// tofuDir returns the absolute path to the tofu/ directory at the repo root.
 func tofuDir(root string) string {
-	return filepath.Join(root, "enclave", "tofu")
+	return filepath.Join(root, "tofu")
 }
 
 // writeTofuVars writes the terraform.tfvars.json file from the config.
@@ -109,7 +109,7 @@ type tofuOutputJSON map[string]struct {
 }
 
 // loadTofuOutputs runs tofu output -json and parses the result.
-// It also caches the result to enclave/tofu-outputs.json for offline reads.
+// It also caches the result to tofu/tofu-outputs.json for offline reads.
 func loadTofuOutputs(root string) (TofuOutputs, error) {
 	dir := tofuDir(root)
 
@@ -133,7 +133,7 @@ func loadTofuOutputs(root string) (TofuOutputs, error) {
 
 	// Cache for offline reads.
 	cacheData, _ := json.MarshalIndent(outputs, "", "  ")
-	cachePath := filepath.Join(root, "enclave", "tofu-outputs.json")
+	cachePath := filepath.Join(tofuDir(root), "tofu-outputs.json")
 	_ = os.WriteFile(cachePath, cacheData, 0644)
 
 	return outputs, nil
@@ -141,7 +141,7 @@ func loadTofuOutputs(root string) (TofuOutputs, error) {
 
 // loadCachedTofuOutputs reads the cached tofu-outputs.json file.
 func loadCachedTofuOutputs(root string) (TofuOutputs, error) {
-	data, err := os.ReadFile(filepath.Join(root, "enclave", "tofu-outputs.json"))
+	data, err := os.ReadFile(filepath.Join(tofuDir(root), "tofu-outputs.json"))
 	if err != nil {
 		return nil, fmt.Errorf("cannot read tofu outputs: %w (run 'tofu apply' first)", err)
 	}

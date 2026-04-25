@@ -134,9 +134,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("Created %s (language: %s)\n", configFile, language)
 
-		// Write framework files (flake.nix + tofu module; the supervisor.service
-		// unit is inlined into tofu/modules/enclave/templates/user_data.sh.tftpl).
-		for _, f := range getFrameworkFiles(language) {
+		// Write build-time framework files (flake.nix + CI workflows). The
+		// OpenTofu deployment scaffold lives under ./tofu/ and is emitted by
+		// `enclave tofu`, not here, so users can iterate on build and
+		// deployment independently.
+		for _, f := range getInitFiles(language) {
 			destPath := filepath.Join(cwd, f.RelPath)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 				return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
@@ -157,6 +159,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No runtime imports needed — the supervisor handles attestation automatically.")
 		fmt.Println("Then run 'enclave setup' to compute hashes and 'enclave build' to build.")
+		fmt.Println("Before deploying, run 'enclave tofu' to generate the OpenTofu module.")
 		return nil
 	}
 

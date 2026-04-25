@@ -211,7 +211,7 @@ rm -f "${SCRIPT_DIR}/app/.enclave/artifacts/image.eif.backup"
 
 
 # --- OpenTofu helpers ---
-TOFU_DIR="${SCRIPT_DIR}/app/enclave/tofu"
+TOFU_DIR="${SCRIPT_DIR}/app/tofu"
 LOCALSTACK="--endpoint-url http://127.0.0.1:4566 --region us-east-1"
 export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
@@ -226,6 +226,8 @@ export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-http://127.0.0.1:4566}"
 
 tofu_apply() {
   # Always regenerate tfvars — paths differ between host and Docker.
+  # `enclave tofu` also ensures the tofu/ scaffold is present (merge-only-new,
+  # so pre-existing test-app files are left alone) before rewriting tfvars.
   echo "  Generating terraform.tfvars.json..."
 
   # Ensure artifact placeholders exist for tofu's filemd5() (local mode
@@ -237,7 +239,8 @@ tofu_apply() {
     [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/.enclave/artifacts/$f"
   done
 
-  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tfvars)
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu > "${SCRIPT_DIR}/tofu-scaffold.log" 2>&1) \
+    || { cat "${SCRIPT_DIR}/tofu-scaffold.log"; return 1; }
 
   # Write local backend config for testing (enclave build generates S3 backend.tf for production).
   cat > "${TOFU_DIR}/backend.tf" <<BACKEND

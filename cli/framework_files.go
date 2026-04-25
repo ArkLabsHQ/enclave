@@ -9,10 +9,15 @@ type frameworkFile struct {
 	Content string      // file content
 }
 
-// getFrameworkFiles returns the list of framework files to scaffold.
-// These are required by OpenTofu deploy and Nix build (flake.nix).
-// The language parameter selects the correct flake.nix template.
-func getFrameworkFiles(language string) []frameworkFile {
+// getInitFiles returns the build-time framework files scaffolded by
+// `enclave init`. Limited to Nix build inputs and CI workflow templates
+// that are tied to the build (not deployment). The language parameter
+// selects the correct flake.nix template.
+//
+// Deployment scaffolding (OpenTofu module) is emitted by `enclave tofu`
+// via getTofuFiles; splitting the two lets users customize one without
+// inadvertently regenerating the other.
+func getInitFiles(language string) []frameworkFile {
 	flakeNix := frameworkFlakeNix // default: Go
 	switch language {
 	case "nodejs":
@@ -28,95 +33,6 @@ func getFrameworkFiles(language string) []frameworkFile {
 			RelPath: "enclave/flake.nix",
 			Mode:    0644,
 			Content: flakeNix,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/templates/user_data.sh.tftpl",
-			Mode:    0644,
-			Content: frameworkUserData,
-		},
-		// OpenTofu root module.
-		{
-			RelPath: "enclave/tofu/main.tf",
-			Mode:    0644,
-			Content: tofuRootMain,
-		},
-		{
-			RelPath: "enclave/tofu/variables.tf",
-			Mode:    0644,
-			Content: tofuRootVariables,
-		},
-		{
-			RelPath: "enclave/tofu/outputs.tf",
-			Mode:    0644,
-			Content: tofuRootOutputs,
-		},
-		// OpenTofu enclave module.
-		{
-			RelPath: "enclave/tofu/modules/enclave/main.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveMain,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/variables.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveVariables,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/outputs.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveOutputs,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/kms.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveKMS,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/iam.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveIAM,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/ssm.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveSSM,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/s3.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveS3,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/vpc.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveVPC,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/ec2.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveEC2,
-		},
-		// OpenTofu backend bootstrap module.
-		{
-			RelPath: "enclave/tofu/modules/backend/main.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendMain,
-		},
-		{
-			RelPath: "enclave/tofu/modules/backend/variables.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendVariables,
-		},
-		{
-			RelPath: "enclave/tofu/modules/backend/outputs.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendOutputs,
-		},
-		// State migration script.
-		{
-			RelPath: "enclave/tofu/migrate-state.sh",
-			Mode:    0755,
-			Content: tofuMigrateState,
 		},
 		{
 			RelPath: ".github/workflows/deploy-enclave.yml",
@@ -138,23 +54,35 @@ func getFrameworkFiles(language string) []frameworkFile {
 			Mode:    0644,
 			Content: frameworkBuildEIFWorkflow,
 		},
-		{
-			RelPath: "enclave/.gitignore",
-			Mode:    0644,
-			Content: frameworkGitignore,
-		},
 	}
 }
 
-// Gitignore for the enclave/ subdirectory — inputs only (config, flake,
-// tofu templates). Build outputs live under the repo-root .enclave/ directory
-// (gitignored separately via the root .gitignore).
-const frameworkGitignore = `# OpenTofu state and outputs (contains account-specific IDs)
+// getTofuFiles returns the OpenTofu module scaffolding emitted by
+// `enclave tofu`. Paths are relative to the repo root; the tree lives
+// under ./tofu/ so it's independent of the enclave/ build inputs.
+//
+// The language parameter is currently unused (templates don't vary by
+// language) but kept for parity with getInitFiles in case per-language
+// defaults are introduced later.
+func getTofuFiles(_ string) []frameworkFile {
+	return []frameworkFile{
+		{RelPath: "tofu/main.tf", Mode: 0644, Content: tofuRootMain},
+		{RelPath: "tofu/.gitignore", Mode: 0644, Content: frameworkTofuGitignore},
+		{RelPath: "tofu/modules/backend/main.tf", Mode: 0644, Content: tofuModuleBackendMain},
+		{RelPath: "tofu/modules/enclave/main.tf", Mode: 0644, Content: tofuModuleEnclaveMain},
+		{RelPath: "tofu/modules/enclave/templates/user_data.sh.tftpl", Mode: 0644, Content: frameworkUserData},
+	}
+}
+
+// Gitignore for the tofu/ scaffold — hides account-specific state and
+// generated files. Scaffolded by `enclave tofu` alongside the module tree.
+const frameworkTofuGitignore = `# OpenTofu state and outputs (contains account-specific IDs)
 tofu-outputs.json
 terraform.tfvars.json
 terraform.tfstate
 terraform.tfstate.backup
 .terraform/
+backend.tf
 `
 
 // EC2 user_data cloud-init — installs dependencies, downloads EIF, configures services.
@@ -684,7 +612,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -703,7 +631,8 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          cd enclave/tofu
+          enclave tofu
+          cd tofu
           tofu init
           tofu apply -auto-approve
 
@@ -953,7 +882,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -962,7 +891,7 @@ jobs:
 
       - name: Destroy infrastructure
         run: |
-          cd enclave/tofu
+          cd tofu
           tofu init
           tofu destroy -auto-approve
 `
@@ -1350,7 +1279,7 @@ jobs:
           go-version: stable
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - name: Fetch deployment manifest
         id: manifest
@@ -1524,7 +1453,7 @@ jobs:
           go-version: stable
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9

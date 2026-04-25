@@ -110,11 +110,6 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("build supervisor server: %w", err)
 	}
 
-	// Generate terraform.tfvars.json so tofu apply can be run directly.
-	if err := writeTofuVars(cfg, root); err != nil {
-		return fmt.Errorf("generate tfvars: %w", err)
-	}
-
 	fmt.Println()
 	fmt.Println("[build] Done:")
 	fmt.Printf("  PCR0:    %s\n", pcrs.PCR0)
@@ -122,12 +117,10 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  PCR2:    %s\n", pcrs.PCR2)
 	fmt.Printf("  EIF:     .enclave/artifacts/image.eif\n")
 	fmt.Printf("  Supervisor: .enclave/artifacts/supervisor\n")
-	fmt.Printf("  Tfvars:  enclave/tofu/terraform.tfvars.json\n")
 	fmt.Println()
 	fmt.Println("Next:")
-	fmt.Println("  cd enclave/tofu")
-	fmt.Println("  tofu init")
-	fmt.Println("  tofu apply")
+	fmt.Println("  enclave tofu                # refresh tofu/terraform.tfvars.json with this build's PCR0")
+	fmt.Println("  cd tofu && tofu init && tofu apply")
 	return nil
 }
 

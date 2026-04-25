@@ -95,27 +95,35 @@
 
 ## 2. Build Flow
 
-### 2.1 Initialization (`enclave init`)
+### 2.1 Initialization (`enclave init` + `enclave tofu`)
 
 ```
-enclave init
+enclave init (build-time scaffold only)
     │
     ├─ First time (no enclave.yaml exists):
     │   ├─ Create enclave/ directory
     │   ├─ Write enclave/enclave.yaml from template
     │   │   └─ Substitute SDK coordinates (rev, hash, vendor_hash) from ldflags
-    │   └─ Write framework files via getFrameworkFiles():
+    │   └─ Write build-time framework files via getInitFiles():
     │       ├─ enclave/flake.nix (language-specific: Go / Node.js / .NET / Rust)
-    │       ├─ enclave/systemd/enclave-supervisor.service (single unit)
-    │       ├─ enclave/tofu/ (OpenTofu module scaffold + user_data.sh.tftpl)
-    │       ├─ .github/workflows/ (CI/CD workflows)
-    │       └─ enclave/.gitignore
+    │       └─ .github/workflows/ (CI/CD workflows)
     │
     └─ Existing config:
         ├─ Load and validate all required fields
         ├─ Validate app coordinates (nix_owner, nix_repo, nix_rev, nix_hash)
         ├─ Validate SDK coordinates (rev, hash, vendor_hash)
         └─ Print summary with secret count
+
+enclave tofu (deployment scaffold, run before first deploy)
+    └─ Write OpenTofu tree via getTofuFiles() with merge-only-new
+       (one main.tf per module, sectioned by banner comments):
+        ├─ tofu/main.tf            (root: provider + module call + vars + outputs)
+        ├─ tofu/modules/enclave/main.tf
+        │   └─ KMS, IAM, S3, SSM, VPC, EC2, vars, outputs
+        ├─ tofu/modules/enclave/templates/user_data.sh.tftpl
+        ├─ tofu/modules/backend/main.tf  (state bucket + lock table bootstrap)
+        └─ tofu/.gitignore
+    └─ Always rewrite tofu/terraform.tfvars.json from enclave.yaml.
 ```
 
 ### 2.2 Configuration (`enclave/enclave.yaml`)

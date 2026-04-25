@@ -69,7 +69,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	fmt.Printf("[setup] Language: %s\n", language)
 
 	// Rewrite enclave/flake.nix to match the language.
-	for _, f := range getFrameworkFiles(language) {
+	for _, f := range getInitFiles(language) {
 		if f.RelPath == "enclave/flake.nix" {
 			destPath := filepath.Join(root, f.RelPath)
 			if err := os.WriteFile(destPath, []byte(f.Content), f.Mode); err != nil {

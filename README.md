@@ -104,9 +104,10 @@ enclave init
 Both create:
 - `enclave/enclave.yaml` — main config file
 - `enclave/flake.nix` — Nix build definition (language-specific)
-- `enclave/tofu/` — OpenTofu module for deploy (the `enclave-supervisor.service` systemd unit is inlined into `tofu/modules/enclave/templates/user_data.sh.tftpl`)
 
 If built with `make build`, the `sdk:` section is auto-populated with the correct hashes.
+
+Run `enclave tofu` to generate the OpenTofu deployment module into `./tofu/`. It's a separate step so you can iterate on the build without regenerating (and clobbering customizations to) your infrastructure scaffold. Re-runs are safe — existing files are skipped. The `enclave-supervisor.service` systemd unit is inlined into `tofu/modules/enclave/templates/user_data.sh.tftpl`.
 
 ### 3. Set up app hashes
 
@@ -326,6 +327,7 @@ make install   # install to $GOPATH/bin
 | `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite enclave/flake.nix |
 | `enclave setup` | Use Nix for hash computation |
 | `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
+| `enclave tofu` | Generate OpenTofu deployment scaffold into ./tofu/ (merge-only-new) |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
 | `enclave build` |  |
 | `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |

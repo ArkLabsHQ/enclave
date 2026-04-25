@@ -62,23 +62,41 @@ The framework provides an **irreversible security guarantee**: once a KMS key is
 ### Lifecycle Workflow
 
 ```
-enclave init   →  enclave setup  →  enclave build  →  enclave deploy  →  enclave verify
-                                                    →  enclave status
-                                                    →  enclave lock
-                                                    →  enclave destroy
+enclave init  →  enclave setup  →  enclave tofu  →  enclave build  →  enclave deploy
+                                                                   →  enclave verify
+                                                                   →  enclave status
+                                                                   →  enclave destroy
 ```
 
 ### 1. `enclave init` — Project Scaffolding
 
-Generates the `enclave/` directory with all framework files needed to build and deploy:
+Generates the build-time files needed to compile an EIF:
 
 | File | Purpose |
 |------|---------|
-| `enclave.yaml` | Configuration (secrets, app source, region, etc.) |
-| `tofu/` | OpenTofu module scaffold (VPC, EC2, KMS, IAM, SSM, S3) |
-| `tofu/modules/enclave/templates/user_data.sh.tftpl` | EC2 cloud-init script — inlines the `enclave-supervisor.service` systemd unit, which runs the supervisor binary owning gvproxy, the IMDS forwarder, the enclave lifecycle watchdog, and the management API in one process |
+| `enclave/enclave.yaml` | Configuration (secrets, app source, region, etc.) |
+| `enclave/flake.nix` | Language-specific Nix build definition |
+| `.github/workflows/*.yml` | CI templates (build-eif, deploy-enclave, verify-enclave, destroy-enclave) |
 
-On subsequent runs, validates the configuration and reports errors.
+On subsequent runs, validates the configuration and reports errors. The
+OpenTofu deployment scaffold is **not** generated here — run
+`enclave tofu` separately when you're ready to deploy.
+
+### 1a. `enclave tofu` — Deployment Scaffold
+
+Writes a consolidated OpenTofu module tree to `./tofu/` at the repo root —
+one `main.tf` per module, plus the `user_data.sh.tftpl` cloud-init
+template. Merge-only-new: existing files are preserved so local
+customizations to any merged `main.tf` survive re-runs. Also rewrites
+`tofu/terraform.tfvars.json` from the current `enclave.yaml` on every
+invocation.
+
+| File | Purpose |
+|------|---------|
+| `tofu/main.tf` | Root module — provider, module call into `./modules/enclave`, variables, outputs |
+| `tofu/modules/backend/main.tf` | S3 state bucket + DynamoDB lock table bootstrap (run separately) |
+| `tofu/modules/enclave/main.tf` | Merged resources: KMS, IAM, S3, SSM, VPC, EC2, with section banners |
+| `tofu/modules/enclave/templates/user_data.sh.tftpl` | EC2 cloud-init — inlines the `enclave-supervisor.service` systemd unit, which runs the supervisor binary owning gvproxy, the IMDS forwarder, the enclave lifecycle watchdog, and the management API in one process |
 
 ### 2. `enclave setup` — Auto-Populate Nix Hashes
 

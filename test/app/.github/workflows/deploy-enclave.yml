@@ -24,7 +24,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -43,7 +43,8 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          cd enclave/tofu
+          enclave tofu
+          cd tofu
           tofu init
           tofu apply -auto-approve
 

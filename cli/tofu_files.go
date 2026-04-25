@@ -1,7 +1,8 @@
 package cli
 
-// OpenTofu files scaffolded by `enclave init`.
-// Generated from enclave/tofu/ — do not edit by hand.
+// OpenTofu scaffolding emitted by `enclave tofu`. One main.tf per module
+// keeps the user's tofu/ tree small; section banners inside each string
+// make the consolidated files still navigable.
 
 const tofuRootMain = `# Root module for the enclave CLI.
 # Calls the reusable enclave module.
@@ -50,20 +51,15 @@ module "enclave" {
   release_tag   = var.release_tag
   github_token  = var.github_token
 
-  eif_path            = var.eif_path
-  supervisor_binary_path    = var.supervisor_binary_path
-  gvproxy_binary_path = var.gvproxy_binary_path
-
-  enclave_init_script_path = var.enclave_init_script_path
-  watchdog_service_path    = var.watchdog_service_path
-  imds_proxy_service_path  = var.imds_proxy_service_path
-  gvproxy_service_path      = var.gvproxy_service_path
-  gvproxy_start_script_path = var.gvproxy_start_script_path
-  supervisor_service_path         = var.supervisor_service_path
+  eif_path               = var.eif_path
+  supervisor_binary_path = var.supervisor_binary_path
 }
-`
 
-const tofuRootVariables = `# Root module variables — pass-through to sub-modules.
+# =============================================================================
+# Variables
+# =============================================================================
+
+# Root module variables — pass-through to sub-modules.
 # These are populated by the Go CLI via terraform.tfvars.json,
 # or by company CI pipelines via -var flags or .tfvars files.
 
@@ -176,46 +172,12 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
-variable "gvproxy_binary_path" {
-  description = "Local path to gvproxy binary. Overrides GitHub Release download."
-  type        = string
-  default     = ""
-}
 
-# --- Local asset file paths ---
+# =============================================================================
+# Outputs
+# =============================================================================
 
-variable "enclave_init_script_path" {
-  description = "Local path to enclave_init.sh."
-  type        = string
-}
-
-variable "watchdog_service_path" {
-  description = "Local path to enclave-watchdog.service."
-  type        = string
-}
-
-variable "imds_proxy_service_path" {
-  description = "Local path to enclave-imds-proxy.service."
-  type        = string
-}
-
-variable "gvproxy_service_path" {
-  description = "Local path to gvproxy.service."
-  type        = string
-}
-
-variable "gvproxy_start_script_path" {
-  description = "Local path to gvproxy start.sh script."
-  type        = string
-}
-
-variable "supervisor_service_path" {
-  description = "Local path to supervisor.service."
-  type        = string
-}
-`
-
-const tofuRootOutputs = `# Root module outputs — re-exported from sub-modules.
+# Root module outputs — re-exported from sub-modules.
 
 output "ec2_role_arn" {
   description = "EC2 instance role ARN."
@@ -267,9 +229,12 @@ locals {
   az_a = "${var.region}a"
   az_b = "${var.region}b"
 }
-`
 
-const tofuModuleEnclaveVariables = `variable "region" {
+# =============================================================================
+# Variables
+# =============================================================================
+
+variable "region" {
   description = "AWS region for all resources."
   type        = string
 }
@@ -336,7 +301,7 @@ variable "supervisor_url" {
 }
 
 # --- GitHub Release artifacts ---
-# Build artifacts (EIF, supervisor, gvproxy) are fetched from a GitHub Release
+# Build artifacts (EIF, supervisor) are fetched from a GitHub Release
 # at apply time using null_resource + curl — unless local path overrides are set.
 
 variable "github_owner" {
@@ -379,73 +344,12 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
-variable "gvproxy_binary_path" {
-  description = "Local path to gvproxy binary. Overrides GitHub Release download."
-  type        = string
-  default     = ""
-}
 
-# --- Local asset file paths ---
+# =============================================================================
+# KMS
+# =============================================================================
 
-variable "enclave_init_script_path" {
-  description = "Local path to enclave_init.sh."
-  type        = string
-}
-
-variable "watchdog_service_path" {
-  description = "Local path to enclave-watchdog.service."
-  type        = string
-}
-
-variable "imds_proxy_service_path" {
-  description = "Local path to enclave-imds-proxy.service."
-  type        = string
-}
-
-variable "gvproxy_service_path" {
-  description = "Local path to gvproxy.service."
-  type        = string
-}
-
-variable "gvproxy_start_script_path" {
-  description = "Local path to gvproxy start.sh script."
-  type        = string
-}
-
-variable "supervisor_service_path" {
-  description = "Local path to supervisor.service."
-  type        = string
-}
-`
-
-const tofuModuleEnclaveOutputs = `output "ec2_role_arn" {
-  description = "EC2 instance role ARN."
-  value       = aws_iam_role.instance.arn
-}
-
-output "kms_key_id" {
-  description = "KMS encryption key ID."
-  value       = local.kms_key_id
-  sensitive   = true
-}
-
-output "instance_id" {
-  description = "EC2 instance ID (empty in local mode)."
-  value       = var.local ? "" : aws_instance.nitro[0].id
-}
-
-output "elastic_ip" {
-  description = "Static public IP for the enclave instance (empty in local mode)."
-  value       = var.local ? "" : aws_eip.instance[0].public_ip
-}
-
-output "storage_bucket" {
-  description = "S3 storage bucket name."
-  value       = aws_s3_bucket.storage.id
-}
-`
-
-const tofuModuleEnclaveKMS = `# KMS encryption key for enclave secrets.
+# KMS encryption key for enclave secrets.
 #
 # Created via AWS CLI (null_resource) instead of a native tofu resource
 # because the enclave locks the key policy to PCR0 at first boot, and the
@@ -570,9 +474,12 @@ locals {
   kms_key_id  = data.aws_ssm_parameter.kms_key_id_lookup.value
   kms_key_arn = "arn:aws:kms:${var.region}:${var.account}:key/${local.kms_key_id}"
 }
-`
 
-const tofuModuleEnclaveIAM = `# IAM role for the EC2 Nitro Enclave host instance.
+# =============================================================================
+# IAM
+# =============================================================================
+
+# IAM role for the EC2 Nitro Enclave host instance.
 
 resource "aws_iam_role" "instance" {
   name_prefix = "${local.prefix}-enclave-"
@@ -717,9 +624,143 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 }
-`
 
-const tofuModuleEnclaveSSM = `# SSM parameters for enclave secrets and migration state.
+# =============================================================================
+# S3
+# =============================================================================
+
+locals {
+  # When local paths are set, use them directly. Otherwise download from GitHub Release.
+  use_local      = var.eif_path != ""
+  artifacts_dir  = "${path.module}/.artifacts"
+  release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
+
+  eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
+  supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
+}
+
+# Download build artifacts from GitHub Release (skipped when local paths are set).
+resource "null_resource" "download_artifacts" {
+  count = local.use_local ? 0 : 1
+
+  triggers = {
+    release_tag = var.release_tag
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      AUTH=""
+      [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
+      mkdir -p ${local.artifacts_dir}
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
+    EOT
+    environment = {
+      GITHUB_TOKEN = var.github_token
+    }
+  }
+}
+
+# S3 bucket for enclave deployment assets (EIF, scripts, systemd units, binaries).
+# This bucket is ephemeral — force_destroy is always true since assets can be re-uploaded.
+
+resource "aws_s3_bucket" "assets" {
+  bucket_prefix = "${local.prefix}-assets-"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_public_access_block" "assets" {
+  bucket = aws_s3_bucket.assets.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_object" "enclave_eif" {
+  depends_on = [null_resource.download_artifacts]
+  bucket     = aws_s3_bucket.assets.id
+  key        = "image.eif"
+  source     = local.eif_source
+  etag       = local.use_local ? filemd5(local.eif_source) : null
+}
+
+resource "aws_s3_object" "supervisor_binary" {
+  depends_on = [null_resource.download_artifacts]
+  bucket     = aws_s3_bucket.assets.id
+  key        = "supervisor"
+  source     = local.supervisor_source
+  etag       = local.use_local ? filemd5(local.supervisor_source) : null
+}
+
+# Staging copy used for in-place supervisor migration. Each tofu apply overwrites
+# this object with the freshly-built binary; the migration null_resource
+# points the running supervisor at this key. On migration success the
+# promote_supervisor_binary null_resource copies it onto the canonical key above,
+# so instance reboots come up on the new version. If migration fails the
+# canonical key stays on the last-known-good binary.
+#
+# Recovery: if a newly deployed supervisor binary crash-loops under systemd,
+# SSM into the host and run
+#   aws s3 cp s3://<assets>/supervisor /home/ec2-user/app/supervisor
+#   systemctl restart supervisor
+# to roll back to the canonical (last-known-good) binary.
+resource "aws_s3_object" "supervisor_binary_staging" {
+  depends_on = [null_resource.download_artifacts]
+  bucket     = aws_s3_bucket.assets.id
+  key        = "supervisor-staging"
+  source     = local.supervisor_source
+  etag       = local.use_local ? filemd5(local.supervisor_source) : null
+}
+
+# The enclave-supervisor.service systemd unit is inlined in user_data.sh.tftpl
+# via a heredoc — no separate S3 object. Keeps deployment concerns colocated
+# with the tofu module that owns them.
+
+# Persistent storage bucket for enclave data (Store/Load API).
+
+resource "aws_s3_bucket" "storage" {
+  bucket_prefix = "${local.prefix}-storage-"
+  force_destroy = var.local
+}
+
+resource "aws_s3_bucket_public_access_block" "storage" {
+  bucket = aws_s3_bucket.storage.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_policy" "storage_ssl" {
+  count  = var.local ? 0 : 1
+  bucket = aws_s3_bucket.storage.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnforceSSL"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.storage.arn,
+        "${aws_s3_bucket.storage.arn}/*",
+      ]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+}
+
+# =============================================================================
+# SSM
+# =============================================================================
+
+# SSM parameters for enclave secrets and migration state.
 
 locals {
   secrets_map = { for s in var.secrets : s.name => s }
@@ -856,185 +897,12 @@ resource "aws_ssm_parameter" "migration_storage_dek" {
     ignore_changes = [value]
   }
 }
-`
 
-const tofuModuleEnclaveS3 = `locals {
-  # When local paths are set, use them directly. Otherwise download from GitHub Release.
-  use_local      = var.eif_path != ""
-  artifacts_dir  = "${path.module}/.artifacts"
-  release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
+# =============================================================================
+# VPC
+# =============================================================================
 
-  eif_source     = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
-  supervisor_source    = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
-  gvproxy_source = local.use_local ? var.gvproxy_binary_path : "${local.artifacts_dir}/gvproxy"
-}
-
-# Download build artifacts from GitHub Release (skipped when local paths are set).
-resource "null_resource" "download_artifacts" {
-  count = local.use_local ? 0 : 1
-
-  triggers = {
-    release_tag = var.release_tag
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      AUTH=""
-      [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
-      mkdir -p ${local.artifacts_dir}
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/gvproxy ${local.release_base}/gvproxy
-    EOT
-    environment = {
-      GITHUB_TOKEN = var.github_token
-    }
-  }
-}
-
-# S3 bucket for enclave deployment assets (EIF, scripts, systemd units, binaries).
-# This bucket is ephemeral — force_destroy is always true since assets can be re-uploaded.
-
-resource "aws_s3_bucket" "assets" {
-  bucket_prefix = "${local.prefix}-assets-"
-  force_destroy = true
-}
-
-resource "aws_s3_bucket_public_access_block" "assets" {
-  bucket = aws_s3_bucket.assets.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_object" "enclave_eif" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "image.eif"
-  source     = local.eif_source
-  etag       = local.use_local ? filemd5(local.eif_source) : null
-}
-
-resource "aws_s3_object" "enclave_init" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave_init.sh"
-  source = var.enclave_init_script_path
-  etag   = filemd5(var.enclave_init_script_path)
-}
-
-resource "aws_s3_object" "watchdog_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-watchdog.service"
-  source = var.watchdog_service_path
-  etag   = filemd5(var.watchdog_service_path)
-}
-
-resource "aws_s3_object" "imds_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "enclave-imds-proxy.service"
-  source = var.imds_proxy_service_path
-  etag   = filemd5(var.imds_proxy_service_path)
-}
-
-resource "aws_s3_object" "gvproxy_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy.service"
-  source = var.gvproxy_service_path
-  etag   = filemd5(var.gvproxy_service_path)
-}
-
-resource "aws_s3_object" "supervisor_binary" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "supervisor"
-  source     = local.supervisor_source
-  etag       = local.use_local ? filemd5(local.supervisor_source) : null
-}
-
-# Staging copy used for in-place supervisor migration. Each tofu apply overwrites
-# this object with the freshly-built binary; the migration null_resource
-# points the running supervisor at this key. On migration success the
-# promote_supervisor_binary null_resource copies it onto the canonical key above,
-# so instance reboots come up on the new version. If migration fails the
-# canonical key stays on the last-known-good binary.
-#
-# Recovery: if a newly deployed supervisor binary crash-loops under systemd,
-# SSM into the host and run
-#   aws s3 cp s3://<assets>/supervisor /home/ec2-user/app/supervisor
-#   systemctl restart supervisor
-# to roll back to the canonical (last-known-good) binary.
-resource "aws_s3_object" "supervisor_binary_staging" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "supervisor-staging"
-  source     = local.supervisor_source
-  etag       = local.use_local ? filemd5(local.supervisor_source) : null
-}
-
-resource "aws_s3_object" "gvproxy_start_script" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "gvproxy-start.sh"
-  source = var.gvproxy_start_script_path
-  etag   = filemd5(var.gvproxy_start_script_path)
-}
-
-resource "aws_s3_object" "gvproxy_binary" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "gvproxy"
-  source     = local.gvproxy_source
-  etag       = local.use_local ? filemd5(local.gvproxy_source) : null
-}
-
-resource "aws_s3_object" "supervisor_systemd" {
-  bucket = aws_s3_bucket.assets.id
-  key    = "supervisor.service"
-  source = var.supervisor_service_path
-  etag   = filemd5(var.supervisor_service_path)
-}
-
-# Persistent storage bucket for enclave data (Store/Load API).
-
-resource "aws_s3_bucket" "storage" {
-  bucket_prefix = "${local.prefix}-storage-"
-  force_destroy = var.local
-}
-
-resource "aws_s3_bucket_public_access_block" "storage" {
-  bucket = aws_s3_bucket.storage.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_policy" "storage_ssl" {
-  count  = var.local ? 0 : 1
-  bucket = aws_s3_bucket.storage.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "EnforceSSL"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:*"
-      Resource = [
-        aws_s3_bucket.storage.arn,
-        "${aws_s3_bucket.storage.arn}/*",
-      ]
-      Condition = {
-        Bool = { "aws:SecureTransport" = "false" }
-      }
-    }]
-  })
-}
-`
-
-const tofuModuleEnclaveVPC = `# VPC + networking (remote only — skipped for localstack).
+# VPC + networking (remote only — skipped for localstack).
 
 resource "aws_vpc" "main" {
   count = var.local ? 0 : 1
@@ -1193,9 +1061,12 @@ resource "aws_vpc_endpoint" "s3" {
 
   tags = { Name = "${local.prefix}-s3-endpoint" }
 }
-`
 
-const tofuModuleEnclaveEC2 = `# EC2 Nitro Enclave instance (remote only — skipped for localstack).
+# =============================================================================
+# EC2
+# =============================================================================
+
+# EC2 Nitro Enclave instance (remote only — skipped for localstack).
 
 data "aws_ami" "al2023" {
   count       = var.local ? 0 : 1
@@ -1297,21 +1168,14 @@ resource "aws_instance" "nitro" {
   }
 
   user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    region                       = var.region
-    dev_mode                     = var.deployment
-    app_name                     = var.app_name
-    kms_key_id                   = local.kms_key_id
-    eif_s3_url                   = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
-    enclave_init_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_init.key}"
-    enclave_init_systemd_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.watchdog_systemd.key}"
-    imds_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.imds_systemd.key}"
-    gvproxy_systemd_s3_url       = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_systemd.key}"
-    supervisor_binary_s3_url           = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
-    supervisor_systemd_s3_url          = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_systemd.key}"
-    gvproxy_binary_s3_url        = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_binary.key}"
-    gvproxy_start_script_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.gvproxy_start_script.key}"
-    migration_cooldown           = var.migration_cooldown
-    previous_pcr0                = var.previous_pcr0
+    region                    = var.region
+    dev_mode                  = var.deployment
+    app_name                  = var.app_name
+    kms_key_id                = local.kms_key_id
+    eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
+    supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
+    migration_cooldown        = var.migration_cooldown
+    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {
@@ -1506,6 +1370,36 @@ resource "null_resource" "promote_supervisor_binary_local" {
 
   depends_on = [null_resource.enclave_migration_local]
 }
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+output "ec2_role_arn" {
+  description = "EC2 instance role ARN."
+  value       = aws_iam_role.instance.arn
+}
+
+output "kms_key_id" {
+  description = "KMS encryption key ID."
+  value       = local.kms_key_id
+  sensitive   = true
+}
+
+output "instance_id" {
+  description = "EC2 instance ID (empty in local mode)."
+  value       = var.local ? "" : aws_instance.nitro[0].id
+}
+
+output "elastic_ip" {
+  description = "Static public IP for the enclave instance (empty in local mode)."
+  value       = var.local ? "" : aws_eip.instance[0].public_ip
+}
+
+output "storage_bucket" {
+  description = "S3 storage bucket name."
+  value       = aws_s3_bucket.storage.id
+}
 `
 
 const tofuModuleBackendMain = `# Bootstrap module for the OpenTofu state backend.
@@ -1567,9 +1461,12 @@ resource "aws_dynamodb_table" "lock" {
     type = "S"
   }
 }
-`
 
-const tofuModuleBackendVariables = `variable "bucket_name" {
+# =============================================================================
+# Variables
+# =============================================================================
+
+variable "bucket_name" {
   description = "S3 bucket name for OpenTofu state storage."
   type        = string
 }
@@ -1583,9 +1480,12 @@ variable "region" {
   description = "AWS region."
   type        = string
 }
-`
 
-const tofuModuleBackendOutputs = `output "bucket_name" {
+# =============================================================================
+# Outputs
+# =============================================================================
+
+output "bucket_name" {
   description = "S3 bucket name for state storage."
   value       = aws_s3_bucket.state.id
 }
@@ -1594,99 +1494,4 @@ output "table_name" {
   description = "DynamoDB table name for state locking."
   value       = aws_dynamodb_table.lock.name
 }
-`
-
-const tofuMigrateState = `#!/usr/bin/env bash
-# Migrate OpenTofu state from the flat layout (resources at root)
-# to the module layout (resources under module.enclave).
-#
-# Run this ONCE after upgrading to the module-based structure.
-# Requires: tofu CLI, initialized state backend.
-#
-# Usage:
-#   cd enclave/tofu
-#   bash migrate-state.sh
-
-set -euo pipefail
-
-echo "=== OpenTofu State Migration ==="
-echo "Moving resources from root to module.enclave"
-echo ""
-
-# Helper: move a resource, skip if it doesn't exist in state.
-move() {
-  local from="$1" to="$2"
-  if tofu state show "$from" &>/dev/null; then
-    echo "  $from -> $to"
-    tofu state mv "$from" "$to"
-  else
-    echo "  (skip) $from not in state"
-  fi
-}
-
-echo "--- KMS ---"
-move "aws_kms_key.encryption"        "module.enclave.aws_kms_key.encryption"
-move "aws_kms_key_policy.encryption"  "module.enclave.aws_kms_key_policy.encryption"
-
-echo ""
-echo "--- IAM ---"
-move "aws_iam_role.instance"                      "module.enclave.aws_iam_role.instance"
-move "aws_iam_instance_profile.instance"           "module.enclave.aws_iam_instance_profile.instance"
-move "aws_iam_role_policy_attachment.ssm_core[0]"  "module.enclave.aws_iam_role_policy_attachment.ssm_core[0]"
-move "aws_iam_role_policy.enclave"                 "module.enclave.aws_iam_role_policy.enclave"
-
-echo ""
-echo "--- S3 ---"
-move "aws_s3_bucket.assets"                    "module.enclave.aws_s3_bucket.assets"
-move "aws_s3_bucket_public_access_block.assets" "module.enclave.aws_s3_bucket_public_access_block.assets"
-move "aws_s3_object.enclave_eif"               "module.enclave.aws_s3_object.enclave_eif"
-move "aws_s3_object.enclave_init"              "module.enclave.aws_s3_object.enclave_init"
-move "aws_s3_object.watchdog_systemd"          "module.enclave.aws_s3_object.watchdog_systemd"
-move "aws_s3_object.imds_systemd"              "module.enclave.aws_s3_object.imds_systemd"
-move "aws_s3_object.gvproxy_systemd"           "module.enclave.aws_s3_object.gvproxy_systemd"
-move "aws_s3_object.supervisor_binary"               "module.enclave.aws_s3_object.supervisor_binary"
-move "aws_s3_object.supervisor_systemd"              "module.enclave.aws_s3_object.supervisor_systemd"
-move "aws_s3_bucket.storage"                   "module.enclave.aws_s3_bucket.storage"
-move "aws_s3_bucket_public_access_block.storage" "module.enclave.aws_s3_bucket_public_access_block.storage"
-move "aws_s3_bucket_policy.storage_ssl[0]"     "module.enclave.aws_s3_bucket_policy.storage_ssl[0]"
-
-echo ""
-echo "--- SSM ---"
-# Dynamic per-secret parameters — enumerate from state.
-for addr in $(tofu state list 2>/dev/null | grep '^aws_ssm_parameter\.'); do
-  move "$addr" "module.enclave.$addr"
-done
-
-echo ""
-echo "--- VPC ---"
-move "aws_vpc.main[0]"                          "module.enclave.aws_vpc.main[0]"
-move "aws_subnet.public[0]"                     "module.enclave.aws_subnet.public[0]"
-move "aws_subnet.private[0]"                    "module.enclave.aws_subnet.private[0]"
-move "aws_subnet.private_b[0]"                  "module.enclave.aws_subnet.private_b[0]"
-move "aws_internet_gateway.main[0]"             "module.enclave.aws_internet_gateway.main[0]"
-move "aws_eip.nat[0]"                           "module.enclave.aws_eip.nat[0]"
-move "aws_nat_gateway.main[0]"                  "module.enclave.aws_nat_gateway.main[0]"
-move "aws_route_table.public[0]"                "module.enclave.aws_route_table.public[0]"
-move "aws_route_table_association.public[0]"    "module.enclave.aws_route_table_association.public[0]"
-move "aws_route_table.private[0]"               "module.enclave.aws_route_table.private[0]"
-move "aws_route_table_association.private[0]"   "module.enclave.aws_route_table_association.private[0]"
-move "aws_route_table_association.private_b[0]" "module.enclave.aws_route_table_association.private_b[0]"
-move "aws_vpc_endpoint.kms[0]"                  "module.enclave.aws_vpc_endpoint.kms[0]"
-move "aws_vpc_endpoint.ssm[0]"                  "module.enclave.aws_vpc_endpoint.ssm[0]"
-move "aws_vpc_endpoint.s3[0]"                   "module.enclave.aws_vpc_endpoint.s3[0]"
-
-echo ""
-echo "--- EC2 ---"
-move "aws_security_group.nitro[0]"              "module.enclave.aws_security_group.nitro[0]"
-move "aws_security_group_rule.https_ingress[0]" "module.enclave.aws_security_group_rule.https_ingress[0]"
-move "aws_security_group_rule.self_tcp[0]"      "module.enclave.aws_security_group_rule.self_tcp[0]"
-move "aws_security_group_rule.self_icmp[0]"     "module.enclave.aws_security_group_rule.self_icmp[0]"
-move "aws_security_group_rule.all_egress[0]"    "module.enclave.aws_security_group_rule.all_egress[0]"
-move "aws_instance.nitro[0]"                    "module.enclave.aws_instance.nitro[0]"
-move "aws_eip.instance[0]"                      "module.enclave.aws_eip.instance[0]"
-move "aws_eip_association.instance[0]"          "module.enclave.aws_eip_association.instance[0]"
-
-echo ""
-echo "=== Migration complete ==="
-echo "Run 'tofu plan' to verify no changes are needed."
 `

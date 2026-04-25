@@ -134,8 +134,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("Created %s (language: %s)\n", configFile, language)
 
-		// Write framework files (flake.nix, gvproxy, systemd units, scripts, user_data, start.sh).
-		for _, f := range getFrameworkFiles(language) {
+		// Write build-time framework files (flake.nix + CI workflows). The
+		// OpenTofu deployment scaffold lives under ./tofu/ and is emitted by
+		// `enclave tofu`, not here, so users can iterate on build and
+		// deployment independently.
+		for _, f := range getInitFiles(language) {
 			destPath := filepath.Join(cwd, f.RelPath)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 				return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
@@ -146,11 +149,17 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Created %s\n", f.RelPath)
 		}
 
+		// Ensure .enclave/ (CLI-managed build outputs) is gitignored at root.
+		if err := ensureGitignoreEntry(cwd, ".enclave/"); err != nil {
+			return fmt.Errorf("update root .gitignore: %w", err)
+		}
+
 		fmt.Println()
 		fmt.Println("Edit enclave/enclave.yaml with your app and runtime details.")
 		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No runtime imports needed — the supervisor handles attestation automatically.")
 		fmt.Println("Then run 'enclave setup' to compute hashes and 'enclave build' to build.")
+		fmt.Println("Before deploying, run 'enclave tofu' to generate the OpenTofu module.")
 		return nil
 	}
 
@@ -228,4 +237,31 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("Next: enclave build")
 	return nil
+}
+
+// ensureGitignoreEntry appends `entry` to <dir>/.gitignore if it's not
+// already present. Creates the file if missing. Idempotent.
+func ensureGitignoreEntry(dir, entry string) error {
+	path := filepath.Join(dir, ".gitignore")
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == entry {
+			return nil
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+		if _, err := f.WriteString("\n"); err != nil {
+			return err
+		}
+	}
+	_, err = f.WriteString(entry + "\n")
+	return err
 }

@@ -8,11 +8,11 @@ import (
 )
 
 func TestGetFrameworkFilesDotnet(t *testing.T) {
-	files := getFrameworkFiles("dotnet")
+	files := getInitFiles("dotnet")
 
 	var foundFlake bool
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			foundFlake = true
 			if !strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("dotnet flake.nix should use buildDotnetModule")
@@ -38,9 +38,8 @@ func TestRunGenerateTemplateDotnet(t *testing.T) {
 	}
 
 	expectedFiles := []string{
-		"flake.nix",
+		"enclave/flake.nix",
 		"enclave/enclave.yaml",
-		"enclave/start.sh",
 		"Program.cs",
 		"MyEnclaveApp.csproj",
 		"NuGet.config",
@@ -99,9 +98,9 @@ func TestRunGenerateTemplateDotnet(t *testing.T) {
 }
 
 func TestGetFrameworkFilesGoUnchanged(t *testing.T) {
-	files := getFrameworkFiles("go")
+	files := getInitFiles("go")
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			if strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("Go flake.nix should NOT contain buildDotnetModule")
 			}
@@ -112,9 +111,9 @@ func TestGetFrameworkFilesGoUnchanged(t *testing.T) {
 }
 
 func TestGetFrameworkFilesNodejsUnchanged(t *testing.T) {
-	files := getFrameworkFiles("nodejs")
+	files := getInitFiles("nodejs")
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			if strings.Contains(f.Content, "buildDotnetModule") {
 				t.Error("Node.js flake.nix should NOT contain buildDotnetModule")
 			}
@@ -128,10 +127,10 @@ func TestGetFrameworkFilesNodejsUnchanged(t *testing.T) {
 }
 
 func TestGetFrameworkFilesRust(t *testing.T) {
-	files := getFrameworkFiles("rust")
+	files := getInitFiles("rust")
 	var foundFlake bool
 	for _, f := range files {
-		if f.RelPath == "flake.nix" {
+		if f.RelPath == "enclave/flake.nix" {
 			foundFlake = true
 			if !strings.Contains(f.Content, "buildRustPackage") {
 				t.Error("Rust flake.nix should use buildRustPackage")
@@ -154,9 +153,8 @@ func TestRunGenerateTemplateGolang(t *testing.T) {
 	}
 
 	expectedFiles := []string{
-		"flake.nix",
+		"enclave/flake.nix",
 		"enclave/enclave.yaml",
-		"enclave/start.sh",
 	}
 
 	for _, name := range expectedFiles {
@@ -184,10 +182,10 @@ func TestRunGenerateTemplateGolang(t *testing.T) {
 func TestFlakeTemplatesHaveBuildInputsPlumbing(t *testing.T) {
 	for _, lang := range []string{"go", "nodejs", "dotnet", "rust"} {
 		t.Run(lang, func(t *testing.T) {
-			files := getFrameworkFiles(lang)
+			files := getInitFiles(lang)
 			var flake string
 			for _, f := range files {
-				if f.RelPath == "flake.nix" {
+				if f.RelPath == "enclave/flake.nix" {
 					flake = f.Content
 					break
 				}

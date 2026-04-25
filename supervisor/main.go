@@ -17,6 +17,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -34,6 +35,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"golang.org/x/sync/errgroup"
 )
 
 // Execute runs the supervisor HTTP server until context cancellation.
@@ -115,6 +117,12 @@ func Execute() {
 		cwlClient = cloudwatchlogs.NewFromConfig(awsCfg)
 	}
 
+	wd, err := newWatchdog()
+	if err != nil {
+		slog.Error("watchdog init failed", "error", err)
+		os.Exit(1)
+	}
+
 	s := &server{
 		deployment:        deployment,
 		appName:           appName,
@@ -126,6 +134,7 @@ func Execute() {
 		cwlClient:         cwlClient,
 		migrationCooldown: cooldown,
 		exitAfterResponse: make(chan struct{}, 1),
+		watchdog:          wd,
 	}
 
 	mux := http.NewServeMux()
@@ -151,28 +160,71 @@ func Execute() {
 		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
-	go func() {
+	// Coordinate subsystems with a single errgroup. If any fatal error fires
+	// (gvproxy listener dies, nitro-cli missing, etc.), the rooted context
+	// cancels and systemd Restart=always brings the supervisor back.
+	g, gctx := errgroup.WithContext(ctx)
+
+	gvproxyReady := make(chan struct{})
+	g.Go(func() error { return runGvproxy(gctx, gvproxyReady) })
+	g.Go(func() error { return runIMDSProxy(gctx) })
+
+	g.Go(func() error {
+		// Wait for gvproxy to bind vsock:1024 before booting the enclave —
+		// the in-enclave nitriding daemon dials this immediately on start.
 		select {
-		case <-ctx.Done():
-			// SIGINT/SIGTERM — normal shutdown.
+		case <-gvproxyReady:
+		case <-gctx.Done():
+			return nil
+		}
+		return wd.Run(gctx)
+	})
+
+	g.Go(func() error {
+		select {
+		case <-gctx.Done():
+			// SIGINT/SIGTERM or subsystem failure — normal shutdown.
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
+			return nil
 		case <-s.exitAfterResponse:
 			// handleMigrate finished a successful supervisor-binary update and is
 			// handing off to the supervisor-relaunched new binary. Give the
 			// HTTP response a moment to flush before tearing down.
 			slog.Info("supervisor update handoff — shutting down so supervisor relaunches new binary")
 			time.Sleep(500 * time.Millisecond)
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
+			// Return sentinel so errgroup cancels gctx → gvproxy/IMDS/watchdog
+			// exit → process terminates → relauncher spawns the new binary.
+			return errSelfUpdateExit
 		}
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
+	})
 
-	slog.Info("management server started", "addr", addr, "deployment", deployment, "app", appName)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("server failed", "error", err)
+	g.Go(func() error {
+		slog.Info("management server started", "addr", addr, "deployment", deployment, "app", appName)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		if errors.Is(err, errSelfUpdateExit) {
+			// Clean exit for supervisor self-update — relauncher will respawn
+			// with the new binary.
+			os.Exit(0)
+		}
+		slog.Error("supervisor exited with error", "error", err)
 		os.Exit(1)
 	}
 }
+
+// errSelfUpdateExit signals the self-update goroutine requested a clean
+// process exit. errgroup.Wait returns it; main treats it as exit 0.
+var errSelfUpdateExit = errors.New("supervisor self-update: clean exit")
 
 type server struct {
 	deployment        string
@@ -183,6 +235,7 @@ type server struct {
 	s3Client          *s3.Client
 	stsClient         *sts.Client
 	cwlClient         *cloudwatchlogs.Client
+	watchdog          *Watchdog
 	migrateMu         sync.Mutex
 	migrationCooldown time.Duration
 	migrationAbort    chan struct{}

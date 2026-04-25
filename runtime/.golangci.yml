@@ -1,0 +1,13 @@
+version: "2"
+
+# runtime/nitriding/ and runtime/viproxy/ are vendored verbatim from upstream
+# (brave/nitriding-daemon and brave/viproxy — see each dir's UPSTREAM.md).
+# We track upstream parity rather than fork the codebases, so style-level
+# lint findings (errcheck on close/Fprintln, ST1005 capitalization) are
+# excluded here. Bugs we'd actually fix go in the vendoring overlay
+# (e.g. nitriding/package_init.go) so re-vendoring stays clean.
+linters:
+  exclusions:
+    paths:
+      - nitriding
+      - viproxy

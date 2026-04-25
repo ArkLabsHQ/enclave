@@ -68,8 +68,12 @@ func runGenerateTemplate(outDir, language string) error {
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	// Write framework files (flake.nix, enclave/, .github/workflows/).
-	for _, f := range getFrameworkFiles(language) {
+	// Write framework files — build-time (flake.nix, CI workflows) and
+	// deployment (tofu/) together, since `generate` produces a complete
+	// ready-to-deploy template. Users invoking `enclave init` get only
+	// the build-time subset; `enclave tofu` emits the deployment subset.
+	allFiles := append(getInitFiles(language), getTofuFiles(language)...)
+	for _, f := range allFiles {
 		destPath := filepath.Join(outDir, f.RelPath)
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
@@ -414,7 +418,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-cd enclave/tofu && tofu init && tofu apply
+cd tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
@@ -507,7 +511,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-cd enclave/tofu && tofu init && tofu apply
+cd tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
@@ -708,7 +712,7 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ` + "```sh" + `
-cd enclave/tofu && tofu init && tofu apply
+cd tofu && tofu init && tofu apply
 ` + "```" + `
 
 Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.

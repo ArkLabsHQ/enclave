@@ -9,10 +9,15 @@ type frameworkFile struct {
 	Content string      // file content
 }
 
-// getFrameworkFiles returns the list of framework files to scaffold.
-// These are required by OpenTofu deploy and Nix build (flake.nix).
-// The language parameter selects the correct flake.nix template.
-func getFrameworkFiles(language string) []frameworkFile {
+// getInitFiles returns the build-time framework files scaffolded by
+// `enclave init`. Limited to Nix build inputs and CI workflow templates
+// that are tied to the build (not deployment). The language parameter
+// selects the correct flake.nix template.
+//
+// Deployment scaffolding (OpenTofu module) is emitted by `enclave tofu`
+// via getTofuFiles; splitting the two lets users customize one without
+// inadvertently regenerating the other.
+func getInitFiles(language string) []frameworkFile {
 	flakeNix := frameworkFlakeNix // default: Go
 	switch language {
 	case "nodejs":
@@ -25,133 +30,9 @@ func getFrameworkFiles(language string) []frameworkFile {
 
 	return []frameworkFile{
 		{
-			RelPath: "flake.nix",
+			RelPath: "enclave/flake.nix",
 			Mode:    0644,
 			Content: flakeNix,
-		},
-		{
-			RelPath: "enclave/start.sh",
-			Mode:    0755,
-			Content: frameworkStartSh,
-		},
-		{
-			RelPath: "enclave/gvproxy/start.sh",
-			Mode:    0755,
-			Content: frameworkGvproxyStartSh,
-		},
-		{
-			RelPath: "enclave/scripts/enclave_init.sh",
-			Mode:    0755,
-			Content: frameworkEnclaveInitSh,
-		},
-		{
-			RelPath: "enclave/systemd/enclave-watchdog.service",
-			Mode:    0644,
-			Content: frameworkWatchdogService,
-		},
-		{
-			RelPath: "enclave/systemd/enclave-imds-proxy.service",
-			Mode:    0644,
-			Content: frameworkIMDSProxyService,
-		},
-		{
-			RelPath: "enclave/systemd/gvproxy.service",
-			Mode:    0644,
-			Content: frameworkGvproxyService,
-		},
-		{
-			RelPath: "enclave/systemd/supervisor.service",
-			Mode:    0644,
-			Content: frameworkSupervisorService,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/templates/user_data.sh.tftpl",
-			Mode:    0644,
-			Content: frameworkUserData,
-		},
-		// OpenTofu root module.
-		{
-			RelPath: "enclave/tofu/main.tf",
-			Mode:    0644,
-			Content: tofuRootMain,
-		},
-		{
-			RelPath: "enclave/tofu/variables.tf",
-			Mode:    0644,
-			Content: tofuRootVariables,
-		},
-		{
-			RelPath: "enclave/tofu/outputs.tf",
-			Mode:    0644,
-			Content: tofuRootOutputs,
-		},
-		// OpenTofu enclave module.
-		{
-			RelPath: "enclave/tofu/modules/enclave/main.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveMain,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/variables.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveVariables,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/outputs.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveOutputs,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/kms.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveKMS,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/iam.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveIAM,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/ssm.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveSSM,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/s3.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveS3,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/vpc.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveVPC,
-		},
-		{
-			RelPath: "enclave/tofu/modules/enclave/ec2.tf",
-			Mode:    0644,
-			Content: tofuModuleEnclaveEC2,
-		},
-		// OpenTofu backend bootstrap module.
-		{
-			RelPath: "enclave/tofu/modules/backend/main.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendMain,
-		},
-		{
-			RelPath: "enclave/tofu/modules/backend/variables.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendVariables,
-		},
-		{
-			RelPath: "enclave/tofu/modules/backend/outputs.tf",
-			Mode:    0644,
-			Content: tofuModuleBackendOutputs,
-		},
-		// State migration script.
-		{
-			RelPath: "enclave/tofu/migrate-state.sh",
-			Mode:    0755,
-			Content: tofuMigrateState,
 		},
 		{
 			RelPath: ".github/workflows/deploy-enclave.yml",
@@ -173,260 +54,35 @@ func getFrameworkFiles(language string) []frameworkFile {
 			Mode:    0644,
 			Content: frameworkBuildEIFWorkflow,
 		},
-		{
-			RelPath: "enclave/.gitignore",
-			Mode:    0644,
-			Content: frameworkGitignore,
-		},
-		{
-			RelPath: "enclave/dokploy/docker-compose.yml",
-			Mode:    0644,
-			Content: frameworkDokployCompose,
-		},
-		{
-			RelPath: "enclave/dokploy/seed.yaml",
-			Mode:    0644,
-			Content: frameworkDokploySeedYaml,
-		},
 	}
 }
 
-// Gitignore for the enclave/ subdirectory — excludes build artifacts and generated files.
-const frameworkGitignore = `# Build artifacts (EIF image + PCR measurements)
-artifacts/
+// getTofuFiles returns the OpenTofu module scaffolding emitted by
+// `enclave tofu`. Paths are relative to the repo root; the tree lives
+// under ./tofu/ so it's independent of the enclave/ build inputs.
+//
+// The language parameter is currently unused (templates don't vary by
+// language) but kept for parity with getInitFiles in case per-language
+// defaults are introduced later.
+func getTofuFiles(_ string) []frameworkFile {
+	return []frameworkFile{
+		{RelPath: "tofu/main.tf", Mode: 0644, Content: tofuRootMain},
+		{RelPath: "tofu/.gitignore", Mode: 0644, Content: frameworkTofuGitignore},
+		{RelPath: "tofu/modules/backend/main.tf", Mode: 0644, Content: tofuModuleBackendMain},
+		{RelPath: "tofu/modules/enclave/main.tf", Mode: 0644, Content: tofuModuleEnclaveMain},
+		{RelPath: "tofu/modules/enclave/templates/user_data.sh.tftpl", Mode: 0644, Content: frameworkUserData},
+	}
+}
 
-# Generated build config (from enclave.yaml for Nix)
-build-config.json
-
-# OpenTofu state and outputs (contains account-specific IDs)
+// Gitignore for the tofu/ scaffold — hides account-specific state and
+// generated files. Scaffolded by `enclave tofu` alongside the module tree.
+const frameworkTofuGitignore = `# OpenTofu state and outputs (contains account-specific IDs)
 tofu-outputs.json
 terraform.tfvars.json
 terraform.tfstate
 terraform.tfstate.backup
 .terraform/
-
-# Nix build symlinks
-result
-result-*
-`
-
-// EIF entrypoint — starts viproxy, nitriding, and the app binary.
-const frameworkStartSh = `#!/bin/sh
-
-set -e
-
-# Seed kernel entropy pool from Nitro Security Module (NSM).
-# The enclave starts with an empty entropy pool and /dev/random blocks until
-# entropy is available. The runtime bypasses this via direct NSM calls, but user
-# apps that read from /dev/random or /dev/urandom (e.g. OpenSSL, libsodium)
-# will hang without seeding.
-if [ -e /dev/nsm ]; then
-  dd if=/dev/nsm of=/dev/urandom bs=256 count=1 2>/dev/null || true
-  dd if=/dev/nsm of=/dev/random  bs=256 count=1 2>/dev/null || true
-fi
-
-# Start viproxy for IMDS access before nitriding sets up full networking
-if [ "${ENCLAVE_VIPROXY_ENABLED:-true}" = "true" ]; then
-  VIPROXY_IN_ADDRS="${ENCLAVE_VIPROXY_IN_ADDRS:-127.0.0.1:80}"
-  VIPROXY_OUT_ADDRS="${ENCLAVE_VIPROXY_OUT_ADDRS:-3:8002}"
-  IN_ADDRS="${VIPROXY_IN_ADDRS}" OUT_ADDRS="${VIPROXY_OUT_ADDRS}" /app/proxy &
-  if [ -z "${AWS_EC2_METADATA_SERVICE_ENDPOINT:-}" ]; then
-    export AWS_EC2_METADATA_SERVICE_ENDPOINT="http://127.0.0.1:80"
-  fi
-fi
-
-export ENCLAVE_NO_TLS=true
-
-# The AWS SDK needs a region. Inside the enclave, IMDS region detection
-# may fail, so we set it explicitly from the deployment config.
-if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
-  export AWS_DEFAULT_REGION="${ENCLAVE_AWS_REGION:-us-east-1}"
-fi
-APP_PORT="${ENCLAVE_PROXY_PORT:-7073}"
-NITRIDING_EXT_PORT="${ENCLAVE_NITRIDING_EXT_PORT:-443}"
-NITRIDING_INT_PORT="${ENCLAVE_NITRIDING_INT_PORT:-8080}"
-NITRIDING_PROM_PORT="${ENCLAVE_NITRIDING_PROM_PORT:-9090}"
-NITRIDING_PROM_NS="${ENCLAVE_NITRIDING_PROM_NAMESPACE:-enclave}"
-NITRIDING_FQDN="${ENCLAVE_NITRIDING_FQDN:-localhost}"
-
-NITRIDING_ARGS="-fqdn ${NITRIDING_FQDN} \
-  -ext-pub-port ${NITRIDING_EXT_PORT} \
-  -intport ${NITRIDING_INT_PORT} \
-  -appwebsrv http://127.0.0.1:${APP_PORT} \
-  -prometheus-namespace ${NITRIDING_PROM_NS} \
-  -prometheus-port ${NITRIDING_PROM_PORT}"
-
-if [ "${ENCLAVE_NITRIDING_DEBUG:-false}" = "true" ]; then
-  NITRIDING_ARGS="${NITRIDING_ARGS} -debug"
-fi
-
-# Configure DNS to use gvproxy gateway
-echo "nameserver 192.168.127.1" > /etc/resolv.conf
-
-# Start nitriding in background (it will set up networking via gvproxy)
-exec /app/nitriding ${NITRIDING_ARGS} -appcmd "/app/runtime"
-`
-
-// Gvproxy entrypoint — starts gvproxy and sets up port forwarding.
-const frameworkGvproxyStartSh = `#!/usr/bin/env sh
-# Based on the gvproxy wrapper from the Nitro Enclave reference project.
-
-set -e
-set -x
-
-VSOCK_SOCKET="${GVPROXY_SOCKET:-/tmp/network.sock}"
-FORWARD_PORTS="${GVPROXY_FORWARD_PORTS:-${ENCLAVE_PORT:-7073}}"
-
-setup_forward() {
-  local_port=$1
-  remote_port=$2
-  curl --unix-socket "${VSOCK_SOCKET}" http:/unix/services/forwarder/expose \
-    -X POST \
-    -d "{\"local\":\":${local_port}\",\"remote\":\"192.168.127.2:${remote_port}\"}"
-}
-
-# Avoid "address already in use" if the socket is left behind.
-if [ -S "${VSOCK_SOCKET}" ]; then
-  rm -f "${VSOCK_SOCKET}"
-fi
-
-# Start gvproxy in the background.
-GVPROXY_BIN="${GVPROXY_BIN:-/home/ec2-user/app/gvproxy/gvproxy}"
-"${GVPROXY_BIN}" -listen vsock://:1024 -listen unix://"${VSOCK_SOCKET}" &
-GVPROXY_PID=$!
-
-# Wait for gvproxy to start.
-sleep 5
-
-for port in ${FORWARD_PORTS}; do
-  setup_forward "${port}" "${port}"
-done
-
-wait "${GVPROXY_PID}"
-`
-
-// Host-side script — starts the Nitro Enclave and polls until it exits.
-const frameworkEnclaveInitSh = `#!/bin/sh
-# Starts the Nitro Enclave and polls until it exits.
-# Designed to run under systemd with Restart=always.
-set -eu
-
-NITRO_CLI="${NITRO_CLI_PATH:-/usr/bin/nitro-cli}"
-ENCLAVE_NAME="${ENCLAVE_NAME:-app}"
-EIF_PATH="${EIF_PATH:-/home/ec2-user/app/server/signing_server.eif}"
-CPU_COUNT="${CPU_COUNT:-2}"
-MEMORY_MIB="${MEMORY_MIB:-4320}"
-ENCLAVE_CID="${ENCLAVE_CID:-16}"
-POLL_INTERVAL="${POLL_INTERVAL_SECONDS:-5}"
-DEBUG_FLAG=""
-
-if [ "${DEBUG_MODE:-false}" = "true" ]; then
-  DEBUG_FLAG="--debug-mode"
-fi
-
-echo "starting enclave '${ENCLAVE_NAME}'"
-
-$NITRO_CLI run-enclave \
-  --cpu-count "$CPU_COUNT" \
-  --memory "$MEMORY_MIB" \
-  --eif-path "$EIF_PATH" \
-  --enclave-cid "$ENCLAVE_CID" \
-  --enclave-name "$ENCLAVE_NAME" \
-  $DEBUG_FLAG
-
-# Poll until the enclave stops running.
-while $NITRO_CLI describe-enclaves \
-  | grep -q "\"EnclaveName\": \"${ENCLAVE_NAME}\""; do
-  sleep "$POLL_INTERVAL"
-done
-
-echo "enclave '${ENCLAVE_NAME}' is no longer running"
-`
-
-// Systemd unit — enclave lifecycle watchdog.
-const frameworkWatchdogService = `#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#  SPDX-License-Identifier: MIT-0
-[Unit]
-Description=Nitro Enclaves Init Service
-After=network-online.target
-DefaultDependencies=no
-Requires=nitro-enclaves-allocator.service
-After=nitro-enclaves-allocator.service
-
-[Service]
-EnvironmentFile=/etc/environment
-Type=simple
-StandardOutput=journal
-StandardError=journal
-ExecStart=/home/ec2-user/app/enclave_init.sh
-ExecStop=/usr/bin/nitro-cli terminate-enclave --enclave-name app
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// Systemd unit — vsock proxy for IMDS access from inside the enclave.
-const frameworkIMDSProxyService = `#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#  SPDX-License-Identifier: MIT-0
-[Unit]
-Description=Nitro Enclaves vsock IMDS Proxy
-After=network-online.target
-DefaultDependencies=no
-
-[Service]
-Type=simple
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=vsock-proxy-imds
-ExecStart=/bin/bash -ce "exec /usr/bin/vsock-proxy 8002 169.254.169.254 80 \
-                --config /etc/nitro_enclaves/vsock-proxy.yaml \
-                -w 5"
-Restart=always
-TimeoutSec=0
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// Systemd unit — gvproxy binary for outbound networking.
-const frameworkGvproxyService = `[Unit]
-Description=gvproxy outbound networking for Nitro Enclave
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=gvproxy
-EnvironmentFile=/etc/environment
-ExecStart=/home/ec2-user/app/gvproxy/start.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// Systemd unit — supervisor server for health monitoring and guarded teardown.
-const frameworkSupervisorService = `[Unit]
-Description=Enclave host supervisor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=supervisor
-EnvironmentFile=/etc/environment
-ExecStart=/home/ec2-user/app/supervisor
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+backend.tf
 `
 
 // EC2 user_data cloud-init — installs dependencies, downloads EIF, configures services.
@@ -470,22 +126,8 @@ DEFAULT_CPU=2
 sed -r "s/^(\s*$MEM_KEY\s*:\s*).*/\1$DEFAULT_MEM/" -i "$ALLOCATOR_YAML"
 sed -r "s/^(\s*$CPU_KEY\s*:\s*).*/\1$DEFAULT_CPU/" -i "$ALLOCATOR_YAML"
 
-VSOCK_PROXY_YAML=/etc/nitro_enclaves/vsock-proxy.yaml
-cat <<EOF > $VSOCK_PROXY_YAML
-allowlist:
-- {address: kms.${region}.amazonaws.com, port: 443}
-- {address: kms-fips.${region}.amazonaws.com, port: 443}
-- {address: ssm.${region}.amazonaws.com, port: 443}
-- {address: ssm-fips.${region}.amazonaws.com, port: 443}
-- {address: sts.${region}.amazonaws.com, port: 443}
-- {address: s3.${region}.amazonaws.com, port: 443}
-- {address: 169.254.169.254, port: 80}
-
-EOF
-
 systemctl enable --now docker
 systemctl enable --now nitro-enclaves-allocator.service
-systemctl enable --now nitro-enclaves-vsock-proxy.service
 
 cd /home/ec2-user
 
@@ -505,25 +147,39 @@ done
 chmod 644 /home/ec2-user/app/server/enclave.eif
 chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 
-# Download gvproxy binary and start script for outbound networking
-aws s3 cp ${gvproxy_binary_s3_url} /home/ec2-user/app/gvproxy/gvproxy
-aws s3 cp ${gvproxy_start_script_s3_url} /home/ec2-user/app/gvproxy/start.sh
-chmod +x /home/ec2-user/app/gvproxy/gvproxy
-chmod +x /home/ec2-user/app/gvproxy/start.sh
-chown -R ec2-user:ec2-user /home/ec2-user/app/gvproxy
-
-aws s3 cp ${enclave_init_s3_url} /home/ec2-user/app/enclave_init.sh
-chmod +x /home/ec2-user/app/enclave_init.sh
-
-aws s3 cp ${enclave_init_systemd_s3_url} /etc/systemd/system/enclave-watchdog.service
-aws s3 cp ${imds_systemd_s3_url} /etc/systemd/system/enclave-imds-proxy.service
-aws s3 cp ${gvproxy_systemd_s3_url} /etc/systemd/system/gvproxy.service
-
-# Download supervisor server binary and systemd unit
+# Download supervisor binary. The supervisor owns the enclave lifecycle,
+# the gvproxy virtual network, and the IMDS AF_VSOCK forwarder in-process
+# — no separate gvproxy/watchdog/vsock-proxy services.
 aws s3 cp ${supervisor_binary_s3_url} /home/ec2-user/app/supervisor
 chmod +x /home/ec2-user/app/supervisor
 chown ec2-user:ec2-user /home/ec2-user/app/supervisor
-aws s3 cp ${supervisor_systemd_s3_url} /etc/systemd/system/supervisor.service
+
+# The systemd unit is inlined here (not scaffolded into enclave/systemd/)
+# so deployment concerns live with the tofu module that owns them.
+# The heredoc delimiter is single-quoted so neither shell nor tofu
+# interpolate the contents — the unit is copied verbatim.
+cat <<'UNIT_EOF' > /etc/systemd/system/enclave-supervisor.service
+[Unit]
+Description=Enclave host supervisor (networking, IMDS, lifecycle, management API)
+After=network-online.target nitro-enclaves-allocator.service
+Wants=network-online.target
+Requires=nitro-enclaves-allocator.service
+
+[Service]
+Type=simple
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=enclave-supervisor
+EnvironmentFile=/etc/environment
+ExecStart=/home/ec2-user/app/supervisor
+ExecStop=/usr/bin/nitro-cli terminate-enclave --enclave-name app
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
 
 cat <<EOF >> /etc/environment
 ENCLAVE_APP_NAME=${app_name}
@@ -540,10 +196,7 @@ CPU_COUNT=2
 GVPROXY_FORWARD_PORTS=443 7073
 EOF
 
-systemctl enable --now enclave-watchdog.service
-systemctl enable --now enclave-imds-proxy.service
-systemctl enable --now gvproxy.service
-systemctl enable --now supervisor.service
+systemctl enable --now enclave-supervisor.service
 --//--
 `
 
@@ -569,7 +222,7 @@ const frameworkFlakeNix = `{
         # BUILD_CONFIG_PATH is set by the CLI; is set by the CLI as an absolute path.
         # Requires --impure flag (already set by the CLI).
         configPath = let p = builtins.getEnv "BUILD_CONFIG_PATH"; in
-          if p != "" then p else "./enclave/build-config.json";
+          if p != "" then p else "../.enclave/build-config.json";
         buildCfg = builtins.fromJSON (builtins.readFile configPath);
         appCfg = buildCfg.app;
         runtimeCfg = buildCfg.runtime;
@@ -645,59 +298,16 @@ const frameworkFlakeNix = `{
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
 
-        # Nitriding TLS termination daemon.
-        nitriding = eifPkgs.buildGoModule {
-          pname = "nitriding-daemon";
-          version = "unstable-2024-01-01";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "nitriding-daemon";
-            rev = "c8cb7248843c82a5d72ff6cdde90f4a4cf68c87f";
-            hash = "sha256-0ww8ZcoUh3UgRJyhfEVwmjxk3tZv7exCw0VmftdnM7U=";
-          };
-
-          vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
-
-          env.CGO_ENABLED = "0";
-          buildFlags = [ "-trimpath" ];
-          doCheck = false;
-
-          postInstall = ''
-            mv $out/bin/nitriding-daemon $out/bin/nitriding
-          '';
-        };
-
-        # Viproxy for IMDS forwarding inside the enclave.
-        viproxy = eifPkgs.buildGoModule {
-          pname = "viproxy";
-          version = "0.1.2";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "viproxy";
-            rev = "v0.1.2";
-            hash = "sha256-xcQCvl+/d7a3fdqDMEEIyP3c49l1bu7ptCG+RZ94Xws=";
-          };
-
-          vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
-
-          subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
-
-          postInstall = ''
-            mv $out/bin/example $out/bin/proxy
-          '';
-        };
+        # Nitriding and viproxy are vendored into the runtime binary (see
+        # runtime/nitriding/ and runtime/viproxy/), so no separate derivations
+        # are needed here — the runtime /app/runtime is the whole enclave
+        # userspace alongside the user's app.
 
         # Assemble the /app directory with all binaries and scripts.
         appDir = eifPkgs.runCommand "enclave-app" { } ''
           mkdir -p $out/app/data
           cp ` + "${upstream-app}" + `/bin/` + "${appCfg.binary_name}" + ` $out/app/` + "${appCfg.binary_name}" + `
           cp ` + "${runtime}" + `/bin/runtime $out/app/runtime
-          cp ` + "${nitriding}" + `/bin/nitriding $out/app/nitriding
-          cp ` + "${viproxy}" + `/bin/proxy $out/app/proxy
-          install -m 0755 ` + "${./enclave/start.sh}" + ` $out/app/start.sh
         '';
 
         # Complete rootfs for the enclave.
@@ -743,7 +353,7 @@ const frameworkFlakeNix = `{
           nsmKo = nitro.blobs.x86_64.nsmKo;
 
           copyToRoot = enclaveRootfs;
-          entrypoint = "/app/start.sh";
+          entrypoint = "/app/runtime";
           env = enclaveEnv;
         };
 
@@ -772,7 +382,7 @@ const frameworkFlakeNix = `{
       in
       {
         packages = {
-          inherit upstream-app runtime nitriding viproxy eif vendor-hash-check;
+          inherit upstream-app runtime eif vendor-hash-check;
           default = eif;
         };
       }
@@ -802,7 +412,7 @@ const frameworkFlakeNixNodejs = `{
         # BUILD_CONFIG_PATH is set by the CLI; is set by the CLI as an absolute path.
         # Requires --impure flag (already set by the CLI).
         configPath = let p = builtins.getEnv "BUILD_CONFIG_PATH"; in
-          if p != "" then p else "./enclave/build-config.json";
+          if p != "" then p else "../.enclave/build-config.json";
         buildCfg = builtins.fromJSON (builtins.readFile configPath);
         appCfg = buildCfg.app;
         runtimeCfg = buildCfg.runtime;
@@ -867,50 +477,10 @@ const frameworkFlakeNixNodejs = `{
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
 
-        # Nitriding TLS termination daemon.
-        nitriding = eifPkgs.buildGoModule {
-          pname = "nitriding-daemon";
-          version = "unstable-2024-01-01";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "nitriding-daemon";
-            rev = "c8cb7248843c82a5d72ff6cdde90f4a4cf68c87f";
-            hash = "sha256-0ww8ZcoUh3UgRJyhfEVwmjxk3tZv7exCw0VmftdnM7U=";
-          };
-
-          vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
-
-          env.CGO_ENABLED = "0";
-          buildFlags = [ "-trimpath" ];
-          doCheck = false;
-
-          postInstall = ''
-            mv $out/bin/nitriding-daemon $out/bin/nitriding
-          '';
-        };
-
-        # Viproxy for IMDS forwarding inside the enclave.
-        viproxy = eifPkgs.buildGoModule {
-          pname = "viproxy";
-          version = "0.1.2";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "viproxy";
-            rev = "v0.1.2";
-            hash = "sha256-xcQCvl+/d7a3fdqDMEEIyP3c49l1bu7ptCG+RZ94Xws=";
-          };
-
-          vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
-
-          subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
-
-          postInstall = ''
-            mv $out/bin/example $out/bin/proxy
-          '';
-        };
+        # Nitriding and viproxy are vendored into the runtime binary (see
+        # runtime/nitriding/ and runtime/viproxy/), so no separate derivations
+        # are needed here — the runtime /app/runtime is the whole enclave
+        # userspace alongside the user's app.
 
         # Assemble the /app directory with all binaries, scripts, and Node.js app.
         appDir = eifPkgs.runCommand "enclave-app" { } ''
@@ -931,9 +501,6 @@ LAUNCHER
           chmod +x $out/app/` + "${appCfg.binary_name}" + `
 
           cp ` + "${runtime}" + `/bin/runtime $out/app/runtime
-          cp ` + "${nitriding}" + `/bin/nitriding $out/app/nitriding
-          cp ` + "${viproxy}" + `/bin/proxy $out/app/proxy
-          install -m 0755 ` + "${./enclave/start.sh}" + ` $out/app/start.sh
         '';
 
         # Complete rootfs for the enclave — includes Node.js runtime.
@@ -980,7 +547,7 @@ LAUNCHER
           nsmKo = nitro.blobs.x86_64.nsmKo;
 
           copyToRoot = enclaveRootfs;
-          entrypoint = "/app/start.sh";
+          entrypoint = "/app/runtime";
           env = enclaveEnv;
         };
 
@@ -1007,7 +574,7 @@ LAUNCHER
       in
       {
         packages = {
-          inherit upstream-app runtime nitriding viproxy eif vendor-hash-check;
+          inherit upstream-app runtime eif vendor-hash-check;
           default = eif;
         };
       }
@@ -1045,7 +612,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -1064,14 +631,17 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          cd enclave/tofu
-          tofu init
-          tofu apply -auto-approve
+          enclave tofu
+          # Stash the artifacts dir before cd so the PCR reads below resolve
+          # to the right path regardless of current working directory.
+          ARTIFACTS="$PWD/.enclave/artifacts"
+          tofu -chdir=tofu init
+          tofu -chdir=tofu apply -auto-approve
 
           # Extract deployment outputs for manifest and verification.
-          pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
-          pcr1=$(jq -r '.PCR1' enclave/artifacts/pcr.json)
-          pcr2=$(jq -r '.PCR2' enclave/artifacts/pcr.json)
+          pcr0=$(jq -r '.PCR0' "$ARTIFACTS/pcr.json")
+          pcr1=$(jq -r '.PCR1' "$ARTIFACTS/pcr.json")
+          pcr2=$(jq -r '.PCR2' "$ARTIFACTS/pcr.json")
           echo "pcr0=${pcr0}" >> "$GITHUB_OUTPUT"
           echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
           echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
@@ -1139,7 +709,7 @@ jobs:
         continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: enclave/artifacts/pcr.json
+          subject-path: .enclave/artifacts/pcr.json
 
       - name: Attestation verification instructions
         if: steps.deploy.outputs.elastic_ip != ''
@@ -1155,7 +725,7 @@ jobs:
         run: |
           echo "## PCR Measurements" >> "$GITHUB_STEP_SUMMARY"
           echo '` + "```" + `json' >> "$GITHUB_STEP_SUMMARY"
-          cat enclave/artifacts/pcr.json >> "$GITHUB_STEP_SUMMARY"
+          cat .enclave/artifacts/pcr.json >> "$GITHUB_STEP_SUMMARY"
           echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify attestation
@@ -1314,7 +884,7 @@ jobs:
           go-version: 'stable'
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -1323,7 +893,7 @@ jobs:
 
       - name: Destroy infrastructure
         run: |
-          cd enclave/tofu
+          cd tofu
           tofu init
           tofu destroy -auto-approve
 `
@@ -1350,7 +920,7 @@ const frameworkFlakeNixDotnet = `{
 
         # Read build config generated by ` + "`" + `enclave build` + "`" + ` from enclave.yaml.
         configPath = let p = builtins.getEnv "BUILD_CONFIG_PATH"; in
-          if p != "" then p else "./enclave/build-config.json";
+          if p != "" then p else "../.enclave/build-config.json";
         buildCfg = builtins.fromJSON (builtins.readFile configPath);
         appCfg = buildCfg.app;
         runtimeCfg = buildCfg.runtime;
@@ -1423,50 +993,10 @@ const frameworkFlakeNixDotnet = `{
           sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
         } else {}));
 
-        # Nitriding TLS termination daemon.
-        nitriding = eifPkgs.buildGoModule {
-          pname = "nitriding-daemon";
-          version = "unstable-2024-01-01";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "nitriding-daemon";
-            rev = "c8cb7248843c82a5d72ff6cdde90f4a4cf68c87f";
-            hash = "sha256-0ww8ZcoUh3UgRJyhfEVwmjxk3tZv7exCw0VmftdnM7U=";
-          };
-
-          vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
-
-          env.CGO_ENABLED = "0";
-          buildFlags = [ "-trimpath" ];
-          doCheck = false;
-
-          postInstall = ''
-            mv $out/bin/nitriding-daemon $out/bin/nitriding
-          '';
-        };
-
-        # Viproxy for IMDS forwarding inside the enclave.
-        viproxy = eifPkgs.buildGoModule {
-          pname = "viproxy";
-          version = "0.1.2";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "viproxy";
-            rev = "v0.1.2";
-            hash = "sha256-xcQCvl+/d7a3fdqDMEEIyP3c49l1bu7ptCG+RZ94Xws=";
-          };
-
-          vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
-
-          subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
-
-          postInstall = ''
-            mv $out/bin/example $out/bin/proxy
-          '';
-        };
+        # Nitriding and viproxy are vendored into the runtime binary (see
+        # runtime/nitriding/ and runtime/viproxy/), so no separate derivations
+        # are needed here — the runtime /app/runtime is the whole enclave
+        # userspace alongside the user's app.
 
         # Assemble the /app directory with all binaries and scripts.
         appDir = eifPkgs.runCommand "enclave-app" { } ''
@@ -1484,9 +1014,6 @@ const frameworkFlakeNixDotnet = `{
           chmod +x $out/app/` + "${appCfg.binary_name}" + `
 
           cp ` + "${runtime}" + `/bin/runtime $out/app/runtime
-          cp ` + "${nitriding}" + `/bin/nitriding $out/app/nitriding
-          cp ` + "${viproxy}" + `/bin/proxy $out/app/proxy
-          install -m 0755 ` + "${./enclave/start.sh}" + ` $out/app/start.sh
         '';
 
         # Complete rootfs for the enclave — includes ICU for .NET globalization.
@@ -1533,7 +1060,7 @@ const frameworkFlakeNixDotnet = `{
           nsmKo = nitro.blobs.x86_64.nsmKo;
 
           copyToRoot = enclaveRootfs;
-          entrypoint = "/app/start.sh";
+          entrypoint = "/app/runtime";
           env = enclaveEnv;
         };
 
@@ -1544,7 +1071,7 @@ const frameworkFlakeNixDotnet = `{
       in
       {
         packages = {
-          inherit upstream-app runtime nitriding viproxy eif vendor-hash-check;
+          inherit upstream-app runtime eif vendor-hash-check;
           default = eif;
         };
       }
@@ -1571,7 +1098,7 @@ const frameworkFlakeNixRust = `{
         nitro = aws-nitro-util.lib.x86_64-linux;
 
         configPath = let p = builtins.getEnv "BUILD_CONFIG_PATH"; in
-          if p != "" then p else "./enclave/build-config.json";
+          if p != "" then p else "../.enclave/build-config.json";
         buildCfg = builtins.fromJSON (builtins.readFile configPath);
         appCfg = buildCfg.app;
         runtimeCfg = buildCfg.runtime;
@@ -1641,56 +1168,13 @@ const frameworkFlakeNixRust = `{
           buildAndTestSubdir = appCfg.nix_subdir;
         } else {}));
 
-        nitriding = eifPkgs.buildGoModule {
-          pname = "nitriding-daemon";
-          version = "unstable-2024-01-01";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "nitriding-daemon";
-            rev = "c8cb7248843c82a5d72ff6cdde90f4a4cf68c87f";
-            hash = "sha256-0ww8ZcoUh3UgRJyhfEVwmjxk3tZv7exCw0VmftdnM7U=";
-          };
-
-          vendorHash = "sha256-B/1tbPfId6qgvaMwPF5w4gFkkkeoI+5k+x0jEvJxQus=";
-
-          env.CGO_ENABLED = "0";
-          buildFlags = [ "-trimpath" ];
-          doCheck = false;
-
-          postInstall = ''
-            mv $out/bin/nitriding-daemon $out/bin/nitriding
-          '';
-        };
-
-        viproxy = eifPkgs.buildGoModule {
-          pname = "viproxy";
-          version = "0.1.2";
-
-          src = eifPkgs.fetchFromGitHub {
-            owner = "brave";
-            repo = "viproxy";
-            rev = "v0.1.2";
-            hash = "sha256-xcQCvl+/d7a3fdqDMEEIyP3c49l1bu7ptCG+RZ94Xws=";
-          };
-
-          vendorHash = "sha256-WOzeqHo1cG8USbGUm3OAEUgh3yKTamCaIL3FpsshnjI=";
-
-          subPackages = [ "example" ];
-          env.CGO_ENABLED = "0";
-
-          postInstall = ''
-            mv $out/bin/example $out/bin/proxy
-          '';
-        };
+        # Nitriding and viproxy are vendored into the runtime binary — no
+        # separate derivations needed.
 
         appDir = eifPkgs.runCommand "enclave-app" { } ''
           mkdir -p $out/app/data
           cp ` + "${upstream-app}" + `/bin/` + "${appCfg.binary_name}" + ` $out/app/` + "${appCfg.binary_name}" + `
           cp ` + "${runtime}" + `/bin/runtime $out/app/runtime
-          cp ` + "${nitriding}" + `/bin/nitriding $out/app/nitriding
-          cp ` + "${viproxy}" + `/bin/proxy $out/app/proxy
-          install -m 0755 ` + "${./enclave/start.sh}" + ` $out/app/start.sh
         '';
 
         enclaveRootfs = eifPkgs.buildEnv {
@@ -1731,7 +1215,7 @@ const frameworkFlakeNixRust = `{
           nsmKo = nitro.blobs.x86_64.nsmKo;
 
           copyToRoot = enclaveRootfs;
-          entrypoint = "/app/start.sh";
+          entrypoint = "/app/runtime";
           env = enclaveEnv;
         };
 
@@ -1759,7 +1243,7 @@ const frameworkFlakeNixRust = `{
       in
       {
         packages = {
-          inherit upstream-app runtime nitriding viproxy eif vendor-hash-check;
+          inherit upstream-app runtime eif vendor-hash-check;
           default = eif;
         };
       }
@@ -1797,7 +1281,7 @@ jobs:
           go-version: stable
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - name: Fetch deployment manifest
         id: manifest
@@ -1945,8 +1429,8 @@ jobs:
 
 // GitHub Actions workflow — builds the EIF and uploads to a GitHub Release.
 // Triggered on push when enclave-related files change, or manually.
-// Dokploy (or any CI/CD tool) can pull the EIF from the "eif-latest" release
-// to run QEMU enclave tests on a bare metal instance without needing Nix locally.
+// Any CI/CD tool can pull the EIF from the "eif-latest" release to run QEMU
+// enclave tests on a bare metal instance without needing Nix locally.
 const frameworkBuildEIFWorkflow = `name: Build EIF
 
 on:
@@ -1954,8 +1438,6 @@ on:
     branches: [master, main]
     paths:
       - 'enclave/**'
-      - 'flake.nix'
-      - 'flake.lock'
   workflow_dispatch:
 
 permissions:
@@ -1973,7 +1455,7 @@ jobs:
           go-version: stable
 
       - name: Install enclave CLI
-        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
 
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9
@@ -1984,7 +1466,7 @@ jobs:
       - name: Extract PCR values
         id: pcr
         run: |
-          PCR0=$(jq -r '.PCR0 // .pcr0' enclave/artifacts/pcr.json)
+          PCR0=$(jq -r '.PCR0 // .pcr0' .enclave/artifacts/pcr.json)
           echo "pcr0=${PCR0}" >> "$GITHUB_OUTPUT"
           echo "PCR0: ${PCR0:0:32}..."
 
@@ -1993,10 +1475,9 @@ jobs:
         with:
           name: enclave-eif
           path: |
-            enclave/artifacts/image.eif
-            enclave/artifacts/pcr.json
-            enclave/artifacts/supervisor
-            enclave/artifacts/gvproxy
+            .enclave/artifacts/image.eif
+            .enclave/artifacts/pcr.json
+            .enclave/artifacts/supervisor
           retention-days: 7
 
       - name: Upload to latest release
@@ -2012,10 +1493,9 @@ jobs:
             --notes "Auto-built EIF from commit ${COMMIT_SHA::8}
           PCR0: ${PCR0}" \
             --prerelease \
-            enclave/artifacts/image.eif \
-            enclave/artifacts/pcr.json \
-            enclave/artifacts/supervisor \
-            enclave/artifacts/gvproxy
+            .enclave/artifacts/image.eif \
+            .enclave/artifacts/pcr.json \
+            .enclave/artifacts/supervisor
 
       - name: Publish build manifest
         continue-on-error: true
@@ -2024,9 +1504,9 @@ jobs:
           REPO: ` + "${{ github.repository }}" + `
           COMMIT_SHA: ` + "${{ github.sha }}" + `
         run: |
-          PCR0=$(jq -r '.PCR0 // .pcr0' enclave/artifacts/pcr.json)
-          PCR1=$(jq -r '.PCR1 // .pcr1' enclave/artifacts/pcr.json)
-          PCR2=$(jq -r '.PCR2 // .pcr2' enclave/artifacts/pcr.json)
+          PCR0=$(jq -r '.PCR0 // .pcr0' .enclave/artifacts/pcr.json)
+          PCR1=$(jq -r '.PCR1 // .pcr1' .enclave/artifacts/pcr.json)
+          PCR2=$(jq -r '.PCR2 // .pcr2' .enclave/artifacts/pcr.json)
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           TAG="build-$(date -u +%Y%m%d-%H%M%S)"
 
@@ -2061,176 +1541,3 @@ jobs:
           fi
 `
 
-const frameworkDokployCompose = `# Dokploy-compatible compose file for local QEMU enclave deployment.
-#
-# Dokploy connects to the GitHub repo and deploys this stack on push.
-# The EIF is downloaded automatically from the "eif-latest" GitHub Release
-# (built by .github/workflows/build-eif.yml).
-#
-# Setup in Dokploy:
-#   1. Create a "Compose" project
-#   2. Connect to your GitHub repo
-#   3. Set compose path: enclave/dokploy/docker-compose.yml
-#   4. Set env var GITHUB_REPO (e.g. owner/repo)
-#   5. Optionally set GITHUB_TOKEN for private repos
-#   6. Deploy
-#
-# Manual usage:
-#   GITHUB_REPO=owner/repo docker compose up
-
-services:
-  # --- EIF Downloader ---
-  # Downloads the latest EIF from GitHub Releases before the enclave starts.
-  eif-downloader:
-    image: curlimages/curl:latest
-    user: "0:0"
-    volumes:
-      - eif-artifacts:/artifacts
-    environment:
-      GITHUB_REPO: "${GITHUB_REPO}"
-      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        echo "=== Downloading EIF from GitHub Releases ==="
-        REPO="$${GITHUB_REPO}"
-        TAG="eif-latest"
-
-        if [ -n "$${GITHUB_TOKEN}" ]; then
-          AUTH_HEADER="Authorization: token $${GITHUB_TOKEN}"
-        else
-          AUTH_HEADER="X-No-Auth: true"
-        fi
-
-        RELEASE_URL="https://api.github.com/repos/$${REPO}/releases/tags/$${TAG}"
-        echo "  Fetching release: $${RELEASE_URL}"
-
-        ASSETS=$(curl -sfL -H "$${AUTH_HEADER}" "$${RELEASE_URL}" | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4)
-
-        if [ -z "$${ASSETS}" ]; then
-          echo "ERROR: No assets found in release $${TAG}"
-          echo "Has the build-eif workflow run? Check: https://github.com/$${REPO}/releases/tag/$${TAG}"
-          exit 1
-        fi
-
-        mkdir -p /artifacts
-        for URL in $${ASSETS}; do
-          FILENAME=$(basename "$${URL}")
-          echo "  Downloading: $${FILENAME}"
-          curl -sfL -H "$${AUTH_HEADER}" -o "/artifacts/$${FILENAME}" "$${URL}"
-        done
-
-        echo "  Downloaded:"
-        ls -lh /artifacts/
-        echo "=== EIF download complete ==="
-
-  # --- Mock AWS Services ---
-
-  local-kms:
-    image: nsmithuk/local-kms
-    ports:
-      - "8080:8080"
-    environment:
-      KMS_REGION: us-east-1
-      KMS_ACCOUNT_ID: "123456789012"
-    volumes:
-      - ./seed.yaml:/init/seed.yaml:ro
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-  kms-proxy:
-    image: ghcr.io/arklabshq/enclave-kms-proxy:latest
-    ports:
-      - "4000:4000"
-    environment:
-      UPSTREAM_KMS_URL: "http://local-kms:8080"
-      LISTEN_ADDR: ":4000"
-    depends_on:
-      local-kms:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/ || exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-  localstack:
-    image: localstack/localstack
-    ports:
-      - "4566:4566"
-    environment:
-      SERVICES: ssm,sts,s3,cloudformation,iam
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
-  mock-imds:
-    image: ghcr.io/arklabshq/enclave-mock-imds:latest
-    ports:
-      - "1338:1338"
-    environment:
-      LISTEN_ADDR: ":1338"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:1338/latest/api/token || exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-  # --- QEMU Enclave ---
-  # Boots the EIF in QEMU with nitro-enclave emulation.
-  # Requires privileged mode for KVM + vsock access.
-
-  enclave:
-    image: ghcr.io/arklabshq/enclave-runner:latest
-    privileged: true
-    network_mode: host
-    devices:
-      - /dev/kvm:/dev/kvm
-      - /dev/vsock:/dev/vsock
-    volumes:
-      - eif-artifacts:/eif
-    depends_on:
-      eif-downloader:
-        condition: service_completed_successfully
-      localstack:
-        condition: service_healthy
-      mock-imds:
-        condition: service_healthy
-      kms-proxy:
-        condition: service_healthy
-    environment:
-      BOOT_TIMEOUT: "120"
-    command: ["boot-qemu.sh", "/eif/image.eif"]
-    restart: unless-stopped
-
-volumes:
-  eif-artifacts:
-`
-
-const frameworkDokploySeedYaml = `# Default KMS seed for local development.
-# local-kms loads this at startup to create a pre-seeded encryption key.
-# Customize the KeyId and alias to match your enclave.yaml configuration.
-Keys:
-  Symmetric:
-    Aes:
-      - Metadata:
-          KeyId: "test-key-id"
-          Description: "Local development enclave key"
-          KeyUsage: ENCRYPT_DECRYPT
-        BackingKeys:
-          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-Aliases:
-  - AliasName: alias/test-enclave-key
-    TargetKeyId: "test-key-id"
-`

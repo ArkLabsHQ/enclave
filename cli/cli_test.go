@@ -51,28 +51,49 @@ func TestCLI_Init(t *testing.T) {
 				t.Fatal("enclave/enclave.yaml not created")
 			}
 
-			// Verify critical framework files.
+			// Verify critical build-time framework files.
 			for _, f := range []string{
-				"flake.nix",
-				"enclave/start.sh",
-				"enclave/scripts/enclave_init.sh",
-				"enclave/tofu/modules/enclave/kms.tf",
+				"enclave/flake.nix",
 			} {
 				if _, err := os.Stat(filepath.Join(dir, f)); os.IsNotExist(err) {
 					t.Errorf("missing: %s", f)
 				}
 			}
-
-			// Verify start.sh has NSM entropy seeding.
-			startSh, _ := os.ReadFile(filepath.Join(dir, "enclave", "start.sh"))
-			if !strings.Contains(string(startSh), "/dev/nsm") {
-				t.Error("start.sh missing NSM entropy seeding")
+			// flake.nix at repo root must NOT exist post-refactor.
+			if _, err := os.Stat(filepath.Join(dir, "flake.nix")); err == nil {
+				t.Error("flake.nix found at repo root; should be under enclave/")
+			}
+			// `enclave init` must NOT scaffold tofu files — that's `enclave tofu`.
+			if _, err := os.Stat(filepath.Join(dir, "tofu")); err == nil {
+				t.Error("tofu/ found after init; should only be created by 'enclave tofu'")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "enclave", "tofu")); err == nil {
+				t.Error("enclave/tofu/ found after init; tofu tree now lives at ./tofu/")
 			}
 
-			// Verify kms.tf has destroy provisioner.
-			kmsTf, _ := os.ReadFile(filepath.Join(dir, "enclave", "tofu", "modules", "enclave", "kms.tf"))
-			if !strings.Contains(string(kmsTf), "when    = destroy") {
-				t.Error("kms.tf missing destroy provisioner")
+			// `enclave tofu` scaffolds the consolidated OpenTofu tree: one
+			// main.tf per module, plus the user_data template.
+			tofuCmd := exec.Command(bin, "tofu")
+			tofuCmd.Dir = dir
+			if out, err := tofuCmd.CombinedOutput(); err != nil {
+				t.Fatalf("enclave tofu failed:\n%s", out)
+			}
+			for _, f := range []string{
+				"tofu/main.tf",
+				"tofu/modules/backend/main.tf",
+				"tofu/modules/enclave/main.tf",
+				"tofu/modules/enclave/templates/user_data.sh.tftpl",
+			} {
+				if _, err := os.Stat(filepath.Join(dir, f)); os.IsNotExist(err) {
+					t.Errorf("missing after enclave tofu: %s", f)
+				}
+			}
+
+			// Destroy provisioner content (from the old kms.tf) now lives
+			// inside the merged module main.tf.
+			moduleMain, _ := os.ReadFile(filepath.Join(dir, "tofu", "modules", "enclave", "main.tf"))
+			if !strings.Contains(string(moduleMain), "when    = destroy") {
+				t.Error("modules/enclave/main.tf missing destroy provisioner")
 			}
 		})
 	}
@@ -127,14 +148,14 @@ func TestCLI_Build(t *testing.T) {
 		t.Fatalf("enclave build failed:\n%s", out)
 	}
 
-	// Verify artifacts were created.
+	// Verify artifacts were created. terraform.tfvars.json is no longer a
+	// build output — `enclave tofu` writes it now (verified separately in
+	// TestCLI_Init).
 	for _, artifact := range []string{
-		"enclave/artifacts/image.eif",
-		"enclave/artifacts/pcr.json",
-		"enclave/artifacts/supervisor",
-		"enclave/artifacts/gvproxy",
-		"enclave/build-config.json",
-		"enclave/tofu/terraform.tfvars.json",
+		".enclave/artifacts/image.eif",
+		".enclave/artifacts/pcr.json",
+		".enclave/artifacts/supervisor",
+		".enclave/build-config.json",
 	} {
 		if _, err := os.Stat(filepath.Join(dir, artifact)); os.IsNotExist(err) {
 			t.Errorf("missing artifact: %s", artifact)

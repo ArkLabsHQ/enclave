@@ -40,15 +40,20 @@ jobs:
           go build -o /tmp/enclave-cli ./cli/cmd/enclave
           export RUNTIME_LOCAL_PATH=$GITHUB_WORKSPACE
           export SUPERVISOR_LOCAL_PATH=$GITHUB_WORKSPACE
+          # Build the test app from the workspace tree (mirrors `make test-build`)
+          # so the baked nix_rev/nix_hash in test/app/enclave/enclave.yaml don't
+          # need to be re-pinned on every change to test/app/.
+          export APP_LOCAL_PATH=$GITHUB_WORKSPACE/test/app
 
           # Vendor SDK dependencies (vendor/ is gitignored, Nix needs it when using local source).
           cd $RUNTIME_LOCAL_PATH/runtime && go mod vendor && cd $GITHUB_WORKSPACE/test/app
+          go mod vendor
 
           # Build v1 once; stash to /tmp so v2's baked predecessor PCR0 is
           # guaranteed to match the final installed v1.
           /tmp/enclave-cli build
-          cp enclave/artifacts/image.eif /tmp/image-v1.eif
-          cp enclave/artifacts/pcr.json /tmp/pcr-v1.json
+          cp .enclave/artifacts/image.eif /tmp/image-v1.eif
+          cp .enclave/artifacts/pcr.json /tmp/pcr-v1.json
           V1_PCR0=$(jq -r '.PCR0' /tmp/pcr-v1.json)
 
           # Build v2 EIF with previous_pcr0 set to v1's PCR0.
@@ -60,30 +65,30 @@ jobs:
             echo "previous_pcr0: \"${V1_PCR0}\"" >> enclave/enclave.yaml
           fi
           /tmp/enclave-cli build
-          cp enclave/artifacts/image.eif /tmp/image-v2.eif
-          cp enclave/artifacts/pcr.json /tmp/pcr-v2.json
+          cp .enclave/artifacts/image.eif /tmp/image-v2.eif
+          cp .enclave/artifacts/pcr.json /tmp/pcr-v2.json
 
           # v3: deliberately wrong previous_pcr0 for the rollback test.
           WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
           sed -i 's/^version: .*/version: 0.0.3/' enclave/enclave.yaml
           sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${WRONG_PCR0}\"|" enclave/enclave.yaml
           /tmp/enclave-cli build
-          cp enclave/artifacts/image.eif /tmp/image-v3.eif
-          cp enclave/artifacts/pcr.json /tmp/pcr-v3.json
+          cp .enclave/artifacts/image.eif /tmp/image-v3.eif
+          cp .enclave/artifacts/pcr.json /tmp/pcr-v3.json
 
           # Restore yaml to v1 state (no rebuild — would produce a divergent PCR0).
           sed -i 's/^version: .*/version: 0.0.1/' enclave/enclave.yaml
           sed -i '/^previous_pcr0:/d' enclave/enclave.yaml
 
           # Install all artifacts from /tmp.
-          cp /tmp/image-v1.eif enclave/artifacts/image.eif
-          cp /tmp/pcr-v1.json enclave/artifacts/pcr.json
-          cp /tmp/image-v1.eif enclave/artifacts/image-v1.eif
-          cp /tmp/pcr-v1.json enclave/artifacts/pcr-v1.json
-          cp /tmp/image-v2.eif enclave/artifacts/image-v2.eif
-          cp /tmp/pcr-v2.json enclave/artifacts/pcr-v2.json
-          cp /tmp/image-v3.eif enclave/artifacts/image-v3.eif
-          cp /tmp/pcr-v3.json enclave/artifacts/pcr-v3.json
+          cp /tmp/image-v1.eif .enclave/artifacts/image.eif
+          cp /tmp/pcr-v1.json .enclave/artifacts/pcr.json
+          cp /tmp/image-v1.eif .enclave/artifacts/image-v1.eif
+          cp /tmp/pcr-v1.json .enclave/artifacts/pcr-v1.json
+          cp /tmp/image-v2.eif .enclave/artifacts/image-v2.eif
+          cp /tmp/pcr-v2.json .enclave/artifacts/pcr-v2.json
+          cp /tmp/image-v3.eif .enclave/artifacts/image-v3.eif
+          cp /tmp/pcr-v3.json .enclave/artifacts/pcr-v3.json
 
       - name: Run integration test
         run: cd test && docker compose --profile test run --build test-runner

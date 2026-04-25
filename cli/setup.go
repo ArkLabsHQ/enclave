@@ -68,9 +68,9 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("[setup] Language: %s\n", language)
 
-	// Rewrite flake.nix to match the language.
-	for _, f := range getFrameworkFiles(language) {
-		if f.RelPath == "flake.nix" {
+	// Rewrite enclave/flake.nix to match the language.
+	for _, f := range getInitFiles(language) {
+		if f.RelPath == "enclave/flake.nix" {
 			destPath := filepath.Join(root, f.RelPath)
 			if err := os.WriteFile(destPath, []byte(f.Content), f.Mode); err != nil {
 				return fmt.Errorf("write %s: %w", f.RelPath, err)
@@ -80,12 +80,12 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Generate flake.lock to pin all input revisions for reproducible builds.
-	fmt.Println("[setup] Generating flake.lock...")
+	// Generate enclave/flake.lock to pin all input revisions for reproducible builds.
+	fmt.Println("[setup] Generating enclave/flake.lock...")
 	lockCmd := exec.Command("nix", "flake", "lock",
 		"--extra-experimental-features", "nix-command flakes",
 	)
-	lockCmd.Dir = root
+	lockCmd.Dir = filepath.Join(root, "enclave")
 	lockCmd.Stdout = os.Stdout
 	lockCmd.Stderr = os.Stderr
 	if err := lockCmd.Run(); err != nil {
@@ -351,9 +351,9 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 	}
 
 	// Ensure files are git-tracked (flakes only see tracked files).
-	ensureGitTracked(root, "flake.nix", "enclave/build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+	ensureGitTracked(root, "enclave/flake.nix", "enclave/enclave.yaml")
 
-	configPath := filepath.Join(root, "enclave", "build-config.json")
+	configPath := filepath.Join(root, ".enclave", "build-config.json")
 	absConfigPath, _ := filepath.Abs(configPath)
 
 	cmd := exec.Command("nix", "build",
@@ -361,7 +361,7 @@ func computeVendorHash(root string, subPackages []string, language string) (stri
 		"--no-link",
 		"--extra-experimental-features", "nix-command flakes",
 		"--option", "eval-cache", "false",
-		".#vendor-hash-check",
+		"./enclave#vendor-hash-check",
 	)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "BUILD_CONFIG_PATH="+absConfigPath)

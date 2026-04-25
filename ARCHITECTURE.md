@@ -45,12 +45,13 @@
                               │  │              EC2 INSTANCE (Nitro)         │  │
                               │  │                                           │  │
                               │  │  ┌─────────────────────────────────────┐  │  │
-                              │  │  │         HOST SERVICES               │  │  │
+                              │  │  │   enclave-supervisor.service        │  │  │
+                              │  │  │   (single host-side process)        │  │  │
                               │  │  │                                     │  │  │
-                              │  │  │  supervisor (127.0.0.1:8443)     │  │  │
-                              │  │  │  gvproxy (Docker, vsock://:1024)   │  │  │
-                              │  │  │  vsock-proxy (8002↔IMDS)           │  │  │
-                              │  │  │  enclave-watchdog (nitro-cli)      │  │  │
+                              │  │  │   • Management API 127.0.0.1:8443  │  │  │
+                              │  │  │   • gvproxy (in-process, vsock:1024)│  │  │
+                              │  │  │   • IMDS AF_VSOCK fwd (vsock:8002) │  │  │
+                              │  │  │   • Watchdog (nitro-cli run/term)   │  │  │
                               │  │  └──────────────┬──────────────────────┘  │  │
                               │  │                 │ vsock                    │  │
                               │  │  ┌──────────────┴──────────────────────┐  │  │
@@ -83,42 +84,46 @@
 | **CLI** | Root Go module (`cmd/enclave/`) | `init`, `build`, `deploy`, `verify`, `start`, `stop`, `destroy` |
 | **Nix Flake** | `flake.nix` | Deterministic EIF build (supervisor + app + nitriding + viproxy) |
 | **CDK Stack** | `cdk.go` | AWS infrastructure (KMS, SSM, EC2, VPC, S3, IAM) |
-| **supervisor** | `supervisor/` | Host-side API (migration, start/stop) |
-| **SDK Supervisor** | `sdk/` | In-enclave orchestrator (secrets, attestation, storage, HTTP) |
+| **supervisor** | `supervisor/` | Host-side all-in-one: management API, in-process gvproxy, in-process IMDS AF_VSOCK forwarder, and enclave lifecycle watchdog. Replaces the former `enclave-watchdog`, `enclave-imds-proxy`, and standalone `gvproxy.service`. |
+| **Runtime** | `runtime/` | In-enclave orchestrator (secrets, attestation, storage, HTTP) |
 | **Nitriding** | Third-party (Brave) | TLS termination, attestation document serving |
-| **Viproxy** | Third-party (Brave) | IMDS proxy over vsock |
-| **gvproxy** | Third-party (Google) | TAP networking over vsock |
+| **Viproxy** | Third-party (Brave) | In-enclave IMDS endpoint (127.0.0.1:80 → vsock:2:8002) |
+| **gvproxy** | Linked as Go library (`github.com/containers/gvisor-tap-vsock`) | TAP networking over vsock, now in-process inside supervisor |
 | **Client Library** | `client/` | Verified HTTP client with attestation checking |
 
 ---
 
 ## 2. Build Flow
 
-### 2.1 Initialization (`enclave init`)
+### 2.1 Initialization (`enclave init` + `enclave tofu`)
 
 ```
-enclave init
+enclave init (build-time scaffold only)
     │
     ├─ First time (no enclave.yaml exists):
     │   ├─ Create enclave/ directory
     │   ├─ Write enclave/enclave.yaml from template
     │   │   └─ Substitute SDK coordinates (rev, hash, vendor_hash) from ldflags
-    │   └─ Write 17 framework files via getFrameworkFiles():
-    │       ├─ flake.nix (language-specific: Go / Node.js / .NET)
-    │       ├─ enclave/start.sh (EIF entrypoint)
-    │       ├─ enclave/gvproxy/Dockerfile + start.sh
-    │       ├─ enclave/scripts/enclave_init.sh
-    │       ├─ enclave/systemd/ (4 unit files)
-    │       ├─ enclave/user_data/user_data
-    │       ├─ .github/workflows/ (4 CI/CD workflows)
-    │       ├─ enclave/dokploy/ (docker-compose, seed.yaml)
-    │       └─ enclave/.gitignore
+    │   └─ Write build-time framework files via getInitFiles():
+    │       ├─ enclave/flake.nix (language-specific: Go / Node.js / .NET / Rust)
+    │       └─ .github/workflows/ (CI/CD workflows)
     │
     └─ Existing config:
         ├─ Load and validate all required fields
         ├─ Validate app coordinates (nix_owner, nix_repo, nix_rev, nix_hash)
         ├─ Validate SDK coordinates (rev, hash, vendor_hash)
         └─ Print summary with secret count
+
+enclave tofu (deployment scaffold, run before first deploy)
+    └─ Write OpenTofu tree via getTofuFiles() with merge-only-new
+       (one main.tf per module, sectioned by banner comments):
+        ├─ tofu/main.tf            (root: provider + module call + vars + outputs)
+        ├─ tofu/modules/enclave/main.tf
+        │   └─ KMS, IAM, S3, SSM, VPC, EC2, vars, outputs
+        ├─ tofu/modules/enclave/templates/user_data.sh.tftpl
+        ├─ tofu/modules/backend/main.tf  (state bucket + lock table bootstrap)
+        └─ tofu/.gitignore
+    └─ Always rewrite tofu/terraform.tfvars.json from enclave.yaml.
 ```
 
 ### 2.2 Configuration (`enclave/enclave.yaml`)
@@ -164,12 +169,12 @@ enclave build
     │
     ├─ 1. Load enclave.yaml, validate SDK fields (rev, hash, vendor_hash)
     │
-    ├─ 2. Generate enclave/build-config.json from enclave.yaml
+    ├─ 2. Generate .enclave/build-config.json from enclave.yaml
     │      Template substitution: {{region}}, {{prefix}}, {{version}}
     │      Includes: APP_BINARY_NAME, secrets config, env vars
     │
     ├─ 3. git add --intent-to-add (make files visible to Nix flakes)
-    │      Files: flake.nix, enclave/build-config.json, enclave/start.sh, enclave/enclave.yaml
+    │      Files: enclave/flake.nix, enclave/enclave.yaml (build-config.json is a CLI-generated intermediate in .enclave/)
     │
     ├─ 4. Build EIF
     │   │
@@ -178,11 +183,11 @@ enclave build
     │   │     nix build --impure \
     │   │       --extra-experimental-features 'nix-command flakes' \
     │   │       --out-link flake_result .#eif
-    │   │     cp flake_result/image.eif /src/enclave/artifacts/image.eif
-    │   │     cp flake_result/pcr.json  /src/enclave/artifacts/pcr.json
+    │   │     cp .enclave/result/image.eif /src/.enclave/artifacts/image.eif
+    │   │     cp .enclave/result/pcr.json  /src/.enclave/artifacts/pcr.json
     │   │   "
     │   │
-    │   └─  BUILD_CONFIG_PATH=./enclave/build-config.json \
+    │   └─  BUILD_CONFIG_PATH=./.enclave/build-config.json \
     │       nix build --impure ... --out-link flake_result .#eif
     │
     ├─ 5. Nix Flake Execution (inside Docker or locally)
@@ -201,14 +206,13 @@ enclave build
     │   │
     │   ├─ Build nitriding (Brave) — TLS termination + attestation
     │   │
-    │   ├─ Build viproxy (Brave) — IMDS proxy
+    │   ├─ (nitriding + viproxy are vendored into runtime/nitriding/ and
+    │   │   runtime/viproxy/ — linked into the runtime binary, no separate
+    │   │   /app/nitriding or /app/proxy in the EIF.)
     │   │
     │   ├─ Assemble /app directory (enclaveRootfs)
-    │   │   ├─ /app/runtime
-    │   │   ├─ /app/{binary_name}
-    │   │   ├─ /app/nitriding
-    │   │   ├─ /app/viproxy
-    │   │   ├─ /app/start.sh
+    │   │   ├─ /app/runtime           ← runtime + nitriding + viproxy, all-in-one
+    │   │   ├─ /app/{binary_name}     ← user's app
     │   │   ├─ /app/data/
     │   │   ├─ busybox, cacert
     │   │   └─ Environment variables baked in:
@@ -220,10 +224,10 @@ enclave build
     │   └─ Build EIF via monzo/aws-nitro-util
     │       ├─ Kernel + kernel config + NSM kernel object (AWS blobs)
     │       ├─ Rootfs from assembled /app
-    │       ├─ Entrypoint: /app/start.sh
+    │       ├─ Entrypoint: /app/runtime
     │       └─ Output: image.eif + pcr.json
     │
-    ├─ 6. Parse PCR values from enclave/artifacts/pcr.json
+    ├─ 6. Parse PCR values from .enclave/artifacts/pcr.json
     │      PCR0 = SHA384(EIF content)  — code identity
     │      PCR1 = SHA384(kernel + boot) — kernel identity
     │      PCR2 = SHA384(app binary)    — application identity
@@ -231,7 +235,7 @@ enclave build
     └─ 7. Build management binary
            go install github.com/ArkLabsHQ/introspector-enclave/supervisor/cmd/supervisor@{Runtime.Rev}
            GOOS=linux GOARCH=amd64 CGO_ENABLED=0
-           Output: enclave/artifacts/supervisor
+           Output: .enclave/artifacts/supervisor
 ```
 
 **Key insight**: `ENCLAVE_SECRETS_CONFIG` is a JSON string baked into the EIF at build time. It tells the supervisor which secrets to fetch at runtime:
@@ -249,7 +253,7 @@ enclave build
 enclave deploy
     │
     ├─ Load config, validate SDK
-    ├─ Read PCR0 from enclave/artifacts/pcr.json
+    ├─ Read PCR0 from .enclave/artifacts/pcr.json
     ├─ Create/resolve KMS key
     ├─ Pre-create SSM parameters for secrets
     ├─ Synth CDK stack (inline, no cdk.json)
@@ -304,10 +308,9 @@ CDK Stack: NitroIntrospectorStack
 │   └─ Used for: encrypted key-value storage (/v1/storage API)
 │
 ├─ S3 Assets (uploaded during deploy)
-│   ├─ enclave/artifacts/image.eif         ← the enclave image
-│   ├─ enclave/scripts/enclave_init.sh     ← enclave startup script
-│   ├─ enclave/systemd/*.service           ← 4 systemd unit files
-│   └─ enclave/artifacts/supervisor      ← management binary
+│   ├─ .enclave/artifacts/image.eif                        ← the enclave image
+│   ├─ enclave/systemd/enclave-supervisor.service         ← sole systemd unit
+│   └─ .enclave/artifacts/supervisor                       ← host supervisor binary
 │
 ├─ EC2 Instance
 │   ├─ Amazon Linux 2023
@@ -321,7 +324,6 @@ CDK Stack: NitroIntrospectorStack
     ├─ S3: Read for all uploaded assets
     ├─ KMS: GrantEncryptDecrypt + GrantPutKeyPolicy + GrantGetKeyPolicy
     ├─ SSM: Read/Write all secret and migration parameters
-    ├─ ECR: Pull gvproxy image
     └─ STS: GetCallerIdentity (for KMS policy construction)
 ```
 
@@ -335,27 +337,15 @@ The `user_data` script executes on first boot:
 EC2 Instance Launch
     │
     ├─ 1. SYSTEM PREPARATION
-    │   ├─ Install packages: aws-nitro-enclaves-cli, jq, git, docker
-    │   ├─ Configure nitro-enclaves-allocator:
-    │   │   ├─ Memory: 6144 MB (6 GB reserved for enclave)
-    │   │   └─ CPUs: 2 (dedicated to enclave)
-    │   └─ Configure vsock-proxy allowlist:
-    │       ├─ kms.{region}.amazonaws.com:443
-    │       ├─ ssm.{region}.amazonaws.com:443
-    │       ├─ sts.{region}.amazonaws.com:443
-    │       ├─ s3.{region}.amazonaws.com:443
-    │       └─ 169.254.169.254:80 (IMDS)
+    │   ├─ Install packages: aws-nitro-enclaves-cli, jq, git
+    │   └─ Configure nitro-enclaves-allocator:
+    │       ├─ Memory: 6144 MB (6 GB reserved for enclave)
+    │       └─ CPUs: 2 (dedicated to enclave)
     │
     ├─ 2. DOWNLOAD ASSETS FROM S3
-    │   ├─ /home/ec2-user/app/server/enclave.eif    ← pre-built EIF
-    │   ├─ /home/ec2-user/app/supervisor          ← management binary
-    │   ├─ /home/ec2-user/app/enclave_init.sh       ← enclave startup script
-    │   ├─ Pull gvproxy Docker image from ECR
-    │   └─ /etc/systemd/system/:
-    │       ├─ enclave-watchdog.service
-    │       ├─ enclave-imds-proxy.service
-    │       ├─ gvproxy.service
-    │       └─ supervisor.service
+    │   ├─ /home/ec2-user/app/server/enclave.eif           ← pre-built EIF
+    │   ├─ /home/ec2-user/app/supervisor                   ← host supervisor binary
+    │   └─ /etc/systemd/system/enclave-supervisor.service  ← sole systemd unit
     │
     ├─ 3. WRITE ENVIRONMENT (/etc/environment)
     │   ├─ ENCLAVE_APP_NAME={appName}
@@ -381,44 +371,40 @@ EC2 Instance Launch
 
 ## 5. Host Systemd Services
 
-### enclave-watchdog.service
+The host runs exactly **one** systemd unit: `enclave-supervisor.service`, which
+execs the `supervisor` binary. The supervisor owns every host-side
+responsibility in-process via a single errgroup:
+
+### enclave-supervisor.service
 ```
-Purpose: Launch and supervise the Nitro Enclave
-Restart: always (auto-restart on crash)
+Purpose:   All host-side enclave infrastructure in one process
+Restart:   always (systemd restarts the supervisor itself)
+Requires:  nitro-enclaves-allocator.service
+After:     nitro-enclaves-allocator.service, network-online.target
 
-Execution:
-  1. /home/ec2-user/app/enclave_init.sh
-  2. nitro-cli run-enclave \
-       --eif-path /home/ec2-user/app/server/enclave.eif \
-       --cpu-count 2 \
-       --memory 6144 \
-       --enclave-cid 16 \
-       --enclave-name app
-  3. Poll: nitro-cli describe-enclaves (until enclave exits)
+Subsystems (one errgroup, shared context):
 
-On stop: nitro-cli terminate-enclave --enclave-name app
-```
+  1. gvproxy (gvisor-tap-vsock linked as a Go library)
+     • vsock listen: vsock://:1024
+     • Gateway 192.168.127.1, VM 192.168.127.2, NAT to 127.0.0.1
+     • Pre-populated Forwards from GVPROXY_FORWARD_PORTS (default: 443 7073)
 
-### enclave-imds-proxy.service
-```
-Purpose: Bridge IMDS access into enclave via vsock
-Command: vsock-proxy 8002 169.254.169.254 80
+  2. IMDS AF_VSOCK forwarder (pure-Go, github.com/mdlayher/vsock)
+     • vsock listen: :8002 on CID_HOST
+     • Per-connection bidirectional copy to 169.254.169.254:80
+     • Replaces the external `vsock-proxy` binary
 
-Traffic flow:
-  Enclave (CID 3, port 8002) ←→ vsock-proxy ←→ 169.254.169.254:80 (EC2 metadata)
-```
+  3. Watchdog (nitro-cli subprocess, in-process poll loop)
+     • Startup: nitro-cli run-enclave --eif-path $EIF_PATH
+                --cpu-count $CPU_COUNT --memory $MEMORY_MIB
+                --enclave-cid $ENCLAVE_CID --enclave-name $ENCLAVE_NAME
+     • Poll every POLL_INTERVAL_SECONDS (default 5s)
+     • On unexpected exit: backoff 1s → 30s, relaunch
+     • On ctx.Done: nitro-cli terminate-enclave
 
-### gvproxy.service
-```
-Purpose: Full IP networking for enclave via TAP device over vsock
-Implementation: Docker container running gvproxy binary
-
-Port forwarding (host ↔ enclave):
-  443   ←→ enclave HTTPS (nitriding)
-  7073  ←→ enclave supervisor proxy
-  9090  ←→ Prometheus metrics
-
-vsock listen: vsock://:1024 (host side, enclave connects to CID 3:1024)
+  4. Management HTTP server (unchanged)
+     • 127.0.0.1:8443 — /health, /metrics, /migrate, /start, /stop, …
+     • /start and /stop now drive the in-process watchdog directly
 ```
 
 ### supervisor.service
@@ -431,49 +417,38 @@ Access: Only via SSM Session Manager (IAM-gated)
 
 ---
 
-## 6. Enclave Boot (start.sh)
+## 6. Enclave Boot
 
-When `nitro-cli run-enclave` launches the EIF, the entrypoint `/app/start.sh` executes:
+`nitro-cli run-enclave` launches the EIF with entrypoint `/app/runtime`. No
+shell entrypoint, no exec chain — the runtime is process 1 and handles
+everything in-process:
 
 ```
-/app/start.sh
+/app/runtime (process 1)
     │
-    ├─ 1. START VIPROXY (IMDS proxy inside enclave)
-    │      /app/viproxy \
-    │        --listen 127.0.0.1:80 \
-    │        --forward vsock://3:8002
+    ├─ 1. NITRIDING init() seeds /dev/random from NSM via ioctl
+    │      (vendored from nitriding/package_init.go; runs before main())
     │
-    │      This lets enclave apps reach IMDS at 127.0.0.1:80
-    │      which is forwarded via vsock to the host's vsock-proxy
-    │      which reaches the real IMDS at 169.254.169.254:80
+    ├─ 2. runtime.StartViproxy()
+    │      AF_INET listen 127.0.0.1:80 → AF_VSOCK dial 3:8002
+    │      Sets AWS_EC2_METADATA_SERVICE_ENDPOINT=http://127.0.0.1:80
     │
-    ├─ 2. SET AWS METADATA ENDPOINT
-    │      export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://127.0.0.1:80
+    ├─ 3. nitriding.NewEnclave(cfg) + .Start()
+    │      a. configureLoIface() — brings up lo with 127.0.0.1/8
+    │      b. configureTapIface() — brings up tap0 with 192.168.127.2/24
+    │      c. writeResolvconf() — nameserver 192.168.127.1 (gvproxy)
+    │      d. Generates self-signed TLS certificate
+    │      e. Starts HTTPS listener on :443 (tap0)
+    │      f. Starts internal HTTP listener on :8080 (loopback)
+    │      g. Reverse-proxies HTTPS → runtime's proxy on 127.0.0.1:7073
     │
-    ├─ 3. CONFIGURE DNS
-    │      echo "nameserver 192.168.127.1" > /etc/resolv.conf
-    │      (192.168.127.1 = gvproxy gateway, provides DNS resolution)
+    ├─ 4. runtime.Init(ctx)
+    │      Generates ephemeral secp256k1 attestation key, calls
+    │      nitEnc.SetAttestationKeyHash(hash) directly (no HTTP).
+    │      Loads KMS secrets, extends PCRs, etc.
     │
-    ├─ 4. SET ENVIRONMENT
-    │      AWS_DEFAULT_REGION=${ENCLAVE_AWS_REGION}
-    │      ENCLAVE_PROXY_PORT=7073
-    │      (Plus all vars baked into EIF at build time)
-    │
-    └─ 5. EXEC NITRIDING
-           /app/nitriding \
-             -fqdn ${FQDN} \
-             -ext-pub-port 443 \
-             -intport 8080 \
-             -prometheus-port 9090 \
-             -appwebsrv http://127.0.0.1:7073 \
-             -appcmd "/app/runtime"
-
-           Nitriding then:
-             a. Generates self-signed TLS certificate
-             b. Starts HTTPS listener on :443
-             c. Registers attestation endpoint: GET /enclave/attestation
-             d. Forks enclave-supervisor as child process
-             e. Reverse-proxies HTTPS traffic → supervisor on :7073
+    └─ 5. exec user app as child process (/app/{binary_name})
+           Serves on ENCLAVE_APP_PORT=7074; runtime reverse-proxies to it.
 ```
 
 ---
@@ -1344,16 +1319,16 @@ Proxies Prometheus metrics from nitriding (port 9090 via gvproxy).
 
 #### POST /start
 ```
-1. systemctl start enclave-watchdog
-2. Watchdog runs enclave_init.sh → nitro-cli run-enclave
-3. Returns streaming status updates (NDJSON)
+1. watchdog.StartOnce(ctx) — in-process call into supervisor/watchdog.go
+2. exec.Command("nitro-cli", "run-enclave", ...) with env-derived args
+3. Returns JSON action response
 ```
 
 #### POST /stop
 ```
-1. systemctl stop enclave-watchdog
-2. Watchdog's ExecStop: nitro-cli terminate-enclave
-3. Enclave process terminated
+1. watchdog.StopOnce(ctx) — latches the poll loop off so it won't auto-restart
+2. exec.Command("nitro-cli", "terminate-enclave", "--enclave-name", ...)
+3. Returns JSON action response
 ```
 
 #### POST /schedule-key-deletion
@@ -1880,7 +1855,7 @@ Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
 3. BUILD       enclave build → Nix → EIF (image.eif) + PCR values + supervisor binary
 4. DEPLOY      enclave deploy → CDK → AWS resources + EC2 instance
 5. BOOTSTRAP   EC2 user_data → install packages, download assets, start services
-6. BOOT        nitro-cli run-enclave → start.sh → viproxy → nitriding → supervisor
+6. BOOT        nitro-cli run-enclave → /app/runtime (links nitriding + viproxy)
 7. INIT        Supervisor: generate keys → load credentials → lock KMS → decrypt secrets
 8. SERVE       User app starts with secrets as env vars, all traffic signed
 9. VERIFY      Clients: fetch attestation → verify PCR0 → verify signatures

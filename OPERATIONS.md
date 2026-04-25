@@ -23,8 +23,7 @@ All components output JSON-structured logs to stderr via `log/slog`. Log fields 
 Logs are written to the systemd journal and can be viewed with:
 
 ```bash
-journalctl -u enclave-watchdog -f        # enclave (supervisor + app)
-journalctl -u supervisor -f            # management server
+journalctl -u enclave-supervisor -f      # host supervisor (gvproxy + IMDS + lifecycle + management API)
 ```
 
 ### Metrics
@@ -73,7 +72,7 @@ The framework currently deploys a single EC2 instance. For horizontal scaling:
 
 ### Automatic recovery
 
-The enclave runs under a systemd watchdog service (`enclave-watchdog`) with `Restart=always`. If the enclave process crashes, systemd restarts it automatically.
+The host-side `enclave-supervisor.service` runs with `Restart=always`. Inside that process, the supervisor's watchdog auto-restarts the enclave with bounded backoff (1s → 30s) when `nitro-cli describe-enclaves` shows it's no longer running; if the supervisor itself exits, systemd brings it back (which relaunches gvproxy, IMDS forwarder, and watchdog).
 
 ### Manual recovery
 

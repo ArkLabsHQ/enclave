@@ -42,10 +42,21 @@ func runTofuScaffold(cmd *cobra.Command, args []string) error {
 
 	remote, _ := cmd.Flags().GetBool("remote")
 
-	// Load config so writeTofuVars below can read region/app_name/secrets etc.
-	// loadConfig already returns a "(run 'enclave init' to create one)" hint
-	// when enclave.yaml is absent — no need to wrap further.
-	cfg, err := loadConfig()
+	// PWD-rooted: don't walk up to a parent .git, so sub-projects inside
+	// a larger repo resolve to their own directory.
+	configPath := os.Getenv("ENCLAVE_CONFIG")
+	if configPath == "" {
+		flat := filepath.Join(root, "enclave.yaml")
+		subdir := filepath.Join(root, "enclave", "enclave.yaml")
+		if _, err := os.Stat(flat); err == nil {
+			configPath = flat
+		} else if _, err := os.Stat(subdir); err == nil {
+			configPath = subdir
+		} else {
+			configPath = flat
+		}
+	}
+	cfg, err := loadConfigAt(configPath)
 	if err != nil {
 		return err
 	}
@@ -84,12 +95,7 @@ func runTofuScaffold(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("\nCreated %d files, skipped %d existing.\n", len(created), len(skipped))
 
-	// Render tofu/terraform.tfvars.json from enclave.yaml so `tofu apply` can
-	// resolve templatefile() references in user_data.sh.tftpl (region,
-	// app_name, deployment, migration_cooldown, previous_pcr0, etc.) without
-	// additional flags. Always overwrites — tfvars is derived state, not
-	// user-editable scaffolding. Re-run after editing enclave.yaml or after
-	// `enclave build` (to pick up a fresh PCR0).
+	// terraform.tfvars.json is derived from enclave.yaml; always overwrite.
 	if err := writeTofuVars(cfg, root, remote); err != nil {
 		return fmt.Errorf("write terraform.tfvars.json: %w", err)
 	}

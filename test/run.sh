@@ -1083,7 +1083,7 @@ done
 if [ "$HEALTH_CODE" = "200" ]; then
   echo "  PASS: Relaunched supervisor serves /health (after ${i}s)"
 else
-  echo "  FAIL: Relaunched supervisor /health returned $HEALTH_CODE after 30s" >&2
+  echo "  FAIL: Relaunched supervisor /health returned $HEALTH_CODE after 30 attempts (~90s)" >&2
   exit 1
 fi
 
@@ -1096,7 +1096,7 @@ done
 if [ "$SUP_HEALTH_CODE" = "200" ]; then
   echo "  PASS: Relaunched supervisor has working AWS/SSM/enclave connectivity (/supervisor/health, after ${i}s)"
 else
-  echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30s" >&2
+  echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30 attempts (~90s)" >&2
   exit 1
 fi
 

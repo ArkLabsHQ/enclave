@@ -29,6 +29,7 @@ type buildConfigJSON struct {
 	Runtime           buildConfigRuntimeJSON  `json:"runtime"`
 	MigrationCooldown string                  `json:"migration_cooldown"`
 	PreviousPCR0      string                  `json:"previous_pcr0"`
+	IsKMSKeyLocked    bool                    `json:"is_kms_key_locked"`
 }
 
 type buildConfigAppJSON struct {
@@ -183,6 +184,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 		},
 		MigrationCooldown: cfg.MigrationCooldown,
 		PreviousPCR0:      cfg.PreviousPCR0,
+		IsKMSKeyLocked:    cfg.IsKMSKeyLocked,
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")

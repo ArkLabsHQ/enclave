@@ -195,6 +195,8 @@ account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
+                                 # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
@@ -285,6 +287,8 @@ account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
+                                 # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
@@ -574,6 +578,8 @@ account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
+                                 # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
@@ -782,6 +788,8 @@ account: ""                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
+                                 # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
 # Runtime coordinates for the enclave supervisor binary.
 runtime:

@@ -15,6 +15,12 @@ import (
 	"time"
 
 	runtime "github.com/ArkLabsHQ/introspector-enclave/runtime"
+	// Importing the nitriding package runs its init() before main(), which
+	// calls maybeSeedEntropy() — pulling 2048 cryptographic bytes from /dev/nsm
+	// via NSM GetRandom, writing them to /dev/random, and crediting the
+	// kernel's entropy_avail counter via the RNDADDTOENTCNT ioctl. Replaces
+	// the manual `dd if=/dev/nsm of=/dev/urandom` that lived in the old
+	// start.sh entrypoint. See runtime/nitriding/system_linux.go.
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
 

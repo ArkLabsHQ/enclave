@@ -34,6 +34,21 @@ type Config struct {
 	InstanceType      string         `yaml:"instance_type"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
 	PreviousPCR0      string         `yaml:"previous_pcr0"`
+	// IsKMSKeyLocked controls the strictness of the locked KMS key policy:
+	//
+	//   false (default — absent in yaml gives this) — the policy adds a
+	//     RootRecovery statement granting the AWS account root user
+	//     kms:PutKeyPolicy, kms:GetKeyPolicy, kms:DescribeKey. Root
+	//     explicitly does NOT have kms:Decrypt — recovery means
+	//     rewriting the policy to add a new PCR0 condition (and the
+	//     freshly-deployed enclave then decrypts). The framework's
+	//     "plaintext only inside an attested enclave" invariant holds
+	//     even during recovery.
+	//
+	//   true — strict mode: the locked policy is permanently frozen;
+	//     even root cannot rewrite it. Only the attested PCR0 enclave
+	//     can decrypt. Permanent at first lock.
+	IsKMSKeyLocked bool `yaml:"is_kms_key_locked"`
 }
 
 type AppConfig struct {

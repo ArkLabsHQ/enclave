@@ -127,7 +127,19 @@ func (e *Runtime) handleExportKey(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("resolve IAM role ARN: %v", err), http.StatusInternalServerError)
 			return
 		}
-		lockedPolicy := buildKMSPolicy(roleARN, req.NewPCR0)
+		// Migration's transitional policy mirrors the strict-mode semantics
+		// of the running build: ENCLAVE_KMS_KEY_LOCKED=true → strict (no
+		// recovery on migration key); anything else → grant root recovery
+		// on the migration key too.
+		var recoveryAccount string
+		if os.Getenv("ENCLAVE_KMS_KEY_LOCKED") != "true" {
+			recoveryAccount, err = arnAccount(*identity.Arn)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("resolve AWS account ID for recovery principal: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+		lockedPolicy := buildKMSPolicy(roleARN, req.NewPCR0, recoveryAccount)
 		if _, err := kmsClient.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
 			KeyId:                          aws.String(migrationKeyID),
 			Policy:                         aws.String(lockedPolicy),

@@ -338,6 +338,7 @@ const frameworkFlakeNix = `{
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
+          ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -532,6 +533,7 @@ LAUNCHER
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
+          ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -1044,6 +1046,7 @@ const frameworkFlakeNixDotnet = `{
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
+          ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
           ` + "${appEnvLines}" + `
@@ -1201,6 +1204,7 @@ const frameworkFlakeNixRust = `{
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
+          ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';

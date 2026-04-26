@@ -560,6 +560,35 @@ echo "=== [3/9] Booting enclave in QEMU ==="
 wait_for_enclave "initial boot"
 echo ""
 
+# Verify the locked KMS policy includes the default RootRecovery statement.
+# The enclave's selfApplyKMSPolicy() runs at boot and calls PutKeyPolicy on
+# the local-kms mock (port 4000). After boot, the policy should carry the
+# fourth statement granting AWS account root the recovery action set.
+KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" \
+  --endpoint-url "http://127.0.0.1:4566" --region us-east-1 \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -n "$KMS_KEY_ID" ]; then
+  POLICY=$(aws kms get-key-policy --key-id "$KMS_KEY_ID" --policy-name default \
+    --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+    --query 'Policy' --output text 2>/dev/null || echo "")
+  if echo "$POLICY" | jq -e '.Statement[] | select(.Sid=="RootRecovery") | (.Action | index("kms:PutKeyPolicy"))' >/dev/null 2>&1; then
+    RR_PRINCIPAL=$(echo "$POLICY" | jq -r '.Statement[] | select(.Sid=="RootRecovery") | .Principal.AWS')
+    echo "  PASS: KMS policy includes RootRecovery with kms:PutKeyPolicy (principal=${RR_PRINCIPAL})"
+  else
+    echo "  FAIL: KMS policy missing RootRecovery + kms:PutKeyPolicy (default is_kms_key_locked=false should produce this)" >&2
+    echo "  policy: $POLICY" >&2
+    exit 1
+  fi
+  # Sanity: root must NOT have direct Decrypt — recovery is via PutKeyPolicy.
+  if echo "$POLICY" | jq -e '.Statement[] | select(.Sid=="RootRecovery") | (.Action | index("kms:Decrypt"))' >/dev/null 2>&1; then
+    echo "  FAIL: RootRecovery must not grant kms:Decrypt directly to root (breaks attested-only-decrypt invariant)" >&2
+    exit 1
+  fi
+else
+  echo "  WARN: could not read KMSKeyID from SSM, skipping policy check"
+fi
+echo ""
+
 # Step 4: Run integration tests.
 echo "=== [4/9] Running integration tests ==="
 ./integration-test.sh
@@ -1041,31 +1070,124 @@ fi
 
 # New supervisor must serve /health (enclave status) and /supervisor/health (its own
 # AWS connectivity). Both are prerequisites for resuming any in-progress
-# migration after a crash.
-HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/health" 2>/dev/null || echo "000")
+# migration after a crash. `kill -0 $PID` already told us the process exists,
+# but the HTTP listener takes a few seconds longer to bind in Docker+QEMU
+# (Go runtime warmup + AWS config + 4 errgroup goroutines + ListenAndServe).
+# Poll for up to 30s instead of a single-shot probe.
+HEALTH_CODE="000"
+for i in $(seq 1 30); do
+  HEALTH_CODE=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/health" 2>/dev/null || echo "000")
+  [ "$HEALTH_CODE" = "200" ] && break
+  sleep 1
+done
 if [ "$HEALTH_CODE" = "200" ]; then
-  echo "  PASS: Relaunched supervisor serves /health"
+  echo "  PASS: Relaunched supervisor serves /health (after ${i}s)"
 else
-  echo "  FAIL: Relaunched supervisor /health returned $HEALTH_CODE" >&2
+  echo "  FAIL: Relaunched supervisor /health returned $HEALTH_CODE after 30s" >&2
   exit 1
 fi
 
-SUP_HEALTH_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/supervisor/health" 2>/dev/null || echo "000")
+SUP_HEALTH_CODE="000"
+for i in $(seq 1 30); do
+  SUP_HEALTH_CODE=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8444/supervisor/health" 2>/dev/null || echo "000")
+  [ "$SUP_HEALTH_CODE" = "200" ] && break
+  sleep 1
+done
 if [ "$SUP_HEALTH_CODE" = "200" ]; then
-  echo "  PASS: Relaunched supervisor has working AWS/SSM/enclave connectivity (/supervisor/health)"
+  echo "  PASS: Relaunched supervisor has working AWS/SSM/enclave connectivity (/supervisor/health, after ${i}s)"
 else
-  echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE" >&2
+  echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30s" >&2
   exit 1
 fi
 
 echo ""
-echo "=== [10/10] Final enclave info ==="
+echo "=== [10/11] Final enclave info ==="
 FINAL_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 if [ -n "$FINAL_INFO" ] && echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1; then
   echo "  PASS: Enclave info valid"
   echo "$FINAL_INFO" | jq -r '"  version: \(.version // "?"), pcr0: \(.previous_pcr0 // "?")"' 2>/dev/null || true
 else
   echo "  FAIL: Could not read enclave info: ${FINAL_INFO:0:120}" >&2
+  exit 1
+fi
+
+echo ""
+echo "=== [11/11] Recovery rehearsal: root rewrites policy with new PCR0 ==="
+# Verifies the locked policy permits root (= the AWS account principal,
+# delegating to IAM in-account) to add a new PCR0 Decrypt condition. This
+# is the load-bearing operation of the lockout-recovery story: rebuild an
+# EIF, root pivots the lock to its PCR0, the new attested enclave decrypts.
+
+RECOVERY_KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" \
+  --endpoint-url "http://127.0.0.1:4566" --region us-east-1 \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$RECOVERY_KMS_KEY_ID" ]; then
+  echo "  FAIL: could not read /dev/my-app/KMSKeyID from SSM" >&2
+  exit 1
+fi
+
+# Read the live policy.
+CURRENT_POLICY=$(aws kms get-key-policy --key-id "$RECOVERY_KMS_KEY_ID" --policy-name default \
+  --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+  --query 'Policy' --output text 2>/dev/null || echo "")
+if [ -z "$CURRENT_POLICY" ]; then
+  echo "  FAIL: could not read current KMS policy for ${RECOVERY_KMS_KEY_ID}" >&2
+  exit 1
+fi
+
+# Construct a recovery policy: append a Decrypt statement gated on a fresh
+# fake PCR0, reusing the existing enclave Principal so the new statement
+# is structurally valid. The original RootRecovery statement stays, so a
+# subsequent recovery call would still be possible.
+NEW_PCR0=$(printf 'cafe%.0s' {1..24})  # 96 hex chars
+ENCLAVE_PRINCIPAL=$(echo "$CURRENT_POLICY" | jq -r '.Statement[] | select(.Sid=="EnclaveDecryptWithAttestation") | .Principal.AWS')
+if [ -z "$ENCLAVE_PRINCIPAL" ] || [ "$ENCLAVE_PRINCIPAL" = "null" ]; then
+  echo "  FAIL: could not extract enclave Principal from policy" >&2
+  exit 1
+fi
+NEW_POLICY=$(echo "$CURRENT_POLICY" | jq --arg pcr0 "$NEW_PCR0" --arg principal "$ENCLAVE_PRINCIPAL" '
+  .Statement += [{
+    "Sid": "EnclaveDecryptRecovery",
+    "Effect": "Allow",
+    "Principal": {"AWS": $principal},
+    "Action": "kms:Decrypt",
+    "Resource": "*",
+    "Condition": {"StringEqualsIgnoreCase": {"kms:RecipientAttestation:PCR0": $pcr0}}
+  }]
+')
+
+# Root call. With the RootRecovery statement granting kms:PutKeyPolicy and
+# the new policy still keeping it (we only appended), the lockout safety
+# check is satisfied — no bypass flag needed.
+if ! aws kms put-key-policy --key-id "$RECOVERY_KMS_KEY_ID" --policy-name default \
+    --policy "$NEW_POLICY" \
+    --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+    >/tmp/put-key-policy.log 2>&1; then
+  echo "  FAIL: root could not rewrite policy" >&2
+  cat /tmp/put-key-policy.log >&2
+  exit 1
+fi
+
+# Verify the new PCR0 actually landed.
+UPDATED_POLICY=$(aws kms get-key-policy --key-id "$RECOVERY_KMS_KEY_ID" --policy-name default \
+  --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+  --query 'Policy' --output text 2>/dev/null || echo "")
+if echo "$UPDATED_POLICY" | jq -e --arg pcr0 "$NEW_PCR0" \
+    '.Statement[] | .Condition? | .StringEqualsIgnoreCase? | ."kms:RecipientAttestation:PCR0"? | select(. == $pcr0)' \
+    >/dev/null 2>&1; then
+  echo "  PASS: root rewrote policy to include new PCR0 ${NEW_PCR0:0:16}..."
+else
+  echo "  FAIL: new PCR0 not present after PutKeyPolicy" >&2
+  echo "  policy: $UPDATED_POLICY" >&2
+  exit 1
+fi
+
+# Sanity: the RootRecovery statement should still be present (we only
+# appended; nothing removed).
+if echo "$UPDATED_POLICY" | jq -e '.Statement[] | select(.Sid=="RootRecovery")' >/dev/null 2>&1; then
+  echo "  PASS: RootRecovery statement preserved across PutKeyPolicy"
+else
+  echo "  FAIL: RootRecovery statement vanished after PutKeyPolicy" >&2
   exit 1
 fi
 

@@ -114,6 +114,14 @@ Two artifact-source modes:
 - **Default** — `enclave tofu` writes `terraform.tfvars.json` pointing at the EIF and supervisor binary that `enclave build` produced under `.enclave/artifacts/`. Tofu uploads them to S3 directly. Best for fast iteration.
 - **Remote** — `enclave tofu --remote` leaves the local paths empty so tofu's bundled `null_resource` curls `image.eif` and `supervisor` from `github.com/<app.nix_owner>/<app.nix_repo>/releases/download/<app.release_tag>/` at apply time, then mirrors them to S3. Use this when a CI pipeline has already published a versioned GitHub Release. Pin a specific build by setting `release_tag: "eif-v1.2.3"` in `enclave.yaml`; default is `"eif-latest"`.
 
+### KMS recovery vs. strict mode
+
+The locked KMS key is the framework's confidentiality root. The framework preserves a strong invariant: **plaintext only ever exists inside an attested enclave**. Recovery options are designed not to break that.
+
+By default the locked policy grants the AWS account principal (root, plus any IAM admin in the account) `kms:PutKeyPolicy`, `kms:GetKeyPolicy`, and `kms:DescribeKey`. **Root never has `kms:Decrypt`** — recovery means rewriting the policy to add a new PCR0 condition, and decryption then flows through the freshly-deployed enclave that attests to that PCR0. The plaintext invariant holds even during recovery; root's role is to pivot the lock, not to read the data.
+
+For workloads that want the strongest immutability — "**nothing**, not even an IAM admin, can change this policy" — set `is_kms_key_locked: true` in `enclave.yaml`. The locked policy is permanently frozen: only the attested PCR0 enclave can decrypt, and even rewriting the policy is impossible. Use this only when you accept that an irrecoverable failure means data loss. **The choice is permanent at first lock**, so pick at first deploy.
+
 ### 3. Set up app hashes
 
 The `setup` command auto-detects your GitHub remote and computes all nix hashes:

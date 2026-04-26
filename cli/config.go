@@ -34,6 +34,17 @@ type Config struct {
 	InstanceType      string         `yaml:"instance_type"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
 	PreviousPCR0      string         `yaml:"previous_pcr0"`
+	// IsKMSKeyLocked controls the strictness of the locked KMS key policy:
+	//
+	//   false (default — absent in yaml gives this) — the policy adds a
+	//     RootRecovery statement granting the AWS account root user
+	//     Decrypt, GetKeyPolicy, DescribeKey, ScheduleKeyDeletion,
+	//     CancelKeyDeletion. An operational failure (lost EIF source,
+	//     broken migration) is recoverable with root credentials.
+	//
+	//   true — strict mode: nothing but the attested PCR0 enclave can
+	//     decrypt; root has no access. Permanent at first lock.
+	IsKMSKeyLocked bool `yaml:"is_kms_key_locked"`
 }
 
 type AppConfig struct {

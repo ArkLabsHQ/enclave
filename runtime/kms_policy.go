@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -86,7 +87,15 @@ func selfApplyKMSPolicy(ctx context.Context, keyID string) error {
 		return fmt.Errorf("resolve IAM role ARN: %w", err)
 	}
 
-	policy := buildKMSPolicy(roleARN, pcr0)
+	var recoveryAccount string
+	if os.Getenv("ENCLAVE_KMS_KEY_LOCKED") != "true" {
+		recoveryAccount, err = arnAccount(*identity.Arn)
+		if err != nil {
+			return fmt.Errorf("resolve AWS account ID for recovery principal: %w", err)
+		}
+	}
+
+	policy := buildKMSPolicy(roleARN, pcr0, recoveryAccount)
 
 	// Retry with backoff to handle IAM propagation delay on fresh deploy.
 	// BypassPolicyLockoutSafetyCheck is required because we're removing
@@ -141,6 +150,20 @@ func assumedRoleARNToRoleARN(arn string) (string, error) {
 	account := parts[4]
 	partition := parts[1]
 	return fmt.Sprintf("arn:%s:iam::%s:role/%s", partition, account, roleName), nil
+}
+
+// arnAccount returns the AWS account ID from any AWS ARN — segment [4]
+// of "arn:partition:service:region:account:resource". Works for STS
+// assumed-role, IAM role, IAM user, and root ARNs alike.
+func arnAccount(arn string) (string, error) {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) < 6 {
+		return "", fmt.Errorf("invalid ARN: %s", arn)
+	}
+	if parts[4] == "" {
+		return "", fmt.Errorf("ARN has empty account segment: %s", arn)
+	}
+	return parts[4], nil
 }
 
 // parseKMSPolicyState parses a KMS key policy JSON and returns:
@@ -207,12 +230,20 @@ func parseActions(raw json.RawMessage) []string {
 // enclave's PCR0 via attestation, Encrypt/GenerateDataKey are unrestricted for
 // the EC2 role, GetKeyPolicy allows the enclave to verify the lock on reboot,
 // and ScheduleKeyDeletion is allowed for old-key cleanup during migration.
-// No PutKeyPolicy is granted to anyone — the key is immutably locked to this PCR0.
-func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
-	return fmt.Sprintf(`{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
+// In strict mode (recoveryAccount == ""), no PutKeyPolicy is granted to
+// anyone — the key is immutably locked to this PCR0.
+//
+// When recoveryAccount is non-empty, a fourth statement grants the AWS account
+// root user kms:PutKeyPolicy, kms:GetKeyPolicy, kms:DescribeKey. This lets an
+// operator rewrite the policy after a lockout — typically by adding a new
+// PCR0 condition.
+//
+// Driven by the ENCLAVE_KMS_KEY_LOCKED env var ("true" → strict mode, caller
+// passes empty so the statement is omitted; anything else → caller passes
+// the account, statement is included). The choice is permanent at first
+// lock; cannot be added or removed after.
+func buildKMSPolicy(ec2RoleARN, pcr0, recoveryAccount string) string {
+	base := fmt.Sprintf(`    {
       "Sid": "EnclaveDecryptWithAttestation",
       "Effect": "Allow",
       "Principal": {"AWS": %q},
@@ -237,7 +268,27 @@ func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
       "Principal": {"AWS": %q},
       "Action": "kms:ScheduleKeyDeletion",
       "Resource": "*"
-    }
+    }`, ec2RoleARN, pcr0, ec2RoleARN, ec2RoleARN)
+
+	if recoveryAccount != "" {
+		base += fmt.Sprintf(`,
+    {
+      "Sid": "RootRecovery",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::%s:root"},
+      "Action": [
+        "kms:PutKeyPolicy",
+        "kms:GetKeyPolicy",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    }`, recoveryAccount)
+	}
+
+	return `{
+  "Version": "2012-10-17",
+  "Statement": [
+` + base + `
   ]
-}`, ec2RoleARN, pcr0, ec2RoleARN, ec2RoleARN)
+}`
 }

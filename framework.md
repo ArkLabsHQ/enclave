@@ -107,6 +107,17 @@ and the module's bundled `null_resource.download_artifacts` curls
 at apply time before uploading to S3. The `release_tag` field in
 `enclave.yaml` (default `"eif-latest"`) selects which release to pull.
 
+**KMS lock recovery (`is_kms_key_locked`).** The KMS key the runtime
+locks at first boot grants the AWS account principal (root + any IAM
+admin in the account) `kms:PutKeyPolicy`, `kms:GetKeyPolicy`, and
+`kms:DescribeKey` by default. **Root never has direct Decrypt** —
+recovery means rewriting the policy to add a new PCR0 condition that
+a freshly-deployed enclave can attest to, so plaintext stays inside
+an attested enclave even during recovery. Set `is_kms_key_locked:
+true` in `enclave.yaml` for strict mode where the locked policy is
+permanently frozen and only the attested enclave can decrypt; this
+is permanent at first lock and cannot be modified after.
+
 ### 2. `enclave setup` — Auto-Populate Nix Hashes
 
 Detects the GitHub remote, computes Nix source and vendor hashes for the user's app, and writes them to `enclave.yaml`.

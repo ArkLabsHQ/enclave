@@ -226,8 +226,12 @@ export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-http://127.0.0.1:4566}"
 
 tofu_apply() {
   # Always regenerate tfvars — paths differ between host and Docker.
-  # `enclave tofu` also ensures the tofu/ scaffold is present (merge-only-new,
-  # so pre-existing test-app files are left alone) before rewriting tfvars.
+  # `enclave tofu` is merge-only-new (existing files are skipped) so the
+  # committed test-app scaffold would mask CLI changes. Delete the
+  # CLI-managed root and module main.tf first to force a fresh emit; the
+  # rest of the tree (modules/backend, templates, etc.) is left untouched.
+  rm -f "${TOFU_DIR}/main.tf" "${TOFU_DIR}/modules/enclave/main.tf"
+
   echo "  Generating terraform.tfvars.json..."
 
   # Ensure artifact placeholders exist for tofu's filemd5() (local mode
@@ -275,6 +279,19 @@ OVERRIDE
 
   echo "  tofu init..."
   tofu -chdir="$TOFU_DIR" init -input=false > ${SCRIPT_DIR}/tofu-init.log 2>&1 || { cat ${SCRIPT_DIR}/tofu-init.log; return 1; }
+  # env_values overrides are supplied via an auto-loaded tfvars file (the env-file
+  # mechanism). tofu auto-loads any *.auto.tfvars.json next to the root module on
+  # every plan/apply, so overrides stick across both the initial deploy and the
+  # later migration apply without us repeating them on the command line.
+  cat > "${TOFU_DIR}/env_values.auto.tfvars.json" <<EOF
+{
+  "env_values": {
+    "TEST_RUNTIME_OVERRIDE": "override-from-tofu",
+    "TEST_RUNTIME_OVERRIDE_ENVFILE": "override-from-envfile"
+  }
+}
+EOF
+
   echo "  tofu apply..."
   tofu -chdir="$TOFU_DIR" apply -auto-approve -input=false -compact-warnings > ${SCRIPT_DIR}/tofu-apply.log 2>&1 || { echo "  tofu apply FAILED:"; tail -20 ${SCRIPT_DIR}/tofu-apply.log; return 1; }
   echo "  tofu apply OK (log: ${SCRIPT_DIR}/tofu-apply.log)"
@@ -609,6 +626,25 @@ if [ "$MIG_PENDING" = "false" ]; then
   echo "  PASS: No migration pending before deploy"
 else
   echo "  FAIL: migration_pending should be false before deploy (got: ${MIG_PENDING})" >&2
+  exit 1
+fi
+
+# Verify tofu's app.env overrides (supplied via env_values.auto.tfvars.json)
+# flowed through SSM into the running app. Both keys default to "default-from-yaml"
+# in enclave.yaml; the env file overrides them with distinct values.
+ENV_OVERRIDE_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/env-override" 2>/dev/null || echo "")
+ENV_OVERRIDE_VAL=$(echo "$ENV_OVERRIDE_RESP" | jq -r '.test_runtime_override // empty' 2>/dev/null || echo "")
+ENV_OVERRIDE_ENVFILE_VAL=$(echo "$ENV_OVERRIDE_RESP" | jq -r '.test_runtime_override_envfile // empty' 2>/dev/null || echo "")
+if [ "$ENV_OVERRIDE_VAL" = "override-from-tofu" ]; then
+  echo "  PASS: app.env override applied (TEST_RUNTIME_OVERRIDE=${ENV_OVERRIDE_VAL})"
+else
+  printf "  FAIL: app.env override not applied — got %q, want \"override-from-tofu\" (response: %s)\n" "$ENV_OVERRIDE_VAL" "${ENV_OVERRIDE_RESP:0:120}" >&2
+  exit 1
+fi
+if [ "$ENV_OVERRIDE_ENVFILE_VAL" = "override-from-envfile" ]; then
+  echo "  PASS: env-file override applied (TEST_RUNTIME_OVERRIDE_ENVFILE=${ENV_OVERRIDE_ENVFILE_VAL})"
+else
+  printf "  FAIL: env-file override not applied — got %q, want \"override-from-envfile\" (response: %s)\n" "$ENV_OVERRIDE_ENVFILE_VAL" "${ENV_OVERRIDE_RESP:0:120}" >&2
   exit 1
 fi
 echo ""

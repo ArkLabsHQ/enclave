@@ -43,6 +43,9 @@ app:
     AWS_SECRET_ACCESS_KEY: "test"
     ENCLAVE_LOG_CLOUDWATCH: "true"
     AWS_ENDPOINT_URL_LOGS: "http://host.containers.internal:4566"
+    # Baked defaults; tofu overrides both keys via env_values.auto.tfvars.json
+    TEST_RUNTIME_OVERRIDE: "default-from-yaml"
+    TEST_RUNTIME_OVERRIDE_ENVFILE: "default-from-yaml"
 
 # One secret for testing KMS secret init and migration.
 secrets:

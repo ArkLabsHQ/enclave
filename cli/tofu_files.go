@@ -53,6 +53,8 @@ module "enclave" {
 
   eif_path               = var.eif_path
   supervisor_binary_path = var.supervisor_binary_path
+
+  env_values = var.env_values
 }
 
 # =============================================================================
@@ -170,6 +172,12 @@ variable "supervisor_binary_path" {
   description = "Local path to supervisor binary. Overrides GitHub Release download."
   type        = string
   default     = ""
+}
+
+variable "env_values" {
+  description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
+  type        = map(string)
+  default     = {}
 }
 
 
@@ -342,6 +350,12 @@ variable "supervisor_binary_path" {
   description = "Local path to supervisor binary. Overrides GitHub Release download."
   type        = string
   default     = ""
+}
+
+variable "env_values" {
+  description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
+  type        = map(string)
+  default     = {}
 }
 
 
@@ -570,9 +584,10 @@ data "aws_iam_policy_document" "enclave" {
   statement {
     sid     = "SSMReadOnly"
     actions = ["ssm:GetParameter"]
-    resources = [
-      aws_ssm_parameter.storage_bucket_name.arn,
-    ]
+    resources = concat(
+      [aws_ssm_parameter.storage_bucket_name.arn],
+      [for p in aws_ssm_parameter.env_override : p.arn],
+    )
   }
 
   # SSM: KMSKeyID needs read+write (supervisor updates it during migration).
@@ -896,6 +911,18 @@ resource "aws_ssm_parameter" "migration_storage_dek" {
   lifecycle {
     ignore_changes = [value]
   }
+}
+
+# Deploy-time app.env overrides. The runtime reads each key listed in
+# ENCLAVE_APP_ENV_KEYS (baked into the EIF) and overlays the SSM value
+# on top of the baked default. Missing keys leave the default in place.
+resource "aws_ssm_parameter" "env_override" {
+  for_each = var.env_values
+
+  name      = "/${var.deployment}/${var.app_name}/env/${each.key}"
+  type      = "String"
+  value     = each.value
+  overwrite = true
 }
 
 # =============================================================================

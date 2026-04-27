@@ -29,24 +29,26 @@ provider "aws" {
 module "enclave" {
   source = "./modules/enclave"
 
-  region             = var.region
-  account            = var.account
-  deployment         = var.deployment
-  app_name           = var.app_name
-  instance_type      = var.instance_type
-  local              = var.local
-  secrets            = var.secrets
+  region            = var.region
+  account           = var.account
+  deployment        = var.deployment
+  app_name          = var.app_name
+  instance_type     = var.instance_type
+  local             = var.local
+  secrets           = var.secrets
   migration_cooldown = var.migration_cooldown
-  previous_pcr0      = var.previous_pcr0
-  expected_pcr0      = var.expected_pcr0
-  supervisor_url     = var.supervisor_url
-  github_owner       = var.github_owner
-  github_repo        = var.github_repo
-  release_tag        = var.release_tag
-  github_token       = var.github_token
+  previous_pcr0     = var.previous_pcr0
+  expected_pcr0     = var.expected_pcr0
+  supervisor_url          = var.supervisor_url
+  github_owner  = var.github_owner
+  github_repo   = var.github_repo
+  release_tag   = var.release_tag
+  github_token  = var.github_token
 
   eif_path               = var.eif_path
   supervisor_binary_path = var.supervisor_binary_path
+
+  env_values = var.env_values
 }
 
 # =============================================================================
@@ -164,6 +166,12 @@ variable "supervisor_binary_path" {
   description = "Local path to supervisor binary. Overrides GitHub Release download."
   type        = string
   default     = ""
+}
+
+variable "env_values" {
+  description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
+  type        = map(string)
+  default     = {}
 }
 
 

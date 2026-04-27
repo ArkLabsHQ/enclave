@@ -90,9 +90,15 @@ type RuntimeConfig struct {
 }
 
 func loadConfig() (*Config, error) {
-	// ENCLAVE_CONFIG overrides the default config path (useful for local testing
-	// with a config at a non-standard location like test/app/enclave/enclave.yaml).
-	configPath := os.Getenv("ENCLAVE_CONFIG")
+	return loadConfigAt("")
+}
+
+// loadConfigAt loads enclave.yaml from an explicit path, or "" to use
+// the default resolution (ENCLAVE_CONFIG env override → findRepoRoot).
+func loadConfigAt(configPath string) (*Config, error) {
+	if configPath == "" {
+		configPath = os.Getenv("ENCLAVE_CONFIG")
+	}
 	if configPath == "" {
 		root, err := findRepoRoot()
 		if err != nil {

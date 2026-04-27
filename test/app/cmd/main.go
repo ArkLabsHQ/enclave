@@ -117,6 +117,7 @@ func main() {
 	mux.HandleFunc("GET /test/attestation-persistence", handleTestAttestationPersistence)
 	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
 	mux.HandleFunc("GET /test/logs", handleTestLogs)
+	mux.HandleFunc("GET /test/env-override", handleTestEnvOverride)
 
 	// Wrap mux with otelhttp — every incoming request creates a span automatically.
 	handler := otelhttp.NewHandler(mux, "test-app",
@@ -1163,4 +1164,16 @@ func handleTestLogs(w http.ResponseWriter, r *http.Request) {
 
 	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
+}
+
+// handleTestEnvOverride exposes the TEST_RUNTIME_OVERRIDE* keys so the
+// integration test can assert tofu's deploy-time overrides (supplied via
+// env_values.auto.tfvars.json) flowed through SSM into the child app.
+func handleTestEnvOverride(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":                        "ok",
+		"test_runtime_override":         os.Getenv("TEST_RUNTIME_OVERRIDE"),
+		"test_runtime_override_envfile": os.Getenv("TEST_RUNTIME_OVERRIDE_ENVFILE"),
+	})
 }

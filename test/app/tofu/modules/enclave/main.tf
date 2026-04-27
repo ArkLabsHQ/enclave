@@ -135,6 +135,12 @@ variable "supervisor_binary_path" {
   default     = ""
 }
 
+variable "env_values" {
+  description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
+  type        = map(string)
+  default     = {}
+}
+
 
 # =============================================================================
 # KMS
@@ -184,31 +190,31 @@ resource "null_resource" "kms_key" {
 
       # Apply initial key policy.
       POLICY='${jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "AllowRootAccount"
-        Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${var.account}:root" }
-        Action    = "kms:*"
-        Resource  = "*"
-      },
-      {
-        Sid       = "AllowInstanceRole"
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.instance.arn }
-        Action = [
-          "kms:Encrypt",
-          "kms:Decrypt",
-          "kms:GenerateDataKey",
-          "kms:DescribeKey",
-          "kms:PutKeyPolicy",
-          "kms:GetKeyPolicy",
+        Version = "2012-10-17"
+        Statement = [
+          {
+            Sid       = "AllowRootAccount"
+            Effect    = "Allow"
+            Principal = { AWS = "arn:aws:iam::${var.account}:root" }
+            Action    = "kms:*"
+            Resource  = "*"
+          },
+          {
+            Sid       = "AllowInstanceRole"
+            Effect    = "Allow"
+            Principal = { AWS = aws_iam_role.instance.arn }
+            Action = [
+              "kms:Encrypt",
+              "kms:Decrypt",
+              "kms:GenerateDataKey",
+              "kms:DescribeKey",
+              "kms:PutKeyPolicy",
+              "kms:GetKeyPolicy",
+            ]
+            Resource = "*"
+          },
         ]
-        Resource = "*"
-      },
-    ]
-})}'
+      })}'
 
       aws kms put-key-policy --key-id "$KEY_ID" --policy-name default \
         --policy "$POLICY" --region ${var.region}
@@ -221,13 +227,13 @@ resource "null_resource" "kms_key" {
 
       echo "KMS key $KEY_ID stored in SSM"
     EOT
-}
+  }
 
-# On destroy: schedule the KMS key for deletion and remove the SSM pointer
-# so that a subsequent apply creates a fresh key.
-provisioner "local-exec" {
-  when    = destroy
-  command = <<-EOT
+  # On destroy: schedule the KMS key for deletion and remove the SSM pointer
+  # so that a subsequent apply creates a fresh key.
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
       set -e
       REGION="${lookup(self.triggers, "region", "us-east-1")}"
       DEPLOYMENT="${self.triggers.deployment}"
@@ -252,7 +258,7 @@ provisioner "local-exec" {
         echo "No KMS key found in SSM — nothing to clean up"
       fi
     EOT
-}
+  }
 }
 
 # Read the KMS key ID from SSM (written by null_resource.kms_key or supervisor).
@@ -361,9 +367,10 @@ data "aws_iam_policy_document" "enclave" {
   statement {
     sid     = "SSMReadOnly"
     actions = ["ssm:GetParameter"]
-    resources = [
-      aws_ssm_parameter.storage_bucket_name.arn,
-    ]
+    resources = concat(
+      [aws_ssm_parameter.storage_bucket_name.arn],
+      [for p in aws_ssm_parameter.env_override : p.arn],
+    )
   }
 
   # SSM: KMSKeyID needs read+write (supervisor updates it during migration).
@@ -422,9 +429,9 @@ data "aws_iam_policy_document" "enclave" {
 
 locals {
   # When local paths are set, use them directly. Otherwise download from GitHub Release.
-  use_local     = var.eif_path != ""
-  artifacts_dir = "${path.module}/.artifacts"
-  release_base  = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
+  use_local      = var.eif_path != ""
+  artifacts_dir  = "${path.module}/.artifacts"
+  release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
   supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
@@ -689,6 +696,18 @@ resource "aws_ssm_parameter" "migration_storage_dek" {
   }
 }
 
+# Deploy-time app.env overrides. The runtime reads each key listed in
+# ENCLAVE_APP_ENV_KEYS (baked into the EIF) and overlays the SSM value
+# on top of the baked default. Missing keys leave the default in place.
+resource "aws_ssm_parameter" "env_override" {
+  for_each = var.env_values
+
+  name      = "/${var.deployment}/${var.app_name}/env/${each.key}"
+  type      = "String"
+  value     = each.value
+  overwrite = true
+}
+
 # =============================================================================
 # VPC
 # =============================================================================
@@ -941,10 +960,10 @@ resource "aws_instance" "nitro" {
   # Wait for IAM policy before booting — user_data downloads from S3 immediately.
   depends_on = [aws_iam_role_policy.enclave]
 
-  ami                    = data.aws_ami.al2023[0].id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public[0].id
-  iam_instance_profile   = aws_iam_instance_profile.instance.name
+  ami                  = data.aws_ami.al2023[0].id
+  instance_type        = var.instance_type
+  subnet_id            = aws_subnet.public[0].id
+  iam_instance_profile = aws_iam_instance_profile.instance.name
   vpc_security_group_ids = [aws_security_group.nitro[0].id]
 
   enclave_options {
@@ -959,14 +978,14 @@ resource "aws_instance" "nitro" {
   }
 
   user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    region                   = var.region
-    dev_mode                 = var.deployment
-    app_name                 = var.app_name
-    kms_key_id               = local.kms_key_id
-    eif_s3_url               = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
-    supervisor_binary_s3_url = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
-    migration_cooldown       = var.migration_cooldown
-    previous_pcr0            = var.previous_pcr0
+    region                    = var.region
+    dev_mode                  = var.deployment
+    app_name                  = var.app_name
+    kms_key_id                = local.kms_key_id
+    eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
+    supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
+    migration_cooldown        = var.migration_cooldown
+    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {
@@ -982,8 +1001,8 @@ resource "aws_instance" "nitro" {
   # On destroy: stop enclave + schedule KMS key deletion via supervisor.
   # Must run while the instance is still alive (before EC2 termination).
   provisioner "local-exec" {
-    when       = destroy
-    command    = <<-EOT
+    when    = destroy
+    command = <<-EOT
       aws ssm send-command \
         --instance-ids ${self.id} \
         --document-name AWS-RunShellScript \

@@ -170,6 +170,40 @@ secrets:
     env_var: APP_SIGNING_KEY
 ```
 
+Values in `app.env` are baked into the EIF as **build-time defaults** —
+each value contributes to PCR0, so changing one forces an EIF rebuild
+and a migration. To change a value at deploy time **without rebuilding
+the EIF**, hand it to tofu via the `env_values` map. Tofu writes each
+key/value to SSM at `/<deployment>/<app>/env/<key>`, and the runtime
+overlays it on top of the baked default at boot. PCR0 stays identical
+across the override — the schema (the set of keys) is attested, the
+values are not.
+
+There are three places to supply `env_values`, in increasing order of
+precedence:
+
+1. **`TF_VAR_env_values` environment variable** — pairs well with
+   `direnv`, secret managers (sops, vault), and CI runners that
+   already inject env vars natively.
+   ```sh
+   export TF_VAR_env_values='{"MY_APP_DATADIR":"/srv/data"}'
+   tofu apply
+   ```
+2. **`*.auto.tfvars.json` file** — tofu auto-loads any file matching
+   this pattern next to the root module. Best for committed
+   per-environment config (`prod.auto.tfvars.json`,
+   `staging.auto.tfvars.json`).
+   ```json
+   { "env_values": { "MY_APP_DATADIR": "/srv/data" } }
+   ```
+3. **`-var` on the command line** — one-off overrides. Highest
+   precedence.
+   ```sh
+   tofu apply -var 'env_values={"MY_APP_DATADIR":"/srv/data"}'
+   ```
+
+
+
 Your app is a plain HTTP server — no SDK imports needed:
 
 **Go:**
@@ -687,7 +721,7 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 | `app.nix_vendor_hash` | Go vendor hash or npm deps hash (SRI) | (auto by `setup`) |
 | `app.nix_sub_packages` | Go sub-packages to build (Go only) | `["."]` |
 | `app.binary_name` | Output binary name | `{name}` |
-| `app.env` | Environment variables baked into EIF | `{}` |
+| `app.env` | Environment variables baked into EIF as defaults (tofu can override per-deploy via `-var env_values={...}`) | `{}` |
 | `secrets[].name` | Secret name (SSM path component) | (required) |
 | `secrets[].env_var` | Env var for decrypted value | (required) |
 

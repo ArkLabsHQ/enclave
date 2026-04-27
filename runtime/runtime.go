@@ -272,6 +272,18 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 
 	deleteOldKMSKey(ctx)
+
+	// Overlay tofu-supplied app.env overrides on top of the baked defaults.
+	// Must happen before the supervisor spawns the child app (which inherits
+	// os.Environ()).
+	awsCfgEnv, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return fmt.Errorf("load aws config for env overrides: %w", err)
+	}
+	if err := applyEnvOverrides(ctx, newSSMClient(awsCfgEnv), getDeployment(), getAppName()); err != nil {
+		return fmt.Errorf("apply env overrides: %w", err)
+	}
+
 	e.initOK.Store(true)
 	slog.Info("init completed successfully")
 	SpanOK(initSpan)

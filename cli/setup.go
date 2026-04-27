@@ -26,6 +26,7 @@ All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().String("commit", "", "Git commit SHA to compute hashes for (required)")
+	cmd.Flags().Bool("force-flake", false, "Overwrite enclave/flake.nix from the template (discards local edits)")
 	_ = cmd.MarkFlagRequired("commit")
 	return cmd
 }
@@ -68,10 +69,18 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("[setup] Language: %s\n", language)
 
-	// Rewrite enclave/flake.nix to match the language.
+	// Write enclave/flake.nix from the template only if it doesn't already
+	// exist — otherwise local edits (e.g. Go toolchain pins, extra inputs)
+	// would be silently clobbered on every `enclave setup` run. Pass
+	// --force-flake to regenerate, e.g. after changing language in enclave.yaml.
+	forceFlake, _ := cmd.Flags().GetBool("force-flake")
 	for _, f := range getInitFiles(language) {
 		if f.RelPath == "enclave/flake.nix" {
 			destPath := filepath.Join(root, f.RelPath)
+			if _, statErr := os.Stat(destPath); statErr == nil && !forceFlake {
+				fmt.Printf("[setup] Keeping existing %s (pass --force-flake to regenerate)\n", f.RelPath)
+				break
+			}
 			if err := os.WriteFile(destPath, []byte(f.Content), f.Mode); err != nil {
 				return fmt.Errorf("write %s: %w", f.RelPath, err)
 			}

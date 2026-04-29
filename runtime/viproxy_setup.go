@@ -11,7 +11,7 @@ import (
 	"github.com/mdlayher/vsock"
 )
 
-// Viproxy defaults match the former /app/proxy invocation from start.sh:
+// Viproxy defaults
 //
 //	IN_ADDRS=127.0.0.1:80 OUT_ADDRS=3:8002 /app/proxy
 //

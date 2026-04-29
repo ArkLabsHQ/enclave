@@ -114,7 +114,7 @@ func (e *Runtime) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	}
 	alreadyLocked, _ := parseKMSPolicyState(currentPolicyText, req.NewPCR0)
 	if alreadyLocked {
-		slog.Info("migration key already locked to target PCR0, skipping PutKeyPolicy", "key_id", migrationKeyID, "new_pcr0", req.NewPCR0[:min(16, len(req.NewPCR0))])
+		slog.Info("migration key already locked to target PCR0, skipping PutKeyPolicy", "key_id", migrationKeyID, "new_pcr0", prefix16(req.NewPCR0))
 	} else {
 		stsClient := newSTSClient(awsCfg)
 		identity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
@@ -149,7 +149,7 @@ func (e *Runtime) handleExportKey(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("lock migration key policy: %v", err), http.StatusInternalServerError)
 			return
 		}
-		slog.Info("applied PCR0-locked policy to migration key", "key_id", migrationKeyID, "new_pcr0", req.NewPCR0[:min(16, len(req.NewPCR0))])
+		slog.Info("applied PCR0-locked policy to migration key", "key_id", migrationKeyID, "new_pcr0", prefix16(req.NewPCR0))
 	}
 
 	var exported []string
@@ -300,7 +300,7 @@ func putMigrationPreviousPCR0(ctx context.Context, pcr0 string) error {
 // reads from Migration/*; when cleared, Init() reads from primary. Each SSM
 // PutParameter is atomic, and all copies use Overwrite:true — if any step
 // fails, MigrationKMSKeyID stays set and the next retry re-runs idempotently.
-func promoteMigrationToPrimary(ctx context.Context, secrets []SecretDef, migrationKeyID string) error {
+func promoteMigrationToPrimary(ctx context.Context, secrets []StaticSecret, migrationKeyID string) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -466,9 +466,9 @@ func clearMigrationOldKMSKeyID(ctx context.Context) error {
 type MigrationBootRole int
 
 const (
-	BootRoleNoMigration    MigrationBootRole = iota // MigrationKMSKeyID empty
-	BootRoleNewEnclave                              // ownPCR0 == MigrationTargetPCR0
-	BootRoleAbortMigration                          // migration in progress, not the target
+	BootRoleNoMigration     MigrationBootRole = iota // MigrationKMSKeyID empty
+	BootRoleMigrationTarget                          // ownPCR0 == MigrationTargetPCR0
+	BootRoleAbortMigration                           // migration in progress, not the target
 )
 
 // classifyBootRole decides the boot role. Empty ownPCR0 (NSM unavailable)
@@ -478,7 +478,7 @@ func classifyBootRole(migrationInProgress bool, ownPCR0, migrationTargetPCR0 str
 		return BootRoleNoMigration
 	}
 	if ownPCR0 != "" && migrationTargetPCR0 != "" && ownPCR0 == migrationTargetPCR0 {
-		return BootRoleNewEnclave
+		return BootRoleMigrationTarget
 	}
 	return BootRoleAbortMigration
 }
@@ -673,6 +673,12 @@ func deleteOldKMSKey(ctx context.Context) {
 	if err != nil {
 		slog.Warn("deleteOldKMSKey: clear SSM param failed", "error", err)
 	}
+}
+
+// prefix16 returns the first 16 bytes of s, or s itself if shorter. Used for
+// log fields where the full 96-char hex PCR0 / KMS key ID is noisy.
+func prefix16(s string) string {
+	return s[:min(16, len(s))]
 }
 
 // readSSMParam reads an SSM parameter value. Returns error if missing or UNSET.

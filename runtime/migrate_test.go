@@ -56,8 +56,8 @@ func TestClassifyBootRole_NoMigration(t *testing.T) {
 // the new enclave, attempt promotion.
 func TestClassifyBootRole_AmTarget(t *testing.T) {
 	pcr0 := strings.Repeat("a", 96)
-	if got := classifyBootRole(true, pcr0, pcr0); got != BootRoleNewEnclave {
-		t.Fatalf("want BootRoleNewEnclave, got %v", got)
+	if got := classifyBootRole(true, pcr0, pcr0); got != BootRoleMigrationTarget {
+		t.Fatalf("want BootRoleMigrationTarget, got %v", got)
 	}
 }
 

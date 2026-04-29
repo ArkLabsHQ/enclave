@@ -252,7 +252,7 @@ func TestSupervisorSpan_NoopWithoutTracer(t *testing.T) {
 	supervisorTracer = nil
 	defer func() { supervisorTracer = old }()
 
-	ctx, span := SupervisorSpan(context.Background(), "test")
+	ctx, span := RuntimeSpan(context.Background(), "test")
 	if ctx == nil {
 		t.Fatal("expected non-nil context")
 	}

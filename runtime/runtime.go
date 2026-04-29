@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,17 +23,6 @@ import (
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
 )
-
-// Version is set at build time via ldflags:
-//
-//	-X github.com/ArkLabsHQ/introspector-enclave/runtime.Version=...
-var Version = "dev"
-
-// SecretDef defines a secret managed by KMS inside the enclave runtime.
-type SecretDef struct {
-	Name   string `json:"name"`
-	EnvVar string `json:"env_var"`
-}
 
 // AttestationHashRegistrar registers the SHA-256 hash of the enclave
 // application's attestation public key with the in-process nitriding instance
@@ -48,7 +38,7 @@ type AttestationHashRegistrar interface {
 type Runtime struct {
 	attestationKey          *btcec.PrivateKey
 	attestationRegistrar    AttestationHashRegistrar
-	secrets                 []SecretDef
+	secrets                 []StaticSecret
 	previousPCR0            string
 	previousPCR0Attestation string       // base64-encoded COSE Sign1 attestation doc
 	initDone                atomic.Bool  // true after Init completes (happens-before fence)
@@ -147,7 +137,7 @@ func secureRandom(b []byte) (int, error) {
 func (e *Runtime) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
 
-	ctx, initSpan := SupervisorSpan(ctx, "init")
+	ctx, initSpan := RuntimeSpan(ctx, "init")
 	defer initSpan.End()
 
 	secrets, err := loadSecretsConfig()
@@ -174,33 +164,23 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	// Classify boot role from declarative SSM flags. Any enclave that boots
 	// with MigrationKMSKeyID set but is NOT the target must run the abort path.
-	migrationKeyID := ""
-	if mkid, err := readMigrationKMSKeyID(ctx); err == nil {
-		migrationKeyID = mkid
-	}
-	migrationTargetPCR0 := ""
-	if tgt, err := readMigrationTargetPCR0(ctx); err == nil {
-		migrationTargetPCR0 = tgt
-	}
+	migrationKeyID, _ := readMigrationKMSKeyID(ctx)
+	migrationTargetPCR0, _ := readMigrationTargetPCR0(ctx)
 	ownPCR0 := getPCR0()
-	role := classifyBootRole(migrationKeyID != "", ownPCR0, migrationTargetPCR0)
-
-	if role == BootRoleAbortMigration {
+	paramPrefix := ""
+	switch classifyBootRole(migrationKeyID != "", ownPCR0, migrationTargetPCR0) {
+	case BootRoleAbortMigration:
 		slog.Warn("aborting in-progress migration — this enclave is not the target",
-			"migration_key", migrationKeyID[:min(16, len(migrationKeyID))],
-			"target_pcr0", migrationTargetPCR0[:min(16, len(migrationTargetPCR0))],
-			"own_pcr0", ownPCR0[:min(16, len(ownPCR0))])
+			"migration_key", prefix16(migrationKeyID),
+			"target_pcr0", prefix16(migrationTargetPCR0),
+			"own_pcr0", prefix16(ownPCR0))
 		if err := abortOrphanedMigration(ctx, expectedPreviousPCR0); err != nil {
 			return fmt.Errorf("abort orphaned migration: %w", err)
 		}
 		migrationKeyID = ""
-		role = BootRoleNoMigration
-	}
-
-	paramPrefix := ""
-	if role == BootRoleNewEnclave {
+	case BootRoleMigrationTarget:
 		paramPrefix = "Migration/"
-		slog.Info("migration mode active — reading from Migration/* staging", "key", migrationKeyID[:min(16, len(migrationKeyID))])
+		slog.Info("migration mode active — reading from Migration/* staging", "key", prefix16(migrationKeyID))
 	}
 
 	// Primary-mode verification: baked ENCLAVE_PREVIOUS_PCR0 must match SSM.
@@ -272,18 +252,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 
 	deleteOldKMSKey(ctx)
-
-	// Overlay tofu-supplied app.env overrides on top of the baked defaults.
-	// Must happen before the supervisor spawns the child app (which inherits
-	// os.Environ()).
-	awsCfgEnv, err := loadAWSConfigWithIMDS(ctx)
-	if err != nil {
-		return fmt.Errorf("load aws config for env overrides: %w", err)
-	}
-	if err := applyEnvOverrides(ctx, newSSMClient(awsCfgEnv), getDeployment(), getAppName()); err != nil {
-		return fmt.Errorf("apply env overrides: %w", err)
-	}
-
 	e.initOK.Store(true)
 	slog.Info("init completed successfully")
 	SpanOK(initSpan)
@@ -405,12 +373,12 @@ func (e *Runtime) Middleware(next http.Handler) http.Handler {
 }
 
 // loadSecretsConfig parses the ENCLAVE_SECRETS_CONFIG env var (JSON array).
-func loadSecretsConfig() ([]SecretDef, error) {
+func loadSecretsConfig() ([]StaticSecret, error) {
 	raw := os.Getenv("ENCLAVE_SECRETS_CONFIG")
 	if raw == "" {
 		return nil, nil
 	}
-	var secrets []SecretDef
+	var secrets []StaticSecret
 	if err := json.Unmarshal([]byte(raw), &secrets); err != nil {
 		return nil, fmt.Errorf("parse ENCLAVE_SECRETS_CONFIG: %w", err)
 	}
@@ -447,7 +415,7 @@ func (e *Runtime) generateAttestationKey() error {
 
 // extendPCRsWithSecretPubkeys derives the secp256k1 compressed public key for
 // each secret and extends PCR (16 + index) with SHA256(compressed_pubkey).
-func (e *Runtime) extendPCRsWithSecretPubkeys(secrets []SecretDef) error {
+func (e *Runtime) extendPCRsWithSecretPubkeys(secrets []StaticSecret) error {
 	for i, s := range secrets {
 		pcrIndex := uint(16) + uint(i)
 		if pcrIndex >= migrationPCRIndex {
@@ -610,6 +578,56 @@ func (e *Runtime) getMigrationCooldownStatus(ctx context.Context) (configuredSec
 	return configuredSeconds, int(remaining.Seconds()), true
 }
 
+// waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
+// Times out after 5 minutes to prevent infinite retries on broken KMS.
+//
+// keyID specifies the KMS key to decrypt under. Pass empty string to use the
+// primary key from SSM. paramPrefix is inserted between the app name and the
+// secret name in the SSM param path — use "Migration/" for migration mode,
+// empty string for primary mode.
+//
+// In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
+// generates a fresh secret — the Migration/* params MUST exist or Init fails.
+// Generating a fresh secret in migration mode would orphan the real data.
+func (e *Runtime) waitForSecretsFromKMS(ctx context.Context, secrets []StaticSecret, keyID, paramPrefix string) error {
+	const timeout = 5 * time.Minute
+	interval := 5 * time.Second
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	migrationMode := paramPrefix != "" && keyID != ""
+
+	var lastErr error
+	for {
+		allLoaded := true
+		for _, s := range secrets {
+			if err := loadStaticSecret(ctx, s, keyID, paramPrefix, migrationMode); err != nil {
+				lastErr = fmt.Errorf("secret %s: %w", s.Name, err)
+				allLoaded = false
+				break
+			}
+			if strings.TrimSpace(os.Getenv(s.EnvVar)) == "" {
+				lastErr = fmt.Errorf("secret %s: env var %s is empty after load", s.Name, s.EnvVar)
+				allLoaded = false
+				break
+			}
+		}
+		if allLoaded {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("KMS secret loading timed out after %s (last error: %v)", timeout, lastErr)
+			}
+			return fmt.Errorf("KMS secret loading timed out after %s", timeout)
+		case <-time.After(interval):
+		}
+	}
+}
+
 // lockPCR locks a PCR via the NSM, making it read-only.
 func lockPCR(index uint) error {
 	session, err := nsm.OpenDefaultSession()
@@ -666,4 +684,34 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 
 func (r *responseRecorder) ReadFrom(src io.Reader) (int64, error) {
 	return io.Copy(r.body, src)
+}
+
+// LoggingMiddleware logs each HTTP request with method, path, status, and duration.
+func LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		duration := time.Since(start)
+		slog.Info("http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.status,
+			"duration_ms", duration.Milliseconds(),
+		)
+		enclaveMetrics.Inc(enclaveMetrics.HTTPRequests, "http_requests_total")
+		if sw.status >= 400 {
+			enclaveMetrics.Inc(enclaveMetrics.HTTPErrors, "http_errors_total")
+		}
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

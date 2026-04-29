@@ -76,10 +76,10 @@ func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) SpanEntry {
 	}
 }
 
-// StartSupervisorTracing initializes the OTEL TracerProvider for the supervisor.
+// StartRuntimeTracing initializes the OTEL TracerProvider for the supervisor.
 // Spans are exported directly into the SpanBuffer (no network).
 // Returns a shutdown function.
-func StartSupervisorTracing(buf *SpanBuffer, shipCh chan SpanEntry) func(context.Context) error {
+func StartRuntimeTracing(buf *SpanBuffer, shipCh chan SpanEntry) func(context.Context) error {
 	exporter := &bufferSpanExporter{buf: buf, shipCh: shipCh}
 
 	tp := sdktrace.NewTracerProvider(
@@ -93,10 +93,10 @@ func StartSupervisorTracing(buf *SpanBuffer, shipCh chan SpanEntry) func(context
 	return tp.Shutdown
 }
 
-// SupervisorSpan starts a new span on the supervisor tracer.
-// Usage: ctx, span := sdk.SupervisorSpan(ctx, "init.kms_policy")
+// RuntimeSpan starts a new span on the supervisor tracer.
+// Usage: ctx, span := runtime.RuntimeSpan(ctx, "init.kms_policy")
 // defer span.End()
-func SupervisorSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+func RuntimeSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	if supervisorTracer == nil {
 		return ctx, trace.SpanFromContext(ctx) // noop if tracing not initialized
 	}
@@ -123,6 +123,6 @@ func SpanSetAttr(span trace.Span, attrs ...attribute.KeyValue) {
 }
 
 // Attr helpers for common span attributes.
-func AttrString(key, val string) attribute.KeyValue { return attribute.String(key, val) }
+func AttrString(key, val string) attribute.KeyValue  { return attribute.String(key, val) }
 func AttrInt(key string, val int) attribute.KeyValue { return attribute.Int(key, val) }
-func AttrError(err error) attribute.KeyValue        { return attribute.String("error", fmt.Sprint(err)) }
+func AttrError(err error) attribute.KeyValue         { return attribute.String("error", fmt.Sprint(err)) }

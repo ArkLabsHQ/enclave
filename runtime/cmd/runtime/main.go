@@ -25,11 +25,8 @@ import (
 )
 
 func main() {
-	// 1. Create enclave (instant — no blocking work).
 	enc, err := runtime.New()
 	if err != nil {
-		runtime.InitLogging() // fallback for early errors
-		slog.Error("create enclave failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -44,7 +41,7 @@ func main() {
 	runtime.InitMetrics()
 
 	// Set up tracing: supervisor spans go directly into the SpanBuffer.
-	shutdownTracing := runtime.StartSupervisorTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
+	shutdownTracing := runtime.StartRuntimeTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
@@ -54,9 +51,7 @@ func main() {
 	// Point the Go DNS resolver at gvproxy's embedded DNS server. Nitriding's
 	// writeResolvconf writes /run/resolvconf/resolv.conf, but the enclave
 	// EIF rootfs doesn't symlink /etc/resolv.conf to that — so we write
-	// directly here before any code does name resolution. This replaces the
-	// `echo "nameserver …" > /etc/resolv.conf` that used to live in
-	// enclave/start.sh before the runtime absorbed the entrypoint.
+	// directly here before any code does name resolution.
 	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
 		// Best-effort; outside the enclave (e.g. local dev) /etc/ may be read-only.
 		slog.Debug("write /etc/resolv.conf", "error", err)

@@ -2,16 +2,101 @@ package runtime
 
 import (
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
 )
+
+// AttestationHashRegistrar registers the SHA-256 hash of the enclave
+// application's attestation public key with the in-process nitriding
+// instance so it's embedded in NSM attestation documents.
+//
+// Implemented by *nitriding.Enclave (see runtime/nitriding/setters.go).
+// Tests inject a fake.
+type AttestationHashRegistrar interface {
+	SetAttestationKeyHash(hash [32]byte)
+}
+
+// Attestation owns the ephemeral secp256k1 attestation key and the
+// nitriding registrar. Init() generates the key and registers its hash
+// so it appears in NSM attestation documents under appKeyHash.
+type Attestation struct {
+	key        *btcec.PrivateKey
+	registrar  AttestationHashRegistrar
+}
+
+// NewAttestation constructs an empty Attestation. Call SetRegistrar
+// before Init.
+func NewAttestation() *Attestation {
+	return &Attestation{}
+}
+
+// SetRegistrar wires the in-process nitriding enclave as the recipient
+// of the attestation key hash. Call this before Init.
+func (a *Attestation) SetRegistrar(r AttestationHashRegistrar) {
+	a.registrar = r
+}
+
+// Init generates an ephemeral secp256k1 keypair and registers its public
+// key hash with the configured registrar.
+func (a *Attestation) Init() error {
+	keyBytes := make([]byte, 32)
+	if _, err := secureRandom(keyBytes); err != nil {
+		return fmt.Errorf("generate random bytes: %w", err)
+	}
+
+	privKey, _ := btcec.PrivKeyFromBytes(keyBytes)
+	if privKey == nil {
+		return fmt.Errorf("invalid secp256k1 key from random bytes")
+	}
+	a.key = privKey
+
+	if a.registrar == nil {
+		return fmt.Errorf("no attestation registrar wired; call SetRegistrar before Init")
+	}
+	hash := sha256.Sum256(privKey.PubKey().SerializeCompressed())
+	a.registrar.SetAttestationKeyHash(hash)
+	return nil
+}
+
+// Pubkey returns the hex-encoded compressed public key, or "" if Init
+// hasn't run yet.
+func (a *Attestation) Pubkey() string {
+	if a == nil || a.key == nil {
+		return ""
+	}
+	return hex.EncodeToString(a.key.PubKey().SerializeCompressed())
+}
+
+// Sign signs body with BIP-340 Schnorr and returns the hex signature, or
+// "" if the key isn't ready or signing fails.
+func (a *Attestation) Sign(body []byte) string {
+	if a == nil || a.key == nil {
+		return ""
+	}
+	msgHash := sha256.Sum256(body)
+	sig, err := schnorr.Sign(a.key, msgHash[:])
+	if err != nil {
+		slog.Warn("schnorr sign failed", "error", err)
+		return ""
+	}
+	return hex.EncodeToString(sig.Serialize())
+}
+
+// Ready returns true once Init has produced a key.
+func (a *Attestation) Ready() bool {
+	return a != nil && a.key != nil
+}
 
 // attestationDocument represents the CBOR structure of a Nitro attestation document.
 type attestationDocument struct {

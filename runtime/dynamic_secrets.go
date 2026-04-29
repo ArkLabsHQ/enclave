@@ -11,8 +11,13 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// =============================================================================
+// Type definitions + helpers
+// =============================================================================
 
 // envMu protects os.Setenv calls from concurrent access.
 var envMu sync.Mutex
@@ -39,6 +44,10 @@ const secretsPrefix = "secrets/"
 // validSecretName matches alphanumeric, hyphens, underscores, dots. No slashes, no ..
 var validSecretName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// maxSecretValueSize is the maximum size of a dynamic secret value.
+// Env vars have OS-level limits (~128KB on Linux), so cap well below that.
+const maxSecretValueSize = 64 * 1024 // 64KB
+
 // validateSecretName rejects path traversal, control chars, and invalid names.
 func validateSecretName(name string) error {
 	if name == "" {
@@ -56,12 +65,81 @@ func validateSecretName(name string) error {
 	return nil
 }
 
-// maxSecretValueSize is the maximum size of a dynamic secret value.
-// Env vars have OS-level limits (~128KB on Linux), so cap well below that.
-const maxSecretValueSize = 64 * 1024 // 64KB
+// safeSetenv wraps os.Setenv with a mutex to prevent concurrent env mutations.
+func safeSetenv(key, value string) error {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Setenv(key, value)
+}
 
-// StoreSecret encrypts and persists a dynamic secret.
-func (e *Runtime) StoreSecret(ctx context.Context, name, envVar, value string) error {
+// =============================================================================
+// DynamicSecrets subsystem
+// =============================================================================
+
+// DynamicSecrets owns the runtime-managed K/V secret store. Each secret is
+// stored as an encrypted JSON envelope in the *Storage S3 bucket and may
+// optionally be exported into a child-app env var. Distinct from
+// *StaticSecrets, which holds the EIF-baked yaml-declared secrets.
+type DynamicSecrets struct {
+	count     atomic.Int64
+	storage   *Storage
+	metrics   *Metrics
+	staticRef *StaticSecrets // for env_var collision check
+	auth      func(http.ResponseWriter, *http.Request) bool
+}
+
+// NewDynamicSecrets constructs the subsystem. storage is required; metrics
+// and staticRef may be nil (collision checks become no-ops). Init-state
+// gating happens at the Runtime middleware layer applied during
+// RegisterRoutes — handlers don't check init themselves.
+func NewDynamicSecrets(storage *Storage, metrics *Metrics, staticRef *StaticSecrets, auth func(http.ResponseWriter, *http.Request) bool) *DynamicSecrets {
+	return &DynamicSecrets{
+		storage:   storage,
+		metrics:   metrics,
+		staticRef: staticRef,
+		auth:      auth,
+	}
+}
+
+// Count returns the loaded-secrets count for enclave-info.
+func (d *DynamicSecrets) Count() int64 { return d.count.Load() }
+
+// Init scans the storage bucket for existing dynamic secrets and injects
+// each one's env var (if configured). Returns the count of loaded secrets.
+// No-op if storage isn't ready (DEK not loaded).
+func (d *DynamicSecrets) Init(ctx context.Context) (int, error) {
+	if d.storage == nil || !d.storage.HasDEK() {
+		return 0, nil // storage not initialized, skip
+	}
+	names, err := d.list(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	seenEnvVars := make(map[string]string) // env_var → secret name
+	loaded := 0
+
+	for _, name := range names {
+		secret, err := d.load(ctx, name)
+		if err != nil {
+			slog.Warn("skip dynamic secret", "name", name, "error", err)
+			continue
+		}
+		if secret.EnvVar != "" {
+			if prev, dup := seenEnvVars[secret.EnvVar]; dup {
+				slog.Warn("duplicate env_var in dynamic secrets", "prev", prev, "current", name, "env_var", secret.EnvVar)
+			}
+			seenEnvVars[secret.EnvVar] = name
+			_ = safeSetenv(secret.EnvVar, secret.Value)
+		}
+		loaded++
+	}
+	d.count.Store(int64(loaded))
+	return loaded, nil
+}
+
+// store encrypts and persists a dynamic secret.
+func (d *DynamicSecrets) store(ctx context.Context, name, envVar, value string) error {
 	if err := validateSecretName(name); err != nil {
 		return err
 	}
@@ -70,8 +148,8 @@ func (e *Runtime) StoreSecret(ctx context.Context, name, envVar, value string) e
 	}
 
 	// Validate env_var doesn't collide with static secrets.
-	if envVar != "" {
-		for _, s := range e.secrets {
+	if envVar != "" && d.staticRef != nil {
+		for _, s := range d.staticRef.Secrets() {
 			if s.EnvVar == envVar {
 				return fmt.Errorf("env_var %q conflicts with static secret %q", envVar, s.Name)
 			}
@@ -82,7 +160,7 @@ func (e *Runtime) StoreSecret(ctx context.Context, name, envVar, value string) e
 
 	// Preserve created_at if updating an existing secret.
 	createdAt := now
-	if existing, err := e.LoadSecret(ctx, name); err == nil {
+	if existing, err := d.load(ctx, name); err == nil {
 		createdAt = existing.CreatedAt
 	}
 
@@ -98,15 +176,19 @@ func (e *Runtime) StoreSecret(ctx context.Context, name, envVar, value string) e
 		return fmt.Errorf("marshal secret: %w", err)
 	}
 
-	enclaveMetrics.Inc(enclaveMetrics.SecretWrites, "secret_writes_total")
+	if d.metrics != nil {
+		d.metrics.Inc(d.metrics.SecretWrites, "secret_writes_total")
+	}
 	slog.Info("secret stored", "name", name, "env_var", envVar)
-	return e.Store(ctx, secretsPrefix+name, data)
+	return d.storage.Store(ctx, secretsPrefix+name, data)
 }
 
-// LoadSecret retrieves and decrypts a dynamic secret.
-func (e *Runtime) LoadSecret(ctx context.Context, name string) (*DynamicSecret, error) {
-	enclaveMetrics.Inc(enclaveMetrics.SecretReads, "secret_reads_total")
-	data, err := e.Load(ctx, secretsPrefix+name)
+// load retrieves and decrypts a dynamic secret.
+func (d *DynamicSecrets) load(ctx context.Context, name string) (*DynamicSecret, error) {
+	if d.metrics != nil {
+		d.metrics.Inc(d.metrics.SecretReads, "secret_reads_total")
+	}
+	data, err := d.storage.Load(ctx, secretsPrefix+name)
 	if err != nil {
 		return nil, err
 	}
@@ -117,16 +199,18 @@ func (e *Runtime) LoadSecret(ctx context.Context, name string) (*DynamicSecret, 
 	return &secret, nil
 }
 
-// DeleteSecret removes a dynamic secret from storage.
-func (e *Runtime) DeleteSecret(ctx context.Context, name string) error {
-	enclaveMetrics.Inc(enclaveMetrics.SecretDeletes, "secret_deletes_total")
+// del removes a dynamic secret from storage.
+func (d *DynamicSecrets) del(ctx context.Context, name string) error {
+	if d.metrics != nil {
+		d.metrics.Inc(d.metrics.SecretDeletes, "secret_deletes_total")
+	}
 	slog.Info("secret deleted", "name", name)
-	return e.Delete(ctx, secretsPrefix+name)
+	return d.storage.Delete(ctx, secretsPrefix+name)
 }
 
-// ListSecrets returns the names of all dynamic secrets.
-func (e *Runtime) ListSecrets(ctx context.Context) ([]string, error) {
-	keys, err := e.List(ctx, secretsPrefix)
+// list returns the names of all dynamic secrets.
+func (d *DynamicSecrets) list(ctx context.Context) ([]string, error) {
+	keys, err := d.storage.List(ctx, secretsPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -137,67 +221,21 @@ func (e *Runtime) ListSecrets(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// loadDynamicSecrets scans stored secrets and injects their env vars.
-// Returns the count of loaded secrets for enclave-info reporting.
-func (e *Runtime) loadDynamicSecrets(ctx context.Context) (int, error) {
-	if e.dek == nil {
-		return 0, nil // storage not initialized, skip
-	}
-	names, err := e.ListSecrets(ctx)
-	if err != nil {
-		return 0, err
-	}
+// =============================================================================
+// HTTP handlers
+// =============================================================================
 
-	seenEnvVars := make(map[string]string) // env_var → secret name
-	loaded := 0
-
-	for _, name := range names {
-		secret, err := e.LoadSecret(ctx, name)
-		if err != nil {
-			slog.Warn("skip dynamic secret", "name", name, "error", err)
-			continue
-		}
-		if secret.EnvVar != "" {
-			if prev, dup := seenEnvVars[secret.EnvVar]; dup {
-				slog.Warn("duplicate env_var in dynamic secrets", "prev", prev, "current", name, "env_var", secret.EnvVar)
-			}
-			seenEnvVars[secret.EnvVar] = name
-			_ = safeSetenv(secret.EnvVar, secret.Value)
-		}
-		loaded++
-	}
-	return loaded, nil
+// RegisterRoutes attaches the dynamic-secrets endpoints on mux.
+func (d *DynamicSecrets) RegisterRoutes(mux Mux) {
+	mux.HandleFunc("PUT /v1/secrets/{name}", d.handlePut)
+	mux.HandleFunc("GET /v1/secrets/{name}", d.handleGet)
+	mux.HandleFunc("DELETE /v1/secrets/{name}", d.handleDelete)
+	mux.HandleFunc("GET /v1/secrets", d.handleList)
 }
 
-// checkRuntimeToken validates the Authorization: Bearer <token> header.
-func (e *Runtime) checkRuntimeToken(w http.ResponseWriter, r *http.Request) bool {
-	if e.runtimeToken == "" {
-		return true // no token configured, allow (backwards compat)
-	}
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
-		return false
-	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
-		http.Error(w, "invalid Authorization format, expected Bearer token", http.StatusUnauthorized)
-		return false
-	}
-	if strings.TrimPrefix(auth, prefix) != e.runtimeToken {
-		http.Error(w, "invalid management token", http.StatusForbidden)
-		return false
-	}
-	return true
-}
-
-// handleSecretPut handles PUT /v1/secrets/{name}.
-func (e *Runtime) handleSecretPut(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handlePut handles PUT /v1/secrets/{name}.
+func (d *DynamicSecrets) handlePut(w http.ResponseWriter, r *http.Request) {
+	if d.auth != nil && !d.auth(w, r) {
 		return
 	}
 
@@ -223,10 +261,10 @@ func (e *Runtime) handleSecretPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if this is a new secret (vs update) for count tracking.
-	_, existsErr := e.LoadSecret(r.Context(), name)
+	_, existsErr := d.load(r.Context(), name)
 	isNew := existsErr != nil
 
-	if err := e.StoreSecret(r.Context(), name, req.EnvVar, req.Value); err != nil {
+	if err := d.store(r.Context(), name, req.EnvVar, req.Value); err != nil {
 		if strings.Contains(err.Error(), "too large") {
 			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		} else {
@@ -236,7 +274,7 @@ func (e *Runtime) handleSecretPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isNew {
-		e.dynamicSecretsCount.Add(1)
+		d.count.Add(1)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -247,13 +285,9 @@ func (e *Runtime) handleSecretPut(w http.ResponseWriter, r *http.Request) {
 	}{Name: name, Status: "stored"})
 }
 
-// handleSecretGet handles GET /v1/secrets/{name}.
-func (e *Runtime) handleSecretGet(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handleGet handles GET /v1/secrets/{name}.
+func (d *DynamicSecrets) handleGet(w http.ResponseWriter, r *http.Request) {
+	if d.auth != nil && !d.auth(w, r) {
 		return
 	}
 
@@ -263,7 +297,7 @@ func (e *Runtime) handleSecretGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	secret, err := e.LoadSecret(r.Context(), name)
+	secret, err := d.load(r.Context(), name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			http.Error(w, "secret not found", http.StatusNotFound)
@@ -277,13 +311,9 @@ func (e *Runtime) handleSecretGet(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(secret)
 }
 
-// handleSecretDelete handles DELETE /v1/secrets/{name}.
-func (e *Runtime) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handleDelete handles DELETE /v1/secrets/{name}.
+func (d *DynamicSecrets) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if d.auth != nil && !d.auth(w, r) {
 		return
 	}
 
@@ -294,7 +324,7 @@ func (e *Runtime) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify secret exists before deleting (for accurate count tracking).
-	if _, err := e.LoadSecret(r.Context(), name); err != nil {
+	if _, err := d.load(r.Context(), name); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			http.Error(w, "secret not found", http.StatusNotFound)
 			return
@@ -303,12 +333,12 @@ func (e *Runtime) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := e.DeleteSecret(r.Context(), name); err != nil {
+	if err := d.del(r.Context(), name); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	e.dynamicSecretsCount.Add(-1)
+	d.count.Add(-1)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
@@ -317,18 +347,14 @@ func (e *Runtime) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 	}{Name: name, Status: "deleted"})
 }
 
-// handleSecretList handles GET /v1/secrets.
+// handleList handles GET /v1/secrets.
 // Returns metadata for each secret (name, env_var, timestamps) but not the value.
-func (e *Runtime) handleSecretList(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+func (d *DynamicSecrets) handleList(w http.ResponseWriter, r *http.Request) {
+	if d.auth != nil && !d.auth(w, r) {
 		return
 	}
 
-	names, err := e.ListSecrets(r.Context())
+	names, err := d.list(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -336,7 +362,7 @@ func (e *Runtime) handleSecretList(w http.ResponseWriter, r *http.Request) {
 
 	secrets := make([]DynamicSecretInfo, 0, len(names))
 	for _, name := range names {
-		secret, err := e.LoadSecret(r.Context(), name)
+		secret, err := d.load(r.Context(), name)
 		if err != nil {
 			slog.Warn("skip secret in list", "name", name, "error", err)
 			continue
@@ -355,9 +381,30 @@ func (e *Runtime) handleSecretList(w http.ResponseWriter, r *http.Request) {
 	}{Secrets: secrets})
 }
 
-// safeSetenv wraps os.Setenv with a mutex to prevent concurrent env mutations.
-func safeSetenv(key, value string) error {
-	envMu.Lock()
-	defer envMu.Unlock()
-	return os.Setenv(key, value)
+// =============================================================================
+// Auth helper (still on Runtime — used as the auth callback by subsystems)
+// =============================================================================
+
+// checkRuntimeToken validates the Authorization: Bearer <token> header.
+// Stays on *Runtime because it reads e.runtimeToken; subsystems pass it
+// in as the auth callback during their construction.
+func (e *Runtime) checkRuntimeToken(w http.ResponseWriter, r *http.Request) bool {
+	if e.runtimeToken == "" {
+		return true // no token configured, allow (backwards compat)
+	}
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "invalid Authorization format, expected Bearer token", http.StatusUnauthorized)
+		return false
+	}
+	if strings.TrimPrefix(auth, prefix) != e.runtimeToken {
+		http.Error(w, "invalid management token", http.StatusForbidden)
+		return false
+	}
+	return true
 }

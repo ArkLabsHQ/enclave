@@ -43,7 +43,7 @@ func TestParseKMSPolicyState_TransitionalPolicy(t *testing.T) {
 // Covers plan test #3: "selfApplyKMSPolicy skips PutKeyPolicy when policy already contains target PCR0".
 func TestParseKMSPolicyState_LockedMatchingPCR0(t *testing.T) {
 	targetPCR0 := strings.Repeat("a", 96)
-	locked := buildKMSPolicy("arn:aws:iam::123:role/ec2", targetPCR0, "")
+	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(targetPCR0).Build()
 	hasPCR0, hasPut := parseKMSPolicyState(locked, targetPCR0)
 	if !hasPCR0 {
 		t.Fatalf("locked policy with matching PCR0: expected hasPCR0=true, got false")
@@ -58,7 +58,7 @@ func TestParseKMSPolicyState_LockedMatchingPCR0(t *testing.T) {
 func TestParseKMSPolicyState_LockedDifferentPCR0(t *testing.T) {
 	otherPCR0 := strings.Repeat("b", 96)
 	myPCR0 := strings.Repeat("c", 96)
-	locked := buildKMSPolicy("arn:aws:iam::123:role/ec2", otherPCR0, "")
+	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(otherPCR0).Build()
 	hasPCR0, hasPut := parseKMSPolicyState(locked, myPCR0)
 	if hasPCR0 {
 		t.Fatalf("locked to different PCR0: expected hasPCR0=false (from my perspective), got true")
@@ -73,7 +73,7 @@ func TestParseKMSPolicyState_LockedDifferentPCR0(t *testing.T) {
 func TestParseKMSPolicyState_CaseInsensitivePCR0(t *testing.T) {
 	lowerPCR0 := strings.Repeat("a", 96)
 	upperPCR0 := strings.ToUpper(lowerPCR0)
-	locked := buildKMSPolicy("arn:aws:iam::123:role/ec2", lowerPCR0, "")
+	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(lowerPCR0).Build()
 	hasPCR0, _ := parseKMSPolicyState(locked, upperPCR0)
 	if !hasPCR0 {
 		t.Fatalf("case-insensitive matching: expected hasPCR0=true for uppercase query against lowercase policy, got false")
@@ -102,7 +102,7 @@ func TestParseKMSPolicyState_KmsStar(t *testing.T) {
 // TestBuildKMSPolicy_NoPutKeyPolicy verifies the locked policy grants no
 // PutKeyPolicy permission to anyone — this is the security guarantee.
 func TestBuildKMSPolicy_NoPutKeyPolicy(t *testing.T) {
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2", strings.Repeat("a", 96), "")
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(strings.Repeat("a", 96)).Build()
 	if strings.Contains(policy, "kms:PutKeyPolicy") {
 		t.Fatalf("locked policy must not grant kms:PutKeyPolicy, got:\n%s", policy)
 	}
@@ -112,7 +112,7 @@ func TestBuildKMSPolicy_NoPutKeyPolicy(t *testing.T) {
 // specified PCR0 via kms:RecipientAttestation:PCR0.
 func TestBuildKMSPolicy_ContainsPCR0Condition(t *testing.T) {
 	pcr0 := strings.Repeat("a", 96)
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2", pcr0, "")
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(pcr0).Build()
 	if !strings.Contains(policy, "kms:RecipientAttestation:PCR0") {
 		t.Fatalf("locked policy must contain kms:RecipientAttestation:PCR0 condition")
 	}
@@ -125,7 +125,7 @@ func TestBuildKMSPolicy_ContainsPCR0Condition(t *testing.T) {
 // the operations it needs: Decrypt (gated), Encrypt, GenerateDataKey, and
 // ScheduleKeyDeletion (for migration cleanup).
 func TestBuildKMSPolicy_AllowsDecryptEncryptDelete(t *testing.T) {
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2", strings.Repeat("a", 96), "")
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(strings.Repeat("a", 96)).Build()
 	for _, must := range []string{"kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:ScheduleKeyDeletion"} {
 		if !strings.Contains(policy, must) {
 			t.Fatalf("locked policy must grant %s", must)
@@ -136,7 +136,7 @@ func TestBuildKMSPolicy_AllowsDecryptEncryptDelete(t *testing.T) {
 // TestBuildKMSPolicy_NoRecovery verifies that an empty recoveryAccount
 // produces the historical 3-statement policy with no RootRecovery Sid.
 func TestBuildKMSPolicy_NoRecovery(t *testing.T) {
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2", strings.Repeat("a", 96), "")
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(strings.Repeat("a", 96)).Build()
 	if strings.Contains(policy, "RootRecovery") {
 		t.Fatalf("strict mode (no recoveryAccount) must not include RootRecovery statement, got:\n%s", policy)
 	}
@@ -155,7 +155,7 @@ func TestBuildKMSPolicy_NoRecovery(t *testing.T) {
 // emitted with the expected principal, action set, and resource.
 func TestBuildKMSPolicy_RootRecovery(t *testing.T) {
 	const account = "123456789012"
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2", strings.Repeat("a", 96), account)
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0(strings.Repeat("a", 96)).WithRootRecovery(account).Build()
 
 	var parsed struct {
 		Statement []map[string]any `json:"Statement"`
@@ -241,8 +241,9 @@ func TestArnAccount(t *testing.T) {
 // load-bearing property of the design: plaintext stays inside the
 // attested enclave even during recovery.
 func TestBuildKMSPolicy_RecoveryGrantsPutKeyPolicy(t *testing.T) {
-	policy := buildKMSPolicy("arn:aws:iam::123:role/ec2",
-		strings.Repeat("a", 96), "123456789012")
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").
+		LockedToPCR0(strings.Repeat("a", 96)).
+		WithRootRecovery("123456789012").Build()
 	if !strings.Contains(policy, "kms:PutKeyPolicy") {
 		t.Fatalf("recovery mode must grant kms:PutKeyPolicy to root, got:\n%s", policy)
 	}

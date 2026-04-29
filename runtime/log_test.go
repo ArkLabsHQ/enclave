@@ -232,7 +232,7 @@ func TestHandleLogGet_Empty(t *testing.T) {
 	enc := newTestEnclave(t)
 	req := httptest.NewRequest("GET", "/v1/enclave-logs", nil)
 	w := httptest.NewRecorder()
-	enc.handleLogGet(w, req)
+	enc.logging.handleGet(w, req)
 
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d", w.Code)
@@ -248,11 +248,11 @@ func TestHandleLogGet_Empty(t *testing.T) {
 
 func TestHandleLogGet_WithEntries(t *testing.T) {
 	enc := newTestEnclave(t)
-	enc.logBuffer.Add(LogEntry{Level: "info", Message: "a"}, LogEntry{Level: "error", Message: "b"})
+	enc.logging.buf.Add(LogEntry{Level: "info", Message: "a"}, LogEntry{Level: "error", Message: "b"})
 
 	req := httptest.NewRequest("GET", "/v1/enclave-logs?level=error", nil)
 	w := httptest.NewRecorder()
-	enc.handleLogGet(w, req)
+	enc.logging.handleGet(w, req)
 
 	var entries []LogEntry
 	if err := json.Unmarshal(w.Body.Bytes(), &entries); err != nil {
@@ -269,7 +269,7 @@ func TestHandleLogPost_NoAuth(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/logs", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	w := httptest.NewRecorder()
-	enc.handleLogPost(w, req)
+	enc.logging.handlePost(w, req)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
@@ -283,13 +283,13 @@ func TestHandleLogPost_ValidOTLP(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Authorization", "Bearer "+enc.RuntimeToken())
 	w := httptest.NewRecorder()
-	enc.handleLogPost(w, req)
+	enc.logging.handlePost(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if enc.logBuffer.Len() != 1 {
-		t.Fatalf("expected 1 entry in buffer, got %d", enc.logBuffer.Len())
+	if enc.logging.buf.Len() != 1 {
+		t.Fatalf("expected 1 entry in buffer, got %d", enc.logging.buf.Len())
 	}
 }
 
@@ -297,7 +297,7 @@ func TestHandleLogPost_ValidOTLP(t *testing.T) {
 
 func TestBufferHandler_SlogToLogEntry(t *testing.T) {
 	buf := NewLogBuffer(10)
-	handler := NewBufferHandler(buf, nil)
+	handler := NewBufferHandler(&Logging{buf: buf})
 	logger := slog.New(handler)
 
 	logger.Info("test message", "key", "value")
@@ -320,7 +320,7 @@ func TestBufferHandler_SlogToLogEntry(t *testing.T) {
 
 func TestBufferHandler_ErrorLevel(t *testing.T) {
 	buf := NewLogBuffer(10)
-	handler := NewBufferHandler(buf, nil)
+	handler := NewBufferHandler(&Logging{buf: buf})
 	logger := slog.New(handler)
 
 	logger.Error("fail", "error", "something broke")
@@ -333,7 +333,7 @@ func TestBufferHandler_ErrorLevel(t *testing.T) {
 
 func TestBufferHandler_NilShipCh(t *testing.T) {
 	buf := NewLogBuffer(10)
-	handler := NewBufferHandler(buf, nil)
+	handler := NewBufferHandler(&Logging{buf: buf})
 	// Should not panic with nil channel.
 	_ = handler.Handle(context.Background(), slog.Record{})
 }

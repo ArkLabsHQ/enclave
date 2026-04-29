@@ -34,19 +34,20 @@ func main() {
 	// LogBuffer (queryable via GET /v1/enclave-logs). Must happen before Init() so
 	// init stages are captured.
 	slog.SetDefault(slog.New(
-		runtime.NewBufferHandler(enc.GetLogBuffer(), enc.GetLogShipCh()),
+		runtime.NewBufferHandler(enc.Logging()),
 	))
 
 	// Set up metrics: OTEL instruments + runtime/proc collector.
 	runtime.InitMetrics()
 
-	// Set up tracing: supervisor spans go directly into the SpanBuffer.
-	shutdownTracing := runtime.StartRuntimeTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
+	// Tracing was already initialised inside runtime.New(); the OTEL
+	// TracerProvider is set as global. Just arrange for shutdown on exit.
+	tracing := enc.Tracing()
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	defer func() { _ = shutdownTracing(ctx) }()
+	defer func() { _ = tracing.Shutdown(ctx) }()
 
 	// Point the Go DNS resolver at gvproxy's embedded DNS server. Nitriding's
 	// writeResolvconf writes /run/resolvconf/resolv.conf, but the enclave

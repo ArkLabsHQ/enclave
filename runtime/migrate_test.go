@@ -107,7 +107,7 @@ func TestClassifyBootRole_BothEmpty(t *testing.T) {
 func TestGetSecretSSMParamName_Primary(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	got := getSecretSSMParamNameWithPrefix("signing-key", "")
+	got := secretParamName("signing-key", "")
 	want := "/dev/my-app/signing-key/Ciphertext"
 	if got != want {
 		t.Fatalf("primary mode: got %q, want %q", got, want)
@@ -119,7 +119,7 @@ func TestGetSecretSSMParamName_Primary(t *testing.T) {
 func TestGetSecretSSMParamName_Migration(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	got := getSecretSSMParamNameWithPrefix("signing-key", "Migration/")
+	got := secretParamName("signing-key", "Migration/")
 	want := "/dev/my-app/Migration/signing-key/Ciphertext"
 	if got != want {
 		t.Fatalf("migration mode: got %q, want %q", got, want)
@@ -132,8 +132,8 @@ func TestGetSecretSSMParamName_Migration(t *testing.T) {
 func TestGetSecretSSMParamName_IsolationInvariant(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	primary := getSecretSSMParamNameWithPrefix("secret1", "")
-	migration := getSecretSSMParamNameWithPrefix("secret1", "Migration/")
+	primary := secretParamName("secret1", "")
+	migration := secretParamName("secret1", "Migration/")
 	if primary == migration {
 		t.Fatalf("primary and migration paths must differ; both = %q", primary)
 	}

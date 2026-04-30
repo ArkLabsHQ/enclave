@@ -198,7 +198,7 @@ func TestHandleSpanGet_Empty(t *testing.T) {
 	enc := newTestEnclave(t)
 	req := httptest.NewRequest("GET", "/v1/enclave-traces", nil)
 	w := httptest.NewRecorder()
-	enc.handleSpanGet(w, req)
+	enc.tracing.handleGet(w, req)
 
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d", w.Code)
@@ -218,7 +218,7 @@ func TestHandleSpanPost_NoAuth(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/enclave-traces", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	w := httptest.NewRecorder()
-	enc.handleSpanPost(w, req)
+	enc.tracing.handlePost(w, req)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
@@ -232,30 +232,25 @@ func TestHandleSpanPost_Valid(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Authorization", "Bearer "+enc.RuntimeToken())
 	w := httptest.NewRecorder()
-	enc.handleSpanPost(w, req)
+	enc.tracing.handlePost(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	entries := enc.spanBuffer.Query(time.Time{}, "", 0)
+	entries := enc.tracing.buf.Query(time.Time{}, "", 0)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 span, got %d", len(entries))
 	}
 }
 
-// --- SupervisorSpan noop test ---
+// --- Tracing.Span noop test ---
 
-func TestSupervisorSpan_NoopWithoutTracer(t *testing.T) {
-	// supervisorTracer is nil by default (StartSupervisorTracing not called).
-	// SupervisorSpan should return a noop span without panicking.
-	old := supervisorTracer
-	supervisorTracer = nil
-	defer func() { supervisorTracer = old }()
-
-	ctx, span := SupervisorSpan(context.Background(), "test")
+func TestTracingSpan_NoopOnNilTracing(t *testing.T) {
+	// A nil-receivered call should return a noop span without panicking.
+	var nilT *Tracing
+	ctx, span := nilT.Span(context.Background(), "test")
 	if ctx == nil {
 		t.Fatal("expected non-nil context")
 	}
-	// Should not panic.
 	span.End()
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/smithy-go"
 	"github.com/edgebitio/nitro-enclaves-sdk-go/crypto/cms"
 	"github.com/hf/nsm"
@@ -31,9 +30,42 @@ var ErrNotFound = errors.New("key not found")
 // nonceSize is the AES-GCM nonce length.
 const nonceSize = 12
 
-// initStorage initializes the encrypted persistent storage subsystem.
-// It creates an S3 client, reads the bucket name from SSM, and loads
-// (or generates) the data encryption key (DEK).
+// =============================================================================
+// Storage subsystem
+// =============================================================================
+
+// Storage owns the encrypted persistent K/V store backed by S3 and a single
+// AES-256 DEK. The DEK lives only in process memory; it's KMS-decrypted at
+// boot from a ciphertext stored in SSM. All Store/Load/Delete operations
+// transparently AES-GCM encrypt/decrypt against the DEK.
+type Storage struct {
+	bucketName string
+	dek        []byte
+	kms        *KMS
+	metrics    *Metrics
+	auth       func(http.ResponseWriter, *http.Request) bool
+}
+
+// NewStorage constructs the storage subsystem. kms is required for Init();
+// metrics may be nil. auth is the bearer-token check; nil = no auth.
+// Init-state gating is handled by Runtime middleware applied during
+// RegisterRoutes — handlers don't check init themselves.
+func NewStorage(kms *KMS, metrics *Metrics, auth func(http.ResponseWriter, *http.Request) bool) *Storage {
+	return &Storage{
+		kms:     kms,
+		metrics: metrics,
+		auth:    auth,
+	}
+}
+
+// HasDEK reports whether the DEK is loaded (storage is operational).
+func (s *Storage) HasDEK() bool { return s != nil && s.dek != nil }
+
+// DEK returns the in-memory DEK (used by Migration.exportStorageDEK).
+func (s *Storage) DEK() []byte { return s.dek }
+
+// Init initializes the encrypted persistent storage subsystem.
+// It reads the bucket name from SSM and loads (or generates) the DEK.
 //
 // If no storage bucket is provisioned (StorageBucketName param missing),
 // storage is silently disabled — Store/Load/Delete return errors.
@@ -45,30 +77,20 @@ const nonceSize = 12
 //
 // In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
 // generates a fresh DEK — the Migration/StorageDEK param MUST exist or Init
-// fails. Generating a fresh DEK in migration mode would orphan all S3 data
-// encrypted under the real DEK.
-func (e *Runtime) initStorage(ctx context.Context, keyID, paramPrefix string) error {
-	awsCfg, err := loadAWSConfigWithIMDS(ctx)
-	if err != nil {
-		return fmt.Errorf("load AWS config: %w", err)
-	}
-
-	ssmClient := newSSMClient(awsCfg)
+// fails. Generating a fresh DEK in migration mode would orphan all S3 data.
+func (s *Storage) Init(ctx context.Context, keyID, paramPrefix string) error {
 	deployment := getDeployment()
 	appName := getAppName()
 
 	// Read bucket name — if not provisioned, storage is disabled.
-	bucketName, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/StorageBucketName", deployment, appName))
+	bucketName, err := readSSMParam(ctx, s.kms.aws.SSM, fmt.Sprintf("/%s/%s/StorageBucketName", deployment, appName))
 	if err != nil {
 		return nil // no bucket provisioned, storage disabled
 	}
+	s.bucketName = bucketName
 
-	e.s3Client = newS3Client(awsCfg)
-	e.bucketName = bucketName
-
-	kmsClient := newKMSClient(awsCfg)
 	if keyID == "" {
-		keyID, err = getKMSKeyID(ctx, ssmClient)
+		keyID, err = s.kms.GetKeyID(ctx)
 		if err != nil {
 			return fmt.Errorf("get KMS key ID: %w", err)
 		}
@@ -77,7 +99,7 @@ func (e *Runtime) initStorage(ctx context.Context, keyID, paramPrefix string) er
 	migrationMode := paramPrefix != ""
 	dekParam := fmt.Sprintf("/%s/%s/%sStorageDEK/Ciphertext", deployment, appName, paramPrefix)
 
-	ciphertextB64, err := loadCiphertextFromSSM(ctx, ssmClient, dekParam)
+	ciphertextB64, err := s.kms.LoadCiphertext(ctx, dekParam)
 	if err != nil {
 		return fmt.Errorf("load DEK from SSM: %w", err)
 	}
@@ -87,34 +109,50 @@ func (e *Runtime) initStorage(ctx context.Context, keyID, paramPrefix string) er
 			return fmt.Errorf("migration DEK missing at %s — cannot generate fresh (would orphan S3 data)", dekParam)
 		}
 		// First boot: generate a new DEK.
-		out, err := kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
+		out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 			KeyId:   aws.String(keyID),
 			KeySpec: kmstypes.DataKeySpecAes256,
 		})
 		if err != nil {
 			return fmt.Errorf("generate DEK: %w", err)
 		}
-		e.dek = out.Plaintext
+		s.dek = out.Plaintext
 
 		encoded := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
-		if err := storeCiphertextInSSM(ctx, ssmClient, dekParam, encoded); err != nil {
+		if err := s.kms.StoreCiphertext(ctx, dekParam, encoded); err != nil {
 			return fmt.Errorf("store DEK: %w", err)
 		}
 		return nil
 	}
 
 	// Subsequent boot: decrypt existing DEK.
-	dek, err := decryptDEK(ctx, kmsClient, keyID, ciphertextB64)
+	dek, err := decryptDEK(ctx, s.kms.aws.KMS, keyID, ciphertextB64)
 	if err != nil {
 		return fmt.Errorf("decrypt DEK: %w", err)
 	}
-	e.dek = dek
+	s.dek = dek
 	return nil
+}
+
+// ExportDEK re-encrypts the DEK under the given migration KMS key and
+// writes it to the Migration/StorageDEK SSM parameter.
+func (s *Storage) ExportDEK(ctx context.Context, migrationKeyID string) error {
+	if s.dek == nil {
+		return nil
+	}
+	deployment := getDeployment()
+	appName := getAppName()
+	ciphertextB64, err := s.kms.Encrypt(ctx, migrationKeyID, s.dek)
+	if err != nil {
+		return fmt.Errorf("encrypt DEK with migration key: %w", err)
+	}
+	migParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
+	return s.kms.StoreCiphertext(ctx, migParam, ciphertextB64)
 }
 
 // decryptDEK decrypts a base64-encoded KMS ciphertext using NSM attestation.
 // Retries up to 3 times with exponential backoff on transient failures.
-func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64 string) ([]byte, error) {
+func decryptDEK(ctx context.Context, kmsClient KMSAPI, keyID, ciphertextB64 string) ([]byte, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode ciphertext: %w", err)
@@ -123,65 +161,63 @@ func decryptDEK(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil, fmt.Errorf("KMS decrypt cancelled: %w", ctx.Err())
-			}
-			slog.Warn("retrying KMS decrypt", "attempt", attempt+1, "max_attempts", 3, "error", lastErr)
+			time.Sleep(time.Duration(1<<attempt) * time.Second)
 		}
 
 		session, err := nsm.OpenDefaultSession()
 		if err != nil {
-			return nil, fmt.Errorf("open NSM session: %w", err)
+			lastErr = fmt.Errorf("open NSM session: %w", err)
+			continue
 		}
 
 		attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
+		_ = session.Close()
 		if err != nil {
-			_ = session.Close()
-			return nil, err
+			lastErr = err
+			continue
 		}
 
-		enclaveMetrics.Inc(enclaveMetrics.KMSOperations, "kms_operations_total")
-		out, err := kmsClient.Decrypt(ctx, &kms.DecryptInput{
+		input := &kms.DecryptInput{
 			KeyId:          aws.String(keyID),
 			CiphertextBlob: ciphertext,
 			Recipient: &kmstypes.RecipientInfo{
 				AttestationDocument:    attestationDoc,
 				KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
 			},
-		})
-		_ = session.Close()
+		}
+
+		out, err := kmsClient.Decrypt(ctx, input)
 		if err != nil {
-			enclaveMetrics.Inc(enclaveMetrics.KMSErrors, "kms_errors_total")
-			lastErr = err
+			lastErr = fmt.Errorf("kms decrypt: %w", err)
 			continue
 		}
-
 		if len(out.CiphertextForRecipient) == 0 {
-			return nil, fmt.Errorf("KMS decrypt returned empty CiphertextForRecipient")
+			lastErr = fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
+			continue
 		}
-
 		plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+			lastErr = fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+			continue
 		}
-
 		return plaintext, nil
 	}
 	return nil, fmt.Errorf("KMS decrypt failed after 3 attempts: %w", lastErr)
 }
 
 // Store encrypts data with the DEK and persists it to S3.
-func (e *Runtime) Store(ctx context.Context, key string, data []byte) error {
-	enclaveMetrics.Inc(enclaveMetrics.StorageWrites, "storage_writes_total")
-	if e.dek == nil {
-		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
+func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
+	if s.metrics != nil {
+		s.metrics.Inc(s.metrics.StorageWrites, "storage_writes_total")
+	}
+	if s.dek == nil {
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
 		return fmt.Errorf("storage not initialized")
 	}
 
-	block, err := aes.NewCipher(e.dek)
+	block, err := aes.NewCipher(s.dek)
 	if err != nil {
 		return fmt.Errorf("create cipher: %w", err)
 	}
@@ -202,29 +238,34 @@ func (e *Runtime) Store(ctx context.Context, key string, data []byte) error {
 	blob = append(blob, nonce...)
 	blob = append(blob, ciphertext...)
 
-	_, err = e.s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(e.bucketName),
+	_, err = s.kms.aws.S3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucketName),
 		Key:    aws.String("data/" + key),
 		Body:   bytes.NewReader(blob),
 	})
 	if err != nil {
-		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
 		return fmt.Errorf("S3 put: %w", err)
 	}
 	return nil
 }
 
-// Load retrieves and decrypts data from S3.
-// Returns ErrNotFound if the key does not exist.
-func (e *Runtime) Load(ctx context.Context, key string) ([]byte, error) {
-	enclaveMetrics.Inc(enclaveMetrics.StorageReads, "storage_reads_total")
-	if e.dek == nil {
-		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
+// Load retrieves and decrypts data from S3. Returns ErrNotFound if missing.
+func (s *Storage) Load(ctx context.Context, key string) ([]byte, error) {
+	if s.metrics != nil {
+		s.metrics.Inc(s.metrics.StorageReads, "storage_reads_total")
+	}
+	if s.dek == nil {
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
-	out, err := e.s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(e.bucketName),
+	out, err := s.kms.aws.S3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucketName),
 		Key:    aws.String("data/" + key),
 	})
 	if err != nil {
@@ -248,7 +289,7 @@ func (e *Runtime) Load(ctx context.Context, key string) ([]byte, error) {
 	nonce := blob[:nonceSize]
 	ciphertext := blob[nonceSize:]
 
-	block, err := aes.NewCipher(e.dek)
+	block, err := aes.NewCipher(s.dek)
 	if err != nil {
 		return nil, fmt.Errorf("create cipher: %w", err)
 	}
@@ -266,15 +307,19 @@ func (e *Runtime) Load(ctx context.Context, key string) ([]byte, error) {
 }
 
 // Delete removes a key from storage.
-func (e *Runtime) Delete(ctx context.Context, key string) error {
-	enclaveMetrics.Inc(enclaveMetrics.StorageDeletes, "storage_deletes_total")
-	if e.s3Client == nil {
-		enclaveMetrics.Inc(enclaveMetrics.StorageErrors, "storage_errors_total")
+func (s *Storage) Delete(ctx context.Context, key string) error {
+	if s.metrics != nil {
+		s.metrics.Inc(s.metrics.StorageDeletes, "storage_deletes_total")
+	}
+	if s.bucketName == "" {
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
 		return fmt.Errorf("storage not initialized")
 	}
 
-	_, err := e.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(e.bucketName),
+	_, err := s.kms.aws.S3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucketName),
 		Key:    aws.String("data/" + key),
 	})
 	if err != nil {
@@ -284,8 +329,8 @@ func (e *Runtime) Delete(ctx context.Context, key string) error {
 }
 
 // List returns keys under the given prefix in storage.
-func (e *Runtime) List(ctx context.Context, prefix string) ([]string, error) {
-	if e.s3Client == nil {
+func (s *Storage) List(ctx context.Context, prefix string) ([]string, error) {
+	if s.bucketName == "" {
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
@@ -294,8 +339,8 @@ func (e *Runtime) List(ctx context.Context, prefix string) ([]string, error) {
 	var continuationToken *string
 
 	for {
-		out, err := e.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(e.bucketName),
+		out, err := s.kms.aws.S3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucketName),
 			Prefix:            aws.String(s3Prefix),
 			ContinuationToken: continuationToken,
 		})
@@ -318,33 +363,21 @@ func (e *Runtime) List(ctx context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
-// exportStorageDEK re-encrypts the DEK under a migration KMS key and stores
-// it in the migration SSM parameter.
-func (e *Runtime) exportStorageDEK(ctx context.Context, kmsClient *kms.Client, ssmClient *ssm.Client, migrationKeyID string) error {
-	if e.dek == nil {
-		return nil // no storage DEK to export
-	}
+// =============================================================================
+// HTTP handlers
+// =============================================================================
 
-	deployment := getDeployment()
-	appName := getAppName()
-
-	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, migrationKeyID, e.dek)
-	if err != nil {
-		return fmt.Errorf("encrypt DEK with migration key: %w", err)
-	}
-
-	migParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
-	return storeCiphertextInSSM(ctx, ssmClient, migParam, ciphertextB64)
+// RegisterRoutes attaches the storage endpoints on mux.
+func (s *Storage) RegisterRoutes(mux Mux) {
+	mux.HandleFunc("PUT /v1/storage/{key...}", s.handlePut)
+	mux.HandleFunc("GET /v1/storage/{key...}", s.handleGet)
+	mux.HandleFunc("DELETE /v1/storage/{key...}", s.handleDelete)
+	mux.HandleFunc("GET /v1/storage", s.handleList)
 }
 
-// handleStoragePut handles PUT /v1/storage/{key...}.
-// The request body is stored as-is (raw bytes).
-func (e *Runtime) handleStoragePut(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handlePut handles PUT /v1/storage/{key...}. The body is stored as raw bytes.
+func (s *Storage) handlePut(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil && !s.auth(w, r) {
 		return
 	}
 
@@ -365,7 +398,7 @@ func (e *Runtime) handleStoragePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := e.Store(r.Context(), key, data); err != nil {
+	if err := s.Store(r.Context(), key, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -378,14 +411,9 @@ func (e *Runtime) handleStoragePut(w http.ResponseWriter, r *http.Request) {
 	}{Key: key, Status: "stored"})
 }
 
-// handleStorageGet handles GET /v1/storage/{key...}.
-// Returns the raw decrypted bytes with application/octet-stream.
-func (e *Runtime) handleStorageGet(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handleGet handles GET /v1/storage/{key...}. Returns raw decrypted bytes.
+func (s *Storage) handleGet(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil && !s.auth(w, r) {
 		return
 	}
 
@@ -399,7 +427,7 @@ func (e *Runtime) handleStorageGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := e.Load(r.Context(), key)
+	data, err := s.Load(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			http.Error(w, "key not found", http.StatusNotFound)
@@ -413,13 +441,9 @@ func (e *Runtime) handleStorageGet(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// handleStorageDelete handles DELETE /v1/storage/{key...}.
-func (e *Runtime) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handleDelete handles DELETE /v1/storage/{key...}.
+func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil && !s.auth(w, r) {
 		return
 	}
 
@@ -433,7 +457,7 @@ func (e *Runtime) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := e.Delete(r.Context(), key); err != nil {
+	if err := s.Delete(r.Context(), key); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -445,20 +469,15 @@ func (e *Runtime) handleStorageDelete(w http.ResponseWriter, r *http.Request) {
 	}{Key: key, Status: "deleted"})
 }
 
-// handleStorageList handles GET /v1/storage?prefix=...
-// Returns a JSON array of keys matching the prefix.
-func (e *Runtime) handleStorageList(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
-	if !e.checkRuntimeToken(w, r) {
+// handleList handles GET /v1/storage?prefix=...
+func (s *Storage) handleList(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil && !s.auth(w, r) {
 		return
 	}
 
 	prefix := r.URL.Query().Get("prefix")
 
-	keys, err := e.List(r.Context(), prefix)
+	keys, err := s.List(r.Context(), prefix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -469,7 +488,8 @@ func (e *Runtime) handleStorageList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Keys []string `json:"keys"`
-	}{Keys: keys})
+	_ = json.NewEncoder(w).Encode(keys)
 }
+
+// silenceUnused references unused imports during transitional compile passes.
+var _ = slog.Info

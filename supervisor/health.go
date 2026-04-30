@@ -7,8 +7,27 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
+
+// Health serves /health (enclave status) and /supervisor/health
+// (supervisor self-readiness, used by the self-update flow).
+// migrationInProgress is a callback to avoid a *Migration back-reference.
+type Health struct {
+	aws                 *AWSClient
+	migrationInProgress func() bool
+}
+
+func NewHealth(aws *AWSClient, migrationInProgress func() bool) *Health {
+	return &Health{aws: aws, migrationInProgress: migrationInProgress}
+}
+
+func (h *Health) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /health", h.handleHealth)
+	mux.HandleFunc("GET /supervisor/health", h.handleSupervisorHealth)
+}
 
 // enclaveStatus is the JSON structure returned by nitro-cli describe-enclaves.
 type enclaveStatus struct {
@@ -34,11 +53,11 @@ type healthResponse struct {
 	AppName    string `json:"app_name"`
 }
 
-func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (h *Health) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		Deployment: s.deployment,
-		AppName:    s.appName,
+		Deployment: getDeployment(),
+		AppName:    getAppName(),
 	}
 
 	enclaves, err := describeEnclaves()
@@ -65,46 +84,41 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// supervisorHealthResponse reports the supervisor's own readiness, distinct from
-// enclave status. Used by the atomic supervisor binary self-update flow to confirm
-// the new binary is functional before deleting the backup.
 type supervisorHealthResponse struct {
 	Status    string            `json:"status"` // "ok" or "error"
 	Checks    map[string]string `json:"checks"`
 	Timestamp string            `json:"timestamp"`
 }
 
-// handleSupervisorHealth verifies supervisor's own readiness: AWS auth, SSM reachability,
-// enclave reachability, no in-progress migration. Returns 200 only when all
-// checks pass; 503 otherwise.
-func (s *server) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) {
+// handleSupervisorHealth: 200 iff AWS auth + SSM reachable + no migration
+// in progress; 503 otherwise. Enclave reachability is informational only
+// (the enclave may be stopped or restarting).
+func (h *Health) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{}
 	allOK := true
 
-	// Check 1: AWS credentials valid.
 	ctx := r.Context()
-	if _, err := s.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err != nil {
+	if _, err := h.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err != nil {
 		checks["aws_auth"] = "fail: " + err.Error()
 		allOK = false
 	} else {
 		checks["aws_auth"] = "ok"
 	}
 
-	// Check 2: SSM reachable (can read a known param).
-	if _, err := s.getParam(ctx, "KMSKeyID"); err != nil {
+	if _, err := h.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: aws.String(ssmParamPath("KMSKeyID")),
+	}); err != nil {
 		checks["ssm"] = "fail: " + err.Error()
 		allOK = false
 	} else {
 		checks["ssm"] = "ok"
 	}
 
-	// Check 3: Enclave HTTP reachable (non-fatal for this check — enclave may
-	// legitimately be stopped or restarting). Used only as informational.
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 		},
 	}
 	resp, err := client.Get(enclaveURL + "/health")
@@ -119,12 +133,10 @@ func (s *server) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Check 4: migrateMu not held by a long-running operation (best effort).
-	if !s.migrateMu.TryLock() {
+	if h.migrationInProgress != nil && h.migrationInProgress() {
 		checks["migration_lock"] = "held (migration in progress)"
 		allOK = false
 	} else {
-		s.migrateMu.Unlock()
 		checks["migration_lock"] = "free"
 	}
 
@@ -143,6 +155,7 @@ func (s *server) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) 
 }
 
 // describeEnclaves runs nitro-cli describe-enclaves and parses the output.
+// Also called from Observability and Lifecycle.
 func describeEnclaves() ([]enclaveStatus, error) {
 	out, err := exec.Command("nitro-cli", "describe-enclaves").Output()
 	if err != nil {
@@ -154,10 +167,4 @@ func describeEnclaves() ([]enclaveStatus, error) {
 		return nil, err
 	}
 	return enclaves, nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }

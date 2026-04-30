@@ -15,16 +15,8 @@ import (
 // which points the SDK's built-in IMDS credential provider to viproxy. The SDK
 // automatically refreshes credentials before they expire — no static snapshot.
 func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
-	region := os.Getenv("AWS_DEFAULT_REGION")
-	if region == "" {
-		region = os.Getenv("AWS_REGION")
-	}
-	if region == "" {
-		region = os.Getenv("ENCLAVE_AWS_REGION")
-	}
-	if region == "" {
-		region = os.Getenv("INTROSPECTOR_AWS_REGION")
-	}
+	region := os.Getenv("ENCLAVE_AWS_REGION")
+
 	if region == "" {
 		region = "us-east-1"
 	}

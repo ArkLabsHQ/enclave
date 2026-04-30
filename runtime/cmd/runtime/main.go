@@ -25,11 +25,8 @@ import (
 )
 
 func main() {
-	// 1. Create enclave (instant — no blocking work).
 	enc, err := runtime.New()
 	if err != nil {
-		runtime.InitLogging() // fallback for early errors
-		slog.Error("create enclave failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -37,26 +34,25 @@ func main() {
 	// LogBuffer (queryable via GET /v1/enclave-logs). Must happen before Init() so
 	// init stages are captured.
 	slog.SetDefault(slog.New(
-		runtime.NewBufferHandler(enc.GetLogBuffer(), enc.GetLogShipCh()),
+		runtime.NewBufferHandler(enc.Logging()),
 	))
 
 	// Set up metrics: OTEL instruments + runtime/proc collector.
 	runtime.InitMetrics()
 
-	// Set up tracing: supervisor spans go directly into the SpanBuffer.
-	shutdownTracing := runtime.StartSupervisorTracing(enc.GetSpanBuffer(), enc.GetSpanShipCh())
+	// Tracing was already initialised inside runtime.New(); the OTEL
+	// TracerProvider is set as global. Just arrange for shutdown on exit.
+	tracing := enc.Tracing()
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	defer func() { _ = shutdownTracing(ctx) }()
+	defer func() { _ = tracing.Shutdown(ctx) }()
 
 	// Point the Go DNS resolver at gvproxy's embedded DNS server. Nitriding's
 	// writeResolvconf writes /run/resolvconf/resolv.conf, but the enclave
 	// EIF rootfs doesn't symlink /etc/resolv.conf to that — so we write
-	// directly here before any code does name resolution. This replaces the
-	// `echo "nameserver …" > /etc/resolv.conf` that used to live in
-	// enclave/start.sh before the runtime absorbed the entrypoint.
+	// directly here before any code does name resolution.
 	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
 		// Best-effort; outside the enclave (e.g. local dev) /etc/ may be read-only.
 		slog.Debug("write /etc/resolv.conf", "error", err)

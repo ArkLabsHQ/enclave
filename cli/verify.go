@@ -14,8 +14,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,52 +33,21 @@ func verifyCmd() *cobra.Command {
 		Long:  "Connects to the enclave, verifies PCR0 attestation, and checks response signatures.",
 		RunE:  runVerify,
 	}
-	cmd.Flags().String("base-url", "", "Enclave base URL (overrides CDK outputs)")
-	cmd.Flags().Bool("verify-build", false, "Rebuild EIF locally and compare PCR0")
+	cmd.Flags().String("base-url", "", "Enclave base URL (required)")
+	cmd.Flags().String("expected-pcr0", "", "Expected PCR0 hex (required)")
 	cmd.Flags().Bool("strict-tls", false, "Require CA-signed TLS certificate")
-	cmd.Flags().String("expected-pcr0", "", "Expected PCR0 hex (overrides auto-detection)")
 	cmd.Flags().Bool("verify-attestation-key", true, "Verify attestation key via UserData appKeyHash and test response signature")
 	cmd.Flags().Int("wait", 0, "Wait up to N seconds for enclave to become reachable (0 = no retry)")
+	_ = cmd.MarkFlagRequired("base-url")
+	_ = cmd.MarkFlagRequired("expected-pcr0")
 	return cmd
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-
-	root, err := findRepoRoot()
-	if err != nil {
-		return err
-	}
-
 	baseURL, _ := cmd.Flags().GetString("base-url")
-	if baseURL == "" {
-		outputs, err := loadTofuOutputs(root)
-		if err != nil {
-			return err
-		}
-
-		elasticIP := outputs.getOutput("elastic_ip")
-		if elasticIP == "" {
-			return fmt.Errorf("elastic_ip not found in tofu outputs (use --base-url to override)")
-		}
-
-		baseURL = "https://" + elasticIP
-	}
-	fmt.Printf("[verify] Verifying %s\n", baseURL)
-
 	pcr0, _ := cmd.Flags().GetString("expected-pcr0")
 
-	if verifyBuild, _ := cmd.Flags().GetBool("verify-build"); verifyBuild && pcr0 == "" {
-		derived, err := buildAndExtractPCR0(root, cfg.Version, cfg.Region)
-		if err != nil {
-			return fmt.Errorf("build verification failed: %w", err)
-		}
-		fmt.Printf("[verify] Derived PCR0 from build: %s\n", derived)
-		pcr0 = derived
-	}
+	fmt.Printf("[verify] Verifying %s\n", baseURL)
 
 	strictTLS, _ := cmd.Flags().GetBool("strict-tls")
 	client := verifyHTTPClient(!strictTLS)
@@ -112,7 +79,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		attempt := 0
 		for {
 			attempt++
-			err = runAllChecks()
+			err := runAllChecks()
 			if err == nil {
 				break
 			}
@@ -226,23 +193,42 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) (*nitr
 // by checking that the pubkey from /v1/enclave-info matches the appKeyHash in
 // the attestation document's UserData, then verifying a live response signature.
 //
-// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
-// Total 68 bytes. appKeyHash is at bytes 36:68 (after the 2nd multihash prefix).
+// UserData format (nitriding v1.4.2):
+//
+//	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
+//
+// Total 79 bytes. appKeyHash is at bytes 47:79.
 func verifyAttestationKeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
 	if attestResult == nil || attestResult.Document == nil {
 		return fmt.Errorf("no attestation result to verify against")
 	}
 
+	const (
+		hashPrefix = "sha256:"
+		hashSep    = ";"
+		tlsStart   = len(hashPrefix)
+		tlsEnd     = tlsStart + 32
+		sepStart   = tlsEnd
+		appPrefix  = sepStart + len(hashSep)
+		appStart   = appPrefix + len(hashPrefix)
+		appEnd     = appStart + 32
+	)
+
 	userData := attestResult.Document.UserData
-	if len(userData) < 68 {
-		fmt.Println("[verify] UserData too short for appKeyHash (enclave may not support attestation key)")
+	if len(userData) < appEnd {
+		fmt.Printf("[verify] UserData too short for appKeyHash: %d bytes (need %d, enclave may not support attestation key)\n", len(userData), appEnd)
 		return nil
 	}
-
-	if userData[34] != 0x12 || userData[35] != 0x20 {
-		return fmt.Errorf("UserData missing multihash prefix at offset 34 (got %02x %02x)", userData[34], userData[35])
+	if !bytes.Equal(userData[:tlsStart], []byte(hashPrefix)) {
+		return fmt.Errorf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(userData[:tlsStart]))
 	}
-	appKeyHash := userData[36:68]
+	if string(userData[sepStart:appPrefix]) != hashSep {
+		return fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:appPrefix]))
+	}
+	if !bytes.Equal(userData[appPrefix:appStart], []byte(hashPrefix)) {
+		return fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(userData[appPrefix:appStart]))
+	}
+	appKeyHash := userData[appStart:appEnd]
 
 	allZero := true
 	for _, b := range appKeyHash {
@@ -482,82 +468,4 @@ func shortErr(err error) string {
 		return s[:60] + "..."
 	}
 	return s
-}
-
-func buildAndExtractPCR0(repoPath, version, region string) (string, error) {
-	absRepo, err := filepath.Abs(repoPath)
-	if err != nil {
-		return "", fmt.Errorf("resolve repo path: %w", err)
-	}
-
-	resultPath := filepath.Join(absRepo, "enclave", "artifacts")
-	_ = os.RemoveAll(resultPath)
-	_ = os.MkdirAll(resultPath, 0o755)
-
-	fmt.Println("[verify] Building EIF with Nix (reproducible)...")
-	if version == "" {
-		version = "0.0.1"
-	}
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	configPath := filepath.Join(absRepo, ".enclave", "build-config.json")
-	absConfigPath, _ := filepath.Abs(configPath)
-
-	ensureGitTracked(absRepo, "enclave/flake.nix", "enclave/enclave.yaml")
-
-	nixCmd := exec.Command("nix", "build",
-		"--impure",
-		"--extra-experimental-features", "nix-command flakes",
-		"--option", "download-attempts", "3",
-		"--out-link", ".enclave/result",
-		"./enclave#eif",
-	)
-	nixCmd.Dir = absRepo
-	nixCmd.Stdout = os.Stdout
-	nixCmd.Stderr = os.Stderr
-	nixCmd.Env = append(os.Environ(),
-		"BUILD_CONFIG_PATH="+absConfigPath,
-		"VERSION="+version,
-		"AWS_REGION="+region,
-	)
-
-	if err := nixCmd.Run(); err != nil {
-		return "", fmt.Errorf("nix build failed: %w", err)
-	}
-
-	// Copy artifacts from .enclave/result/.
-	resultLink := filepath.Join(absRepo, ".enclave", "result")
-	for _, name := range []string{"image.eif", "pcr.json"} {
-		src := filepath.Join(resultLink, name)
-		dst := filepath.Join(resultPath, name)
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return "", fmt.Errorf("read .enclave/result/%s: %w", name, err)
-		}
-		if err := os.WriteFile(dst, data, 0644); err != nil {
-			return "", fmt.Errorf("write artifacts/%s: %w", name, err)
-		}
-	}
-
-	pcrPath := filepath.Join(resultPath, "pcr.json")
-	pcrData, err := os.ReadFile(pcrPath)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", pcrPath, err)
-	}
-
-	var buildOutput PCRValues
-	if err := json.Unmarshal(pcrData, &buildOutput); err != nil {
-		return "", fmt.Errorf("parse pcr.json: %w", err)
-	}
-
-	if len(buildOutput.PCR0) != 96 {
-		return "", fmt.Errorf("unexpected PCR0 length %d (expected 96 hex chars): %q", len(buildOutput.PCR0), buildOutput.PCR0)
-	}
-
-	fmt.Printf("[verify] EIF built successfully\n")
-	fmt.Printf("[verify] PCR0: %s\n", buildOutput.PCR0)
-
-	return buildOutput.PCR0, nil
 }

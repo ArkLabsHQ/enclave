@@ -13,19 +13,21 @@ import (
 
 func logCmd() *cobra.Command {
 	var (
-		level   string
-		limit   int
-		since   string
-		asJSON  bool
-		history bool
+		level      string
+		limit      int
+		since      string
+		asJSON     bool
+		history    bool
+		instanceID string
+		region     string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "log",
 		Short: "Show enclave application logs",
-		Long:  "Retrieves structured log entries from the enclave supervisor via the supervisor server.\nUse --history to query CloudWatch Logs for past logs (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
+		Long:  "Retrieves structured log entries from the enclave supervisor via SSM RunCommand.\nUse --history to query CloudWatch Logs for past logs (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLog(level, limit, since, asJSON, history)
+			return runLog(level, limit, since, asJSON, history, instanceID, region)
 		},
 	}
 
@@ -34,38 +36,19 @@ func logCmd() *cobra.Command {
 	cmd.Flags().StringVar(&since, "since", "", "show entries newer than this (duration like 5m or RFC3339 timestamp)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON array")
 	cmd.Flags().BoolVar(&history, "history", false, "query CloudWatch Logs for historical traces")
+	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
+	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	_ = cmd.MarkFlagRequired("instance-id")
+	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runLog(level string, limit int, since string, asJSON bool, history bool) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	if err := cfg.validateAccount(); err != nil {
-		return err
-	}
-
-	root, err := findRepoRoot()
-	if err != nil {
-		return err
-	}
-
-	outputs, err := loadTofuOutputs(root)
-	if err != nil {
-		return err
-	}
-
+func runLog(level string, limit int, since string, asJSON bool, history bool, instanceID, region string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, cfg.Region, cfg.Profile)
+	ac, err := newAWSClients(ctx, region, "")
 	if err != nil {
 		return err
-	}
-
-	instanceID := outputs.getOutput("instance_id")
-	if instanceID == "" {
-		return fmt.Errorf("instance_id not found in tofu outputs")
 	}
 
 	// Build query string.
@@ -92,8 +75,11 @@ func runLog(level string, limit int, since string, asJSON bool, history bool) er
 		curlURL += "?" + q
 	}
 
-	curlCmd := fmt.Sprintf("curl -sf '%s' 2>/dev/null || echo '[]'", curlURL)
-	output := ac.runCommandOutput(ctx, instanceID, curlCmd)
+	curlCmd := fmt.Sprintf("curl -sfS '%s'", curlURL)
+	output, err := ac.runCommand(ctx, instanceID, curlCmd)
+	if err != nil {
+		return fmt.Errorf("read logs from supervisor on %s: %w", instanceID, err)
+	}
 	if output == "" {
 		output = "[]"
 	}

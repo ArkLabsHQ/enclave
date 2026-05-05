@@ -34,12 +34,13 @@ type Runtime struct {
 	migrator      *Migrator
 	environment   *Environment
 
-	mux                     *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
-	previousPCR0            string
-	previousPCR0Attestation string      // base64-encoded COSE Sign1 attestation doc
-	initDone                atomic.Bool // true after Init completes (happens-before fence)
-	initOK                  atomic.Bool // true only if Init completed successfully
-	runtimeToken            string      // bearer token for management endpoints (empty = no auth)
+	mux *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
+
+	initDone        atomic.Bool  // true after Init completes (happens-before fence)
+	initOK          atomic.Bool  // true only if Init completed successfully
+	migrationState  atomic.Value // MigrationState
+	migrationReason atomic.Value // string
+	runtimeToken    string       // bearer token for management endpoints (empty = no auth)
 }
 
 // New returns a Runtime safe to use for serving management endpoints
@@ -57,7 +58,6 @@ func New() (*Runtime, error) {
 	r := &Runtime{
 		metrics:      enclaveMetrics,
 		attestation:  NewAttestation(),
-		previousPCR0: "genesis",
 		runtimeToken: token,
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
@@ -69,28 +69,6 @@ func (e *Runtime) RuntimeToken() string {
 	return e.runtimeToken
 }
 
-func generateRuntimeToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := secureRandom(b); err != nil {
-		return "", fmt.Errorf("secure random: %w", err)
-	}
-	return hex.EncodeToString(b), nil
-}
-
-// secureRandom uses the NSM hardware RNG when running inside an enclave and
-// crypto/rand otherwise. Inside an enclave crypto/rand depends on a starved
-// kernel entropy pool (no disk, no network, no HID — only RDRAND), so the
-// NSM RNG is the only trustworthy source. If /dev/nsm opens but GetRandom
-// fails we surface the error rather than fall back to the weak pool.
-func secureRandom(b []byte) (int, error) {
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return rand.Read(b)
-	}
-	defer func() { _ = session.Close() }()
-	return session.Read(b)
-}
-
 // Init brings up subsystems: AWS clients, KMS policy lock, secrets via
 // attestation, PCR extension, storage, migration handshake. May block on
 // KMS. The HTTP server should be started before Init so /v1/enclave-info
@@ -98,6 +76,8 @@ func secureRandom(b []byte) (int, error) {
 // or failure) so handlers can read fields safely.
 func (e *Runtime) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
+	e.migrationState.Store(MigrationStateNone)
+	e.migrationReason.Store("")
 
 	ctx, initSpan := e.tracing.Span(ctx, "init")
 	defer initSpan.End()
@@ -109,8 +89,14 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init AWS clients: %w", err)
 	}
 	e.aws = aws
+
 	e.kms = NewKMS(e.aws)
+
 	e.environment = NewEnvironment(e.aws)
+	if err := e.environment.Override(ctx); err != nil {
+		slog.Error("apply env overrides", "error", err)
+		return fmt.Errorf("apply env overrides: %w", err)
+	}
 
 	staticSecrets, err := NewStaticSecrets(e.kms)
 	if err != nil {
@@ -119,72 +105,67 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 	e.staticSecrets = staticSecrets
 
+	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
+
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
 		return fmt.Errorf("init attestation: %w", err)
 	}
 
 	// Migrator needs Storage too, but Storage doesn't exist yet. Wired in below;
-	// export-key isn't reachable before initOK, so the late wire-up is safe.
+	// start-migration isn't reachable before initOK, so the late wire-up is safe.
 	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
 
-	// Verify previous PCR0 BEFORE any irreversible operations. KMS policy
-	// self-apply permanently locks the key to the current PCR0; storage Init
-	// may generate a fresh DEK. Checking first prevents a silent revert to a
-	// fresh deployment when previous_pcr0 is wrong.
-	expectedPreviousPCR0 := getPreviousPCR0()
+	// Classify boot role. If MigrationKMSKeyID is set and we're the declared
+	// MigrationTargetPCR0, read secrets and DEK from Migration/* staging
+	// using the migration key. Otherwise (orphan or normal boot), read from
+	// primary. CompleteMigration at the end commits or aborts accordingly,
+	// so primary state is only touched after the staged reads validate.
+	// Missing MigrationKMSKeyID is the normal "no migration in progress" case;
+	// readSSMParam reports it as an error which we discard. Same treatment
+	// for ReadTargetPCR0 below — if it's unset while a migration is in flight,
+	// we're not the target and CompleteMigration will run AbortOrphaned.
+	migrationKMSKeyID, _ := e.migrator.GetMigrationKMSKeyID(ctx)
 
-	migrationKeyID, _ := e.migrator.ReadKMSKeyID(ctx)
-	migrationTargetPCR0, _ := e.migrator.ReadTargetPCR0(ctx)
-	ownPCR0 := getPCR0()
-	paramPrefix := ""
-	switch classifyBootRole(migrationKeyID != "", ownPCR0, migrationTargetPCR0) {
-	case BootRoleAbortMigration:
-		slog.Warn("aborting in-progress migration — this enclave is not the target",
-			"migration_key", prefix16(migrationKeyID),
-			"target_pcr0", prefix16(migrationTargetPCR0),
-			"own_pcr0", prefix16(ownPCR0))
-		if err := e.migrator.AbortOrphaned(ctx, expectedPreviousPCR0); err != nil {
-			return fmt.Errorf("abort orphaned migration: %w", err)
+	var (
+		paramPrefix       ParamPrefix
+		keyID             string
+		isMigrationTarget bool
+	)
+	if migrationKMSKeyID != "" {
+		isMigrationTarget, _ = e.migrator.IsTarget(ctx)
+		if isMigrationTarget {
+			paramPrefix = MigrationPrefix
+			keyID = migrationKMSKeyID
+			slog.Info("migration target — reading from Migration/* staging", "key", prefix16(migrationKMSKeyID))
 		}
-		migrationKeyID = ""
-	case BootRoleMigrationTarget:
-		paramPrefix = "Migration/"
-		slog.Info("migration mode active — reading from Migration/* staging", "key", prefix16(migrationKeyID))
+	}
+	if !isMigrationTarget {
+		keyID, err = e.kms.GetKeyID(ctx)
+		if err != nil {
+			slog.Error("get KMS key ID", "error", err)
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 
-	previousPCR0 := "genesis"
-	if pcr0, err := e.migrator.ReadPreviousPCR0(ctx); err == nil {
-		previousPCR0 = pcr0
-	}
-	if expectedPreviousPCR0 != previousPCR0 {
-		return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave config), got %q (from SSM)", expectedPreviousPCR0, previousPCR0)
-	}
-	e.previousPCR0 = previousPCR0
-
-	slog.Info("applying KMS policy")
-	if err := e.kms.SelfApplyPolicy(ctx, migrationKeyID); err != nil {
+	// Narrow the KMS policy to current PCR0 before any decrypt.
+	if err := e.kms.SelfApplyPolicy(ctx, keyID); err != nil {
 		slog.Error("apply KMS policy", "error", err)
 		return fmt.Errorf("apply KMS policy: %w", err)
 	}
 
-	if e.staticSecrets.Len() > 0 {
-		slog.Info("waiting for KMS secrets")
-		if err := e.staticSecrets.WaitForKMS(ctx, migrationKeyID, paramPrefix); err != nil {
-			slog.Error("load secrets from KMS", "error", err)
-			return fmt.Errorf("load secrets from KMS: %w", err)
-		}
-
-		if err := e.staticSecrets.ExtendPCRs(); err != nil {
-			slog.Error("extend PCRs with secret pubkeys", "error", err)
-			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
-		}
+	if err := e.staticSecrets.LoadAll(ctx, keyID, paramPrefix); err != nil {
+		slog.Error("load secrets from KMS", "error", err)
+		return fmt.Errorf("load secrets from KMS: %w", err)
+	}
+	if err := e.staticSecrets.ExtendPCRs(); err != nil {
+		slog.Error("extend PCRs with secret pubkeys", "error", err)
+		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 	}
 
 	slog.Info("initializing storage")
-	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
 	e.migrator.storage = e.storage
-	if err := e.storage.Init(ctx, migrationKeyID, paramPrefix); err != nil {
+	if err := e.storage.Init(ctx, keyID, paramPrefix); err != nil {
 		slog.Error("init storage", "error", err)
 		return fmt.Errorf("init storage: %w", err)
 	}
@@ -194,43 +175,17 @@ func (e *Runtime) Init(ctx context.Context) error {
 		slog.Warn("load dynamic secrets failed", "error", err)
 	}
 
-	if attestDoc, err := e.migrator.ReadPreviousPCR0Attestation(ctx); err == nil {
-		e.previousPCR0Attestation = attestDoc
-
-		// PCR31 in the previous enclave's attestation must equal a hash of
-		// our PCR0 — proving it committed to handing off to us specifically.
-		// Mismatch ⇒ rogue new_pcr0, or an old enclave predating commitment
-		// (PCR31 all zeros).
-		if err := verifyPCR31Commitment(attestDoc, getPCR0()); err != nil {
-			slog.Warn("PCR31 migration commitment verification failed", "error", err)
-		} else {
-			slog.Info("PCR31 migration commitment verified")
+	if migrationKMSKeyID != "" {
+		outcome, err := e.migrator.CompleteMigration(ctx, migrationKMSKeyID)
+		if err != nil {
+			slog.Error("complete migration", "error", err)
+			return fmt.Errorf("complete migration: %w", err)
 		}
+		e.migrationState.Store(outcome.State)
+		e.migrationReason.Store(outcome.Reason)
+		slog.Info("migration completed", "state", outcome.State, "reason", outcome.Reason)
 	}
 
-	// Atomic commit: promote Migration/* to primary and clear
-	// MigrationKMSKeyID in one ordered sequence (see PromoteToPrimary).
-	if migrationKeyID != "" {
-		slog.Info("promoting migration staging to primary")
-		if err := e.migrator.PromoteToPrimary(ctx, migrationKeyID); err != nil {
-			slog.Error("promote migration to primary", "error", err)
-			return fmt.Errorf("promote migration: %w", err)
-		}
-		slog.Info("migration committed")
-	}
-
-	e.migrator.DeleteOldKMSKey(ctx)
-
-	// Overlay tofu-supplied app.env overrides before the child app forks
-	// (it inherits os.Environ()).
-	if err := e.environment.Override(ctx); err != nil {
-		slog.Error("apply env overrides", "error", err)
-		return fmt.Errorf("apply env overrides: %w", err)
-	}
-
-	// Storage/dynamic/migrator only exist now, so their routes weren't
-	// registered at startup. http.ServeMux is safe under concurrent Handle
-	// calls, so registering against the live server is fine.
 	e.registerGatedRoutes()
 
 	e.initOK.Store(true)
@@ -290,7 +245,7 @@ func (e *Runtime) requireInitDone(next http.Handler) http.Handler {
 }
 
 // requireInitOK is stricter: also rejects when Init completed but failed.
-// Used for export-key — running it on a half-initialised enclave would
+// Used for start-migration — running it on a half-initialised enclave would
 // write garbage into the new enclave's SSM.
 func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -311,7 +266,7 @@ func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 //	GET    /v1/enclave-info
 //	POST   /v1/enclave-metrics
 //	GET    /v1/enclave-metrics
-//	POST   /v1/export-key                 (gated: requireInitOK)
+//	POST   /v1/start-migration            (gated: requireInitOK)
 //	PUT    /v1/storage/{key...}           (gated: requireInitDone)
 //	GET    /v1/storage/{key...}           (gated: requireInitDone)
 //	DELETE /v1/storage/{key...}           (gated: requireInitDone)
@@ -394,20 +349,40 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 	e.attestation.SetRegistrar(r)
 }
 
-// handleEnclaveInfo returns 503 with partial JSON during init (so callers
-// get meaningful state instead of 502, while curl -sf still fails).
+type MigrationInfo struct {
+	State  MigrationState `json:"state"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+type EnclaveInfo struct {
+	Version                    string         `json:"version"`
+	PreviousPCR0               string         `json:"previous_pcr0"`
+	PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
+	DynamicSecrets             int64          `json:"dynamic_secrets"`
+	Metrics                    map[string]any `json:"metrics"`
+	MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
+	MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
+	MigrationPending           bool           `json:"migration_pending"`
+	Migration                  MigrationInfo  `json:"migration"`
+}
+
+type enclaveInitializing struct {
+	Version      string `json:"version"`
+	PreviousPCR0 string `json:"previous_pcr0"`
+	Initializing bool   `json:"initializing"`
+}
+
+// handleEnclaveInfo gates on initOK rather than initDone so a failed Init
+// does not fall through to the success path and nil-deref subsystems that
+// were never wired.
 func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if !e.initDone.Load() {
+	if !e.initOK.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(struct {
-			Version      string `json:"version"`
-			PreviousPCR0 string `json:"previous_pcr0"`
-			Initializing bool   `json:"initializing"`
-		}{
+		_ = json.NewEncoder(w).Encode(enclaveInitializing{
 			Version:      Version,
-			PreviousPCR0: "genesis",
 			Initializing: true,
 		})
 		return
@@ -415,26 +390,30 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 
 	cooldownSeconds, cooldownRemaining, migrationPending := e.migrator.CooldownStatus(r.Context())
 
-	_ = json.NewEncoder(w).Encode(struct {
-		Version                    string         `json:"version"`
-		PreviousPCR0               string         `json:"previous_pcr0"`
-		PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets             int64          `json:"dynamic_secrets"`
-		Metrics                    map[string]any `json:"metrics"`
-		MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
-		MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
-		MigrationPending           bool           `json:"migration_pending"`
-	}{
+	previousPCR0 := "genesis"
+	previousPCR0Attestation := ""
+	if info, err := e.migrator.GetPreviousPCR0Info(r.Context(), false); err == nil && info != nil {
+		previousPCR0 = info.PCR0
+		previousPCR0Attestation = info.Attestation
+	}
+
+	migrationState, _ := e.migrationState.Load().(MigrationState)
+	if migrationState == "" {
+		migrationState = MigrationStateNone
+	}
+	migrationReason, _ := e.migrationReason.Load().(string)
+
+	_ = json.NewEncoder(w).Encode(EnclaveInfo{
 		Version:                    Version,
-		PreviousPCR0:               e.previousPCR0,
-		PreviousPCR0Attestation:    e.previousPCR0Attestation,
+		PreviousPCR0:               previousPCR0,
+		PreviousPCR0Attestation:    previousPCR0Attestation,
 		AttestationPubkey:          e.AttestationPubkey(),
 		DynamicSecrets:             e.dynamic.Count(),
 		Metrics:                    enclaveMetrics.MetricsSnapshot(),
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,
+		Migration:                  MigrationInfo{State: migrationState, Reason: migrationReason},
 	})
 }
 
@@ -521,4 +500,26 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func generateRuntimeToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := secureRandom(b); err != nil {
+		return "", fmt.Errorf("secure random: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// secureRandom uses the NSM hardware RNG when running inside an enclave and
+// crypto/rand otherwise. Inside an enclave crypto/rand depends on a starved
+// kernel entropy pool (no disk, no network, no HID — only RDRAND), so the
+// NSM RNG is the only trustworthy source. If /dev/nsm opens but GetRandom
+// fails we surface the error rather than fall back to the weak pool.
+func secureRandom(b []byte) (int, error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return rand.Read(b)
+	}
+	defer func() { _ = session.Close() }()
+	return session.Read(b)
 }

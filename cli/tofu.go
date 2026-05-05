@@ -18,7 +18,6 @@ type tofuVars struct {
 	Local             bool           `json:"local"`
 	Secrets           []SecretConfig `json:"secrets"`
 	MigrationCooldown string         `json:"migration_cooldown"`
-	PreviousPCR0      string         `json:"previous_pcr0"`
 	ExpectedPCR0      string         `json:"expected_pcr0,omitempty"`
 
 	// GitHub Release coordinates for build artifacts (EIF, supervisor).
@@ -59,7 +58,6 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 		Local:             os.Getenv("LOCAL_DEPLOYMENT") == "true",
 		Secrets:           cfg.Secrets,
 		MigrationCooldown: cfg.MigrationCooldown,
-		PreviousPCR0:      cfg.PreviousPCR0,
 		ExpectedPCR0:      readPCR0FromArtifacts(absRoot),
 
 		GithubOwner: cfg.App.NixOwner,

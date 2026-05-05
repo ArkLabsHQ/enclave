@@ -28,7 +28,7 @@ lint: ## Run golangci-lint on all modules (matches CI)
 	cd supervisor && golangci-lint run ./...
 	cd client && golangci-lint run ./...
 
-.PHONY: test test-build test-run
+.PHONY: test test-build test-run test-rebuild
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
@@ -69,7 +69,11 @@ test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with
 	cp /tmp/image-v3.eif test/app/.enclave/artifacts/image-v3.eif
 	cp /tmp/pcr-v3.json test/app/.enclave/artifacts/pcr-v3.json
 
-test-run: ## Run integration tests (requires test-build first)
+test-run: ## Run integration tests (uses last-built test-runner image)
+	cd test && docker compose --profile test down -v
+	cd test && docker compose --profile test run test-runner
+
+test-rebuild: ## Rebuild test-runner image and run integration tests
 	cd test && docker compose --profile test down -v
 	cd test && docker compose --profile test run --build test-runner
 

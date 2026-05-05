@@ -11,53 +11,36 @@ import (
 
 func metricsCmd() *cobra.Command {
 	var (
-		source string
-		asJSON bool
+		source     string
+		asJSON     bool
+		instanceID string
+		region     string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "metrics",
 		Short: "Show enclave metrics",
-		Long:  "Retrieves metric snapshots from the enclave supervisor via the supervisor server.",
+		Long:  "Retrieves metric snapshots from the enclave supervisor via SSM RunCommand.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMetricsCmd(source, asJSON)
+			return runMetricsCmd(source, asJSON, instanceID, region)
 		},
 	}
 
 	cmd.Flags().StringVar(&source, "source", "", "filter by source (supervisor, app, runtime)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON")
+	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
+	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	_ = cmd.MarkFlagRequired("instance-id")
+	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runMetricsCmd(source string, asJSON bool) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	if err := cfg.validateAccount(); err != nil {
-		return err
-	}
-
-	root, err := findRepoRoot()
-	if err != nil {
-		return err
-	}
-
-	outputs, err := loadTofuOutputs(root)
-	if err != nil {
-		return err
-	}
-
+func runMetricsCmd(source string, asJSON bool, instanceID, region string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, cfg.Region, cfg.Profile)
+	ac, err := newAWSClients(ctx, region, "")
 	if err != nil {
 		return err
-	}
-
-	instanceID := outputs.getOutput("instance_id")
-	if instanceID == "" {
-		return fmt.Errorf("instance_id not found in tofu outputs")
 	}
 
 	params := url.Values{}
@@ -70,8 +53,11 @@ func runMetricsCmd(source string, asJSON bool) error {
 		curlURL += "?" + q
 	}
 
-	curlCmd := fmt.Sprintf("curl -sf '%s' 2>/dev/null || echo '{}'", curlURL)
-	output := ac.runCommandOutput(ctx, instanceID, curlCmd)
+	curlCmd := fmt.Sprintf("curl -sfS '%s'", curlURL)
+	output, err := ac.runCommand(ctx, instanceID, curlCmd)
+	if err != nil {
+		return fmt.Errorf("read metrics from supervisor on %s: %w", instanceID, err)
+	}
 	if output == "" {
 		output = "{}"
 	}

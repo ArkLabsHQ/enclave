@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.0"
     }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
   }
 }
 
@@ -71,12 +75,6 @@ variable "migration_cooldown" {
   description = "Migration cooldown duration string."
   type        = string
   default     = "0s"
-}
-
-variable "previous_pcr0" {
-  description = "Previous PCR0 hash for migration chain validation."
-  type        = string
-  default     = "genesis"
 }
 
 variable "expected_pcr0" {
@@ -354,6 +352,8 @@ data "aws_iam_policy_document" "enclave" {
         aws_ssm_parameter.migration_kms_key_id.arn,
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
+        aws_ssm_parameter.migration_staged_previous_pcr0.arn,
+        aws_ssm_parameter.migration_staged_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_old_kms_key_id.arn,
         aws_ssm_parameter.migration_target_pcr0.arn,
         aws_ssm_parameter.migration_requested_at.arn,
@@ -435,14 +435,18 @@ locals {
 
   eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
   supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
+  pcr_source        = "${dirname(local.eif_source)}/pcr.json"
 }
 
 # Download build artifacts from GitHub Release (skipped when local paths are set).
+# Re-runs on every apply because release_tag is typically a moving pointer
+# (e.g. "eif-latest"). The downstream S3 etag (filemd5 over the downloaded
+# file) is what actually decides whether anything propagates.
 resource "null_resource" "download_artifacts" {
   count = local.use_local ? 0 : 1
 
   triggers = {
-    release_tag = var.release_tag
+    always_run = timestamp()
   }
 
   provisioner "local-exec" {
@@ -450,13 +454,42 @@ resource "null_resource" "download_artifacts" {
       AUTH=""
       [ -n "$GITHUB_TOKEN" ] && AUTH="-H \"Authorization: Bearer $GITHUB_TOKEN\""
       mkdir -p ${local.artifacts_dir}
-      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif ${local.release_base}/image.eif
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/image.eif  ${local.release_base}/image.eif
       eval curl -sfL $AUTH -o ${local.artifacts_dir}/supervisor ${local.release_base}/supervisor
+      eval curl -sfL $AUTH -o ${local.artifacts_dir}/pcr.json   ${local.release_base}/pcr.json
     EOT
     environment = {
       GITHUB_TOKEN = var.github_token
     }
   }
+}
+
+# pcr.json is produced by the EIF builder (monzo/aws-nitro-util) alongside
+# image.eif and contains the precomputed PCR0/PCR1/PCR2. Reading it here lets
+# tofu auto-derive expected_pcr0 instead of asking operators to maintain it.
+data "local_file" "pcr" {
+  filename   = local.pcr_source
+  depends_on = [null_resource.download_artifacts]
+}
+
+# Also read the EIF and supervisor through data.local_file so their
+# content_md5 (used as the S3 etag) is computed at apply time AFTER any
+# download — otherwise a moving release_tag causes one-apply-late drift
+# (planned filemd5 from yesterday's file, then download replaces it).
+data "local_file" "eif" {
+  filename   = local.eif_source
+  depends_on = [null_resource.download_artifacts]
+}
+
+data "local_file" "supervisor" {
+  filename   = local.supervisor_source
+  depends_on = [null_resource.download_artifacts]
+}
+
+locals {
+  # Auto-derived from the build's pcr.json. Falls back to var.expected_pcr0 if
+  # pcr.json is missing or malformed (e.g. partial local artifact set).
+  effective_pcr0 = try(jsondecode(data.local_file.pcr.content).PCR0, var.expected_pcr0)
 }
 
 # S3 bucket for enclave deployment assets (EIF, scripts, systemd units, binaries).
@@ -481,7 +514,7 @@ resource "aws_s3_object" "enclave_eif" {
   bucket     = aws_s3_bucket.assets.id
   key        = "image.eif"
   source     = local.eif_source
-  etag       = local.use_local ? filemd5(local.eif_source) : null
+  etag       = data.local_file.eif.content_md5
 }
 
 resource "aws_s3_object" "supervisor_binary" {
@@ -489,7 +522,7 @@ resource "aws_s3_object" "supervisor_binary" {
   bucket     = aws_s3_bucket.assets.id
   key        = "supervisor"
   source     = local.supervisor_source
-  etag       = local.use_local ? filemd5(local.supervisor_source) : null
+  etag       = data.local_file.supervisor.content_md5
 }
 
 # Staging copy used for in-place supervisor migration. Each tofu apply overwrites
@@ -509,7 +542,7 @@ resource "aws_s3_object" "supervisor_binary_staging" {
   bucket     = aws_s3_bucket.assets.id
   key        = "supervisor-staging"
   source     = local.supervisor_source
-  etag       = local.use_local ? filemd5(local.supervisor_source) : null
+  etag       = data.local_file.supervisor.content_md5
 }
 
 # The enclave-supervisor.service systemd unit is inlined in user_data.sh.tftpl
@@ -618,6 +651,35 @@ resource "aws_ssm_parameter" "migration_previous_pcr0" {
 
 resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
   name      = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0Attestation"
+  type      = "String"
+  tier      = "Advanced"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Staging chain proof: the OLD enclave's /v1/start-migration writes the
+# predecessor PCR0 + attestation here, and the NEW enclave's
+# PromoteToPrimary copies them to the primary keys above on commit.
+# AbortOrphaned clears these without touching the primary keys, so a
+# failed migration leaves the true predecessor chain intact.
+
+resource "aws_ssm_parameter" "migration_staged_previous_pcr0" {
+  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "migration_staged_previous_pcr0_attestation" {
+  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0Attestation"
   type      = "String"
   tier      = "Advanced"
   value     = "UNSET"
@@ -985,7 +1047,6 @@ resource "aws_instance" "nitro" {
     eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
     migration_cooldown        = var.migration_cooldown
-    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {
@@ -1011,6 +1072,14 @@ resource "aws_instance" "nitro" {
         --output text || true
     EOT
     on_failure = continue
+  }
+
+  # AL2023 publishes new AMIs constantly; data.aws_ami.al2023.most_recent re-resolves
+  # on every plan and would otherwise force-replace the host (and break migration
+  # because the old supervisor is gone before /migrate can be called). Bump the host
+  # OS deliberately with: tofu apply -replace=module.enclave.aws_instance.nitro[0]
+  lifecycle {
+    ignore_changes = [ami]
   }
 }
 
@@ -1056,8 +1125,8 @@ resource "null_resource" "enclave_migration" {
   count = var.local ? 0 : 1
 
   triggers = {
-    eif_key       = aws_s3_object.enclave_eif.key
-    expected_pcr0 = var.expected_pcr0
+    eif_etag      = data.local_file.eif.content_md5
+    expected_pcr0 = local.effective_pcr0
   }
 
   provisioner "local-exec" {
@@ -1066,7 +1135,7 @@ resource "null_resource" "enclave_migration" {
       REGION="${var.region}"
       BUCKET="${aws_s3_bucket.assets.id}"
       EIF_KEY="${aws_s3_object.enclave_eif.key}"
-      PCR0="${var.expected_pcr0}"
+      PCR0="${local.effective_pcr0}"
       SECRETS='${jsonencode([for s in var.secrets : s.name])}'
 
       # Skip on first deploy (no running enclave).
@@ -1116,8 +1185,8 @@ resource "null_resource" "promote_supervisor_binary" {
   count = var.local ? 0 : 1
 
   triggers = {
-    eif_key       = aws_s3_object.enclave_eif.key
-    expected_pcr0 = var.expected_pcr0
+    eif_etag      = data.local_file.eif.content_md5
+    expected_pcr0 = local.effective_pcr0
   }
 
   provisioner "local-exec" {
@@ -1132,21 +1201,26 @@ resource "null_resource" "promote_supervisor_binary" {
   depends_on = [null_resource.enclave_migration]
 }
 
-# Automatic migration (local mode) — triggers when expected_pcr0 changes.
+# Automatic migration (local mode) — triggers when EIF content changes.
 # Calls the supervisor directly via HTTP (no EC2/SSM in local mode).
+# Skips at runtime if expected_pcr0 is unset or no supervisor is running.
 resource "null_resource" "enclave_migration_local" {
-  count = var.local && var.expected_pcr0 != "" ? 1 : 0
+  count = var.local ? 1 : 0
 
   triggers = {
-    expected_pcr0 = var.expected_pcr0
+    eif_etag      = data.local_file.eif.content_md5
+    expected_pcr0 = local.effective_pcr0
   }
 
   provisioner "local-exec" {
     command = <<-EOT
       SUPERVISOR_URL="${var.supervisor_url}"
       BUCKET="${aws_s3_bucket.assets.id}"
-      PCR0="${var.expected_pcr0}"
+      PCR0="${local.effective_pcr0}"
       SECRETS='${jsonencode([for s in var.secrets : s.name])}'
+
+      # Skip if PCR0 couldn't be derived — nothing meaningful to verify against.
+      [ -z "$${PCR0}" ] && { echo "PCR0 not derivable (missing pcr.json + var.expected_pcr0), skipping migration."; exit 0; }
 
       # Skip on first deploy (supervisor not running yet).
       curl -sf "$${SUPERVISOR_URL}/health" >/dev/null 2>&1 || { echo "No supervisor, skipping migration."; exit 0; }
@@ -1163,10 +1237,11 @@ resource "null_resource" "enclave_migration_local" {
 # Promote the staging supervisor binary onto the canonical key after a successful
 # local-mode migration. Mirrors null_resource.promote_supervisor_binary for non-local.
 resource "null_resource" "promote_supervisor_binary_local" {
-  count = var.local && var.expected_pcr0 != "" ? 1 : 0
+  count = var.local ? 1 : 0
 
   triggers = {
-    expected_pcr0 = var.expected_pcr0
+    eif_etag      = data.local_file.eif.content_md5
+    expected_pcr0 = local.effective_pcr0
   }
 
   provisioner "local-exec" {

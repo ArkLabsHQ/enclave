@@ -37,7 +37,6 @@ module "enclave" {
   local             = var.local
   secrets           = var.secrets
   migration_cooldown = var.migration_cooldown
-  previous_pcr0     = var.previous_pcr0
   expected_pcr0     = var.expected_pcr0
   supervisor_url          = var.supervisor_url
   github_owner  = var.github_owner
@@ -105,12 +104,6 @@ variable "migration_cooldown" {
   description = "Migration cooldown duration string."
   type        = string
   default     = "0s"
-}
-
-variable "previous_pcr0" {
-  description = "Previous PCR0 hash for migration chain validation."
-  type        = string
-  default     = "genesis"
 }
 
 variable "expected_pcr0" {

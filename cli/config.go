@@ -19,7 +19,10 @@ var (
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
 var reservedEnvPrefixes = []string{"ENCLAVE_", "AWS_"}
 
-const configFile = "enclave/enclave.yaml"
+const (
+	configFile     = "enclave/enclave.yaml" // canonical layout: enclave/ subdir at project root
+	configFileBare = "enclave.yaml"         // alternate layout: enclave.yaml directly at project root
+)
 
 type Config struct {
 	Name              string         `yaml:"name"`
@@ -104,7 +107,7 @@ func loadConfigAt(configPath string) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		configPath = filepath.Join(root, configFile)
+		configPath = resolveConfigPath(root)
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -213,7 +216,24 @@ func (c *Config) validateRuntime() error {
 	return nil
 }
 
-// findRepoRoot walks up from cwd looking for enclave.yaml or .git.
+// resolveConfigPath returns the path to enclave.yaml under root, accepting
+// either the canonical enclave/enclave.yaml or a bare enclave.yaml at the
+// project root. Falls back to the canonical path when neither exists, so
+// downstream errors point at the conventional location.
+func resolveConfigPath(root string) string {
+	canonical := filepath.Join(root, configFile)
+	if _, err := os.Stat(canonical); err == nil {
+		return canonical
+	}
+	bare := filepath.Join(root, configFileBare)
+	if _, err := os.Stat(bare); err == nil {
+		return bare
+	}
+	return canonical
+}
+
+// findRepoRoot walks up from cwd looking for an enclave.yaml (in either layout)
+// or a .git boundary.
 func findRepoRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -221,6 +241,9 @@ func findRepoRoot() (string, error) {
 	}
 	for {
 		if _, err := os.Stat(filepath.Join(dir, configFile)); err == nil {
+			return dir, nil
+		}
+		if _, err := os.Stat(filepath.Join(dir, configFileBare)); err == nil {
 			return dir, nil
 		}
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {

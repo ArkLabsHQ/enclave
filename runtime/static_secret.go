@@ -90,32 +90,25 @@ func (s *StaticSecrets) Len() int {
 	return len(s.secrets)
 }
 
-// WaitForKMS waits until all configured secrets are loaded from KMS.
-// Times out after 5 minutes to prevent infinite retries on broken KMS.
+// LoadAll loads (or generates, when missing) every configured static secret,
+// retrying transient failures up to 5 minutes / 5 seconds apart. The wait
+// loop is the only thing protecting boot from KMS/SSM warmup races; without
+// it, a transient AWS hiccup during init fails the enclave to boot.
 //
-// keyID specifies the KMS key to decrypt under. Pass empty string to use
-// the primary key from SSM. paramPrefix is inserted between the app name
-// and the secret name in the SSM param path — use "Migration/" for
-// migration mode, empty string for primary mode.
-//
-// In migration mode (paramPrefix != "" AND keyID != ""), this function
-// NEVER generates a fresh secret — the Migration/* params MUST exist or
-// Init fails. Generating a fresh secret in migration mode would orphan
-// the real data.
-func (s *StaticSecrets) WaitForKMS(ctx context.Context, keyID, paramPrefix string) error {
+// keyID specifies the KMS key to decrypt under. prefix selects the SSM
+// namespace (PrimaryPrefix or MigrationPrefix).
+func (s *StaticSecrets) LoadAll(ctx context.Context, keyID string, prefix ParamPrefix) error {
 	const timeout = 5 * time.Minute
 	interval := 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	migrationMode := paramPrefix != "" && keyID != ""
-
 	var lastErr error
 	for {
 		allLoaded := true
 		for _, sec := range s.secrets {
-			if err := s.loadOne(ctx, sec, keyID, paramPrefix, migrationMode); err != nil {
+			if err := s.LoadOrGenerate(ctx, sec, keyID, prefix); err != nil {
 				lastErr = fmt.Errorf("secret %s: %w", sec.Name, err)
 				allLoaded = false
 				break
@@ -141,41 +134,26 @@ func (s *StaticSecrets) WaitForKMS(ctx context.Context, keyID, paramPrefix strin
 	}
 }
 
-// loadOne loads a single secret's ciphertext from SSM and decrypts via KMS.
-// In primary mode (migrationMode=false), generates a fresh secret if
-// missing. In migration mode, returns an error if the ciphertext is missing.
-func (s *StaticSecrets) loadOne(ctx context.Context, secret StaticSecret, keyID, paramPrefix string, migrationMode bool) error {
-	paramName := secretParamName(secret.Name, paramPrefix)
-
-	if keyID == "" {
-		var err error
-		keyID, err = s.kms.GetKeyID(ctx)
-		if err != nil {
-			return fmt.Errorf("get KMS key ID: %w", err)
-		}
-	}
-	if keyID == "" {
-		return fmt.Errorf("KMS key ID is empty")
-	}
+// LoadOrGenerate loads the secret's ciphertext from SSM, generating a
+// fresh one only in primary mode. In migration mode (MigrationPrefix) the
+// staged ciphertext MUST exist — generating would orphan real data on
+// PromoteToPrimary.
+func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret, keyID string, prefix ParamPrefix) error {
+	paramName := secretParamName(secret.Name, prefix)
 
 	ciphertextB64, err := s.kms.LoadCiphertext(ctx, paramName)
 	if err != nil {
 		return err
 	}
 
-	if ciphertextB64 == "" {
-		if migrationMode {
-			return fmt.Errorf("migration ciphertext missing at %s — cannot generate fresh (would orphan data)", paramName)
-		}
-		return s.generateAndStore(ctx, keyID, paramName, secret.EnvVar)
+	if ciphertextB64 != "" {
+		return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
 	}
 
-	return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
-}
+	if prefix == MigrationPrefix {
+		return fmt.Errorf("migration ciphertext missing at %s — cannot generate fresh (would orphan data)", paramName)
+	}
 
-// generateAndStore uses KMS GenerateDataKey to produce a 32-byte secret with
-// hardware RNG, and stores the ciphertext in SSM.
-func (s *StaticSecrets) generateAndStore(ctx context.Context, keyID, paramName, envVar string) error {
 	out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 		KeyId:         aws.String(keyID),
 		NumberOfBytes: aws.Int32(32),
@@ -184,15 +162,15 @@ func (s *StaticSecrets) generateAndStore(ctx context.Context, keyID, paramName, 
 		return fmt.Errorf("kms generate data key: %w", err)
 	}
 
-	ciphertextB64 := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
+	ciphertextB64 = base64.StdEncoding.EncodeToString(out.CiphertextBlob)
 
 	if err := s.kms.StoreCiphertext(ctx, paramName, ciphertextB64); err != nil {
 		return err
 	}
 
 	secretHex := hex.EncodeToString(out.Plaintext)
-	if err := safeSetenv(envVar, secretHex); err != nil {
-		return fmt.Errorf("set %s: %w", envVar, err)
+	if err := safeSetenv(secret.EnvVar, secretHex); err != nil {
+		return fmt.Errorf("set %s: %w", secret.EnvVar, err)
 	}
 
 	return nil

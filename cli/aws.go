@@ -161,3 +161,56 @@ func (ac *awsClients) runCommandOutput(ctx context.Context, instanceID, command 
 	}
 	return ""
 }
+
+// runCommand runs a command on the host via SSM and returns its stdout. Unlike
+// runCommandOutput, this surfaces SSM-level errors and non-zero exit codes
+// (with stderr) instead of silently returning an empty string. Use it when an
+// empty result must be distinguishable from a failed invocation.
+func (ac *awsClients) runCommand(ctx context.Context, instanceID, command string) (string, error) {
+	out, err := ac.ssmClient.SendCommand(ctx, &ssm.SendCommandInput{
+		InstanceIds:  []string{instanceID},
+		DocumentName: aws.String("AWS-RunShellScript"),
+		Parameters:   map[string][]string{"commands": {command}},
+	})
+	if err != nil {
+		return "", fmt.Errorf("ssm SendCommand: %w", err)
+	}
+	commandID := *out.Command.CommandId
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("ssm command %s did not complete within 30s", commandID)
+		}
+		time.Sleep(2 * time.Second)
+		inv, err := ac.ssmClient.GetCommandInvocation(ctx, &ssm.GetCommandInvocationInput{
+			CommandId:  aws.String(commandID),
+			InstanceId: aws.String(instanceID),
+		})
+		if err != nil {
+			// InvocationDoesNotExist races for a beat after SendCommand.
+			continue
+		}
+		switch inv.Status {
+		case ssmtypes.CommandInvocationStatusPending,
+			ssmtypes.CommandInvocationStatusInProgress,
+			ssmtypes.CommandInvocationStatusDelayed:
+			continue
+		case ssmtypes.CommandInvocationStatusSuccess:
+			stdout := ""
+			if inv.StandardOutputContent != nil {
+				stdout = strings.TrimSpace(*inv.StandardOutputContent)
+			}
+			return stdout, nil
+		default:
+			stderr := ""
+			if inv.StandardErrorContent != nil {
+				stderr = strings.TrimSpace(*inv.StandardErrorContent)
+			}
+			if stderr == "" {
+				return "", fmt.Errorf("ssm command on %s ended with status=%s (no stderr)", instanceID, inv.Status)
+			}
+			return "", fmt.Errorf("ssm command on %s ended with status=%s: %s", instanceID, inv.Status, stderr)
+		}
+	}
+}

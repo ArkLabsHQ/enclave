@@ -863,7 +863,7 @@ checkRuntimeToken(request)
 | `GET /v1/enclave-info` | No | Public enclave metadata |
 | `GET /health` | No | Public health check |
 | `GET /v1/metrics` | No | Public Prometheus metrics |
-| `POST /v1/export-key` | No | Migration (verified via SSM) |
+| `POST /v1/start-migration` | No | Migration (verified via SSM) |
 
 #### Security Properties
 
@@ -1282,7 +1282,7 @@ enclave_secret_writes_total 5
 enclave_secret_deletes_total 1
 ```
 
-### POST /v1/export-key
+### POST /v1/start-migration
 
 Migration export endpoint. See [Section 15](#15-migration-flow) for full detail.
 
@@ -1439,7 +1439,7 @@ Admin → POST /migrate → supervisor
 #### Phase 2: Export (old enclave)
 
 ```
-supervisor → POST /v1/export-key → old enclave (via gvproxy)
+supervisor → POST /v1/start-migration → old enclave (via gvproxy)
     │
     │  Request body:
     │  { "migration_key_id": "arn:aws:kms:...:key/new-key-id" }
@@ -1591,7 +1591,7 @@ After a migration completes:
     - migration_cooldown_remaining = max(0, cooldown - elapsed)
     - Cached for 5 seconds (avoid SSM hammering)
   - If migration_cooldown_remaining > 0:
-    - POST /v1/export-key returns 429 Too Many Requests
+    - POST /v1/start-migration returns 429 Too Many Requests
     - Prevents rapid successive migrations
 
 Purpose: Safety valve against accidental rapid migrations

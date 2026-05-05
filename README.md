@@ -264,8 +264,10 @@ enclave deploy             # deploy CDK stack (VPC, EC2, KMS, IAM, secrets)
 ### 8. Verify
 
 ```sh
-enclave verify             # verify attestation document + PCR0 match
+enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ```
+
+`enclave deploy` prints both the elastic IP and the expected PCR0 after a successful apply; pass them through to `enclave verify`.
 
 ## Updating Your App
 
@@ -409,7 +411,7 @@ These endpoints are used internally and are not exposed to external clients.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/v1/export-key` | — | Re-encrypt secrets for locked-key migration (gated by SSM parameter, called by supervisor) |
+| POST | `/v1/start-migration` | — | Re-encrypt secrets for locked-key migration (gated by SSM parameter, called by supervisor) |
 
 ### Response Signing
 
@@ -549,7 +551,7 @@ The KMS key policy is irreversible — only the old PCR0 can decrypt. Secrets mu
 2. Create a **new KMS key** with a policy allowing the new PCR0 to decrypt
 3. Apply transitional KMS policy (grants Encrypt to EC2 role, no Decrypt)
 4. Store migration parameters in SSM (`MigrationKMSKeyID`, `MigrationOldKMSKeyID`)
-5. Call `POST /v1/export-key` on the running enclave. The enclave:
+5. Call `POST /v1/start-migration` on the running enclave. The enclave:
    - Reads `MigrationKMSKeyID` from SSM (this is the only gate — if the param is unset, the endpoint returns an error)
    - Decrypts each secret using the old KMS key (which only this enclave can do)
    - Re-encrypts each secret with the new KMS key

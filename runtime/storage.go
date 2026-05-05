@@ -70,15 +70,14 @@ func (s *Storage) DEK() []byte { return s.dek }
 // If no storage bucket is provisioned (StorageBucketName param missing),
 // storage is silently disabled — Store/Load/Delete return errors.
 //
-// keyID specifies the KMS key for DEK operations. Pass empty string to read
-// the primary key from SSM. paramPrefix is inserted between appName and
-// "StorageDEK" in the SSM path — use "Migration/" for migration mode,
-// empty string for primary mode.
+// keyID specifies the KMS key for DEK operations. prefix selects the SSM
+// namespace: PrimaryPrefix reads/writes the canonical DEK; MigrationPrefix
+// reads the staged DEK during a locked-key migration.
 //
-// In migration mode (paramPrefix != "" AND keyID != ""), this function NEVER
-// generates a fresh DEK — the Migration/StorageDEK param MUST exist or Init
-// fails. Generating a fresh DEK in migration mode would orphan all S3 data.
-func (s *Storage) Init(ctx context.Context, keyID, paramPrefix string) error {
+// In migration mode (prefix == MigrationPrefix), this function NEVER
+// generates a fresh DEK — the staged param MUST exist or Init fails.
+// Generating a fresh DEK in migration mode would orphan all S3 data.
+func (s *Storage) Init(ctx context.Context, keyID string, prefix ParamPrefix) error {
 	deployment := getDeployment()
 	appName := getAppName()
 
@@ -89,15 +88,7 @@ func (s *Storage) Init(ctx context.Context, keyID, paramPrefix string) error {
 	}
 	s.bucketName = bucketName
 
-	if keyID == "" {
-		keyID, err = s.kms.GetKeyID(ctx)
-		if err != nil {
-			return fmt.Errorf("get KMS key ID: %w", err)
-		}
-	}
-
-	migrationMode := paramPrefix != ""
-	dekParam := fmt.Sprintf("/%s/%s/%sStorageDEK/Ciphertext", deployment, appName, paramPrefix)
+	dekParam := fmt.Sprintf("/%s/%s/%sStorageDEK/Ciphertext", deployment, appName, prefix)
 
 	ciphertextB64, err := s.kms.LoadCiphertext(ctx, dekParam)
 	if err != nil {
@@ -105,7 +96,7 @@ func (s *Storage) Init(ctx context.Context, keyID, paramPrefix string) error {
 	}
 
 	if ciphertextB64 == "" {
-		if migrationMode {
+		if prefix == MigrationPrefix {
 			return fmt.Errorf("migration DEK missing at %s — cannot generate fresh (would orphan S3 data)", dekParam)
 		}
 		// First boot: generate a new DEK.

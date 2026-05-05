@@ -170,23 +170,42 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 // checking that the pubkey from /v1/enclave-info matches the appKeyHash
 // in the attestation document's UserData.
 //
-// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
-// Total 68 bytes. appKeyHash is at bytes 36:68 (after the 2nd multihash prefix).
+// UserData format (nitriding v1.4.2):
+//
+//	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
+//
+// Total 79 bytes. appKeyHash is at bytes 47:79.
 func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL string, attestResult *nitrite.Result) (string, error) {
 	if attestResult == nil || attestResult.Document == nil {
 		return "", fmt.Errorf("no attestation result to verify against")
 	}
 
+	const (
+		hashPrefix = "sha256:"
+		hashSep    = ";"
+		tlsStart   = len(hashPrefix)
+		tlsEnd     = tlsStart + 32
+		sepStart   = tlsEnd
+		appPrefix  = sepStart + len(hashSep)
+		appStart   = appPrefix + len(hashPrefix)
+		appEnd     = appStart + 32
+	)
+
 	userData := attestResult.Document.UserData
-	if len(userData) < 68 {
+	if len(userData) < appEnd {
 		// UserData too short — enclave may not support attestation key.
 		return "", nil
 	}
-
-	if userData[34] != 0x12 || userData[35] != 0x20 {
-		return "", fmt.Errorf("UserData missing multihash prefix at offset 34 (got %02x %02x)", userData[34], userData[35])
+	if !bytes.Equal(userData[:tlsStart], []byte(hashPrefix)) {
+		return "", fmt.Errorf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(userData[:tlsStart]))
 	}
-	appKeyHash := userData[36:68]
+	if string(userData[sepStart:appPrefix]) != hashSep {
+		return "", fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:appPrefix]))
+	}
+	if !bytes.Equal(userData[appPrefix:appStart], []byte(hashPrefix)) {
+		return "", fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(userData[appPrefix:appStart]))
+	}
+	appKeyHash := userData[appStart:appEnd]
 
 	// Check if appKeyHash is all zeros (key not yet registered).
 	allZero := true

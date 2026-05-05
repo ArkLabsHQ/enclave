@@ -99,7 +99,7 @@ The `enclave migrate` command performs a locked-key migration in 9 steps:
 2. Create new KMS key with transitional policy
 3. Apply transitional KMS policy (Encrypt + PutKeyPolicy, no Decrypt)
 4. Store migration parameters in SSM
-5. Call `POST /v1/export-key` on old enclave (re-encrypts secrets under new key)
+5. Call `POST /v1/start-migration` on old enclave (re-encrypts secrets under new key)
 6. Poll for migration ciphertexts in SSM
 7. Adopt ciphertexts and update KMS key ID
 8. Download new EIF, stop old enclave, replace, restart
@@ -134,3 +134,10 @@ enclave status
 ```
 
 Shows the current enclave state, instance ID, and CDK stack outputs.
+
+
+## Wire-format notes
+
+- `/v1/enclave-info` always responds with HTTP 503 and `{"version": ..., "initializing": true}` while Init is in progress **and** when Init has failed. To distinguish the two, check `/health` (200 once `initOK`) or the runtime logs. 
+- `/v1/enclave-info` now includes a `migration` block: `{"state": "none" | "committed" | "aborted", "reason": "<detail>"}`. The supervisor consumes this on the rollback path; external monitors can read it for an authoritative migration verdict.
+

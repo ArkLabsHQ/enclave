@@ -346,19 +346,26 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 
 // handleEnclaveInfo returns 503 with partial JSON during init (so callers
 // get meaningful state instead of 502, while curl -sf still fails).
+//
+// Guard on initOK rather than initDone: initDone fires on Init return
+// regardless of outcome, so a failed Init would otherwise fall through
+// to the success path and nil-deref subsystems that were never wired.
 func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if !e.initDone.Load() {
+	if !e.initOK.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
+		initializing := !e.initDone.Load()
 		_ = json.NewEncoder(w).Encode(struct {
 			Version      string `json:"version"`
 			PreviousPCR0 string `json:"previous_pcr0"`
 			Initializing bool   `json:"initializing"`
+			InitFailed   bool   `json:"init_failed,omitempty"`
 		}{
 			Version:      Version,
 			PreviousPCR0: "",
-			Initializing: true,
+			Initializing: initializing,
+			InitFailed:   !initializing,
 		})
 		return
 	}

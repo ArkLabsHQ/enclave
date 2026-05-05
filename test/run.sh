@@ -988,20 +988,27 @@ if [ -x "$ENCLAVE_CLI" ]; then
 fi
 
 
-# Step 9: Rollback test — migration with wrong previous_pcr0.
-# Build a v3 EIF with an intentionally WRONG baked-in previous_pcr0 and trigger
-# a migration. The new enclave's Init() PCR0 check must fail, supervisor's commit
-# poll must time out, and rollback must restore v2 with all data intact.
-# Skipped inside Docker (no Nix toolchain to build v3).
+# Step 9: Rollback test — migration with mismatched target PCR0.
+#
+# Induces a deterministic v3 boot failure to exercise the supervisor's
+# rollback path. Mechanism: pass a WRONG target PCR0 in the /migrate body.
+# Supervisor cuts the migration KMS key locked to that wrong PCR0 and
+# writes MigrationTargetPCR0 = wrong PCR0. v3 boots, sees own PCR0 ≠
+# MigrationTargetPCR0 → "not the target" → tries to read primary state
+# with the existing KMS key whose policy is locked to v2's PCR0 → KMS
+# decrypt is denied to v3 → LoadAll fails → Init returns error →
+# /health stays 503 → supervisor's commit-poll times out → rollback
+# restores v2 EIF and the staging-only writes are wiped by AbortOrphaned
+# on the next v2 boot. Primary chain proof is untouched throughout, so
+# v2's /v1/enclave-info still reports v1's PCR0 as the predecessor.
 echo ""
-echo "=== [9/10] Rollback test: migration with wrong previous_pcr0 ==="
+echo "=== [9/10] Rollback test: migration with mismatched target PCR0 ==="
 
 ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
 V3_EIF="${ARTIFACTS}/image-v3.eif"
 V3_PCR_FILE="${ARTIFACTS}/pcr-v3.json"
 
 # Require pre-built v3 artifacts (produced by `make test-build`).
-# This works identically in Docker and on the host — no Nix needed at test-run.
 if [ ! -f "$V3_EIF" ] || [ ! -f "$V3_PCR_FILE" ]; then
   echo "  FAIL: v3 artifacts not found (run 'make test-build' to build them)" >&2
   echo "  expected: $V3_EIF, $V3_PCR_FILE" >&2
@@ -1010,8 +1017,10 @@ fi
 
 V2_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
 V3_PCR0=$(jq -r '.PCR0' "$V3_PCR_FILE")
-echo "  v2 PCR0: ${V2_PCR0:0:16}... (currently running)"
-echo "  v3 PCR0: ${V3_PCR0:0:16}... (baked-in previous_pcr0 = 0000...ff — deliberately wrong)"
+WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
+echo "  v2 PCR0:    ${V2_PCR0:0:16}... (currently running)"
+echo "  v3 PCR0:    ${V3_PCR0:0:16}... (real PCR0 of new EIF)"
+echo "  Sending wrong target PCR0 in /migrate: ${WRONG_PCR0:0:16}..."
 
 ROLLBACK_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
 aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /dev/null 2>&1 || {
@@ -1019,8 +1028,10 @@ aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /de
   exit 1
 }
 
+# WRONG_PCR0 in pcr0 field — supervisor locks the migration KMS key to
+# a PCR0 v3 cannot match, so v3 cannot adopt the migration.
 MIGRATE_BODY=$(jq -nc \
-  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$V3_PCR0" \
+  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$WRONG_PCR0" \
   --argjson s '["signing_key"]' \
   '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
 
@@ -1038,18 +1049,22 @@ else
   exit 1
 fi
 
-# A healthy v2 boot after rollback implies abortOrphanedMigration ran.
+# A healthy v2 boot after rollback implies AbortOrphaned ran (cleared the
+# in-flight migration flags) and the v2 EIF was restored by the supervisor.
 wait_for_enclave "post-rollback"
 
-# Verify rollback restored v2 by checking previous_pcr0 — the abort path
-# re-asserts it from the baked predecessor, so it should equal pcr-v1.json.
+# The chain-proof SSM keys (MigrationPreviousPCR0, ...Attestation) are
+# never touched by AbortOrphaned in the staging model — the failed
+# migration only wrote to /Migration/* staging. So v2's /v1/enclave-info
+# should still report v1's PCR0 as the predecessor (set by the original
+# v1 → v2 commit earlier in this test run).
 V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr-v1.json")
 POST_ROLLBACK_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 POST_ROLLBACK_PREV=$(echo "$POST_ROLLBACK_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
 V1_LOWER=$(echo "$V1_PCR0" | tr '[:upper:]' '[:lower:]')
 POST_LOWER=$(echo "$POST_ROLLBACK_PREV" | tr '[:upper:]' '[:lower:]')
 if [ -n "$POST_LOWER" ] && [ "$V1_LOWER" = "$POST_LOWER" ]; then
-  echo "  PASS: v2 restored after rollback (previous_pcr0 matches baked v1)"
+  echo "  PASS: v2 restored after rollback (primary chain proof intact, previous_pcr0 = v1)"
 else
   echo "  FAIL: previous_pcr0 after rollback (${POST_ROLLBACK_PREV:0:16}...) != v1 (${V1_PCR0:0:16}...)" >&2
   exit 1

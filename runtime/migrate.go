@@ -148,43 +148,53 @@ func (m *Migrator) GetPreviousPCR0Info(ctx context.Context, isMigrationPending b
 
 }
 
-func (m *Migrator) CompleteMigration(ctx context.Context, kmsMigrationKey string) error {
-	pcr0 := getPCR0()
+// MigrationState is the terminal outcome of a migration-mode boot.
+// Both commit and abort clear MigrationKMSKeyID, so SSM alone cannot
+// distinguish them — the supervisor reads this state from
+// /v1/enclave-info to decide whether to roll back.
+type MigrationState string
 
-	migrationTargetPCR0, err := m.ReadTargetPCR0(ctx)
-	if err != nil {
-		return fmt.Errorf("read MigrationTargetPCR0: %w", err)
-	}
+const (
+	MigrationStateNone      MigrationState = "none"
+	MigrationStateCommitted MigrationState = "committed"
+	MigrationStateAborted   MigrationState = "aborted"
+)
+
+type MigrationOutcome struct {
+	State  MigrationState
+	Reason string
+}
+
+func (m *Migrator) CompleteMigration(ctx context.Context, kmsMigrationKey string) (MigrationOutcome, error) {
+	pcr0 := getPCR0()
+	migrationTargetPCR0, _ := m.ReadTargetPCR0(ctx)
 
 	if pcr0 != migrationTargetPCR0 {
-		// Try To Abort
 		if err := m.AbortOrphaned(ctx); err != nil {
-			return fmt.Errorf("abort orphaned migration failed: %w", err)
+			return MigrationOutcome{}, fmt.Errorf("abort orphaned migration: %w", err)
 		}
-
-		return nil
+		return MigrationOutcome{
+			State:  MigrationStateAborted,
+			Reason: fmt.Sprintf("PCR0 does not match MigrationTargetPCR0 (own=%s, target=%s)", prefix16(pcr0), prefix16(migrationTargetPCR0)),
+		}, nil
 	}
 
 	previousPCRInfo, err := m.GetPreviousPCR0Info(ctx, true)
 	if err != nil {
-		return fmt.Errorf("get previous PCR0 info: %w", err)
+		return MigrationOutcome{}, fmt.Errorf("get previous PCR0 info: %w", err)
 	}
-
 	if previousPCRInfo != nil {
-		if err := verifyPCR31Commitment(previousPCRInfo.Attestation, getPCR0()); err != nil {
-			return fmt.Errorf("verify PCR31 migration commitment: %w", err)
+		if err := verifyPCR31Commitment(previousPCRInfo.Attestation, pcr0); err != nil {
+			return MigrationOutcome{}, fmt.Errorf("verify PCR31 migration commitment: %w", err)
 		}
 	}
 
 	if err := m.PromoteToPrimary(ctx, kmsMigrationKey); err != nil {
-		slog.Error("promote migration to primary", "error", err)
-		return fmt.Errorf("promote migration: %w", err)
+		return MigrationOutcome{}, fmt.Errorf("promote migration: %w", err)
 	}
-
 	m.DeleteOldKMSKey(ctx)
 
-	return nil
-
+	return MigrationOutcome{State: MigrationStateCommitted}, nil
 }
 
 // GetMigrationKMSKeyID: non-empty result means migration mode is active and

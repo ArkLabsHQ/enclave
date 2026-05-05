@@ -36,9 +36,11 @@ type Runtime struct {
 
 	mux *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
 
-	initDone     atomic.Bool // true after Init completes (happens-before fence)
-	initOK       atomic.Bool // true only if Init completed successfully
-	runtimeToken string      // bearer token for management endpoints (empty = no auth)
+	initDone        atomic.Bool  // true after Init completes (happens-before fence)
+	initOK          atomic.Bool  // true only if Init completed successfully
+	migrationState  atomic.Value // MigrationState
+	migrationReason atomic.Value // string
+	runtimeToken    string       // bearer token for management endpoints (empty = no auth)
 }
 
 // New returns a Runtime safe to use for serving management endpoints
@@ -74,6 +76,8 @@ func (e *Runtime) RuntimeToken() string {
 // or failure) so handlers can read fields safely.
 func (e *Runtime) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
+	e.migrationState.Store(MigrationStateNone)
+	e.migrationReason.Store("")
 
 	ctx, initSpan := e.tracing.Span(ctx, "init")
 	defer initSpan.End()
@@ -117,11 +121,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 	// using the migration key. Otherwise (orphan or normal boot), read from
 	// primary. CompleteMigration at the end commits or aborts accordingly,
 	// so primary state is only touched after the staged reads validate.
-	migrationKMSKeyID, err := e.migrator.GetMigrationKMSKeyID(ctx)
-	if err != nil {
-		slog.Error("read migration KMS key ID", "error", err)
-		return fmt.Errorf("read migration KMS key ID: %w", err)
-	}
+	// Missing MigrationKMSKeyID is the normal "no migration in progress" case;
+	// readSSMParam reports it as an error which we discard. Same treatment
+	// for ReadTargetPCR0 below — if it's unset while a migration is in flight,
+	// we're not the target and CompleteMigration will run AbortOrphaned.
+	migrationKMSKeyID, _ := e.migrator.GetMigrationKMSKeyID(ctx)
 
 	var (
 		paramPrefix       ParamPrefix
@@ -129,10 +133,7 @@ func (e *Runtime) Init(ctx context.Context) error {
 		isMigrationTarget bool
 	)
 	if migrationKMSKeyID != "" {
-		isMigrationTarget, err = e.migrator.IsTarget(ctx)
-		if err != nil {
-			return fmt.Errorf("classify boot role: %w", err)
-		}
+		isMigrationTarget, _ = e.migrator.IsTarget(ctx)
 		if isMigrationTarget {
 			paramPrefix = MigrationPrefix
 			keyID = migrationKMSKeyID
@@ -175,10 +176,14 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 
 	if migrationKMSKeyID != "" {
-		if err := e.migrator.CompleteMigration(ctx, migrationKMSKeyID); err != nil {
+		outcome, err := e.migrator.CompleteMigration(ctx, migrationKMSKeyID)
+		if err != nil {
 			slog.Error("complete migration", "error", err)
 			return fmt.Errorf("complete migration: %w", err)
 		}
+		e.migrationState.Store(outcome.State)
+		e.migrationReason.Store(outcome.Reason)
+		slog.Info("migration completed", "state", outcome.State, "reason", outcome.Reason)
 	}
 
 	e.registerGatedRoutes()
@@ -344,54 +349,61 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 	e.attestation.SetRegistrar(r)
 }
 
-// handleEnclaveInfo returns 503 with partial JSON during init (so callers
-// get meaningful state instead of 502, while curl -sf still fails).
-//
-// Guard on initOK rather than initDone: initDone fires on Init return
-// regardless of outcome, so a failed Init would otherwise fall through
-// to the success path and nil-deref subsystems that were never wired.
+type MigrationInfo struct {
+	State  MigrationState `json:"state"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+type EnclaveInfo struct {
+	Version                    string         `json:"version"`
+	PreviousPCR0               string         `json:"previous_pcr0"`
+	PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
+	DynamicSecrets             int64          `json:"dynamic_secrets"`
+	Metrics                    map[string]any `json:"metrics"`
+	MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
+	MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
+	MigrationPending           bool           `json:"migration_pending"`
+	Migration                  MigrationInfo  `json:"migration"`
+}
+
+type enclaveInitializing struct {
+	Version      string `json:"version"`
+	PreviousPCR0 string `json:"previous_pcr0"`
+	Initializing bool   `json:"initializing"`
+}
+
+// handleEnclaveInfo gates on initOK rather than initDone so a failed Init
+// does not fall through to the success path and nil-deref subsystems that
+// were never wired.
 func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if !e.initOK.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		initializing := !e.initDone.Load()
-		_ = json.NewEncoder(w).Encode(struct {
-			Version      string `json:"version"`
-			PreviousPCR0 string `json:"previous_pcr0"`
-			Initializing bool   `json:"initializing"`
-			InitFailed   bool   `json:"init_failed,omitempty"`
-		}{
+		_ = json.NewEncoder(w).Encode(enclaveInitializing{
 			Version:      Version,
-			PreviousPCR0: "",
-			Initializing: initializing,
-			InitFailed:   !initializing,
+			Initializing: true,
 		})
 		return
 	}
 
 	cooldownSeconds, cooldownRemaining, migrationPending := e.migrator.CooldownStatus(r.Context())
 
-	previousPCR0 := ""
+	previousPCR0 := "genesis"
 	previousPCR0Attestation := ""
-
-	previousPCR0Info, err := e.migrator.GetPreviousPCR0Info(r.Context(), false)
-	if err == nil && previousPCR0Info != nil {
-		previousPCR0 = previousPCR0Info.PCR0
-		previousPCR0Attestation = previousPCR0Info.Attestation
+	if info, err := e.migrator.GetPreviousPCR0Info(r.Context(), false); err == nil && info != nil {
+		previousPCR0 = info.PCR0
+		previousPCR0Attestation = info.Attestation
 	}
 
-	_ = json.NewEncoder(w).Encode(struct {
-		Version                    string         `json:"version"`
-		PreviousPCR0               string         `json:"previous_pcr0"`
-		PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
-		AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
-		DynamicSecrets             int64          `json:"dynamic_secrets"`
-		Metrics                    map[string]any `json:"metrics"`
-		MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
-		MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
-		MigrationPending           bool           `json:"migration_pending"`
-	}{
+	migrationState, _ := e.migrationState.Load().(MigrationState)
+	if migrationState == "" {
+		migrationState = MigrationStateNone
+	}
+	migrationReason, _ := e.migrationReason.Load().(string)
+
+	_ = json.NewEncoder(w).Encode(EnclaveInfo{
 		Version:                    Version,
 		PreviousPCR0:               previousPCR0,
 		PreviousPCR0Attestation:    previousPCR0Attestation,
@@ -401,6 +413,7 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,
+		Migration:                  MigrationInfo{State: migrationState, Reason: migrationReason},
 	})
 }
 

@@ -1304,7 +1304,7 @@ resource "null_resource" "enclave_migration" {
   count = var.local ? 0 : 1
 
   triggers = {
-    eif_etag      = aws_s3_object.enclave_eif.etag
+    eif_etag      = data.local_file.eif.content_md5
     expected_pcr0 = local.effective_pcr0
   }
 
@@ -1364,7 +1364,7 @@ resource "null_resource" "promote_supervisor_binary" {
   count = var.local ? 0 : 1
 
   triggers = {
-    eif_etag      = aws_s3_object.enclave_eif.etag
+    eif_etag      = data.local_file.eif.content_md5
     expected_pcr0 = local.effective_pcr0
   }
 
@@ -1387,7 +1387,7 @@ resource "null_resource" "enclave_migration_local" {
   count = var.local ? 1 : 0
 
   triggers = {
-    eif_etag      = aws_s3_object.enclave_eif.etag
+    eif_etag      = data.local_file.eif.content_md5
     expected_pcr0 = local.effective_pcr0
   }
 
@@ -1419,7 +1419,7 @@ resource "null_resource" "promote_supervisor_binary_local" {
   count = var.local ? 1 : 0
 
   triggers = {
-    eif_etag      = aws_s3_object.enclave_eif.etag
+    eif_etag      = data.local_file.eif.content_md5
     expected_pcr0 = local.effective_pcr0
   }
 

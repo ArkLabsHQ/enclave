@@ -352,6 +352,8 @@ data "aws_iam_policy_document" "enclave" {
         aws_ssm_parameter.migration_kms_key_id.arn,
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
+        aws_ssm_parameter.migration_staged_previous_pcr0.arn,
+        aws_ssm_parameter.migration_staged_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_old_kms_key_id.arn,
         aws_ssm_parameter.migration_target_pcr0.arn,
         aws_ssm_parameter.migration_requested_at.arn,
@@ -649,6 +651,35 @@ resource "aws_ssm_parameter" "migration_previous_pcr0" {
 
 resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
   name      = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0Attestation"
+  type      = "String"
+  tier      = "Advanced"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Staging chain proof: the OLD enclave's /v1/start-migration writes the
+# predecessor PCR0 + attestation here, and the NEW enclave's
+# PromoteToPrimary copies them to the primary keys above on commit.
+# AbortOrphaned clears these without touching the primary keys, so a
+# failed migration leaves the true predecessor chain intact.
+
+resource "aws_ssm_parameter" "migration_staged_previous_pcr0" {
+  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0"
+  type      = "String"
+  value     = "UNSET"
+  overwrite = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "migration_staged_previous_pcr0_attestation" {
+  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0Attestation"
   type      = "String"
   tier      = "Advanced"
   value     = "UNSET"

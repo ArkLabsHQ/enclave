@@ -440,10 +440,11 @@ Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
 ### 6. Verify
 
 ` + "```sh" + `
-enclave verify
+enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
+` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 
@@ -533,10 +534,11 @@ Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
 ### 6. Verify
 
 ` + "```sh" + `
-enclave verify
+enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
+` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 
@@ -741,10 +743,11 @@ Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
 ### 6. Verify
 
 ` + "```sh" + `
-enclave verify
+enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
+` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 

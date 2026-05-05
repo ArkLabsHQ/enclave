@@ -264,8 +264,10 @@ enclave deploy             # deploy CDK stack (VPC, EC2, KMS, IAM, secrets)
 ### 8. Verify
 
 ```sh
-enclave verify             # verify attestation document + PCR0 match
+enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ```
+
+`enclave deploy` prints both the elastic IP and the expected PCR0 after a successful apply; pass them through to `enclave verify`.
 
 ## Updating Your App
 

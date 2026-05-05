@@ -449,7 +449,7 @@ else
   # Build v2 with previous_pcr0 set to v1's PCR0.
   # This exercises the runtime's previousPCR0 validation during v2 Init:
   # the enclave checks that ENCLAVE_PREVIOUS_PCR0 (baked from enclave.yaml)
-  # matches MigrationPreviousPCR0 in SSM (stored by v1's export-key).
+  # matches MigrationPreviousPCR0 in SSM (stored by v1's start-migration).
   echo "  Building v2 EIF (version 0.0.2, previous_pcr0=${V1_PCR0:0:16}...)..."
   sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
   if grep -q '^previous_pcr0:' "$ENCLAVE_YAML"; then
@@ -832,7 +832,7 @@ else
   exit 1
 fi
 
-# Verify previous_pcr0 was updated (no longer "genesis" after export-key).
+# Verify previous_pcr0 was updated (no longer "genesis" after start-migration).
 POST_MIG_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 PREV_PCR0=$(echo "$POST_MIG_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
 if [ -n "$PREV_PCR0" ] && [ "$PREV_PCR0" != "genesis" ]; then

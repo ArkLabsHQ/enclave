@@ -34,12 +34,11 @@ type Runtime struct {
 	migrator      *Migrator
 	environment   *Environment
 
-	mux                     *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
-	previousPCR0            string
-	previousPCR0Attestation string      // base64-encoded COSE Sign1 attestation doc
-	initDone                atomic.Bool // true after Init completes (happens-before fence)
-	initOK                  atomic.Bool // true only if Init completed successfully
-	runtimeToken            string      // bearer token for management endpoints (empty = no auth)
+	mux *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
+
+	initDone     atomic.Bool // true after Init completes (happens-before fence)
+	initOK       atomic.Bool // true only if Init completed successfully
+	runtimeToken string      // bearer token for management endpoints (empty = no auth)
 }
 
 // New returns a Runtime safe to use for serving management endpoints
@@ -57,7 +56,6 @@ func New() (*Runtime, error) {
 	r := &Runtime{
 		metrics:      enclaveMetrics,
 		attestation:  NewAttestation(),
-		previousPCR0: "genesis",
 		runtimeToken: token,
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
@@ -67,28 +65,6 @@ func New() (*Runtime, error) {
 
 func (e *Runtime) RuntimeToken() string {
 	return e.runtimeToken
-}
-
-func generateRuntimeToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := secureRandom(b); err != nil {
-		return "", fmt.Errorf("secure random: %w", err)
-	}
-	return hex.EncodeToString(b), nil
-}
-
-// secureRandom uses the NSM hardware RNG when running inside an enclave and
-// crypto/rand otherwise. Inside an enclave crypto/rand depends on a starved
-// kernel entropy pool (no disk, no network, no HID — only RDRAND), so the
-// NSM RNG is the only trustworthy source. If /dev/nsm opens but GetRandom
-// fails we surface the error rather than fall back to the weak pool.
-func secureRandom(b []byte) (int, error) {
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return rand.Read(b)
-	}
-	defer func() { _ = session.Close() }()
-	return session.Read(b)
 }
 
 // Init brings up subsystems: AWS clients, KMS policy lock, secrets via
@@ -109,8 +85,14 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init AWS clients: %w", err)
 	}
 	e.aws = aws
+
 	e.kms = NewKMS(e.aws)
+
 	e.environment = NewEnvironment(e.aws)
+	if err := e.environment.Override(ctx); err != nil {
+		slog.Error("apply env overrides", "error", err)
+		return fmt.Errorf("apply env overrides: %w", err)
+	}
 
 	staticSecrets, err := NewStaticSecrets(e.kms)
 	if err != nil {
@@ -119,72 +101,70 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 	e.staticSecrets = staticSecrets
 
+	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
+
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
 		return fmt.Errorf("init attestation: %w", err)
 	}
 
 	// Migrator needs Storage too, but Storage doesn't exist yet. Wired in below;
-	// export-key isn't reachable before initOK, so the late wire-up is safe.
+	// start-migration isn't reachable before initOK, so the late wire-up is safe.
 	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
 
-	// Verify previous PCR0 BEFORE any irreversible operations. KMS policy
-	// self-apply permanently locks the key to the current PCR0; storage Init
-	// may generate a fresh DEK. Checking first prevents a silent revert to a
-	// fresh deployment when previous_pcr0 is wrong.
-	expectedPreviousPCR0 := getPreviousPCR0()
+	// Classify boot role. If MigrationKMSKeyID is set and we're the declared
+	// MigrationTargetPCR0, read secrets and DEK from Migration/* staging
+	// using the migration key. Otherwise (orphan or normal boot), read from
+	// primary. CompleteMigration at the end commits or aborts accordingly,
+	// so primary state is only touched after the staged reads validate.
+	migrationKMSKeyID, err := e.migrator.GetMigrationKMSKeyID(ctx)
+	if err != nil {
+		slog.Error("read migration KMS key ID", "error", err)
+		return fmt.Errorf("read migration KMS key ID: %w", err)
+	}
 
-	migrationKeyID, _ := e.migrator.ReadKMSKeyID(ctx)
-	migrationTargetPCR0, _ := e.migrator.ReadTargetPCR0(ctx)
-	ownPCR0 := getPCR0()
-	paramPrefix := ""
-	switch classifyBootRole(migrationKeyID != "", ownPCR0, migrationTargetPCR0) {
-	case BootRoleAbortMigration:
-		slog.Warn("aborting in-progress migration — this enclave is not the target",
-			"migration_key", prefix16(migrationKeyID),
-			"target_pcr0", prefix16(migrationTargetPCR0),
-			"own_pcr0", prefix16(ownPCR0))
-		if err := e.migrator.AbortOrphaned(ctx, expectedPreviousPCR0); err != nil {
-			return fmt.Errorf("abort orphaned migration: %w", err)
+	var (
+		paramPrefix       ParamPrefix
+		keyID             string
+		isMigrationTarget bool
+	)
+	if migrationKMSKeyID != "" {
+		isMigrationTarget, err = e.migrator.IsTarget(ctx)
+		if err != nil {
+			return fmt.Errorf("classify boot role: %w", err)
 		}
-		migrationKeyID = ""
-	case BootRoleMigrationTarget:
-		paramPrefix = "Migration/"
-		slog.Info("migration mode active — reading from Migration/* staging", "key", prefix16(migrationKeyID))
+		if isMigrationTarget {
+			paramPrefix = MigrationPrefix
+			keyID = migrationKMSKeyID
+			slog.Info("migration target — reading from Migration/* staging", "key", prefix16(migrationKMSKeyID))
+		}
+	}
+	if !isMigrationTarget {
+		keyID, err = e.kms.GetKeyID(ctx)
+		if err != nil {
+			slog.Error("get KMS key ID", "error", err)
+			return fmt.Errorf("get KMS key ID: %w", err)
+		}
 	}
 
-	previousPCR0 := "genesis"
-	if pcr0, err := e.migrator.ReadPreviousPCR0(ctx); err == nil {
-		previousPCR0 = pcr0
-	}
-	if expectedPreviousPCR0 != previousPCR0 {
-		return fmt.Errorf("previous_pcr0 mismatch: expected %q (from enclave config), got %q (from SSM)", expectedPreviousPCR0, previousPCR0)
-	}
-	e.previousPCR0 = previousPCR0
-
-	slog.Info("applying KMS policy")
-	if err := e.kms.SelfApplyPolicy(ctx, migrationKeyID); err != nil {
+	// Narrow the KMS policy to current PCR0 before any decrypt.
+	if err := e.kms.SelfApplyPolicy(ctx, keyID); err != nil {
 		slog.Error("apply KMS policy", "error", err)
 		return fmt.Errorf("apply KMS policy: %w", err)
 	}
 
-	if e.staticSecrets.Len() > 0 {
-		slog.Info("waiting for KMS secrets")
-		if err := e.staticSecrets.WaitForKMS(ctx, migrationKeyID, paramPrefix); err != nil {
-			slog.Error("load secrets from KMS", "error", err)
-			return fmt.Errorf("load secrets from KMS: %w", err)
-		}
-
-		if err := e.staticSecrets.ExtendPCRs(); err != nil {
-			slog.Error("extend PCRs with secret pubkeys", "error", err)
-			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
-		}
+	if err := e.staticSecrets.LoadAll(ctx, keyID, paramPrefix); err != nil {
+		slog.Error("load secrets from KMS", "error", err)
+		return fmt.Errorf("load secrets from KMS: %w", err)
+	}
+	if err := e.staticSecrets.ExtendPCRs(); err != nil {
+		slog.Error("extend PCRs with secret pubkeys", "error", err)
+		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 	}
 
 	slog.Info("initializing storage")
-	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
 	e.migrator.storage = e.storage
-	if err := e.storage.Init(ctx, migrationKeyID, paramPrefix); err != nil {
+	if err := e.storage.Init(ctx, keyID, paramPrefix); err != nil {
 		slog.Error("init storage", "error", err)
 		return fmt.Errorf("init storage: %w", err)
 	}
@@ -194,43 +174,13 @@ func (e *Runtime) Init(ctx context.Context) error {
 		slog.Warn("load dynamic secrets failed", "error", err)
 	}
 
-	if attestDoc, err := e.migrator.ReadPreviousPCR0Attestation(ctx); err == nil {
-		e.previousPCR0Attestation = attestDoc
-
-		// PCR31 in the previous enclave's attestation must equal a hash of
-		// our PCR0 — proving it committed to handing off to us specifically.
-		// Mismatch ⇒ rogue new_pcr0, or an old enclave predating commitment
-		// (PCR31 all zeros).
-		if err := verifyPCR31Commitment(attestDoc, getPCR0()); err != nil {
-			slog.Warn("PCR31 migration commitment verification failed", "error", err)
-		} else {
-			slog.Info("PCR31 migration commitment verified")
+	if migrationKMSKeyID != "" {
+		if err := e.migrator.CompleteMigration(ctx, migrationKMSKeyID); err != nil {
+			slog.Error("complete migration", "error", err)
+			return fmt.Errorf("complete migration: %w", err)
 		}
 	}
 
-	// Atomic commit: promote Migration/* to primary and clear
-	// MigrationKMSKeyID in one ordered sequence (see PromoteToPrimary).
-	if migrationKeyID != "" {
-		slog.Info("promoting migration staging to primary")
-		if err := e.migrator.PromoteToPrimary(ctx, migrationKeyID); err != nil {
-			slog.Error("promote migration to primary", "error", err)
-			return fmt.Errorf("promote migration: %w", err)
-		}
-		slog.Info("migration committed")
-	}
-
-	e.migrator.DeleteOldKMSKey(ctx)
-
-	// Overlay tofu-supplied app.env overrides before the child app forks
-	// (it inherits os.Environ()).
-	if err := e.environment.Override(ctx); err != nil {
-		slog.Error("apply env overrides", "error", err)
-		return fmt.Errorf("apply env overrides: %w", err)
-	}
-
-	// Storage/dynamic/migrator only exist now, so their routes weren't
-	// registered at startup. http.ServeMux is safe under concurrent Handle
-	// calls, so registering against the live server is fine.
 	e.registerGatedRoutes()
 
 	e.initOK.Store(true)
@@ -290,7 +240,7 @@ func (e *Runtime) requireInitDone(next http.Handler) http.Handler {
 }
 
 // requireInitOK is stricter: also rejects when Init completed but failed.
-// Used for export-key — running it on a half-initialised enclave would
+// Used for start-migration — running it on a half-initialised enclave would
 // write garbage into the new enclave's SSM.
 func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -311,7 +261,7 @@ func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 //	GET    /v1/enclave-info
 //	POST   /v1/enclave-metrics
 //	GET    /v1/enclave-metrics
-//	POST   /v1/export-key                 (gated: requireInitOK)
+//	POST   /v1/start-migration            (gated: requireInitOK)
 //	PUT    /v1/storage/{key...}           (gated: requireInitDone)
 //	GET    /v1/storage/{key...}           (gated: requireInitDone)
 //	DELETE /v1/storage/{key...}           (gated: requireInitDone)
@@ -407,13 +357,22 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 			Initializing bool   `json:"initializing"`
 		}{
 			Version:      Version,
-			PreviousPCR0: "genesis",
+			PreviousPCR0: "",
 			Initializing: true,
 		})
 		return
 	}
 
 	cooldownSeconds, cooldownRemaining, migrationPending := e.migrator.CooldownStatus(r.Context())
+
+	previousPCR0 := ""
+	previousPCR0Attestation := ""
+
+	previousPCR0Info, err := e.migrator.GetPreviousPCR0Info(r.Context(), false)
+	if err == nil && previousPCR0Info != nil {
+		previousPCR0 = previousPCR0Info.PCR0
+		previousPCR0Attestation = previousPCR0Info.Attestation
+	}
 
 	_ = json.NewEncoder(w).Encode(struct {
 		Version                    string         `json:"version"`
@@ -427,8 +386,8 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		MigrationPending           bool           `json:"migration_pending"`
 	}{
 		Version:                    Version,
-		PreviousPCR0:               e.previousPCR0,
-		PreviousPCR0Attestation:    e.previousPCR0Attestation,
+		PreviousPCR0:               previousPCR0,
+		PreviousPCR0Attestation:    previousPCR0Attestation,
 		AttestationPubkey:          e.AttestationPubkey(),
 		DynamicSecrets:             e.dynamic.Count(),
 		Metrics:                    enclaveMetrics.MetricsSnapshot(),
@@ -521,4 +480,26 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func generateRuntimeToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := secureRandom(b); err != nil {
+		return "", fmt.Errorf("secure random: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// secureRandom uses the NSM hardware RNG when running inside an enclave and
+// crypto/rand otherwise. Inside an enclave crypto/rand depends on a starved
+// kernel entropy pool (no disk, no network, no HID — only RDRAND), so the
+// NSM RNG is the only trustworthy source. If /dev/nsm opens but GetRandom
+// fails we surface the error rather than fall back to the weak pool.
+func secureRandom(b []byte) (int, error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return rand.Read(b)
+	}
+	defer func() { _ = session.Close() }()
+	return session.Read(b)
 }

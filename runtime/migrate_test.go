@@ -36,78 +36,13 @@ func TestShouldRefuseKeyDeletion_EmptyOld(t *testing.T) {
 	}
 }
 
-// --- Tests for classifyBootRole (covers plan §13) ---
-//
-// The classifier is the failure-mode-agnostic replacement for the old self-heal
-// predicate. It distinguishes "new enclave, promote" from "old enclave after
-// rollback, abort" using only two declarative SSM flags. Every failure mode
-// — wrong previous_pcr0, wrong req.PCR0, KMS error, OOM, EIF corruption,
-// network partition — looks identical to this function: MigrationKMSKeyID is
-// still set, and I'm not the declared MigrationTargetPCR0.
-
-// TestClassifyBootRole_NoMigration: MigrationKMSKeyID empty → normal boot.
-func TestClassifyBootRole_NoMigration(t *testing.T) {
-	if got := classifyBootRole(false, "any", "any"); got != BootRoleNoMigration {
-		t.Fatalf("want BootRoleNoMigration, got %v", got)
-	}
-}
-
-// TestClassifyBootRole_AmTarget: my PCR0 matches the declared target → I'm
-// the new enclave, attempt promotion.
-func TestClassifyBootRole_AmTarget(t *testing.T) {
-	pcr0 := strings.Repeat("a", 96)
-	if got := classifyBootRole(true, pcr0, pcr0); got != BootRoleMigrationTarget {
-		t.Fatalf("want BootRoleMigrationTarget, got %v", got)
-	}
-}
-
-// TestClassifyBootRole_NotTarget: migration in progress but my PCR0 differs
-// from the target. This is the generic failure path — applies to the old
-// enclave after rollback AND any other enclave booted into orphaned migration
-// state. The classifier doesn't care WHY the new enclave failed, only that
-// it didn't commit.
-func TestClassifyBootRole_NotTarget(t *testing.T) {
-	own := strings.Repeat("b", 96)
-	target := strings.Repeat("a", 96)
-	if got := classifyBootRole(true, own, target); got != BootRoleAbortMigration {
-		t.Fatalf("want BootRoleAbortMigration, got %v", got)
-	}
-}
-
-// TestClassifyBootRole_EmptyOwnPCR0: NSM unavailable — cannot prove identity.
-// Treat as abort (cannot safely attempt promotion with unknown PCR0).
-func TestClassifyBootRole_EmptyOwnPCR0(t *testing.T) {
-	target := strings.Repeat("a", 96)
-	if got := classifyBootRole(true, "", target); got != BootRoleAbortMigration {
-		t.Fatalf("empty ownPCR0 should abort (cannot prove target match), got %v", got)
-	}
-}
-
-// TestClassifyBootRole_EmptyTarget: migration flag set but target not yet
-// written (supervisor crashed between writes). Safe outcome: abort, which will
-// clear MigrationKMSKeyID so the half-setup state doesn't block future boots.
-func TestClassifyBootRole_EmptyTarget(t *testing.T) {
-	own := strings.Repeat("a", 96)
-	if got := classifyBootRole(true, own, ""); got != BootRoleAbortMigration {
-		t.Fatalf("empty target with migration-in-progress should abort, got %v", got)
-	}
-}
-
-// TestClassifyBootRole_BothEmpty: NSM failed AND target unset. Still abort
-// — no data to make a promotion decision on.
-func TestClassifyBootRole_BothEmpty(t *testing.T) {
-	if got := classifyBootRole(true, "", ""); got != BootRoleAbortMigration {
-		t.Fatalf("both empty with migration-in-progress should abort, got %v", got)
-	}
-}
-
 // --- Tests for migration-mode SSM param path routing (covers plan test #1) ---
 
 // TestGetSecretSSMParamName_Primary: primary mode uses no prefix.
 func TestGetSecretSSMParamName_Primary(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	got := secretParamName("signing-key", "")
+	got := secretParamName("signing-key", PrimaryPrefix)
 	want := "/dev/my-app/signing-key/Ciphertext"
 	if got != want {
 		t.Fatalf("primary mode: got %q, want %q", got, want)
@@ -119,7 +54,7 @@ func TestGetSecretSSMParamName_Primary(t *testing.T) {
 func TestGetSecretSSMParamName_Migration(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	got := secretParamName("signing-key", "Migration/")
+	got := secretParamName("signing-key", MigrationPrefix)
 	want := "/dev/my-app/Migration/signing-key/Ciphertext"
 	if got != want {
 		t.Fatalf("migration mode: got %q, want %q", got, want)
@@ -132,8 +67,8 @@ func TestGetSecretSSMParamName_Migration(t *testing.T) {
 func TestGetSecretSSMParamName_IsolationInvariant(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
-	primary := secretParamName("secret1", "")
-	migration := secretParamName("secret1", "Migration/")
+	primary := secretParamName("secret1", PrimaryPrefix)
+	migration := secretParamName("secret1", MigrationPrefix)
 	if primary == migration {
 		t.Fatalf("primary and migration paths must differ; both = %q", primary)
 	}

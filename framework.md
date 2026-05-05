@@ -148,7 +148,7 @@ Handles both fresh deployments and upgrades:
 
 **Upgrade (locked KMS — irreversible key):**
 - Creates temporary KMS key bound to new PCR0
-- Old enclave re-encrypts all secrets with temporary key via `/v1/export-key`
+- Old enclave re-encrypts all secrets with temporary key via `/v1/start-migration`
 - New enclave boots with migrated secrets
 - Old KMS key scheduled for deletion
 
@@ -245,7 +245,7 @@ The supervisor is the main process inside the enclave. It:
 5. **Spawns user app** — Runs the user's binary as a child process with secrets as env vars
 6. **Reverse proxies** — Routes all non-management traffic to the user app
 7. **Signs responses** — Schnorr BIP-340 signature on every response
-8. **Handles upgrades** — `/v1/export-key` and `/v1/prepare-upgrade` endpoints
+8. **Handles upgrades** — `/v1/start-migration` and `/v1/prepare-upgrade` endpoints
 
 ### Management Endpoints
 
@@ -254,7 +254,7 @@ The supervisor is the main process inside the enclave. It:
 | `/v1/enclave-info` | GET | Version, PCR0 history, attestation pubkey, init status |
 | `/v1/extend-pcr` | POST | Extend user PCR (16-31) with custom data |
 | `/v1/lock-pcr` | POST | Lock a user PCR against further extension |
-| `/v1/export-key` | POST | Re-encrypt secrets for migration (upgrade) |
+| `/v1/start-migration` | POST | Re-encrypt secrets for migration (upgrade) |
 | `/v1/prepare-upgrade` | POST | Store PCR0 + attestation for upgrade chain |
 | `/health` | GET | Readiness probe (200 ready, 503 initializing) |
 

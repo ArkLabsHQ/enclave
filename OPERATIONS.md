@@ -99,7 +99,7 @@ The `enclave migrate` command performs a locked-key migration in 9 steps:
 2. Create new KMS key with transitional policy
 3. Apply transitional KMS policy (Encrypt + PutKeyPolicy, no Decrypt)
 4. Store migration parameters in SSM
-5. Call `POST /v1/export-key` on old enclave (re-encrypts secrets under new key)
+5. Call `POST /v1/start-migration` on old enclave (re-encrypts secrets under new key)
 6. Poll for migration ciphertexts in SSM
 7. Adopt ciphertexts and update KMS key ID
 8. Download new EIF, stop old enclave, replace, restart

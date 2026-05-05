@@ -280,18 +280,18 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	emit(4, "progress", "Migration KMS key IDs stored in SSM")
 
-	// Step 5: Call export-key on the running enclave.
+	// Step 5: Call start-migration on the running enclave.
 	// The enclave replaces the transitional policy with the final
 	// PCR0-locked one (targeting the new enclave's PCR0) before encrypting
 	// any secret under this key, so no decryptable ciphertext can exist
 	// under a policy mutable by supervisor.
-	emit(5, "progress", "Calling export-key on old enclave...")
-	if err := m.callExportKey(ctx, newKMSKeyID, req.PCR0); err != nil {
+	emit(5, "progress", "Calling start-migration on old enclave...")
+	if err := m.callStartMigration(ctx, newKMSKeyID, req.PCR0); err != nil {
 		rollbackKey()
-		emitErr(5, fmt.Sprintf("export-key failed: %v", err))
+		emitErr(5, fmt.Sprintf("start-migration failed: %v", err))
 		return
 	}
-	emit(5, "progress", "Export-key succeeded")
+	emit(5, "progress", "Start-migration succeeded")
 
 	// Step 6: Poll for migration ciphertexts.
 	emit(6, "progress", "Waiting for migration ciphertexts...")
@@ -434,7 +434,11 @@ func (m *Migration) waitForMigrationCommit(ctx context.Context, timeout time.Dur
 
 // rollbackMigration restores the old EIF and restarts the old enclave.
 // Migration SSM flags stay set so the restarted enclave's Init can run
-// abortOrphanedMigration, which clears them and re-asserts MigrationPreviousPCR0.
+// AbortOrphaned, which clears the in-flight flags + the staging chain
+// proof (Migration/PreviousPCR0, Migration/PreviousPCR0Attestation) that
+// the failed start-migration wrote. Primary chain keys (MigrationPreviousPCR0,
+// MigrationPreviousPCR0Attestation) are untouched, so the rolled-back
+// enclave's /v1/enclave-info still reports the true predecessor.
 func (m *Migration) rollbackMigration(ctx context.Context, eifDest, eifBackup, stopCmd, startCmd, failedKeyID string, emit func(step int, status, msg string)) {
 	emit(9, "rollback", "Initiating rollback...")
 
@@ -499,7 +503,7 @@ func (m *Migration) atomicSupervisorUpdate(ctx context.Context, bucket, key stri
 	return nil
 }
 
-func (m *Migration) callExportKey(ctx context.Context, migrationKeyID, newPCR0 string) error {
+func (m *Migration) callStartMigration(ctx context.Context, migrationKeyID, newPCR0 string) error {
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -508,7 +512,7 @@ func (m *Migration) callExportKey(ctx context.Context, migrationKeyID, newPCR0 s
 		},
 	}
 	body := fmt.Sprintf(`{"migration_key_id":%q,"new_pcr0":%q}`, migrationKeyID, newPCR0)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/export-key", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/start-migration", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -520,7 +524,7 @@ func (m *Migration) callExportKey(ctx context.Context, migrationKeyID, newPCR0 s
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("export-key returned %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("start-migration returned %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
@@ -708,7 +712,7 @@ func assumedRoleARNToRoleARN(arn string) string {
 // Grants Encrypt + PutKeyPolicy to the EC2 role so the running enclave can
 // replace this with the final PCR0-locked policy before encrypting any
 // secret. Intentionally omits Decrypt — the running enclave adds that,
-// gated on the new enclave's PCR0, inside handleExportKey.
+// gated on the new enclave's PCR0, inside handleStartMigration.
 func buildTransitionalPolicy(ec2RoleARN, accountRoot string) string {
 	return fmt.Sprintf(`{
   "Version": "2012-10-17",

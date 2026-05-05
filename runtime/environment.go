@@ -34,13 +34,6 @@ func getAppName() string {
 	return "app"
 }
 
-func getPreviousPCR0() string {
-	if v := strings.TrimSpace(os.Getenv("ENCLAVE_PREVIOUS_PCR0")); v != "" {
-		return v
-	}
-	return "genesis"
-}
-
 func getStaticSecretsConfig() string {
 	return os.Getenv("ENCLAVE_SECRETS_CONFIG")
 }
@@ -103,8 +96,19 @@ func spanBufferSize() int {
 	return 1000
 }
 
-// secretParamName: prefix is "" for primary storage, "Migration/" for staging.
-func secretParamName(secretName, prefix string) string {
+// ParamPrefix selects the SSM parameter namespace for ciphertext reads/writes.
+// PrimaryPrefix targets the canonical paths; MigrationPrefix targets the
+// /Migration/* staging paths used during a locked-key migration.
+type ParamPrefix string
+
+const (
+	PrimaryPrefix   ParamPrefix = ""
+	MigrationPrefix ParamPrefix = "Migration/"
+)
+
+// secretParamName builds the SSM path for a secret's ciphertext, scoped by
+// ParamPrefix.
+func secretParamName(secretName string, prefix ParamPrefix) string {
 	return fmt.Sprintf("/%s/%s/%s%s/Ciphertext", getDeployment(), getAppName(), prefix, secretName)
 }
 

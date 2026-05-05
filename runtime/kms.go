@@ -113,7 +113,7 @@ func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 // keyID specifies which KMS key to operate on. Pass empty string to use
 // the primary key from SSM. In migration mode, callers pass the
 // migration key ID so the enclave operates on the transitional key that
-// was already locked by the old enclave's handleExportKey.
+// was already locked by the old enclave's handleStartMigration.
 //
 // Idempotent: if the policy already contains the correct PCR0, or if
 // the key is locked (no PutKeyPolicy permission), the function returns nil.

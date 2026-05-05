@@ -73,12 +73,6 @@ variable "migration_cooldown" {
   default     = "0s"
 }
 
-variable "previous_pcr0" {
-  description = "Previous PCR0 hash for migration chain validation."
-  type        = string
-  default     = "genesis"
-}
-
 variable "expected_pcr0" {
   description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
   type        = string
@@ -985,7 +979,6 @@ resource "aws_instance" "nitro" {
     eif_s3_url                = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     supervisor_binary_s3_url  = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
     migration_cooldown        = var.migration_cooldown
-    previous_pcr0             = var.previous_pcr0
   })
 
   tags = {

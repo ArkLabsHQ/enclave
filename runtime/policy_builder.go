@@ -10,28 +10,14 @@ import (
 // KMS policy builder — fluent construction of locked KMS key policies.
 // =============================================================================
 
-// KMSPolicyBuilder constructs a locked KMS key policy via chained method
-// calls. The locked policy restricts Decrypt to a specific PCR0 via Nitro
-// attestation, grants Encrypt/GenerateDataKey/GetKeyPolicy to the enclave
-// role, and (in strict mode) revokes PutKeyPolicy from everyone — making
-// the key immutably bound to the enclave that built it.
-//
-// Usage:
-//
-//	policy := NewKMSPolicyBuilder().
-//	    ForRole(ec2RoleARN).
-//	    LockedToPCR0Values([]string{pcr0}).
-//	    WithRootRecovery(accountID). // omit for strict mode
-//	    Build()
-//
-// Driven by the ENCLAVE_KMS_KEY_LOCKED env var: callers should skip
-// WithRootRecovery when ENCLAVE_KMS_KEY_LOCKED=true, include it otherwise.
-// The choice is permanent at first lock — cannot be added or removed after.
+// KMSPolicyBuilder builds the locked KMS key policy passed to CreateKey.
+// Decrypt is PCR0-attestation-gated; the EC2 role gets Encrypt /
+// GenerateDataKey / GetKeyPolicy / ScheduleKeyDeletion (no PutKeyPolicy).
+// WithRootRecovery is the only path to mutate the policy post-creation.
 type KMSPolicyBuilder struct {
 	roleARN         string
 	pcr0Values      []string
 	recoveryAccount string
-	putKeyPolicy    bool
 }
 
 // NewKMSPolicyBuilder returns an empty builder.
@@ -48,17 +34,9 @@ func (b *KMSPolicyBuilder) ForRole(arn string) *KMSPolicyBuilder {
 
 // LockedToPCR0Values gates Decrypt on the Nitro attestation condition,
 // admitting any of the given PCR0 hashes (implicit OR). At least one is
-// required; handleStartMigration passes [oldPCR0, newPCR0].
+// required; CreateMigrationKey passes [oldPCR0, newPCR0].
 func (b *KMSPolicyBuilder) LockedToPCR0Values(pcr0s []string) *KMSPolicyBuilder {
 	b.pcr0Values = pcr0s
-	return b
-}
-
-// WithPutKeyPolicy adds kms:PutKeyPolicy to the EnclaveOperations statement
-// so the new enclave can call SelfApplyPolicy to narrow the policy after
-// migration. Only used in handleStartMigration; not set by SelfApplyPolicy.
-func (b *KMSPolicyBuilder) WithPutKeyPolicy() *KMSPolicyBuilder {
-	b.putKeyPolicy = true
 	return b
 }
 
@@ -74,12 +52,6 @@ func (b *KMSPolicyBuilder) WithRootRecovery(account string) *KMSPolicyBuilder {
 // Build assembles the JSON policy document.
 func (b *KMSPolicyBuilder) Build() string {
 	condVal, _ := json.Marshal(b.pcr0Values)
-
-	opsActions := `["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"]`
-	if b.putKeyPolicy {
-		opsActions = `["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey", "kms:PutKeyPolicy"]`
-	}
-
 	roleJSON, _ := json.Marshal(b.roleARN)
 	base := fmt.Sprintf(`    {
       "Sid": "EnclaveDecryptWithAttestation",
@@ -97,7 +69,7 @@ func (b *KMSPolicyBuilder) Build() string {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %s},
-      "Action": %s,
+      "Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
       "Resource": "*"
     },
     {
@@ -106,7 +78,7 @@ func (b *KMSPolicyBuilder) Build() string {
       "Principal": {"AWS": %s},
       "Action": "kms:ScheduleKeyDeletion",
       "Resource": "*"
-    }`, roleJSON, condVal, roleJSON, opsActions, roleJSON)
+    }`, roleJSON, condVal, roleJSON, roleJSON)
 
 	if b.recoveryAccount != "" {
 		base += fmt.Sprintf(`,
@@ -181,71 +153,44 @@ func arnAccount(arn string) (string, error) {
 	return parts[4], nil
 }
 
-// parseKMSPolicyState parses a KMS key policy JSON and returns:
-//   - hasPCR0: whether any statement's Condition references the given PCR0 value
-//   - hasPutKeyPolicy: whether any statement grants "kms:PutKeyPolicy" or "kms:*"
-func parseKMSPolicyState(policyJSON, pcr0 string) (hasPCR0, hasPutKeyPolicy bool) {
+// policyAdmitsPCR0: true iff some kms:RecipientAttestation:PCR0 condition
+// matches pcr0 (single value or array, case-insensitive).
+func policyAdmitsPCR0(policyJSON, pcr0 string) bool {
 	if policyJSON == "" {
-		return false, false
+		return false
 	}
-
 	var policy struct {
 		Statement []struct {
-			Action    json.RawMessage        `json:"Action"`
 			Condition map[string]interface{} `json:"Condition"`
 		} `json:"Statement"`
 	}
 	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
-		return false, false
+		return false
 	}
-
 	for _, stmt := range policy.Statement {
-		// Check if this statement's condition references our PCR0.
 		for _, condOps := range stmt.Condition {
-			if ops, ok := condOps.(map[string]interface{}); ok {
-				for key, val := range ops {
-					if strings.Contains(strings.ToLower(key), "pcr0") {
-						switch v := val.(type) {
-						case string:
-							if strings.EqualFold(v, pcr0) {
-								hasPCR0 = true
-							}
-						case []interface{}:
-							for _, item := range v {
-								if s, ok := item.(string); ok && strings.EqualFold(s, pcr0) {
-									hasPCR0 = true
-								}
-							}
+			ops, ok := condOps.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			for key, val := range ops {
+				if !strings.Contains(strings.ToLower(key), "pcr0") {
+					continue
+				}
+				switch v := val.(type) {
+				case string:
+					if strings.EqualFold(v, pcr0) {
+						return true
+					}
+				case []interface{}:
+					for _, item := range v {
+						if s, ok := item.(string); ok && strings.EqualFold(s, pcr0) {
+							return true
 						}
 					}
 				}
 			}
 		}
-
-		// Check if this statement grants PutKeyPolicy or kms:*.
-		actions := parseActions(stmt.Action)
-		for _, a := range actions {
-			if a == "kms:PutKeyPolicy" || a == "kms:*" {
-				hasPutKeyPolicy = true
-			}
-		}
 	}
-	return
-}
-
-// parseActions extracts action strings from a JSON value that can be
-// either a single string or an array of strings.
-func parseActions(raw json.RawMessage) []string {
-	if raw == nil {
-		return nil
-	}
-	var single string
-	if err := json.Unmarshal(raw, &single); err == nil {
-		return []string{single}
-	}
-	var multi []string
-	if err := json.Unmarshal(raw, &multi); err == nil {
-		return multi
-	}
-	return nil
+	return false
 }

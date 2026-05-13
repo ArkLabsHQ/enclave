@@ -18,7 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hf/nsm"
 )
 
@@ -132,16 +131,15 @@ func (m *Migrator) CooldownStatus(ctx context.Context) (configuredSeconds, remai
 	return configuredSeconds, int(rem.Seconds()), true
 }
 
-// handleStartMigration re-encrypts secrets + DEK under the migration key
-// (locked to [ownPCR0, newPCR0]) into its key-scoped SSM paths, verifies them,
-// then flips KMSKeyID (one atomic write) and schedules the old key for deletion.
+// handleStartMigration mints the migration key PCR0-locked at birth, re-encrypts
+// secrets + DEK into its key-scoped SSM paths, verifies them, then flips
+// KMSKeyID (one atomic write) and schedules the old key for deletion.
 func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MigrationKeyID string `json:"migration_key_id"`
-		NewPCR0        string `json:"new_pcr0"`
+		NewPCR0 string `json:"new_pcr0"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MigrationKeyID == "" || req.NewPCR0 == "" {
-		http.Error(w, "migration_key_id and new_pcr0 are required in request body", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewPCR0 == "" {
+		http.Error(w, "new_pcr0 is required in request body", http.StatusBadRequest)
 		return
 	}
 	if len(req.NewPCR0) != 96 {
@@ -156,7 +154,6 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
-	migrationKeyID := req.MigrationKeyID
 
 	ownPCR0 := getPCR0()
 	if ownPCR0 == "" {
@@ -172,58 +169,32 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	currentPolicy, err := m.aws.KMS.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId:      aws.String(migrationKeyID),
-		PolicyName: aws.String("default"),
-	})
+	// Mint the migration key with the final PCR0-locked policy in one call.
+	// No external principal ever holds authority over the key.
+	migrationKeyID, err := m.kms.CreateMigrationKey(ctx, ownPCR0, req.NewPCR0)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("get migration key policy: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("create migration key: %v", err), http.StatusInternalServerError)
 		return
 	}
-	currentPolicyText := ""
-	if currentPolicy.Policy != nil {
-		currentPolicyText = *currentPolicy.Policy
-	}
-	ownLocked, _ := parseKMSPolicyState(currentPolicyText, ownPCR0)
-	newLocked, _ := parseKMSPolicyState(currentPolicyText, req.NewPCR0)
-	if ownLocked && newLocked {
-		slog.Info("migration key already locked to both PCR0s, skipping PutKeyPolicy",
-			"key_id", migrationKeyID)
-	} else {
-		identity, err := m.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("sts get-caller-identity: %v", err), http.StatusInternalServerError)
+	slog.Info("created migration KMS key", "key_id", migrationKeyID, "own_pcr0", prefix16(ownPCR0), "new_pcr0", prefix16(req.NewPCR0))
+
+	committed := false
+	defer func() {
+		if committed {
 			return
 		}
-		roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("resolve IAM role ARN: %v", err), http.StatusInternalServerError)
-			return
+		pendingDays := keyDeletionPendingDays
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, derr := m.aws.KMS.ScheduleKeyDeletion(cleanupCtx, &kms.ScheduleKeyDeletionInput{
+			KeyId:               aws.String(migrationKeyID),
+			PendingWindowInDays: &pendingDays,
+		}); derr != nil {
+			slog.Warn("schedule unused migration key for deletion failed", "key_id", migrationKeyID, "error", derr)
+		} else {
+			slog.Info("scheduled unused migration key for deletion (handleStartMigration failed before commit)", "key_id", migrationKeyID)
 		}
-		builder := NewKMSPolicyBuilder().
-			ForRole(roleARN).
-			LockedToPCR0Values([]string{ownPCR0, req.NewPCR0}).
-			WithPutKeyPolicy()
-		if !kmsKeyLocked() {
-			account, err := arnAccount(*identity.Arn)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("resolve AWS account ID for recovery principal: %v", err), http.StatusInternalServerError)
-				return
-			}
-			builder = builder.WithRootRecovery(account)
-		}
-		if _, err := m.aws.KMS.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-			KeyId:                          aws.String(migrationKeyID),
-			Policy:                         aws.String(builder.Build()),
-			PolicyName:                     aws.String("default"),
-			BypassPolicyLockoutSafetyCheck: true,
-		}); err != nil {
-			http.Error(w, fmt.Sprintf("lock migration key policy: %v", err), http.StatusInternalServerError)
-			return
-		}
-		slog.Info("applied dual-PCR0 policy to migration key",
-			"key_id", migrationKeyID, "own_pcr0", prefix16(ownPCR0), "new_pcr0", prefix16(req.NewPCR0))
-	}
+	}()
 
 	type encryptedSecret struct {
 		name          string
@@ -296,6 +267,7 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, fmt.Sprintf("update KMSKeyID: %v", err), http.StatusInternalServerError)
 		return
 	}
+	committed = true
 	slog.Info("KMSKeyID updated to migration key", "key_id", migrationKeyID)
 
 	// Schedule old key for deletion (best-effort — failure is non-fatal).

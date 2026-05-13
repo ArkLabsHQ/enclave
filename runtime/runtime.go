@@ -112,16 +112,15 @@ func (e *Runtime) Init(ctx context.Context) error {
 	// start-migration isn't reachable before initOK, so the late wire-up is safe.
 	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
 
-	keyID, err := e.kms.GetKeyID(ctx)
+	keyID, err := e.kms.EnsureKeyID(ctx)
 	if err != nil {
-		slog.Error("get KMS key ID", "error", err)
-		return fmt.Errorf("get KMS key ID: %w", err)
+		slog.Error("ensure KMS key ID", "error", err)
+		return fmt.Errorf("ensure KMS key ID: %w", err)
 	}
 
-	// Narrow the KMS policy to current PCR0 before any decrypt.
-	if err := e.kms.SelfApplyPolicy(ctx, keyID); err != nil {
-		slog.Error("apply KMS policy", "error", err)
-		return fmt.Errorf("apply KMS policy: %w", err)
+	if err := e.kms.VerifyKeyAuthorization(ctx, keyID); err != nil {
+		slog.Error("verify KMS key admits us", "error", err)
+		return fmt.Errorf("verify KMS key admits us: %w", err)
 	}
 
 	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {

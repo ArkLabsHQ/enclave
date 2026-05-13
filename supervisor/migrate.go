@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 const eifPath = "/home/ec2-user/app/server/enclave.eif"
@@ -82,19 +81,17 @@ type migrateStatus struct {
 	Message string `json:"message"`
 }
 
-const migrateTotalSteps = 9
+const migrateTotalSteps = 7
 
 const (
-	stepCooldown                = 0
-	stepReadCurrentKey          = 1
-	stepCreateMigrationKey      = 2
-	stepApplyTransitionalPolicy = 3
-	stepStartMigration          = 4
-	stepDownloadEIF             = 5
-	stepSwapAndStart            = 6
-	stepWaitOutcome             = 7
-	stepHostCleanup             = 8
-	stepSupervisorUpdate        = 9
+	stepCooldown         = 0
+	stepReadCurrentKey   = 1
+	stepStartMigration   = 2
+	stepDownloadEIF      = 3
+	stepSwapAndStart     = 4
+	stepWaitOutcome      = 5
+	stepHostCleanup      = 6
+	stepSupervisorUpdate = 7
 )
 
 const (
@@ -156,10 +153,10 @@ func (e *migrateEmitter) warnf(step int, format string, args ...any) {
 	e.warn(step, fmt.Sprintf(format, args...))
 }
 
-// handleMigrate orchestrates the 11-step locked-key KMS migration handshake
-// plus the optional supervisor self-update tail. Each step is delegated to
-// a focused helper; this function owns only sequencing and the rollback
-// decision tree.
+// handleMigrate orchestrates the migration handshake plus the optional
+// supervisor self-update tail. The enclave creates and lifecycle-manages the
+// migration KMS key internally; the supervisor only sequences cooldown, EIF
+// swap, health-poll, and rollback.
 func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	if !m.migrateMu.TryLock() {
 		http.Error(w, `{"error":"migration already in progress"}`, http.StatusConflict)
@@ -186,22 +183,9 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newKMSKeyID, err := m.acquireMigrationKey(ctx, p, req.PCR0)
-	if err != nil {
+	if err := m.invokeStartMigration(ctx, p, req.PCR0); err != nil {
 		return
 	}
-
-	rollbackKey := m.makeKeyRollback(ctx, newKMSKeyID)
-
-	if err := m.applyTransitionalPolicy(ctx, p, newKMSKeyID); err != nil {
-		rollbackKey()
-		return
-	}
-	if err := m.invokeStartMigration(ctx, p, newKMSKeyID, req.PCR0); err != nil {
-		rollbackKey()
-		return
-	}
-	rollbackKey = func() {} // KMSKeyID updated — migration key is now primary, do not delete
 
 	eifDest := envOrDefault("ENCLAVE_EIF_PATH", eifPath)
 	eifBackup := eifDest + ".backup"
@@ -211,7 +195,7 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	if err := m.stageNewEIF(ctx, p, req, eifDest, eifBackup); err != nil {
 		return
 	}
-	if err := m.swapAndStart(ctx, p, eifDest, eifBackup, stopCmd, startCmd, rollbackKey); err != nil {
+	if err := m.swapAndStart(ctx, p, eifDest, eifBackup, stopCmd, startCmd); err != nil {
 		return // rollback already performed
 	}
 	if !m.awaitMigrationOutcome(ctx, p, eifDest, eifBackup, stopCmd, startCmd) {
@@ -221,7 +205,8 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	m.cleanupHostArtifacts(p, eifBackup)
 	exitAfter := m.maybeUpdateSupervisor(ctx, p, req)
 
-	p.complete(stepSupervisorUpdate, fmt.Sprintf("Migration complete. New KMS key: %s", newKMSKeyID))
+	newKeyID, _ := m.getParam(ctx, "KMSKeyID")
+	p.complete(stepSupervisorUpdate, fmt.Sprintf("Migration complete. New KMS key: %s", newKeyID))
 
 	if exitAfter && m.requestShutdown != nil {
 		m.requestShutdown()
@@ -318,76 +303,12 @@ func (m *Migration) readCurrentKMSKey(ctx context.Context, p *migrateEmitter) (s
 	return keyID, nil
 }
 
-func (m *Migration) acquireMigrationKey(ctx context.Context, p *migrateEmitter, targetPCR0 string) (string, error) {
-	p.progress(stepCreateMigrationKey, "Creating migration KMS key...")
-	pcr0Short := targetPCR0
-	if len(pcr0Short) > 16 {
-		pcr0Short = pcr0Short[:16]
-	}
-	out, err := m.aws.KMS.CreateKey(ctx, &kms.CreateKeyInput{
-		Description: aws.String(fmt.Sprintf("migration key for PCR0 %s...", pcr0Short)),
-	})
-	if err != nil {
-		p.errorf(stepCreateMigrationKey, "create KMS key: %v", err)
-		return "", err
-	}
-	keyID := *out.KeyMetadata.KeyId
-	p.progressf(stepCreateMigrationKey, "Created KMS key: %s", keyID)
-	return keyID, nil
-}
-
-// makeKeyRollback returns a closure that schedules keyID for deletion, unless
-// KMSKeyID already points at it .
-func (m *Migration) makeKeyRollback(ctx context.Context, keyID string) func() {
-	return func() {
-		current, err := m.getParam(ctx, "KMSKeyID")
-		if err != nil {
-			slog.Error("rollback: cannot read KMSKeyID, refusing to delete migration key (may leak)", "key_id", keyID, "error", err)
-			return
-		}
-		if current == keyID {
-			slog.Error("rollback: KMSKeyID points at this key — migration committed, refusing deletion", "key_id", keyID)
-			return
-		}
-		pendingDays := int32(keyDeletionPendingDays)
-		if _, err := m.aws.KMS.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
-			KeyId:               aws.String(keyID),
-			PendingWindowInDays: &pendingDays,
-		}); err != nil {
-			slog.Warn("failed to schedule orphaned key for deletion", "key_id", keyID, "error", err)
-		} else {
-			slog.Info("scheduled orphaned key for deletion", "key_id", keyID, "pending_days", keyDeletionPendingDays)
-		}
-	}
-}
-
-func (m *Migration) applyTransitionalPolicy(ctx context.Context, p *migrateEmitter, keyID string) error {
-	p.progress(stepApplyTransitionalPolicy, "Applying transitional KMS policy...")
-	roleARN, accountID, err := m.getCallerRole(ctx)
-	if err != nil {
-		p.errorf(stepApplyTransitionalPolicy, "get caller identity: %v", err)
-		return err
-	}
-	policy := buildTransitionalPolicy(roleARN, fmt.Sprintf("arn:aws:iam::%s:root", accountID))
-	if _, err := m.aws.KMS.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-		KeyId:      aws.String(keyID),
-		Policy:     aws.String(policy),
-		PolicyName: aws.String("default"),
-	}); err != nil {
-		p.errorf(stepApplyTransitionalPolicy, "apply transitional policy: %v", err)
-		return err
-	}
-	p.progress(stepApplyTransitionalPolicy, "Transitional KMS policy applied")
-	return nil
-}
-
 // invokeStartMigration calls /v1/start-migration on the running enclave.
-// The enclave replaces the transitional policy with the final PCR0-locked
-// one before encrypting any secret under the new key, so no decryptable
-// ciphertext can exist under a supervisor-mutable policy.
-func (m *Migration) invokeStartMigration(ctx context.Context, p *migrateEmitter, newKMSKeyID, targetPCR0 string) error {
+// The enclave creates the migration key with the final PCR0-locked policy at
+// CreateKey time, re-encrypts secrets under it, then flips KMSKeyID.
+func (m *Migration) invokeStartMigration(ctx context.Context, p *migrateEmitter, targetPCR0 string) error {
 	p.progress(stepStartMigration, "Calling start-migration on old enclave...")
-	if err := m.callStartMigration(ctx, newKMSKeyID, targetPCR0); err != nil {
+	if err := m.callStartMigration(ctx, targetPCR0); err != nil {
 		p.errorf(stepStartMigration, "start-migration failed: %v", err)
 		return err
 	}
@@ -415,15 +336,13 @@ func (m *Migration) stageNewEIF(ctx context.Context, p *migrateEmitter, req migr
 }
 
 // swapAndStart stops the old enclave, swaps the EIF, and starts the new one.
-// On any failure after the swap begins it triggers the appropriate rollback
-// (key-only when the swap itself failed and the old enclave was already
-// restored inline; full rollbackMigration when the new enclave fails to
-// start). Returns nil on success; non-nil means rollback already ran.
+// On failure after the swap it restores the v2 EIF and restarts it. The
+// enclave's handleStartMigration owns its own key cleanup; the supervisor
+// no longer schedules migration-key deletion.
 func (m *Migration) swapAndStart(
 	ctx context.Context,
 	p *migrateEmitter,
 	eifDest, eifBackup, stopCmd, startCmd string,
-	rollbackKey func(),
 ) error {
 	p.progress(stepSwapAndStart, "Stopping old enclave...")
 	if err := m.lifecycle.Stop(ctx, stopCmd); err != nil {
@@ -438,7 +357,6 @@ func (m *Migration) swapAndStart(
 			// the system always has a healthy enclave running.
 			_ = os.Rename(eifBackup, eifDest)
 			_ = m.lifecycle.Start(ctx, startCmd)
-			rollbackKey()
 			p.errorf(stepSwapAndStart, "replace EIF: %v", cpErr)
 			return cpErr
 		}
@@ -593,7 +511,7 @@ func (m *Migration) atomicSupervisorUpdate(ctx context.Context, bucket, key stri
 	return nil
 }
 
-func (m *Migration) callStartMigration(ctx context.Context, migrationKeyID, newPCR0 string) error {
+func (m *Migration) callStartMigration(ctx context.Context, newPCR0 string) error {
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
 	client := &http.Client{
 		Timeout: 2 * time.Minute,
@@ -601,7 +519,7 @@ func (m *Migration) callStartMigration(ctx context.Context, migrationKeyID, newP
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	body := fmt.Sprintf(`{"migration_key_id":%q,"new_pcr0":%q}`, migrationKeyID, newPCR0)
+	body := fmt.Sprintf(`{"new_pcr0":%q}`, newPCR0)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, enclaveURL+"/v1/start-migration", strings.NewReader(body))
 	if err != nil {
 		return err
@@ -740,81 +658,6 @@ func (m *Migration) downloadS3Object(ctx context.Context, bucket, key, destPath 
 		return err
 	}
 	return os.Rename(tmp, destPath)
-}
-
-func (m *Migration) getCallerRole(ctx context.Context) (roleARN, accountID string, err error) {
-	out, err := m.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return "", "", err
-	}
-	accountID = *out.Account
-	roleARN = assumedRoleARNToRoleARN(*out.Arn)
-	return roleARN, accountID, nil
-}
-
-// assumedRoleARNToRoleARN converts an STS assumed-role ARN to an IAM role ARN.
-// e.g. arn:aws:sts::123456:assumed-role/MyRole/session → arn:aws:iam::123456:role/MyRole
-func assumedRoleARNToRoleARN(arn string) string {
-	if !strings.Contains(arn, ":assumed-role/") {
-		return arn
-	}
-	parts := strings.Split(arn, ":")
-	if len(parts) < 6 {
-		return arn
-	}
-	resource := parts[5]
-	segments := strings.Split(resource, "/")
-	if len(segments) < 2 {
-		return arn
-	}
-	roleName := segments[1]
-	parts[2] = "iam"
-	parts[5] = "role/" + roleName
-	return strings.Join(parts[:6], ":")
-}
-
-// buildTransitionalPolicy returns a KMS key policy for locked-key migration.
-// Grants Encrypt + PutKeyPolicy to the EC2 role so the running enclave can
-// replace this with the final PCR0-locked policy before encrypting any
-// secret. Intentionally omits Decrypt — the running enclave adds that,
-// gated on the new enclave's PCR0, inside handleStartMigration.
-func buildTransitionalPolicy(ec2RoleARN, accountRoot string) string {
-	return fmt.Sprintf(`{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "Enable encrypt and self-apply from enclave",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": [
-        "kms:Encrypt",
-        "kms:GetKeyPolicy",
-        "kms:PutKeyPolicy"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "Enable key administration (no decrypt)",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": [
-        "kms:DescribeKey",
-        "kms:GetKeyPolicy",
-        "kms:GetKeyRotationStatus",
-        "kms:ListResourceTags",
-        "kms:PutKeyPolicy",
-        "kms:EnableKeyRotation",
-        "kms:DisableKeyRotation",
-        "kms:TagResource",
-        "kms:UntagResource",
-        "kms:ScheduleKeyDeletion",
-        "kms:CancelKeyDeletion",
-        "kms:Encrypt"
-      ],
-      "Resource": "*"
-    }
-  ]
-}`, ec2RoleARN, accountRoot)
 }
 
 // copyFile copies src to dst as a fallback when rename fails (cross-device).

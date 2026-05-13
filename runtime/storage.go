@@ -64,20 +64,10 @@ func (s *Storage) HasDEK() bool { return s != nil && s.dek != nil }
 // DEK returns the in-memory DEK (used by Migration.exportStorageDEK).
 func (s *Storage) DEK() []byte { return s.dek }
 
-// Init initializes the encrypted persistent storage subsystem.
-// It reads the bucket name from SSM and loads (or generates) the DEK.
-//
-// If no storage bucket is provisioned (StorageBucketName param missing),
-// storage is silently disabled — Store/Load/Delete return errors.
-//
-// keyID specifies the KMS key for DEK operations. prefix selects the SSM
-// namespace: PrimaryPrefix reads/writes the canonical DEK; MigrationPrefix
-// reads the staged DEK during a locked-key migration.
-//
-// In migration mode (prefix == MigrationPrefix), this function NEVER
-// generates a fresh DEK — the staged param MUST exist or Init fails.
-// Generating a fresh DEK in migration mode would orphan all S3 data.
-func (s *Storage) Init(ctx context.Context, keyID string, prefix ParamPrefix) error {
+// Init loads (or, on the first boot for keyID, generates) the storage DEK from
+// its key-scoped SSM path. If no bucket is provisioned (StorageBucketName param
+// missing), storage is silently disabled and Store/Load/Delete return errors.
+func (s *Storage) Init(ctx context.Context, keyID string) error {
 	deployment := getDeployment()
 	appName := getAppName()
 
@@ -88,7 +78,7 @@ func (s *Storage) Init(ctx context.Context, keyID string, prefix ParamPrefix) er
 	}
 	s.bucketName = bucketName
 
-	dekParam := fmt.Sprintf("/%s/%s/%sStorageDEK/Ciphertext", deployment, appName, prefix)
+	dekParam := storageDEKCiphertextParam(keyID)
 
 	ciphertextB64, err := s.kms.LoadCiphertext(ctx, dekParam)
 	if err != nil {
@@ -96,10 +86,7 @@ func (s *Storage) Init(ctx context.Context, keyID string, prefix ParamPrefix) er
 	}
 
 	if ciphertextB64 == "" {
-		if prefix == MigrationPrefix {
-			return fmt.Errorf("migration DEK missing at %s — cannot generate fresh (would orphan S3 data)", dekParam)
-		}
-		// First boot: generate a new DEK.
+		// First boot for this KMS key: generate a new DEK.
 		out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 			KeyId:   aws.String(keyID),
 			KeySpec: kmstypes.DataKeySpecAes256,
@@ -125,20 +112,29 @@ func (s *Storage) Init(ctx context.Context, keyID string, prefix ParamPrefix) er
 	return nil
 }
 
-// ExportDEK re-encrypts the DEK under the given migration KMS key and
-// writes it to the Migration/StorageDEK SSM parameter.
+// ExportDEK re-encrypts the DEK under migrationKeyID into its key-scoped SSM
+// path, then verifies by decrypting the result and comparing to the live DEK.
 func (s *Storage) ExportDEK(ctx context.Context, migrationKeyID string) error {
 	if s.dek == nil {
 		return nil
 	}
-	deployment := getDeployment()
-	appName := getAppName()
 	ciphertextB64, err := s.kms.Encrypt(ctx, migrationKeyID, s.dek)
 	if err != nil {
 		return fmt.Errorf("encrypt DEK with migration key: %w", err)
 	}
-	migParam := fmt.Sprintf("/%s/%s/Migration/StorageDEK/Ciphertext", deployment, appName)
-	return s.kms.StoreCiphertext(ctx, migParam, ciphertextB64)
+	dekParam := storageDEKCiphertextParam(migrationKeyID)
+	if err := s.kms.StoreCiphertext(ctx, dekParam, ciphertextB64); err != nil {
+		return err
+	}
+	// Verify: decrypt the stored ciphertext and confirm it matches the in-memory DEK.
+	decrypted, err := decryptDEK(ctx, s.kms.aws.KMS, migrationKeyID, ciphertextB64)
+	if err != nil {
+		return fmt.Errorf("verify DEK re-encryption: %w", err)
+	}
+	if !bytes.Equal(decrypted, s.dek) {
+		return fmt.Errorf("verify DEK re-encryption: plaintext mismatch")
+	}
+	return nil
 }
 
 // decryptDEK decrypts a base64-encoded KMS ciphertext using NSM attestation.

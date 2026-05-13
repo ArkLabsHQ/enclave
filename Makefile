@@ -32,7 +32,7 @@ lint: ## Run golangci-lint on all modules (matches CI)
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
-test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with WRONG previousPCR0 for rollback test)
+test-build:  ## Build v1/v2/v3 test EIFs (v3 baked with a wrong app name so its Init fails — exercises the supervisor's rollback)
 	cd runtime && go mod vendor
 	cd test/app && go mod vendor
 	# Build v1 once and stash; re-using the same artifact for the final v1 copy
@@ -51,15 +51,17 @@ test-build:  ## Build test EIFs (v1 genesis, v2 with valid previousPCR0, v3 with
 	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
 	cp test/app/.enclave/artifacts/image.eif /tmp/image-v2.eif
 	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v2.json
-	# v3: deliberately wrong previous_pcr0 for the rollback test.
-	WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff" && \
+	# v3: wrong app name → /dev/my-app-wrong/KMSKeyID 404 → Init fails → rollback.
+	V2_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v2.json) && \
 	sed -i 's/^version: .*/version: 0.0.3/' test/app/enclave/enclave.yaml && \
-	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$WRONG_PCR0\"|" test/app/enclave/enclave.yaml
+	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$V2_PCR0\"|" test/app/enclave/enclave.yaml && \
+	sed -i 's|^name: my-app\b|name: my-app-wrong|' test/app/enclave/enclave.yaml
 	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
 	cp test/app/.enclave/artifacts/image.eif /tmp/image-v3.eif
 	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v3.json
 	sed -i 's/^version: .*/version: 0.0.1/' test/app/enclave/enclave.yaml
 	sed -i '/^previous_pcr0:/d' test/app/enclave/enclave.yaml
+	sed -i 's|^name: my-app-wrong\b|name: my-app|' test/app/enclave/enclave.yaml
 	cp /tmp/image-v1.eif test/app/.enclave/artifacts/image.eif
 	cp /tmp/pcr-v1.json test/app/.enclave/artifacts/pcr.json
 	cp /tmp/image-v1.eif test/app/.enclave/artifacts/image-v1.eif

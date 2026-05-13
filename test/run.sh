@@ -953,56 +953,42 @@ else
   exit 1
 fi
 
-# After a successful migration, MigrationKMSKeyID must be cleared (= atomic
-# commit happened inside the new enclave's Init). This is the most important
-# post-migration invariant.
-POST_MIG_KEY=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/MigrationKMSKeyID" \
+# After a migration, KMSKeyID names the new key and the secret's ciphertext
+# lives at the key-scoped path under it (flipping KMSKeyID is the atomic commit).
+NEW_KEY=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/KMSKeyID" \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$POST_MIG_KEY" ] || [ "$POST_MIG_KEY" = "UNSET" ]; then
-  echo "  PASS: MigrationKMSKeyID cleared after commit (= atomic migration succeeded)"
+if [ -z "$NEW_KEY" ] || [ "$NEW_KEY" = "UNSET" ]; then
+  echo "  FAIL: KMSKeyID empty after migration" >&2
+  exit 1
+fi
+NEW_CT=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/signing_key/Ciphertext/$NEW_KEY" \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -n "$NEW_CT" ] && [ "$NEW_CT" != "UNSET" ]; then
+  echo "  PASS: signing_key ciphertext present under new key (key-scoped commit)"
 else
-  echo "  FAIL: MigrationKMSKeyID still set after migration (got: $POST_MIG_KEY)" >&2
+  echo "  FAIL: /dev/my-app/signing_key/Ciphertext/$NEW_KEY missing after migration" >&2
   exit 1
 fi
 
-# Verify Migration/* staging params were cleaned up.
-STAGING_SECRET=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/Migration/signing_key/Ciphertext" \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$STAGING_SECRET" ] || [ "$STAGING_SECRET" = "UNSET" ]; then
-  echo "  PASS: Migration staging ciphertexts cleaned up"
-else
-  echo "  WARN: Migration/signing_key/Ciphertext still present (length=${#STAGING_SECRET})"
-fi
-
-# `enclave migration-status` CLI command — should report committed state.
+# `enclave migration-status` CLI command — should show the migrated KMS key.
 if [ -x "$ENCLAVE_CLI" ]; then
   (cd app && "$ENCLAVE_CLI" migration-status > /tmp/migration-status.out 2>&1) || true
-  if grep -q "Phase:.*committed" /tmp/migration-status.out 2>/dev/null; then
-    echo "  PASS: 'enclave migration-status' reports committed state"
+  if grep -q "$NEW_KEY" /tmp/migration-status.out 2>/dev/null; then
+    echo "  PASS: 'enclave migration-status' reports the migrated KMS key"
   else
-    echo "  WARN: 'enclave migration-status' did not report committed phase"
+    echo "  WARN: 'enclave migration-status' did not show the new key"
     sed 's/^/    /' /tmp/migration-status.out 2>/dev/null | head -10
   fi
 fi
 
 
-# Step 9: Rollback test — migration with mismatched target PCR0.
-#
-# Induces a deterministic v3 boot failure to exercise the supervisor's
-# rollback path. Mechanism: pass a WRONG target PCR0 in the /migrate body.
-# Supervisor cuts the migration KMS key locked to that wrong PCR0 and
-# writes MigrationTargetPCR0 = wrong PCR0. v3 boots, sees own PCR0 ≠
-# MigrationTargetPCR0 → "not the target" → tries to read primary state
-# with the existing KMS key whose policy is locked to v2's PCR0 → KMS
-# decrypt is denied to v3 → LoadAll fails → Init returns error →
-# /health stays 503 → supervisor's commit-poll times out → rollback
-# restores v2 EIF and the staging-only writes are wiped by AbortOrphaned
-# on the next v2 boot. Primary chain proof is untouched throughout, so
-# v2's /v1/enclave-info still reports v1's PCR0 as the predecessor.
+# Step 9: rollback — v3 is baked with a wrong app name, so its Init fails
+# (GetKeyID 404 at /dev/my-app-wrong/KMSKeyID) → /health stays 503 → the
+# supervisor's awaitEnclaveReady times out → rollbackMigration restores v2.
 echo ""
-echo "=== [9/10] Rollback test: migration with mismatched target PCR0 ==="
+echo "=== [9/10] Rollback test: v3 Init fails on wrong app name ==="
 
 ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
 V3_EIF="${ARTIFACTS}/image-v3.eif"
@@ -1017,10 +1003,8 @@ fi
 
 V2_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
 V3_PCR0=$(jq -r '.PCR0' "$V3_PCR_FILE")
-WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
-echo "  v2 PCR0:    ${V2_PCR0:0:16}... (currently running)"
-echo "  v3 PCR0:    ${V3_PCR0:0:16}... (real PCR0 of new EIF)"
-echo "  Sending wrong target PCR0 in /migrate: ${WRONG_PCR0:0:16}..."
+echo "  v2 PCR0: ${V2_PCR0:0:16}... (currently running)"
+echo "  v3 PCR0: ${V3_PCR0:0:16}..."
 
 ROLLBACK_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
 aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /dev/null 2>&1 || {
@@ -1028,10 +1012,8 @@ aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /de
   exit 1
 }
 
-# WRONG_PCR0 in pcr0 field — supervisor locks the migration KMS key to
-# a PCR0 v3 cannot match, so v3 cannot adopt the migration.
 MIGRATE_BODY=$(jq -nc \
-  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$WRONG_PCR0" \
+  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$V3_PCR0" \
   --argjson s '["signing_key"]' \
   '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
 
@@ -1049,28 +1031,19 @@ else
   exit 1
 fi
 
-# A healthy v2 boot after rollback implies AbortOrphaned ran (cleared the
-# in-flight migration flags) and the v2 EIF was restored by the supervisor.
 wait_for_enclave "post-rollback"
 
-# The chain-proof SSM keys (MigrationPreviousPCR0, ...Attestation) are
-# never touched by AbortOrphaned in the staging model — the failed
-# migration only wrote to /Migration/* staging. So v2's /v1/enclave-info
-# should still report v1's PCR0 as the predecessor (set by the original
-# v1 → v2 commit earlier in this test run).
-V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr-v1.json")
+V2_PCR0_LOWER=$(echo "$V2_PCR0" | tr '[:upper:]' '[:lower:]')
 POST_ROLLBACK_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
 POST_ROLLBACK_PREV=$(echo "$POST_ROLLBACK_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
-V1_LOWER=$(echo "$V1_PCR0" | tr '[:upper:]' '[:lower:]')
 POST_LOWER=$(echo "$POST_ROLLBACK_PREV" | tr '[:upper:]' '[:lower:]')
-if [ -n "$POST_LOWER" ] && [ "$V1_LOWER" = "$POST_LOWER" ]; then
-  echo "  PASS: v2 restored after rollback (primary chain proof intact, previous_pcr0 = v1)"
+if [ -n "$POST_LOWER" ] && [ "$V2_PCR0_LOWER" = "$POST_LOWER" ]; then
+  echo "  PASS: v2 restored after rollback (previous_pcr0 = v2)"
 else
-  echo "  FAIL: previous_pcr0 after rollback (${POST_ROLLBACK_PREV:0:16}...) != v1 (${V1_PCR0:0:16}...)" >&2
+  echo "  FAIL: previous_pcr0 after rollback (${POST_ROLLBACK_PREV:0:16}...) != v2 (${V2_PCR0:0:16}...)" >&2
   exit 1
 fi
 
-# Data must survive rollback unchanged.
 ROLLBACK_STORAGE=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage" 2>/dev/null || echo "")
 if echo "$ROLLBACK_STORAGE" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
   echo "  PASS: v2 storage round-trip works after rollback (DEK intact)"

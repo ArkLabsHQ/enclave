@@ -96,20 +96,15 @@ func spanBufferSize() int {
 	return 1000
 }
 
-// ParamPrefix selects the SSM parameter namespace for ciphertext reads/writes.
-// PrimaryPrefix targets the canonical paths; MigrationPrefix targets the
-// /Migration/* staging paths used during a locked-key migration.
-type ParamPrefix string
+// secretCiphertextParam: SSM path for a secret's KMS ciphertext, scoped by the
+// KMS key ID. Flipping /{dep}/{app}/KMSKeyID is the atomic migration commit.
+func secretCiphertextParam(secretName, keyID string) string {
+	return fmt.Sprintf("/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), secretName, keyID)
+}
 
-const (
-	PrimaryPrefix   ParamPrefix = ""
-	MigrationPrefix ParamPrefix = "Migration/"
-)
-
-// secretParamName builds the SSM path for a secret's ciphertext, scoped by
-// ParamPrefix.
-func secretParamName(secretName string, prefix ParamPrefix) string {
-	return fmt.Sprintf("/%s/%s/%s%s/Ciphertext", getDeployment(), getAppName(), prefix, secretName)
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, scoped by key ID.
+func storageDEKCiphertextParam(keyID string) string {
+	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
 }
 
 // ssmGetter is a minimal subset of *ssm.Client so applyEnvOverrides can

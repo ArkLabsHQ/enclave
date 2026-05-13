@@ -36,11 +36,9 @@ type Runtime struct {
 
 	mux *http.ServeMux // captured at RegisterRoutes; Init wires gated subsystem routes here
 
-	initDone        atomic.Bool  // true after Init completes (happens-before fence)
-	initOK          atomic.Bool  // true only if Init completed successfully
-	migrationState  atomic.Value // MigrationState
-	migrationReason atomic.Value // string
-	runtimeToken    string       // bearer token for management endpoints (empty = no auth)
+	initDone     atomic.Bool // true after Init completes (happens-before fence)
+	initOK       atomic.Bool // true only if Init completed successfully
+	runtimeToken string      // bearer token for management endpoints (empty = no auth)
 }
 
 // New returns a Runtime safe to use for serving management endpoints
@@ -76,8 +74,6 @@ func (e *Runtime) RuntimeToken() string {
 // or failure) so handlers can read fields safely.
 func (e *Runtime) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
-	e.migrationState.Store(MigrationStateNone)
-	e.migrationReason.Store("")
 
 	ctx, initSpan := e.tracing.Span(ctx, "init")
 	defer initSpan.End()
@@ -116,36 +112,10 @@ func (e *Runtime) Init(ctx context.Context) error {
 	// start-migration isn't reachable before initOK, so the late wire-up is safe.
 	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
 
-	// Classify boot role. If MigrationKMSKeyID is set and we're the declared
-	// MigrationTargetPCR0, read secrets and DEK from Migration/* staging
-	// using the migration key. Otherwise (orphan or normal boot), read from
-	// primary. CompleteMigration at the end commits or aborts accordingly,
-	// so primary state is only touched after the staged reads validate.
-	// Missing MigrationKMSKeyID is the normal "no migration in progress" case;
-	// readSSMParam reports it as an error which we discard. Same treatment
-	// for ReadTargetPCR0 below — if it's unset while a migration is in flight,
-	// we're not the target and CompleteMigration will run AbortOrphaned.
-	migrationKMSKeyID, _ := e.migrator.GetMigrationKMSKeyID(ctx)
-
-	var (
-		paramPrefix       ParamPrefix
-		keyID             string
-		isMigrationTarget bool
-	)
-	if migrationKMSKeyID != "" {
-		isMigrationTarget, _ = e.migrator.IsTarget(ctx)
-		if isMigrationTarget {
-			paramPrefix = MigrationPrefix
-			keyID = migrationKMSKeyID
-			slog.Info("migration target — reading from Migration/* staging", "key", prefix16(migrationKMSKeyID))
-		}
-	}
-	if !isMigrationTarget {
-		keyID, err = e.kms.GetKeyID(ctx)
-		if err != nil {
-			slog.Error("get KMS key ID", "error", err)
-			return fmt.Errorf("get KMS key ID: %w", err)
-		}
+	keyID, err := e.kms.GetKeyID(ctx)
+	if err != nil {
+		slog.Error("get KMS key ID", "error", err)
+		return fmt.Errorf("get KMS key ID: %w", err)
 	}
 
 	// Narrow the KMS policy to current PCR0 before any decrypt.
@@ -154,7 +124,7 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("apply KMS policy: %w", err)
 	}
 
-	if err := e.staticSecrets.LoadAll(ctx, keyID, paramPrefix); err != nil {
+	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {
 		slog.Error("load secrets from KMS", "error", err)
 		return fmt.Errorf("load secrets from KMS: %w", err)
 	}
@@ -165,7 +135,7 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	slog.Info("initializing storage")
 	e.migrator.storage = e.storage
-	if err := e.storage.Init(ctx, keyID, paramPrefix); err != nil {
+	if err := e.storage.Init(ctx, keyID); err != nil {
 		slog.Error("init storage", "error", err)
 		return fmt.Errorf("init storage: %w", err)
 	}
@@ -173,17 +143,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 	e.dynamic = NewDynamicSecrets(e.storage, e.metrics, e.staticSecrets, e.checkRuntimeToken)
 	if _, err := e.dynamic.Init(ctx); err != nil {
 		slog.Warn("load dynamic secrets failed", "error", err)
-	}
-
-	if migrationKMSKeyID != "" {
-		outcome, err := e.migrator.CompleteMigration(ctx, migrationKMSKeyID)
-		if err != nil {
-			slog.Error("complete migration", "error", err)
-			return fmt.Errorf("complete migration: %w", err)
-		}
-		e.migrationState.Store(outcome.State)
-		e.migrationReason.Store(outcome.Reason)
-		slog.Info("migration completed", "state", outcome.State, "reason", outcome.Reason)
 	}
 
 	e.registerGatedRoutes()
@@ -349,11 +308,6 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 	e.attestation.SetRegistrar(r)
 }
 
-type MigrationInfo struct {
-	State  MigrationState `json:"state"`
-	Reason string         `json:"reason,omitempty"`
-}
-
 type EnclaveInfo struct {
 	Version                    string         `json:"version"`
 	PreviousPCR0               string         `json:"previous_pcr0"`
@@ -364,7 +318,6 @@ type EnclaveInfo struct {
 	MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
 	MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
 	MigrationPending           bool           `json:"migration_pending"`
-	Migration                  MigrationInfo  `json:"migration"`
 }
 
 type enclaveInitializing struct {
@@ -392,16 +345,10 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 
 	previousPCR0 := "genesis"
 	previousPCR0Attestation := ""
-	if info, err := e.migrator.GetPreviousPCR0Info(r.Context(), false); err == nil && info != nil {
+	if info, err := e.migrator.GetPreviousPCR0Info(r.Context()); err == nil && info != nil {
 		previousPCR0 = info.PCR0
 		previousPCR0Attestation = info.Attestation
 	}
-
-	migrationState, _ := e.migrationState.Load().(MigrationState)
-	if migrationState == "" {
-		migrationState = MigrationStateNone
-	}
-	migrationReason, _ := e.migrationReason.Load().(string)
 
 	_ = json.NewEncoder(w).Encode(EnclaveInfo{
 		Version:                    Version,
@@ -413,7 +360,6 @@ func (e *Runtime) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		MigrationCooldownSeconds:   cooldownSeconds,
 		MigrationCooldownRemaining: cooldownRemaining,
 		MigrationPending:           migrationPending,
-		Migration:                  MigrationInfo{State: migrationState, Reason: migrationReason},
 	})
 }
 
@@ -454,6 +400,26 @@ func extendPCR(index uint, data []byte) error {
 		return fmt.Errorf("ExtendPCR(%d): NSM error: %s", index, resp.Error)
 	}
 	return nil
+}
+
+func describePCR(index uint) (data []byte, locked bool, err error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return nil, false, fmt.Errorf("open NSM session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	resp, err := session.Send(&request.DescribePCR{Index: uint16(index)})
+	if err != nil {
+		return nil, false, fmt.Errorf("DescribePCR(%d): %w", index, err)
+	}
+	if resp.Error != "" {
+		return nil, false, fmt.Errorf("DescribePCR(%d): NSM error: %s", index, resp.Error)
+	}
+	if resp.DescribePCR == nil {
+		return nil, false, fmt.Errorf("DescribePCR(%d): empty response", index)
+	}
+	return resp.DescribePCR.Data, resp.DescribePCR.Lock, nil
 }
 
 // responseRecorder buffers a response body so Middleware can Schnorr-sign it.

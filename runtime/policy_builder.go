@@ -20,7 +20,7 @@ import (
 //
 //	policy := NewKMSPolicyBuilder().
 //	    ForRole(ec2RoleARN).
-//	    LockedToPCR0(pcr0).
+//	    LockedToPCR0Values([]string{pcr0}).
 //	    WithRootRecovery(accountID). // omit for strict mode
 //	    Build()
 //
@@ -29,8 +29,9 @@ import (
 // The choice is permanent at first lock — cannot be added or removed after.
 type KMSPolicyBuilder struct {
 	roleARN         string
-	pcr0            string
+	pcr0Values      []string
 	recoveryAccount string
+	putKeyPolicy    bool
 }
 
 // NewKMSPolicyBuilder returns an empty builder.
@@ -45,10 +46,19 @@ func (b *KMSPolicyBuilder) ForRole(arn string) *KMSPolicyBuilder {
 	return b
 }
 
-// LockedToPCR0 sets the PCR0 hash that gates Decrypt via Nitro
-// attestation condition. Required.
-func (b *KMSPolicyBuilder) LockedToPCR0(pcr0 string) *KMSPolicyBuilder {
-	b.pcr0 = pcr0
+// LockedToPCR0Values gates Decrypt on the Nitro attestation condition,
+// admitting any of the given PCR0 hashes (implicit OR). At least one is
+// required; handleStartMigration passes [oldPCR0, newPCR0].
+func (b *KMSPolicyBuilder) LockedToPCR0Values(pcr0s []string) *KMSPolicyBuilder {
+	b.pcr0Values = pcr0s
+	return b
+}
+
+// WithPutKeyPolicy adds kms:PutKeyPolicy to the EnclaveOperations statement
+// so the new enclave can call SelfApplyPolicy to narrow the policy after
+// migration. Only used in handleStartMigration; not set by SelfApplyPolicy.
+func (b *KMSPolicyBuilder) WithPutKeyPolicy() *KMSPolicyBuilder {
+	b.putKeyPolicy = true
 	return b
 }
 
@@ -63,32 +73,40 @@ func (b *KMSPolicyBuilder) WithRootRecovery(account string) *KMSPolicyBuilder {
 
 // Build assembles the JSON policy document.
 func (b *KMSPolicyBuilder) Build() string {
+	condVal, _ := json.Marshal(b.pcr0Values)
+
+	opsActions := `["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"]`
+	if b.putKeyPolicy {
+		opsActions = `["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey", "kms:PutKeyPolicy"]`
+	}
+
+	roleJSON, _ := json.Marshal(b.roleARN)
 	base := fmt.Sprintf(`    {
       "Sid": "EnclaveDecryptWithAttestation",
       "Effect": "Allow",
-      "Principal": {"AWS": %q},
+      "Principal": {"AWS": %s},
       "Action": "kms:Decrypt",
       "Resource": "*",
       "Condition": {
         "StringEqualsIgnoreCase": {
-          "kms:RecipientAttestation:PCR0": %q
+          "kms:RecipientAttestation:PCR0": %s
         }
       }
     },
     {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
+      "Principal": {"AWS": %s},
+      "Action": %s,
       "Resource": "*"
     },
     {
       "Sid": "AllowKeyDeletion",
       "Effect": "Allow",
-      "Principal": {"AWS": %q},
+      "Principal": {"AWS": %s},
       "Action": "kms:ScheduleKeyDeletion",
       "Resource": "*"
-    }`, b.roleARN, b.pcr0, b.roleARN, b.roleARN)
+    }`, roleJSON, condVal, roleJSON, opsActions, roleJSON)
 
 	if b.recoveryAccount != "" {
 		base += fmt.Sprintf(`,
@@ -187,8 +205,17 @@ func parseKMSPolicyState(policyJSON, pcr0 string) (hasPCR0, hasPutKeyPolicy bool
 			if ops, ok := condOps.(map[string]interface{}); ok {
 				for key, val := range ops {
 					if strings.Contains(strings.ToLower(key), "pcr0") {
-						if s, ok := val.(string); ok && strings.EqualFold(s, pcr0) {
-							hasPCR0 = true
+						switch v := val.(type) {
+						case string:
+							if strings.EqualFold(v, pcr0) {
+								hasPCR0 = true
+							}
+						case []interface{}:
+							for _, item := range v {
+								if s, ok := item.(string); ok && strings.EqualFold(s, pcr0) {
+									hasPCR0 = true
+								}
+							}
 						}
 					}
 				}

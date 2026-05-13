@@ -338,7 +338,9 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
-  # SSM: read/write on secret ciphertext parameters.
+  # SSM: read/write on secret + DEK ciphertext parameters. Paths are key-scoped
+  # (/.../{secret}/Ciphertext/{kmsKeyId}) and created by the runtime at boot /
+  # migration, so the wildcard covers every KMS key generation.
   statement {
     sid = "SSMSecretParams"
     actions = [
@@ -346,19 +348,12 @@ data "aws_iam_policy_document" "enclave" {
       "ssm:PutParameter",
     ]
     resources = concat(
-      [for p in aws_ssm_parameter.secret_ciphertext : p.arn],
-      [for p in aws_ssm_parameter.secret_migration : p.arn],
+      [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${s.name}/Ciphertext/*"],
       [
-        aws_ssm_parameter.migration_kms_key_id.arn,
+        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext/*",
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
-        aws_ssm_parameter.migration_staged_previous_pcr0.arn,
-        aws_ssm_parameter.migration_staged_previous_pcr0_attestation.arn,
-        aws_ssm_parameter.migration_old_kms_key_id.arn,
-        aws_ssm_parameter.migration_target_pcr0.arn,
         aws_ssm_parameter.migration_requested_at.arn,
-        aws_ssm_parameter.storage_dek.arn,
-        aws_ssm_parameter.migration_storage_dek.arn,
       ],
     )
   }
@@ -591,52 +586,8 @@ resource "aws_s3_bucket_policy" "storage_ssl" {
 # SSM
 # =============================================================================
 
-# SSM parameters for enclave secrets and migration state.
-
-locals {
-  secrets_map = { for s in var.secrets : s.name => s }
-}
-
-# Per-secret ciphertext parameters.
-resource "aws_ssm_parameter" "secret_ciphertext" {
-  for_each = local.secrets_map
-
-  name      = "/${var.deployment}/${var.app_name}/${each.key}/Ciphertext"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-# Per-secret migration ciphertext parameters.
-resource "aws_ssm_parameter" "secret_migration" {
-  for_each = local.secrets_map
-
-  name      = "/${var.deployment}/${var.app_name}/Migration/${each.key}/Ciphertext"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-# Shared migration parameters (one per deployment, not per secret).
-
-resource "aws_ssm_parameter" "migration_kms_key_id" {
-  name      = "/${var.deployment}/${var.app_name}/MigrationKMSKeyID"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
+# SSM parameters for migration state. Per-secret + DEK ciphertexts are key-scoped
+# (/.../{secret}/Ciphertext/{kmsKeyId}) and created by the runtime, not here.
 
 resource "aws_ssm_parameter" "migration_previous_pcr0" {
   name      = "/${var.deployment}/${var.app_name}/MigrationPreviousPCR0"
@@ -661,35 +612,6 @@ resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
   }
 }
 
-# Staging chain proof: the OLD enclave's /v1/start-migration writes the
-# predecessor PCR0 + attestation here, and the NEW enclave's
-# PromoteToPrimary copies them to the primary keys above on commit.
-# AbortOrphaned clears these without touching the primary keys, so a
-# failed migration leaves the true predecessor chain intact.
-
-resource "aws_ssm_parameter" "migration_staged_previous_pcr0" {
-  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-resource "aws_ssm_parameter" "migration_staged_previous_pcr0_attestation" {
-  name      = "/${var.deployment}/${var.app_name}/Migration/PreviousPCR0Attestation"
-  type      = "String"
-  tier      = "Advanced"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
 resource "aws_ssm_parameter" "migration_requested_at" {
   name      = "/${var.deployment}/${var.app_name}/MigrationRequestedAt"
   type      = "String"
@@ -701,25 +623,26 @@ resource "aws_ssm_parameter" "migration_requested_at" {
   }
 }
 
-resource "aws_ssm_parameter" "migration_old_kms_key_id" {
-  name      = "/${var.deployment}/${var.app_name}/MigrationOldKMSKeyID"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
+# Deletes the runtime-created key-scoped ciphertext params on tofu destroy
+# (tofu doesn't track them). Kept separate from null_resource.kms_key so a
+# var.secrets change replaces only this no-op resource, not the KMS key.
+resource "null_resource" "ciphertext_cleanup" {
+  triggers = {
+    region       = var.region
+    deployment   = var.deployment
+    app_name     = var.app_name
+    secret_names = jsonencode([for s in var.secrets : s.name])
   }
-}
 
-resource "aws_ssm_parameter" "migration_target_pcr0" {
-  name      = "/${var.deployment}/${var.app_name}/MigrationTargetPCR0"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      REGION="${self.triggers.region}"; DEP="${self.triggers.deployment}"; APP="${self.triggers.app_name}"
+      for S in $(echo '${self.triggers.secret_names}' | jq -r '.[]' 2>/dev/null); do
+        aws ssm delete-parameters-by-path --path "/$DEP/$APP/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+      done
+      aws ssm delete-parameters-by-path --path "/$DEP/$APP/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+    EOT
   }
 }
 
@@ -732,30 +655,6 @@ resource "aws_ssm_parameter" "storage_bucket_name" {
   type      = "String"
   value     = aws_s3_bucket.storage.id
   overwrite = true
-}
-
-# Storage data encryption key (DEK).
-resource "aws_ssm_parameter" "storage_dek" {
-  name      = "/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
-# Migration storage DEK.
-resource "aws_ssm_parameter" "migration_storage_dek" {
-  name      = "/${var.deployment}/${var.app_name}/Migration/StorageDEK/Ciphertext"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
 }
 
 # Deploy-time app.env overrides. The runtime reads each key listed in

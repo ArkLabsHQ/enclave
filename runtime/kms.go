@@ -110,13 +110,8 @@ func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 // (unforgeable), derives its role ARN and account ID via STS, and calls
 // PutKeyPolicy to restrict Decrypt to its own attestation identity.
 //
-// keyID specifies which KMS key to operate on. Pass empty string to use
-// the primary key from SSM. In migration mode, callers pass the
-// migration key ID so the enclave operates on the transitional key that
-// was already locked by the old enclave's handleStartMigration.
-//
-// Idempotent: if the policy already contains the correct PCR0, or if
-// the key is locked (no PutKeyPolicy permission), the function returns nil.
+// keyID may be empty to read the current key ID from SSM. Idempotent:
+// no-op if already sealed to this PCR0; error if sealed to a different one.
 func (k *KMS) SelfApplyPolicy(ctx context.Context, keyID string) error {
 	if keyID == "" {
 		var err error
@@ -148,14 +143,14 @@ func (k *KMS) SelfApplyPolicy(ctx context.Context, keyID string) error {
 
 	hasPCR0, hasPutKeyPolicy := parseKMSPolicyState(policyText, pcr0)
 
-	if hasPCR0 {
-		slog.Info("KMS policy already contains PCR0, skipping", "pcr0", pcr0[:16])
-		return nil
-	}
-
-	// Modifiable when: policy is empty (fresh key), or grants PutKeyPolicy or kms:*.
+	// Sealed (no PutKeyPolicy): no-op if it's ours, fatal otherwise.
+	// Otherwise (fresh key, or migration key still open) fall through and apply.
 	if policyText != "" && !hasPutKeyPolicy {
-		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
+		if hasPCR0 {
+			slog.Info("KMS policy already locked to PCR0, skipping", "pcr0", pcr0[:16])
+			return nil
+		}
+		return fmt.Errorf("KMS key is sealed to a different PCR0 (ours: %s...)", pcr0[:16])
 	}
 
 	// Get caller identity for role ARN and account ID.
@@ -169,7 +164,7 @@ func (k *KMS) SelfApplyPolicy(ctx context.Context, keyID string) error {
 		return fmt.Errorf("resolve IAM role ARN: %w", err)
 	}
 
-	builder := NewKMSPolicyBuilder().ForRole(roleARN).LockedToPCR0(pcr0)
+	builder := NewKMSPolicyBuilder().ForRole(roleARN).LockedToPCR0Values([]string{pcr0})
 	if !kmsKeyLocked() {
 		account, err := arnAccount(*identity.Arn)
 		if err != nil {

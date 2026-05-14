@@ -1,6 +1,7 @@
 package nitriding
 
 import (
+	"net/http/httputil"
 	"sync"
 )
 
@@ -28,6 +29,11 @@ func newBufPool() *bufPool {
 		},
 	}
 }
+
+// NewBufPool returns a buffer pool sized for use as httputil.ReverseProxy's
+// BufferPool. Exported wrapper for the runtime package after the
+// Enclave→Runtime merge.
+func NewBufPool() httputil.BufferPool { return newBufPool() }
 
 func (p *bufPool) Get() []byte {
 	s := p.Pool.Get()

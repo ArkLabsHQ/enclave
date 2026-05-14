@@ -33,8 +33,12 @@ func BuildNitridingConfig() (*nitriding.Config, error) {
 		return nil, err
 	}
 
-	proxyPort := envDefault("ENCLAVE_PROXY_PORT", "7073")
-	appWebSrv, err := url.Parse("http://127.0.0.1:" + proxyPort)
+	// Point directly at the user app — there is no longer an intermediate
+	// runtime proxy on :7073. The runtime's management routes are registered
+	// on nitriding's pubSrv chi mux via Enclave.PubMux(); nitriding's
+	// catch-all revProxy reaches the user app in one hop.
+	appPort := envDefault("ENCLAVE_APP_PORT", "7074")
+	appWebSrv, err := url.Parse("http://127.0.0.1:" + appPort)
 	if err != nil {
 		return nil, fmt.Errorf("parse app web srv url: %w", err)
 	}

@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -72,7 +73,7 @@ type Enclave struct {
 	hashes       *AttestationHashes
 	promRegistry *prometheus.Registry
 	metrics      *metrics
-	nonceCache   *cache
+	nonceCache   *Cache
 	keyMaterial  any
 	ready, stop  chan bool
 }
@@ -214,7 +215,7 @@ func NewEnclave(cfg *Config) (*Enclave, error) {
 		},
 		promRegistry: reg,
 		metrics:      newMetrics(reg, cfg.PrometheusNamespace),
-		nonceCache:   newCache(defaultItemExpiry),
+		nonceCache:   NewCache(defaultItemExpiry),
 		hashes:       new(AttestationHashes),
 		stop:         make(chan bool),
 		ready:        make(chan bool),
@@ -263,6 +264,20 @@ func NewEnclave(cfg *Config) (*Enclave, error) {
 	if cfg.AppWebSrv != nil {
 		e.revProxy = httputil.NewSingleHostReverseProxy(cfg.AppWebSrv)
 		e.revProxy.BufferPool = newBufPool()
+		// Use http2.Transport with AllowHTTP=true so this hop speaks h2c
+		// (HTTP/2 cleartext) to the runtime proxy upstream. The default
+		// transport forces HTTP/1.1 on plain-http URLs, which drops gRPC
+		// trailers and breaks long-lived streams. FlushInterval=-1
+		// flushes on every write so server-streaming RPCs deliver in
+		// real time.
+		e.revProxy.Transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		}
+		e.revProxy.FlushInterval = -1
 		e.pubSrv.Handler.(*chi.Mux).Handle(pathProxy, e.revProxy)
 		// If we expose Prometheus metrics, we keep track of the HTTP backend's
 		// responses.
@@ -293,7 +308,7 @@ func (e *Enclave) Start() error {
 
 	// Set up our networking environment which creates a TAP device that
 	// forwards traffic (via the VSOCK interface) to the EC2 host.
-	go runNetworking(e.cfg, e.stop)
+	go RunNetworking(e.cfg.HostProxyPort, e.stop)
 
 	// Get an HTTPS certificate.
 	if e.cfg.UseACME {
@@ -441,6 +456,8 @@ func (e *Enclave) genSelfSignedCert() error {
 
 	e.pubSrv.TLSConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
 
 	return nil
@@ -471,6 +488,11 @@ func (e *Enclave) setupAcme() error {
 		HostPolicy: autocert.HostWhitelist([]string{e.cfg.FQDN}...),
 	}
 	e.pubSrv.TLSConfig = certManager.TLSConfig()
+	// autocert.Manager.TLSConfig() does not set NextProtos in this version of
+	// golang.org/x/crypto. Set explicitly so ALPN negotiates h2; keep
+	// acme-tls/1 so TLS-ALPN-01 challenges still work.
+	e.pubSrv.TLSConfig.NextProtos = []string{"h2", "http/1.1", "acme-tls/1"}
+	e.pubSrv.TLSConfig.MinVersion = tls.VersionTLS12
 
 	go func() {
 		var rawData []byte

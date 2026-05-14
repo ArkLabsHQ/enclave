@@ -1,6 +1,7 @@
 package nitriding
 
 import (
+	"crypto/tls"
 	"testing"
 )
 
@@ -58,6 +59,20 @@ func TestGenSelfSignedCert(t *testing.T) {
 	e := createEnclave(&defaultCfg)
 	if err := e.genSelfSignedCert(); err != nil {
 		t.Fatalf("Failed to create self-signed certificate: %s", err)
+	}
+
+	got := e.pubSrv.TLSConfig.NextProtos
+	want := []string{"h2", "http/1.1"}
+	if len(got) != len(want) {
+		t.Fatalf("NextProtos length: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NextProtos[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+	if e.pubSrv.TLSConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("MinVersion: got %v, want %v", e.pubSrv.TLSConfig.MinVersion, tls.VersionTLS12)
 	}
 }
 

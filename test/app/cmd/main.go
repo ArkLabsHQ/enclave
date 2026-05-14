@@ -34,6 +34,12 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	otelTrace "go.opentelemetry.io/otel/trace"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 )
 
 // attestationPayload is the CBOR structure inside a COSE Sign1 attestation document.
@@ -120,14 +126,37 @@ func main() {
 	mux.HandleFunc("GET /test/env-override", handleTestEnvOverride)
 
 	// Wrap mux with otelhttp — every incoming request creates a span automatically.
-	handler := otelhttp.NewHandler(mux, "test-app",
+	otelHandler := otelhttp.NewHandler(mux, "test-app",
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return r.Method + " " + r.URL.Path
 		}),
 	)
 
+	// gRPC server: registers grpc.health.v1.Health which gives us both a unary
+	// (Check) and a server-streaming (Watch) RPC for end-to-end protocol tests
+	// without dragging in protobuf codegen.
+	grpcSrv := grpc.NewServer()
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(grpcSrv, healthSrv)
+	reflection.Register(grpcSrv)
+
+	// Unified handler: HTTP/2 gRPC requests go to the gRPC server; everything
+	// else stays on the existing REST mux. Wrapped in h2c.NewHandler so the
+	// listener accepts HTTP/2 cleartext from the runtime proxy upstream.
+	unified := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && strings.HasPrefix(
+			r.Header.Get("Content-Type"), "application/grpc") {
+			grpcSrv.ServeHTTP(w, r)
+			return
+		}
+		otelHandler.ServeHTTP(w, r)
+	})
+	handler := h2c.NewHandler(unified, &http2.Server{})
+
 	log.Printf("listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	srv := &http.Server{Addr: ":" + port, Handler: handler}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {

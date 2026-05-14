@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -66,9 +64,11 @@ func main() {
 	}
 
 	// Build nitriding in-process. It terminates TLS on ENCLAVE_NITRIDING_EXT_PORT
-	// (443 by default) and reverse-proxies to the runtime's own proxy server
-	// on ENCLAVE_PROXY_PORT (7073). Replaces the former /app/nitriding daemon
-	// that used to exec this runtime as -appcmd.
+	// (443 by default) and reverse-proxies directly to the user app on
+	// ENCLAVE_APP_PORT (7074) via h2c — see nitriding/enclave.go where
+	// revProxy.Transport is wired with http2.Transport{AllowHTTP:true}.
+	// Runtime management routes (/v1/enclave-*) are registered on the same
+	// chi mux below, eliminating the legacy intermediate :7073 hop.
 	nitCfg, err := runtime.BuildNitridingConfig()
 	if err != nil {
 		slog.Error("build nitriding config", "error", err)
@@ -79,26 +79,14 @@ func main() {
 		slog.Error("nitriding NewEnclave", "error", err)
 		os.Exit(1)
 	}
-	if err := nitEnc.Start(); err != nil {
-		slog.Error("nitriding start", "error", err)
-		os.Exit(1)
-	}
-	defer func() { _ = nitEnc.Stop() }()
-	enc.SetAttestationRegistrar(nitEnc)
 
-	// 2. Ports.
-	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")
+	// Register the runtime's management routes (/v1/enclave-*, /health) on
+	// nitriding's pubSrv chi mux. chi routes more-specific patterns before
+	// the /* catch-all that revProxies to the user app.
 	appPort := envOr("ENCLAVE_APP_PORT", "7074")
-
-	// 3. Reverse proxy → user's app.
-	upstream, _ := url.Parse("http://127.0.0.1:" + appPort)
-	proxy := httputil.NewSingleHostReverseProxy(upstream)
-
-	// 4. Mux: management routes local, everything else proxied.
-	mux := http.NewServeMux()
-	enc.RegisterRoutes(mux) // /v1/enclave-info, /v1/start-migration, /v1/storage, /v1/secrets
-
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	adminMux := http.NewServeMux()
+	enc.RegisterRoutes(adminMux)
+	adminMux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !enc.IsReady() {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -107,28 +95,52 @@ func main() {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
+	pubMux := nitEnc.PubMux()
+	pubMux.Handle("/v1/*", adminMux)
+	pubMux.Handle("/health", adminMux)
 
-	mux.Handle("/", proxy)
-	handler := runtime.LoggingMiddleware(enc.Middleware(mux)) // log + sign all responses
+	// Apply response-signing + logging middleware once, wrapping the whole
+	// pubSrv handler so it sees every route (chi-internal /enclave/*,
+	// /v1/*, /health, and the catch-all proxy to the user app).
+	// enc.Middleware short-circuits to next.ServeHTTP for gRPC content-type
+	// so streaming RPCs aren't buffered.
+	nitEnc.UseMiddleware(enc.Middleware)
+	nitEnc.UseMiddleware(runtime.LoggingMiddleware)
 
-	srv := &http.Server{
-		Addr:         ":" + proxyPort,
-		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+	// Internal admin listener on :7073 for loopback callbacks from the
+	// user app (storage, secrets, traces, log emission). Plain HTTP, no
+	// TLS, no reverse proxy — only management routes. The user app dials
+	// this via http://127.0.0.1:7073 with the ENCLAVE_RUNTIME_TOKEN.
+	// External clients always go through TLS on :443.
+	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")
+	adminHandler := runtime.LoggingMiddleware(enc.Middleware(adminMux))
+	adminSrv := &http.Server{
+		Addr:        ":" + proxyPort,
+		Handler:     adminHandler,
+		ReadTimeout: 10 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
-
-	// 5. Start HTTP server immediately (management endpoints available during init).
-	srvErr := make(chan error, 1)
+	adminErr := make(chan error, 1)
 	go func() {
-		slog.Info("supervisor started", "proxy_port", proxyPort, "app_port", appPort, "version", runtime.Version)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			srvErr <- err
+		slog.Info("admin listener started", "port", proxyPort)
+		if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			adminErr <- err
 		}
 	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = adminSrv.Shutdown(shutdownCtx)
+	}()
 
-	// 6. Bootstrap: attestation key, KMS secrets, PCR extension (may block).
+	if err := nitEnc.Start(); err != nil {
+		slog.Error("nitriding start", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = nitEnc.Stop() }()
+	enc.SetAttestationRegistrar(nitEnc)
+
+	// Bootstrap: attestation key, KMS secrets, PCR extension (may block).
 	initCtx := ctx
 	if t := envOr("ENCLAVE_INIT_TIMEOUT", ""); t != "" {
 		if d, err := time.ParseDuration(t); err == nil {
@@ -139,17 +151,14 @@ func main() {
 		}
 	}
 
+	slog.Info("supervisor started", "app_port", appPort, "version", runtime.Version)
+
 	if err := enc.Init(initCtx); err != nil {
 		slog.Error("enclave init failed — app will NOT be started", "error", err)
-		select {
-		case err := <-srvErr:
-			slog.Error("server failed", "error", err)
-			os.Exit(1)
-		case <-ctx.Done():
-			slog.Info("shutting down (init failed, no child)")
-		}
+		<-ctx.Done()
+		slog.Info("shutting down (init failed, no child)")
 	} else {
-		// 7. Start user's app as child process (env vars from KMS are ready).
+		// Start user's app as child process (env vars from KMS are ready).
 		appBinary := envOr("APP_BINARY_NAME", "app")
 		appPath := fmt.Sprintf("/app/%s", appBinary)
 
@@ -167,7 +176,7 @@ func main() {
 		}
 		slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
 
-		// 8. Supervise: wait for child exit or shutdown signal.
+		// Supervise: wait for child exit or shutdown signal.
 		childDone := make(chan error, 1)
 		go func() { childDone <- child.Wait() }()
 
@@ -177,8 +186,8 @@ func main() {
 				slog.Error("child exited", "error", err)
 			}
 			stop()
-		case err := <-srvErr:
-			slog.Error("server failed", "error", err)
+		case err := <-adminErr:
+			slog.Error("admin listener failed", "error", err)
 			_ = child.Process.Signal(syscall.SIGTERM)
 			<-childDone
 			os.Exit(1)
@@ -193,12 +202,6 @@ func main() {
 				<-childDone
 			}
 		}
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("server shutdown error", "error", err)
 	}
 }
 

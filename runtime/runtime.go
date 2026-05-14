@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -276,6 +277,17 @@ func (e *Runtime) registerGatedRoutes() {
 	}
 }
 
+// isGRPCRequest reports whether r looks like a native gRPC call.
+// Native gRPC (and gRPC-Web over HTTP/2) carries an application/grpc*
+// Content-Type and uses HTTP/2. Buffering such requests breaks
+// server-streaming RPCs and drops the grpc-status / grpc-message trailers.
+func isGRPCRequest(r *http.Request) bool {
+	if r.ProtoMajor != 2 {
+		return false
+	}
+	return strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
+}
+
 // Middleware signs every response with the ephemeral attestation key
 // (BIP-340 Schnorr). A failed Init leaves the enclave half-initialised
 // where signing would mislead callers, so we gate on initOK (matches
@@ -283,6 +295,14 @@ func (e *Runtime) registerGatedRoutes() {
 func (e *Runtime) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !e.initOK.Load() || !e.attestation.Ready() {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// gRPC streams cannot be buffered — clients verify enclave
+		// authenticity via the TLS cert fingerprint embedded in the NSM
+		// attestation document, not via X-Attestation-Signature headers.
+		if isGRPCRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -470,6 +490,17 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Flush delegates to the underlying writer's http.Flusher so HTTP/2
+// streaming (gRPC server-streaming responses) is not buffered when this
+// middleware sits in the chain. Without an explicit Flush method,
+// downstream code that does an `(w).(http.Flusher)` type assertion
+// would miss the underlying Flusher and never flush mid-stream.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func generateRuntimeToken() (string, error) {

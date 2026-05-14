@@ -7,7 +7,7 @@ import (
 )
 
 func TestCache(t *testing.T) {
-	c := newCache(time.Millisecond * 50)
+	c := NewCache(time.Millisecond * 50)
 	elem := "foo"
 
 	c.Add(elem)
@@ -28,7 +28,7 @@ func TestCache(t *testing.T) {
 }
 
 func TestCacheWithManyElems(t *testing.T) {
-	c := newCache(time.Millisecond * 50)
+	c := NewCache(time.Millisecond * 50)
 
 	// Add 100 items.
 	for i := 0; i < 100; i++ {

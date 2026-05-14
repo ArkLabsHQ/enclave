@@ -9,24 +9,24 @@ const (
 	defaultItemExpiry = time.Minute
 )
 
-// cache implements a simple cache whose items expire.
-type cache struct {
+// Cache implements a simple cache whose items expire.
+type Cache struct {
 	sync.RWMutex
 	Items map[string]time.Time
 	TTL   time.Duration
 }
 
-// newCache creates and returns a new cache with the given lifetime for cache
+// NewCache creates and returns a new cache with the given lifetime for cache
 // items.
-func newCache(ttl time.Duration) *cache {
-	return &cache{
+func NewCache(ttl time.Duration) *Cache {
+	return &Cache{
 		Items: make(map[string]time.Time),
 		TTL:   ttl,
 	}
 }
 
 // Count returns the number of elements in the cache.
-func (c *cache) Count() int {
+func (c *Cache) Count() int {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -34,7 +34,7 @@ func (c *cache) Count() int {
 }
 
 // pruneLater prunes the given element after ttl.
-func (c *cache) pruneLater(key string, ttl time.Duration) {
+func (c *Cache) pruneLater(key string, ttl time.Duration) {
 	time.Sleep(ttl)
 
 	c.Lock()
@@ -43,7 +43,7 @@ func (c *cache) pruneLater(key string, ttl time.Duration) {
 }
 
 // Add adds a new string item to the cache.
-func (c *cache) Add(key string) {
+func (c *Cache) Add(key string) {
 	c.Lock()
 	defer c.Unlock()
 
@@ -58,7 +58,7 @@ func (c *cache) Add(key string) {
 
 // Exists returns true if the given string item exists in the cache.  If the
 // item exists but is expired, the function returns false.
-func (c *cache) Exists(key string) bool {
+func (c *Cache) Exists(key string) bool {
 	c.RLock()
 	defer c.RUnlock()
 	_, exists := c.Items[key]

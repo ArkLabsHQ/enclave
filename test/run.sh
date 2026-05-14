@@ -274,9 +274,6 @@ provider "aws" {
 }
 OVERRIDE
 
-  # Clean previous init state.
-  rm -rf "${TOFU_DIR}/.terraform" 2>/dev/null || true
-
   echo "  tofu init..."
   tofu -chdir="$TOFU_DIR" init -input=false > ${SCRIPT_DIR}/tofu-init.log 2>&1 || { cat ${SCRIPT_DIR}/tofu-init.log; return 1; }
   # env_values overrides are supplied via an auto-loaded tfvars file (the env-file
@@ -489,12 +486,9 @@ tofu_destroy
 
 tofu_apply
 
-# Tofu created a KMS key in localstack, but we use local-kms for real KMS ops.
-# Overwrite SSM with the local-kms seeded key ID so the enclave uses it.
-aws ssm put-parameter $LOCALSTACK \
-  --name "/dev/my-app/KMSKeyID" --value "test-key-id" \
-  --type String --overwrite --no-cli-pager
-echo "  Seeded SSM /dev/my-app/KMSKeyID = test-key-id"
+# tofu leaves SSM /dev/my-app/KMSKeyID = "UNSET"; the enclave's EnsureKeyID
+# calls CreateKey on the first boot, registers the new ID, and locks the
+# policy to its own PCR0 at creation time.
 
 # Start supervisor on the host (like production EC2 host).
 # Configured with stop/start commands that manage boot_qemu via PID file.

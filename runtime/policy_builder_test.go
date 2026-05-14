@@ -6,96 +6,42 @@ import (
 	"testing"
 )
 
-// TestParseKMSPolicyState_Empty verifies an empty policy is treated as fresh.
-func TestParseKMSPolicyState_Empty(t *testing.T) {
-	hasPCR0, hasPut := parseKMSPolicyState("", "deadbeef")
-	if hasPCR0 || hasPut {
-		t.Fatalf("empty policy: expected (false, false), got (%v, %v)", hasPCR0, hasPut)
+// TestPolicyAdmitsPCR0_Empty verifies an empty policy admits no one.
+func TestPolicyAdmitsPCR0_Empty(t *testing.T) {
+	if policyAdmitsPCR0("", "deadbeef") {
+		t.Fatalf("empty policy must not admit any PCR0")
 	}
 }
 
-// TestParseKMSPolicyState_TransitionalPolicy verifies the transitional policy
-// (grants PutKeyPolicy, no PCR0 condition) is detected as modifiable.
-func TestParseKMSPolicyState_TransitionalPolicy(t *testing.T) {
-	transitional := `{
-	  "Version": "2012-10-17",
-	  "Statement": [
-	    {
-	      "Effect": "Allow",
-	      "Principal": {"AWS": "arn:aws:iam::123:role/ec2"},
-	      "Action": ["kms:Encrypt", "kms:PutKeyPolicy"],
-	      "Resource": "*"
-	    }
-	  ]
-	}`
-	hasPCR0, hasPut := parseKMSPolicyState(transitional, "aaaa")
-	if hasPCR0 {
-		t.Fatalf("transitional policy: expected hasPCR0=false, got true")
-	}
-	if !hasPut {
-		t.Fatalf("transitional policy: expected hasPutKeyPolicy=true, got false")
-	}
-}
-
-// TestParseKMSPolicyState_LockedMatchingPCR0 verifies the locked policy with
-// the target PCR0 is correctly detected — this is the idempotency check that
-// lets selfApplyKMSPolicy skip PutKeyPolicy on restart.
-// Covers plan test #3: "selfApplyKMSPolicy skips PutKeyPolicy when policy already contains target PCR0".
-func TestParseKMSPolicyState_LockedMatchingPCR0(t *testing.T) {
+// TestPolicyAdmitsPCR0_LockedMatching verifies a locked policy admits the PCR0
+// it was built for.
+func TestPolicyAdmitsPCR0_LockedMatching(t *testing.T) {
 	targetPCR0 := strings.Repeat("a", 96)
 	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0Values([]string{targetPCR0}).Build()
-	hasPCR0, hasPut := parseKMSPolicyState(locked, targetPCR0)
-	if !hasPCR0 {
-		t.Fatalf("locked policy with matching PCR0: expected hasPCR0=true, got false")
-	}
-	if hasPut {
-		t.Fatalf("locked policy: expected hasPutKeyPolicy=false (no-one can modify), got true")
+	if !policyAdmitsPCR0(locked, targetPCR0) {
+		t.Fatalf("locked policy with matching PCR0: expected admit=true, got false")
 	}
 }
 
-// TestParseKMSPolicyState_LockedDifferentPCR0 verifies we correctly detect
-// when a key is locked to a DIFFERENT PCR0 (rebuilds would fail here).
-func TestParseKMSPolicyState_LockedDifferentPCR0(t *testing.T) {
+// TestPolicyAdmitsPCR0_LockedDifferent verifies a policy locked to one PCR0
+// does NOT admit a different one.
+func TestPolicyAdmitsPCR0_LockedDifferent(t *testing.T) {
 	otherPCR0 := strings.Repeat("b", 96)
 	myPCR0 := strings.Repeat("c", 96)
 	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0Values([]string{otherPCR0}).Build()
-	hasPCR0, hasPut := parseKMSPolicyState(locked, myPCR0)
-	if hasPCR0 {
-		t.Fatalf("locked to different PCR0: expected hasPCR0=false (from my perspective), got true")
-	}
-	if hasPut {
-		t.Fatalf("locked policy: expected hasPutKeyPolicy=false, got true")
+	if policyAdmitsPCR0(locked, myPCR0) {
+		t.Fatalf("locked to different PCR0: expected admit=false, got true")
 	}
 }
 
-// TestParseKMSPolicyState_CaseInsensitivePCR0 verifies PCR0 matching is case-
+// TestPolicyAdmitsPCR0_CaseInsensitive verifies PCR0 matching is case-
 // insensitive (consistent with the KMS policy's StringEqualsIgnoreCase).
-func TestParseKMSPolicyState_CaseInsensitivePCR0(t *testing.T) {
+func TestPolicyAdmitsPCR0_CaseInsensitive(t *testing.T) {
 	lowerPCR0 := strings.Repeat("a", 96)
 	upperPCR0 := strings.ToUpper(lowerPCR0)
 	locked := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0Values([]string{lowerPCR0}).Build()
-	hasPCR0, _ := parseKMSPolicyState(locked, upperPCR0)
-	if !hasPCR0 {
-		t.Fatalf("case-insensitive matching: expected hasPCR0=true for uppercase query against lowercase policy, got false")
-	}
-}
-
-// TestParseKMSPolicyState_KmsStar verifies kms:* grants PutKeyPolicy.
-func TestParseKMSPolicyState_KmsStar(t *testing.T) {
-	bootstrapPolicy := `{
-	  "Version": "2012-10-17",
-	  "Statement": [
-	    {
-	      "Effect": "Allow",
-	      "Principal": {"AWS": "arn:aws:iam::123:root"},
-	      "Action": "kms:*",
-	      "Resource": "*"
-	    }
-	  ]
-	}`
-	_, hasPut := parseKMSPolicyState(bootstrapPolicy, "deadbeef")
-	if !hasPut {
-		t.Fatalf("kms:* should imply PutKeyPolicy, got hasPutKeyPolicy=false")
+	if !policyAdmitsPCR0(locked, upperPCR0) {
+		t.Fatalf("case-insensitive matching: expected admit=true for uppercase query against lowercase policy, got false")
 	}
 }
 

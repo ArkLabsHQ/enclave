@@ -27,28 +27,9 @@ func TestPolicyBuilder_LockedToPCR0Values_MultipleIsArray(t *testing.T) {
 	}
 }
 
-func TestPolicyBuilder_WithPutKeyPolicy_AddsAction(t *testing.T) {
-	base := NewKMSPolicyBuilder().
-		ForRole("arn:aws:iam::123:role/MyRole").
-		LockedToPCR0Values([]string{"abc123"}).
-		Build()
-	if strings.Contains(base, "kms:PutKeyPolicy") {
-		t.Fatalf("default policy must not contain PutKeyPolicy")
-	}
+// --- policyAdmitsPCR0 tests ---
 
-	withPKP := NewKMSPolicyBuilder().
-		ForRole("arn:aws:iam::123:role/MyRole").
-		LockedToPCR0Values([]string{"abc123"}).
-		WithPutKeyPolicy().
-		Build()
-	if !strings.Contains(withPKP, "kms:PutKeyPolicy") {
-		t.Fatalf("WithPutKeyPolicy must add PutKeyPolicy action")
-	}
-}
-
-// --- parseKMSPolicyState tests ---
-
-func TestParseKMSPolicyState_StringPCR0Match(t *testing.T) {
+func TestPolicyAdmitsPCR0_StringMatch(t *testing.T) {
 	policy := `{
 		"Statement": [{
 			"Action": "kms:Decrypt",
@@ -59,16 +40,12 @@ func TestParseKMSPolicyState_StringPCR0Match(t *testing.T) {
 			}
 		}]
 	}`
-	hasPCR0, hasPKP := parseKMSPolicyState(policy, "abc123")
-	if !hasPCR0 {
-		t.Error("expected hasPCR0=true for matching string value")
-	}
-	if hasPKP {
-		t.Error("expected hasPutKeyPolicy=false")
+	if !policyAdmitsPCR0(policy, "abc123") {
+		t.Error("expected true for matching string value")
 	}
 }
 
-func TestParseKMSPolicyState_ArrayPCR0Match(t *testing.T) {
+func TestPolicyAdmitsPCR0_ArrayMatch(t *testing.T) {
 	policy := `{
 		"Statement": [{
 			"Action": "kms:Decrypt",
@@ -79,13 +56,12 @@ func TestParseKMSPolicyState_ArrayPCR0Match(t *testing.T) {
 			}
 		}]
 	}`
-	hasPCR0, _ := parseKMSPolicyState(policy, "bbb222")
-	if !hasPCR0 {
-		t.Error("expected hasPCR0=true when PCR0 is in array condition")
+	if !policyAdmitsPCR0(policy, "bbb222") {
+		t.Error("expected true when PCR0 is in array condition")
 	}
 }
 
-func TestParseKMSPolicyState_ArrayPCR0NoMatch(t *testing.T) {
+func TestPolicyAdmitsPCR0_ArrayNoMatch(t *testing.T) {
 	policy := `{
 		"Statement": [{
 			"Action": "kms:Decrypt",
@@ -96,34 +72,8 @@ func TestParseKMSPolicyState_ArrayPCR0NoMatch(t *testing.T) {
 			}
 		}]
 	}`
-	hasPCR0, _ := parseKMSPolicyState(policy, "bbb222")
-	if hasPCR0 {
-		t.Error("expected hasPCR0=false when PCR0 not in array")
-	}
-}
-
-func TestParseKMSPolicyState_DetectsPutKeyPolicy(t *testing.T) {
-	policy := `{
-		"Statement": [
-			{
-				"Action": "kms:Decrypt",
-				"Condition": {
-					"StringEqualsIgnoreCase": {
-						"kms:RecipientAttestation:PCR0": "abc123"
-					}
-				}
-			},
-			{
-				"Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey", "kms:PutKeyPolicy"]
-			}
-		]
-	}`
-	hasPCR0, hasPKP := parseKMSPolicyState(policy, "abc123")
-	if !hasPCR0 {
-		t.Error("expected hasPCR0=true")
-	}
-	if !hasPKP {
-		t.Error("expected hasPutKeyPolicy=true")
+	if policyAdmitsPCR0(policy, "bbb222") {
+		t.Error("expected false when PCR0 not in array")
 	}
 }
 

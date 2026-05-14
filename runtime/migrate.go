@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -360,6 +361,31 @@ func readSSMParam(ctx context.Context, ssmClient SSMAPI, paramName string) (stri
 	return value, nil
 }
 
+// readSSMParamOptional is like readSSMParam but returns ("", nil) when the
+// param is missing or holds the tofu placeholder "UNSET". Real SSM errors
+// (network, IAM) still propagate.
+func readSSMParamOptional(ctx context.Context, ssmClient SSMAPI, paramName string) (string, error) {
+	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(paramName),
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		var pnf *ssmtypes.ParameterNotFound
+		if errors.As(err, &pnf) {
+			return "", nil
+		}
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", nil
+	}
+	v := strings.TrimSpace(*out.Parameter.Value)
+	if v == "" || v == "UNSET" {
+		return "", nil
+	}
+	return v, nil
+}
+
 func getPCR0() string {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
@@ -418,14 +444,16 @@ func commitPCR31(newPCR0Hex string, newPCR0Bytes []byte) error {
 // enclave wrote the attestation before a failed migration, and its PCR31
 // commits to the failed target rather than to itself.
 func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 string) error {
-	prevPCR0, err := m.ReadPreviousPCR0(ctx)
+	deployment := getDeployment()
+	appName := getAppName()
+	prevPCR0, err := readSSMParamOptional(ctx, m.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
 	if err != nil {
 		return fmt.Errorf("read previous PCR0: %w", err)
 	}
 	if prevPCR0 == "" || strings.EqualFold(prevPCR0, ownPCR0) {
 		return nil
 	}
-	attestB64, err := m.ReadPreviousPCR0Attestation(ctx)
+	attestB64, err := readSSMParamOptional(ctx, m.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName))
 	if err != nil {
 		return fmt.Errorf("read previous attestation: %w", err)
 	}

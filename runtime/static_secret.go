@@ -25,13 +25,9 @@ import (
 // StaticSecret type + config loading
 // =============================================================================
 
-// StaticSecret defines a secret managed by KMS inside the enclave runtime.
-// Configured in enclave.yaml under `secrets:`. At boot, the supervisor
-// either decrypts an existing KMS-encrypted ciphertext from SSM (one per
-// secret), or generates a fresh 32-byte secret if none exists yet (primary
-// mode only — never in migration mode). Each secret's plaintext is
-// hex-encoded and exported into the configured env var, which the child
-// app inherits via os.Environ().
+// StaticSecret defines a secret managed by KMS inside the enclave runtime
+// (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
+// into the configured env var, which the child app inherits via os.Environ().
 type StaticSecret struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
@@ -95,9 +91,8 @@ func (s *StaticSecrets) Len() int {
 // loop is the only thing protecting boot from KMS/SSM warmup races; without
 // it, a transient AWS hiccup during init fails the enclave to boot.
 //
-// keyID specifies the KMS key to decrypt under. prefix selects the SSM
-// namespace (PrimaryPrefix or MigrationPrefix).
-func (s *StaticSecrets) LoadAll(ctx context.Context, keyID string, prefix ParamPrefix) error {
+// keyID is the KMS key to decrypt under; it also scopes the SSM ciphertext path.
+func (s *StaticSecrets) LoadAll(ctx context.Context, keyID string) error {
 	const timeout = 5 * time.Minute
 	interval := 5 * time.Second
 
@@ -108,7 +103,7 @@ func (s *StaticSecrets) LoadAll(ctx context.Context, keyID string, prefix ParamP
 	for {
 		allLoaded := true
 		for _, sec := range s.secrets {
-			if err := s.LoadOrGenerate(ctx, sec, keyID, prefix); err != nil {
+			if err := s.LoadOrGenerate(ctx, sec, keyID); err != nil {
 				lastErr = fmt.Errorf("secret %s: %w", sec.Name, err)
 				allLoaded = false
 				break
@@ -134,12 +129,10 @@ func (s *StaticSecrets) LoadAll(ctx context.Context, keyID string, prefix ParamP
 	}
 }
 
-// LoadOrGenerate loads the secret's ciphertext from SSM, generating a
-// fresh one only in primary mode. In migration mode (MigrationPrefix) the
-// staged ciphertext MUST exist — generating would orphan real data on
-// PromoteToPrimary.
-func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret, keyID string, prefix ParamPrefix) error {
-	paramName := secretParamName(secret.Name, prefix)
+// LoadOrGenerate loads the secret's ciphertext from the key-scoped SSM path,
+// generating + storing a fresh one if absent (first boot for this KMS key).
+func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret, keyID string) error {
+	paramName := secretCiphertextParam(secret.Name, keyID)
 
 	ciphertextB64, err := s.kms.LoadCiphertext(ctx, paramName)
 	if err != nil {
@@ -148,10 +141,6 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 
 	if ciphertextB64 != "" {
 		return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
-	}
-
-	if prefix == MigrationPrefix {
-		return fmt.Errorf("migration ciphertext missing at %s — cannot generate fresh (would orphan data)", paramName)
 	}
 
 	out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{

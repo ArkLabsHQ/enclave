@@ -179,12 +179,6 @@ output "ec2_role_arn" {
   value       = module.enclave.ec2_role_arn
 }
 
-output "kms_key_id" {
-  description = "KMS encryption key ID."
-  value       = module.enclave.kms_key_id
-  sensitive   = true
-}
-
 output "instance_id" {
   description = "EC2 instance ID (empty in local mode)."
   value       = module.enclave.instance_id

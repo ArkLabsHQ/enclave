@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -83,6 +84,180 @@ func (k *KMS) LoadCiphertext(ctx context.Context, paramName string) (string, err
 	return value, nil
 }
 
+// EnsureKeyID returns the primary KMS key ID, creating one PCR0-locked at
+// first boot if /<dep>/<app>/KMSKeyID is the tofu-provisioned "UNSET"
+// placeholder. CreateKey carries the final policy in the same call, so no
+// external principal ever holds authority over the key. A missing param (or
+// any other read error) is fatal — the placeholder must exist, otherwise the
+// runtime is pointed at the wrong SSM namespace and shouldn't silently mint
+// a key there.
+func (k *KMS) EnsureKeyID(ctx context.Context) (string, error) {
+	deployment := getDeployment()
+	appName := getAppName()
+	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
+
+	out, err := k.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(paramName),
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		var pnf *ssmtypes.ParameterNotFound
+		if errors.As(err, &pnf) {
+			return "", fmt.Errorf("KMSKeyID placeholder missing at %s — tofu apply required", paramName)
+		}
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	}
+	if out.Parameter != nil && out.Parameter.Value != nil {
+		if v := strings.TrimSpace(*out.Parameter.Value); v != "" && v != "UNSET" {
+			return v, nil
+		}
+	}
+
+	pcr0 := getPCR0()
+	if pcr0 == "" {
+		return "", fmt.Errorf("could not read PCR0 from NSM")
+	}
+	identity, err := k.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", fmt.Errorf("sts get-caller-identity: %w", err)
+	}
+	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
+	if err != nil {
+		return "", fmt.Errorf("resolve IAM role ARN: %w", err)
+	}
+	builder := NewKMSPolicyBuilder().ForRole(roleARN).LockedToPCR0Values([]string{pcr0})
+	if !kmsKeyLocked() {
+		account, err := arnAccount(*identity.Arn)
+		if err != nil {
+			return "", fmt.Errorf("resolve AWS account ID for recovery principal: %w", err)
+		}
+		builder = builder.WithRootRecovery(account)
+	}
+
+	createOut, err := k.aws.KMS.CreateKey(ctx, &kms.CreateKeyInput{
+		Description:                    aws.String(fmt.Sprintf("introspector-enclave primary key for %s/%s", deployment, appName)),
+		Policy:                         aws.String(builder.Build()),
+		BypassPolicyLockoutSafetyCheck: true,
+		Tags: []kmstypes.Tag{
+			{TagKey: aws.String("AppName"), TagValue: aws.String(appName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(deployment)},
+			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("kms create-key: %w", err)
+	}
+	keyID := *createOut.KeyMetadata.KeyId
+
+	// Schedule the just-created key for deletion if anything from here on
+	// fails before we successfully register it as the primary key.
+	keyOK := false
+	defer func() {
+		if keyOK {
+			return
+		}
+		pendingDays := keyDeletionPendingDays
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, delErr := k.aws.KMS.ScheduleKeyDeletion(cleanupCtx, &kms.ScheduleKeyDeletionInput{
+			KeyId:               aws.String(keyID),
+			PendingWindowInDays: &pendingDays,
+		}); delErr != nil {
+			slog.Warn("schedule unregistered primary key for deletion failed", "key_id", keyID, "error", delErr)
+		}
+	}()
+
+	if _, err := k.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(paramName),
+		Value:     aws.String(keyID),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return "", fmt.Errorf("ssm put-parameter %s: %w", paramName, err)
+	}
+
+	registered, _ := k.readKMSKeyID(ctx, paramName)
+	if registered != "" && registered != keyID {
+		// Another enclave registered first; defer schedules ours for deletion.
+		slog.Warn("another enclave registered a different KMS key, scheduling own key for deletion", "ours", keyID, "registered", registered)
+		return registered, nil
+	}
+
+	keyOK = true
+	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", pcr0[:16])
+	return keyID, nil
+}
+
+// CreateMigrationKey mints a fresh KMS key with policy locked to
+// [ownPCR0, newPCR0] at CreateKey time. The EC2 role never holds
+// kms:PutKeyPolicy on the key, so the PCR0 set is immutable from birth —
+// the only window during which the policy could be set is the single
+// CreateKey call itself, and that call carries the final policy. When the
+// deployment runs in non-strict mode (!kmsKeyLocked()), RootRecovery is
+// included from birth, matching the primary key's posture so root retains
+// the same escape hatch across migration generations.
+func (k *KMS) CreateMigrationKey(ctx context.Context, ownPCR0, newPCR0 string) (string, error) {
+	deployment := getDeployment()
+	appName := getAppName()
+	identity, err := k.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", fmt.Errorf("sts get-caller-identity: %w", err)
+	}
+	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
+	if err != nil {
+		return "", fmt.Errorf("resolve IAM role ARN: %w", err)
+	}
+	builder := NewKMSPolicyBuilder().
+		ForRole(roleARN).
+		LockedToPCR0Values([]string{ownPCR0, newPCR0})
+	if !kmsKeyLocked() {
+		account, err := arnAccount(*identity.Arn)
+		if err != nil {
+			return "", fmt.Errorf("resolve AWS account ID for recovery principal: %w", err)
+		}
+		builder = builder.WithRootRecovery(account)
+	}
+	out, err := k.aws.KMS.CreateKey(ctx, &kms.CreateKeyInput{
+		Description:                    aws.String(fmt.Sprintf("introspector-enclave migration key for %s/%s", deployment, appName)),
+		Policy:                         aws.String(builder.Build()),
+		BypassPolicyLockoutSafetyCheck: true,
+		Tags: []kmstypes.Tag{
+			{TagKey: aws.String("AppName"), TagValue: aws.String(appName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(deployment)},
+			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
+			{TagKey: aws.String("Purpose"), TagValue: aws.String("migration")},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("kms create-key: %w", err)
+	}
+	return *out.KeyMetadata.KeyId, nil
+}
+
+// readKMSKeyID returns the current KMSKeyID value, or "" when the SSM param
+// is missing or set to "UNSET". Distinguishes "no key yet" from a hard error.
+func (k *KMS) readKMSKeyID(ctx context.Context, paramName string) (string, error) {
+	out, err := k.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(paramName),
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		var pnf *ssmtypes.ParameterNotFound
+		if errors.As(err, &pnf) {
+			return "", nil
+		}
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", nil
+	}
+	v := strings.TrimSpace(*out.Parameter.Value)
+	if v == "" || v == "UNSET" {
+		return "", nil
+	}
+	return v, nil
+}
+
 // GetKeyID reads the primary KMS key ID from SSM at /<dep>/<app>/KMSKeyID.
 func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 	deployment := getDeployment()
@@ -105,101 +280,26 @@ func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// SelfApplyPolicy applies the PCR0-restricted KMS key policy from inside
-// the enclave. The enclave reads its own PCR0 from NSM hardware
-// (unforgeable), derives its role ARN and account ID via STS, and calls
-// PutKeyPolicy to restrict Decrypt to its own attestation identity.
-//
-// keyID specifies which KMS key to operate on. Pass empty string to use
-// the primary key from SSM. In migration mode, callers pass the
-// migration key ID so the enclave operates on the transitional key that
-// was already locked by the old enclave's handleStartMigration.
-//
-// Idempotent: if the policy already contains the correct PCR0, or if
-// the key is locked (no PutKeyPolicy permission), the function returns nil.
-func (k *KMS) SelfApplyPolicy(ctx context.Context, keyID string) error {
-	if keyID == "" {
-		var err error
-		keyID, err = k.GetKeyID(ctx)
-		if err != nil {
-			return fmt.Errorf("get KMS key ID: %w", err)
-		}
-	}
-
-	// Get own PCR0 from NSM hardware.
+// VerifyKeyAuthorization errors if keyID's policy doesn't admit this enclave's PCR0
+// for Decrypt. Verification only — keys are policy-locked at CreateKey time.
+func (k *KMS) VerifyKeyAuthorization(ctx context.Context, keyID string) error {
 	pcr0 := getPCR0()
 	if pcr0 == "" {
 		return fmt.Errorf("could not read PCR0 from NSM")
 	}
-
-	// Read current key policy to determine state.
-	currentPolicy, err := k.aws.KMS.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
+	out, err := k.aws.KMS.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
 		KeyId:      aws.String(keyID),
 		PolicyName: aws.String("default"),
 	})
 	if err != nil {
 		return fmt.Errorf("get current KMS key policy: %w", err)
 	}
-
 	policyText := ""
-	if currentPolicy.Policy != nil {
-		policyText = *currentPolicy.Policy
+	if out.Policy != nil {
+		policyText = *out.Policy
 	}
-
-	hasPCR0, hasPutKeyPolicy := parseKMSPolicyState(policyText, pcr0)
-
-	if hasPCR0 {
-		slog.Info("KMS policy already contains PCR0, skipping", "pcr0", pcr0[:16])
+	if policyAdmitsPCR0(policyText, pcr0) {
 		return nil
 	}
-
-	// Modifiable when: policy is empty (fresh key), or grants PutKeyPolicy or kms:*.
-	if policyText != "" && !hasPutKeyPolicy {
-		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
-	}
-
-	// Get caller identity for role ARN and account ID.
-	identity, err := k.aws.STS.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return fmt.Errorf("sts get-caller-identity: %w", err)
-	}
-
-	roleARN, err := assumedRoleARNToRoleARN(*identity.Arn)
-	if err != nil {
-		return fmt.Errorf("resolve IAM role ARN: %w", err)
-	}
-
-	builder := NewKMSPolicyBuilder().ForRole(roleARN).LockedToPCR0(pcr0)
-	if !kmsKeyLocked() {
-		account, err := arnAccount(*identity.Arn)
-		if err != nil {
-			return fmt.Errorf("resolve AWS account ID for recovery principal: %w", err)
-		}
-		builder = builder.WithRootRecovery(account)
-	}
-	policy := builder.Build()
-
-	// Retry with backoff to handle IAM propagation delay on fresh deploy.
-	// BypassPolicyLockoutSafetyCheck is required because we're removing
-	// PutKeyPolicy from everyone — the key becomes immutably locked.
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*2) * time.Second)
-		}
-		_, err = k.aws.KMS.PutKeyPolicy(ctx, &kms.PutKeyPolicyInput{
-			KeyId:                          aws.String(keyID),
-			Policy:                         aws.String(policy),
-			PolicyName:                     aws.String("default"),
-			BypassPolicyLockoutSafetyCheck: true,
-		})
-		if err == nil {
-			slog.Info("applied PCR0-restricted KMS policy", "pcr0", pcr0[:16])
-			return nil
-		}
-		lastErr = err
-		slog.Warn("PutKeyPolicy attempt failed", "attempt", attempt+1, "error", err)
-	}
-
-	return fmt.Errorf("kms put-key-policy after retries: %w", lastErr)
+	return fmt.Errorf("KMS key %s does not admit our PCR0 (ours: %s...)", keyID, pcr0[:16])
 }

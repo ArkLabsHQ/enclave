@@ -68,10 +68,11 @@ jobs:
           cp .enclave/artifacts/image.eif /tmp/image-v2.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v2.json
 
-          # v3: deliberately wrong previous_pcr0 for the rollback test.
-          WRONG_PCR0="0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
+          # v3: wrong app name → /dev/my-app-wrong/KMSKeyID 404 → Init fails → rollback.
+          V2_PCR0=$(jq -r '.PCR0' /tmp/pcr-v2.json)
           sed -i 's/^version: .*/version: 0.0.3/' enclave/enclave.yaml
-          sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${WRONG_PCR0}\"|" enclave/enclave.yaml
+          sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" enclave/enclave.yaml
+          sed -i 's|^name: my-app\b|name: my-app-wrong|' enclave/enclave.yaml
           /tmp/enclave-cli build
           cp .enclave/artifacts/image.eif /tmp/image-v3.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v3.json
@@ -79,6 +80,7 @@ jobs:
           # Restore yaml to v1 state (no rebuild — would produce a divergent PCR0).
           sed -i 's/^version: .*/version: 0.0.1/' enclave/enclave.yaml
           sed -i '/^previous_pcr0:/d' enclave/enclave.yaml
+          sed -i 's|^name: my-app-wrong\b|name: my-app|' enclave/enclave.yaml
 
           # Install all artifacts from /tmp.
           cp /tmp/image-v1.eif .enclave/artifacts/image.eif

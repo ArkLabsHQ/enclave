@@ -123,6 +123,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("verify KMS key admits us: %w", err)
 	}
 
+	if err := e.migrator.VerifyPredecessorCommitment(ctx, getPCR0()); err != nil {
+		slog.Error("verify predecessor PCR31 commitment", "error", err)
+		return fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
+	}
+
 	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {
 		slog.Error("load secrets from KMS", "error", err)
 		return fmt.Errorf("load secrets from KMS: %w", err)

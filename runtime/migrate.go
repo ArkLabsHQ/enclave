@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -385,25 +386,73 @@ func getPCR0() string {
 // target) it errors rather than corrupting the register.
 func commitPCR31(newPCR0Hex string, newPCR0Bytes []byte) error {
 	want := sha512.Sum384(append(make([]byte, 48), newPCR0Bytes...))
-	if cur, locked, err := describePCR(migrationPCRIndex); err == nil {
-		switch {
-		case bytes.Equal(cur, want[:]):
-			if !locked {
-				if err := lockPCR(migrationPCRIndex); err != nil {
-					return fmt.Errorf("lock PCR%d: %w", migrationPCRIndex, err)
-				}
+	cur, locked, err := describePCR(migrationPCRIndex)
+	if err != nil {
+		return fmt.Errorf("describePCR(%d): %w", migrationPCRIndex, err)
+	}
+	switch {
+	case bytes.Equal(cur, want[:]):
+		if !locked {
+			if err := lockPCR(migrationPCRIndex); err != nil {
+				return fmt.Errorf("lock PCR%d: %w", migrationPCRIndex, err)
 			}
-			slog.Info("PCR31 already committed to new_pcr0, skipped re-extension", "new_pcr0", prefix16(newPCR0Hex))
-			return nil
-		case !bytes.Equal(cur, make([]byte, len(cur))):
-			return fmt.Errorf("PCR%d holds an unexpected value; reboot the enclave to retry migration", migrationPCRIndex)
 		}
+		slog.Info("PCR31 already committed to new_pcr0, skipped re-extension", "new_pcr0", prefix16(newPCR0Hex))
+		return nil
+	case !bytes.Equal(cur, make([]byte, len(cur))):
+		return fmt.Errorf("PCR%d holds an unexpected value; reboot the enclave to retry migration", migrationPCRIndex)
 	}
 	if err := extendPCR(migrationPCRIndex, newPCR0Bytes); err != nil {
 		return fmt.Errorf("extend PCR%d with new_pcr0: %w", migrationPCRIndex, err)
 	}
 	if err := lockPCR(migrationPCRIndex); err != nil {
 		return fmt.Errorf("lock PCR%d: %w", migrationPCRIndex, err)
+	}
+	return nil
+}
+
+// VerifyPredecessorCommitment checks that the previous enclave's stored
+// attestation document committed (via PCR31) to handing off to ownPCR0.
+// No-op when there's no predecessor (genesis), or when the chain entry
+// points at our own PCR0 — that's the rolled-back-onto-self case: this
+// enclave wrote the attestation before a failed migration, and its PCR31
+// commits to the failed target rather than to itself.
+func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 string) error {
+	prevPCR0, err := m.ReadPreviousPCR0(ctx)
+	if err != nil {
+		return fmt.Errorf("read previous PCR0: %w", err)
+	}
+	if prevPCR0 == "" || strings.EqualFold(prevPCR0, ownPCR0) {
+		return nil
+	}
+	attestB64, err := m.ReadPreviousPCR0Attestation(ctx)
+	if err != nil {
+		return fmt.Errorf("read previous attestation: %w", err)
+	}
+	if attestB64 == "" {
+		return nil
+	}
+	return verifyPCR31Commitment(attestB64, ownPCR0)
+}
+
+// verifyPCR31Commitment: nil iff the previous enclave's attestation document
+// committed to handing off to THIS enclave's PCR0 (by extending PCR31).
+func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
+	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
+	if err != nil {
+		return fmt.Errorf("decode attestation base64: %w", err)
+	}
+	pcr31, err := extractPCRFromAttestation(attestDoc, migrationPCRIndex)
+	if err != nil {
+		return fmt.Errorf("extract PCR%d: %w", migrationPCRIndex, err)
+	}
+	myPCR0Bytes, err := hex.DecodeString(myPCR0)
+	if err != nil {
+		return fmt.Errorf("decode own PCR0 hex: %w", err)
+	}
+	expected := sha512.Sum384(append(make([]byte, 48), myPCR0Bytes...))
+	if !bytes.Equal(pcr31, expected[:]) {
+		return fmt.Errorf("PCR%d mismatch: previous enclave committed to a different target PCR0", migrationPCRIndex)
 	}
 	return nil
 }

@@ -14,8 +14,11 @@ func TestIsGRPCRequest(t *testing.T) {
 	}{
 		{"native grpc over h2", 2, "application/grpc", true},
 		{"grpc with proto subtype", 2, "application/grpc+proto", true},
-		{"grpc-web over h2", 2, "application/grpc-web+proto", true},
 		{"grpc with charset", 2, "application/grpc; charset=utf-8", true},
+		{"grpc-web over h2", 2, "application/grpc-web+proto", true},
+		{"grpc-web over h1", 1, "application/grpc-web", true},
+		{"grpc-web-text over h1", 1, "application/grpc-web-text", true},
+		{"grpc-web binary over h1", 1, "application/grpc-web+proto", true},
 		{"json over h2", 2, "application/json", false},
 		{"grpc-shaped CT over h1", 1, "application/grpc", false},
 		{"empty CT over h2", 2, "", false},

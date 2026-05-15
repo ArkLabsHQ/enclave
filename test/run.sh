@@ -528,7 +528,7 @@ export ENCLAVE_SUPERVISOR_ADDR="127.0.0.1:8444"
 #
 # Forward enclave TLS (443 inside) to unprivileged 8443 on the host so
 # the test can curl https://localhost:8443/health without root.
-export GVPROXY_FORWARD_PORTS="8443:443 7073 9090"
+export GVPROXY_FORWARD_PORTS="8443:443 7073"
 # Point the in-process IMDS forwarder at mock-imds instead of the real
 # 169.254.169.254 (which isn't reachable from the test container).
 export IMDS_PROXY_TARGET="127.0.0.1:1338"

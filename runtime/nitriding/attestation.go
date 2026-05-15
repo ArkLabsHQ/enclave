@@ -87,6 +87,17 @@ func arePCRsIdentical(ourPCRs, theirPCRs map[uint][]byte) bool {
 	return true
 }
 
+// Attest asks the NSM hypervisor for a signed attestation document
+// binding the given nonce, userData, and publicKey.
+func Attest(nonce, userData, publicKey []byte) ([]byte, error) {
+	return attest(nonce, userData, publicKey)
+}
+
+// ArePCRsIdentical reports whether two PCR maps have the same keys and values.
+func ArePCRsIdentical(ourPCRs, theirPCRs map[uint][]byte) bool {
+	return arePCRsIdentical(ourPCRs, theirPCRs)
+}
+
 // attest takes as input a nonce, user-provided data and a public key, and then
 // asks the Nitro hypervisor to return a signed attestation document that
 // contains all three values.

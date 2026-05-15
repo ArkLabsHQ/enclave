@@ -21,12 +21,8 @@ var (
 	frameSizeLen = 2
 )
 
-// RunNetworking calls the function that sets up our networking environment.
-// If anything fails, we try again after a brief wait period. hostProxyPort
-// is the vsock port the host-side gvproxy listens on (typically 1024).
-//
-// Exported for cross-package use after the Enclave struct moved into the
-// runtime package.
+// RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
+// on failure. hostProxyPort is the vsock port gvproxy listens on (typically 1024).
 func RunNetworking(hostProxyPort uint32, stop chan bool) {
 	var err error
 	for {

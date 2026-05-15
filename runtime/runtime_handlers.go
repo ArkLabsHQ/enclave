@@ -8,12 +8,10 @@ package runtime
 //   - /health — liveness for load balancers
 //
 // Each handler closes over *Runtime so it can read attestation hashes,
-// the nonce cache, registered key material, and subsystem state. Pure
-// utility helpers (Attest, the limit reader) live in the nitriding
-// subpackage.
+// registered key material, and subsystem state. Pure utility helpers
+// (Attest, the limit reader) live in the nitriding subpackage.
 
 import (
-	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -31,9 +29,7 @@ import (
 const (
 	maxKeyMaterialLen = 1024 * 1024
 	indexPage         = "This host runs inside an AWS Nitro Enclave.\n"
-
-	nonceLen       = 20
-	nonceNumDigits = nonceLen * 2
+	nonceNumDigits    = 40 // 20-byte nonce, hex-encoded
 )
 
 var (
@@ -97,20 +93,6 @@ func attestationHandler(useProfiling bool, hashes *AttestationHashes) http.Handl
 			return
 		}
 		fmt.Fprintln(w, base64.StdEncoding.EncodeToString(rawDoc))
-	}
-}
-
-// nonceHandler issues a fresh 20-byte base64 nonce for client attestation flows.
-func nonceHandler(e *Runtime) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		buf := make([]byte, nonceLen)
-		if _, err := io.ReadFull(cryptoRand.Reader, buf); err != nil {
-			http.Error(w, "nonce generation failed", http.StatusInternalServerError)
-			return
-		}
-		n := base64.StdEncoding.EncodeToString(buf)
-		e.nonceCache.Add(n)
-		fmt.Fprintln(w, n)
 	}
 }
 

@@ -30,12 +30,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Route every slog call to both stderr and the LogBuffer so /v1/enclave-logs
-	// can serve them. Must run before Init() so init stages are captured.
 	slog.SetDefault(slog.New(
 		runtime.NewBufferHandler(enc.Logging()),
 	))
-
 	runtime.InitMetrics()
 	tracing := enc.Tracing()
 
@@ -44,8 +41,7 @@ func main() {
 	defer stop()
 	defer func() { _ = tracing.Shutdown(ctx) }()
 
-	// Point the Go resolver at gvproxy's DNS. The EIF rootfs doesn't
-	// symlink /etc/resolv.conf, so we write it before any name resolution.
+	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
 	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
 		slog.Debug("write /etc/resolv.conf", "error", err)
 	}
@@ -84,8 +80,6 @@ func main() {
 		<-ctx.Done()
 		slog.Info("shutting down (init failed, no child)")
 	} else {
-		// Start the user app as a child process. ENCLAVE_PROXY_PORT points
-		// at the private loopback listener (cfg.IntPort) for app callbacks.
 		appBinary := envOr("APP_BINARY_NAME", "app")
 		appPath := fmt.Sprintf("/app/%s", appBinary)
 
@@ -113,6 +107,11 @@ func main() {
 				slog.Error("child exited", "error", err)
 			}
 			stop()
+		case err := <-enc.ListenErr():
+			slog.Error("HTTP listener failed", "error", err)
+			_ = child.Process.Signal(syscall.SIGTERM)
+			<-childDone
+			os.Exit(1)
 		case <-ctx.Done():
 			slog.Info("shutting down")
 			_ = child.Process.Signal(syscall.SIGTERM)

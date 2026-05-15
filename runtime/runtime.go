@@ -49,14 +49,12 @@ const (
 	acmeCertCacheDir    = "cert-cache"
 	certificateOrg      = "AWS Nitro enclave application"
 	certificateValidity = time.Hour * 24 * 356
-	defaultNonceExpiry  = time.Minute
 
 	// Routes served on the public TLS mux (pubSrv) and the internal HTTP
 	// mux (privSrv). Paths are scoped under /enclave so they don't collide
 	// with the user app's surface area, which is forwarded via the catch-all
 	// reverse proxy at pathProxy.
 	pathRoot        = "/enclave"
-	pathNonce       = "/enclave/nonce"
 	pathAttestation = "/enclave/attestation"
 	pathState       = "/enclave/state"
 	pathHash        = "/enclave/hash"
@@ -99,8 +97,9 @@ type Runtime struct {
 	mux      *http.ServeMux         // admin mux captured at RegisterRoutes; gated routes wire here
 
 	// Lifecycle channels.
-	ready chan bool // closed when the user app POSTs /enclave/ready
-	stop  chan bool // closed by Stop() to unwind goroutines
+	ready     chan bool  // closed when the user app POSTs /enclave/ready
+	stop      chan bool  // closed by Stop() to unwind goroutines
+	listenErr chan error // first listener bind/serve error; consumed by main
 
 	// Init state — set by Init, read by gating middleware and handlers.
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
@@ -108,7 +107,6 @@ type Runtime struct {
 
 	// Attestation state.
 	hashes      *AttestationHashes // embedded in every NSM attestation doc
-	nonceCache  *nitriding.Cache   // recently-issued nonces for the keysync flow
 	keyMaterial any                // arbitrary peer-syncable state
 
 	// Subsystems — built in Init, registered via RegisterRoutes.
@@ -436,10 +434,10 @@ func (e *Runtime) configureHTTPServers() error {
 		return fmt.Errorf("validate config: %w", err)
 	}
 
-	e.nonceCache = nitriding.NewCache(defaultNonceExpiry)
 	e.hashes = new(AttestationHashes)
 	e.stop = make(chan bool)
 	e.ready = make(chan bool)
+	e.listenErr = make(chan error, 2) // pubSrv + privSrv
 
 	// Boost the default idle-connection pool — see brave/nitriding-daemon#2.
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
@@ -469,7 +467,6 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 	}
 
 	pm.Get(pathAttestation, attestationHandler(e.cfg.UseProfiling, e.hashes))
-	pm.Get(pathNonce, nonceHandler(e))
 	pm.Get(pathRoot, rootHandler(e.cfg))
 	pm.Get(pathConfig, configHandler(e.cfg))
 
@@ -522,12 +519,18 @@ func (e *Runtime) configureInternalHttpServer(admin http.Handler) {
 	im.Handle("/health", admin)
 }
 
-// runListeners spawns the goroutines that bind the private and public HTTP servers.
+// runListeners spawns the goroutines that bind the private and public HTTP
+// servers. Bind / serve failures are pushed onto e.listenErr so cmd/runtime
+// can exit non-zero — silently leaking a listener-less process would let
+// Init complete and the user app start with no external reachability.
 func (e *Runtime) runListeners() error {
 	slog.Info("starting private listener", "addr", e.privSrv.Addr)
 	go func() {
 		if err := e.privSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("private listener", "error", err)
+			select {
+			case e.listenErr <- fmt.Errorf("private listener: %w", err):
+			default:
+			}
 		}
 	}()
 
@@ -538,15 +541,26 @@ func (e *Runtime) runListeners() error {
 		}
 		lis, err := e.externalListener()
 		if err != nil {
-			slog.Error("listen on external port", "error", err)
+			select {
+			case e.listenErr <- fmt.Errorf("listen on external port: %w", err):
+			default:
+			}
 			return
 		}
 		if err := e.pubSrv.ServeTLS(lis, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("public listener", "error", err)
+			select {
+			case e.listenErr <- fmt.Errorf("public listener: %w", err):
+			default:
+			}
 		}
 	}()
 	return nil
 }
+
+// ListenErr returns a channel that fires once if either listener fails to
+// bind or serves an unexpected error. cmd/runtime selects on it alongside
+// the child-process and signal channels and exits non-zero on receive.
+func (e *Runtime) ListenErr() <-chan error { return e.listenErr }
 
 // externalListener returns the listener for the external TLS port, either
 // AF_VSOCK or AF_INET depending on Config.UseVsockForExtPort.
@@ -634,12 +648,12 @@ func (e *Runtime) configureACME() error {
 	// first TLS handshake.
 	go func() {
 		var raw []byte
-		var err error
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			raw, err = cache.Get(ctx, e.cfg.FQDN)
+			got, err := cache.Get(ctx, e.cfg.FQDN)
+			cancel()
 			if err == nil {
+				raw = got
 				break
 			}
 			time.Sleep(5 * time.Second)

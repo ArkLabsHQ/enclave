@@ -630,7 +630,7 @@ func (e *Runtime) genSelfSignedCert() error {
 // requests a fresh cert; outside an enclave a local DirCache is used.
 // ALPN includes acme-tls/1 so TLS-ALPN-01 challenges continue to work.
 func (e *Runtime) configureACME() error {
-	var cache autocert.Cache = nitriding.NewCertCache()
+	cache := nitriding.NewCertCache()
 	if !nitriding.InEnclave() {
 		cache = autocert.DirCache(acmeCertCacheDir)
 	}

@@ -54,13 +54,13 @@ func formatIndexPage(appURL *url.URL) string {
 
 func rootHandler(cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
+		_, _ = fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
 	}
 }
 
 func configHandler(cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, cfg)
+		_, _ = fmt.Fprintln(w, cfg)
 	}
 }
 
@@ -92,7 +92,7 @@ func attestationHandler(useProfiling bool, hashes *AttestationHashes) http.Handl
 			http.Error(w, errFailedAttestation, http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintln(w, base64.StdEncoding.EncodeToString(rawDoc))
+		_, _ = fmt.Fprintln(w, base64.StdEncoding.EncodeToString(rawDoc))
 	}
 }
 

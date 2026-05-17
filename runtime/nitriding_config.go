@@ -6,16 +6,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
 
-// BuildNitridingConfig constructs a nitriding.Config from the same ENCLAVE_*
-// env vars that the former stand-alone nitriding daemon consumed via CLI flags.
-// Returns an error if required fields are missing or a port is out of range.
-//
-// The caller passes this config to nitriding.NewEnclave.
-func BuildNitridingConfig() (*nitriding.Config, error) {
+// BuildNitridingConfig constructs a *Config from the same ENCLAVE_* env vars
+// the former stand-alone nitriding daemon consumed via CLI flags. The caller
+// passes this config to runtime.New() — there is no longer a separate
+// nitriding.Enclave constructor.
+func BuildNitridingConfig() (*Config, error) {
 	extPort, err := envUint16("ENCLAVE_NITRIDING_EXT_PORT", 443)
 	if err != nil {
 		return nil, err
@@ -24,31 +21,29 @@ func BuildNitridingConfig() (*nitriding.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	promPort, err := envUint16("ENCLAVE_NITRIDING_PROM_PORT", 9090)
-	if err != nil {
-		return nil, err
-	}
 	hostProxyPort, err := envUint32("ENCLAVE_NITRIDING_HOST_PROXY_PORT", 1024)
 	if err != nil {
 		return nil, err
 	}
 
-	proxyPort := envDefault("ENCLAVE_PROXY_PORT", "7073")
-	appWebSrv, err := url.Parse("http://127.0.0.1:" + proxyPort)
+	// Point directly at the user app — there is no longer an intermediate
+	// runtime proxy on :7073 in the external path. Runtime's management
+	// routes mount on the public chi mux via PubMux(); the catch-all
+	// revProxy reaches the user app in one hop.
+	appPort := envDefault("ENCLAVE_APP_PORT", "7074")
+	appWebSrv, err := url.Parse("http://127.0.0.1:" + appPort)
 	if err != nil {
 		return nil, fmt.Errorf("parse app web srv url: %w", err)
 	}
 
-	cfg := &nitriding.Config{
-		FQDN:                envDefault("ENCLAVE_NITRIDING_FQDN", "localhost"),
-		ExtPort:             extPort,
-		IntPort:             intPort,
-		HostProxyPort:       hostProxyPort,
-		PrometheusPort:      promPort,
-		PrometheusNamespace: envDefault("ENCLAVE_NITRIDING_PROM_NAMESPACE", "enclave"),
-		AppWebSrv:           appWebSrv,
-		WaitForApp:          false, // runtime binds IntPort itself; the /ready gate is irrelevant when nitriding runs in-process
-		Debug:               strings.EqualFold(os.Getenv("ENCLAVE_NITRIDING_DEBUG"), "true"),
+	cfg := &Config{
+		FQDN:          envDefault("ENCLAVE_NITRIDING_FQDN", "localhost"),
+		ExtPort:       extPort,
+		IntPort:       intPort,
+		HostProxyPort: hostProxyPort,
+		AppWebSrv:     appWebSrv,
+		WaitForApp:    false, // runtime binds IntPort itself; the /ready gate is irrelevant when nitriding runs in-process
+		Debug:         strings.EqualFold(os.Getenv("ENCLAVE_NITRIDING_DEBUG"), "true"),
 	}
 	return cfg, nil
 }

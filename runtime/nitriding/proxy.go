@@ -21,12 +21,12 @@ var (
 	frameSizeLen = 2
 )
 
-// runNetworking calls the function that sets up our networking environment.
-// If anything fails, we try again after a brief wait period.
-func runNetworking(c *Config, stop chan bool) {
+// RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
+// on failure. hostProxyPort is the vsock port gvproxy listens on (typically 1024).
+func RunNetworking(hostProxyPort uint32, stop chan bool) {
 	var err error
 	for {
-		if err = setupNetworking(c, stop); err == nil {
+		if err = setupNetworking(hostProxyPort, stop); err == nil {
 			return
 		}
 		elog.Printf("TAP tunnel to EC2 host failed: %v.  Restarting.", err)
@@ -42,12 +42,12 @@ func runNetworking(c *Config, stop chan bool) {
 //  3. Establish a connection with the proxy running on the host.
 //  4. Spawn goroutines to forward traffic between the TAP device and the proxy
 //     running on the host.
-func setupNetworking(c *Config, stop chan bool) error {
+func setupNetworking(hostProxyPort uint32, stop chan bool) error {
 	elog.Println("Setting up networking between host and enclave.")
 	defer elog.Println("Tearing down networking between host and enclave.")
 
 	// Establish connection with the proxy running on the EC2 host.
-	endpoint := fmt.Sprintf("vsock://%d:%d/connect", parentCID, c.HostProxyPort)
+	endpoint := fmt.Sprintf("vsock://%d:%d/connect", parentCID, hostProxyPort)
 	conn, path, err := transport.Dial(endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to connect to host: %w", err)

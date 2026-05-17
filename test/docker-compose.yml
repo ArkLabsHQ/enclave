@@ -6,28 +6,33 @@ services:
     environment:
       KMS_REGION: us-east-1
       KMS_ACCOUNT_ID: "123456789012"
-    volumes:
-      - ./seed.yaml:/init/seed.yaml
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 0"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  kms-proxy:
+  # Combined helper: kms-proxy (:4000) + mock-imds (:1338) in one container.
+  # Source lives at the repo root in awsmocks/. Published as
+  # ghcr.io/arklabshq/enclave-awsmocks for upstream apps; the framework's
+  # self-test builds it locally from source.
+  aws-mocks:
     build:
-      context: ../
-      dockerfile: test/local-kms-proxy/Dockerfile
+      context: ../awsmocks
+      dockerfile: Dockerfile
     ports:
       - "4000:4000"
+      - "1338:1338"
     environment:
       UPSTREAM_KMS_URL: "http://local-kms:8080"
-      LISTEN_ADDR: ":4000"
+      KMS_PROXY_LISTEN_ADDR: ":4000"
+      IMDS_LISTEN_ADDR: ":1338"
     depends_on:
       local-kms:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/ || exit 0"]
+      # Healthy only when BOTH listeners answer their /health route.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health && wget -qO- http://localhost:1338/health"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -45,20 +50,6 @@ services:
       timeout: 3s
       retries: 10
 
-  mock-imds:
-    build:
-      context: ../
-      dockerfile: test/mock-imds/Dockerfile
-    ports:
-      - "1338:1338"
-    environment:
-      LISTEN_ADDR: ":1338"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:1338/latest/api/token || exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # Full QEMU enclave test runner (replaces nix develop).
   # Usage: docker compose --profile test run --build test-runner
   test-runner:
@@ -73,9 +64,7 @@ services:
     depends_on:
       localstack:
         condition: service_healthy
-      mock-imds:
-        condition: service_healthy
-      kms-proxy:
+      aws-mocks:
         condition: service_healthy
     environment:
       SKIP_MOCK_SERVICES: "1"

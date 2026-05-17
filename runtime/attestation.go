@@ -18,10 +18,10 @@ import (
 )
 
 // AttestationHashRegistrar registers the SHA-256 hash of the enclave
-// application's attestation public key with the in-process nitriding
-// instance so it's embedded in NSM attestation documents.
+// application's attestation public key so it's embedded in NSM attestation
+// documents.
 //
-// Implemented by *nitriding.Enclave (see runtime/nitriding/setters.go).
+// Implemented by *Runtime itself (see SetAttestationKeyHash in runtime.go).
 // Tests inject a fake.
 type AttestationHashRegistrar interface {
 	SetAttestationKeyHash(hash [32]byte)
@@ -31,8 +31,8 @@ type AttestationHashRegistrar interface {
 // nitriding registrar. Init() generates the key and registers its hash
 // so it appears in NSM attestation documents under appKeyHash.
 type Attestation struct {
-	key        *btcec.PrivateKey
-	registrar  AttestationHashRegistrar
+	key       *btcec.PrivateKey
+	registrar AttestationHashRegistrar
 }
 
 // NewAttestation constructs an empty Attestation. Call SetRegistrar
@@ -101,6 +101,21 @@ func (a *Attestation) Ready() bool {
 // attestationDocument represents the CBOR structure of a Nitro attestation document.
 type attestationDocument struct {
 	PCRs map[uint][]byte `cbor:"pcrs"`
+}
+
+// AttestationHashes is the user_data payload embedded in NSM attestation
+// documents so clients can bind the document to the TLS cert and (optionally)
+// the user app's registered public key.
+type AttestationHashes struct {
+	tlsKeyHash [sha256.Size]byte
+	appKeyHash [sha256.Size]byte
+}
+
+// Serialize returns "sha256:<tls>;sha256:<app>" matching the format clients
+// expect when verifying the attestation document.
+func (a *AttestationHashes) Serialize() []byte {
+	return []byte(fmt.Sprintf("%s%s%s%s%s",
+		hashPrefix, a.tlsKeyHash, hashSeparator, hashPrefix, a.appKeyHash))
 }
 
 // buildAttestationDocument creates an attestation document with an RSA public key.

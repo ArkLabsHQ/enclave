@@ -26,8 +26,10 @@ import (
 // Metrics holds OTEL metric instruments for the enclave supervisor.
 type Metrics struct {
 	// Supervisor counters.
-	HTTPRequests   metric.Int64Counter
-	HTTPErrors     metric.Int64Counter
+	HTTPRequests        metric.Int64Counter
+	HTTPErrors          metric.Int64Counter
+	AppProxiedRequests  metric.Int64Counter // requests forwarded to the user app via revProxy
+	AppProxiedErrors    metric.Int64Counter // failures dialing or talking to the user app
 	KMSOperations  metric.Int64Counter
 	KMSErrors      metric.Int64Counter
 	StorageReads   metric.Int64Counter
@@ -74,6 +76,8 @@ func NewMetrics() *Metrics {
 	meter := otel.Meter("runtime")
 	m.HTTPRequests = newCounter(meter, "enclave_http_requests_total", "Total HTTP requests handled by the enclave supervisor.")
 	m.HTTPErrors = newCounter(meter, "enclave_http_errors_total", "Total HTTP responses with status 4xx or 5xx.")
+	m.AppProxiedRequests = newCounter(meter, "enclave_app_proxied_requests_total", "Total requests forwarded to the user app via the reverse proxy.")
+	m.AppProxiedErrors = newCounter(meter, "enclave_app_proxied_errors_total", "Total failures forwarding requests to the user app (dial / connect errors).")
 	m.KMSOperations = newCounter(meter, "enclave_kms_operations_total", "Total KMS Decrypt operations attempted.")
 	m.KMSErrors = newCounter(meter, "enclave_kms_errors_total", "Total failed KMS operations.")
 	m.StorageReads = newCounter(meter, "enclave_storage_reads_total", "Total encrypted storage read operations.")

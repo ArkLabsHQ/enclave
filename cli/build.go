@@ -60,19 +60,26 @@ type buildConfigRuntimeJSON struct {
 }
 
 func buildCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "build",
 		Short: "Build the enclave image (EIF)",
 		Long:  "Builds a reproducible Enclave Image File using Nix.",
 		RunE:  runBuild,
 	}
+	cmd.Flags().StringP("config", "c", "", "path to enclave.yaml (defaults to enclave/enclave.yaml or ./enclave.yaml). Use to build a test variant: `enclave build --config enclave/enclave_test.yaml`.")
+	return cmd
 }
 
 func runBuild(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	configPath, _ := cmd.Flags().GetString("config")
+	cfg, err := loadConfigAt(configPath)
 	if err != nil {
 		return err
 	}
+	return runBuildWithConfig(cfg)
+}
+
+func runBuildWithConfig(cfg *Config) error {
 	if err := cfg.validateRuntime(); err != nil {
 		return err
 	}

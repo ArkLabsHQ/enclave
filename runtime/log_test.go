@@ -20,7 +20,8 @@ import (
 
 func newTestEnclave(t *testing.T) *Runtime {
 	t.Helper()
-	enc, err := New()
+	// nil cfg → skip HTTP server setup; tests only need subsystem state.
+	enc, err := New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

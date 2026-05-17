@@ -1,4 +1,4 @@
-module github.com/ArkLabsHQ/introspector-enclave/cmd/local-kms-proxy
+module github.com/ArkLabsHQ/introspector-enclave/cmd/awsmocks
 
 go 1.25.5
 

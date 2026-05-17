@@ -35,6 +35,7 @@ func Execute() {
 		traceCmd(),
 		metricsCmd(),
 		migrationStatusCmd(),
+		testCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

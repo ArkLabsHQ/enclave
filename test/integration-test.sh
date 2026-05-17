@@ -354,12 +354,76 @@ else
 fi
 
 # Test 30: Attestation still works after all tests (NSM stability).
-echo "[28/28] Attestation stability check"
+echo "[28/33] Attestation stability check"
 PCR_RESP2=$($CURL "${BASE_URL}/test/pcr-secrets" 2>/dev/null || echo "")
 if [ -n "$PCR_RESP2" ] && echo "$PCR_RESP2" | jq -e '.status == "ok"' >/dev/null 2>&1; then
   pass "Attestation stable after all tests"
 else
   fail "Attestation stability" "${PCR_RESP2:0:120}"
+fi
+
+# --- HTTP/2 + gRPC tests ---
+#
+# End-to-end HTTP/2 + gRPC through nitriding (TLS edge, h2 via ALPN) ->
+# runtime proxy (h2c via http2.Transport{AllowHTTP:true}) -> test app (h2c
+# unified handler routing gRPC vs REST).
+# Issue: https://github.com/ArkLabsHQ/enclave/issues/85
+GRPC_HOST="localhost:${HOST_TLS_PORT}"
+GRPCURL="grpcurl -insecure -max-time 30 -authority test"
+
+# Test 29: HTTP/2 negotiated end-to-end via ALPN.
+echo "[29/33] HTTP/2 ALPN negotiation"
+H2_OUT=$(curl -sk --http2 -o /dev/null -w '%{http_version}' --max-time 10 \
+  "${BASE_URL}/health" 2>/dev/null || echo "")
+if [ "$H2_OUT" = "2" ]; then
+  pass "ALPN negotiated h2 (http_version=$H2_OUT)"
+else
+  fail "HTTP/2 negotiation" "expected http_version=2, got '$H2_OUT'"
+fi
+
+# Test 30: HTTP/1.1 still works (backward compatibility).
+echo "[30/33] HTTP/1.1 backward compatibility"
+H1_OUT=$(curl -sk --http1.1 -o /dev/null -w '%{http_version}' --max-time 10 \
+  "${BASE_URL}/health" 2>/dev/null || echo "")
+if [ "$H1_OUT" = "1.1" ]; then
+  pass "HTTP/1.1 still serves /health (http_version=$H1_OUT)"
+else
+  fail "HTTP/1.1 compat" "expected http_version=1.1, got '$H1_OUT'"
+fi
+
+# Test 31: gRPC unary — grpc.health.v1.Health/Check returns SERVING.
+echo "[31/33] gRPC unary (Health/Check)"
+HEALTH_OUT=$($GRPCURL "$GRPC_HOST" grpc.health.v1.Health/Check 2>&1 || echo "")
+if echo "$HEALTH_OUT" | grep -q '"status": "SERVING"'; then
+  pass "gRPC unary returns SERVING"
+else
+  fail "gRPC unary" "${HEALTH_OUT:0:200}"
+fi
+
+# Test 32: gRPC server-streaming — grpc.health.v1.Health/Watch yields >=1
+# message within 5s and the stream is not severed prematurely.
+echo "[32/33] gRPC server-streaming (Health/Watch)"
+WATCH_OUT=$(grpcurl -insecure -max-time 6 -authority test \
+  "$GRPC_HOST" grpc.health.v1.Health/Watch 2>&1 || true)
+WATCH_COUNT=$(echo "$WATCH_OUT" | grep -c '"status": "SERVING"' || true)
+if [ "$WATCH_COUNT" -ge 1 ]; then
+  pass "gRPC streaming delivered $WATCH_COUNT SERVING message(s)"
+else
+  fail "gRPC streaming" "no SERVING messages received: ${WATCH_OUT:0:200}"
+fi
+
+# Test 33: gRPC bypasses response-signing middleware. Native gRPC requests
+# must NOT get X-Attestation-Signature — that would imply buffering, which
+# breaks streaming. Use curl to shape an HTTP/2 request like gRPC and check
+# response headers.
+echo "[33/33] gRPC bypasses response-signing middleware"
+GRPC_HDRS=$(curl -sk --http2 -D - -o /dev/null --max-time 10 \
+  -H 'Content-Type: application/grpc' \
+  -X POST "${BASE_URL}/grpc.health.v1.Health/Check" 2>/dev/null || echo "")
+if echo "$GRPC_HDRS" | grep -qi '^x-attestation-signature:'; then
+  fail "gRPC middleware bypass" "X-Attestation-Signature header present on gRPC response"
+else
+  pass "no X-Attestation-Signature on gRPC response (bypass active)"
 fi
 
 echo ""

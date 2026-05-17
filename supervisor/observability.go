@@ -15,8 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
-const nitridingMetricsURL = "http://localhost:9090/metrics"
-
 // Observability serves the four read-only telemetry endpoints. The
 // shared HTTP client uses InsecureSkipVerify because the enclave's TLS
 // cert is attestation-pinned, not CA-issued — verification is impossible
@@ -45,18 +43,12 @@ func (o *Observability) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /enclave-traces", o.handleTraces)
 }
 
-// handleMetrics serves Prometheus text: nitriding metrics + enclave-app
-// metrics (JSON → text) + host-side gauges.
+// handleMetrics serves Prometheus text: runtime + enclave-app metrics
+// (JSON → text) + host-side gauges. The runtime exports OTEL counters
+// via /v1/enclave-metrics; the old Prometheus exposition on :9090 was
+// removed when chi metrics middleware was dropped.
 func (o *Observability) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-
-	resp, err := http.Get(nitridingMetricsURL)
-	if err == nil {
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode == http.StatusOK {
-			_, _ = io.Copy(w, resp.Body)
-		}
-	}
 
 	// Proxy enclave application metrics (JSON → Prometheus text).
 	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
@@ -65,13 +57,13 @@ func (o *Observability) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(appResp.Body)
 		_ = appResp.Body.Close()
 		if appResp.StatusCode == http.StatusOK && len(body) > 0 {
-			_, _ = fmt.Fprintln(w)
 			var snapshot map[string]any
 			if json.Unmarshal(body, &snapshot) == nil {
 				writePrometheusFromSnapshot(w, snapshot)
 			}
 		}
 	}
+	_, _ = fmt.Fprintln(w)
 
 	// Host-level enclave metrics.
 	_, _ = fmt.Fprintln(w)

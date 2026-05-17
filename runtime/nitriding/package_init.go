@@ -1,10 +1,5 @@
 package nitriding
 
-// Package-level globals and init() extracted from upstream main.go, which we
-// don't vendor (we own the entrypoint from runtime/cmd/runtime/main.go). These
-// must stay in the vendored package because attestation.go, enclave.go,
-// handlers.go, proxy.go, system_linux.go, and metrics.go all reference them.
-
 import (
 	"errors"
 	"log"
@@ -12,9 +7,15 @@ import (
 )
 
 var (
-	elog      = log.New(os.Stderr, "nitriding: ", log.Ldate|log.Ltime|log.LUTC|log.Lshortfile)
+	elog = log.New(os.Stderr, "nitriding: ", log.Ldate|log.Ltime|log.LUTC|log.Lshortfile)
+	// Elog is the exported logger.
+	Elog = elog
+	// inEnclave is true when /dev/nsm is present.
 	inEnclave = false
 )
+
+// InEnclave reports whether the process is running inside a Nitro Enclave.
+func InEnclave() bool { return inEnclave }
 
 func init() {
 	if _, err := os.Stat("/dev/nsm"); err == nil {

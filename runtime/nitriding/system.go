@@ -19,6 +19,9 @@ const (
 
 var errTooMuchToRead = errors.New("reached read limit")
 
+// ErrTooMuchToRead is returned by NewLimitReader when the read budget is exceeded.
+var ErrTooMuchToRead = errTooMuchToRead
+
 // limitReader behaves like a Reader but it returns errTooMuchToRead if the
 // given read limit was exceeded.
 type limitReader struct {
@@ -52,6 +55,13 @@ func newLimitReader(r io.Reader, limit int) *limitReader {
 		Limit:  limit,
 	}
 }
+
+// NewLimitReader returns a Reader that errors with ErrTooMuchToRead once
+// more than limit bytes are read.
+func NewLimitReader(r io.Reader, limit int) io.Reader { return newLimitReader(r, limit) }
+
+// SetFdLimit sets the process file-descriptor soft/hard caps.
+func SetFdLimit(cur, max uint64) error { return setFdLimit(cur, max) }
 
 // setFdLimit sets the process's file descriptor limit to the given soft (cur)
 // and hard (max) cap.  If either of the two given values is 0, we use our

@@ -19,6 +19,9 @@ func newCertCache() *certCache {
 	}
 }
 
+// NewCertCache returns an in-memory autocert.Cache for use by ACME flows.
+func NewCertCache() autocert.Cache { return newCertCache() }
+
 func (c *certCache) Get(ctx context.Context, key string) ([]byte, error) {
 	c.RLock()
 	defer c.RUnlock()

@@ -24,6 +24,9 @@ var ourWaterParams = water.PlatformSpecificParams{
 	MultiQueue: true,
 }
 
+// ConfigureLoIface assigns the loopback interface its IP.
+func ConfigureLoIface() error { return configureLoIface() }
+
 // configureLoIface assigns an IP address to the loopback interface.
 func configureLoIface() error {
 	l, err := tenus.NewLinkFrom(ifaceLo)

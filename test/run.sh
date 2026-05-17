@@ -8,9 +8,10 @@
 #   ./run.sh              Build skeleton test app EIF, then run full test
 #   ./run.sh <path-to-eif>  Use a pre-built EIF
 #
-# Prerequisites (pick one):
-#   nix develop ./test   (provides QEMU, vhost-device-vsock, gvproxy, awscli)
-#   docker compose --profile test run --build test-runner  (all-in-one Docker)
+# Prerequisites:
+#   docker compose --profile test run --build test-runner  (canonical invocation
+#                                                           — image bakes in
+#                                                           QEMU + vsock + supervisor)
 #
 # Additional requirements:
 #   docker compose       (for mock services, unless SKIP_MOCK_SERVICES=1)
@@ -63,7 +64,7 @@ boot_qemu() {
 
   # Kill any stale processes from previous runs.
   killall vhost-device-vsock 2>/dev/null || true
-  pkill -f heartbeat.py 2>/dev/null || true
+  pkill -f enclave-test-heartbeat 2>/dev/null || true
   sleep 0.5
   rm -f "$vsock_socket"
 
@@ -85,8 +86,32 @@ boot_qemu() {
     return 1
   fi
 
+  # Heartbeat responder. The EIF init binary connects to vsock CID 3 port
+  # 9000, sends byte 0xB7, and expects 0xB7 back. With vhost-device-vsock's
+  # forward-cid=1 mode the request hits the host's AF_VSOCK loopback, which
+  # this inline Python listener echoes. Tagged "enclave-test-heartbeat" so
+  # stale instances from prior runs can be pkill'd by name.
   echo "=== Starting heartbeat responder ==="
-  python3 "$SCRIPT_DIR/heartbeat.py" &
+  python3 -c '
+# enclave-test-heartbeat
+import socket, sys
+sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind((0xFFFFFFFF, 9000))
+sock.listen(1)
+print("Heartbeat: listening on vsock port 9000", flush=True)
+while True:
+    try:
+        conn, (cid, _) = sock.accept()
+        data = conn.recv(1)
+        if data: conn.send(data)
+        conn.close()
+        print(f"Heartbeat: OK (CID {cid}, sent {data.hex()})", flush=True)
+    except KeyboardInterrupt:
+        break
+    except Exception as e:
+        print(f"Heartbeat: error: {e}", file=sys.stderr, flush=True)
+' &
   hb_pid=$!
   sleep 0.5
   if ! kill -0 "$hb_pid" 2>/dev/null; then
@@ -165,13 +190,15 @@ if [ "${1:-}" = "--boot-only" ]; then
   exit $?
 fi
 
-# Auto-enter Nix dev shell if required tools are missing.
+# run.sh runs inside the test-runner Docker image, which bakes in
+# vhost-device-vsock + qemu-system-x86_64. If either is missing, the
+# image was built wrong — fail fast rather than papering over it.
 if ! command -v vhost-device-vsock &>/dev/null || ! command -v qemu-system-x86_64 &>/dev/null; then
-  echo "Required tools not found, entering nix develop ..."
-  exec nix develop "${SCRIPT_DIR}" --command "$0" "$@"
+  echo "Error: vhost-device-vsock and qemu-system-x86_64 must be on PATH (rebuild test/Dockerfile.runner)." >&2
+  exit 1
 fi
 
-# Use pre-built binaries (Docker test-runner) or build from source (nix develop).
+# Use pre-built binaries (Docker test-runner) or fall back to host-built.
 if command -v enclave-cli &>/dev/null && command -v supervisor &>/dev/null; then
   ENCLAVE_CLI="$(command -v enclave-cli)"
   ENCLAVE_SUPERVISOR="$(command -v supervisor)"

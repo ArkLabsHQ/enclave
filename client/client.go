@@ -56,6 +56,13 @@ type Options struct {
 	// Nitriding uses self-signed certificates, so this is typically needed.
 	InsecureTLS *bool
 
+	// InsecureSkipCOSEVerify skips COSE Sign1 signature + AWS Nitro root cert
+	// chain verification of the attestation document, while keeping PCR0 and
+	// TLS-cert-fingerprint pinning intact. Intended for local QEMU integration
+	// tests where the emulated NSM doesn't produce an AWS-rooted ECDSA384
+	// signature. Never set this against a real production enclave.
+	InsecureSkipCOSEVerify bool
+
 	// VerifyProvenance enables GitHub artifact attestation verification
 	// for the deployment manifest. When true, NewFromManifest checks that
 	// deployment.json has a valid build provenance attestation from GitHub
@@ -81,6 +88,7 @@ type AttestationResult struct {
 	PCR0           string
 	PCRs           map[uint]string
 	AttestationKey string // hex-encoded compressed secp256k1 pubkey
+	TLSKeyHash     string // hex-encoded SHA-256 of the enclave's TLS leaf cert (from user_data)
 	Verified       bool
 	VerifiedAt     time.Time
 }
@@ -210,7 +218,7 @@ func (c *Client) ensureVerified(ctx context.Context) (*AttestationResult, error)
 // verify performs full attestation verification and caches the result.
 func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 	// 1. Fetch and verify attestation document.
-	nitResult, err := fetchAndVerifyAttestation(ctx, c.httpClient, c.baseURL, c.opts.ExpectedPCR0)
+	nitResult, err := fetchAndVerifyAttestation(ctx, c.httpClient, c.baseURL, c.opts.ExpectedPCR0, c.opts.InsecureSkipCOSEVerify)
 	if err != nil {
 		return nil, err
 	}
@@ -240,10 +248,17 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 		return nil, fmt.Errorf("key binding verification: %w", err)
 	}
 
+	// 4. Extract tlsKeyHash from user_data so gRPC callers can pin the TLS cert.
+	tlsKeyHash, err := extractTLSKeyHash(nitResult)
+	if err != nil {
+		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
+	}
+
 	result := &AttestationResult{
 		PCR0:           c.opts.ExpectedPCR0,
 		PCRs:           pcrs,
 		AttestationKey: attestKey,
+		TLSKeyHash:     tlsKeyHash,
 		Verified:       true,
 		VerifiedAt:     time.Now(),
 	}

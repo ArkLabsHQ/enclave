@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 )
 
@@ -78,7 +79,12 @@ type enclaveInfoResponse struct {
 // fetchAndVerifyAttestation fetches the attestation document from the enclave,
 // verifies it against the AWS Nitro root certificate chain, checks the nonce,
 // and validates PCR0 against the expected value.
-func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, baseURL, expectedPCR0 string) (*nitrite.Result, error) {
+//
+// When insecureSkipCOSEVerify is true, the COSE Sign1 signature + cert chain
+// check is bypassed (the document is parsed manually). PCR0 and nonce checks
+// still run. Used for local QEMU tests where the emulated NSM doesn't sign
+// with AWS Nitro keys.
+func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, baseURL, expectedPCR0 string, insecureSkipCOSEVerify bool) (*nitrite.Result, error) {
 	// Generate a random nonce to prevent replay attacks.
 	nonce := make([]byte, 20)
 	if _, err := rand.Read(nonce); err != nil {
@@ -125,16 +131,26 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 		return nil, fmt.Errorf("decode attestation document: %w", err)
 	}
 
-	// Verify the COSE Sign1 document against the AWS Nitro root certs.
-	result, err := nitrite.Verify(docBytes, nitrite.VerifyOptions{
-		CurrentTime: time.Now(),
-	})
-	if err != nil {
-		if result != nil && result.SignatureOK {
-			// Signature is valid but certificate may have expired — proceed
-			// with a warning since we still trust the attestation.
-		} else {
-			return nil, fmt.Errorf("attestation verification: %w", err)
+	var result *nitrite.Result
+	if insecureSkipCOSEVerify {
+		// Manual parse — extract Document from the COSE Sign1 payload without
+		// validating the AWS Nitro chain. PCR0 + tlsKeyHash pinning below still
+		// constrain trust to the expected enclave build.
+		result, err = parseCOSEPayloadInsecure(docBytes)
+		if err != nil {
+			return nil, fmt.Errorf("insecure parse attestation: %w", err)
+		}
+	} else {
+		result, err = nitrite.Verify(docBytes, nitrite.VerifyOptions{
+			CurrentTime: time.Now(),
+		})
+		if err != nil {
+			if result != nil && result.SignatureOK {
+				// Signature is valid but certificate may have expired — proceed
+				// with a warning since we still trust the attestation.
+			} else {
+				return nil, fmt.Errorf("attestation verification: %w", err)
+			}
 		}
 	}
 
@@ -166,15 +182,41 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 	return result, nil
 }
 
-// verifyKeyBinding verifies the enclave's ephemeral attestation key by
-// checking that the pubkey from /v1/enclave-info matches the appKeyHash
-// in the attestation document's UserData.
-//
-// UserData format (nitriding v1.4.2):
+// UserData format embedded in NSM attestation documents (nitriding v1.4.2):
 //
 //	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
 //
-// Total 79 bytes. appKeyHash is at bytes 47:79.
+// Total 79 bytes. tlsKeyHash at bytes 7:39, appKeyHash at bytes 47:79.
+const (
+	udHashPrefix = "sha256:"
+	udHashSep    = ";"
+	udTLSStart   = len(udHashPrefix)
+	udTLSEnd     = udTLSStart + 32
+	udSepStart   = udTLSEnd
+	udAppPrefix  = udSepStart + len(udHashSep)
+	udAppStart   = udAppPrefix + len(udHashPrefix)
+	udAppEnd     = udAppStart + 32
+)
+
+// extractTLSKeyHash returns the hex-encoded SHA-256 fingerprint of the
+// enclave's TLS leaf cert, taken from bytes 7:39 of user_data.
+func extractTLSKeyHash(attestResult *nitrite.Result) (string, error) {
+	if attestResult == nil || attestResult.Document == nil {
+		return "", fmt.Errorf("no attestation result")
+	}
+	userData := attestResult.Document.UserData
+	if len(userData) < udTLSEnd {
+		return "", fmt.Errorf("user_data too short for tlsKeyHash (got %d bytes)", len(userData))
+	}
+	if string(userData[:udTLSStart]) != udHashPrefix {
+		return "", fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
+	}
+	return hex.EncodeToString(userData[udTLSStart:udTLSEnd]), nil
+}
+
+// verifyKeyBinding verifies the enclave's ephemeral attestation key by
+// checking that the pubkey from /v1/enclave-info matches the appKeyHash
+// in the attestation document's UserData.
 func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL string, attestResult *nitrite.Result) (string, error) {
 	if attestResult == nil || attestResult.Document == nil {
 		return "", fmt.Errorf("no attestation result to verify against")
@@ -306,4 +348,35 @@ func fetchEnclaveInfo(ctx context.Context, httpClient *http.Client, baseURL stri
 		return &info, fmt.Errorf("enclave init error: %s", info.Error)
 	}
 	return &info, nil
+}
+
+// parseCOSEPayloadInsecure decodes a COSE Sign1 attestation envelope without
+// verifying the signature or cert chain. Used only when the caller opts into
+// InsecureSkipCOSEVerify (local-test mode). It still returns the parsed
+// Document so PCR0 + tlsKeyHash pinning can run downstream.
+func parseCOSEPayloadInsecure(data []byte) (*nitrite.Result, error) {
+	var envelope struct {
+		_           struct{} `cbor:",toarray"`
+		Protected   []byte
+		Unprotected cbor.RawMessage
+		Payload     []byte
+		Signature   []byte
+	}
+	if err := cbor.Unmarshal(data, &envelope); err != nil {
+		return nil, fmt.Errorf("decode COSE Sign1 envelope: %w", err)
+	}
+	if len(envelope.Payload) == 0 {
+		return nil, fmt.Errorf("COSE Sign1 payload empty")
+	}
+	doc := &nitrite.Document{}
+	if err := cbor.Unmarshal(envelope.Payload, doc); err != nil {
+		return nil, fmt.Errorf("decode attestation document: %w", err)
+	}
+	return &nitrite.Result{
+		Document:    doc,
+		Protected:   envelope.Protected,
+		Payload:     envelope.Payload,
+		Signature:   envelope.Signature,
+		SignatureOK: false,
+	}, nil
 }

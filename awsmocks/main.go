@@ -1,3 +1,6 @@
+// awsmocks bundles a KMS-Decrypt-with-Recipient proxy (:4000, wraps
+// plaintext in CMS EnvelopedData for the attesting enclave's RSA key)
+// and an IMDSv2 stub (:1338) into one binary.
 package main
 
 import (
@@ -24,15 +27,12 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-// ASN.1 OIDs for CMS EnvelopedData construction.
 var (
 	oidData          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
 	oidEnvelopedData = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 3}
 	oidRSAESOAEP     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 7}
 	oidAES256CBC     = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
 )
-
-// ASN.1 structures for CMS EnvelopedData.
 
 type contentInfo struct {
 	ContentType asn1.ObjectIdentifier
@@ -58,8 +58,6 @@ type encryptedContentInfo struct {
 	EncryptedContent           asn1.RawValue `asn1:"tag:0"`
 }
 
-// KMS request/response types.
-
 type kmsDecryptRequest struct {
 	CiphertextBlob    string          `json:"CiphertextBlob,omitempty"`
 	KeyId             string          `json:"KeyId,omitempty"`
@@ -84,38 +82,96 @@ type kmsDecryptResponseWithRecipient struct {
 	EncryptionAlgorithm    string `json:"EncryptionAlgorithm,omitempty"`
 }
 
-func main() {
-	listenAddr := envOrDefault("LISTEN_ADDR", ":4000")
-	upstreamURL := envOrDefault("UPSTREAM_KMS_URL", "http://localhost:8080")
+type imdsCredentials struct {
+	Code            string `json:"Code"`
+	LastUpdated     string `json:"LastUpdated"`
+	Type            string `json:"Type"`
+	AccessKeyId     string `json:"AccessKeyId"`
+	SecretAccessKey string `json:"SecretAccessKey"`
+	Token           string `json:"Token"`
+	Expiration      string `json:"Expiration"`
+}
 
-	upstream, err := url.Parse(upstreamURL)
+func main() {
+	kmsListen := envOrDefault("KMS_PROXY_LISTEN_ADDR", ":4000")
+	upstreamKMS := envOrDefault("UPSTREAM_KMS_URL", "http://local-kms:8080")
+	imdsListen := envOrDefault("IMDS_LISTEN_ADDR", ":1338")
+
+	upstream, err := url.Parse(upstreamKMS)
 	if err != nil {
-		log.Fatalf("invalid UPSTREAM_KMS_URL %q: %v", upstreamURL, err)
+		log.Fatalf("invalid UPSTREAM_KMS_URL %q: %v", upstreamKMS, err)
 	}
 
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- runKMSProxy(kmsListen, upstream)
+	}()
+	go func() {
+		errCh <- runMockIMDS(imdsListen)
+	}()
+
+	// First fatal error from either listener wins.
+	log.Fatal(<-errCh)
+}
+
+func runKMSProxy(listenAddr string, upstream *url.URL) error {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		target := r.Header.Get("X-Amz-Target")
-		// Check if this is a Decrypt call with Recipient.
-		if target == "TrentService.Decrypt" && r.Method == http.MethodPost {
+		if r.Header.Get("X-Amz-Target") == "TrentService.Decrypt" && r.Method == http.MethodPost {
 			handleDecrypt(w, r, upstream, proxy)
 			return
 		}
-		// All other requests: pass through.
 		proxy.ServeHTTP(w, r)
 	})
 
-	log.Printf("local-kms-proxy listening on %s, forwarding to %s", listenAddr, upstreamURL)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
-		log.Fatalf("server error: %v", err)
-	}
+	log.Printf("kms-proxy listening on %s, forwarding to %s", listenAddr, upstream.String())
+	return http.ListenAndServe(listenAddr, mux)
+}
+
+func runMockIMDS(listenAddr string) error {
+	const roleName = "test-enclave-role"
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("PUT /latest/api/token", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("mock-imds-token"))
+	})
+
+	mux.HandleFunc("GET /latest/meta-data/iam/security-credentials/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(roleName))
+	})
+
+	mux.HandleFunc("GET /latest/meta-data/iam/security-credentials/{role}", func(w http.ResponseWriter, _ *http.Request) {
+		creds := imdsCredentials{
+			Code:            "Success",
+			LastUpdated:     "2026-01-01T00:00:00Z",
+			Type:            "AWS-HMAC",
+			AccessKeyId:     "AKIAIOSFODNN7EXAMPLE",
+			SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+			Token:           "mock-session-token",
+			Expiration:      "2099-12-31T23:59:59Z",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(creds)
+	})
+
+	log.Printf("mock-imds listening on %s", listenAddr)
+	return http.ListenAndServe(listenAddr, mux)
 }
 
 func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, proxy *httputil.ReverseProxy) {
 	body, err := io.ReadAll(r.Body)
-	r.Body.Close()
+	_ = r.Body.Close()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
 		return
@@ -127,7 +183,6 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
-	// If no Recipient, pass through as-is.
 	if req.Recipient == nil {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
@@ -135,14 +190,12 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
-	// Extract the RSA public key from the attestation document.
 	rsaPub, err := extractRSAPubKeyFromAttestationDoc(req.Recipient.AttestationDocument)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("extract RSA key from attestation doc: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	// Strip Recipient and forward to upstream local-kms.
 	req.Recipient = nil
 	strippedBody, err := json.Marshal(req)
 	if err != nil {
@@ -155,7 +208,6 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		http.Error(w, fmt.Sprintf("create upstream request: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// Copy relevant headers.
 	for _, h := range []string{"X-Amz-Target", "Content-Type", "Authorization", "X-Amz-Date", "X-Amz-Security-Token"} {
 		if v := r.Header.Get(h); v != "" {
 			upstreamReq.Header.Set(h, v)
@@ -168,7 +220,7 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		http.Error(w, fmt.Sprintf("upstream request: %v", err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -177,14 +229,13 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		// Forward error response as-is.
 		for k, vals := range resp.Header {
 			for _, v := range vals {
 				w.Header().Add(k, v)
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		w.Write(respBody)
+		_, _ = w.Write(respBody)
 		return
 	}
 
@@ -200,7 +251,6 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
-	// Wrap plaintext in CMS EnvelopedData.
 	cmsData, err := buildCMSEnvelopedData(plaintext, rsaPub)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("build CMS EnvelopedData: %v", err), http.StatusInternalServerError)
@@ -215,13 +265,12 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 
 	w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
-// buildCMSEnvelopedData constructs a CMS EnvelopedData (ContentInfo) wrapping
-// the plaintext with AES-256-CBC content encryption and RSA-OAEP-SHA256 key transport.
+// buildCMSEnvelopedData mirrors AWS Nitro KMS's response shape:
+// AES-256-CBC over the plaintext, RSA-OAEP-SHA256 over the CEK.
 func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, error) {
-	// 1. Generate random AES-256 key (CEK) and IV.
 	cek := make([]byte, 32)
 	if _, err := rand.Read(cek); err != nil {
 		return nil, fmt.Errorf("generate CEK: %w", err)
@@ -231,7 +280,6 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 		return nil, fmt.Errorf("generate IV: %w", err)
 	}
 
-	// 2. PKCS#7 pad the plaintext.
 	padLen := aes.BlockSize - (len(plaintext) % aes.BlockSize)
 	padded := make([]byte, len(plaintext)+padLen)
 	copy(padded, plaintext)
@@ -239,7 +287,6 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 		padded[i] = byte(padLen)
 	}
 
-	// 3. Encrypt with AES-256-CBC.
 	block, err := aes.NewCipher(cek)
 	if err != nil {
 		return nil, fmt.Errorf("create AES cipher: %w", err)
@@ -247,13 +294,11 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 	ciphertext := make([]byte, len(padded))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, padded)
 
-	// 4. Encrypt CEK with RSA-OAEP-SHA256.
 	encryptedCEK, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pubKey, cek, nil)
 	if err != nil {
 		return nil, fmt.Errorf("RSA-OAEP encrypt CEK: %w", err)
 	}
 
-	// 5. Build ASN.1 structure.
 	eci := encryptedContentInfo{
 		ContentType: oidData,
 		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
@@ -288,25 +333,19 @@ func buildCMSEnvelopedData(plaintext []byte, pubKey *rsa.PublicKey) ([]byte, err
 	return asn1.Marshal(ci)
 }
 
-// extractRSAPubKeyFromAttestationDoc parses a base64-encoded COSE Sign1
-// attestation document and extracts the RSA public key from the public_key field.
 func extractRSAPubKeyFromAttestationDoc(attestB64 string) (*rsa.PublicKey, error) {
 	attestRaw, err := base64.StdEncoding.DecodeString(attestB64)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
 
-	// COSE Sign1 may be CBOR-tagged (tag 18). Try to unwrap tag first.
 	var tagged cbor.Tag
 	if err := cbor.Unmarshal(attestRaw, &tagged); err == nil {
-		// Successfully unwrapped tag, use inner content.
-		innerBytes, err := cbor.Marshal(tagged.Content)
-		if err == nil {
+		if innerBytes, err := cbor.Marshal(tagged.Content); err == nil {
 			attestRaw = innerBytes
 		}
 	}
 
-	// COSE Sign1 is a CBOR array: [protected, unprotected, payload, signature].
 	var coseSign1 []cbor.RawMessage
 	if err := cbor.Unmarshal(attestRaw, &coseSign1); err != nil {
 		return nil, fmt.Errorf("unmarshal COSE Sign1: %w", err)
@@ -315,7 +354,6 @@ func extractRSAPubKeyFromAttestationDoc(attestB64 string) (*rsa.PublicKey, error
 		return nil, fmt.Errorf("invalid COSE Sign1: expected 4 elements, got %d", len(coseSign1))
 	}
 
-	// Payload is element [2], CBOR bstr.
 	var payloadBytes []byte
 	if err := cbor.Unmarshal(coseSign1[2], &payloadBytes); err != nil {
 		return nil, fmt.Errorf("unmarshal payload: %w", err)

@@ -85,6 +85,6 @@ COPY --from=qemu-build /qemu-install/usr/local/ /usr/local/
 # boot-qemu.sh was merged into run.sh — invoke via `run.sh --boot-only <eif>`.
 # vsock-proxy.py is no longer needed; the supervisor's in-process IMDS
 # forwarder (supervisor/imds_proxy.go) replaces it.
-COPY test/heartbeat.py /usr/local/bin/heartbeat.py
+# heartbeat.py was inlined into run.sh — no separate file to ship.
 
 WORKDIR /test

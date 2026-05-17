@@ -12,15 +12,10 @@ Test your enclave application locally using QEMU's nitro-enclave emulation with 
 ## Quick Start
 
 ```sh
-# Enter the dev shell (provides QEMU 10.x, vhost-device-vsock, gvproxy, awscli).
+# Run the framework self-test inside the test-runner Docker image
+# (it bakes in QEMU 9.2.4, vhost-device-vsock, supervisor, etc.).
 cd test
-nix develop
-
-# Option A: Run with the skeleton test app (builds EIF automatically).
-./run.sh
-
-# Option B: Run with your own pre-built EIF.
-./run.sh ../.enclave/artifacts/image.eif
+docker compose --profile test run --build test-runner
 ```
 
 Or run each step manually:
@@ -180,5 +175,3 @@ All other KMS requests (GenerateDataKey, Encrypt, etc.) pass through unmodified.
 **Credentials not found**: Ensure mock-imds is running and `IMDS_ENDPOINT` is set to `192.168.127.1:1338` in enclave.yaml env overrides.
 
 **gvproxy networking fails**: Ensure port 1024 is in the vhost-device-vsock `forward-listen` list. Check gvproxy logs for connection errors.
-
-**Nix dev shell missing packages**: Run `nix develop ./test` from the test directory. The flake provides QEMU, vhost-device-vsock, and gvproxy.

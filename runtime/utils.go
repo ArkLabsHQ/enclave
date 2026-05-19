@@ -2,8 +2,8 @@ package runtime
 
 // OTLP protobuf parsers for the telemetry signals the runtime ingests over
 // HTTP from the user's app: structured logs (POST /v1/logs) and metrics
-// (POST /v1/enclave-metrics). OTLP trace ingest currently lives alongside its
-// HTTP handler in tracing_handler.go.
+// (POST /v1/metrics). OTLP trace ingest lives alongside its handler in
+// tracing.go.
 
 import (
 	"crypto/rand"

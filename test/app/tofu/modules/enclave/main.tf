@@ -160,8 +160,13 @@ resource "aws_ssm_parameter" "kms_key_id" {
   }
 }
 
-# PCR0 signing key. Deleting it makes every past signature un-verifiable —
-# protected by prevent_destroy + a 30-day deletion window as a safety net.
+# PCR0 signing key. Used by the admin's 'enclave sign' command to sign
+# this build's PCR0; the cert + signature get threaded into user_data and
+# served by the runtime at /enclave/signature.
+#
+# Deletion of this key would make every signature ever produced
+# un-verifiable, so it is double-protected: Tofu refuses to destroy it,
+# and even if that is bypassed AWS waits 30 days before actually deleting.
 resource "aws_kms_key" "pcr0_signing" {
   description              = "${local.prefix} PCR0 signing key (ECC_NIST_P384)"
   customer_master_key_spec = "ECC_NIST_P384"
@@ -179,16 +184,23 @@ resource "aws_kms_alias" "pcr0_signing" {
   target_key_id = aws_kms_key.pcr0_signing.key_id
 }
 
+# Sign the build's PCR0 with the KMS key during this apply. Triggered on
+# the PCR0 itself, so a new build → new PCR0 → re-sign on the next apply.
+# Writes pubkey.pem + signature.bin under .signing/ which the
+# data.local_file blocks below read into the SSM parameter resources.
 resource "terraform_data" "sign_pcr0" {
   triggers_replace = [local.effective_pcr0, aws_kms_key.pcr0_signing.key_id]
 
   provisioner "local-exec" {
-    # bash for pipefail; default /bin/sh is dash on slim images.
+    # Force bash so 'set -o pipefail' works. Terraform's default
+    # interpreter on linux is /bin/sh which on dash-based containers
+    # (alpine, debian-slim, etc.) rejects -o pipefail.
     interpreter = ["bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
       mkdir -p ${local.signing_dir}
-      # hex → bytes without xxd (not in slim images)
+      # Hex → raw bytes without xxd (which isn't in slim container images).
+      # sed prefixes each pair with \x, then printf %b emits the byte.
       printf '%b' "$(printf '%s' "${local.effective_pcr0}" | sed 's/../\\x&/g')" \
         > ${local.signing_dir}/pcr0.bin
       aws kms get-public-key \
@@ -219,6 +231,8 @@ data "local_file" "pcr0_signature_b64" {
   depends_on = [terraform_data.sign_pcr0]
 }
 
+# Publish pubkey + PCR0 + signature to SSM. The runtime reads these at
+# startup and serves them at /enclave/signature.
 resource "aws_ssm_parameter" "pcr0_pubkey" {
   name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
   type      = "String"

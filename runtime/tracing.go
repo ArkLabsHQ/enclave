@@ -198,12 +198,12 @@ func AttrError(err error) attribute.KeyValue         { return attribute.String("
 
 // RegisterRoutes attaches the trace endpoints on mux.
 func (t *Tracing) RegisterRoutes(mux Mux) {
-	mux.HandleFunc("POST /v1/enclave-traces", t.handlePost)
+	mux.HandleFunc("POST /v1/traces", t.handlePost)
 	mux.HandleFunc("GET /v1/enclave-traces", t.handleGet)
 }
 
 // handlePost accepts OTLP trace spans from the app.
-// POST /v1/enclave-traces (Content-Type: application/x-protobuf)
+// POST /v1/traces (Content-Type: application/x-protobuf)
 func (t *Tracing) handlePost(w http.ResponseWriter, r *http.Request) {
 	if t.auth != nil && !t.auth(w, r) {
 		return

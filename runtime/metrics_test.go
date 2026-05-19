@@ -221,7 +221,7 @@ func TestHandleMetricGet(t *testing.T) {
 func TestHandleMetricPost_NoAuth(t *testing.T) {
 	enc := newTestEnclave(t)
 	body := buildOTLPMetricRequest("test", 1)
-	req := httptest.NewRequest("POST", "/v1/enclave-metrics", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/v1/metrics", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	w := httptest.NewRecorder()
 	enc.handleMetricPost(w, req)
@@ -234,7 +234,7 @@ func TestHandleMetricPost_NoAuth(t *testing.T) {
 func TestHandleMetricPost_Valid(t *testing.T) {
 	enc := newTestEnclave(t)
 	body := buildOTLPMetricRequest("posted_metric", 77)
-	req := httptest.NewRequest("POST", "/v1/enclave-metrics", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/v1/metrics", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Authorization", "Bearer "+enc.RuntimeToken())
 	w := httptest.NewRecorder()

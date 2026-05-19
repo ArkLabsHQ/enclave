@@ -426,16 +426,15 @@ else
   pass "no X-Attestation-Signature on gRPC response (bypass active)"
 fi
 
-echo "[34/35] PCR0 signing endpoint"
-SIG_RESP=$($CURL "${BASE_URL}/enclave/signature" 2>/dev/null || echo "")
-SIG_CODE=$($CURL -o /dev/null -w '%{http_code}' "${BASE_URL}/enclave/signature" 2>/dev/null || echo "000")
-SIG_PUBKEY=$(echo "$SIG_RESP" | jq -r '.pubkey_pem // empty' 2>/dev/null || echo "")
-SIG_PCR0=$(echo "$SIG_RESP" | jq -r '.pcr0_hex // empty' 2>/dev/null || echo "")
-SIG_VALUE=$(echo "$SIG_RESP" | jq -r '.signature_b64 // empty' 2>/dev/null || echo "")
-if [ "$SIG_CODE" = "200" ] && [ -n "$SIG_PUBKEY" ] && [ -n "$SIG_PCR0" ] && [ -n "$SIG_VALUE" ]; then
-  pass "PCR0 signature endpoint serves pubkey + PCR0 + signature (PCR0: ${SIG_PCR0:0:16}...)"
+echo "[34/35] PCR0 signature in /v1/enclave-info"
+INFO_LATE=$($CURL "${BASE_URL}/v1/enclave-info" 2>/dev/null || echo "")
+SIG_PUBKEY=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pubkey_pem // empty' 2>/dev/null || echo "")
+SIG_PCR0=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pcr0_hex // empty' 2>/dev/null || echo "")
+SIG_VALUE=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.signature_b64 // empty' 2>/dev/null || echo "")
+if [ -n "$SIG_PUBKEY" ] && [ -n "$SIG_PCR0" ] && [ -n "$SIG_VALUE" ]; then
+  pass "pcr0_signature block carries pubkey + PCR0 + signature (PCR0: ${SIG_PCR0:0:16}...)"
 else
-  fail "PCR0 signature endpoint" "HTTP $SIG_CODE, body: ${SIG_RESP:0:200}"
+  fail "pcr0_signature missing from /v1/enclave-info" "${INFO_LATE:0:200}"
 fi
 
 echo "[35/35] PCR0 signature crypto verification"

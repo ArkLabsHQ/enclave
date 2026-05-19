@@ -9,11 +9,8 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 )
 
@@ -52,39 +49,28 @@ func TestSignature_VerifierRoundTrip(t *testing.T) {
 		t.Fatalf("Signature.Ready() = false after Load with all params present")
 	}
 
-	resp := callHandler(t, sig)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("handler returned %d, want 200", resp.Code)
+	snap := sig.Snapshot()
+	if snap == nil {
+		t.Fatal("Snapshot() = nil after Ready() = true")
 	}
-
-	var body struct {
-		PubkeyPEM    string `json:"pubkey_pem"`
-		PCR0Hex      string `json:"pcr0_hex"`
-		SignatureB64 string `json:"signature_b64"`
-	}
-	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode response: %v\nbody: %s", err, resp.Body.String())
-	}
-
-	if body.PubkeyPEM != pubkeyPEM {
+	if snap.PubkeyPEM != pubkeyPEM {
 		t.Errorf("pubkey round-trip drift")
 	}
+	if snap.PCR0Hex != pcr0Hex {
+		t.Errorf("pcr0_hex = %q, want %q", snap.PCR0Hex, pcr0Hex)
+	}
 
-	verifierPub := parsePubKeyPEM(t, body.PubkeyPEM)
-	pcr0Bytes, err := hex.DecodeString(body.PCR0Hex)
+	verifierPub := parsePubKeyPEM(t, snap.PubkeyPEM)
+	pcr0Bytes, err := hex.DecodeString(snap.PCR0Hex)
 	if err != nil {
 		t.Fatalf("decode pcr0_hex: %v", err)
 	}
-	sigBytes, err := base64.StdEncoding.DecodeString(body.SignatureB64)
+	sigBytes, err := base64.StdEncoding.DecodeString(snap.SignatureB64)
 	if err != nil {
 		t.Fatalf("decode signature_b64: %v", err)
 	}
 	if !ecdsa.VerifyASN1(verifierPub, pcr0Bytes, sigBytes) {
 		t.Fatal("ecdsa.VerifyASN1 returned false")
-	}
-
-	if body.PCR0Hex != pcr0Hex {
-		t.Errorf("pcr0_hex = %q, want %q", body.PCR0Hex, pcr0Hex)
 	}
 }
 
@@ -99,10 +85,8 @@ func TestSignature_NotProvisioned(t *testing.T) {
 	if sig.Ready() {
 		t.Fatal("Signature.Ready() = true with no SSM params; want false")
 	}
-
-	resp := callHandler(t, sig)
-	if resp.Code != http.StatusServiceUnavailable {
-		t.Errorf("handler returned %d, want 503", resp.Code)
+	if sig.Snapshot() != nil {
+		t.Fatal("Snapshot() != nil when not ready")
 	}
 }
 
@@ -132,14 +116,6 @@ func TestSignature_SSMError(t *testing.T) {
 	if sig.Ready() {
 		t.Fatal("Signature.Ready() = true after SSM error; want false")
 	}
-}
-
-func callHandler(t *testing.T, sig *Signature) *httptest.ResponseRecorder {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/enclave/signature", nil)
-	signatureHandler(sig)(rec, req)
-	return rec
 }
 
 func marshalPubKeyPEM(t *testing.T, pub *ecdsa.PublicKey) string {

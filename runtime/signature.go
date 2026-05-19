@@ -2,15 +2,19 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
+
+type PCR0SignatureInfo struct {
+	PubkeyPEM    string `json:"pubkey_pem"`
+	PCR0Hex      string `json:"pcr0_hex"`
+	SignatureB64 string `json:"signature_b64"`
+}
 
 type Signature struct {
 	mu        sync.RWMutex
@@ -74,22 +78,15 @@ func getSSMValue(ctx context.Context, ssmAPI ssmGetter, name string) (string, er
 	return *out.Parameter.Value, nil
 }
 
-func signatureHandler(s *Signature) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		if !s.ready {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"status": "signing_not_provisioned",
-			})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"pubkey_pem":    s.pubkeyPEM,
-			"pcr0_hex":      s.pcr0Hex,
-			"signature_b64": s.signature,
-		})
+func (s *Signature) Snapshot() *PCR0SignatureInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.ready {
+		return nil
+	}
+	return &PCR0SignatureInfo{
+		PubkeyPEM:    s.pubkeyPEM,
+		PCR0Hex:      s.pcr0Hex,
+		SignatureB64: s.signature,
 	}
 }

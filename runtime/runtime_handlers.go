@@ -160,15 +160,16 @@ func readyHandler(e *Runtime) http.HandlerFunc {
 
 // RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
 type RuntimeInfo struct {
-	Version                    string         `json:"version"`
-	PreviousPCR0               string         `json:"previous_pcr0"`
-	PreviousPCR0Attestation    string         `json:"previous_pcr0_attestation,omitempty"`
-	AttestationPubkey          string         `json:"attestation_pubkey,omitempty"`
-	DynamicSecrets             int64          `json:"dynamic_secrets"`
-	Metrics                    map[string]any `json:"metrics"`
-	MigrationCooldownSeconds   int            `json:"migration_cooldown_seconds"`
-	MigrationCooldownRemaining int            `json:"migration_cooldown_remaining,omitempty"`
-	MigrationPending           bool           `json:"migration_pending"`
+	Version                    string             `json:"version"`
+	PreviousPCR0               string             `json:"previous_pcr0"`
+	PreviousPCR0Attestation    string             `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey          string             `json:"attestation_pubkey,omitempty"`
+	DynamicSecrets             int64              `json:"dynamic_secrets"`
+	Metrics                    map[string]any     `json:"metrics"`
+	MigrationCooldownSeconds   int                `json:"migration_cooldown_seconds"`
+	MigrationCooldownRemaining int                `json:"migration_cooldown_remaining,omitempty"`
+	MigrationPending           bool               `json:"migration_pending"`
+	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
 }
 
 // RuntimeInitializing is the JSON body returned by GET /v1/enclave-info before Init completes.
@@ -212,6 +213,7 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			MigrationCooldownSeconds:   cooldownSeconds,
 			MigrationCooldownRemaining: cooldownRemaining,
 			MigrationPending:           migrationPending,
+			PCR0Signature:              e.signature.Snapshot(),
 		})
 	}
 }

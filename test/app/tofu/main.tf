@@ -194,3 +194,8 @@ output "storage_bucket" {
   value       = module.enclave.storage_bucket
 }
 
+output "pcr0_signing_key_arn" {
+  description = "ARN of the PCR0 signing key. The identity running 'tofu apply' must have kms:Sign + kms:GetPublicKey on this key."
+  value       = module.enclave.pcr0_signing_key_arn
+}
+

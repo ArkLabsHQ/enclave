@@ -568,7 +568,6 @@ export ENCLAVE_SUPERVISOR_BINARY_PATH="$ENCLAVE_SUPERVISOR"
 export ENCLAVE_SUPERVISOR_RESTART_CMD="kill \$(cat $SUPERVISOR_PIDFILE)"
 export ENCLAVE_STOP_CMD="kill \$(cat /tmp/enclave-boot.pid) 2>/dev/null; sleep 3"
 export ENCLAVE_START_CMD="nohup \"$SCRIPT_PATH\" --boot-only \"$EIF_ABS_PATH\" >> /tmp/boot-qemu.log 2>&1 &"
-export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
@@ -576,7 +575,14 @@ export AWS_ENDPOINT_URL_LOGS="http://127.0.0.1:4566"
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 
-"$SUP_RELAUNCHER" "$ENCLAVE_SUPERVISOR" "$SUPERVISOR_PIDFILE" &
+# Inline KMS endpoint for the supervisor only. The test env runs two
+# independent KMS mocks: LocalStack at :4566 holds the pcr0_signing key
+# that tofu created; kms-proxy → local-kms at :4000 holds the runtime's
+# encryption key. Exporting AWS_ENDPOINT_URL_KMS=4000 globally would
+# leak into the migration's second tofu_apply, whose local-exec would
+# then ask local-kms for a key UUID that only exists in LocalStack.
+AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000" \
+  "$SUP_RELAUNCHER" "$ENCLAVE_SUPERVISOR" "$SUPERVISOR_PIDFILE" &
 SUP_PID=$!
 sleep 2
 
@@ -676,7 +682,9 @@ echo ""
 echo "=== [6/9] Migration cooldown: abort test ==="
 SUPERVISOR_URL="http://localhost:${SUPERVISOR_PORT:-8444}"
 
-export AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000"
+# KMS endpoint deliberately omitted — the aws kms calls below use
+# explicit --endpoint-url; exporting AWS_ENDPOINT_URL_KMS=4000 here would
+# leak into step 7's tofu_apply local-exec (see line 583 for context).
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"

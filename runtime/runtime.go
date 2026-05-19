@@ -121,6 +121,7 @@ type Runtime struct {
 	storage       *Storage
 	migrator      *Migrator
 	environment   *Environment
+	signature     *Signature
 }
 
 // New returns a Runtime safe to use for serving management endpoints.
@@ -143,6 +144,7 @@ func New(cfg *Config) (*Runtime, error) {
 		cfg:          cfg,
 		metrics:      enclaveMetrics,
 		attestation:  NewAttestation(),
+		signature:    NewSignature(),
 		runtimeToken: token,
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
@@ -175,6 +177,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init AWS clients: %w", err)
 	}
 	e.aws = aws
+
+	// Pull the PCR0 signature Tofu wrote to SSM during apply. Non-fatal:
+	// if signing isn't provisioned for this deployment, /enclave/signature
+	// stays at 503 but everything else still boots.
+	e.signature.Load(ctx, e.aws.SSM)
 
 	e.kms = NewKMS(e.aws)
 
@@ -303,27 +310,30 @@ func (e *Runtime) Stop() error {
 	return nil
 }
 
-// RegisterRoutes mounts Runtime's admin endpoints on mux:
+// RegisterRoutes mounts Runtime's admin endpoints on mux. POST routes
+// follow the OTLP/HTTP spec (/v1/{metrics,traces,logs}) so standard OTEL
+// SDK exporters work without URL overrides. GET routes carry the
+// `enclave-` prefix to distinguish introspection from OTLP ingest.
 //
 //	GET    /v1/enclave-info
-//	POST   /v1/enclave-metrics
-//	GET    /v1/enclave-metrics
+//	POST   /v1/metrics                    (OTLP ingest)
+//	GET    /v1/enclave-metrics            (JSON snapshot)
 //	POST   /v1/start-migration            (gated: requireInitOK)
 //	{PUT,GET,DELETE} /v1/storage/{key...} (gated: requireInitDone)
 //	GET    /v1/storage                    (gated: requireInitDone)
 //	{PUT,GET,DELETE} /v1/secrets/{name}   (gated: requireInitDone)
 //	GET    /v1/secrets                    (gated: requireInitDone)
-//	POST   /v1/logs
-//	GET    /v1/enclave-logs
-//	POST   /v1/enclave-traces
-//	GET    /v1/enclave-traces
+//	POST   /v1/logs                       (OTLP ingest)
+//	GET    /v1/enclave-logs               (JSON history)
+//	POST   /v1/traces                     (OTLP ingest)
+//	GET    /v1/enclave-traces             (JSON history)
 //
 // Subsystem-owned routes are added later by registerGatedRoutes once Init
 // has built those subsystems.
 func (e *Runtime) RegisterRoutes(mux *http.ServeMux) {
 	e.mux = mux
 	mux.Handle("GET /v1/enclave-info", enclaveInfoHandler(e))
-	mux.HandleFunc("POST /v1/enclave-metrics", e.handleMetricPost)
+	mux.HandleFunc("POST /v1/metrics", e.handleMetricPost)
 	mux.HandleFunc("GET /v1/enclave-metrics", e.handleMetricGet)
 
 	// Telemetry endpoints stay reachable while Init runs, for diagnostics.

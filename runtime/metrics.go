@@ -266,7 +266,7 @@ func (e *Runtime) handleMetricGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMetricPost accepts OTLP metrics from the app.
-// POST /v1/enclave-metrics (Content-Type: application/x-protobuf)
+// POST /v1/metrics (Content-Type: application/x-protobuf)
 func (e *Runtime) handleMetricPost(w http.ResponseWriter, r *http.Request) {
 	if !e.checkRuntimeToken(w, r) {
 		return

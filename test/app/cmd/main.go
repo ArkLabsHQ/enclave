@@ -74,10 +74,9 @@ func main() {
 		ctx := context.Background()
 		headers := map[string]string{"Authorization": "Bearer " + token}
 
-		// Tracing exporter.
+		// Tracing exporter — uses OTLP/HTTP default path /v1/traces.
 		traceExporter, err := otlptracehttp.New(ctx,
 			otlptracehttp.WithEndpoint("127.0.0.1:"+proxyPort),
-			otlptracehttp.WithURLPath("/v1/enclave-traces"),
 			otlptracehttp.WithInsecure(),
 			otlptracehttp.WithHeaders(headers),
 		)
@@ -88,10 +87,9 @@ func main() {
 			log.Printf("OTEL tracing enabled")
 		}
 
-		// Metrics exporter.
+		// Metrics exporter — uses OTLP/HTTP default path /v1/metrics.
 		metricExporter, err := otlpmetrichttp.New(ctx,
 			otlpmetrichttp.WithEndpoint("127.0.0.1:"+proxyPort),
-			otlpmetrichttp.WithURLPath("/v1/enclave-metrics"),
 			otlpmetrichttp.WithInsecure(),
 			otlpmetrichttp.WithHeaders(headers),
 		)

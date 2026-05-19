@@ -416,7 +416,7 @@ fi
 # must NOT get X-Attestation-Signature — that would imply buffering, which
 # breaks streaming. Use curl to shape an HTTP/2 request like gRPC and check
 # response headers.
-echo "[33/33] gRPC bypasses response-signing middleware"
+echo "[33/35] gRPC bypasses response-signing middleware"
 GRPC_HDRS=$(curl -sk --http2 -D - -o /dev/null --max-time 10 \
   -H 'Content-Type: application/grpc' \
   -X POST "${BASE_URL}/grpc.health.v1.Health/Check" 2>/dev/null || echo "")
@@ -424,6 +424,39 @@ if echo "$GRPC_HDRS" | grep -qi '^x-attestation-signature:'; then
   fail "gRPC middleware bypass" "X-Attestation-Signature header present on gRPC response"
 else
   pass "no X-Attestation-Signature on gRPC response (bypass active)"
+fi
+
+echo "[34/35] PCR0 signature in /v1/enclave-info"
+INFO_LATE=$($CURL "${BASE_URL}/v1/enclave-info" 2>/dev/null || echo "")
+SIG_PUBKEY=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pubkey_pem // empty' 2>/dev/null || echo "")
+SIG_PCR0=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pcr0_hex // empty' 2>/dev/null || echo "")
+SIG_VALUE=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.signature_b64 // empty' 2>/dev/null || echo "")
+if [ -n "$SIG_PUBKEY" ] && [ -n "$SIG_PCR0" ] && [ -n "$SIG_VALUE" ]; then
+  pass "pcr0_signature block carries pubkey + PCR0 + signature (PCR0: ${SIG_PCR0:0:16}...)"
+else
+  fail "pcr0_signature missing from /v1/enclave-info" "${INFO_LATE:0:200}"
+fi
+
+echo "[35/35] PCR0 signature crypto verification"
+if [ -z "$SIG_PUBKEY" ] || [ -z "$SIG_PCR0" ] || [ -z "$SIG_VALUE" ]; then
+  fail "PCR0 signature verify" "missing field from previous endpoint test"
+else
+  TMP_VERIFY=$(mktemp -d)
+  trap 'rm -rf "$TMP_VERIFY"' EXIT
+  printf '%s' "$SIG_PUBKEY"            > "${TMP_VERIFY}/pubkey.pem"
+  # hex → bytes without xxd (not in slim images)
+  printf '%b' "$(printf '%s' "$SIG_PCR0" | sed 's/../\\x&/g')" \
+                                       > "${TMP_VERIFY}/pcr0.bin"
+  printf '%s' "$SIG_VALUE" | base64 -d > "${TMP_VERIFY}/sig.bin"
+  VERIFY_OUT=$(openssl pkeyutl -verify -pubin \
+        -inkey "${TMP_VERIFY}/pubkey.pem" \
+        -in "${TMP_VERIFY}/pcr0.bin" \
+        -sigfile "${TMP_VERIFY}/sig.bin" 2>&1 || true)
+  if echo "$VERIFY_OUT" | grep -q 'Signature Verified Successfully'; then
+    pass "ECDSA-P384 signature verifies against pubkey + PCR0"
+  else
+    fail "PCR0 signature verify" "openssl rejected the signature: ${VERIFY_OUT}"
+  fi
 fi
 
 echo ""

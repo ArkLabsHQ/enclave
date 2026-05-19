@@ -215,7 +215,7 @@ func TestHandleSpanGet_Empty(t *testing.T) {
 func TestHandleSpanPost_NoAuth(t *testing.T) {
 	enc := newTestEnclave(t)
 	body := buildOTLPTraceRequest("test", tracepb.Status_STATUS_CODE_OK)
-	req := httptest.NewRequest("POST", "/v1/enclave-traces", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/v1/traces", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	w := httptest.NewRecorder()
 	enc.tracing.handlePost(w, req)
@@ -228,7 +228,7 @@ func TestHandleSpanPost_NoAuth(t *testing.T) {
 func TestHandleSpanPost_Valid(t *testing.T) {
 	enc := newTestEnclave(t)
 	body := buildOTLPTraceRequest("test", tracepb.Status_STATUS_CODE_OK)
-	req := httptest.NewRequest("POST", "/v1/enclave-traces", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/v1/traces", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Authorization", "Bearer "+enc.RuntimeToken())
 	w := httptest.NewRecorder()

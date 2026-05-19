@@ -200,6 +200,11 @@ output "storage_bucket" {
   value       = module.enclave.storage_bucket
 }
 
+output "pcr0_signing_key_arn" {
+  description = "ARN of the PCR0 signing key. The identity running 'tofu apply' must have kms:Sign + kms:GetPublicKey on this key."
+  value       = module.enclave.pcr0_signing_key_arn
+}
+
 `
 
 const tofuModuleEnclaveMain = `terraform {
@@ -364,6 +369,86 @@ resource "aws_ssm_parameter" "kms_key_id" {
   }
 }
 
+# PCR0 signing key. Deleting it makes every past signature un-verifiable —
+# protected by prevent_destroy + a 30-day deletion window as a safety net.
+resource "aws_kms_key" "pcr0_signing" {
+  description              = "${local.prefix} PCR0 signing key (ECC_NIST_P384)"
+  customer_master_key_spec = "ECC_NIST_P384"
+  key_usage                = "SIGN_VERIFY"
+  enable_key_rotation      = false
+  deletion_window_in_days  = 30
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_kms_alias" "pcr0_signing" {
+  name          = "alias/${local.prefix}-pcr0-signing"
+  target_key_id = aws_kms_key.pcr0_signing.key_id
+}
+
+resource "terraform_data" "sign_pcr0" {
+  triggers_replace = [local.effective_pcr0, aws_kms_key.pcr0_signing.key_id]
+
+  provisioner "local-exec" {
+    # bash for pipefail; default /bin/sh is dash on slim images.
+    interpreter = ["bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      mkdir -p ${local.signing_dir}
+      # hex → bytes without xxd (not in slim images)
+      printf '%b' "$(printf '%s' "${local.effective_pcr0}" | sed 's/../\\x&/g')" \
+        > ${local.signing_dir}/pcr0.bin
+      aws kms get-public-key \
+        --key-id ${aws_kms_key.pcr0_signing.arn} \
+        --query PublicKey --output text \
+        | base64 -d > ${local.signing_dir}/pubkey.der
+      openssl ec -pubin -inform DER -outform PEM \
+        < ${local.signing_dir}/pubkey.der \
+        > ${local.signing_dir}/pubkey.pem
+      aws kms sign \
+        --key-id ${aws_kms_key.pcr0_signing.arn} \
+        --message fileb://${local.signing_dir}/pcr0.bin \
+        --message-type DIGEST \
+        --signing-algorithm ECDSA_SHA_384 \
+        --query Signature --output text \
+        > ${local.signing_dir}/signature.b64
+    EOT
+  }
+}
+
+data "local_file" "pcr0_pubkey_pem" {
+  filename   = "${local.signing_dir}/pubkey.pem"
+  depends_on = [terraform_data.sign_pcr0]
+}
+
+data "local_file" "pcr0_signature_b64" {
+  filename   = "${local.signing_dir}/signature.b64"
+  depends_on = [terraform_data.sign_pcr0]
+}
+
+resource "aws_ssm_parameter" "pcr0_pubkey" {
+  name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
+  type      = "String"
+  value     = data.local_file.pcr0_pubkey_pem.content
+  overwrite = true
+}
+
+resource "aws_ssm_parameter" "pcr0_value" {
+  name      = "/${var.deployment}/${var.app_name}/Signing/PCR0"
+  type      = "String"
+  value     = local.effective_pcr0
+  overwrite = true
+}
+
+resource "aws_ssm_parameter" "pcr0_signature" {
+  name      = "/${var.deployment}/${var.app_name}/Signing/Signature"
+  type      = "String"
+  value     = trimspace(data.local_file.pcr0_signature_b64.content)
+  overwrite = true
+}
+
 # =============================================================================
 # IAM
 # =============================================================================
@@ -459,6 +544,11 @@ data "aws_iam_policy_document" "enclave" {
     resources = concat(
       [aws_ssm_parameter.storage_bucket_name.arn],
       [for p in aws_ssm_parameter.env_override : p.arn],
+      [
+        aws_ssm_parameter.pcr0_pubkey.arn,
+        aws_ssm_parameter.pcr0_value.arn,
+        aws_ssm_parameter.pcr0_signature.arn,
+      ],
     )
   }
 
@@ -519,6 +609,7 @@ locals {
   # When local paths are set, use them directly. Otherwise download from GitHub Release.
   use_local      = var.eif_path != ""
   artifacts_dir  = "${path.module}/.artifacts"
+  signing_dir    = "${path.module}/.signing"
   release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
@@ -1266,6 +1357,11 @@ output "elastic_ip" {
 output "storage_bucket" {
   description = "S3 storage bucket name."
   value       = aws_s3_bucket.storage.id
+}
+
+output "pcr0_signing_key_arn" {
+  description = "ARN of the KMS key used by Tofu to sign each build's PCR0."
+  value       = aws_kms_key.pcr0_signing.arn
 }
 `
 

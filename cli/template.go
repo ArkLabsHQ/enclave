@@ -198,6 +198,9 @@ migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
+signing:
+  enabled: false                 # tofu apply will sign PCR0 with a KMS key; runtime serves it at /enclave/signature
+
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero runtime imports.
@@ -293,6 +296,9 @@ instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
+
+signing:
+  enabled: false                 # tofu apply will sign PCR0 with a KMS key; runtime serves it at /enclave/signature
 
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
@@ -591,6 +597,9 @@ migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
+signing:
+  enabled: false                 # tofu apply will sign PCR0 with a KMS key; runtime serves it at /enclave/signature
+
 # Runtime coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero runtime imports.
@@ -805,6 +814,9 @@ instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
+
+signing:
+  enabled: false                 # tofu apply will sign PCR0 with a KMS key; runtime serves it at /enclave/signature
 
 # Runtime coordinates for the enclave supervisor binary.
 runtime:

@@ -83,6 +83,7 @@ terraform.tfstate
 terraform.tfstate.backup
 .terraform/
 backend.tf
+modules/enclave/.signing/
 `
 
 // EC2 user_data cloud-init — installs dependencies, downloads EIF, configures services.

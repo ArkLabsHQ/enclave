@@ -56,6 +56,7 @@ const (
 	// reverse proxy at pathProxy.
 	pathRoot        = "/enclave"
 	pathAttestation = "/enclave/attestation"
+	pathSignature   = "/enclave/signature"
 	pathState       = "/enclave/state"
 	pathHash        = "/enclave/hash"
 	pathReady       = "/enclave/ready"
@@ -121,6 +122,7 @@ type Runtime struct {
 	storage       *Storage
 	migrator      *Migrator
 	environment   *Environment
+	signature     *Signature
 }
 
 // New returns a Runtime safe to use for serving management endpoints.
@@ -143,6 +145,7 @@ func New(cfg *Config) (*Runtime, error) {
 		cfg:          cfg,
 		metrics:      enclaveMetrics,
 		attestation:  NewAttestation(),
+		signature:    NewSignature(),
 		runtimeToken: token,
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
@@ -175,6 +178,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init AWS clients: %w", err)
 	}
 	e.aws = aws
+
+	// Pull the PCR0 signature Tofu wrote to SSM during apply. Non-fatal:
+	// if signing isn't provisioned for this deployment, /enclave/signature
+	// stays at 503 but everything else still boots.
+	e.signature.Load(ctx, e.aws.SSM)
 
 	e.kms = NewKMS(e.aws)
 
@@ -467,6 +475,7 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 	}
 
 	pm.Get(pathAttestation, attestationHandler(e.cfg.UseProfiling, e.hashes))
+	pm.Get(pathSignature, signatureHandler(e.signature))
 	pm.Get(pathRoot, rootHandler(e.cfg))
 	pm.Get(pathConfig, configHandler(e.cfg))
 

@@ -7,3 +7,4 @@ terraform.tfstate.backup
 .terraform.lock.hcl
 backend.tf
 provider_override.tf
+modules/enclave/.signing/

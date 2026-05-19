@@ -162,6 +162,9 @@ func startSupervisor(ctx context.Context, eifPath string) (*exec.Cmd, error) {
 	// re-execing ourselves keeps QEMU args in one place.
 	startCmd := fmt.Sprintf(`nohup %q --boot-only %q >> /tmp/boot-qemu.log 2>&1 &`, self, eifPath)
 
+	// Set AWS_ENDPOINT_URL_KMS explicitly on the supervisor's env so it
+	// doesn't depend on whatever the parent shell exported (which might
+	// be the LocalStack endpoint used for `tofu apply`).
 	env := append(os.Environ(),
 		"ENCLAVE_SUPERVISOR_ADDR=127.0.0.1:8444",
 		"GVPROXY_FORWARD_PORTS=8443:443 7073",
@@ -170,6 +173,7 @@ func startSupervisor(ctx context.Context, eifPath string) (*exec.Cmd, error) {
 		"ENCLAVE_EIF_PATH="+eifPath,
 		"ENCLAVE_START_CMD="+startCmd,
 		"ENCLAVE_STOP_CMD=pkill -f qemu-system-x86_64 || true; sleep 2",
+		"AWS_ENDPOINT_URL_KMS="+envOr("AWS_ENDPOINT_URL_KMS_SUPERVISOR", "http://aws-mocks:4000"),
 	)
 
 	cmd := exec.CommandContext(ctx, "supervisor")

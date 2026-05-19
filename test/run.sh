@@ -575,10 +575,12 @@ export AWS_ENDPOINT_URL_LOGS="http://127.0.0.1:4566"
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 
-# Inline KMS endpoint for the supervisor only — exporting it would leak into
-# the migration's second tofu_apply, where local-exec would hit kms-proxy
-# (account 123456789012) while tofu state holds a LocalStack key ARN
-# (account 000000000000) → NotFoundException.
+# Inline KMS endpoint for the supervisor only. The test env runs two
+# independent KMS mocks: LocalStack at :4566 holds the pcr0_signing key
+# that tofu created; kms-proxy → local-kms at :4000 holds the runtime's
+# encryption key. Exporting AWS_ENDPOINT_URL_KMS=4000 globally would
+# leak into the migration's second tofu_apply, whose local-exec would
+# then ask local-kms for a key UUID that only exists in LocalStack.
 AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000" \
   "$SUP_RELAUNCHER" "$ENCLAVE_SUPERVISOR" "$SUPERVISOR_PIDFILE" &
 SUP_PID=$!

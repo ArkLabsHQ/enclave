@@ -52,12 +52,6 @@ type Config struct {
 	//     even root cannot rewrite it. Only the attested PCR0 enclave
 	//     can decrypt. Permanent at first lock.
 	IsKMSKeyLocked bool `yaml:"is_kms_key_locked"`
-
-	Signing *SigningConfig `yaml:"signing,omitempty"`
-}
-
-type SigningConfig struct {
-	Enabled bool `yaml:"enabled"`
 }
 
 type AppConfig struct {

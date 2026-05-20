@@ -23,6 +23,7 @@ func Execute() {
 		initCmd(),
 		setupCmd(),
 		updateCmd(),
+		upgradeCmd(),
 		tofuCmd(),
 		buildCmd(),
 		startCmd(),

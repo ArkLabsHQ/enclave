@@ -54,6 +54,7 @@ module "enclave" {
   supervisor_binary_path = var.supervisor_binary_path
 
   env_values = var.env_values
+  tls        = var.tls
 }
 
 # =============================================================================
@@ -171,6 +172,20 @@ variable "env_values" {
   description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
   type        = map(string)
   default     = {}
+}
+
+variable "tls" {
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  type = object({
+    fqdn     = string
+    provider = string
+    email    = string
+  })
+  default = {
+    fqdn     = ""
+    provider = "self-signed"
+    email    = ""
+  }
 }
 
 
@@ -346,6 +361,20 @@ variable "env_values" {
   description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
   type        = map(string)
   default     = {}
+}
+
+variable "tls" {
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  type = object({
+    fqdn     = string
+    provider = string
+    email    = string
+  })
+  default = {
+    fqdn     = ""
+    provider = "self-signed"
+    email    = ""
+  }
 }
 
 
@@ -838,11 +867,26 @@ resource "aws_ssm_parameter" "storage_bucket_name" {
   overwrite = true
 }
 
-# Deploy-time app.env overrides. The runtime reads each key listed in
-# ENCLAVE_APP_ENV_KEYS (baked into the EIF) and overlays the SSM value
-# on top of the baked default. Missing keys leave the default in place.
+# Deploy-time env overrides, published to SSM at /<deployment>/<app>/env/<key>.
+# Merges two sources:
+#   - var.env_values: overrides for keys declared in app.env (enclave.yaml);
+#     the runtime overlays them on the EIF's baked defaults at boot.
+#   - local.tls_params: the ENCLAVE_NITRIDING_* TLS settings from var.tls,
+#     read by the runtime at boot to select the cert source.
+locals {
+  # SSM rejects empty values, so each key is published only when it has one.
+  tls_params = merge(
+    var.tls.fqdn != "" ? { ENCLAVE_NITRIDING_FQDN = var.tls.fqdn } : {},
+    var.tls.provider != "self-signed" ? {
+      ENCLAVE_NITRIDING_USE_ACME       = "true"
+      ENCLAVE_NITRIDING_ACME_DIRECTORY = var.tls.provider
+    } : {},
+    var.tls.provider != "self-signed" && var.tls.email != "" ? { ENCLAVE_NITRIDING_ACME_EMAIL = var.tls.email } : {}
+  )
+}
+
 resource "aws_ssm_parameter" "env_override" {
-  for_each = var.env_values
+  for_each = merge(var.env_values, local.tls_params)
 
   name      = "/${var.deployment}/${var.app_name}/env/${each.key}"
   type      = "String"

@@ -67,6 +67,22 @@ secrets:
     env_var: APP_SIGNING_KEY
   # - name: api_token
   #   env_var: APP_API_TOKEN
+
+# TLS for the enclave's public HTTPS listener (port 443).
+#   self-signed         — self-signed cert (default). Clients trust the
+#                         connection via the attestation document, so no CA
+#                         is needed; browsers show a warning.
+#   letsencrypt         — CA-trusted cert from Let's Encrypt (production).
+#   letsencrypt-staging — Let's Encrypt staging (untrusted root, high rate
+#                         limits) — for testing the ACME flow.
+# fqdn is required for the letsencrypt providers; its DNS A record must point
+# at the enclave host's public IP. These settings are applied at deploy time
+# (CLI writes them to tofu, which stores them in SSM), so changing the domain
+# is a redeploy — no EIF rebuild.
+tls:
+  provider: self-signed
+  fqdn: ""
+  email: ""
 `
 
 func initCmd() *cobra.Command {

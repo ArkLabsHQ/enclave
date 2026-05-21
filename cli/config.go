@@ -14,6 +14,7 @@ var (
 	accountIDRegex  = regexp.MustCompile(`^\d{12}$`)
 	secretNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 	envVarRegex     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	fqdnRegex       = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 )
 
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
@@ -33,7 +34,7 @@ type Config struct {
 	Profile           string         `yaml:"profile"`
 	App               AppConfig      `yaml:"app"`
 	Secrets           []SecretConfig `yaml:"secrets"`
-	Runtime               RuntimeConfig      `yaml:"runtime"`
+	Runtime           RuntimeConfig  `yaml:"runtime"`
 	InstanceType      string         `yaml:"instance_type"`
 	MigrationCooldown string         `yaml:"migration_cooldown"`
 	PreviousPCR0      string         `yaml:"previous_pcr0"`
@@ -51,17 +52,18 @@ type Config struct {
 	//   true — strict mode: the locked policy is permanently frozen;
 	//     even root cannot rewrite it. Only the attested PCR0 enclave
 	//     can decrypt. Permanent at first lock.
-	IsKMSKeyLocked bool `yaml:"is_kms_key_locked"`
+	IsKMSKeyLocked bool      `yaml:"is_kms_key_locked"`
+	TLS            TLSConfig `yaml:"tls"`
 }
 
 type AppConfig struct {
-	Language       string            `yaml:"language"`
-	Source         string            `yaml:"source"`
-	NixOwner       string            `yaml:"nix_owner"`
-	NixRepo        string            `yaml:"nix_repo"`
-	NixRev         string            `yaml:"nix_rev"`
-	NixHash        string            `yaml:"nix_hash"`
-	NixVendorHash  string            `yaml:"nix_vendor_hash"`
+	Language             string            `yaml:"language"`
+	Source               string            `yaml:"source"`
+	NixOwner             string            `yaml:"nix_owner"`
+	NixRepo              string            `yaml:"nix_repo"`
+	NixRev               string            `yaml:"nix_rev"`
+	NixHash              string            `yaml:"nix_hash"`
+	NixVendorHash        string            `yaml:"nix_vendor_hash"`
 	NixSubPackages       []string          `yaml:"nix_sub_packages"`
 	NixProjectFile       string            `yaml:"nix_project_file"`
 	NixSubdir            string            `yaml:"nix_subdir"`
@@ -90,6 +92,24 @@ type RuntimeConfig struct {
 	Rev        string `yaml:"rev"`         // SDK git commit SHA
 	Hash       string `yaml:"hash"`        // Nix source hash (SRI format)
 	VendorHash string `yaml:"vendor_hash"` // Go vendor hash (SRI format)
+}
+
+// TLSConfig selects the cert the enclave serves on its public HTTPS listener.
+// It is applied at deploy time (CLI -> tofu -> SSM -> runtime), so changing
+// the domain is a redeploy, not an EIF rebuild.
+//
+//	provider self-signed (default) — the enclave generates a self-signed cert.
+//	  Clients trust the connection via the attestation document, which binds
+//	  the cert hash into UserData; no CA is involved.
+//
+//	provider letsencrypt / letsencrypt-staging — the enclave obtains a
+//	  CA-issued cert via ACME (TLS-ALPN-01) for FQDN. 'letsencrypt-staging'
+//	  uses the Let's Encrypt staging environment (untrusted root, high rate
+//	  limits) for testing. FQDN is required for both.
+type TLSConfig struct {
+	FQDN     string `yaml:"fqdn"`     // domain the cert is issued for
+	Provider string `yaml:"provider"` // self-signed | letsencrypt | letsencrypt-staging
+	Email    string `yaml:"email"`    // optional ACME contact for expiry notices
 }
 
 func loadConfig() (*Config, error) {
@@ -148,6 +168,9 @@ func loadConfigAt(configPath string) (*Config, error) {
 	if cfg.PreviousPCR0 == "" {
 		cfg.PreviousPCR0 = "genesis"
 	}
+	if cfg.TLS.Provider == "" {
+		cfg.TLS.Provider = "self-signed"
+	}
 	// Validate required fields.
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("%s: 'name' is required", configFile)
@@ -186,6 +209,20 @@ func loadConfigAt(configPath string) (*Config, error) {
 		seen[s.Name] = true
 		seenEnv[s.EnvVar] = true
 	}
+
+	// Validate TLS config.
+	switch cfg.TLS.Provider {
+	case "self-signed", "letsencrypt", "letsencrypt-staging":
+	default:
+		return nil, fmt.Errorf("%s: tls.provider %q must be one of self-signed, letsencrypt, letsencrypt-staging", configFile, cfg.TLS.Provider)
+	}
+	if cfg.TLS.Provider != "self-signed" && cfg.TLS.FQDN == "" {
+		return nil, fmt.Errorf("%s: tls.fqdn is required when tls.provider is %q", configFile, cfg.TLS.Provider)
+	}
+	if cfg.TLS.FQDN != "" && !fqdnRegex.MatchString(cfg.TLS.FQDN) {
+		return nil, fmt.Errorf("%s: tls.fqdn %q is not a valid domain name", configFile, cfg.TLS.FQDN)
+	}
+
 	return &cfg, nil
 }
 

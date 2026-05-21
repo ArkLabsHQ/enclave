@@ -48,6 +48,7 @@ module "enclave" {
   supervisor_binary_path = var.supervisor_binary_path
 
   env_values = var.env_values
+  tls        = var.tls
 }
 
 # =============================================================================
@@ -165,6 +166,20 @@ variable "env_values" {
   description = "Deploy-time overrides for keys declared in app.env (enclave.yaml). Each key/value here is written to SSM at /<deployment>/<app>/env/<key>; the runtime overlays them on top of the EIF's baked defaults at boot. Keys not present in app.env are still written but never read."
   type        = map(string)
   default     = {}
+}
+
+variable "tls" {
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  type = object({
+    fqdn     = string
+    provider = string
+    email    = string
+  })
+  default = {
+    fqdn     = ""
+    provider = "self-signed"
+    email    = ""
+  }
 }
 
 

@@ -377,6 +377,10 @@ func (s *Storage) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
 		return
 	}
+	if strings.HasPrefix(key, "acme/") {
+		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB limit
 	data, err := io.ReadAll(r.Body)
@@ -413,6 +417,10 @@ func (s *Storage) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
 		return
 	}
+	if strings.HasPrefix(key, "acme/") {
+		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
+		return
+	}
 
 	data, err := s.Load(r.Context(), key)
 	if err != nil {
@@ -441,6 +449,10 @@ func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(key, "secrets/") {
 		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
+		return
+	}
+	if strings.HasPrefix(key, "acme/") {
+		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
 		return
 	}
 

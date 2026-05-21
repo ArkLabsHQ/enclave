@@ -20,6 +20,9 @@ type Config struct {
 	HostProxyPort      uint32   // Vsock port the host-side gvproxy listens on.
 	UseProfiling       bool     // Mount net/http/pprof at /enclave/debug.
 	UseACME            bool     // Use ACME (Let's Encrypt) instead of a self-signed cert.
+	ACMEDirectory      string   // ACME directory: keyword (letsencrypt | letsencrypt-staging | self-signed) or a literal https:// directory URL.
+	ACMEEmail          string   // Optional ACME account contact email.
+	ACMECA             string   // Optional PEM CA bundle trusted for the ACME directory's HTTPS API (private/test ACME servers).
 	Debug              bool     // Verbose chi request logging.
 	FdCur, FdMax       uint64   // File-descriptor soft/hard limits.
 	AppURL             *url.URL // Public source URL of the user app (informational).

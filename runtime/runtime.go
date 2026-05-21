@@ -39,6 +39,7 @@ import (
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
 	"github.com/mdlayher/vsock"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 
@@ -46,9 +47,12 @@ import (
 )
 
 const (
-	acmeCertCacheDir    = "cert-cache"
-	certificateOrg      = "AWS Nitro enclave application"
-	certificateValidity = time.Hour * 24 * 356
+	acmeCertCacheDir = "cert-cache"
+	// acmeStagingDirectoryURL is Let's Encrypt's staging ACME endpoint — an
+	// untrusted root with high rate limits, used for testing.
+	acmeStagingDirectoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	certificateOrg          = "AWS Nitro enclave application"
+	certificateValidity     = time.Hour * 24 * 356
 
 	// Routes served on the public TLS mux (pubSrv) and the internal HTTP
 	// mux (privSrv). Paths are scoped under /enclave so they don't collide
@@ -96,10 +100,16 @@ type Runtime struct {
 	revProxy *httputil.ReverseProxy // catch-all forwarder to the user app
 	mux      *http.ServeMux         // admin mux captured at RegisterRoutes; gated routes wire here
 
+	// tlsGetCert is the resolved TLS cert source — installed by configureTLS
+	// during Init, read by the pubSrv GetCertificate callback once tlsReady closes.
+	tlsGetCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
 	// Lifecycle channels.
-	ready     chan bool  // closed when the user app POSTs /enclave/ready
-	stop      chan bool  // closed by Stop() to unwind goroutines
-	listenErr chan error // first listener bind/serve error; consumed by main
+	ready        chan bool     // closed when the user app POSTs /enclave/ready
+	stop         chan bool     // closed by Stop() to unwind goroutines
+	listenErr    chan error    // first listener bind/serve error; consumed by main
+	storageReady chan struct{} // closed by Init once Storage initialization has settled
+	tlsReady     chan struct{} // closed once configureTLS installs the cert source
 
 	// Init state — set by Init, read by gating middleware and handlers.
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
@@ -146,6 +156,8 @@ func New(cfg *Config) (*Runtime, error) {
 		attestation:  NewAttestation(),
 		signature:    NewSignature(),
 		runtimeToken: token,
+		storageReady: make(chan struct{}),
+		tlsReady:     make(chan struct{}),
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
 	r.tracing = NewTracing(enclaveMetrics, nil, r.checkRuntimeToken)
@@ -167,6 +179,9 @@ func New(cfg *Config) (*Runtime, error) {
 // endpoints remain reachable while subsystems come up.
 func (e *Runtime) Init(ctx context.Context) error {
 	defer e.initDone.Store(true)
+	// storageReady unblocks the ACME cert cache (wired by configureTLS) once
+	// Storage initialization has settled — whether it succeeded or not.
+	defer close(e.storageReady)
 
 	ctx, initSpan := e.tracing.Span(ctx, "init")
 	defer initSpan.End()
@@ -177,6 +192,13 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init AWS clients: %w", err)
 	}
 	e.aws = aws
+
+	// Install the TLS cert source now that the AWS client is up: this reads
+	// the deploy-time TLS config from SSM and unblocks the pubSrv listener.
+	if err := e.configureTLS(ctx); err != nil {
+		slog.Error("configure TLS", "error", err)
+		return fmt.Errorf("configure TLS: %w", err)
+	}
 
 	// Pull the PCR0 signature Tofu wrote to SSM during apply. Non-fatal:
 	// if signing isn't provisioned for this deployment, /enclave/signature
@@ -279,15 +301,9 @@ func (e *Runtime) Start() error {
 	}
 	go nitriding.RunNetworking(e.cfg.HostProxyPort, e.stop)
 
-	var err error
-	if e.cfg.UseACME {
-		err = e.configureACME()
-	} else {
-		err = e.genSelfSignedCert()
-	}
-	if err != nil {
-		return fmt.Errorf("%s: %w", errPrefix, err)
-	}
+	// The TLS cert source is installed later by configureTLS (during Init,
+	// after the deploy-time TLS config is read from SSM). Start only binds
+	// the listener; pubSrv.TLSConfig already carries the getCertificate callback.
 	return e.runListeners()
 }
 
@@ -506,6 +522,15 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 		}
 		pm.Handle(pathProxy, e.revProxy)
 	}
+
+	// The TLS cert is resolved per-handshake by getCertificate, which blocks
+	// until configureTLS (run during Init, after the SSM read) installs the
+	// cert source. acme-tls/1 is advertised so ACME TLS-ALPN-01 challenges work.
+	e.pubSrv.TLSConfig = &tls.Config{
+		GetCertificate: e.getCertificate,
+		MinVersion:     tls.VersionTLS12,
+		NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
+	}
 }
 
 // configureInternalHttpServer builds privSrv: the loopback HTTP listener
@@ -581,9 +606,51 @@ func (e *Runtime) externalListener() (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf(":%d", e.cfg.ExtPort))
 }
 
+// getCertificate is the pubSrv TLS GetCertificate callback. It blocks until
+// configureTLS (run during Init) installs the cert source, then delegates.
+// The first real handshake happens after Init, so the wait is normally a
+// no-op; a handshake racing Init waits rather than failing.
+func (e *Runtime) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	select {
+	case <-e.tlsReady:
+	case <-hello.Context().Done():
+		return nil, hello.Context().Err()
+	}
+	return e.tlsGetCert(hello)
+}
+
+// configureTLS reads the deploy-time TLS settings from SSM (published by tofu
+// from enclave.yaml's tls: block) and installs the cert source — self-signed
+// or ACME — then unblocks getCertificate. It runs during Init because the SSM
+// read needs the AWS client; Start only binds the listener.
+func (e *Runtime) configureTLS(ctx context.Context) error {
+	t, err := loadDeployTLSConfig(ctx, e.aws.SSM)
+	if err != nil {
+		return err
+	}
+	e.cfg.FQDN = t.FQDN
+	e.cfg.UseACME = t.UseACME
+	e.cfg.ACMEDirectory = t.Directory
+	e.cfg.ACMEEmail = t.Email
+	e.cfg.ACMECA = t.CA
+
+	if e.cfg.UseACME {
+		slog.Info("TLS: ACME enabled", "fqdn", e.cfg.FQDN, "directory", e.cfg.ACMEDirectory)
+		err = e.configureACME()
+	} else {
+		slog.Info("TLS: self-signed certificate", "fqdn", e.cfg.FQDN)
+		err = e.genSelfSignedCert()
+	}
+	if err != nil {
+		return err
+	}
+	close(e.tlsReady)
+	return nil
+}
+
 // genSelfSignedCert generates an ECDSA-P256 leaf cert, records its
 // fingerprint in the attestation hashes (so clients can pin it against
-// the NSM document), and installs it on pubSrv with ALPN advertising h2.
+// the NSM document), and installs it as the tlsGetCert source.
 func (e *Runtime) genSelfSignedCert() error {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -627,31 +694,76 @@ func (e *Runtime) genSelfSignedCert() error {
 	if err != nil {
 		return fmt.Errorf("load X509 key pair: %w", err)
 	}
-	e.pubSrv.TLSConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"h2", "http/1.1"},
+	e.tlsGetCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return &cert, nil
 	}
 	return nil
 }
 
+// acmeClientForDirectory returns the acme.Client autocert should use for the
+// given directory selector, or nil to let autocert default to Let's Encrypt
+// production. A value beginning with "https://" is a literal ACME directory URL
+// (a private or test ACME server such as Pebble); "letsencrypt-staging" maps to
+// the Let's Encrypt staging directory; anything else returns (nil, nil).
+//
+// When caPEM is non-empty it is installed as the sole root for the client's
+// HTTPS transport, so the enclave can verify a private ACME server's own
+// (non-public) API certificate. caPEM is irrelevant for the public Let's
+// Encrypt endpoints, which chain to the system roots baked into the EIF.
+func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
+	var dirURL string
+	switch {
+	case strings.HasPrefix(directory, "https://"):
+		dirURL = directory
+	case directory == "letsencrypt-staging":
+		dirURL = acmeStagingDirectoryURL
+	default:
+		return nil, nil
+	}
+	client := &acme.Client{DirectoryURL: dirURL}
+	if caPEM != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+			return nil, errors.New("ENCLAVE_NITRIDING_ACME_CA: no certificates parsed")
+		}
+		client.HTTPClient = &http.Client{
+			Timeout: 90 * time.Second,
+			Transport: &http.Transport{
+				Proxy:           http.ProxyFromEnvironment,
+				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+			},
+		}
+	}
+	return client, nil
+}
+
 // configureACME wires Let's Encrypt as the TLS cert source via autocert.
-// The cert is cached in memory only (inside an enclave) so a restart
-// requests a fresh cert; outside an enclave a local DirCache is used.
-// ALPN includes acme-tls/1 so TLS-ALPN-01 challenges continue to work.
+// Inside an enclave the cert is persisted in the encrypted Storage subsystem
+// (acmeStorageCache) so reboots and migrations reuse it instead of re-issuing;
+// outside an enclave a local DirCache is used. The pubSrv TLS config already
+// advertises acme-tls/1, so TLS-ALPN-01 challenges work.
 func (e *Runtime) configureACME() error {
-	cache := nitriding.NewCertCache()
+	var cache autocert.Cache = &acmeStorageCache{
+		ready:   e.storageReady,
+		storage: func() *Storage { return e.storage },
+	}
 	if !nitriding.InEnclave() {
 		cache = autocert.DirCache(acmeCertCacheDir)
 	}
 	mgr := autocert.Manager{
 		Cache:      cache,
 		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist([]string{e.cfg.FQDN}...),
+		HostPolicy: autocert.HostWhitelist(e.cfg.FQDN),
+		Email:      e.cfg.ACMEEmail,
 	}
-	e.pubSrv.TLSConfig = mgr.TLSConfig()
-	e.pubSrv.TLSConfig.NextProtos = []string{"h2", "http/1.1", "acme-tls/1"}
-	e.pubSrv.TLSConfig.MinVersion = tls.VersionTLS12
+	client, err := acmeClientForDirectory(e.cfg.ACMEDirectory, e.cfg.ACMECA)
+	if err != nil {
+		return err
+	}
+	if client != nil {
+		mgr.Client = client
+	}
+	e.tlsGetCert = mgr.GetCertificate
 
 	// Block on the cert appearing in the cache before computing its
 	// fingerprint. autocert populates the cache asynchronously after the

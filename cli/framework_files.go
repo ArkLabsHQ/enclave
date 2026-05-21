@@ -186,7 +186,6 @@ cat <<EOF >> /etc/environment
 ENCLAVE_APP_NAME=${app_name}
 EIF_PATH=/home/ec2-user/app/server/enclave.eif
 ENCLAVE_NITRIDING_ENABLED=true
-ENCLAVE_NITRIDING_FQDN=example.com
 ENCLAVE_DEPLOYMENT=${dev_mode}
 ENCLAVE_AWS_REGION=${region}
 ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
@@ -1560,4 +1559,3 @@ jobs:
           **Commit:** ${COMMIT_SHA}"
           fi
 `
-

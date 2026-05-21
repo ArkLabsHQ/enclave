@@ -616,6 +616,20 @@ func (e *Runtime) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	case <-hello.Context().Done():
 		return nil, hello.Context().Err()
 	}
+	return e.certForHello(hello)
+}
+
+// certForHello resolves the TLS certificate for a ClientHello. A client
+// reaching the enclave by IP — the supervisor's watchdog, observability, and
+// migration probes all hit it on loopback — sends no SNI, and in ACME mode
+// autocert rejects a nameless ClientHello. The enclave serves exactly one
+// FQDN, so a nameless handshake resolves to it instead of failing.
+func (e *Runtime) certForHello(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if hello.ServerName == "" && e.cfg.FQDN != "" {
+		h := *hello
+		h.ServerName = e.cfg.FQDN
+		return e.tlsGetCert(&h)
+	}
 	return e.tlsGetCert(hello)
 }
 

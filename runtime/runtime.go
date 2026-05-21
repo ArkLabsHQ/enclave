@@ -728,13 +728,57 @@ func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
 		}
 		client.HTTPClient = &http.Client{
 			Timeout: 90 * time.Second,
-			Transport: &http.Transport{
+			Transport: newACMERoundTripper(&http.Transport{
 				Proxy:           http.ProxyFromEnvironment,
 				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-			},
+			}),
 		}
 	}
 	return client, nil
+}
+
+// acmeRoundTripper is the ACME client's HTTP transport. It works around Pebble
+// omitting the Location header on its finalize-order response, which leaves
+// x/crypto/acme unable to poll the order: the order URL, remembered from an
+// earlier Location header, is re-attached to any response missing one. A no-op
+// against a directory that sets Location, such as real Let's Encrypt.
+type acmeRoundTripper struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	urls map[string]string // resource ID (trailing path segment) -> resource URL
+}
+
+func newACMERoundTripper(base http.RoundTripper) *acmeRoundTripper {
+	return &acmeRoundTripper{base: base, urls: make(map[string]string)}
+}
+
+func lastPathSegment(s string) string {
+	if i := strings.LastIndexByte(s, '/'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
+func (rt *acmeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := rt.base.RoundTrip(req)
+	if err != nil {
+		slog.Warn("ACME http", "method", req.Method, "url", req.URL.String(), "error", err)
+		return resp, err
+	}
+
+	loc := resp.Header.Get("Location")
+	rt.mu.Lock()
+	if loc != "" {
+		rt.urls[lastPathSegment(loc)] = loc
+	} else if known := rt.urls[lastPathSegment(req.URL.Path)]; known != "" {
+		resp.Header.Set("Location", known)
+		loc = known
+	}
+	rt.mu.Unlock()
+
+	slog.Info("ACME http",
+		"method", req.Method, "url", req.URL.String(), "status", resp.StatusCode, "location", loc)
+	return resp, err
 }
 
 // configureACME wires Let's Encrypt as the TLS cert source via autocert.

@@ -71,3 +71,45 @@ services:
       # Must match enclave.yaml name — the runtime reads ENCLAVE_APP_NAME for SSM paths.
       ENCLAVE_APP_NAME: "test-app"
     command: ["./run.sh", "app/.enclave/artifacts/image.eif"]
+
+  # Pebble — Let's Encrypt's test ACME server, for the end-to-end ACME test
+  # (acme-test.sh). Only started under the "acme" compose profile. Bridge
+  # network: extra_hosts routes the challenge target enclave.test back to the
+  # host, where the supervisor's gvproxy forwards 8443 -> enclave:443.
+  pebble:
+    profiles: ["acme"]
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/test/pebble/pebble-config.json", "-strict"]
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    volumes:
+      - ./pebble:/test/pebble:ro
+    extra_hosts:
+      - "enclave.test:host-gateway"
+
+  # Runs the end-to-end ACME test (acme-test.sh) — mirrors test-runner.
+  acme-runner:
+    profiles: ["acme"]
+    build:
+      context: ../
+      dockerfile: test/Dockerfile.runner
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      aws-mocks:
+        condition: service_healthy
+      pebble:
+        condition: service_started
+    environment:
+      SKIP_MOCK_SERVICES: "1"
+      # Must match enclave.yaml `name` — the runtime + tofu derive SSM paths from it.
+      ENCLAVE_APP_NAME: "my-app"
+      ENCLAVE_DEPLOYMENT: "dev"
+    command: ["./acme-test.sh", "app/.enclave/artifacts/image.eif"]

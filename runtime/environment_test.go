@@ -32,6 +32,66 @@ func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ .
 	}, nil
 }
 
+func TestLoadDeployTLSConfig(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
+	t.Setenv("ENCLAVE_APP_NAME", "app")
+	p := func(k string) string { return "/dev/app/env/" + k }
+
+	t.Run("defaults when unset", func(t *testing.T) {
+		got, err := loadDeployTLSConfig(context.Background(), &fakeSSM{params: map[string]string{}})
+		if err != nil {
+			t.Fatalf("loadDeployTLSConfig: %v", err)
+		}
+		if got.FQDN != "localhost" || got.UseACME || got.Directory != "self-signed" || got.Email != "" {
+			t.Errorf("defaults = %+v, want {localhost false self-signed }", got)
+		}
+	})
+
+	t.Run("acme params populated", func(t *testing.T) {
+		fake := &fakeSSM{params: map[string]string{
+			p("ENCLAVE_NITRIDING_FQDN"):           "api.example.com",
+			p("ENCLAVE_NITRIDING_USE_ACME"):       "true",
+			p("ENCLAVE_NITRIDING_ACME_DIRECTORY"): "letsencrypt-staging",
+			p("ENCLAVE_NITRIDING_ACME_EMAIL"):     "ops@example.com",
+		}}
+		got, err := loadDeployTLSConfig(context.Background(), fake)
+		if err != nil {
+			t.Fatalf("loadDeployTLSConfig: %v", err)
+		}
+		if got.FQDN != "api.example.com" || !got.UseACME ||
+			got.Directory != "letsencrypt-staging" || got.Email != "ops@example.com" {
+			t.Errorf("got %+v", got)
+		}
+	})
+
+	t.Run("custom directory and ca", func(t *testing.T) {
+		wantCA := "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----"
+		fake := &fakeSSM{params: map[string]string{
+			p("ENCLAVE_NITRIDING_FQDN"):           "enclave.test",
+			p("ENCLAVE_NITRIDING_USE_ACME"):       "true",
+			p("ENCLAVE_NITRIDING_ACME_DIRECTORY"): "https://pebble.internal:14000/dir",
+			p("ENCLAVE_NITRIDING_ACME_CA"):        wantCA,
+		}}
+		got, err := loadDeployTLSConfig(context.Background(), fake)
+		if err != nil {
+			t.Fatalf("loadDeployTLSConfig: %v", err)
+		}
+		if got.Directory != "https://pebble.internal:14000/dir" {
+			t.Errorf("Directory = %q", got.Directory)
+		}
+		if got.CA != wantCA {
+			t.Errorf("CA = %q, want %q", got.CA, wantCA)
+		}
+	})
+
+	t.Run("ssm error surfaces", func(t *testing.T) {
+		_, err := loadDeployTLSConfig(context.Background(), &fakeSSM{err: errors.New("AccessDenied")})
+		if err == nil {
+			t.Error("expected error when SSM fails")
+		}
+	})
+}
+
 func TestApplyEnvOverrides(t *testing.T) {
 	type tc struct {
 		name      string

@@ -327,3 +327,45 @@ func TestValidateSDK(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfig_TLSDefault(t *testing.T) {
+	writeConfig(t, "name: myapp\nregion: us-east-1\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.TLS.Provider != "self-signed" {
+		t.Errorf("TLS.Provider = %q, want self-signed (default)", cfg.TLS.Provider)
+	}
+}
+
+func TestLoadConfig_TLSValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		tls     string
+		wantErr bool
+	}{
+		{name: "self-signed without fqdn", tls: "tls:\n  provider: self-signed\n"},
+		{name: "self-signed with fqdn", tls: "tls:\n  provider: self-signed\n  fqdn: api.example.com\n"},
+		{name: "letsencrypt with fqdn", tls: "tls:\n  provider: letsencrypt\n  fqdn: api.example.com\n"},
+		{name: "staging with fqdn and email", tls: "tls:\n  provider: letsencrypt-staging\n  fqdn: api.example.com\n  email: ops@example.com\n"},
+		{name: "unknown provider", tls: "tls:\n  provider: vault\n  fqdn: api.example.com\n", wantErr: true},
+		{name: "letsencrypt without fqdn", tls: "tls:\n  provider: letsencrypt\n", wantErr: true},
+		{name: "staging without fqdn", tls: "tls:\n  provider: letsencrypt-staging\n", wantErr: true},
+		{name: "malformed fqdn", tls: "tls:\n  provider: letsencrypt\n  fqdn: not a domain\n", wantErr: true},
+		{name: "fqdn without tld", tls: "tls:\n  provider: letsencrypt\n  fqdn: localhost\n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.tls)
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error for %s", tt.name)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error for %s: %v", tt.name, err)
+			}
+		})
+	}
+}

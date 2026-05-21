@@ -28,7 +28,7 @@ lint: ## Run golangci-lint on all modules (matches CI)
 	cd supervisor && golangci-lint run ./...
 	cd client && golangci-lint run ./...
 
-.PHONY: test test-build test-run test-rebuild
+.PHONY: test test-build test-run test-rebuild test-acme
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
@@ -78,6 +78,11 @@ test-run: ## Run integration tests (uses last-built test-runner image)
 test-rebuild: ## Rebuild test-runner image and run integration tests
 	cd test && docker compose --profile test down -v
 	cd test && docker compose --profile test run --build test-runner
+
+test-acme: test-build ## Build the test EIF and run the end-to-end ACME (Pebble) test
+	bash test/pebble/gen-certs.sh
+	cd test && docker compose --profile acme down -v
+	cd test && docker compose --profile acme run --build acme-runner
 
 .PHONY: test-build-docker test-docker
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)

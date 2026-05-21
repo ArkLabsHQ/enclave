@@ -163,3 +163,72 @@ func applyEnvOverrides(ctx context.Context, ssmClient ssmGetter, deployment, app
 	}
 	return nil
 }
+
+// deployTLSConfig is the TLS configuration resolved at boot from SSM. tofu
+// publishes it (from enclave.yaml's tls: block) under /<deployment>/<app>/env/.
+type deployTLSConfig struct {
+	FQDN      string
+	UseACME   bool
+	Directory string // "letsencrypt" | "letsencrypt-staging" | "self-signed" | a literal https:// directory URL
+	Email     string
+	CA        string // optional PEM CA bundle for a custom ACME directory's HTTPS API
+}
+
+// loadDeployTLSConfig reads the ENCLAVE_NITRIDING_* TLS settings tofu wrote to
+// SSM under /<deployment>/<app>/env/. Absent params keep the defaults
+// (self-signed, localhost) — the common case when no domain is configured. A
+// non-NotFound SSM error is returned so the caller can fail the boot.
+func loadDeployTLSConfig(ctx context.Context, ssmClient ssmGetter) (deployTLSConfig, error) {
+	t := deployTLSConfig{FQDN: "localhost", Directory: "self-signed"}
+	dep, app := getDeployment(), getAppName()
+
+	get := func(key string) (string, error) {
+		name := fmt.Sprintf("/%s/%s/env/%s", dep, app, key)
+		out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+			Name:           aws.String(name),
+			WithDecryption: aws.Bool(false),
+		})
+		if err != nil {
+			var pnf *ssmtypes.ParameterNotFound
+			if errors.As(err, &pnf) {
+				return "", nil
+			}
+			return "", fmt.Errorf("ssm get-parameter %s: %w", name, err)
+		}
+		if out.Parameter == nil || out.Parameter.Value == nil {
+			return "", nil
+		}
+		return strings.TrimSpace(*out.Parameter.Value), nil
+	}
+
+	fqdn, err := get("ENCLAVE_NITRIDING_FQDN")
+	if err != nil {
+		return t, err
+	}
+	if fqdn != "" {
+		t.FQDN = fqdn
+	}
+	useACME, err := get("ENCLAVE_NITRIDING_USE_ACME")
+	if err != nil {
+		return t, err
+	}
+	t.UseACME = strings.EqualFold(useACME, "true")
+	dir, err := get("ENCLAVE_NITRIDING_ACME_DIRECTORY")
+	if err != nil {
+		return t, err
+	}
+	if dir != "" {
+		t.Directory = dir
+	}
+	email, err := get("ENCLAVE_NITRIDING_ACME_EMAIL")
+	if err != nil {
+		return t, err
+	}
+	t.Email = email
+	ca, err := get("ENCLAVE_NITRIDING_ACME_CA")
+	if err != nil {
+		return t, err
+	}
+	t.CA = ca
+	return t, nil
+}

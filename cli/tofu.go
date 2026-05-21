@@ -29,6 +29,17 @@ type tofuVars struct {
 	// Local artifact overrides (skip GitHub download when set).
 	EIFPath              string `json:"eif_path,omitempty"`
 	SupervisorBinaryPath string `json:"supervisor_binary_path,omitempty"`
+
+	// TLS settings for the enclave's public HTTPS listener, applied at
+	// deploy time (tofu stores them in SSM; the runtime reads them at boot).
+	TLS tofuTLSVars `json:"tls"`
+}
+
+// tofuTLSVars mirrors enclave.yaml's tls: block for the OpenTofu module.
+type tofuTLSVars struct {
+	FQDN     string `json:"fqdn"`
+	Provider string `json:"provider"`
+	Email    string `json:"email"`
 }
 
 // tofuDir returns the absolute path to the tofu/ directory at the repo root.
@@ -63,6 +74,12 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 		GithubOwner: cfg.App.NixOwner,
 		GithubRepo:  cfg.App.NixRepo,
 		ReleaseTag:  cfg.App.ReleaseTag,
+
+		TLS: tofuTLSVars{
+			FQDN:     cfg.TLS.FQDN,
+			Provider: cfg.TLS.Provider,
+			Email:    cfg.TLS.Email,
+		},
 	}
 
 	if !remote {

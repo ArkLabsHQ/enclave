@@ -139,6 +139,20 @@ variable "env_values" {
   default     = {}
 }
 
+variable "tls" {
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  type = object({
+    fqdn     = string
+    provider = string
+    email    = string
+  })
+  default = {
+    fqdn     = ""
+    provider = "self-signed"
+    email    = ""
+  }
+}
+
 
 # =============================================================================
 # KMS
@@ -160,13 +174,8 @@ resource "aws_ssm_parameter" "kms_key_id" {
   }
 }
 
-# PCR0 signing key. Used by the admin's 'enclave sign' command to sign
-# this build's PCR0; the cert + signature get threaded into user_data and
-# served by the runtime at /enclave/signature.
-#
-# Deletion of this key would make every signature ever produced
-# un-verifiable, so it is double-protected: Tofu refuses to destroy it,
-# and even if that is bypassed AWS waits 30 days before actually deleting.
+# PCR0 signing key. Deleting it makes every past signature un-verifiable —
+# protected by prevent_destroy + a 30-day deletion window as a safety net.
 resource "aws_kms_key" "pcr0_signing" {
   description              = "${local.prefix} PCR0 signing key (ECC_NIST_P384)"
   customer_master_key_spec = "ECC_NIST_P384"
@@ -184,23 +193,16 @@ resource "aws_kms_alias" "pcr0_signing" {
   target_key_id = aws_kms_key.pcr0_signing.key_id
 }
 
-# Sign the build's PCR0 with the KMS key during this apply. Triggered on
-# the PCR0 itself, so a new build → new PCR0 → re-sign on the next apply.
-# Writes pubkey.pem + signature.bin under .signing/ which the
-# data.local_file blocks below read into the SSM parameter resources.
 resource "terraform_data" "sign_pcr0" {
   triggers_replace = [local.effective_pcr0, aws_kms_key.pcr0_signing.key_id]
 
   provisioner "local-exec" {
-    # Force bash so 'set -o pipefail' works. Terraform's default
-    # interpreter on linux is /bin/sh which on dash-based containers
-    # (alpine, debian-slim, etc.) rejects -o pipefail.
+    # bash for pipefail; default /bin/sh is dash on slim images.
     interpreter = ["bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
       mkdir -p ${local.signing_dir}
-      # Hex → raw bytes without xxd (which isn't in slim container images).
-      # sed prefixes each pair with \x, then printf %b emits the byte.
+      # hex → bytes without xxd (not in slim images)
       printf '%b' "$(printf '%s' "${local.effective_pcr0}" | sed 's/../\\x&/g')" \
         > ${local.signing_dir}/pcr0.bin
       aws kms get-public-key \
@@ -231,8 +233,6 @@ data "local_file" "pcr0_signature_b64" {
   depends_on = [terraform_data.sign_pcr0]
 }
 
-# Publish pubkey + PCR0 + signature to SSM. The runtime reads these at
-# startup and serves them at /enclave/signature.
 resource "aws_ssm_parameter" "pcr0_pubkey" {
   name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
   type      = "String"
@@ -643,11 +643,26 @@ resource "aws_ssm_parameter" "storage_bucket_name" {
   overwrite = true
 }
 
-# Deploy-time app.env overrides. The runtime reads each key listed in
-# ENCLAVE_APP_ENV_KEYS (baked into the EIF) and overlays the SSM value
-# on top of the baked default. Missing keys leave the default in place.
+# Deploy-time env overrides, published to SSM at /<deployment>/<app>/env/<key>.
+# Merges two sources:
+#   - var.env_values: overrides for keys declared in app.env (enclave.yaml);
+#     the runtime overlays them on the EIF's baked defaults at boot.
+#   - local.tls_params: the ENCLAVE_NITRIDING_* TLS settings from var.tls,
+#     read by the runtime at boot to select the cert source.
+locals {
+  # SSM rejects empty values, so each key is published only when it has one.
+  tls_params = merge(
+    var.tls.fqdn != "" ? { ENCLAVE_NITRIDING_FQDN = var.tls.fqdn } : {},
+    var.tls.provider != "self-signed" ? {
+      ENCLAVE_NITRIDING_USE_ACME       = "true"
+      ENCLAVE_NITRIDING_ACME_DIRECTORY = var.tls.provider
+    } : {},
+    var.tls.provider != "self-signed" && var.tls.email != "" ? { ENCLAVE_NITRIDING_ACME_EMAIL = var.tls.email } : {}
+  )
+}
+
 resource "aws_ssm_parameter" "env_override" {
-  for_each = var.env_values
+  for_each = merge(var.env_values, local.tls_params)
 
   name      = "/${var.deployment}/${var.app_name}/env/${each.key}"
   type      = "String"

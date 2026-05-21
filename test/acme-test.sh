@@ -24,7 +24,9 @@ EIF_PATH="${1:?Usage: acme-test.sh <path-to-eif>}"
 EIF_ABS="$(realpath "$EIF_PATH")"
 
 GUEST_CID="${GUEST_CID:-4}"
-MEMORY="${MEMORY:-4G}"
+# 2G (run.sh uses 4G): the test app is tiny, and a smaller guest leaves
+# headroom on memory-constrained CI runners so QEMU is not OOM-killed.
+MEMORY="${MEMORY:-2G}"
 HOST_TLS_PORT="${HOST_TLS_PORT:-8443}"
 FQDN="enclave.test"
 PEBBLE_DIRECTORY="https://host.containers.internal:14000/dir"
@@ -221,10 +223,51 @@ stop_enclave() {
   sleep 2
 }
 
-# wait_health blocks until /health returns 200 (enclave Init complete).
+# qemu_pid prints the QEMU pid (3rd field) from the file boot_enclave wrote,
+# or nothing if the enclave has not been launched.
+qemu_pid() {
+  [ -f "$ENCLAVE_PIDS" ] || return 0
+  local q
+  read -r _ _ q < "$ENCLAVE_PIDS" 2>/dev/null || true
+  printf '%s' "${q:-}"
+}
+
+# dump_boot_diagnostics prints what a failed boot needs: whether QEMU is still
+# alive (hung at init) or gone (crashed / OOM-killed), host memory, the dmesg
+# tail (an OOM kill lands there), and the full supervisor + boot logs.
+dump_boot_diagnostics() {
+  local qpid lg
+  qpid="$(qemu_pid)"
+  if [ -n "$qpid" ]; then
+    if kill -0 "$qpid" 2>/dev/null; then
+      echo "  QEMU (pid ${qpid}): still running — hung at init" >&2
+    else
+      echo "  QEMU (pid ${qpid}): not running — exited or was killed" >&2
+    fi
+  fi
+  echo "--- free -m ---" >&2
+  free -m >&2 || true
+  echo "--- dmesg (tail; an OOM kill of qemu lands here) ---" >&2
+  dmesg 2>/dev/null | tail -30 >&2 || echo "(dmesg unavailable)" >&2
+  for lg in "$SUP_LOG" "$BOOT_LOG"; do
+    echo "--- ${lg} ---" >&2
+    if [ -s "$lg" ]; then cat "$lg" >&2; else echo "(empty or missing)" >&2; fi
+  done
+}
+
+# wait_health blocks until /health returns 200 (enclave Init complete). It
+# also watches QEMU: if the process exits, the wait is abandoned immediately
+# with its status, instead of curling a dead enclave until the timeout.
 wait_health() {
-  local label="${1:-}" timeout="${2:-420}" seconds=0 code
+  local label="${1:-}" timeout="${2:-420}" seconds=0 code qpid rc
+  qpid="$(qemu_pid)"
   while [ "$seconds" -lt "$timeout" ]; do
+    if [ -n "$qpid" ] && ! kill -0 "$qpid" 2>/dev/null; then
+      rc=0; wait "$qpid" 2>/dev/null || rc=$?
+      echo "Error: QEMU (pid ${qpid}) exited during boot — status ${rc} (137 = OOM/SIGKILL) ${label}" >&2
+      dump_boot_diagnostics
+      return 1
+    fi
     # SNI must be FQDN — in ACME mode autocert rejects any other server name.
     code=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
       --resolve "${FQDN}:${HOST_TLS_PORT}:127.0.0.1" \
@@ -238,10 +281,7 @@ wait_health() {
     seconds=$((seconds + 5))
   done
   echo "Error: enclave not ready within ${timeout}s ${label}" >&2
-  echo "--- supervisor log (tail) ---" >&2
-  tail -40 "$SUP_LOG" 2>/dev/null >&2 || echo "(no supervisor log)" >&2
-  echo "--- boot log (tail) ---" >&2
-  tail -50 "$BOOT_LOG" 2>/dev/null >&2 || echo "(no boot log)" >&2
+  dump_boot_diagnostics
   return 1
 }
 

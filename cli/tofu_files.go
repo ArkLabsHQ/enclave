@@ -399,7 +399,7 @@ resource "aws_ssm_parameter" "kms_key_id" {
 }
 
 # PCR0 signing key. Deleting it makes every past signature un-verifiable —
-# protected by prevent_destroy + a 30-day deletion window as a safety net.
+# the 30-day deletion window is the only safety net.
 resource "aws_kms_key" "pcr0_signing" {
   description              = "${local.prefix} PCR0 signing key (ECC_NIST_P384)"
   customer_master_key_spec = "ECC_NIST_P384"
@@ -408,7 +408,7 @@ resource "aws_kms_key" "pcr0_signing" {
   deletion_window_in_days  = 30
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

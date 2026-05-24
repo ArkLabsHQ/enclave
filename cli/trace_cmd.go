@@ -22,6 +22,7 @@ func traceCmd() *cobra.Command {
 		history    bool
 		instanceID string
 		region     string
+		profile    string
 	)
 
 	cmd := &cobra.Command{
@@ -29,7 +30,7 @@ func traceCmd() *cobra.Command {
 		Short: "Show enclave trace spans",
 		Long:  "Retrieves distributed trace spans from the enclave supervisor via SSM RunCommand.\nUse --history to query CloudWatch Logs for past spans (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTraceCmd(service, limit, since, asJSON, history, instanceID, region)
+			return runTraceCmd(service, limit, since, asJSON, history, instanceID, region, profile)
 		},
 	}
 
@@ -40,15 +41,16 @@ func traceCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&history, "history", false, "query CloudWatch Logs for historical spans")
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS named profile (optional; defaults to AWS_PROFILE env var or the default credential chain)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runTraceCmd(service string, limit int, since string, asJSON bool, history bool, instanceID, region string) error {
+func runTraceCmd(service string, limit int, since string, asJSON bool, history bool, instanceID, region, profile string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, region, "")
+	ac, err := newAWSClients(ctx, region, profile)
 	if err != nil {
 		return err
 	}

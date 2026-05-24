@@ -21,31 +21,34 @@ func stopCmd() *cobra.Command {
 
 // lifecycleCmd builds an `enclave {start,stop}` command. Both POST to the
 // supervisor's /<action> endpoint on the EC2 instance via SSM RunCommand;
-// they take only --instance-id and --region (matching `enclave log` /
-// `enclave metrics`) — no enclave.yaml or tofu outputs needed.
+// they take --instance-id, --region, and optionally --profile (matching
+// `enclave log` / `enclave metrics`) — no enclave.yaml or tofu outputs
+// needed.
 func lifecycleCmd(action, short, long string) *cobra.Command {
 	var (
 		instanceID string
 		region     string
+		profile    string
 	)
 	cmd := &cobra.Command{
 		Use:   action,
 		Short: short,
 		Long:  long,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLifecycle(action, instanceID, region)
+			return runLifecycle(action, instanceID, region, profile)
 		},
 	}
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS named profile (optional; defaults to AWS_PROFILE env var or the default credential chain)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	_ = cmd.MarkFlagRequired("region")
 	return cmd
 }
 
-func runLifecycle(action, instanceID, region string) error {
+func runLifecycle(action, instanceID, region, profile string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, region, "")
+	ac, err := newAWSClients(ctx, region, profile)
 	if err != nil {
 		return err
 	}

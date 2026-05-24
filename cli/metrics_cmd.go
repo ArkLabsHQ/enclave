@@ -17,6 +17,7 @@ func metricsCmd() *cobra.Command {
 		asJSON     bool
 		instanceID string
 		region     string
+		profile    string
 	)
 
 	cmd := &cobra.Command{
@@ -24,7 +25,7 @@ func metricsCmd() *cobra.Command {
 		Short: "Show enclave metrics",
 		Long:  "Retrieves metric snapshots from the enclave supervisor via SSM RunCommand.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMetricsCmd(source, asJSON, instanceID, region)
+			return runMetricsCmd(source, asJSON, instanceID, region, profile)
 		},
 	}
 
@@ -32,15 +33,16 @@ func metricsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON")
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS named profile (optional; defaults to AWS_PROFILE env var or the default credential chain)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runMetricsCmd(source string, asJSON bool, instanceID, region string) error {
+func runMetricsCmd(source string, asJSON bool, instanceID, region, profile string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, region, "")
+	ac, err := newAWSClients(ctx, region, profile)
 	if err != nil {
 		return err
 	}

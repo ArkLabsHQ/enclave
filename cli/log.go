@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -20,6 +23,7 @@ func logCmd() *cobra.Command {
 		history    bool
 		instanceID string
 		region     string
+		profile    string
 	)
 
 	cmd := &cobra.Command{
@@ -27,7 +31,7 @@ func logCmd() *cobra.Command {
 		Short: "Show enclave application logs",
 		Long:  "Retrieves structured log entries from the enclave supervisor via SSM RunCommand.\nUse --history to query CloudWatch Logs for past logs (requires ENCLAVE_LOG_CLOUDWATCH=true on the enclave).",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLog(level, limit, since, asJSON, history, instanceID, region)
+			return runLog(level, limit, since, asJSON, history, instanceID, region, profile)
 		},
 	}
 
@@ -38,20 +42,20 @@ func logCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&history, "history", false, "query CloudWatch Logs for historical traces")
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS named profile (optional; defaults to AWS_PROFILE env var or the default credential chain)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runLog(level string, limit int, since string, asJSON bool, history bool, instanceID, region string) error {
+func runLog(level string, limit int, since string, asJSON bool, history bool, instanceID, region, profile string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, region, "")
+	ac, err := newAWSClients(ctx, region, profile)
 	if err != nil {
 		return err
 	}
 
-	// Build query string.
 	params := url.Values{}
 	if level != "" {
 		params.Set("level", level)
@@ -70,29 +74,33 @@ func runLog(level string, limit int, since string, asJSON bool, history bool, in
 		params.Set("history", "true")
 	}
 
-	curlURL := "http://localhost:8443/enclave-logs"
+	path := "/enclave-logs"
 	if q := params.Encode(); q != "" {
-		curlURL += "?" + q
+		path += "?" + q
 	}
 
-	curlCmd := fmt.Sprintf("curl -sfS '%s'", curlURL)
-	output, err := ac.runCommand(ctx, instanceID, curlCmd)
+	body, err := ac.fetchSupervisor(ctx, instanceID, path)
 	if err != nil {
 		return fmt.Errorf("read logs from supervisor on %s: %w", instanceID, err)
 	}
-	if output == "" {
-		output = "[]"
-	}
+	defer func() { _ = body.Close() }()
 
 	if asJSON {
-		fmt.Println(output)
+		return streamBodyToStdout(body)
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		fmt.Println("No log entries found.")
 		return nil
 	}
 
-	// Parse and display in human-readable format.
 	var entries []logEntry
-	if err := json.Unmarshal([]byte(output), &entries); err != nil {
-		return fmt.Errorf("failed to parse traces: %w", err)
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return fmt.Errorf("failed to parse logs: %w", err)
 	}
 
 	if len(entries) == 0 {
@@ -100,10 +108,8 @@ func runLog(level string, limit int, since string, asJSON bool, history bool, in
 		return nil
 	}
 
-	// Print table header.
 	fmt.Printf("%-27s %-7s %-12s %s\n", "TIMESTAMP", "LEVEL", "SOURCE", "MESSAGE")
 	for _, e := range entries {
-		// Format timestamp to be more readable.
 		ts := e.Timestamp
 		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
 			ts = t.Format("2006-01-02T15:04:05.000Z")
@@ -111,7 +117,6 @@ func runLog(level string, limit int, since string, asJSON bool, history bool, in
 
 		line := fmt.Sprintf("%-27s %-7s %-12s %s", ts, e.Level, e.Source, e.Message)
 
-		// Append attributes inline.
 		if len(e.Attributes) > 0 {
 			attrs := make([]string, 0, len(e.Attributes))
 			for k, v := range e.Attributes {
@@ -134,6 +139,38 @@ type logEntry struct {
 	Message    string         `json:"message"`
 	Attributes map[string]any `json:"attributes,omitempty"`
 	Source     string         `json:"source"`
+}
+
+// streamBodyToStdout copies body to stdout for --json output, emitting one
+// trailing newline only if the body doesn't already end with one.
+func streamBodyToStdout(body io.Reader) error {
+	tracker := &lastByteTracker{w: os.Stdout}
+	if _, err := io.Copy(tracker, body); err != nil {
+		return err
+	}
+	if !tracker.endsWithNewline() {
+		fmt.Println()
+	}
+	return nil
+}
+
+type lastByteTracker struct {
+	w    io.Writer
+	last byte
+	any  bool
+}
+
+func (l *lastByteTracker) Write(p []byte) (int, error) {
+	n, err := l.w.Write(p)
+	if n > 0 {
+		l.last = p[n-1]
+		l.any = true
+	}
+	return n, err
+}
+
+func (l *lastByteTracker) endsWithNewline() bool {
+	return l.any && l.last == '\n'
 }
 
 // parseSince converts a duration string (e.g. "5m", "1h") or RFC3339 timestamp

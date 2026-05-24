@@ -37,13 +37,14 @@ func BuildNitridingConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		FQDN:          envDefault("ENCLAVE_NITRIDING_FQDN", "localhost"),
-		ExtPort:       extPort,
-		IntPort:       intPort,
-		HostProxyPort: hostProxyPort,
-		AppWebSrv:     appWebSrv,
-		WaitForApp:    false, // runtime binds IntPort itself; the /ready gate is irrelevant when nitriding runs in-process
-		Debug:         strings.EqualFold(os.Getenv("ENCLAVE_NITRIDING_DEBUG"), "true"),
+		FQDN:             envDefault("ENCLAVE_NITRIDING_FQDN", "localhost"),
+		ExtPort:          extPort,
+		IntPort:          intPort,
+		HostProxyPort:    hostProxyPort,
+		AppWebSrv:        appWebSrv,
+		UpstreamProtocol: strings.ToLower(envDefault("ENCLAVE_NITRIDING_UPSTREAM", "auto")),
+		WaitForApp:       false, // runtime binds IntPort itself; the /ready gate is irrelevant when nitriding runs in-process
+		Debug:            strings.EqualFold(os.Getenv("ENCLAVE_NITRIDING_DEBUG"), "true"),
 	}
 	return cfg, nil
 }

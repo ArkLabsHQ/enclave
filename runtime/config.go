@@ -27,6 +27,7 @@ type Config struct {
 	FdCur, FdMax       uint64   // File-descriptor soft/hard limits.
 	AppURL             *url.URL // Public source URL of the user app (informational).
 	AppWebSrv          *url.URL // Loopback URL the catch-all revProxy forwards to.
+	UpstreamProtocol   string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
 	WaitForApp         bool     // Block TLS listener until the app POSTs /enclave/ready.
 	MockCertFp         string   // Test-only override for the TLS cert fingerprint.
 }

@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 
 	"github.com/spf13/cobra"
@@ -15,6 +17,7 @@ func metricsCmd() *cobra.Command {
 		asJSON     bool
 		instanceID string
 		region     string
+		profile    string
 	)
 
 	cmd := &cobra.Command{
@@ -22,7 +25,7 @@ func metricsCmd() *cobra.Command {
 		Short: "Show enclave metrics",
 		Long:  "Retrieves metric snapshots from the enclave supervisor via SSM RunCommand.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMetricsCmd(source, asJSON, instanceID, region)
+			return runMetricsCmd(source, asJSON, instanceID, region, profile)
 		},
 	}
 
@@ -30,15 +33,16 @@ func metricsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON")
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "EC2 instance ID (required)")
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (required)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS named profile (optional; defaults to AWS_PROFILE env var or the default credential chain)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	_ = cmd.MarkFlagRequired("region")
 
 	return cmd
 }
 
-func runMetricsCmd(source string, asJSON bool, instanceID, region string) error {
+func runMetricsCmd(source string, asJSON bool, instanceID, region, profile string) error {
 	ctx := context.Background()
-	ac, err := newAWSClients(ctx, region, "")
+	ac, err := newAWSClients(ctx, region, profile)
 	if err != nil {
 		return err
 	}
@@ -48,27 +52,32 @@ func runMetricsCmd(source string, asJSON bool, instanceID, region string) error 
 		params.Set("source", source)
 	}
 
-	curlURL := "http://localhost:8443/enclave-metrics"
+	path := "/enclave-metrics"
 	if q := params.Encode(); q != "" {
-		curlURL += "?" + q
+		path += "?" + q
 	}
 
-	curlCmd := fmt.Sprintf("curl -sfS '%s'", curlURL)
-	output, err := ac.runCommand(ctx, instanceID, curlCmd)
+	body, err := ac.fetchSupervisor(ctx, instanceID, path)
 	if err != nil {
 		return fmt.Errorf("read metrics from supervisor on %s: %w", instanceID, err)
 	}
-	if output == "" {
-		output = "{}"
-	}
+	defer func() { _ = body.Close() }()
 
 	if asJSON {
-		fmt.Println(output)
+		return streamBodyToStdout(body)
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		fmt.Println("No metrics available.")
 		return nil
 	}
 
 	var snapshot map[string]any
-	if err := json.Unmarshal([]byte(output), &snapshot); err != nil {
+	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return fmt.Errorf("failed to parse metrics: %w", err)
 	}
 

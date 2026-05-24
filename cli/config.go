@@ -107,9 +107,10 @@ type RuntimeConfig struct {
 //	  uses the Let's Encrypt staging environment (untrusted root, high rate
 //	  limits) for testing. FQDN is required for both.
 type TLSConfig struct {
-	FQDN     string `yaml:"fqdn"`     // domain the cert is issued for
-	Provider string `yaml:"provider"` // self-signed | letsencrypt | letsencrypt-staging
-	Email    string `yaml:"email"`    // optional ACME contact for expiry notices
+	FQDN          string `yaml:"fqdn"`            // domain the cert is issued for
+	Provider      string `yaml:"provider"`        // self-signed | letsencrypt | letsencrypt-staging
+	Email         string `yaml:"email"`           // optional ACME contact for expiry notices
+	Route53ZoneID string `yaml:"route53_zone_id"` // optional; when set, tofu creates an A record for fqdn in this zone
 }
 
 func loadConfig() (*Config, error) {
@@ -221,6 +222,9 @@ func loadConfigAt(configPath string) (*Config, error) {
 	}
 	if cfg.TLS.FQDN != "" && !fqdnRegex.MatchString(cfg.TLS.FQDN) {
 		return nil, fmt.Errorf("%s: tls.fqdn %q is not a valid domain name", configFile, cfg.TLS.FQDN)
+	}
+	if cfg.TLS.Route53ZoneID != "" && cfg.TLS.FQDN == "" {
+		return nil, fmt.Errorf("%s: tls.route53_zone_id requires tls.fqdn to be set", configFile)
 	}
 
 	return &cfg, nil

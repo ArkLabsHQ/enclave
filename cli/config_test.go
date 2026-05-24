@@ -354,6 +354,9 @@ func TestLoadConfig_TLSValidation(t *testing.T) {
 		{name: "staging without fqdn", tls: "tls:\n  provider: letsencrypt-staging\n", wantErr: true},
 		{name: "malformed fqdn", tls: "tls:\n  provider: letsencrypt\n  fqdn: not a domain\n", wantErr: true},
 		{name: "fqdn without tld", tls: "tls:\n  provider: letsencrypt\n  fqdn: localhost\n", wantErr: true},
+		{name: "route53_zone_id with fqdn", tls: "tls:\n  provider: letsencrypt\n  fqdn: api.example.com\n  route53_zone_id: Z123ABC\n"},
+		{name: "route53_zone_id without fqdn", tls: "tls:\n  provider: self-signed\n  route53_zone_id: Z123ABC\n", wantErr: true},
+		{name: "empty route53_zone_id self-signed", tls: "tls:\n  provider: self-signed\n  route53_zone_id: \"\"\n"},
 	}
 
 	for _, tt := range tests {

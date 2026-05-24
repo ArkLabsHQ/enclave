@@ -37,9 +37,10 @@ type tofuVars struct {
 
 // tofuTLSVars mirrors enclave.yaml's tls: block for the OpenTofu module.
 type tofuTLSVars struct {
-	FQDN     string `json:"fqdn"`
-	Provider string `json:"provider"`
-	Email    string `json:"email"`
+	FQDN          string `json:"fqdn"`
+	Provider      string `json:"provider"`
+	Email         string `json:"email"`
+	Route53ZoneID string `json:"route53_zone_id"`
 }
 
 // tofuDir returns the absolute path to the tofu/ directory at the repo root.
@@ -76,9 +77,10 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 		ReleaseTag:  cfg.App.ReleaseTag,
 
 		TLS: tofuTLSVars{
-			FQDN:     cfg.TLS.FQDN,
-			Provider: cfg.TLS.Provider,
-			Email:    cfg.TLS.Email,
+			FQDN:          cfg.TLS.FQDN,
+			Provider:      cfg.TLS.Provider,
+			Email:         cfg.TLS.Email,
+			Route53ZoneID: cfg.TLS.Route53ZoneID,
 		},
 	}
 

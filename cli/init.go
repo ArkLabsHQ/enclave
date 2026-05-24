@@ -76,13 +76,17 @@ secrets:
 #   letsencrypt-staging — Let's Encrypt staging (untrusted root, high rate
 #                         limits) — for testing the ACME flow.
 # fqdn is required for the letsencrypt providers; its DNS A record must point
-# at the enclave host's public IP. These settings are applied at deploy time
-# (CLI writes them to tofu, which stores them in SSM), so changing the domain
-# is a redeploy — no EIF rebuild.
+# at the enclave host's public IP. Either set this up manually at your DNS
+# provider, OR set route53_zone_id below so the next tofu apply creates the A
+# record for you in your existing Route53 zone (operator needs
+# route53:ChangeResourceRecordSets on the zone). These settings are applied
+# at deploy time (CLI writes them to tofu, which stores them in SSM), so
+# changing the domain is a redeploy — no EIF rebuild.
 tls:
   provider: self-signed
   fqdn: ""
   email: ""
+  route53_zone_id: ""
 `
 
 func initCmd() *cobra.Command {

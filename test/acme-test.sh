@@ -307,6 +307,107 @@ trigger_issuance() {
   return 1
 }
 
+R53_FIXTURE_DIR="/tmp/acme-route53-smoke"
+R53_ZONE_ID=""
+
+# route53_smoke exercises the framework's aws_route53_record.enclave block
+# against LocalStack's Route53 emulation. Extracts the resource verbatim from
+# the scaffolded module so drift between the framework's emitted HCL and the
+# test would surface here. Independent tofu state — does not touch the main
+# acme tofu_apply state.
+route53_smoke() {
+  local fqdn="acme-r53.example.com" zone_ref ip_found
+  local endpoint="http://127.0.0.1:4566"
+
+  rm -rf "$R53_FIXTURE_DIR" && mkdir -p "$R53_FIXTURE_DIR"
+
+  zone_ref=$(aws --endpoint-url "$endpoint" route53 create-hosted-zone \
+    --name example.com --caller-reference "r53-$$" \
+    --query 'HostedZone.Id' --output text 2>>"${SCRIPT_DIR}/acme-route53.log")
+  R53_ZONE_ID="${zone_ref##*/}"
+  [ -n "$R53_ZONE_ID" ] || { fail "could not create LocalStack hosted zone"; return 1; }
+
+  cat > "$R53_FIXTURE_DIR/main.tf" <<HCL
+terraform {
+  required_providers { aws = { source = "hashicorp/aws", version = "~> 5.0" } }
+}
+provider "aws" {
+  access_key                  = "test"
+  secret_key                  = "test"
+  region                      = "us-east-1"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+  endpoints {
+    ec2     = "${endpoint}"
+    route53 = "${endpoint}"
+  }
+}
+variable "local" {
+  type    = bool
+  default = false
+}
+variable "tls" {
+  type = object({
+    fqdn            = string
+    provider        = string
+    email           = string
+    route53_zone_id = string
+  })
+}
+resource "aws_eip" "instance" {
+  count  = var.local ? 0 : 1
+  domain = "vpc"
+}
+HCL
+
+  # Append the framework's actual route53 record block — drift detector.
+  awk '/^resource "aws_route53_record" "enclave"/,/^}/' \
+    "${TOFU_DIR}/modules/enclave/main.tf" >> "$R53_FIXTURE_DIR/main.tf"
+
+  if ! grep -q 'aws_route53_record" "enclave"' "$R53_FIXTURE_DIR/main.tf"; then
+    fail "framework's aws_route53_record block not found in scaffolded module"
+    return 1
+  fi
+
+  # Auto-loaded tfvars — avoids HCL-vs-JSON escaping headaches on -var flags.
+  jq -n \
+    --arg fqdn "$fqdn" \
+    --arg zone "$R53_ZONE_ID" \
+    '{local: false, tls: {fqdn: $fqdn, provider: "letsencrypt", email: "", route53_zone_id: $zone}}' \
+    > "$R53_FIXTURE_DIR/test.auto.tfvars.json"
+
+  tofu -chdir="$R53_FIXTURE_DIR" init -input=false >"${SCRIPT_DIR}/acme-route53-init.log" 2>&1 \
+    || { fail "route53 fixture tofu init"; cat "${SCRIPT_DIR}/acme-route53-init.log" >&2; return 1; }
+
+  tofu -chdir="$R53_FIXTURE_DIR" apply -auto-approve -input=false \
+    >"${SCRIPT_DIR}/acme-route53-apply.log" 2>&1 \
+    || { fail "route53 fixture tofu apply"; tail -25 "${SCRIPT_DIR}/acme-route53-apply.log" >&2; return 1; }
+
+  ip_found=$(aws --endpoint-url "$endpoint" route53 list-resource-record-sets \
+    --hosted-zone-id "$R53_ZONE_ID" \
+    --query "ResourceRecordSets[?Type=='A' && Name=='${fqdn}.'].ResourceRecords[].Value" \
+    --output text 2>>"${SCRIPT_DIR}/acme-route53.log")
+
+  if [ -n "$ip_found" ]; then
+    pass "Route53 A record created for ${fqdn} → ${ip_found} (zone=${R53_ZONE_ID})"
+  else
+    fail "Route53 A record missing for ${fqdn} (zone=${R53_ZONE_ID})"
+  fi
+
+  tofu -chdir="$R53_FIXTURE_DIR" destroy -auto-approve -input=false \
+    >>"${SCRIPT_DIR}/acme-route53-apply.log" 2>&1 || true
+}
+
+route53_cleanup() {
+  [ -d "$R53_FIXTURE_DIR" ] || return 0
+  if [ -n "$R53_ZONE_ID" ]; then
+    aws --endpoint-url "http://127.0.0.1:4566" route53 delete-hosted-zone \
+      --id "$R53_ZONE_ID" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$R53_FIXTURE_DIR"
+}
+
 cleanup() {
   echo "=== Teardown ==="
   stop_enclave
@@ -314,6 +415,7 @@ cleanup() {
   killall vhost-device-vsock 2>/dev/null || true
   rm -f /tmp/acme-supervisor.pid
   tofu_destroy
+  route53_cleanup
 }
 trap cleanup EXIT
 
@@ -323,23 +425,23 @@ echo "=============================================="
 echo " Enclave ACME (Pebble) end-to-end test"
 echo "=============================================="
 
-echo "[1/6] Checking Pebble fixtures..."
+echo "[1/7] Checking Pebble fixtures..."
 [ -f "${PEBBLE_DIR}/pebble-ca.crt" ] || { echo "Error: ${PEBBLE_DIR}/pebble-ca.crt missing — run test/pebble/gen-certs.sh" >&2; exit 1; }
 echo "  Pebble directory: ${PEBBLE_DIRECTORY}"
 
-echo "[2/6] Writing ACME config to env_values.auto.tfvars.json..."
+echo "[2/7] Writing ACME config to env_values.auto.tfvars.json..."
 write_env_values
 
-echo "[3/6] tofu apply (localstack)..."
+echo "[3/7] tofu apply (localstack)..."
 tofu_destroy
 tofu_apply
 
-echo "[4/6] Starting supervisor + booting enclave (ACME mode)..."
+echo "[4/7] Starting supervisor + booting enclave (ACME mode)..."
 start_supervisor
 boot_enclave
 wait_health "(initial boot)"
 
-echo "[5/6] Triggering ACME issuance via Pebble..."
+echo "[5/7] Triggering ACME issuance via Pebble..."
 if trigger_issuance; then
   pass "enclave obtained a cert via ACME"
 else
@@ -366,7 +468,7 @@ else
   fail "served cert SAN missing ${FQDN}"
 fi
 
-echo "[6/6] Reboot — verifying the cert is reused from the S3 cache..."
+echo "[6/7] Reboot — verifying the cert is reused from the S3 cache..."
 SERIAL_BEFORE="$(served_cert -serial || true)"
 echo "  serial before reboot: ${SERIAL_BEFORE}"
 boot_enclave   # stop_enclave + relaunch; tofu state (S3 bucket) is untouched
@@ -379,6 +481,9 @@ if [ -n "$SERIAL_BEFORE" ] && [ "$SERIAL_BEFORE" = "$SERIAL_AFTER" ]; then
 else
   fail "cert serial changed across reboot — re-issued instead of reusing the S3 cache"
 fi
+
+echo "[7/7] Route53 record smoke against LocalStack..."
+route53_smoke
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="

@@ -175,16 +175,18 @@ variable "env_values" {
 }
 
 variable "tls" {
-  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME). route53_zone_id, when set, opts into automatic A-record management in that zone for fqdn."
   type = object({
-    fqdn     = string
-    provider = string
-    email    = string
+    fqdn            = string
+    provider        = string
+    email           = string
+    route53_zone_id = string
   })
   default = {
-    fqdn     = ""
-    provider = "self-signed"
-    email    = ""
+    fqdn            = ""
+    provider        = "self-signed"
+    email           = ""
+    route53_zone_id = ""
   }
 }
 
@@ -364,16 +366,18 @@ variable "env_values" {
 }
 
 variable "tls" {
-  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME)."
+  description = "TLS settings for the enclave's public HTTPS listener, published to SSM as /<deployment>/<app>/env/ENCLAVE_NITRIDING_* and read by the runtime at boot to select the cert source (self-signed or ACME). route53_zone_id, when set, opts into automatic A-record management in that zone for fqdn."
   type = object({
-    fqdn     = string
-    provider = string
-    email    = string
+    fqdn            = string
+    provider        = string
+    email           = string
+    route53_zone_id = string
   })
   default = {
-    fqdn     = ""
-    provider = "self-signed"
-    email    = ""
+    fqdn            = ""
+    provider        = "self-signed"
+    email           = ""
+    route53_zone_id = ""
   }
 }
 
@@ -1236,6 +1240,19 @@ resource "aws_eip_association" "instance" {
 
   allocation_id = aws_eip.instance[0].id
   instance_id   = aws_instance.nitro[0].id
+}
+
+# Optional Route53 A record. Skipped in local mode or when route53_zone_id is
+# unset; operator-managed DNS providers (Cloudflare, registrar, etc.) keep
+# pointing at the elastic_ip output manually.
+resource "aws_route53_record" "enclave" {
+  count = var.local || var.tls.route53_zone_id == "" ? 0 : 1
+
+  zone_id = var.tls.route53_zone_id
+  name    = var.tls.fqdn
+  type    = "A"
+  ttl     = 60
+  records = [aws_eip.instance[0].public_ip]
 }
 
 # Automatic migration — triggers when the EIF changes (new PCR0).

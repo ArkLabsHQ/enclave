@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -69,27 +71,32 @@ func runTraceCmd(service string, limit int, since string, asJSON bool, history b
 		params.Set("history", "true")
 	}
 
-	curlURL := "http://localhost:8443/enclave-traces"
+	path := "/enclave-traces"
 	if q := params.Encode(); q != "" {
-		curlURL += "?" + q
+		path += "?" + q
 	}
 
-	curlCmd := fmt.Sprintf("curl -sfS '%s'", curlURL)
-	output, err := ac.runCommand(ctx, instanceID, curlCmd)
+	body, err := ac.fetchSupervisor(ctx, instanceID, path)
 	if err != nil {
 		return fmt.Errorf("read traces from supervisor on %s: %w", instanceID, err)
 	}
-	if output == "" {
-		output = "[]"
-	}
+	defer body.Close()
 
 	if asJSON {
-		fmt.Println(output)
+		return streamBodyToStdout(body)
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		fmt.Println("No trace spans found.")
 		return nil
 	}
 
 	var entries []spanDisplayEntry
-	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+	if err := json.Unmarshal(data, &entries); err != nil {
 		return fmt.Errorf("failed to parse spans: %w", err)
 	}
 

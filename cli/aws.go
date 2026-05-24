@@ -1,10 +1,18 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,6 +31,7 @@ type awsClients struct {
 	kmsClient *kms.Client
 	ssmClient *ssm.Client
 	s3Client  *s3.Client
+	sessions  sessionStarter // opens SSM Session Manager port-forwards; tests swap in fakes
 }
 
 func newAWSClients(ctx context.Context, region, profile string) (*awsClients, error) {
@@ -66,6 +75,8 @@ func newAWSClientsWithEnv(ctx context.Context, region, profile string, appEnv ma
 	} else {
 		ac.s3Client = s3.NewFromConfig(cfg)
 	}
+
+	ac.sessions = cmdSessionStarter{}
 
 	return ac, nil
 }
@@ -162,55 +173,236 @@ func (ac *awsClients) runCommandOutput(ctx context.Context, instanceID, command 
 	return ""
 }
 
-// runCommand runs a command on the host via SSM and returns its stdout. Unlike
-// runCommandOutput, this surfaces SSM-level errors and non-zero exit codes
-// (with stderr) instead of silently returning an empty string. Use it when an
-// empty result must be distinguishable from a failed invocation.
-func (ac *awsClients) runCommand(ctx context.Context, instanceID, command string) (string, error) {
-	out, err := ac.ssmClient.SendCommand(ctx, &ssm.SendCommandInput{
-		InstanceIds:  []string{instanceID},
-		DocumentName: aws.String("AWS-RunShellScript"),
-		Parameters:   map[string][]string{"commands": {command}},
-	})
-	if err != nil {
-		return "", fmt.Errorf("ssm SendCommand: %w", err)
-	}
-	commandID := *out.Command.CommandId
+// --- SSM Session Manager port-forwarding transport ---
+//
+// The data-fetching CLI commands (enclave log/trace/metrics) HTTP the
+// supervisor directly through a Session Manager port-forwarding tunnel — no
+// SSM RunCommand involvement, so no 24KB truncation cap.
 
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("ssm command %s did not complete within 30s", commandID)
+// sessionStarter abstracts opening a Session Manager port-forward, so tests
+// can substitute a fake.
+type sessionStarter interface {
+	StartPortForward(ctx context.Context, instanceID, region, remotePort string) (localPort int, cleanup func(), err error)
+}
+
+// errPluginMissing surfaces the install hint when session-manager-plugin is
+// not on the operator's PATH.
+var errPluginMissing = errors.New(
+	"AWS SSM session-manager-plugin not found on PATH.\n" +
+		"  macOS:  brew install --cask session-manager-plugin\n" +
+		"  Linux:  https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html")
+
+// cmdSessionStarter shells out to `aws ssm start-session` to open a real
+// session-manager-plugin tunnel.
+type cmdSessionStarter struct{}
+
+// StartPortForward runs `aws ssm start-session` and returns the local port and
+// a cleanup func once the tunnel accepts connections. Retries once if the
+// chosen local port loses a race to another process between alloc and bind.
+func (s cmdSessionStarter) StartPortForward(ctx context.Context, instanceID, region, remotePort string) (int, func(), error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		port, cleanup, err := s.startOnce(ctx, instanceID, region, remotePort)
+		if err == nil {
+			return port, cleanup, nil
 		}
-		time.Sleep(2 * time.Second)
-		inv, err := ac.ssmClient.GetCommandInvocation(ctx, &ssm.GetCommandInvocationInput{
-			CommandId:  aws.String(commandID),
-			InstanceId: aws.String(instanceID),
-		})
-		if err != nil {
-			// InvocationDoesNotExist races for a beat after SendCommand.
+		if attempt == 0 && isPortRaceError(err) {
 			continue
 		}
-		switch inv.Status {
-		case ssmtypes.CommandInvocationStatusPending,
-			ssmtypes.CommandInvocationStatusInProgress,
-			ssmtypes.CommandInvocationStatusDelayed:
-			continue
-		case ssmtypes.CommandInvocationStatusSuccess:
-			stdout := ""
-			if inv.StandardOutputContent != nil {
-				stdout = strings.TrimSpace(*inv.StandardOutputContent)
+		return 0, nil, err
+	}
+	return 0, nil, errors.New("aws ssm start-session: lost local-port race twice")
+}
+
+// isPortRaceError matches the kernel/AWS-CLI wording for "another process
+// snatched the local port between our :0 alloc-close and the AWS CLI's bind."
+func isPortRaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "bind: address already")
+}
+
+// startOnce attempts a single Session Manager port-forwarding session. It
+// returns errors verbatim (with captured AWS-CLI stderr when the subprocess
+// exits early) so callers can decide whether to retry.
+func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remotePort string) (int, func(), error) {
+	// Grab a free ephemeral port. Sub-millisecond race between close and
+	// AWS-CLI bind; caller retries once on EADDRINUSE.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, nil, fmt.Errorf("alloc local port: %w", err)
+	}
+	localPort := lis.Addr().(*net.TCPAddr).Port
+	lis.Close()
+
+	params := fmt.Sprintf(`{"portNumber":["%s"],"localPortNumber":["%d"]}`, remotePort, localPort)
+	cmd := exec.CommandContext(ctx, "aws", "ssm", "start-session",
+		"--target", instanceID,
+		"--document-name", "AWS-StartPortForwardingSession",
+		"--parameters", params,
+		"--region", region,
+	)
+	setProcessGroup(cmd)
+
+	// Tee stderr into a buffer so we can surface the real AWS-CLI error if
+	// the subprocess exits early. The scanner consumes from the same tee and
+	// raises pluginErrCh on the canonical plugin-missing sentinel.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return 0, nil, err
+	}
+	var stderrBuf bytes.Buffer
+	stderrTee := io.TeeReader(stderrPipe, &stderrBuf)
+
+	if err := cmd.Start(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return 0, nil, errors.New("aws CLI not found on PATH (required for SSM Session Manager). Install the AWS CLI v2.")
+		}
+		return 0, nil, fmt.Errorf("start aws ssm start-session: %w", err)
+	}
+
+	// One goroutine owns cmd.Wait — the others observe via exitedCh. Buffer
+	// of 1 so the goroutine never blocks, and cleanup can drain it later.
+	exitedCh := make(chan error, 1)
+	go func() { exitedCh <- cmd.Wait() }()
+
+	pluginErrCh := make(chan struct{}, 1)
+	go func() {
+		scanner := bufio.NewScanner(stderrTee)
+		for scanner.Scan() {
+			// Only the canonical AWS-CLI sentinel — avoid false positives
+			// from diagnostic lines that merely mention the plugin name.
+			if strings.Contains(scanner.Text(), "SessionManagerPlugin is not found") {
+				select {
+				case pluginErrCh <- struct{}{}:
+				default:
+				}
+				return
 			}
-			return stdout, nil
-		default:
-			stderr := ""
-			if inv.StandardErrorContent != nil {
-				stderr = strings.TrimSpace(*inv.StandardErrorContent)
+		}
+	}()
+
+	// cleanup: SIGTERM the whole group, give it 2s, escalate to SIGKILL.
+	// Drains exitedCh so the cmd.Wait goroutine fully completes.
+	cleanup := func() {
+		killProcessGroup(cmd)
+		select {
+		case <-exitedCh:
+		case <-time.After(2 * time.Second):
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
-			if stderr == "" {
-				return "", fmt.Errorf("ssm command on %s ended with status=%s (no stderr)", instanceID, inv.Status)
-			}
-			return "", fmt.Errorf("ssm command on %s ended with status=%s: %s", instanceID, inv.Status, stderr)
+			<-exitedCh
 		}
 	}
+
+	// Probe localhost:localPort until connect succeeds, the 15s deadline
+	// hits, stderr signals plugin-missing, or the subprocess exits early.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-pluginErrCh:
+			cleanup()
+			return 0, nil, errPluginMissing
+		case waitErr := <-exitedCh:
+			// Subprocess died before the tunnel came up. Surface its
+			// captured stderr so the operator sees the real AWS error
+			// (AccessDenied, expired creds, bad instance ID, port
+			// collision, etc.) instead of a generic 15s timeout.
+			stderrTxt := strings.TrimSpace(stderrBuf.String())
+			if stderrTxt == "" {
+				return 0, nil, fmt.Errorf("aws ssm start-session exited: %w", waitErr)
+			}
+			return 0, nil, fmt.Errorf("aws ssm start-session exited (%v): %s", waitErr, stderrTxt)
+		default:
+		}
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return localPort, cleanup, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	cleanup()
+	return 0, nil, fmt.Errorf("port-forward session did not establish within 15s")
+}
+
+// sessionClosingBody wraps an http.Response.Body so closing it also tears down
+// the underlying Session Manager subprocess.
+type sessionClosingBody struct {
+	rc      io.ReadCloser
+	cleanup func()
+}
+
+func (s sessionClosingBody) Read(p []byte) (int, error) { return s.rc.Read(p) }
+func (s sessionClosingBody) Close() error {
+	err := s.rc.Close()
+	s.cleanup()
+	return err
+}
+
+// supervisorRemotePort is the port the supervisor binds to on the instance.
+// httpViaSession opens an SSM Session Manager port-forward to this port.
+const supervisorRemotePort = "8443"
+
+// httpViaSession opens a Session Manager port-forwarding tunnel to the
+// supervisor at instance:supervisorRemotePort and returns a streaming
+// http.Response. The caller must Close the Body — that also tears down
+// the SSM session.
+func (ac *awsClients) httpViaSession(ctx context.Context, instanceID, path string) (*http.Response, error) {
+	starter := ac.sessions
+	if starter == nil {
+		starter = cmdSessionStarter{}
+	}
+	port, cleanup, err := starter.StartPortForward(ctx, instanceID, ac.region, supervisorRemotePort)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	resp.Body = sessionClosingBody{rc: resp.Body, cleanup: cleanup}
+	return resp, nil
+}
+
+// fetchSupervisor returns the supervisor's response body for a given path as a
+// streaming io.ReadCloser via a Session Manager port-forwarding tunnel.
+func (ac *awsClients) fetchSupervisor(ctx context.Context, instanceID, path string) (io.ReadCloser, error) {
+	resp, err := ac.httpViaSession(ctx, instanceID, path)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("supervisor returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp.Body, nil
+}
+
+// setProcessGroup makes the spawned process the leader of its own group so
+// killProcessGroup can take down child processes too — the AWS CLI internally
+// spawns session-manager-plugin. Unix-only; Windows isn't supported.
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+// killProcessGroup sends SIGTERM to the entire process group of cmd. Callers
+// that need a hard guarantee escalate to SIGKILL after a short grace period.
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 }

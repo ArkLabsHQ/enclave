@@ -59,7 +59,7 @@ func runMetricsCmd(source string, asJSON bool, instanceID, region string) error 
 	if err != nil {
 		return fmt.Errorf("read metrics from supervisor on %s: %w", instanceID, err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	if asJSON {
 		return streamBodyToStdout(body)

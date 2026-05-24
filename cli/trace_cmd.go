@@ -80,7 +80,7 @@ func runTraceCmd(service string, limit int, since string, asJSON bool, history b
 	if err != nil {
 		return fmt.Errorf("read traces from supervisor on %s: %w", instanceID, err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	if asJSON {
 		return streamBodyToStdout(body)

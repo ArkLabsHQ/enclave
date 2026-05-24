@@ -235,7 +235,7 @@ func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remo
 		return 0, nil, fmt.Errorf("alloc local port: %w", err)
 	}
 	localPort := lis.Addr().(*net.TCPAddr).Port
-	lis.Close()
+	_ = lis.Close()
 
 	params := fmt.Sprintf(`{"portNumber":["%s"],"localPortNumber":["%d"]}`, remotePort, localPort)
 	cmd := exec.CommandContext(ctx, "aws", "ssm", "start-session",
@@ -258,7 +258,7 @@ func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remo
 
 	if err := cmd.Start(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return 0, nil, errors.New("aws CLI not found on PATH (required for SSM Session Manager). Install the AWS CLI v2.")
+			return 0, nil, errors.New("aws CLI not found on PATH (required for SSM Session Manager); install AWS CLI v2")
 		}
 		return 0, nil, fmt.Errorf("start aws ssm start-session: %w", err)
 	}
@@ -320,7 +320,7 @@ func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remo
 		}
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 500*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return localPort, cleanup, nil
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -385,7 +385,7 @@ func (ac *awsClients) fetchSupervisor(ctx context.Context, instanceID, path stri
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("supervisor returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return resp.Body, nil

@@ -141,10 +141,8 @@ type logEntry struct {
 	Source     string         `json:"source"`
 }
 
-// streamBodyToStdout copies an HTTP response body to stdout for --json
-// output, ensuring exactly one trailing newline so the result composes
-// cleanly with jq / shell pipelines regardless of whether the supervisor's
-// payload already ends in a newline.
+// streamBodyToStdout copies body to stdout for --json output, emitting one
+// trailing newline only if the body doesn't already end with one.
 func streamBodyToStdout(body io.Reader) error {
 	tracker := &lastByteTracker{w: os.Stdout}
 	if _, err := io.Copy(tracker, body); err != nil {
@@ -156,8 +154,6 @@ func streamBodyToStdout(body io.Reader) error {
 	return nil
 }
 
-// lastByteTracker is an io.Writer that remembers the last byte written so
-// streamBodyToStdout can decide whether to emit a trailing newline.
 type lastByteTracker struct {
 	w    io.Writer
 	last byte

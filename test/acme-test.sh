@@ -80,6 +80,10 @@ tofu_apply() {
   (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu init >"${SCRIPT_DIR}/acme-tofu-scaffold.log" 2>&1) \
     || { cat "${SCRIPT_DIR}/acme-tofu-scaffold.log"; return 1; }
 
+  # 'enclave tofu env' requires the scaffold to exist (above) — write env
+  # vars now, before tofu init/apply runs.
+  write_env_values
+
   cat > "${TOFU_DIR}/backend.tf" <<BACKEND
 terraform {
   backend "local" {
@@ -112,21 +116,21 @@ OVERRIDE
     || { echo "tofu apply FAILED:"; tail -25 "${SCRIPT_DIR}/acme-tofu-apply.log"; return 1; }
 }
 
-# write_env_values writes the ACME config into the tofu env_values map. tofu's
-# aws_ssm_parameter.env_override turns each key into /dev/my-app/env/<key>,
-# which the runtime reads at boot via loadDeployTLSConfig.
+# write_env_values populates tofu/env_values.auto.tfvars.json via the
+# `enclave tofu env` CLI — exercises the same UX an operator uses (rather
+# than dumping framework-private JSON). tofu's aws_ssm_parameter.env_override
+# turns each key into /dev/my-app/env/<key>, which the runtime reads at boot
+# via loadDeployTLSConfig.
+# Caller must have scaffolded the module first (enclave tofu init).
 write_env_values() {
-  jq -n \
-    --arg fqdn "$FQDN" \
-    --arg dir "$PEBBLE_DIRECTORY" \
-    --arg ca "$(cat "${PEBBLE_DIR}/pebble-ca.crt")" \
-    '{env_values: {
-        ENCLAVE_NITRIDING_FQDN: $fqdn,
-        ENCLAVE_NITRIDING_USE_ACME: "true",
-        ENCLAVE_NITRIDING_ACME_DIRECTORY: $dir,
-        ENCLAVE_NITRIDING_ACME_EMAIL: "acme-test@enclave.test",
-        ENCLAVE_NITRIDING_ACME_CA: $ca
-      }}' > "${TOFU_DIR}/env_values.auto.tfvars.json"
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu env \
+    --key ENCLAVE_NITRIDING_FQDN           --value "$FQDN" \
+    --key ENCLAVE_NITRIDING_USE_ACME       --value "true" \
+    --key ENCLAVE_NITRIDING_ACME_DIRECTORY --value "$PEBBLE_DIRECTORY" \
+    --key ENCLAVE_NITRIDING_ACME_EMAIL     --value "acme-test@enclave.test" \
+    --key ENCLAVE_NITRIDING_ACME_CA        --value "$(cat "${PEBBLE_DIR}/pebble-ca.crt")" \
+    > "${SCRIPT_DIR}/acme-tofu-env.log" 2>&1) \
+    || { cat "${SCRIPT_DIR}/acme-tofu-env.log"; return 1; }
 }
 
 # start_supervisor runs the supervisor purely for in-process gvproxy (the
@@ -425,23 +429,20 @@ echo "=============================================="
 echo " Enclave ACME (Pebble) end-to-end test"
 echo "=============================================="
 
-echo "[1/7] Checking Pebble fixtures..."
+echo "[1/6] Checking Pebble fixtures..."
 [ -f "${PEBBLE_DIR}/pebble-ca.crt" ] || { echo "Error: ${PEBBLE_DIR}/pebble-ca.crt missing — run test/pebble/gen-certs.sh" >&2; exit 1; }
 echo "  Pebble directory: ${PEBBLE_DIRECTORY}"
 
-echo "[2/7] Writing ACME config to env_values.auto.tfvars.json..."
-write_env_values
-
-echo "[3/7] tofu apply (localstack)..."
+echo "[2/6] tofu apply (localstack) — scaffolds module, writes env via 'enclave tofu env', applies..."
 tofu_destroy
 tofu_apply
 
-echo "[4/7] Starting supervisor + booting enclave (ACME mode)..."
+echo "[3/6] Starting supervisor + booting enclave (ACME mode)..."
 start_supervisor
 boot_enclave
 wait_health "(initial boot)"
 
-echo "[5/7] Triggering ACME issuance via Pebble..."
+echo "[4/6] Triggering ACME issuance via Pebble..."
 if trigger_issuance; then
   pass "enclave obtained a cert via ACME"
 else
@@ -468,7 +469,7 @@ else
   fail "served cert SAN missing ${FQDN}"
 fi
 
-echo "[6/7] Reboot — verifying the cert is reused from the S3 cache..."
+echo "[5/6] Reboot — verifying the cert is reused from the S3 cache..."
 SERIAL_BEFORE="$(served_cert -serial || true)"
 echo "  serial before reboot: ${SERIAL_BEFORE}"
 boot_enclave   # stop_enclave + relaunch; tofu state (S3 bucket) is untouched
@@ -482,7 +483,7 @@ else
   fail "cert serial changed across reboot — re-issued instead of reusing the S3 cache"
 fi
 
-echo "[7/7] Route53 record smoke against LocalStack..."
+echo "[6/6] Route53 record smoke against LocalStack..."
 route53_smoke
 
 echo ""

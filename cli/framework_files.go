@@ -321,11 +321,6 @@ const frameworkFlakeNix = `{
 
         # Secrets config JSON baked into the EIF for runtime discovery.
         secretsCfgJson = builtins.toJSON (buildCfg.secrets or []);
-        # Names of app.env keys, attested via PCR0. Values for these keys
-        # are baked below as defaults; the runtime overlays tofu-supplied
-        # SSM overrides on top at boot (see runtime/env_overrides.go).
-        appEnvKeysJson = builtins.toJSON (builtins.attrNames (appCfg.env or {}));
-
         # Environment variables for the enclave.
         # Standard vars + all app-specific vars from build-config.json.
         enclaveEnv = let
@@ -341,7 +336,6 @@ const frameworkFlakeNix = `{
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
-          ENCLAVE_APP_ENV_KEYS=` + "${appEnvKeysJson}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -521,11 +515,6 @@ LAUNCHER
 
         # Secrets config JSON baked into the EIF for runtime discovery.
         secretsCfgJson = builtins.toJSON (buildCfg.secrets or []);
-        # Names of app.env keys, attested via PCR0. Values for these keys
-        # are baked below as defaults; the runtime overlays tofu-supplied
-        # SSM overrides on top at boot (see runtime/env_overrides.go).
-        appEnvKeysJson = builtins.toJSON (builtins.attrNames (appCfg.env or {}));
-
         # Environment variables for the enclave.
         # Standard vars + all app-specific vars from build-config.json.
         enclaveEnv = let
@@ -541,7 +530,6 @@ LAUNCHER
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
-          ENCLAVE_APP_ENV_KEYS=` + "${appEnvKeysJson}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';
@@ -1040,11 +1028,6 @@ const frameworkFlakeNixDotnet = `{
 
         # Secrets config JSON baked into the EIF for runtime discovery.
         secretsCfgJson = builtins.toJSON (buildCfg.secrets or []);
-        # Names of app.env keys, attested via PCR0. Values are baked
-        # below as defaults; the runtime overlays tofu-supplied SSM
-        # overrides on top at boot (see runtime/env_overrides.go).
-        appEnvKeysJson = builtins.toJSON (builtins.attrNames (appCfg.env or {}));
-
         # Environment variables for the enclave.
         enclaveEnv = let
           appEnvLines = builtins.concatStringsSep "\n"
@@ -1059,7 +1042,6 @@ const frameworkFlakeNixDotnet = `{
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
-          ENCLAVE_APP_ENV_KEYS=` + "${appEnvKeysJson}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
           ` + "${appEnvLines}" + `
@@ -1204,7 +1186,6 @@ const frameworkFlakeNixRust = `{
         };
 
         secretsCfgJson = builtins.toJSON (buildCfg.secrets or []);
-        appEnvKeysJson = builtins.toJSON (builtins.attrNames (appCfg.env or {}));
 
         enclaveEnv = let
           appEnvLines = builtins.concatStringsSep "\n"
@@ -1219,7 +1200,6 @@ const frameworkFlakeNixRust = `{
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
-          ENCLAVE_APP_ENV_KEYS=` + "${appEnvKeysJson}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
           ` + "${appEnvLines}" + `
         '';

@@ -48,15 +48,14 @@ app:
   binary_name: ""                # Output binary name (defaults to 'name')
   release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
-  # Environment variables baked into the EIF as build-time defaults
-  # (each value contributes to PCR0). Tofu can override any key here
-  # at deploy time via -var 'env_values={"MY_KEY":"new-value"}' without
-  # rebuilding the EIF — the runtime overlays the SSM value on top of
-  # the baked default at boot.
+  # Optional build-time env values baked into the EIF (each value
+  # contributes to PCR0). Use ONLY when you need a value cryptographically
+  # bound to the image (e.g., BUILD_VARIANT=prod).
+  # For deploy-time env vars (the common case), run:
+  #   enclave tofu env --key MY_KEY --value foo
+  # then 'tofu apply' — no rebuild needed.
   # Template vars: {{region}}, {{prefix}}, {{version}}
-  env:
-    # MY_APP_DATA_DIR: /app/data
-    # MY_APP_REGION: "{{region}}"
+  env: {}
 
 # Secrets managed by KMS inside the enclave.
 # Each secret is generated as 32 random bytes, encrypted with KMS,

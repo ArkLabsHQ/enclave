@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -107,10 +106,12 @@ func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
 }
 
-// ssmGetter is a minimal subset of *ssm.Client so applyEnvOverrides can
-// take a fake in unit tests without an AWSClient.
+// ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by
+// loadDeployTLSConfig for known one-off lookups; GetParametersByPath drives
+// the deploy-time env overlay (no need to enumerate keys at build time).
 type ssmGetter interface {
 	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
+	GetParametersByPath(ctx context.Context, params *ssm.GetParametersByPathInput, optFns ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error)
 }
 
 // Environment is the boot-time env-overlay step.
@@ -122,45 +123,48 @@ func NewEnvironment(aws *AWSClient) *Environment {
 	return &Environment{aws: aws}
 }
 
-// Override reads ENCLAVE_APP_ENV_KEYS (a JSON list of app.env keys baked
-// into the EIF and attested via PCR0) and, for each key, overlays the
-// tofu-supplied SSM value at /<deployment>/<app>/env/<key> on top of the
-// baked default. Missing params (ParameterNotFound) leave the default intact.
+// Override scans /<deployment>/<app>/env/ in SSM and overlays every key
+// found there onto the process env, on top of any defaults baked into the
+// EIF. Trust boundary is the IAM grant on that SSM prefix.
 func (e *Environment) Override(ctx context.Context) error {
 	return applyEnvOverrides(ctx, e.aws.SSM, getDeployment(), getAppName())
 }
 
 func applyEnvOverrides(ctx context.Context, ssmClient ssmGetter, deployment, appName string) error {
-	raw := os.Getenv("ENCLAVE_APP_ENV_KEYS")
-	if raw == "" || raw == "[]" {
-		return nil
-	}
-	var keys []string
-	if err := json.Unmarshal([]byte(raw), &keys); err != nil {
-		return fmt.Errorf("parse ENCLAVE_APP_ENV_KEYS: %w", err)
-	}
-	for _, key := range keys {
-		paramName := fmt.Sprintf("/%s/%s/env/%s", deployment, appName, key)
-		out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
-			Name:           aws.String(paramName),
-			WithDecryption: aws.Bool(false),
+	prefix := fmt.Sprintf("/%s/%s/env/", deployment, appName)
+	var nextToken *string
+	var applied int
+	for {
+		out, err := ssmClient.GetParametersByPath(ctx, &ssm.GetParametersByPathInput{
+			Path:           aws.String(prefix),
+			Recursive:      aws.Bool(false),
+			WithDecryption: aws.Bool(true),
+			NextToken:      nextToken,
 		})
 		if err != nil {
-			var pnf *ssmtypes.ParameterNotFound
-			if errors.As(err, &pnf) {
+			return fmt.Errorf("ssm get-parameters-by-path %s: %w", prefix, err)
+		}
+		for _, p := range out.Parameters {
+			if p.Name == nil || p.Value == nil {
 				continue
 			}
-			return fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+			key := strings.TrimPrefix(*p.Name, prefix)
+			// Defensive: skip empty or nested keys so a misconfigured SSM
+			// tree can't surface unexpected env var names.
+			if key == "" || strings.ContainsRune(key, '/') {
+				continue
+			}
+			if err := os.Setenv(key, *p.Value); err != nil {
+				return fmt.Errorf("setenv %s: %w", key, err)
+			}
+			applied++
 		}
-		if out.Parameter == nil || out.Parameter.Value == nil {
-			continue
+		if out.NextToken == nil {
+			break
 		}
-		value := *out.Parameter.Value
-		if err := os.Setenv(key, value); err != nil {
-			return fmt.Errorf("setenv %s: %w", key, err)
-		}
-		slog.Info("app.env override applied", "key", key)
+		nextToken = out.NextToken
 	}
+	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
 	return nil
 }
 

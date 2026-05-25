@@ -229,11 +229,12 @@ app:
   nix_build_inputs: []           # Link-time libs (e.g. ["openssl", "zlib"])
   nix_native_build_inputs: []    # Build-time tools (e.g. ["pkg-config", "protobuf"])
 
-  # Environment variables baked into the EIF as build-time defaults
-  # (each value contributes to PCR0). Tofu can override any key here
-  # at deploy time via -var 'env_values={"MY_KEY":"new-value"}' without
-  # rebuilding the EIF — the runtime overlays the SSM value on top of
-  # the baked default at boot.
+  # Optional build-time env values baked into the EIF (each value
+  # contributes to PCR0). Use ONLY when you need a value cryptographically
+  # bound to the image (e.g., BUILD_VARIANT=prod).
+  # For deploy-time env vars (the common case), run:
+  #   enclave tofu env --key MY_KEY --value foo
+  # then 'tofu apply' — no rebuild needed.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
@@ -323,11 +324,12 @@ app:
   nix_build_inputs: []           # Link-time libs (e.g. ["openssl", "cairo"])
   nix_native_build_inputs: []    # Build-time tools (e.g. ["python3", "pkg-config"])
 
-  # Environment variables baked into the EIF as build-time defaults
-  # (each value contributes to PCR0). Tofu can override any key here
-  # at deploy time via -var 'env_values={"MY_KEY":"new-value"}' without
-  # rebuilding the EIF — the runtime overlays the SSM value on top of
-  # the baked default at boot.
+  # Optional build-time env values baked into the EIF (each value
+  # contributes to PCR0). Use ONLY when you need a value cryptographically
+  # bound to the image (e.g., BUILD_VARIANT=prod).
+  # For deploy-time env vars (the common case), run:
+  #   enclave tofu env --key MY_KEY --value foo
+  # then 'tofu apply' — no rebuild needed.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
@@ -621,11 +623,12 @@ app:
   nix_build_inputs: []           # Link-time libs (e.g. ["icu", "openssl"])
   nix_native_build_inputs: []    # Build-time tools
 
-  # Environment variables baked into the EIF as build-time defaults
-  # (each value contributes to PCR0). Tofu can override any key here
-  # at deploy time via -var 'env_values={"MY_KEY":"new-value"}' without
-  # rebuilding the EIF — the runtime overlays the SSM value on top of
-  # the baked default at boot.
+  # Optional build-time env values baked into the EIF (each value
+  # contributes to PCR0). Use ONLY when you need a value cryptographically
+  # bound to the image (e.g., BUILD_VARIANT=prod).
+  # For deploy-time env vars (the common case), run:
+  #   enclave tofu env --key MY_KEY --value foo
+  # then 'tofu apply' — no rebuild needed.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data

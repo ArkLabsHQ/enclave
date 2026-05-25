@@ -570,19 +570,26 @@ data "aws_iam_policy_document" "enclave" {
     )
   }
 
-  # SSM: read-only parameters.
+  # SSM: read-only known one-off parameters.
   statement {
-    sid     = "SSMReadOnly"
+    sid     = "SSMReadKnownParams"
     actions = ["ssm:GetParameter"]
-    resources = concat(
-      [aws_ssm_parameter.storage_bucket_name.arn],
-      [for p in aws_ssm_parameter.env_override : p.arn],
-      [
-        aws_ssm_parameter.pcr0_pubkey.arn,
-        aws_ssm_parameter.pcr0_value.arn,
-        aws_ssm_parameter.pcr0_signature.arn,
-      ],
-    )
+    resources = [
+      aws_ssm_parameter.storage_bucket_name.arn,
+      aws_ssm_parameter.pcr0_pubkey.arn,
+      aws_ssm_parameter.pcr0_value.arn,
+      aws_ssm_parameter.pcr0_signature.arn,
+    ]
+  }
+
+  # SSM: prefix-scoped env overrides. The runtime calls GetParametersByPath
+  # to fetch the whole map at boot — no need to enumerate keys in the EIF.
+  statement {
+    sid     = "SSMReadEnvOverridesPrefix"
+    actions = ["ssm:GetParameter", "ssm:GetParametersByPath"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/env/*",
+    ]
   }
 
   # SSM: KMSKeyID needs read+write (supervisor updates it during migration).

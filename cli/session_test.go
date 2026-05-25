@@ -20,7 +20,7 @@ type fakeSessionStarter struct {
 	err      error
 }
 
-func (f *fakeSessionStarter) StartPortForward(ctx context.Context, instanceID, region, remotePort string) (int, func(), error) {
+func (f *fakeSessionStarter) StartPortForward(ctx context.Context, instanceID, region, profile, remotePort string) (int, func(), error) {
 	if f.err != nil {
 		return 0, nil, f.err
 	}

@@ -14,7 +14,7 @@ type frameworkFile struct {
 // that are tied to the build (not deployment). The language parameter
 // selects the correct flake.nix template.
 //
-// Deployment scaffolding (OpenTofu module) is emitted by `enclave tofu`
+// Deployment scaffolding (OpenTofu module) is emitted by `enclave tofu init`
 // via getTofuFiles; splitting the two lets users customize one without
 // inadvertently regenerating the other.
 func getInitFiles(language string) []frameworkFile {
@@ -58,7 +58,7 @@ func getInitFiles(language string) []frameworkFile {
 }
 
 // getTofuFiles returns the OpenTofu module scaffolding emitted by
-// `enclave tofu`. Paths are relative to the repo root; the tree lives
+// `enclave tofu init`. Paths are relative to the repo root; the tree lives
 // under ./tofu/ so it's independent of the enclave/ build inputs.
 //
 // The language parameter is currently unused (templates don't vary by
@@ -75,7 +75,7 @@ func getTofuFiles(_ string) []frameworkFile {
 }
 
 // Gitignore for the tofu/ scaffold — hides account-specific state and
-// generated files. Scaffolded by `enclave tofu` alongside the module tree.
+// generated files. Scaffolded by `enclave tofu init` alongside the module tree.
 const frameworkTofuGitignore = `# OpenTofu state and outputs (contains account-specific IDs)
 tofu-outputs.json
 terraform.tfvars.json
@@ -641,7 +641,7 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          enclave tofu
+          enclave tofu init
           # Stash the artifacts dir before cd so the PCR reads below resolve
           # to the right path regardless of current working directory.
           ARTIFACTS="$PWD/.enclave/artifacts"

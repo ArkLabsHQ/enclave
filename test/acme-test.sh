@@ -77,7 +77,7 @@ tofu_apply() {
   for f in image.eif supervisor; do
     [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/.enclave/artifacts/$f"
   done
-  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu >"${SCRIPT_DIR}/acme-tofu-scaffold.log" 2>&1) \
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu init >"${SCRIPT_DIR}/acme-tofu-scaffold.log" 2>&1) \
     || { cat "${SCRIPT_DIR}/acme-tofu-scaffold.log"; return 1; }
 
   cat > "${TOFU_DIR}/backend.tf" <<BACKEND

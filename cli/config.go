@@ -72,7 +72,7 @@ type AppConfig struct {
 	BinaryName           string            `yaml:"binary_name"`
 	Env                  map[string]string `yaml:"env"`
 	// ReleaseTag identifies the GitHub Release of nix_owner/nix_repo from
-	// which `enclave tofu --remote` downloads image.eif and supervisor.
+	// which `enclave tofu init --remote` downloads image.eif and supervisor.
 	// Defaults to "eif-latest" when unset.
 	ReleaseTag string `yaml:"release_tag"`
 }

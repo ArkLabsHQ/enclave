@@ -43,7 +43,7 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
-          enclave tofu
+          enclave tofu init
           # Stash the artifacts dir before the tofu run so the PCR reads below
           # resolve to the right path regardless of current working directory.
           ARTIFACTS="$PWD/.enclave/artifacts"

@@ -126,9 +126,6 @@ func runBuildWithConfig(cfg *Config) error {
 	fmt.Printf("  EIF:     .enclave/artifacts/image.eif\n")
 	fmt.Printf("  Supervisor: .enclave/artifacts/supervisor\n")
 	fmt.Println()
-	fmt.Println("Next:")
-	fmt.Println("  enclave tofu                # refresh tofu/terraform.tfvars.json with this build's PCR0")
-	fmt.Println("  cd tofu && tofu init && tofu apply")
 	return nil
 }
 
@@ -347,4 +344,3 @@ func buildSupervisorBinary(cfg *Config, root string) error {
 	}
 	return nil
 }
-

@@ -253,7 +253,7 @@ export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-http://127.0.0.1:4566}"
 
 tofu_apply() {
   # Always regenerate tfvars — paths differ between host and Docker.
-  # `enclave tofu` is merge-only-new (existing files are skipped) so the
+  # `enclave tofu init` is merge-only-new (existing files are skipped) so the
   # committed test-app scaffold would mask CLI changes. Delete the
   # CLI-managed root and module main.tf first to force a fresh emit; the
   # rest of the tree (modules/backend, templates, etc.) is left untouched.
@@ -270,7 +270,7 @@ tofu_apply() {
     [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/.enclave/artifacts/$f"
   done
 
-  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu > "${SCRIPT_DIR}/tofu-scaffold.log" 2>&1) \
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu init > "${SCRIPT_DIR}/tofu-scaffold.log" 2>&1) \
     || { cat "${SCRIPT_DIR}/tofu-scaffold.log"; return 1; }
 
   # Write local backend config for testing (enclave build generates S3 backend.tf for production).

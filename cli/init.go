@@ -46,7 +46,7 @@ app:
     - "."
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
-  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
   # Environment variables baked into the EIF as build-time defaults
   # (each value contributes to PCR0). Tofu can override any key here
@@ -163,7 +163,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 		// Write build-time framework files (flake.nix + CI workflows). The
 		// OpenTofu deployment scaffold lives under ./tofu/ and is emitted by
-		// `enclave tofu`, not here, so users can iterate on build and
+		// `enclave tofu init`, not here, so users can iterate on build and
 		// deployment independently.
 		for _, f := range getInitFiles(language) {
 			destPath := filepath.Join(cwd, f.RelPath)
@@ -186,7 +186,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No runtime imports needed — the supervisor handles attestation automatically.")
 		fmt.Println("Then run 'enclave setup' to compute hashes and 'enclave build' to build.")
-		fmt.Println("Before deploying, run 'enclave tofu' to generate the OpenTofu module.")
+		fmt.Println("Before deploying, run 'enclave tofu init' to generate the OpenTofu module.")
 		return nil
 	}
 

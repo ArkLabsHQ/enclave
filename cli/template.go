@@ -71,7 +71,7 @@ func runGenerateTemplate(outDir, language string) error {
 	// Write framework files — build-time (flake.nix, CI workflows) and
 	// deployment (tofu/) together, since `generate` produces a complete
 	// ready-to-deploy template. Users invoking `enclave init` get only
-	// the build-time subset; `enclave tofu` emits the deployment subset.
+	// the build-time subset; `enclave tofu init` emits the deployment subset.
 	allFiles := append(getInitFiles(language), getTofuFiles(language)...)
 	for _, f := range allFiles {
 		destPath := filepath.Join(outDir, f.RelPath)
@@ -222,7 +222,7 @@ app:
     - "cmd"
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
-  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
   # Extra nixpkgs attrs added to the build sandbox.
   # Names must match attr paths in nixpkgs (e.g. "openssl", "pkg-config").
@@ -316,7 +316,7 @@ app:
   nix_vendor_hash: ""            # npm deps hash (required)
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Package name from package.json (defaults to 'name')
-  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
   # Extra nixpkgs attrs added to the build sandbox.
   # Names must match attr paths in nixpkgs (e.g. "python3", "pkg-config").
@@ -614,7 +614,7 @@ app:
   # NuGet deps: run 'enclave setup' to generate deps.json (used by flake.nix)
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
-  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
   # Extra nixpkgs attrs added to the build sandbox.
   # Names must match attr paths in nixpkgs (e.g. "icu", "openssl").
@@ -823,7 +823,7 @@ app:
   nix_vendor_hash: ""            # Cargo.lock hash (required)
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
-  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu --remote'
+  release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
 
   # Extra nixpkgs attrs added to the build sandbox.
   # Names must match attr paths in nixpkgs (e.g. "openssl", "protobuf").

@@ -1,6 +1,6 @@
 package cli
 
-// OpenTofu scaffolding emitted by `enclave tofu`. One main.tf per module
+// OpenTofu scaffolding emitted by `enclave tofu init`. One main.tf per module
 // keeps the user's tofu/ tree small; section banners inside each string
 // make the consolidated files still navigable.
 

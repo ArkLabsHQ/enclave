@@ -64,20 +64,20 @@ func TestCLI_Init(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(dir, "flake.nix")); err == nil {
 				t.Error("flake.nix found at repo root; should be under enclave/")
 			}
-			// `enclave init` must NOT scaffold tofu files — that's `enclave tofu`.
+			// `enclave init` must NOT scaffold tofu files — that's `enclave tofu init`.
 			if _, err := os.Stat(filepath.Join(dir, "tofu")); err == nil {
-				t.Error("tofu/ found after init; should only be created by 'enclave tofu'")
+				t.Error("tofu/ found after init; should only be created by 'enclave tofu init'")
 			}
 			if _, err := os.Stat(filepath.Join(dir, "enclave", "tofu")); err == nil {
 				t.Error("enclave/tofu/ found after init; tofu tree now lives at ./tofu/")
 			}
 
-			// `enclave tofu` scaffolds the consolidated OpenTofu tree: one
+			// `enclave tofu init` scaffolds the consolidated OpenTofu tree: one
 			// main.tf per module, plus the user_data template.
-			tofuCmd := exec.Command(bin, "tofu")
+			tofuCmd := exec.Command(bin, "tofu", "init")
 			tofuCmd.Dir = dir
 			if out, err := tofuCmd.CombinedOutput(); err != nil {
-				t.Fatalf("enclave tofu failed:\n%s", out)
+				t.Fatalf("enclave tofu init failed:\n%s", out)
 			}
 			for _, f := range []string{
 				"tofu/main.tf",
@@ -86,7 +86,7 @@ func TestCLI_Init(t *testing.T) {
 				"tofu/modules/enclave/templates/user_data.sh.tftpl",
 			} {
 				if _, err := os.Stat(filepath.Join(dir, f)); os.IsNotExist(err) {
-					t.Errorf("missing after enclave tofu: %s", f)
+					t.Errorf("missing after enclave tofu init: %s", f)
 				}
 			}
 
@@ -100,7 +100,7 @@ func TestCLI_Init(t *testing.T) {
 	}
 }
 
-// runEnclaveTofu runs `enclave init --language go && enclave tofu [args...]`
+// runEnclaveTofu runs `enclave init --language go && enclave tofu init [args...]`
 // in a fresh temp dir and returns the parsed terraform.tfvars.json.
 func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[string]string) map[string]any {
 	t.Helper()
@@ -113,8 +113,9 @@ func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[s
 	}
 
 	// Mutate enclave.yaml so nix_owner/nix_repo/release_tag are non-empty —
-	// `enclave tofu --remote` requires owner+repo, and the default release_tag
-	// from the loader is "eif-latest" but the scaffolded file pins it.
+	// `enclave tofu init --remote` requires owner+repo, and the default
+	// release_tag from the loader is "eif-latest" but the scaffolded file
+	// pins it.
 	cfgPath := filepath.Join(dir, "enclave", "enclave.yaml")
 	cfg, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -128,10 +129,10 @@ func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[s
 		t.Fatalf("write enclave.yaml: %v", err)
 	}
 
-	tofuCmd := exec.Command(bin, append([]string{"tofu"}, tofuArgs...)...)
+	tofuCmd := exec.Command(bin, append([]string{"tofu", "init"}, tofuArgs...)...)
 	tofuCmd.Dir = dir
 	if out, err := tofuCmd.CombinedOutput(); err != nil {
-		t.Fatalf("enclave tofu %v failed:\n%s", tofuArgs, out)
+		t.Fatalf("enclave tofu init %v failed:\n%s", tofuArgs, out)
 	}
 
 	tfvarsPath := filepath.Join(dir, "tofu", "terraform.tfvars.json")
@@ -146,8 +147,8 @@ func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[s
 	return parsed
 }
 
-// TestCLI_Tofu_Default verifies that `enclave tofu` (no flag) populates
-// the local artifact paths so tofu uploads them straight from disk.
+// TestCLI_Tofu_Default verifies that `enclave tofu init` (no flag)
+// populates the local artifact paths so tofu uploads them straight from disk.
 func TestCLI_Tofu_Default(t *testing.T) {
 	binDir := t.TempDir()
 	bin := buildCLI(t, binDir)
@@ -172,7 +173,7 @@ func TestCLI_Tofu_Default(t *testing.T) {
 	}
 }
 
-// TestCLI_Tofu_Remote verifies that `enclave tofu --remote` leaves the
+// TestCLI_Tofu_Remote verifies that `enclave tofu init --remote` leaves the
 // local paths empty (so the tofu module's null_resource downloads from
 // GitHub Release at apply time) and surfaces the user-pinned release_tag.
 func TestCLI_Tofu_Remote(t *testing.T) {
@@ -216,7 +217,7 @@ func TestCLI_Tofu_Remote_RequiresOwnerRepo(t *testing.T) {
 	}
 
 	// Leave nix_owner/nix_repo as their scaffolded defaults ("").
-	tofuCmd := exec.Command(bin, "tofu", "--remote")
+	tofuCmd := exec.Command(bin, "tofu", "init", "--remote")
 	tofuCmd.Dir = dir
 	out, err := tofuCmd.CombinedOutput()
 	if err == nil {
@@ -277,7 +278,7 @@ func TestCLI_Build(t *testing.T) {
 	}
 
 	// Verify artifacts were created. terraform.tfvars.json is no longer a
-	// build output — `enclave tofu` writes it now (verified separately in
+	// build output — `enclave tofu init` writes it now (verified separately in
 	// TestCLI_Init).
 	for _, artifact := range []string{
 		".enclave/artifacts/image.eif",

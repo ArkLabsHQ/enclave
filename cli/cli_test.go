@@ -76,6 +76,7 @@ func TestCLI_Init(t *testing.T) {
 			// main.tf per module, plus the user_data template.
 			tofuCmd := exec.Command(bin, "tofu", "init")
 			tofuCmd.Dir = dir
+			tofuCmd.Stdin = nil // /dev/null — never let the subprocess inherit a TTY
 			if out, err := tofuCmd.CombinedOutput(); err != nil {
 				t.Fatalf("enclave tofu init failed:\n%s", out)
 			}
@@ -131,6 +132,7 @@ func runEnclaveTofu(t *testing.T, bin string, tofuArgs []string, yamlEdits map[s
 
 	tofuCmd := exec.Command(bin, append([]string{"tofu", "init"}, tofuArgs...)...)
 	tofuCmd.Dir = dir
+	tofuCmd.Stdin = nil // /dev/null — never let the subprocess inherit a TTY
 	if out, err := tofuCmd.CombinedOutput(); err != nil {
 		t.Fatalf("enclave tofu init %v failed:\n%s", tofuArgs, out)
 	}
@@ -219,6 +221,7 @@ func TestCLI_Tofu_Remote_RequiresOwnerRepo(t *testing.T) {
 	// Leave nix_owner/nix_repo as their scaffolded defaults ("").
 	tofuCmd := exec.Command(bin, "tofu", "init", "--remote")
 	tofuCmd.Dir = dir
+	tofuCmd.Stdin = nil // /dev/null — never let the subprocess inherit a TTY
 	out, err := tofuCmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected --remote without owner/repo to error, got success:\n%s", out)

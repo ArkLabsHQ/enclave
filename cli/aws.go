@@ -27,6 +27,7 @@ import (
 // awsClients holds initialized AWS SDK v2 clients for a specific region.
 type awsClients struct {
 	region    string
+	profile   string // empty = default credential chain; passed to `aws ssm start-session --profile` subprocesses
 	ec2Client *ec2.Client
 	kmsClient *kms.Client
 	ssmClient *ssm.Client
@@ -52,7 +53,7 @@ func newAWSClientsWithEnv(ctx context.Context, region, profile string, appEnv ma
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
 
-	ac := &awsClients{region: region}
+	ac := &awsClients{region: region, profile: profile}
 	ac.ec2Client = ec2.NewFromConfig(cfg)
 
 	if ep := appEnv["AWS_ENDPOINT_URL_KMS"]; ep != "" {
@@ -177,7 +178,7 @@ func (ac *awsClients) runCommandOutput(ctx context.Context, instanceID, command 
 // for log/trace/metrics so the 24KB stdout cap doesn't truncate responses.
 
 type sessionStarter interface {
-	StartPortForward(ctx context.Context, instanceID, region, remotePort string) (localPort int, cleanup func(), err error)
+	StartPortForward(ctx context.Context, instanceID, region, profile, remotePort string) (localPort int, cleanup func(), err error)
 }
 
 var errPluginMissing = errors.New(
@@ -187,9 +188,9 @@ var errPluginMissing = errors.New(
 
 type cmdSessionStarter struct{}
 
-func (s cmdSessionStarter) StartPortForward(ctx context.Context, instanceID, region, remotePort string) (int, func(), error) {
+func (s cmdSessionStarter) StartPortForward(ctx context.Context, instanceID, region, profile, remotePort string) (int, func(), error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		port, cleanup, err := s.startOnce(ctx, instanceID, region, remotePort)
+		port, cleanup, err := s.startOnce(ctx, instanceID, region, profile, remotePort)
 		if err == nil {
 			return port, cleanup, nil
 		}
@@ -210,7 +211,7 @@ func isPortRaceError(err error) bool {
 		strings.Contains(msg, "bind: address already")
 }
 
-func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remotePort string) (int, func(), error) {
+func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, profile, remotePort string) (int, func(), error) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, nil, fmt.Errorf("alloc local port: %w", err)
@@ -219,12 +220,16 @@ func (cmdSessionStarter) startOnce(ctx context.Context, instanceID, region, remo
 	_ = lis.Close()
 
 	params := fmt.Sprintf(`{"portNumber":["%s"],"localPortNumber":["%d"]}`, remotePort, localPort)
-	cmd := exec.CommandContext(ctx, "aws", "ssm", "start-session",
+	args := []string{"ssm", "start-session",
 		"--target", instanceID,
 		"--document-name", "AWS-StartPortForwardingSession",
 		"--parameters", params,
 		"--region", region,
-	)
+	}
+	if profile != "" {
+		args = append(args, "--profile", profile)
+	}
+	cmd := exec.CommandContext(ctx, "aws", args...)
 	setProcessGroup(cmd)
 
 	stderrPipe, err := cmd.StderrPipe()
@@ -336,7 +341,7 @@ func (ac *awsClients) httpViaSession(ctx context.Context, instanceID, path strin
 	if starter == nil {
 		starter = cmdSessionStarter{}
 	}
-	port, cleanup, err := starter.StartPortForward(ctx, instanceID, ac.region, supervisorRemotePort)
+	port, cleanup, err := starter.StartPortForward(ctx, instanceID, ac.region, ac.profile, supervisorRemotePort)
 	if err != nil {
 		return nil, err
 	}

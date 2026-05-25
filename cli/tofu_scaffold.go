@@ -48,6 +48,16 @@ enclave.yaml at apply time, then mirrors them to S3.`,
 	}
 	cmd.Flags().Bool("remote", false,
 		"Pull EIF + supervisor from the GitHub Release at apply time instead of using local files")
+	cmd.Flags().Bool("bootstrap-backend", false,
+		"Run 'tofu init' + 'tofu apply' on the backend module to create the S3 state bucket and DynamoDB lock table. Default: prompt in a TTY, skip otherwise.")
+	cmd.Flags().Bool("no-bootstrap", false,
+		"Never bootstrap the backend (just scaffold). Overrides --bootstrap-backend and any interactive prompt.")
+	cmd.Flags().String("backend-bucket", "",
+		"S3 bucket name for the state backend (overrides the computed default). Setting any --backend-* flag skips the interactive prompts.")
+	cmd.Flags().String("backend-table", "",
+		"DynamoDB lock table name (overrides the computed default). Setting any --backend-* flag skips the interactive prompts.")
+	cmd.Flags().String("backend-region", "",
+		"AWS region for the backend (overrides enclave.yaml region). Setting any --backend-* flag skips the interactive prompts.")
 	return cmd
 }
 
@@ -126,19 +136,125 @@ func runTofuInit(cmd *cobra.Command, args []string) error {
 	if err := writeTofuVars(cfg, root, remote); err != nil {
 		return fmt.Errorf("write terraform.tfvars.json: %w", err)
 	}
-	if err := writeBackendConfig(cfg, root); err != nil {
+
+	// Backend values prompt comes FIRST, independently of the bootstrap
+	// decision — operators with a pre-existing S3 bucket / lock table need
+	// backend.tf to point at THEIR resources even when they decline to
+	// bootstrap (no-op for the framework). Skipped if backend.tf already
+	// exists (operator has their own), any --backend-* flag is set, or in
+	// non-TTY contexts.
+	override := collectBackendValues(cmd, cfg, root)
+	if err := writeBackendConfig(cfg, root, override); err != nil {
 		return fmt.Errorf("write backend.tf: %w", err)
 	}
 	if remote {
 		fmt.Printf("Wrote    tofu/terraform.tfvars.json — remote artifacts: github.com/%s/%s @ %s\n",
 			cfg.App.NixOwner, cfg.App.NixRepo, cfg.App.ReleaseTag)
-		fmt.Println("\nNext: cd tofu && tofu init && tofu apply")
 	} else {
 		fmt.Println("Wrote    tofu/terraform.tfvars.json (from enclave.yaml)")
-		fmt.Println("\nNext: enclave build  →  cd tofu && tofu init && tofu apply")
+	}
+
+	wantBootstrap, prompted := shouldBootstrapBackend(cmd, root)
+
+	if wantBootstrap {
+		fmt.Println("\nBootstrapping backend (S3 state bucket + DynamoDB lock table)...")
+		if err := bootstrapBackend(root, override); err != nil {
+			return fmt.Errorf("backend bootstrap: %w", err)
+		}
+		fmt.Println("\nBackend ready. Next: cd tofu && tofu init && tofu apply")
+	} else if !prompted {
+		fmt.Println("\nNext:")
+		fmt.Println("  enclave tofu init --bootstrap-backend   # create state bucket + lock table")
+		fmt.Println("  cd tofu && tofu init && tofu apply")
+	} else {
+		fmt.Println("\nNext: cd tofu && tofu init && tofu apply")
 	}
 	fmt.Println("\nTip: after editing enclave.yaml, run 'enclave tofu update' to refresh tfvars only.")
 	return nil
+}
+
+// shouldBootstrapBackend returns (wantBootstrap, prompted). prompted is true
+// when an interactive prompt was actually shown — used by the caller to
+// avoid printing a "next: --bootstrap-backend" hint after the operator has
+// already explicitly answered no.
+//
+// Decision matrix:
+//
+//	--no-bootstrap            -> false, false
+//	state file exists & no --bootstrap-backend
+//	                          -> false, false (already done; silent skip)
+//	--bootstrap-backend       -> true,  false
+//	non-TTY (no flag)         -> false, false
+//	TTY (no flag)             -> ask;   prompted=true
+func shouldBootstrapBackend(cmd *cobra.Command, root string) (bool, bool) {
+	noBootstrap, _ := cmd.Flags().GetBool("no-bootstrap")
+	if noBootstrap {
+		return false, false
+	}
+	explicit, _ := cmd.Flags().GetBool("bootstrap-backend")
+	stateFile := filepath.Join(root, "tofu", "modules", "backend", "terraform.tfstate")
+	if _, err := os.Stat(stateFile); err == nil && !explicit {
+		fmt.Println("\nBackend state file already present — skipping bootstrap (use --bootstrap-backend to force re-run).")
+		return false, false
+	}
+	if explicit {
+		return true, false
+	}
+	if !isTTY(os.Stdin) {
+		return false, false
+	}
+	yes, _ := yesNo(os.Stdin, os.Stdout,
+		"\nBootstrap the backend now (creates S3 state bucket + DynamoDB lock table)?", true)
+	return yes, true
+}
+
+// collectBackendValues resolves the bucket/table/region for backend.tf and a
+// potential bootstrap.
+// Prompts are skipped when: any --backend-* flag is set, backend.tf already
+// exists, LOCAL_DEPLOYMENT or empty account, or stdin is not a TTY.
+func collectBackendValues(cmd *cobra.Command, cfg *Config, root string) *backendOverride {
+	bucketDef, tableDef, regionDef := defaultBackendValues(cfg)
+	flagBucket, _ := cmd.Flags().GetString("backend-bucket")
+	flagTable, _ := cmd.Flags().GetString("backend-table")
+	flagRegion, _ := cmd.Flags().GetString("backend-region")
+
+	withFlagOverlay := func(b, t, r string) *backendOverride {
+		if flagBucket != "" {
+			b = flagBucket
+		}
+		if flagTable != "" {
+			t = flagTable
+		}
+		if flagRegion != "" {
+			r = flagRegion
+		}
+		return &backendOverride{bucket: b, table: t, region: r}
+	}
+
+	anyFlag := flagBucket != "" || flagTable != "" || flagRegion != ""
+	if anyFlag {
+		return withFlagOverlay(bucketDef, tableDef, regionDef)
+	}
+	if os.Getenv("LOCAL_DEPLOYMENT") == "true" || cfg.Account == "" {
+		return withFlagOverlay(bucketDef, tableDef, regionDef)
+	}
+	if _, err := os.Stat(filepath.Join(tofuDir(root), "backend.tf")); err == nil {
+		return withFlagOverlay(bucketDef, tableDef, regionDef)
+	}
+	if !isTTY(os.Stdin) {
+		return withFlagOverlay(bucketDef, tableDef, regionDef)
+	}
+
+	fmt.Printf("\nBackend (S3 state bucket + DynamoDB lock table) — defaults from enclave.yaml:\n  bucket = %s\n  table  = %s\n  region = %s\n",
+		bucketDef, tableDef, regionDef)
+	useDefaults, _ := yesNo(os.Stdin, os.Stdout, "Use these defaults?", true)
+	if useDefaults {
+		return withFlagOverlay(bucketDef, tableDef, regionDef)
+	}
+	bucket, _ := promptWithDefault(os.Stdin, os.Stdout, "S3 bucket name", bucketDef)
+	table, _ := promptWithDefault(os.Stdin, os.Stdout, "DynamoDB lock table name", tableDef)
+	region, _ := promptWithDefault(os.Stdin, os.Stdout, "AWS region", regionDef)
+	return &backendOverride{bucket: bucket, table: table, region: region}
 }
 
 // tofuUpdateCmd refreshes tofu/terraform.tfvars.json from the current

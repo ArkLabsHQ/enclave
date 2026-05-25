@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -184,5 +185,122 @@ func TestTofuUpdate_FailsWithoutScaffold(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "tofu/main.tf not found") {
 		t.Errorf("error = %q, want substring 'tofu/main.tf not found'", err.Error())
+	}
+}
+
+// TestYesNo verifies the y/n prompt parsing and default semantics.
+func TestYesNo(t *testing.T) {
+	cases := []struct {
+		name       string
+		input      string
+		defaultYes bool
+		want       bool
+	}{
+		{name: "empty input + default yes", input: "\n", defaultYes: true, want: true},
+		{name: "empty input + default no", input: "\n", defaultYes: false, want: false},
+		{name: "explicit y", input: "y\n", defaultYes: false, want: true},
+		{name: "explicit yes", input: "YES\n", defaultYes: false, want: true},
+		{name: "explicit n", input: "n\n", defaultYes: true, want: false},
+		{name: "explicit no", input: "No\n", defaultYes: true, want: false},
+		{name: "garbage falls back to default", input: "maybe\n", defaultYes: true, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var w bytes.Buffer
+			got, err := yesNo(strings.NewReader(tc.input), &w, "ok?", tc.defaultYes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("yesNo(%q, default=%v) = %v, want %v", tc.input, tc.defaultYes, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPromptWithDefault verifies empty-input fallback and trim behavior.
+func TestPromptWithDefault(t *testing.T) {
+	cases := []struct {
+		name, input, def, want string
+	}{
+		{name: "empty returns default", input: "\n", def: "fallback", want: "fallback"},
+		{name: "value returned", input: "custom\n", def: "fallback", want: "custom"},
+		{name: "trims whitespace", input: "  spaced  \n", def: "x", want: "spaced"},
+		{name: "EOF treated as empty", input: "", def: "fallback", want: "fallback"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var w bytes.Buffer
+			got, err := promptWithDefault(strings.NewReader(tc.input), &w, "label", tc.def)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWriteBackendConfig_AppliesOverride confirms operator-chosen values
+// flow into backend.tf (not the computed defaults).
+func TestWriteBackendConfig_AppliesOverride(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "tofu"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Name:    "myapp",
+		Region:  "us-east-1",
+		Account: "123456789012",
+		Prefix:  "dev",
+	}
+	override := &backendOverride{
+		bucket: "custom-bucket-name",
+		table:  "custom-lock-table",
+		region: "eu-west-2",
+	}
+	if err := writeBackendConfig(cfg, root, override); err != nil {
+		t.Fatalf("writeBackendConfig: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "tofu", "backend.tf"))
+	if err != nil {
+		t.Fatalf("read backend.tf: %v", err)
+	}
+	bodyStr := string(body)
+	for _, want := range []string{`bucket         = "custom-bucket-name"`, `dynamodb_table = "custom-lock-table"`, `region         = "eu-west-2"`} {
+		if !strings.Contains(bodyStr, want) {
+			t.Errorf("backend.tf missing %q\n--- body ---\n%s", want, bodyStr)
+		}
+	}
+	// And — the computed defaults must NOT have leaked through.
+	for _, notWanted := range []string{"dev-myapp-tfstate-123456789012-us-east-1", "dev-myapp-tfstate-lock"} {
+		if strings.Contains(bodyStr, notWanted) {
+			t.Errorf("backend.tf unexpectedly contains computed default %q", notWanted)
+		}
+	}
+}
+
+// TestWriteBackendConfig_NilOverrideUsesDefaults confirms backwards-compatible
+// behavior: nil override emits the computed-from-yaml defaults.
+func TestWriteBackendConfig_NilOverrideUsesDefaults(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "tofu"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Name:    "myapp",
+		Region:  "us-east-1",
+		Account: "123456789012",
+		Prefix:  "dev",
+	}
+	if err := writeBackendConfig(cfg, root, nil); err != nil {
+		t.Fatalf("writeBackendConfig: %v", err)
+	}
+	body, _ := os.ReadFile(filepath.Join(root, "tofu", "backend.tf"))
+	for _, want := range []string{`"dev-myapp-tfstate-123456789012-us-east-1"`, `"dev-myapp-tfstate-lock"`, `"us-east-1"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("backend.tf missing default %q\n--- body ---\n%s", want, body)
+		}
 	}
 }

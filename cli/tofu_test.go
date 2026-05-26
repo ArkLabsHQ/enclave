@@ -169,6 +169,163 @@ func TestTofuUpdate_RefreshesOnlyTfvars(t *testing.T) {
 	}
 }
 
+// --- enclave tofu env tests ---
+
+// writeSentinelMainTF satisfies the precondition check by creating a
+// placeholder tofu/main.tf in the temp dir. Tests use this so runTofuEnv
+// passes the "scaffold already exists" guard.
+func writeSentinelMainTF(t *testing.T, tmp string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(tmp, "tofu"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "tofu", "main.tf"), []byte("# sentinel\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readEnvValuesFile(t *testing.T, tmp string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(tmp, "tofu", "env_values.auto.tfvars.json"))
+	if err != nil {
+		t.Fatalf("read env_values.auto.tfvars.json: %v", err)
+	}
+	var f envValuesFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("unmarshal env_values: %v", err)
+	}
+	return f.EnvValues
+}
+
+func TestTofuEnv_AddNewKeys(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	if err := runTofuEnv([]string{"FOO", "BAR"}, []string{"one", "two"}); err != nil {
+		t.Fatalf("runTofuEnv: %v", err)
+	}
+	got := readEnvValuesFile(t, tmp)
+	if got["FOO"] != "one" || got["BAR"] != "two" || len(got) != 2 {
+		t.Errorf("env_values = %v, want {FOO:one, BAR:two}", got)
+	}
+}
+
+func TestTofuEnv_MergesWithExisting(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	// Pre-populate one key.
+	if err := os.WriteFile(
+		filepath.Join(tmp, "tofu", "env_values.auto.tfvars.json"),
+		[]byte(`{"env_values":{"EXISTING":"keep"}}`+"\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTofuEnv([]string{"NEW_KEY"}, []string{"added"}); err != nil {
+		t.Fatalf("runTofuEnv: %v", err)
+	}
+	got := readEnvValuesFile(t, tmp)
+	if got["EXISTING"] != "keep" {
+		t.Errorf("EXISTING was clobbered, got %q", got["EXISTING"])
+	}
+	if got["NEW_KEY"] != "added" {
+		t.Errorf("NEW_KEY missing or wrong: got %q", got["NEW_KEY"])
+	}
+}
+
+func TestTofuEnv_OverwritesExistingKey(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	if err := os.WriteFile(
+		filepath.Join(tmp, "tofu", "env_values.auto.tfvars.json"),
+		[]byte(`{"env_values":{"FOO":"old"}}`+"\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTofuEnv([]string{"FOO"}, []string{"new"}); err != nil {
+		t.Fatalf("runTofuEnv: %v", err)
+	}
+	got := readEnvValuesFile(t, tmp)
+	if got["FOO"] != "new" {
+		t.Errorf("FOO = %q, want %q", got["FOO"], "new")
+	}
+}
+
+func TestTofuEnv_RejectsMismatchedKeyValuePairs(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	err := runTofuEnv([]string{"A", "B"}, []string{"1"})
+	if err == nil {
+		t.Fatal("expected error for mismatched --key/--value counts, got nil")
+	}
+	if !strings.Contains(err.Error(), "pairs") {
+		t.Errorf("error = %q, want substring 'pairs'", err.Error())
+	}
+}
+
+func TestTofuEnv_RejectsInvalidKeyName(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	err := runTofuEnv([]string{"lowercase-bad"}, []string{"val"})
+	if err == nil {
+		t.Fatal("expected error for invalid env var name, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid env var name") {
+		t.Errorf("error = %q, want substring 'invalid env var name'", err.Error())
+	}
+}
+
+func TestTofuEnv_RefusesWithoutScaffold(t *testing.T) {
+	chdirTemp(t)
+	// Don't create tofu/main.tf — precondition should fail.
+	err := runTofuEnv([]string{"FOO"}, []string{"bar"})
+	if err == nil {
+		t.Fatal("expected error when tofu/main.tf missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "tofu/main.tf not found") {
+		t.Errorf("error = %q, want substring 'tofu/main.tf not found'", err.Error())
+	}
+}
+
+func TestTofuEnv_RejectsEmptyKeyValueArgs(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	err := runTofuEnv(nil, nil)
+	if err == nil {
+		t.Fatal("expected error for no --key/--value pairs, got nil")
+	}
+}
+
+// TestTofuEnv_PreservesCommasAndNewlines guards against the StringSlice
+// gotcha (values with commas getting split). The CLI uses StringArrayVar so
+// "a,b,c" stays one value, and a multi-line PEM-style string round-trips
+// verbatim.
+func TestTofuEnv_PreservesCommasAndNewlines(t *testing.T) {
+	tmp := chdirTemp(t)
+	writeSentinelMainTF(t, tmp)
+
+	multiline := "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----"
+	if err := runTofuEnv(
+		[]string{"COMMA_VALUE", "PEM_CERT"},
+		[]string{"a,b,c", multiline},
+	); err != nil {
+		t.Fatalf("runTofuEnv: %v", err)
+	}
+	got := readEnvValuesFile(t, tmp)
+	if got["COMMA_VALUE"] != "a,b,c" {
+		t.Errorf("COMMA_VALUE = %q, want %q (commas must NOT be split)", got["COMMA_VALUE"], "a,b,c")
+	}
+	if got["PEM_CERT"] != multiline {
+		t.Errorf("PEM_CERT was not preserved verbatim:\n  got  %q\n  want %q", got["PEM_CERT"], multiline)
+	}
+}
+
 // TestTofuUpdate_FailsWithoutScaffold confirms `enclave tofu update` refuses
 // to run when there's no prior scaffold (tofu/main.tf missing).
 func TestTofuUpdate_FailsWithoutScaffold(t *testing.T) {

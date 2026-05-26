@@ -18,10 +18,12 @@ func tofuCmd() *cobra.Command {
 		Long: `OpenTofu lifecycle subcommands for an enclave deployment.
 
   enclave tofu init    scaffold the module tree + tfvars + backend.tf
-  enclave tofu update  refresh tfvars from enclave.yaml (modules untouched)`,
+  enclave tofu update  refresh tfvars from enclave.yaml (modules untouched)
+  enclave tofu env     set deploy-time env vars in env_values.auto.tfvars.json`,
 	}
 	cmd.AddCommand(tofuInitCmd())
 	cmd.AddCommand(tofuUpdateCmd())
+	cmd.AddCommand(tofuEnvCmd())
 	return cmd
 }
 

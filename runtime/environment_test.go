@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +16,15 @@ type fakeSSM struct {
 	params map[string]string
 	err    error
 	calls  []string
+
+	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
+	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
+	// (empty string = no more). lastDecryption captures the last call's
+	// WithDecryption value so tests can assert SecureString handling.
+	pages          [][]ssmtypes.Parameter
+	nextTokens     []string
+	lastDecryption bool
+	pathCalls      int
 }
 
 func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
@@ -30,6 +40,40 @@ func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ .
 	return &ssm.GetParameterOutput{
 		Parameter: &ssmtypes.Parameter{Name: aws.String(name), Value: aws.String(v)},
 	}, nil
+}
+
+func (f *fakeSSM) GetParametersByPath(_ context.Context, in *ssm.GetParametersByPathInput, _ ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if in.WithDecryption != nil {
+		f.lastDecryption = *in.WithDecryption
+	}
+
+	// Page-based mode: walk pages/nextTokens.
+	if f.pages != nil {
+		i := f.pathCalls
+		f.pathCalls++
+		if i >= len(f.pages) {
+			return &ssm.GetParametersByPathOutput{}, nil
+		}
+		out := &ssm.GetParametersByPathOutput{Parameters: f.pages[i]}
+		if i < len(f.nextTokens) && f.nextTokens[i] != "" {
+			out.NextToken = aws.String(f.nextTokens[i])
+		}
+		return out, nil
+	}
+
+	// Simple mode: filter params by prefix, return in a single page.
+	prefix := aws.ToString(in.Path)
+	var out []ssmtypes.Parameter
+	for name, val := range f.params {
+		if strings.HasPrefix(name, prefix) {
+			n, v := name, val
+			out = append(out, ssmtypes.Parameter{Name: &n, Value: &v})
+		}
+	}
+	return &ssm.GetParametersByPathOutput{Parameters: out}, nil
 }
 
 func TestLoadDeployTLSConfig(t *testing.T) {
@@ -92,85 +136,101 @@ func TestLoadDeployTLSConfig(t *testing.T) {
 	})
 }
 
-func TestApplyEnvOverrides(t *testing.T) {
-	type tc struct {
-		name      string
-		schema    string
-		baked     map[string]string
-		ssmParams map[string]string
-		ssmErr    error
-		want      map[string]string // expected env value after override
-		wantErr   bool
-	}
-	cases := []tc{
-		{
-			name:      "override applied for matching key",
-			schema:    `["API_URL","ROLLOUT_ID"]`,
-			baked:     map[string]string{"API_URL": "default", "ROLLOUT_ID": "green"},
-			ssmParams: map[string]string{"/dev/myapp/env/API_URL": "https://prod.example.com"},
-			want:      map[string]string{"API_URL": "https://prod.example.com", "ROLLOUT_ID": "green"},
-		},
-		{
-			name:      "missing ssm param leaves baked default",
-			schema:    `["API_URL"]`,
-			baked:     map[string]string{"API_URL": "default"},
-			ssmParams: map[string]string{},
-			want:      map[string]string{"API_URL": "default"},
-		},
-		{
-			name:      "empty schema is a no-op",
-			schema:    `[]`,
-			baked:     map[string]string{"X": "x"},
-			ssmParams: map[string]string{"/dev/myapp/env/X": "override"},
-			want:      map[string]string{"X": "x"},
-		},
-		{
-			name:    "malformed schema returns error",
-			schema:  `not-json`,
-			wantErr: true,
-		},
-		{
-			name:    "ssm error other than NotFound is fatal",
-			schema:  `["X"]`,
-			baked:   map[string]string{"X": "x"},
-			ssmErr:  errors.New("access denied"),
-			wantErr: true,
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_APP_ENV_KEYS", c.schema)
-			for k, v := range c.baked {
-				t.Setenv(k, v)
-			}
-			fake := &fakeSSM{params: c.ssmParams, err: c.ssmErr}
-			err := applyEnvOverrides(context.Background(), fake, "dev", "myapp")
-			if c.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			for k, want := range c.want {
-				if got := os.Getenv(k); got != want {
-					t.Errorf("env[%s] = %q, want %q", k, got, want)
-				}
-			}
-		})
-	}
-}
-
-func TestApplyEnvOverridesEmptyEnvVar(t *testing.T) {
-	t.Setenv("ENCLAVE_APP_ENV_KEYS", "")
-	fake := &fakeSSM{}
+// TestApplyEnvOverrides_EmptyPrefix: no params under prefix → no-op, no error.
+func TestApplyEnvOverrides_EmptyPrefix(t *testing.T) {
+	fake := &fakeSSM{params: map[string]string{}}
 	if err := applyEnvOverrides(context.Background(), fake, "dev", "myapp"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(fake.calls) != 0 {
-		t.Errorf("expected no SSM calls, got %d", len(fake.calls))
+}
+
+// TestApplyEnvOverrides_SinglePage: 3 params under the prefix → all set as env.
+func TestApplyEnvOverrides_SinglePage(t *testing.T) {
+	// Ensure clean env before test so leftover values don't mask bugs.
+	for _, k := range []string{"FOO", "BAR", "BAZ"} {
+		_ = os.Unsetenv(k)
+	}
+	fake := &fakeSSM{params: map[string]string{
+		"/dev/myapp/env/FOO": "one",
+		"/dev/myapp/env/BAR": "two",
+		"/dev/myapp/env/BAZ": "three",
+	}}
+	if err := applyEnvOverrides(context.Background(), fake, "dev", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for k, want := range map[string]string{"FOO": "one", "BAR": "two", "BAZ": "three"} {
+		if got := os.Getenv(k); got != want {
+			t.Errorf("env[%s] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestApplyEnvOverrides_Paginated: NextToken cycles through two pages.
+func TestApplyEnvOverrides_Paginated(t *testing.T) {
+	_ = os.Unsetenv("PAGE1_A")
+	_ = os.Unsetenv("PAGE1_B")
+	_ = os.Unsetenv("PAGE2_C")
+	mk := func(n, v string) ssmtypes.Parameter {
+		return ssmtypes.Parameter{Name: aws.String(n), Value: aws.String(v)}
+	}
+	fake := &fakeSSM{
+		pages: [][]ssmtypes.Parameter{
+			{mk("/dev/myapp/env/PAGE1_A", "a"), mk("/dev/myapp/env/PAGE1_B", "b")},
+			{mk("/dev/myapp/env/PAGE2_C", "c")},
+		},
+		nextTokens: []string{"token-page-2", ""}, // first call returns NextToken, second drains
+	}
+	if err := applyEnvOverrides(context.Background(), fake, "dev", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.pathCalls != 2 {
+		t.Errorf("expected 2 GetParametersByPath calls, got %d", fake.pathCalls)
+	}
+	for k, want := range map[string]string{"PAGE1_A": "a", "PAGE1_B": "b", "PAGE2_C": "c"} {
+		if got := os.Getenv(k); got != want {
+			t.Errorf("env[%s] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestApplyEnvOverrides_SecureString: WithDecryption: true must be sent so
+// SSM SecureString params are returned plaintext to the caller.
+func TestApplyEnvOverrides_SecureString(t *testing.T) {
+	fake := &fakeSSM{params: map[string]string{}}
+	if err := applyEnvOverrides(context.Background(), fake, "dev", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fake.lastDecryption {
+		t.Error("expected WithDecryption=true on GetParametersByPath call")
+	}
+}
+
+// TestApplyEnvOverrides_SkipsNestedAndEmpty: defensive — keys with '/' (nested
+// under a sub-path) or empty after prefix-strip are ignored, not setenv'd.
+func TestApplyEnvOverrides_SkipsNestedAndEmpty(t *testing.T) {
+	_ = os.Unsetenv("VALID_KEY")
+	fake := &fakeSSM{params: map[string]string{
+		"/dev/myapp/env/VALID_KEY":     "ok",
+		"/dev/myapp/env/nested/IGNORE": "should-not-set",
+		"/dev/myapp/env/":              "empty-key", // edge: stat as a folder
+	}}
+	if err := applyEnvOverrides(context.Background(), fake, "dev", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := os.Getenv("VALID_KEY"); got != "ok" {
+		t.Errorf("VALID_KEY = %q, want %q", got, "ok")
+	}
+	// IGNORE (under the nested path) must not have been set.
+	if got := os.Getenv("IGNORE"); got != "" {
+		t.Errorf("IGNORE was set to %q; nested keys must be skipped", got)
+	}
+}
+
+// TestApplyEnvOverrides_SSMError: a non-NotFound error from SSM must surface.
+func TestApplyEnvOverrides_SSMError(t *testing.T) {
+	fake := &fakeSSM{err: errors.New("access denied")}
+	err := applyEnvOverrides(context.Background(), fake, "dev", "myapp")
+	if err == nil {
+		t.Fatal("expected error when SSM fails")
 	}
 }

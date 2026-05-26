@@ -303,18 +303,15 @@ OVERRIDE
 
   echo "  tofu init..."
   tofu -chdir="$TOFU_DIR" init -input=false > ${SCRIPT_DIR}/tofu-init.log 2>&1 || { cat ${SCRIPT_DIR}/tofu-init.log; return 1; }
-  # env_values overrides are supplied via an auto-loaded tfvars file (the env-file
-  # mechanism). tofu auto-loads any *.auto.tfvars.json next to the root module on
-  # every plan/apply, so overrides stick across both the initial deploy and the
-  # later migration apply without us repeating them on the command line.
-  cat > "${TOFU_DIR}/env_values.auto.tfvars.json" <<EOF
-{
-  "env_values": {
-    "TEST_RUNTIME_OVERRIDE": "override-from-tofu",
-    "TEST_RUNTIME_OVERRIDE_ENVFILE": "override-from-envfile"
-  }
-}
-EOF
+  # env_values overrides are supplied via tofu/env_values.auto.tfvars.json,
+  # which tofu auto-loads on every plan/apply. The 'enclave tofu env' CLI
+  # populates that file — exercises the same UX an operator uses (rather
+  # than the framework dropping its own hand-crafted JSON).
+  (cd "${SCRIPT_DIR}/app" && LOCAL_DEPLOYMENT=true "$ENCLAVE_CLI" tofu env \
+    --key TEST_RUNTIME_OVERRIDE         --value "override-from-tofu" \
+    --key TEST_RUNTIME_OVERRIDE_ENVFILE --value "override-from-envfile" \
+    > "${SCRIPT_DIR}/tofu-env.log" 2>&1) \
+    || { cat "${SCRIPT_DIR}/tofu-env.log"; return 1; }
 
   echo "  tofu apply..."
   tofu -chdir="$TOFU_DIR" apply -auto-approve -input=false -compact-warnings > ${SCRIPT_DIR}/tofu-apply.log 2>&1 || { echo "  tofu apply FAILED:"; tail -20 ${SCRIPT_DIR}/tofu-apply.log; return 1; }

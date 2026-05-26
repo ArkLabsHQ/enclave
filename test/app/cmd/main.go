@@ -122,6 +122,7 @@ func main() {
 	mux.HandleFunc("GET /test/attestation-binding", handleTestAttestationBinding)
 	mux.HandleFunc("GET /test/logs", handleTestLogs)
 	mux.HandleFunc("GET /test/env-override", handleTestEnvOverride)
+	mux.HandleFunc("POST /test/crash", handleTestCrash)
 
 	// Wrap mux with otelhttp — every incoming request creates a span automatically.
 	otelHandler := otelhttp.NewHandler(mux, "test-app",
@@ -1203,4 +1204,19 @@ func handleTestEnvOverride(w http.ResponseWriter, r *http.Request) {
 		"test_runtime_override":         os.Getenv("TEST_RUNTIME_OVERRIDE"),
 		"test_runtime_override_envfile": os.Getenv("TEST_RUNTIME_OVERRIDE_ENVFILE"),
 	})
+}
+
+// handleTestCrash simulates an upstream-app crash by exiting the process
+// shortly after responding.
+func handleTestCrash(w http.ResponseWriter, r *http.Request) {
+	log.Println("[test] /test/crash invoked — exiting in 100ms")
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"crashing"}` + "\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(1)
+	}()
 }

@@ -170,6 +170,15 @@ type RuntimeInfo struct {
 	MigrationCooldownRemaining int                `json:"migration_cooldown_remaining,omitempty"`
 	MigrationPending           bool               `json:"migration_pending"`
 	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
+	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
+}
+
+// UpstreamAppInfo reports whether the user app process has exited and, if
+// so, the error from its exit. The runtime stays alive after app exit so
+// admin endpoints remain reachable.
+type UpstreamAppInfo struct {
+	Exited bool   `json:"exited"`
+	Error  string `json:"error,omitempty"`
 }
 
 // RuntimeInitializing is the JSON body returned by GET /v1/enclave-info before Init completes.
@@ -203,6 +212,8 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			previousPCR0Attestation = info.Attestation
 		}
 
+		upstreamExited, upstreamErr := e.UpstreamExited()
+
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                    Version,
 			PreviousPCR0:               previousPCR0,
@@ -214,6 +225,7 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			MigrationCooldownRemaining: cooldownRemaining,
 			MigrationPending:           migrationPending,
 			PCR0Signature:              e.signature.Snapshot(),
+			UpstreamApp:                UpstreamAppInfo{Exited: upstreamExited, Error: upstreamErr},
 		})
 	}
 }

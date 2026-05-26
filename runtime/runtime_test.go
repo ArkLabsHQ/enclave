@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -99,5 +101,85 @@ func TestCorsWildcard_PassthroughAndHeaders(t *testing.T) {
 		if got := rec.Header().Get(hdr); got != "*" {
 			t.Errorf("%s = %q, want %q", hdr, got, "*")
 		}
+	}
+}
+
+// TestUpstreamExited_DefaultsFalse verifies a fresh runtime reports the app
+// as not-exited (the only state observable until cmd/runtime/main.go calls
+// MarkUpstreamExited).
+func TestUpstreamExited_DefaultsFalse(t *testing.T) {
+	e := &Runtime{}
+	exited, msg := e.UpstreamExited()
+	if exited {
+		t.Errorf("UpstreamExited() exited=true on fresh runtime, want false")
+	}
+	if msg != "" {
+		t.Errorf("UpstreamExited() msg=%q on fresh runtime, want empty", msg)
+	}
+}
+
+// TestUpstreamExited_RecordsError flips the latch with a non-nil error and
+// confirms both the bool and the error string round-trip.
+func TestUpstreamExited_RecordsError(t *testing.T) {
+	e := &Runtime{}
+	e.MarkUpstreamExited(errors.New("exit status 1"))
+	exited, msg := e.UpstreamExited()
+	if !exited {
+		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(err), want true")
+	}
+	if msg != "exit status 1" {
+		t.Errorf("UpstreamExited() msg=%q, want %q", msg, "exit status 1")
+	}
+}
+
+// TestUpstreamExited_RecordsCleanExit: nil error means "app exited cleanly"
+// — still marks the latch, but message stays empty.
+func TestUpstreamExited_RecordsCleanExit(t *testing.T) {
+	e := &Runtime{}
+	e.MarkUpstreamExited(nil)
+	exited, msg := e.UpstreamExited()
+	if !exited {
+		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(nil), want true")
+	}
+	if msg != "" {
+		t.Errorf("UpstreamExited() msg=%q after clean exit, want empty", msg)
+	}
+}
+
+// TestUpstreamAppInfo_JSONShape locks in the JSON field names that
+// test/run.sh and external clients depend on (.upstream_app.exited,
+// .upstream_app.error).
+func TestUpstreamAppInfo_JSONShape(t *testing.T) {
+	cases := []struct {
+		name string
+		in   UpstreamAppInfo
+		want string
+	}{
+		{
+			name: "not exited — no error field",
+			in:   UpstreamAppInfo{Exited: false},
+			want: `{"exited":false}`,
+		},
+		{
+			name: "exited cleanly — no error field",
+			in:   UpstreamAppInfo{Exited: true},
+			want: `{"exited":true}`,
+		},
+		{
+			name: "exited with error — error included",
+			in:   UpstreamAppInfo{Exited: true, Error: "exit status 1"},
+			want: `{"exited":true,"error":"exit status 1"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("json shape mismatch:\n  got:  %s\n  want: %s", b, tc.want)
+			}
+		})
 	}
 }

@@ -64,7 +64,7 @@ func main() {
 
 	proxyPort := os.Getenv("ENCLAVE_PROXY_PORT")
 	if proxyPort == "" {
-		proxyPort = "7073"
+		proxyPort = "8080"
 	}
 	supervisorURL = "http://127.0.0.1:" + proxyPort
 

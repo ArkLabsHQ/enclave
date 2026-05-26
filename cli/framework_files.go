@@ -191,7 +191,7 @@ ENCLAVE_AWS_REGION=${region}
 ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
 MEMORY_MIB=4320
 CPU_COUNT=2
-GVPROXY_FORWARD_PORTS=443 7073
+GVPROXY_FORWARD_PORTS=443
 EOF
 
 systemctl enable --now enclave-supervisor.service

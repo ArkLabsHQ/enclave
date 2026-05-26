@@ -167,7 +167,7 @@ func startSupervisor(ctx context.Context, eifPath string) (*exec.Cmd, error) {
 	// be the LocalStack endpoint used for `tofu apply`).
 	env := append(os.Environ(),
 		"ENCLAVE_SUPERVISOR_ADDR=127.0.0.1:8444",
-		"GVPROXY_FORWARD_PORTS=8443:443 7073",
+		"GVPROXY_FORWARD_PORTS=8443:443",
 		"IMDS_PROXY_TARGET="+envOr("IMDS_PROXY_TARGET", "aws-mocks:1338"),
 		"ENCLAVE_URL=https://127.0.0.1:8443",
 		"ENCLAVE_EIF_PATH="+eifPath,

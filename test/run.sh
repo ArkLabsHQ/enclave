@@ -673,6 +673,54 @@ else
 fi
 echo ""
 
+# Step 5.5: Runtime resilience — issue #122. The upstream app crashing must
+# NOT take the runtime down (which would void any in-flight migration). We
+# trigger /test/crash on the app, then assert the runtime keeps serving
+# /health and /v1/enclave-info while app routes surface as 502.
+echo "=== [5.5/9] Runtime resilience: upstream app crash ==="
+HOST_TLS_PORT_VAL="${HOST_TLS_PORT:-8443}"
+RESILIENCE_BASE="https://localhost:${HOST_TLS_PORT_VAL}"
+RESILIENCE_LOG="${SCRIPT_DIR}/crash-resilience.log"
+: > "$RESILIENCE_LOG"
+
+# Trigger crash. Connection will reset partway — that's expected; we only
+# need the request to hit the app.
+curl -sk -X POST --max-time 5 "${RESILIENCE_BASE}/test/crash" \
+  >>"$RESILIENCE_LOG" 2>&1 || true
+
+# Give the runtime a moment to observe child exit + flip the latch.
+sleep 3
+
+# 1) /health must still return 200 — proves the runtime is alive.
+HEALTH=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${RESILIENCE_BASE}/health" 2>>"$RESILIENCE_LOG" || echo "000")
+if [ "$HEALTH" != "200" ]; then
+  echo "  FAIL: runtime died after app crash (/health=${HEALTH}); see ${RESILIENCE_LOG}" >&2
+  exit 1
+fi
+echo "  PASS: /health=200 after app crash (runtime alive)"
+
+# 2) /v1/enclave-info.upstream_app.exited must be true.
+RUNTIME_INFO=$(curl -sk --max-time 5 "${RESILIENCE_BASE}/v1/enclave-info" 2>>"$RESILIENCE_LOG" || echo "")
+APP_EXITED=$(echo "$RUNTIME_INFO" | jq -r '.upstream_app.exited // false' 2>/dev/null || echo "false")
+APP_ERROR=$(echo "$RUNTIME_INFO" | jq -r '.upstream_app.error // ""' 2>/dev/null || echo "")
+if [ "$APP_EXITED" != "true" ]; then
+  printf "  FAIL: enclave-info.upstream_app.exited=%q, want true (response: %s)\n" "$APP_EXITED" "${RUNTIME_INFO:0:200}" >&2
+  exit 1
+fi
+echo "  PASS: enclave-info.upstream_app.exited=true (error: ${APP_ERROR:-<empty>})"
+
+# 3) Any non-/v1 path proxied to the dead app must surface as 502 (reverse
+#    proxy's ErrorHandler).
+APP_PROXY=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${RESILIENCE_BASE}/test/storage-persistence" 2>>"$RESILIENCE_LOG" || echo "000")
+if [ "$APP_PROXY" != "502" ]; then
+  echo "  FAIL: dead-app route returned ${APP_PROXY}, want 502" >&2
+  exit 1
+fi
+echo "  PASS: dead-app route returns 502 via reverse proxy"
+echo "  Note: app stays dead until step [7/9] migration replaces the EIF —"
+echo "        intermediate steps [6/9] cooldown only use /v1/* runtime endpoints."
+echo ""
+
 # Step 6: Migration cooldown abort test.
 # Start a migration in the background (enters cooldown), verify pending=true,
 # abort, verify pending=false.

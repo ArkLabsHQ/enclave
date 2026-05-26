@@ -115,6 +115,11 @@ type Runtime struct {
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
 	initOK   atomic.Bool // Init returned without error
 
+	// Upstream app state — set by MarkUpstreamExited (called from
+	// cmd/runtime/main.go when the user app exits).
+	upstreamExited atomic.Bool
+	upstreamErr    atomic.Value // string; "" when no error or not exited
+
 	// Attestation state.
 	hashes      *AttestationHashes // embedded in every NSM attestation doc
 	keyMaterial any                // arbitrary peer-syncable state
@@ -421,6 +426,35 @@ func (e *Runtime) AttestationPubkey() string { return e.attestation.Pubkey() }
 // IsReady reports whether Init completed successfully. /health uses this
 // to distinguish "ready" from "initializing" / "failed".
 func (e *Runtime) IsReady() bool { return e.initOK.Load() }
+
+// MarkUpstreamExited records that the user app has exited. The runtime
+// keeps running so /v1/start-migration and other admin endpoints stay
+// reachable — without this latch, cmd/runtime/main.go used to call stop()
+// and tear the whole runtime down (issue #122). Pass nil for a clean exit,
+// a non-nil error otherwise.
+func (e *Runtime) MarkUpstreamExited(err error) {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	e.upstreamErr.Store(msg)
+	e.upstreamExited.Store(true)
+}
+
+// UpstreamExited returns whether the user app has exited and the error
+// string from its exit. The error is empty when the app exited cleanly or
+// has not exited at all (check the bool first).
+func (e *Runtime) UpstreamExited() (bool, string) {
+	if !e.upstreamExited.Load() {
+		return false, ""
+	}
+	if v := e.upstreamErr.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return true, s
+		}
+	}
+	return true, ""
+}
 
 // SetAttestationRegistrar must be called before Init.
 func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {

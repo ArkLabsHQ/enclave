@@ -103,10 +103,21 @@ func main() {
 
 		select {
 		case err := <-childDone:
+			// Upstream app exited. Record the state on the runtime
 			if err != nil {
-				slog.Error("child exited", "error", err)
+				slog.Error("upstream app exited — runtime stays alive", "error", err)
+			} else {
+				slog.Warn("upstream app exited cleanly — runtime stays alive")
 			}
-			stop()
+			enc.MarkUpstreamExited(err)
+			// Wait for explicit shutdown or a listener failure.
+			select {
+			case lerr := <-enc.ListenErr():
+				slog.Error("HTTP listener failed after app exit", "error", lerr)
+				os.Exit(1)
+			case <-ctx.Done():
+				slog.Info("shutting down (upstream app already exited)")
+			}
 		case err := <-enc.ListenErr():
 			slog.Error("HTTP listener failed", "error", err)
 			_ = child.Process.Signal(syscall.SIGTERM)

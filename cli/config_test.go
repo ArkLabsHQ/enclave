@@ -434,7 +434,8 @@ func TestLoadConfig_NixCacheValidation(t *testing.T) {
 
 func TestLoadConfig_NixpkgsPinValidation(t *testing.T) {
 	const validSHA = "0d843eedba88d22a7eaa2a7e54a2c1d8c0c0d4f8"
-	const validHash = "sha256-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef="
+	// SRI sha256 of the empty string (43 base64 chars + "=") — real, valid.
+	const validHash = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
 	tests := []struct {
 		name    string
 		nix     string
@@ -482,6 +483,30 @@ func TestLoadConfig_NixpkgsPinValidation(t *testing.T) {
 			nix: `nix:
   nixpkgs_rev:  "` + validSHA + `"
   nixpkgs_hash: "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef="
+`,
+			wantErr: true,
+		},
+		{
+			name: "hash with sha256- prefix but garbage body rejected",
+			nix: `nix:
+  nixpkgs_rev:  "` + validSHA + `"
+  nixpkgs_hash: "sha256-!!!"
+`,
+			wantErr: true,
+		},
+		{
+			name: "hash too short rejected",
+			nix: `nix:
+  nixpkgs_rev:  "` + validSHA + `"
+  nixpkgs_hash: "sha256-aBc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "hash missing trailing = rejected",
+			nix: `nix:
+  nixpkgs_rev:  "` + validSHA + `"
+  nixpkgs_hash: "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
 `,
 			wantErr: true,
 		},

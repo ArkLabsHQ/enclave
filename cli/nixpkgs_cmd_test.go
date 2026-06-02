@@ -9,7 +9,8 @@ import (
 
 const (
 	testRev  = "0d843eedba88d22a7eaa2a7e54a2c1d8c0c0d4f8"
-	testHash = "sha256-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef="
+	// SRI sha256 of the empty string (43 base64 chars + "=") — real, valid.
+	testHash = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
 )
 
 func TestUpdateNixpkgsInYaml_AppendsBlockWhenMissing(t *testing.T) {
@@ -182,6 +183,30 @@ func TestApplyNixpkgsRef_SubstitutesProvidedRef(t *testing.T) {
 	}
 	if strings.Contains(out, "{{NixpkgsRef}}") {
 		t.Errorf("placeholder should be gone, got: %s", out)
+	}
+}
+
+func TestGetInitFilesWithNixpkgs_PreservesOperatorPin(t *testing.T) {
+	pinSHA := "0d843eedba88d22a7eaa2a7e54a2c1d8c0c0d4f8"
+	for _, lang := range []string{"go", "nodejs", "dotnet", "rust"} {
+		t.Run(lang, func(t *testing.T) {
+			files := getInitFilesWithNixpkgs(lang, pinSHA)
+			var flake string
+			for _, f := range files {
+				if f.RelPath == "enclave/flake.nix" {
+					flake = f.Content
+				}
+			}
+			if flake == "" {
+				t.Fatal("no flake.nix in init files")
+			}
+			if !strings.Contains(flake, pinSHA) {
+				t.Errorf("operator's pin %q missing from scaffolded flake.nix — setup --force-flake regression risk", pinSHA)
+			}
+			if strings.Contains(flake, DefaultNixpkgsRef) {
+				t.Errorf("default ref %q leaked into scaffolded flake when operator pin was provided", DefaultNixpkgsRef)
+			}
+		})
 	}
 }
 

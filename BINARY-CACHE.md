@@ -156,8 +156,10 @@ PCR0 — that requires building the actual derivation.
 
 - **Cachix free-tier limit is 5 GB.** Rust EIFs are 200 MB – 1 GB each. Watch
   your usage in the Cachix dashboard.
-- **`aws-nitro-util.url` and `flake-utils.url` are still branch references.**
-  Same problem class as nixpkgs. Tracked separately as a follow-up.
+- **`aws-nitro-util.url` and `flake-utils.url` are framework-pinned commits**
+  (the `AwsNitroUtilRef` and `FlakeUtilsRef` constants in `cli/framework_files.go`).
+  Bumping is a framework-release activity, not per-project. `follows` declarations
+  collapse their transitive inputs onto the operator's `nixpkgs` pin.
 - **`enclave nixpkgs pin --latest` requires `git`, `nix`, and network
   access.** Surface the install hints from the error messages.
 - **`flake.lock` may go stale relative to the rev in `enclave.yaml`.** If you

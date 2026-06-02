@@ -1,11 +1,8 @@
 package cli
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,8 +69,8 @@ func runPinCheck(cfg *Config) error {
 	if !commitSHARegex.MatchString(cfg.Nix.NixpkgsRev) {
 		return fmt.Errorf("nix.nixpkgs_rev %q is not a 40-char hex commit SHA", cfg.Nix.NixpkgsRev)
 	}
-	if !strings.HasPrefix(cfg.Nix.NixpkgsHash, "sha256-") {
-		return fmt.Errorf("nix.nixpkgs_hash %q must start with 'sha256-' (SRI format)", cfg.Nix.NixpkgsHash)
+	if !sriSha256Regex.MatchString(cfg.Nix.NixpkgsHash) {
+		return fmt.Errorf("nix.nixpkgs_hash %q must be SRI-formatted sha256 ('sha256-' + 43 base64 chars + '=')", cfg.Nix.NixpkgsHash)
 	}
 	fmt.Printf("nixpkgs pin OK: %s (%s)\n", cfg.Nix.NixpkgsRev, cfg.Nix.NixpkgsHash)
 	return nil
@@ -142,40 +139,20 @@ func gitLsRemoteBranch(repoURL, branch string) (string, error) {
 // and returns the SRI hash of the unpacked contents. Uses `nix-prefetch-url
 // --unpack` so the hash matches what fetchTarball produces in the flake.
 func prefetchNixpkgsHash(rev string) (string, error) {
+	if _, err := exec.LookPath("nix-prefetch-url"); err != nil {
+		return "", fmt.Errorf("`nix-prefetch-url` not on PATH — install Nix (https://nixos.org/download) to compute the SRI hash")
+	}
 	url := fmt.Sprintf("https://github.com/NixOS/nixpkgs/archive/%s.tar.gz", rev)
-	if _, err := exec.LookPath("nix-prefetch-url"); err == nil {
-		out, err := exec.Command("nix-prefetch-url", "--unpack", "--type", "sha256", url).Output()
-		if err != nil {
-			return "", fmt.Errorf("nix-prefetch-url %s: %w (is Nix installed?)", url, err)
-		}
-		raw := strings.TrimSpace(string(out))
-		sri, err := nixHashToSRI(raw)
-		if err != nil {
-			return "", fmt.Errorf("convert nix-prefetch-url output to SRI: %w", err)
-		}
-		return sri, nil
-	}
-	return prefetchNixpkgsHashOverHTTP(url)
-}
-
-// prefetchNixpkgsHashOverHTTP downloads the tarball and computes the SRI
-// hash directly. Slower than nix-prefetch-url (no caching) and only matches
-// the unpacked-tree hash if used with `fetchTarball` style fetchers; flake
-// inputs use a different hashing scheme. Kept as a fallback for hint only.
-func prefetchNixpkgsHashOverHTTP(url string) (string, error) {
-	resp, err := http.Get(url)
+	out, err := exec.Command("nix-prefetch-url", "--unpack", "--type", "sha256", url).Output()
 	if err != nil {
-		return "", fmt.Errorf("http get %s: %w", url, err)
+		return "", fmt.Errorf("nix-prefetch-url %s: %w (is Nix installed?)", url, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("http get %s: %s", url, resp.Status)
+	raw := strings.TrimSpace(string(out))
+	sri, err := nixHashToSRI(raw)
+	if err != nil {
+		return "", fmt.Errorf("convert nix-prefetch-url output to SRI: %w", err)
 	}
-	h := sha256.New()
-	if _, err := io.Copy(h, resp.Body); err != nil {
-		return "", fmt.Errorf("read tarball: %w", err)
-	}
-	return "", fmt.Errorf("`nix-prefetch-url` not on PATH — install Nix (https://nixos.org/download) to compute the SRI hash (tarball downloaded OK at %d bytes but the gzipped-byte hash is not what Nix wants)", h.Size())
+	return sri, nil
 }
 
 // nixHashToSRI converts a `nix-prefetch-url` (legacy base32) or already-SRI
@@ -231,8 +208,10 @@ func decodeNixBase32(s string) ([]byte, error) {
 
 var (
 	nixpkgsURLRegex = regexp.MustCompile(`(github:NixOS/nixpkgs/)[^"]+`)
-	nixpkgsRevYamlRegex  = regexp.MustCompile(`(?m)^(\s*nixpkgs_rev:\s*).*$`)
-	nixpkgsHashYamlRegex = regexp.MustCompile(`(?m)^(\s*nixpkgs_hash:\s*).*$`)
+	// Anchored to the canonical 2-space indent under `nix:` so unrelated
+	// fields elsewhere in the yaml can't accidentally match.
+	nixpkgsRevYamlRegex  = regexp.MustCompile(`(?m)^(  nixpkgs_rev:\s*).*$`)
+	nixpkgsHashYamlRegex = regexp.MustCompile(`(?m)^(  nixpkgs_hash:\s*).*$`)
 	nixBlockYamlRegex    = regexp.MustCompile(`(?m)^nix:\s*$`)
 )
 

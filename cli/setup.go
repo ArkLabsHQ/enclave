@@ -74,7 +74,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	// would be silently clobbered on every `enclave setup` run. Pass
 	// --force-flake to regenerate, e.g. after changing language in enclave.yaml.
 	forceFlake, _ := cmd.Flags().GetBool("force-flake")
-	for _, f := range getInitFiles(language) {
+	for _, f := range getInitFilesWithNixpkgs(language, cfg.Nix.NixpkgsRev) {
 		if f.RelPath == "enclave/flake.nix" {
 			destPath := filepath.Join(root, f.RelPath)
 			if _, statErr := os.Stat(destPath); statErr == nil && !forceFlake {

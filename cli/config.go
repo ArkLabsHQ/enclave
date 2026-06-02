@@ -20,6 +20,8 @@ var (
 	commitSHARegex   = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	cachixHostRegex  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
 	publicKeyRegex   = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
+	// SRI sha256: "sha256-" + 43 base64 chars + "=" (32 raw bytes → 44 base64).
+	sriSha256Regex   = regexp.MustCompile(`^sha256-[A-Za-z0-9+/]{43}=$`)
 )
 
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
@@ -295,8 +297,8 @@ func validateNixConfig(n *NixConfig, configPath string) error {
 		if !commitSHARegex.MatchString(n.NixpkgsRev) {
 			return fmt.Errorf("%s: nix.nixpkgs_rev %q must be a 40-char hex commit SHA", configPath, n.NixpkgsRev)
 		}
-		if !strings.HasPrefix(n.NixpkgsHash, "sha256-") {
-			return fmt.Errorf("%s: nix.nixpkgs_hash %q must start with 'sha256-' (SRI format)", configPath, n.NixpkgsHash)
+		if !sriSha256Regex.MatchString(n.NixpkgsHash) {
+			return fmt.Errorf("%s: nix.nixpkgs_hash %q must be SRI-formatted sha256 ('sha256-' + 43 base64 chars + '=')", configPath, n.NixpkgsHash)
 		}
 	}
 	return nil

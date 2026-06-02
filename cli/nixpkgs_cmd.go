@@ -67,7 +67,7 @@ func nixpkgsPinCmd() *cobra.Command {
 
 func runPinCheck(cfg *Config) error {
 	if cfg.Nix.NixpkgsRev == "" {
-		return fmt.Errorf("no pin set — nix.nixpkgs_rev is empty in enclave.yaml. Run `enclave nixpkgs pin --latest` to create one.")
+		return fmt.Errorf("no pin set — nix.nixpkgs_rev is empty in enclave.yaml (run `enclave nixpkgs pin --latest` to create one)")
 	}
 	if !commitSHARegex.MatchString(cfg.Nix.NixpkgsRev) {
 		return fmt.Errorf("nix.nixpkgs_rev %q is not a 40-char hex commit SHA", cfg.Nix.NixpkgsRev)
@@ -175,7 +175,7 @@ func prefetchNixpkgsHashOverHTTP(url string) (string, error) {
 	if _, err := io.Copy(h, resp.Body); err != nil {
 		return "", fmt.Errorf("read tarball: %w", err)
 	}
-	return "", fmt.Errorf("`nix-prefetch-url` not on PATH — install Nix (https://nixos.org/download) to compute the SRI hash. Tarball downloaded OK (%d bytes) but the hash of the gzipped bytes is not what Nix wants.", h.Size())
+	return "", fmt.Errorf("`nix-prefetch-url` not on PATH — install Nix (https://nixos.org/download) to compute the SRI hash (tarball downloaded OK at %d bytes but the gzipped-byte hash is not what Nix wants)", h.Size())
 }
 
 // nixHashToSRI converts a `nix-prefetch-url` (legacy base32) or already-SRI

@@ -253,10 +253,10 @@ func loadConfigAt(configPath string) (*Config, error) {
 		switch cfg.App.Language {
 		case "go", "rust":
 		default:
-			return nil, fmt.Errorf("%s: app.vendor=true is only supported for language go|rust (got %q). Node uses npmDepsHash; .NET uses nugetDeps — both already manifest-pinned.", configFile, cfg.App.Language)
+			return nil, fmt.Errorf("%s: app.vendor=true is only supported for language go|rust (got %q) — Node uses npmDepsHash and .NET uses nugetDeps, both already manifest-pinned", configFile, cfg.App.Language)
 		}
 		if cfg.App.NixVendorHash != "" {
-			return nil, fmt.Errorf("%s: app.vendor=true is mutually exclusive with app.nix_vendor_hash (vendor mode uses the committed vendor/ directory; no hash needed). Clear nix_vendor_hash to switch to vendor mode.", configFile)
+			return nil, fmt.Errorf("%s: app.vendor=true is mutually exclusive with app.nix_vendor_hash — clear nix_vendor_hash to switch to vendor mode (vendor mode uses the committed vendor/ directory; no hash needed)", configFile)
 		}
 	}
 

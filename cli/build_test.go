@@ -228,3 +228,88 @@ func TestGenerateBuildConfig_BuildInputsNeverNull(t *testing.T) {
 		t.Errorf("JSON must not emit null for build-input lists, got:\n%s", raw)
 	}
 }
+
+func TestBuildNixArgs_NoCache(t *testing.T) {
+	cfg := &Config{}
+	args := buildNixArgs(cfg)
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "extra-substituters") {
+		t.Errorf("expected no extra-substituters when nix block is empty, got: %s", joined)
+	}
+	if !strings.Contains(joined, "./enclave#eif") {
+		t.Errorf("expected ./enclave#eif as the final build target, got: %s", joined)
+	}
+	if args[0] != "build" {
+		t.Errorf("expected first arg to be \"build\", got %q", args[0])
+	}
+}
+
+func TestBuildNixArgs_WithCache(t *testing.T) {
+	cfg := &Config{
+		Nix: NixConfig{
+			Substituters:      []string{"https://merlin.cachix.org", "https://shared.cachix.org"},
+			TrustedPublicKeys: []string{"merlin.cachix.org-1:abc=", "shared.cachix.org-1:def="},
+		},
+	}
+	args := buildNixArgs(cfg)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--option extra-substituters https://merlin.cachix.org https://shared.cachix.org") {
+		t.Errorf("expected extra-substituters in argv, got: %s", joined)
+	}
+	if !strings.Contains(joined, "--option extra-trusted-public-keys merlin.cachix.org-1:abc= shared.cachix.org-1:def=") {
+		t.Errorf("expected extra-trusted-public-keys in argv, got: %s", joined)
+	}
+	if !strings.Contains(joined, "./enclave#eif") {
+		t.Errorf("expected build target preserved, got: %s", joined)
+	}
+}
+
+func TestGenerateBuildConfig_VendorField(t *testing.T) {
+	for _, vendor := range []bool{true, false} {
+		t.Run(map[bool]string{true: "vendor=true", false: "vendor=false"}[vendor], func(t *testing.T) {
+			root := t.TempDir()
+			cfg := &Config{
+				Name:    "app",
+				Version: "1.0.0",
+				Region:  "us-east-1",
+				App: AppConfig{
+					Language:   "rust",
+					BinaryName: "app",
+					Vendor:     vendor,
+				},
+				MigrationCooldown: "0s",
+				PreviousPCR0:      "genesis",
+			}
+			if err := generateBuildConfig(cfg, root); err != nil {
+				t.Fatalf("generateBuildConfig: %v", err)
+			}
+			data, err := os.ReadFile(filepath.Join(root, ".enclave", "build-config.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var bc buildConfigJSON
+			if err := json.Unmarshal(data, &bc); err != nil {
+				t.Fatal(err)
+			}
+			if bc.App.Vendor != vendor {
+				t.Errorf("bc.App.Vendor = %v, want %v", bc.App.Vendor, vendor)
+			}
+		})
+	}
+}
+
+func TestBuildNixArgs_KeysWithoutSubstituters(t *testing.T) {
+	cfg := &Config{
+		Nix: NixConfig{
+			TrustedPublicKeys: []string{"merlin.cachix.org-1:abc="},
+		},
+	}
+	args := buildNixArgs(cfg)
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "extra-substituters") {
+		t.Errorf("expected no extra-substituters, got: %s", joined)
+	}
+	if !strings.Contains(joined, "extra-trusted-public-keys") {
+		t.Errorf("trusted_public_keys should still be plumbed through even without substituters, got: %s", joined)
+	}
+}

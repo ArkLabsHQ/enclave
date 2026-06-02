@@ -339,6 +339,312 @@ func TestLoadConfig_TLSDefault(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_NixCacheValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		nix     string
+		wantErr bool
+	}{
+		{
+			name: "valid cachix substituter with key",
+			nix: `nix:
+  substituters:
+    - "https://merlin.cachix.org"
+  trusted_public_keys:
+    - "merlin.cachix.org-1:abcDEF123+/="
+`,
+		},
+		{
+			name: "substituters without keys",
+			nix: `nix:
+  substituters:
+    - "https://merlin.cachix.org"
+`,
+			wantErr: true,
+		},
+		{
+			name: "non-cachix substituter rejected",
+			nix: `nix:
+  substituters:
+    - "https://my-cache.s3.amazonaws.com"
+  trusted_public_keys:
+    - "k:abc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "self-hosted attic rejected",
+			nix: `nix:
+  substituters:
+    - "https://attic.example.com"
+  trusted_public_keys:
+    - "k:abc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "http (not https) rejected",
+			nix: `nix:
+  substituters:
+    - "http://merlin.cachix.org"
+  trusted_public_keys:
+    - "k:abc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "cachix subdomain with path rejected",
+			nix: `nix:
+  substituters:
+    - "https://merlin.cachix.org/v1"
+  trusted_public_keys:
+    - "k:abc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "malformed public key rejected",
+			nix: `nix:
+  substituters:
+    - "https://merlin.cachix.org"
+  trusted_public_keys:
+    - "no-colon-here"
+`,
+			wantErr: true,
+		},
+		{
+			name: "no nix block is fine",
+			nix:  ``,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.nix)
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error for %s", tt.name)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error for %s: %v", tt.name, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_NixpkgsPinValidation(t *testing.T) {
+	const validSHA = "0d843eedba88d22a7eaa2a7e54a2c1d8c0c0d4f8"
+	const validHash = "sha256-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef="
+	tests := []struct {
+		name    string
+		nix     string
+		wantErr bool
+	}{
+		{
+			name: "both fields set with valid values",
+			nix: `nix:
+  nixpkgs_rev:  "` + validSHA + `"
+  nixpkgs_hash: "` + validHash + `"
+`,
+		},
+		{
+			name: "rev without hash",
+			nix: `nix:
+  nixpkgs_rev: "` + validSHA + `"
+`,
+			wantErr: true,
+		},
+		{
+			name: "hash without rev",
+			nix: `nix:
+  nixpkgs_hash: "` + validHash + `"
+`,
+			wantErr: true,
+		},
+		{
+			name: "short rev rejected",
+			nix: `nix:
+  nixpkgs_rev:  "deadbeef"
+  nixpkgs_hash: "` + validHash + `"
+`,
+			wantErr: true,
+		},
+		{
+			name: "uppercase rev rejected",
+			nix: `nix:
+  nixpkgs_rev:  "0D843EEDBA88D22A7EAA2A7E54A2C1D8C0C0D4F8"
+  nixpkgs_hash: "` + validHash + `"
+`,
+			wantErr: true,
+		},
+		{
+			name: "hash missing sha256- prefix",
+			nix: `nix:
+  nixpkgs_rev:  "` + validSHA + `"
+  nixpkgs_hash: "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef="
+`,
+			wantErr: true,
+		},
+		{
+			name: "no pin set is fine",
+			nix:  ``,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.nix)
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error for %s", tt.name)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error for %s: %v", tt.name, err)
+			}
+		})
+	}
+}
+
+func TestCachixCacheName(t *testing.T) {
+	tests := []struct {
+		url  string
+		want string
+	}{
+		{"https://merlin.cachix.org", "merlin"},
+		{"https://my-project.cachix.org", "my-project"},
+		{"https://acme123.cachix.org", "acme123"},
+		{"http://merlin.cachix.org", ""},
+		{"https://cache.s3.amazonaws.com", ""},
+		{"https://merlin.cachix.org/path", ""},
+		{"not a url", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			if got := CachixCacheName(tt.url); got != tt.want {
+				t.Errorf("CachixCacheName(%q) = %q, want %q", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_VendorValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{
+			name: "rust with vendor: true and empty hash is ok",
+			body: `
+app:
+  language: rust
+  vendor: true
+  nix_vendor_hash: ""
+`,
+		},
+		{
+			name: "go with vendor: true and empty hash is ok",
+			body: `
+app:
+  language: go
+  vendor: true
+  nix_vendor_hash: ""
+`,
+		},
+		{
+			name: "nodejs with vendor: true is rejected",
+			body: `
+app:
+  language: nodejs
+  vendor: true
+`,
+			wantErr: true,
+		},
+		{
+			name: "dotnet with vendor: true is rejected",
+			body: `
+app:
+  language: dotnet
+  vendor: true
+`,
+			wantErr: true,
+		},
+		{
+			name: "rust with vendor: true and non-empty hash is rejected (mutex)",
+			body: `
+app:
+  language: rust
+  vendor: true
+  nix_vendor_hash: "sha256-abc="
+`,
+			wantErr: true,
+		},
+		{
+			name: "vendor omitted defaults to false (no validation triggered)",
+			body: `
+app:
+  language: rust
+  nix_vendor_hash: "sha256-abc="
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.body)
+			cfg, err := loadConfig()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %s, got nil", tt.name)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error for %s: %v", tt.name, err)
+				return
+			}
+			// Round-trip sanity: vendor bool reaches cfg.App.Vendor
+			if cfg == nil {
+				t.Fatal("nil config")
+			}
+		})
+	}
+}
+
+func TestLoadConfig_VendorDefaultFalse(t *testing.T) {
+	writeConfig(t, `
+name: myapp
+region: us-east-1
+app:
+  language: go
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.App.Vendor {
+		t.Errorf("App.Vendor = true, want false (default when unset)")
+	}
+}
+
+func TestLoadConfig_VendorTrueRoundTrips(t *testing.T) {
+	writeConfig(t, `
+name: myapp
+region: us-east-1
+app:
+  language: rust
+  vendor: true
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.App.Vendor {
+		t.Errorf("App.Vendor = false, want true")
+	}
+}
+
 func TestLoadConfig_TLSValidation(t *testing.T) {
 	tests := []struct {
 		name    string

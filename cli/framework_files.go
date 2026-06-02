@@ -1,12 +1,55 @@
 package cli
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // frameworkFile describes a template file to scaffold during `enclave init`.
 type frameworkFile struct {
 	RelPath string      // path relative to user's project root
 	Mode    os.FileMode // file permissions
 	Content string      // file content
+}
+
+// Placeholders replaced in flake templates at scaffold time.
+const (
+	nixpkgsRefPlaceholder       = "{{NixpkgsRef}}"
+	flakeUtilsRefPlaceholder    = "{{FlakeUtilsRef}}"
+	awsNitroUtilRefPlaceholder  = "{{AwsNitroUtilRef}}"
+)
+
+// DefaultNixpkgsRef is the nixpkgs reference baked into scaffolded flakes
+// when the operator hasn't set nix.nixpkgs_rev in enclave.yaml. A branch
+// reference — same behavior as before this feature existed — so opting in
+// to reproducibility is an explicit `enclave nixpkgs pin --latest` step,
+// not something the framework silently does on the operator's behalf.
+const DefaultNixpkgsRef = "nixos-25.11"
+
+// Framework-managed flake inputs. Unlike nixpkgs (which the operator pins
+// for reproducibility of their own derivation graph), these are framework
+// infrastructure — operators don't touch them. Bumping is a framework-release
+// activity. Pinned to commit SHAs so the derivation graph is fully closed.
+const (
+	// flake-utils @ main, fetched 2026-06-01.
+	FlakeUtilsRef = "11707dc2f618dd54ca8739b309ec4fc024de578b"
+	// aws-nitro-util @ master, fetched 2026-06-01.
+	AwsNitroUtilRef = "b529ed6299a49ebe362d3cf618b21d6dac4a2e48"
+)
+
+// applyNixpkgsRef substitutes flake input references into a template.
+// Replaces {{NixpkgsRef}} with the operator's pin (or DefaultNixpkgsRef
+// when empty), and {{FlakeUtilsRef}} / {{AwsNitroUtilRef}} with the
+// framework-managed commit pins. Kept as a single helper because all three
+// substitutions happen together at every scaffold call site.
+func applyNixpkgsRef(template, nixpkgsRef string) string {
+	if nixpkgsRef == "" {
+		nixpkgsRef = DefaultNixpkgsRef
+	}
+	out := strings.ReplaceAll(template, nixpkgsRefPlaceholder, nixpkgsRef)
+	out = strings.ReplaceAll(out, flakeUtilsRefPlaceholder, FlakeUtilsRef)
+	out = strings.ReplaceAll(out, awsNitroUtilRefPlaceholder, AwsNitroUtilRef)
+	return out
 }
 
 // getInitFiles returns the build-time framework files scaffolded by
@@ -18,6 +61,13 @@ type frameworkFile struct {
 // via getTofuFiles; splitting the two lets users customize one without
 // inadvertently regenerating the other.
 func getInitFiles(language string) []frameworkFile {
+	return getInitFilesWithNixpkgs(language, "")
+}
+
+// getInitFilesWithNixpkgs is the same as getInitFiles but substitutes the
+// given nixpkgs reference into the flake template. Empty ref uses
+// DefaultNixpkgsRef.
+func getInitFilesWithNixpkgs(language, nixpkgsRef string) []frameworkFile {
 	flakeNix := frameworkFlakeNix // default: Go
 	switch language {
 	case "nodejs":
@@ -32,7 +82,7 @@ func getInitFiles(language string) []frameworkFile {
 		{
 			RelPath: "enclave/flake.nix",
 			Mode:    0644,
-			Content: flakeNix,
+			Content: applyNixpkgsRef(flakeNix, nixpkgsRef),
 		},
 		{
 			RelPath: ".github/workflows/deploy-enclave.yml",
@@ -203,9 +253,12 @@ const frameworkFlakeNix = `{
   description = "Nitro Enclave - reproducible build";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    flake-utils.url = "github:numtide/flake-utils";
-    aws-nitro-util.url = "github:monzo/aws-nitro-util";
+    nixpkgs.url = "github:NixOS/nixpkgs/{{NixpkgsRef}}";
+    flake-utils.url = "github:numtide/flake-utils/{{FlakeUtilsRef}}";
+    flake-utils.inputs.systems.follows = "";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util/{{AwsNitroUtilRef}}";
+    aws-nitro-util.inputs.nixpkgs.follows = "nixpkgs";
+    aws-nitro-util.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils, aws-nitro-util }:
@@ -261,6 +314,8 @@ const frameworkFlakeNix = `{
         };
 
         # User's app — fetched from GitHub. No runtime dependency needed.
+        # vendor: true → use the committed vendor/ in the source tree (offline-safe);
+        # otherwise use vendorHash to fetch deps via go mod download.
         upstream-app = eifPkgs.buildGoModule ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
@@ -272,8 +327,10 @@ const frameworkFlakeNix = `{
             hash = appCfg.nix_hash;
           };
 
-          vendorHash = if appCfg.nix_vendor_hash == "" then null else appCfg.nix_vendor_hash;
-          proxyVendor = true;
+          vendorHash = if (appCfg.vendor or false) then null
+                       else if appCfg.nix_vendor_hash == "" then null
+                       else appCfg.nix_vendor_hash;
+          proxyVendor = !(appCfg.vendor or false);
 
           subPackages = appCfg.nix_sub_packages;
           env.CGO_ENABLED = "0";
@@ -356,26 +413,29 @@ const frameworkFlakeNix = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.buildGoModule ({
-          pname = "vendor-hash-check";
-          version = buildCfg.version;
-          src = eifPkgs.fetchFromGitHub {
-            owner = appCfg.nix_owner;
-            repo = appCfg.nix_repo;
-            rev = appCfg.nix_rev;
-            hash = appCfg.nix_hash;
-          };
-          vendorHash = "";
-          proxyVendor = true;
-          subPackages = appCfg.nix_sub_packages;
-          env.CGO_ENABLED = "0";
-          doCheck = false;
+        # No-op in vendor mode (nothing to discover — vendor/ is committed).
+        vendor-hash-check = if (appCfg.vendor or false)
+          then eifPkgs.runCommand "vendor-hash-check-noop" {} "echo noop > $out"
+          else eifPkgs.buildGoModule ({
+            pname = "vendor-hash-check";
+            version = buildCfg.version;
+            src = eifPkgs.fetchFromGitHub {
+              owner = appCfg.nix_owner;
+              repo = appCfg.nix_repo;
+              rev = appCfg.nix_rev;
+              hash = appCfg.nix_hash;
+            };
+            vendorHash = "";
+            proxyVendor = true;
+            subPackages = appCfg.nix_sub_packages;
+            env.CGO_ENABLED = "0";
+            doCheck = false;
 
-          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
-          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
-        } // (if (appCfg.nix_subdir or "") != "" then {
-          sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
-        } else {}));
+            nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+            buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
+          } // (if (appCfg.nix_subdir or "") != "" then {
+            sourceRoot = "source/` + "${appCfg.nix_subdir}" + `";
+          } else {}));
 
       in
       {
@@ -393,9 +453,12 @@ const frameworkFlakeNixNodejs = `{
   description = "Nitro Enclave - reproducible build (Node.js)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    flake-utils.url = "github:numtide/flake-utils";
-    aws-nitro-util.url = "github:monzo/aws-nitro-util";
+    nixpkgs.url = "github:NixOS/nixpkgs/{{NixpkgsRef}}";
+    flake-utils.url = "github:numtide/flake-utils/{{FlakeUtilsRef}}";
+    flake-utils.inputs.systems.follows = "";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util/{{AwsNitroUtilRef}}";
+    aws-nitro-util.inputs.nixpkgs.follows = "nixpkgs";
+    aws-nitro-util.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils, aws-nitro-util }:
@@ -622,6 +685,17 @@ jobs:
 
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9
+
+      # Wire up the Cachix binary cache when configured. Pulls cached store
+      # paths before the build and pushes any newly-built paths at job end.
+      # Opt in by setting vars.CACHIX_CACHE_NAME + secrets.CACHIX_AUTH_TOKEN.
+      # If unset, the step is skipped and the build runs without the cache.
+      - name: Setup Cachix
+        if: vars.CACHIX_CACHE_NAME != ''
+        uses: cachix/cachix-action@v15
+        with:
+          name: ` + "${{ vars.CACHIX_CACHE_NAME }}" + `
+          authToken: ` + "${{ secrets.CACHIX_AUTH_TOKEN }}" + `
 
       - name: Build and deploy
         id: deploy
@@ -902,10 +976,13 @@ const frameworkFlakeNixDotnet = `{
 
   inputs = {
     # Pinned nixpkgs commit for reproducible .NET SDK version.
-    # Update deliberately with: nix flake update nixpkgs
-    nixpkgs.url = "github:NixOS/nixpkgs/e38213b91d3786389a446dfce4ff5a8aaf6012f2";
-    flake-utils.url = "github:numtide/flake-utils";
-    aws-nitro-util.url = "github:monzo/aws-nitro-util";
+    # Update deliberately with: enclave nixpkgs pin --latest
+    nixpkgs.url = "github:NixOS/nixpkgs/{{NixpkgsRef}}";
+    flake-utils.url = "github:numtide/flake-utils/{{FlakeUtilsRef}}";
+    flake-utils.inputs.systems.follows = "";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util/{{AwsNitroUtilRef}}";
+    aws-nitro-util.inputs.nixpkgs.follows = "nixpkgs";
+    aws-nitro-util.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils, aws-nitro-util }:
@@ -1082,9 +1159,12 @@ const frameworkFlakeNixRust = `{
   description = "Nitro Enclave - reproducible build (Rust)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    flake-utils.url = "github:numtide/flake-utils";
-    aws-nitro-util.url = "github:monzo/aws-nitro-util";
+    nixpkgs.url = "github:NixOS/nixpkgs/{{NixpkgsRef}}";
+    flake-utils.url = "github:numtide/flake-utils/{{FlakeUtilsRef}}";
+    flake-utils.inputs.systems.follows = "";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util/{{AwsNitroUtilRef}}";
+    aws-nitro-util.inputs.nixpkgs.follows = "nixpkgs";
+    aws-nitro-util.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils, aws-nitro-util }:
@@ -1134,6 +1214,8 @@ const frameworkFlakeNixRust = `{
         };
 
         # User's Rust app — fetched from GitHub. No runtime dependency needed.
+        # vendor: true → use the committed vendor/ in the source tree (offline-safe);
+        # otherwise use cargoHash to fetch crates via fetchCargoVendor.
         upstream-app = eifPkgs.rustPlatform.buildRustPackage ({
           pname = appCfg.binary_name;
           version = buildCfg.version;
@@ -1144,8 +1226,6 @@ const frameworkFlakeNixRust = `{
             rev = appCfg.nix_rev;
             hash = appCfg.nix_hash;
           };
-
-          cargoHash = if appCfg.nix_vendor_hash == "" then "" else appCfg.nix_vendor_hash;
 
           doCheck = false;
 
@@ -1160,7 +1240,11 @@ const frameworkFlakeNixRust = `{
               fi
             done
           '';
-        } // (if (appCfg.nix_subdir or "") != "" then {
+        }
+        // (if (appCfg.vendor or false)
+             then { cargoVendorDir = "vendor"; }
+             else { cargoHash = if appCfg.nix_vendor_hash == "" then "" else appCfg.nix_vendor_hash; })
+        // (if (appCfg.nix_subdir or "") != "" then {
           sourceRoot = "source";
           cargoRoot = appCfg.nix_subdir;
           buildAndTestSubdir = appCfg.nix_subdir;
@@ -1219,25 +1303,28 @@ const frameworkFlakeNixRust = `{
         };
 
         # Vendor hash check — used by enclave setup to discover the correct hash.
-        vendor-hash-check = eifPkgs.rustPlatform.buildRustPackage ({
-          pname = "vendor-hash-check";
-          version = buildCfg.version;
-          src = eifPkgs.fetchFromGitHub {
-            owner = appCfg.nix_owner;
-            repo = appCfg.nix_repo;
-            rev = appCfg.nix_rev;
-            hash = appCfg.nix_hash;
-          };
-          cargoHash = "";
-          doCheck = false;
+        # No-op in vendor mode (nothing to discover — vendor/ is committed).
+        vendor-hash-check = if (appCfg.vendor or false)
+          then eifPkgs.runCommand "vendor-hash-check-noop" {} "echo noop > $out"
+          else eifPkgs.rustPlatform.buildRustPackage ({
+            pname = "vendor-hash-check";
+            version = buildCfg.version;
+            src = eifPkgs.fetchFromGitHub {
+              owner = appCfg.nix_owner;
+              repo = appCfg.nix_repo;
+              rev = appCfg.nix_rev;
+              hash = appCfg.nix_hash;
+            };
+            cargoHash = "";
+            doCheck = false;
 
-          nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
-          buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
-        } // (if (appCfg.nix_subdir or "") != "" then {
-          sourceRoot = "source";
-          cargoRoot = appCfg.nix_subdir;
-          buildAndTestSubdir = appCfg.nix_subdir;
-        } else {}));
+            nativeBuildInputs = resolveInputs (appCfg.nix_native_build_inputs or []);
+            buildInputs = resolveInputs (appCfg.nix_build_inputs or []);
+          } // (if (appCfg.nix_subdir or "") != "" then {
+            sourceRoot = "source";
+            cargoRoot = appCfg.nix_subdir;
+            buildAndTestSubdir = appCfg.nix_subdir;
+          } else {}));
 
       in
       {
@@ -1458,6 +1545,17 @@ jobs:
 
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9
+
+      # Wire up the Cachix binary cache when configured. Pulls cached store
+      # paths before the build and pushes any newly-built paths at job end.
+      # Opt in by setting vars.CACHIX_CACHE_NAME + secrets.CACHIX_AUTH_TOKEN.
+      # If unset, the step is skipped and the build runs without the cache.
+      - name: Setup Cachix
+        if: vars.CACHIX_CACHE_NAME != ''
+        uses: cachix/cachix-action@v15
+        with:
+          name: ` + "${{ vars.CACHIX_CACHE_NAME }}" + `
+          authToken: ` + "${{ secrets.CACHIX_AUTH_TOKEN }}" + `
 
       - name: Build EIF
         run: enclave build

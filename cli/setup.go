@@ -144,7 +144,11 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 
 	// 5. Compute vendor/deps hash via trial nix build.
-	if language == "dotnet" {
+	// In vendor mode, skip entirely — the committed vendor/ directory is
+	// the source of truth; no hash to compute.
+	if cfg.App.Vendor {
+		fmt.Println("[setup] vendor: true — skipping vendor hash discovery (using committed vendor/)")
+	} else if language == "dotnet" {
 		fmt.Println("[setup] Generating NuGet deps.json...")
 		vendorErr = generateDotnetDeps(root)
 		if vendorErr == nil {
@@ -162,10 +166,12 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Println("[setup] Will update other fields; you'll need to fill nix_vendor_hash manually.")
 		}
-	} else if language == "dotnet" {
-		fmt.Println("[setup] deps.json generated successfully")
-	} else {
-		fmt.Printf("[setup] nix_vendor_hash: %s\n", vendorHash)
+	} else if !cfg.App.Vendor {
+		if language == "dotnet" {
+			fmt.Println("[setup] deps.json generated successfully")
+		} else {
+			fmt.Printf("[setup] nix_vendor_hash: %s\n", vendorHash)
+		}
 	}
 
 	// 5. Update enclave.yaml preserving comments.
@@ -193,7 +199,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 
 	fmt.Println()
 	fmt.Printf("[setup] Updated %s\n", configFile)
-	if vendorHash == "" {
+	if vendorHash == "" && !cfg.App.Vendor {
 		fmt.Println()
 		if language == "dotnet" {
 			fmt.Println("Warning: deps.json was not generated.")

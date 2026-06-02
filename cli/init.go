@@ -47,6 +47,15 @@ app:
   nix_subdir: ""                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
   release_tag: "eif-latest"      # GitHub Release tag used by 'enclave tofu init --remote'
+  vendor: false                  # (go|rust only) Set true after committing vendor/ to the app repo
+                                 # (cargo vendor / go mod vendor). Offline builds survive upstream
+                                 # dep disappearance regardless of cache state. Workflow:
+                                 # 1) run 'enclave vendor --path <app-repo>' to populate vendor/
+                                 # 2) git add vendor/ && commit && push
+                                 # 3) flip vendor: true here AND clear nix_vendor_hash
+                                 # 4) 'enclave setup' (sees vendor: true, skips hash discovery)
+                                 # Note: step 3 BEFORE step 4 — setup's trial build needs upstream
+                                 # otherwise, which defeats the recovery purpose.
 
   # Optional build-time env values baked into the EIF (each value
   # contributes to PCR0). Use ONLY when you need a value cryptographically
@@ -86,6 +95,27 @@ tls:
   fqdn: ""
   email: ""
   route53_zone_id: ""
+
+# Nix binary cache + reproducibility settings (optional).
+#
+# Without these, the EIF still builds — but every rebuild has to fetch every
+# transitive dep from upstream. If a Cargo crate moves or a GitHub repo gets
+# renamed, enclave build breaks.
+#
+# Cachix (https://cachix.org) hosts a project-specific binary cache so future
+# builds resolve from the cache instead of upstream. nixpkgs_rev pins the
+# flake's nixpkgs input to a commit so the derivation graph is stable.
+#
+# Bump the pin with: enclave nixpkgs pin --latest
+# Push the closure after a build with: enclave build --push-cache
+#
+# nix:
+#   substituters:
+#     - "https://myproject.cachix.org"   # only Cachix URLs are accepted
+#   trusted_public_keys:
+#     - "myproject.cachix.org-1:<base64-key>="
+#   nixpkgs_rev:  ""                     # 40-char commit SHA
+#   nixpkgs_hash: ""                     # sha256-<SRI hash>
 `
 
 func initCmd() *cobra.Command {

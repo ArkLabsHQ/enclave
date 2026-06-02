@@ -2,19 +2,24 @@ package cli
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	accountIDRegex  = regexp.MustCompile(`^\d{12}$`)
-	secretNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
-	envVarRegex     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-	fqdnRegex       = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+	accountIDRegex   = regexp.MustCompile(`^\d{12}$`)
+	secretNameRegex  = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+	envVarRegex      = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	fqdnRegex        = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+	commitSHARegex   = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	cachixHostRegex  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
+	publicKeyRegex   = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
 )
 
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
@@ -54,6 +59,18 @@ type Config struct {
 	//     can decrypt. Permanent at first lock.
 	IsKMSKeyLocked bool      `yaml:"is_kms_key_locked"`
 	TLS            TLSConfig `yaml:"tls"`
+	Nix            NixConfig `yaml:"nix"`
+}
+
+// NixConfig configures Nix binary caching and reproducibility for EIF builds.
+// Only Cachix is supported as a substituter backend — config-load rejects
+// any other URL. NixpkgsRev pins the flake's nixpkgs input to a specific
+// commit so the derivation graph is stable across builds.
+type NixConfig struct {
+	Substituters      []string `yaml:"substituters"`
+	TrustedPublicKeys []string `yaml:"trusted_public_keys"`
+	NixpkgsRev        string   `yaml:"nixpkgs_rev"`
+	NixpkgsHash       string   `yaml:"nixpkgs_hash"`
 }
 
 type AppConfig struct {
@@ -75,6 +92,11 @@ type AppConfig struct {
 	// which `enclave tofu init --remote` downloads image.eif and supervisor.
 	// Defaults to "eif-latest" when unset.
 	ReleaseTag string `yaml:"release_tag"`
+	// Vendor switches the flake into vendor mode — Nix uses a committed
+	// vendor/ directory in the source tree instead of fetching deps via
+	// cargoHash/vendorHash. Survives upstream dep disappearance regardless
+	// of cache state. Only supported for language=go|rust.
+	Vendor bool `yaml:"vendor"`
 }
 
 // SecretConfig defines a secret managed by KMS inside the enclave.
@@ -227,7 +249,74 @@ func loadConfigAt(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("%s: tls.route53_zone_id requires tls.fqdn to be set", configFile)
 	}
 
+	if cfg.App.Vendor {
+		switch cfg.App.Language {
+		case "go", "rust":
+		default:
+			return nil, fmt.Errorf("%s: app.vendor=true is only supported for language go|rust (got %q). Node uses npmDepsHash; .NET uses nugetDeps — both already manifest-pinned.", configFile, cfg.App.Language)
+		}
+		if cfg.App.NixVendorHash != "" {
+			return nil, fmt.Errorf("%s: app.vendor=true is mutually exclusive with app.nix_vendor_hash (vendor mode uses the committed vendor/ directory; no hash needed). Clear nix_vendor_hash to switch to vendor mode.", configFile)
+		}
+	}
+
+	if err := validateNixConfig(&cfg.Nix, configPath); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateNixConfig enforces the Cachix-only substituter rule and the
+// well-formed-pin invariant. Substituters must be https://<name>.cachix.org;
+// any other URL is rejected. NixpkgsRev/Hash must both be set together.
+func validateNixConfig(n *NixConfig, configPath string) error {
+	if len(n.Substituters) > 0 && len(n.TrustedPublicKeys) == 0 {
+		return fmt.Errorf("%s: nix.substituters set but nix.trusted_public_keys empty (Cachix shows the public key on the cache settings page)", configPath)
+	}
+	for i, s := range n.Substituters {
+		u, err := url.Parse(s)
+		if err != nil || u.Scheme != "https" || !cachixHostRegex.MatchString(u.Host) {
+			return fmt.Errorf("%s: nix.substituters[%d] %q is not a Cachix URL — only https://<name>.cachix.org is supported", configPath, i, s)
+		}
+		if u.Path != "" && u.Path != "/" {
+			return fmt.Errorf("%s: nix.substituters[%d] %q must not include a path", configPath, i, s)
+		}
+	}
+	for i, k := range n.TrustedPublicKeys {
+		if !publicKeyRegex.MatchString(k) {
+			return fmt.Errorf("%s: nix.trusted_public_keys[%d] %q must be in <name>:<base64> format", configPath, i, k)
+		}
+	}
+	if n.NixpkgsRev != "" || n.NixpkgsHash != "" {
+		if n.NixpkgsRev == "" || n.NixpkgsHash == "" {
+			return fmt.Errorf("%s: nix.nixpkgs_rev and nix.nixpkgs_hash must both be set (use `enclave nixpkgs pin --latest`)", configPath)
+		}
+		if !commitSHARegex.MatchString(n.NixpkgsRev) {
+			return fmt.Errorf("%s: nix.nixpkgs_rev %q must be a 40-char hex commit SHA", configPath, n.NixpkgsRev)
+		}
+		if !strings.HasPrefix(n.NixpkgsHash, "sha256-") {
+			return fmt.Errorf("%s: nix.nixpkgs_hash %q must start with 'sha256-' (SRI format)", configPath, n.NixpkgsHash)
+		}
+	}
+	return nil
+}
+
+// CachixCacheName extracts the cache name from a Cachix substituter URL.
+// Returns "" if the URL is not a well-formed Cachix URL (wrong scheme, host,
+// or includes any path/query/fragment).
+func CachixCacheName(substituter string) string {
+	u, err := url.Parse(substituter)
+	if err != nil || u.Scheme != "https" || !cachixHostRegex.MatchString(u.Host) {
+		return ""
+	}
+	if u.Path != "" && u.Path != "/" {
+		return ""
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	return strings.TrimSuffix(u.Host, ".cachix.org")
 }
 
 // validateAccount checks that the AWS account ID is present and valid.

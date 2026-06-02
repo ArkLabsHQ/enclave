@@ -378,7 +378,10 @@ make install   # install to $GOPATH/bin
 | `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
 | `enclave tofu` | Generate OpenTofu deployment scaffold into ./tofu/ (merge-only-new). Pass `--remote` to pull EIF + supervisor from a GitHub Release at apply time instead of from local files. |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
-| `enclave build` |  |
+| `enclave build --push-cache` | Build, then push the closure to the first Cachix substituter (requires `CACHIX_AUTH_TOKEN` + `cachix` CLI) |
+| `enclave nixpkgs pin --latest` | Pin `nixpkgs` to the tip of `nixos-25.11` (writes enclave.yaml + flake.nix). See [BINARY-CACHE.md](BINARY-CACHE.md). |
+| `enclave nixpkgs pin --check` | Validate the existing nixpkgs pin without bumping it |
+| `enclave vendor --path <dir>` | Run `cargo vendor` / `go mod vendor` in the upstream app source (language taken from enclave.yaml). Then commit `vendor/`, run `enclave setup`, and set `app.vendor: true`. |
 | `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |
 | `enclave verify` | Verify attestation document and PCR0 against local build |
 | `enclave status` | Show deployment status |
@@ -582,6 +585,52 @@ The attestation proof is an NSM attestation document — a COSE Sign1 structure 
 
 The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util) inside a pinned Docker container, producing a byte-identical EIF on every build. This guarantees identical PCR0 measurements, enabling anyone to verify that the running enclave matches the published source code.
 
+### Surviving upstream dep churn
+
+Nix fetches every transitive dependency from upstream on each build. If a Cargo crate is yanked, a GitHub repo is renamed, or any tarball disappears, the rebuild fails — your six-month-old EIF can become un-rebuildable from one upstream event.
+
+Two opt-in tools fix this:
+
+- **Cachix binary cache** — once an EIF is built, push the closure to a project-specific [Cachix](https://cachix.org) cache. Subsequent builds resolve from the cache, regardless of upstream state.
+- **Pinned nixpkgs commit** — pin `nixpkgs` to a specific SHA so the derivation graph stays stable even when the branch tip moves.
+
+Setup:
+
+```yaml
+# enclave/enclave.yaml
+nix:
+  substituters:
+    - "https://your-cache.cachix.org"   # only Cachix URLs are accepted
+  trusted_public_keys:
+    - "your-cache.cachix.org-1:<base64-key>="
+  nixpkgs_rev:  "<40-char commit SHA>"
+  nixpkgs_hash: "sha256-<SRI hash>"
+```
+
+```sh
+enclave nixpkgs pin --latest    # writes rev + hash, rewrites enclave/flake.nix
+enclave build --push-cache      # builds and pushes the closure to Cachix
+```
+
+Without these, the EIF still builds — but every rebuild needs upstream. See [BINARY-CACHE.md](BINARY-CACHE.md) for the full setup, trust model, and CI integration.
+
+### Vendor app source deps (optional, Rust + Go)
+
+Cachix protects rebuilds *after* the cache is populated. For belt-and-suspenders coverage that survives upstream disappearance regardless of cache state, vendor the app's dependencies into git:
+
+```sh
+enclave vendor --path ~/my-app   # cargo vendor (Rust) or go mod vendor (Go)
+git add vendor/ && git commit && git push
+enclave setup                    # refresh nix_rev/nix_hash
+# Set app.vendor: true in enclave.yaml; clear nix_vendor_hash
+```
+
+The Nix build then uses the committed `vendor/` tree — zero upstream fetch for app code. Complements Cachix (which still serves nixpkgs + runtime). See [BINARY-CACHE.md](BINARY-CACHE.md#vendor-mode-rust--go--survives-upstream-dep-disappearance) for the full workflow and trade-offs.
+
+### Commit `enclave/flake.lock`
+
+The scaffolded flake pins all framework inputs (`nixpkgs`, `flake-utils`, `aws-nitro-util`) by commit SHA in their URLs and uses `inputs.<dep>.inputs.<sub>.follows` declarations to collapse transitive inputs onto your top-level pins. That closes the derivation graph for everything the framework declares directly. **Commit `enclave/flake.lock` to git** as defense-in-depth — it pins any transitive flake inputs that a future framework upgrade might introduce, so PCR0 stays stable even when you bump framework deps.
+
 ## Local Testing
 
 The test suite runs a full enclave inside QEMU (`-M nitro-enclave`) with mock AWS services, executing 15 integration tests followed by a locked-key migration with post-migration verification.
@@ -723,9 +772,14 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 | `app.nix_vendor_hash` | Go vendor hash or npm deps hash (SRI) | (auto by `setup`) |
 | `app.nix_sub_packages` | Go sub-packages to build (Go only) | `["."]` |
 | `app.binary_name` | Output binary name | `{name}` |
+| `app.vendor` | (go/rust) Use committed `vendor/` in app source; mutually exclusive with `nix_vendor_hash`. See [BINARY-CACHE.md](BINARY-CACHE.md#vendor-mode-rust--go--survives-upstream-dep-disappearance). | `false` |
 | `app.env` | Environment variables baked into EIF as defaults (tofu can override per-deploy via `-var env_values={...}`) | `{}` |
 | `secrets[].name` | Secret name (SSM path component) | (required) |
 | `secrets[].env_var` | Env var for decrypted value | (required) |
+| `nix.substituters` | Cachix substituter URLs (`https://<name>.cachix.org`) — only Cachix is accepted | `[]` |
+| `nix.trusted_public_keys` | Public keys for the substituters above (Cachix shows on cache settings page) | `[]` |
+| `nix.nixpkgs_rev` | 40-char nixpkgs commit SHA — pins the derivation graph | `nixos-25.11` branch |
+| `nix.nixpkgs_hash` | SRI hash of the nixpkgs tarball at `nixpkgs_rev` | — |
 
 ### Environment Variables (Runtime)
 

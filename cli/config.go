@@ -292,7 +292,7 @@ func validateNixConfig(n *NixConfig, configPath string) error {
 	}
 	if n.NixpkgsRev != "" || n.NixpkgsHash != "" {
 		if n.NixpkgsRev == "" || n.NixpkgsHash == "" {
-			return fmt.Errorf("%s: nix.nixpkgs_rev and nix.nixpkgs_hash must both be set (use `enclave nixpkgs pin --latest`)", configPath)
+			return fmt.Errorf("%s: nix.nixpkgs_rev and nix.nixpkgs_hash must both be set (use `enclave nixpkgs pin`)", configPath)
 		}
 		if !commitSHARegex.MatchString(n.NixpkgsRev) {
 			return fmt.Errorf("%s: nix.nixpkgs_rev %q must be a 40-char hex commit SHA", configPath, n.NixpkgsRev)

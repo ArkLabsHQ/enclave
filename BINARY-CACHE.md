@@ -1,20 +1,8 @@
-# Binary cache + reproducible nixpkgs
+# Binary cache + reproducible nixpkgs — setup guide
 
-`enclave build` is a Nix build. If any transitive dependency moves upstream —
-a Cargo crate yanked, a GitHub repo renamed, a tarball removed — the rebuild
-fails. Production EIFs that ran for months can become un-rebuildable from
-one upstream event. See [ArkLabsHQ/enclave#127](https://github.com/ArkLabsHQ/enclave/issues/127)
-for the failure mode that motivated this feature.
-
-Two complementary tools fix it:
-
-| Tool | What it solves |
-|---|---|
-| **Cachix binary cache** | Once an EIF is built, it can be re-served byte-identically from cache — regardless of upstream state. |
-| **Pinned nixpkgs commit** | Stops the derivation graph from changing under you when the nixpkgs branch tip moves. |
-
-Use both together. The cache without the pin only delays the inevitable —
-when nixpkgs moves, the graph changes and the cache misses.
+See [README.md — Reproducible Build](README.md#reproducible-build) for the
+overview: what each layer protects, when to use each command, and the yaml
+schema. This document covers the step-by-step setup.
 
 ## 1. Set up Cachix (one-time)
 
@@ -44,27 +32,40 @@ nix profile install nixpkgs#cachix
 
 ## 2. Pin nixpkgs
 
-```sh
-enclave nixpkgs pin --latest
-```
-
-This:
-- queries `git ls-remote` for the tip of `nixos-25.11`,
-- computes the SRI hash via `nix-prefetch-url --unpack`,
-- writes `nix.nixpkgs_rev` + `nix.nixpkgs_hash` to `enclave/enclave.yaml`,
-- rewrites `enclave/flake.nix`'s `nixpkgs.url` line to point at the commit.
-
-Validate the pin without bumping:
+The framework ships a pinned `nixpkgs` SHA in every release (alongside the
+`aws-nitro-util` and `flake-utils` pins), so new projects are reproducible
+by default without any extra steps. You only need `enclave nixpkgs pin` when
+you want to **upgrade** to a newer nixpkgs commit — for example to pick up
+security patches or a newer toolchain version.
 
 ```sh
-enclave nixpkgs pin --check
+enclave nixpkgs pin
 ```
 
-Follow a different branch:
+What it does:
+1. `git ls-remote github.com/NixOS/nixpkgs refs/heads/nixos-25.11` → gets the current tip SHA
+2. `nix-prefetch-url --unpack` on the tarball → computes the SRI hash
+3. Writes `nix.nixpkgs_rev` + `nix.nixpkgs_hash` to `enclave/enclave.yaml`
+4. Rewrites `nixpkgs.url` in `enclave/flake.nix` to point at the SHA
+
+After running, commit both files:
 
 ```sh
-enclave nixpkgs pin --latest --branch nixos-unstable
+git add enclave/enclave.yaml enclave/flake.nix
+git commit -m "bump nixpkgs pin"
 ```
+
+This is an intentional EIF change — the new derivation graph produces a
+different PCR0. Deploy it through the normal migration flow.
+
+**Validate the existing pin without any network access:**
+
+```sh
+enclave nixpkgs pin --check   # exits 0 if rev + hash are well-formed
+```
+
+**Requirements:** `git` and `nix-prefetch-url` (part of any Nix installation)
+must be on PATH.
 
 ## 3. Build and push
 
@@ -114,7 +115,7 @@ Bumping picks up upstream security patches. It is an intentional EIF change —
 the new PCR0 needs to go through normal migration.
 
 ```sh
-enclave nixpkgs pin --latest        # writes new rev + hash + flake.nix
+enclave nixpkgs pin        # writes new rev + hash + flake.nix
 git add enclave/enclave.yaml enclave/flake.nix
 git commit -m "bump nixpkgs pin (CVE-XXXX-YYYY)"
 enclave build --push-cache          # populate cache with new closure
@@ -160,7 +161,7 @@ PCR0 — that requires building the actual derivation.
   (the `AwsNitroUtilRef` and `FlakeUtilsRef` constants in `cli/framework_files.go`).
   Bumping is a framework-release activity, not per-project. `follows` declarations
   collapse their transitive inputs onto the operator's `nixpkgs` pin.
-- **`enclave nixpkgs pin --latest` requires `git`, `nix`, and network
+- **`enclave nixpkgs pin` requires `git`, `nix`, and network
   access.** Surface the install hints from the error messages.
 - **`flake.lock` may go stale relative to the rev in `enclave.yaml`.** If you
   see drift, delete `enclave/flake.lock` and re-run `enclave build` to
@@ -241,5 +242,5 @@ transitive flake input that wasn't there before. The lockfile is your safety
 net.
 
 The file is small (a few hundred lines of JSON), regenerated only when you
-intentionally update inputs (`nix flake update` or `enclave nixpkgs pin
---latest`), and the diff is reviewable.
+intentionally update inputs (`nix flake update` or `enclave nixpkgs pin`),
+and the diff is reviewable.

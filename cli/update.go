@@ -103,7 +103,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	if !skipDeps {
-		if language == "dotnet" {
+		if cfg.App.Vendor {
+			fmt.Println("[update] vendor: true — skipping vendor hash (using committed vendor/)")
+		} else if language == "dotnet" {
 			fmt.Println("[update] Generating NuGet deps.json...")
 			if dErr := generateDotnetDeps(root); dErr != nil {
 				fmt.Printf("[update] Warning: could not generate deps.json: %v\n", dErr)

@@ -955,14 +955,14 @@ else
 fi
 
 # Verify persistent storage key survived migration+restart (written in integration test 13).
+# GET /test/storage-persistence reads the known key and compares byte-for-byte.
+# 200+ok=true → data intact. 404 → data lost. 500 → value corrupted. All non-200 are FAIL.
 PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage-persistence" 2>/dev/null || echo "")
-PERSIST_PHASE=$(echo "$PERSIST_RESP" | jq -r '.phase // empty' 2>/dev/null || echo "")
-if [ "$PERSIST_PHASE" = "verify" ] && echo "$PERSIST_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+if echo "$PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
   echo "  PASS: Persistent storage survived migration+restart"
-elif [ "$PERSIST_PHASE" = "write" ]; then
-  echo "  INFO: Persistent key was re-written (expected after full restart)"
 else
-  echo "  WARN: Could not verify storage persistence: ${PERSIST_RESP:0:120}"
+  echo "  FAIL: Persistent storage lost or corrupted during migration: ${PERSIST_RESP:0:200}" >&2
+  exit 1
 fi
 
 # Verify dynamic secrets API works after restart.
@@ -974,35 +974,26 @@ else
   exit 1
 fi
 
-# Verify attestation pubkey + PCR16 hash survived migration (write/verify pattern).
-# Pre-migration values were stored to encrypted storage in integration test 14.
+# Verify attestation pubkey + PCR16 survived migration (written in integration test 15).
+# GET /test/attestation-persistence re-derives current values and compares to stored.
+# 200+ok=true → SIGNING_KEY intact and derivation matches. 404 → storage lost. 500 → mismatch.
 ATTEST_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/attestation-persistence" 2>/dev/null || echo "")
-ATTEST_PERSIST_PHASE=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.phase // empty' 2>/dev/null || echo "")
-if [ "$ATTEST_PERSIST_PHASE" = "verify" ]; then
-  PUBKEY_MATCH=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.pubkey_match // false' 2>/dev/null || echo "false")
-  PCR16_MATCH=$(echo "$ATTEST_PERSIST_RESP" | jq -r '.pcr16_match // false' 2>/dev/null || echo "false")
-  if [ "$PUBKEY_MATCH" = "true" ] && [ "$PCR16_MATCH" = "true" ]; then
-    echo "  PASS: Attestation pubkey + PCR16 identical after migration (SIGNING_KEY survived)"
-  else
-    echo "  FAIL: Attestation values changed after migration!" >&2
-    echo "$ATTEST_PERSIST_RESP" | jq . >&2
-    exit 1
-  fi
-elif [ "$ATTEST_PERSIST_PHASE" = "write" ]; then
-  echo "  INFO: Attestation persistence re-written (expected after full restart)"
+if echo "$ATTEST_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  echo "  PASS: Attestation pubkey + PCR16 identical after migration (SIGNING_KEY survived)"
 else
-  echo "  WARN: Could not verify attestation persistence: ${ATTEST_PERSIST_RESP:0:120}"
+  echo "  FAIL: Attestation data lost or changed during migration!" >&2
+  echo "$ATTEST_PERSIST_RESP" | jq . >&2
+  exit 1
 fi
 
-# Verify dynamic secret created before migration survived restart.
+# Verify dynamic secret created before migration survived restart (written in integration test 14).
+# GET /test/dynamic-secret-persistence reads the known secret and compares value byte-for-byte.
 DYN_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-DYN_PERSIST_PHASE=$(echo "$DYN_PERSIST_RESP" | jq -r '.phase // empty' 2>/dev/null || echo "")
-if [ "$DYN_PERSIST_PHASE" = "verify" ] && echo "$DYN_PERSIST_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
+if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
   echo "  PASS: Dynamic secret survived migration+restart"
-elif [ "$DYN_PERSIST_PHASE" = "write" ]; then
-  echo "  INFO: Dynamic secret was re-written (expected after full restart)"
 else
-  echo "  WARN: Could not verify dynamic secret persistence: ${DYN_PERSIST_RESP:0:120}"
+  echo "  FAIL: Dynamic secret lost or corrupted during migration: ${DYN_PERSIST_RESP:0:200}" >&2
+  exit 1
 fi
 
 # Step 8.5: Verify new atomic-migration observability endpoints and CLI commands.

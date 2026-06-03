@@ -12,40 +12,38 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const defaultNixpkgsBranch = "nixos-25.11"
+// nixpkgsBranch is the nixpkgs branch tracked by `enclave nixpkgs pin`.
+const nixpkgsBranch = "nixos-25.11"
 
 func nixpkgsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "nixpkgs",
 		Short: "Manage the pinned nixpkgs commit for reproducible builds",
-		Long: `Pin the nixpkgs revision used by the flake template to a specific commit.
-
-A pinned commit guarantees the derivation graph is byte-identical across
-builds — so the EIF stays reproducible even when the nixpkgs branch tip
-moves upstream (security patches, package updates).
-
-Use 'enclave nixpkgs pin --latest' to fetch the current branch tip and
-write it to enclave.yaml + enclave/flake.nix. Use 'enclave nixpkgs pin --check'
-to validate the existing pin without bumping it.`,
 	}
 	cmd.AddCommand(nixpkgsPinCmd())
 	return cmd
 }
 
 func nixpkgsPinCmd() *cobra.Command {
-	var latest bool
 	var checkOnly bool
-	var branch string
 	cmd := &cobra.Command{
 		Use:   "pin",
-		Short: "Pin nixpkgs to a specific commit for byte-identical EIFs",
+		Short: "Pin nixpkgs to the current nixos-25.11 tip",
+		Long: `Fetches the current tip of nixos-25.11, computes its SRI hash via
+nix-prefetch-url, and writes both into:
+
+  enclave/enclave.yaml  →  nix.nixpkgs_rev + nix.nixpkgs_hash
+  enclave/flake.nix     →  nixpkgs.url = "github:NixOS/nixpkgs/<sha>"
+
+After running, commit both files. Subsequent builds use the pinned commit
+so the derivation graph — and therefore PCR0 — stays byte-identical until
+you deliberately bump the pin.
+
+The framework already ships a pinned SHA as its default, so this command
+is only needed when you want to upgrade to a newer nixpkgs commit.
+
+Use --check to validate the existing pin without any network access.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !latest && !checkOnly {
-				return fmt.Errorf("specify one of --latest or --check")
-			}
-			if latest && checkOnly {
-				return fmt.Errorf("--latest and --check are mutually exclusive")
-			}
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
@@ -53,18 +51,16 @@ func nixpkgsPinCmd() *cobra.Command {
 			if checkOnly {
 				return runPinCheck(cfg)
 			}
-			return runPinLatest(branch)
+			return runPinLatest()
 		},
 	}
-	cmd.Flags().BoolVar(&latest, "latest", false, "Fetch the latest commit from --branch and pin to it (writes enclave.yaml + enclave/flake.nix)")
-	cmd.Flags().BoolVar(&checkOnly, "check", false, "Validate the existing pin without bumping (no network)")
-	cmd.Flags().StringVar(&branch, "branch", defaultNixpkgsBranch, "nixpkgs branch to follow when --latest is set")
+	cmd.Flags().BoolVar(&checkOnly, "check", false, "Validate the existing pin without fetching (no network)")
 	return cmd
 }
 
 func runPinCheck(cfg *Config) error {
 	if cfg.Nix.NixpkgsRev == "" {
-		return fmt.Errorf("no pin set — nix.nixpkgs_rev is empty in enclave.yaml (run `enclave nixpkgs pin --latest` to create one)")
+		return fmt.Errorf("no pin set — nix.nixpkgs_rev is empty in enclave.yaml (run `enclave nixpkgs pin` to create one)")
 	}
 	if !commitSHARegex.MatchString(cfg.Nix.NixpkgsRev) {
 		return fmt.Errorf("nix.nixpkgs_rev %q is not a 40-char hex commit SHA", cfg.Nix.NixpkgsRev)
@@ -76,7 +72,8 @@ func runPinCheck(cfg *Config) error {
 	return nil
 }
 
-func runPinLatest(branch string) error {
+func runPinLatest() error {
+	branch := nixpkgsBranch
 	root, err := findRepoRoot()
 	if err != nil {
 		return err
@@ -118,7 +115,7 @@ func runPinLatest(branch string) error {
 // API) needs auth for high-traffic users.
 func gitLsRemoteBranch(repoURL, branch string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("`git` not found on PATH — install git to use `enclave nixpkgs pin --latest`")
+		return "", fmt.Errorf("`git` not found on PATH — install git to use `enclave nixpkgs pin`")
 	}
 	out, err := exec.Command("git", "ls-remote", repoURL, "refs/heads/"+branch).Output()
 	if err != nil {
@@ -236,21 +233,29 @@ func updateNixpkgsInYaml(path, rev, hash string) error {
 	revRepl := fmt.Sprintf(`${1}%q`, rev)
 	hashRepl := fmt.Sprintf(`${1}%q`, hash)
 
-	if nixpkgsRevYamlRegex.MatchString(content) {
+	hasRev := nixpkgsRevYamlRegex.MatchString(content)
+	hasHash := nixpkgsHashYamlRegex.MatchString(content)
+
+	switch {
+	case hasRev && hasHash:
 		content = nixpkgsRevYamlRegex.ReplaceAllString(content, revRepl)
-	} else {
-		content = insertUnderNixBlock(content, fmt.Sprintf("  nixpkgs_rev:  %q", rev))
-	}
-	if nixpkgsHashYamlRegex.MatchString(content) {
 		content = nixpkgsHashYamlRegex.ReplaceAllString(content, hashRepl)
-	} else {
+	case hasRev:
+		content = nixpkgsRevYamlRegex.ReplaceAllString(content, revRepl)
 		content = insertUnderNixBlock(content, fmt.Sprintf("  nixpkgs_hash: %q", hash))
+	case hasHash:
+		content = nixpkgsHashYamlRegex.ReplaceAllString(content, hashRepl)
+		content = insertUnderNixBlock(content, fmt.Sprintf("  nixpkgs_rev:  %q", rev))
+	default:
+		// Neither field exists — insert both in one replacement to avoid
+		// the double-call clobber bug (each call matches the same `nix:` line).
+		content = insertUnderNixBlock(content, fmt.Sprintf("  nixpkgs_rev:  %q\n  nixpkgs_hash: %q", rev, hash))
 	}
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-// insertUnderNixBlock appends a line immediately after the `nix:` header,
-// indented to match. Caller guarantees the nix: block exists.
+// insertUnderNixBlock inserts a line (or block of lines) immediately after
+// the `nix:` header. Caller guarantees the nix: block exists.
 func insertUnderNixBlock(content, line string) string {
 	return nixBlockYamlRegex.ReplaceAllString(content, "nix:\n"+line)
 }

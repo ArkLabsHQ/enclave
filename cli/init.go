@@ -106,7 +106,7 @@ tls:
 # builds resolve from the cache instead of upstream. nixpkgs_rev pins the
 # flake's nixpkgs input to a commit so the derivation graph is stable.
 #
-# Bump the pin with: enclave nixpkgs pin --latest
+# Bump the pin with: enclave nixpkgs pin
 # Push the closure after a build with: enclave build --push-cache
 #
 # nix:

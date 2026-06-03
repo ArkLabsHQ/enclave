@@ -19,12 +19,14 @@ const (
 	awsNitroUtilRefPlaceholder  = "{{AwsNitroUtilRef}}"
 )
 
-// DefaultNixpkgsRef is the nixpkgs reference baked into scaffolded flakes
-// when the operator hasn't set nix.nixpkgs_rev in enclave.yaml. A branch
-// reference — same behavior as before this feature existed — so opting in
-// to reproducibility is an explicit `enclave nixpkgs pin --latest` step,
-// not something the framework silently does on the operator's behalf.
-const DefaultNixpkgsRef = "nixos-25.11"
+// DefaultNixpkgsRef is the nixpkgs commit baked into scaffolded flakes when
+// the operator hasn't set nix.nixpkgs_rev in enclave.yaml. Pinned per
+// framework release (same pattern as FlakeUtilsRef / AwsNitroUtilRef) so
+// new projects are reproducible by default. Operators who want a different
+// commit run `enclave nixpkgs pin` to override.
+//
+// nixpkgs @ nixos-25.11 tip, fetched 2026-06-03.
+const DefaultNixpkgsRef = "25f538306313eae3927264466c70d7001dcea1df"
 
 // Framework-managed flake inputs. Unlike nixpkgs (which the operator pins
 // for reproducibility of their own derivation graph), these are framework
@@ -976,7 +978,7 @@ const frameworkFlakeNixDotnet = `{
 
   inputs = {
     # Pinned nixpkgs commit for reproducible .NET SDK version.
-    # Update deliberately with: enclave nixpkgs pin --latest
+    # Update deliberately with: enclave nixpkgs pin
     nixpkgs.url = "github:NixOS/nixpkgs/{{NixpkgsRef}}";
     flake-utils.url = "github:numtide/flake-utils/{{FlakeUtilsRef}}";
     flake-utils.inputs.systems.follows = "";

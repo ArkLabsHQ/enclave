@@ -168,35 +168,34 @@ else
   fail "Attestation document" "${ATTEST_DOC_RESP:0:120}"
 fi
 
-# Test 13: Storage persistence (write a known key for post-migration verification).
-echo "[13/28] Storage persistence (write phase)"
-PERSIST_RESP=$($CURL "${BASE_URL}/test/storage-persistence" 2>/dev/null || echo "")
-if [ -n "$PERSIST_RESP" ] && echo "$PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
-  PHASE=$(echo "$PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
-  pass "Storage persistence $PHASE phase"
+# Test 13: Storage persistence — write a known key for post-migration verification.
+# Uses POST to unconditionally write (deletes stale data first), so the
+# post-migration GET verify always has a fresh baseline.
+echo "[13/28] Storage persistence (write)"
+PERSIST_RESP=$($CURL -X POST "${BASE_URL}/test/storage-persistence" 2>/dev/null || echo "")
+if echo "$PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  pass "Storage persistence write"
 else
-  fail "Storage persistence" "${PERSIST_RESP:0:120}"
+  fail "Storage persistence write" "${PERSIST_RESP:0:120}"
 fi
 
-# Test 14: Dynamic secret persistence (write a known secret for post-migration verification).
-echo "[14/28] Dynamic secret persistence (write phase)"
-DYN_PERSIST_RESP=$($CURL "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if [ -n "$DYN_PERSIST_RESP" ] && echo "$DYN_PERSIST_RESP" | jq -e '.phase' >/dev/null 2>&1; then
-  DYN_PHASE=$(echo "$DYN_PERSIST_RESP" | jq -r '.phase' 2>/dev/null || echo "")
-  pass "Dynamic secret persistence $DYN_PHASE phase"
+# Test 14: Dynamic secret persistence — write a known secret for post-migration verification.
+echo "[14/28] Dynamic secret persistence (write)"
+DYN_PERSIST_RESP=$($CURL -X POST "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
+if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  pass "Dynamic secret persistence write"
 else
-  fail "Dynamic secret persistence" "${DYN_PERSIST_RESP:0:120}"
+  fail "Dynamic secret persistence write" "${DYN_PERSIST_RESP:0:120}"
 fi
 
-# Test 15: Attestation persistence (write pubkey + PCR16 hash for post-migration verification).
-echo "[15/28] Attestation persistence (write phase)"
-ATTEST_PERSIST=$($CURL "${BASE_URL}/test/attestation-persistence" 2>/dev/null || echo "")
-if [ -n "$ATTEST_PERSIST" ] && echo "$ATTEST_PERSIST" | jq -e '.phase' >/dev/null 2>&1; then
-  ATTEST_PHASE=$(echo "$ATTEST_PERSIST" | jq -r '.phase' 2>/dev/null || echo "")
+# Test 15: Attestation persistence — write pubkey + PCR16 hash for post-migration verification.
+echo "[15/28] Attestation persistence (write)"
+ATTEST_PERSIST=$($CURL -X POST "${BASE_URL}/test/attestation-persistence" 2>/dev/null || echo "")
+if echo "$ATTEST_PERSIST" | jq -e '.ok == true' >/dev/null 2>&1; then
   ATTEST_PCR16=$(echo "$ATTEST_PERSIST" | jq -r '.pcr16 // empty' 2>/dev/null || echo "")
-  pass "Attestation persistence $ATTEST_PHASE phase (PCR16: ${ATTEST_PCR16:0:16}...)"
+  pass "Attestation persistence write (PCR16: ${ATTEST_PCR16:0:16}...)"
 else
-  fail "Attestation persistence" "${ATTEST_PERSIST:0:120}"
+  fail "Attestation persistence write" "${ATTEST_PERSIST:0:120}"
 fi
 
 # Test 16: Schnorr signature still valid (sanity check before migration).

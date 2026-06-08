@@ -234,3 +234,28 @@ func TestApplyEnvOverrides_SSMError(t *testing.T) {
 		t.Fatal("expected error when SSM fails")
 	}
 }
+
+// The overlay must never change framework-identity vars: an SSM writer could
+// otherwise set ENCLAVE_DEPLOYMENT=dev to flip the COSE-verification skip.
+func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	_ = os.Unsetenv("SAFE_KEY")
+	fake := &fakeSSM{params: map[string]string{
+		"/prod/myapp/env/ENCLAVE_DEPLOYMENT": "dev",
+		"/prod/myapp/env/ENCLAVE_APP_NAME":   "evil",
+		"/prod/myapp/env/SAFE_KEY":           "ok",
+	}}
+	if err := applyEnvOverrides(context.Background(), fake, "prod", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := os.Getenv("ENCLAVE_DEPLOYMENT"); got != "prod" {
+		t.Errorf("ENCLAVE_DEPLOYMENT overridden via overlay to %q; must stay %q", got, "prod")
+	}
+	if got := os.Getenv("ENCLAVE_APP_NAME"); got != "myapp" {
+		t.Errorf("ENCLAVE_APP_NAME overridden via overlay to %q; must stay %q", got, "myapp")
+	}
+	if got := os.Getenv("SAFE_KEY"); got != "ok" {
+		t.Errorf("non-identity key should still apply, got %q", got)
+	}
+}

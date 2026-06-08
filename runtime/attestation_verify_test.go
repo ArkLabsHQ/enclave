@@ -57,6 +57,14 @@ func useAttestationRoots(t *testing.T, pool *x509.CertPool) {
 // to the CA).
 func buildSignedAttestation(t *testing.T, pcrs map[uint][]byte) signedAttestation {
 	t.Helper()
+	now := time.Now()
+	return buildSignedAttestationCustom(t, pcrs, now.Add(-time.Hour), now.Add(time.Hour), now)
+}
+
+// buildSignedAttestationCustom lets a test control the cert validity window and
+// the document timestamp (to exercise verification as-of the attestation time).
+func buildSignedAttestationCustom(t *testing.T, pcrs map[uint][]byte, certNotBefore, certNotAfter, timestamp time.Time) signedAttestation {
+	t.Helper()
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
@@ -65,8 +73,8 @@ func buildSignedAttestation(t *testing.T, pcrs map[uint][]byte) signedAttestatio
 	caTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "test-nitro-root"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotBefore:             certNotBefore,
+		NotAfter:              certNotAfter,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
@@ -88,8 +96,8 @@ func buildSignedAttestation(t *testing.T, pcrs map[uint][]byte) signedAttestatio
 	leafTmpl := &x509.Certificate{
 		SerialNumber:       big.NewInt(2),
 		Subject:            pkix.Name{CommonName: "test-nitro-leaf"},
-		NotBefore:          time.Now().Add(-time.Hour),
-		NotAfter:           time.Now().Add(time.Hour),
+		NotBefore:          certNotBefore,
+		NotAfter:           certNotAfter,
 		SignatureAlgorithm: x509.ECDSAWithSHA384,
 	}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
@@ -99,7 +107,7 @@ func buildSignedAttestation(t *testing.T, pcrs map[uint][]byte) signedAttestatio
 
 	doc := nitrite.Document{
 		ModuleID:    "test-module",
-		Timestamp:   uint64(time.Now().UnixMilli()),
+		Timestamp:   uint64(timestamp.UnixMilli()),
 		Digest:      "SHA384",
 		PCRs:        pcrs,
 		Certificate: leafDER,
@@ -212,16 +220,27 @@ func buildForgedAttestation(t *testing.T, pcrs map[uint][]byte) string {
 	return base64.StdEncoding.EncodeToString(out)
 }
 
+// predecessorPCRs builds a PCRs map that sets PCR0 to the predecessor's own
+// measurement and commits PCR31 to targetPCR0Hex — what an honest predecessor's
+// attestation carries when handing off to targetPCR0Hex.
+func predecessorPCRs(t *testing.T, prevPCR0Bytes []byte, targetPCR0Hex string) map[uint][]byte {
+	t.Helper()
+	return map[uint][]byte{
+		0:                 prevPCR0Bytes,
+		migrationPCRIndex: pcr31Commitment(t, targetPCR0Hex),
+	}
+}
+
 func TestVerifyPCR31Commitment_ValidSignedDocPasses(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod") // force the verification path
 
 	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-	att := buildSignedAttestation(t, map[uint][]byte{
-		migrationPCRIndex: pcr31Commitment(t, myPCR0),
-	})
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0); err != nil {
+	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err != nil {
 		t.Fatalf("valid commitment should verify, got: %v", err)
 	}
 }
@@ -232,11 +251,11 @@ func TestVerifyPCR31Commitment_ForgedDocRejected(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 
 	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
-	forged := buildForgedAttestation(t, map[uint][]byte{
-		migrationPCRIndex: pcr31Commitment(t, myPCR0),
-	})
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	forged := buildForgedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 
-	if err := verifyPCR31Commitment(forged, myPCR0); err == nil {
+	if err := verifyPCR31Commitment(forged, myPCR0, prevPCR0); err == nil {
 		t.Fatal("forged (unsigned) attestation with correct PCR31 must be rejected")
 	}
 }
@@ -247,13 +266,13 @@ func TestVerifyPCR31Commitment_UntrustedSignerRejected(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 
 	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xef}, 48))
-	att := buildSignedAttestation(t, map[uint][]byte{
-		migrationPCRIndex: pcr31Commitment(t, myPCR0),
-	})
-	other := buildSignedAttestation(t, map[uint][]byte{migrationPCRIndex: make([]byte, 48)})
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
+	other := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 	useAttestationRoots(t, other.roots) // trust a different CA
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0); err == nil {
+	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
 		t.Fatal("attestation from an untrusted CA must be rejected")
 	}
 }
@@ -265,13 +284,48 @@ func TestVerifyPCR31Commitment_WrongTargetRejected(t *testing.T) {
 
 	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x11}, 48))
 	otherPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x22}, 48))
-	att := buildSignedAttestation(t, map[uint][]byte{
-		migrationPCRIndex: pcr31Commitment(t, otherPCR0),
-	})
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, otherPCR0))
 	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0); err == nil {
+	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
 		t.Fatal("commitment to a different PCR0 must be rejected")
+	}
+}
+
+// A validly signed document whose PCR0 does not match the stored predecessor
+// PCR0 must be rejected — a different enclave's document cannot be substituted.
+func TestVerifyPCR31Commitment_PCR0MismatchRejected(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+
+	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
+	prevPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
+	wrongPCR0Bytes := bytes.Repeat([]byte{0x77}, 48) // doc attests a different PCR0
+	att := buildSignedAttestation(t, predecessorPCRs(t, wrongPCR0Bytes, myPCR0))
+	useAttestationRoots(t, att.roots)
+
+	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
+		t.Fatal("attestation whose PCR0 differs from MigrationPreviousPCR0 must be rejected")
+	}
+}
+
+// A cert that has expired by now but was valid at the attestation timestamp must
+// still verify — the document is checked as-of its own timestamp, not boot time.
+func TestVerifyPCR31Commitment_ExpiredCertValidAtTimestamp(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+
+	now := time.Now()
+	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	// Cert window is entirely in the past; the timestamp falls inside it.
+	att := buildSignedAttestationCustom(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0),
+		now.Add(-3*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour))
+	useAttestationRoots(t, att.roots)
+
+	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err != nil {
+		t.Fatalf("attestation valid at its timestamp must verify despite a now-expired cert, got: %v", err)
 	}
 }
 
@@ -282,11 +336,11 @@ func TestVerifyPCR31Commitment_DevPrefixSkipsVerification(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 
 	myPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
-	forged := buildForgedAttestation(t, map[uint][]byte{
-		migrationPCRIndex: pcr31Commitment(t, myPCR0),
-	})
+	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
+	forged := buildForgedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 
-	if err := verifyPCR31Commitment(forged, myPCR0); err != nil {
+	if err := verifyPCR31Commitment(forged, myPCR0, prevPCR0); err != nil {
 		t.Fatalf("dev prefix should skip COSE verification, got: %v", err)
 	}
 }

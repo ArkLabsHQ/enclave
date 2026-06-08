@@ -460,13 +460,14 @@ func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 stri
 	if attestB64 == "" {
 		return nil
 	}
-	return verifyPCR31Commitment(attestB64, ownPCR0)
+	return verifyPCR31Commitment(attestB64, ownPCR0, prevPCR0)
 }
 
 // verifyPCR31Commitment: nil iff the previous enclave's attestation document
 // committed to handing off to THIS enclave's PCR0 (by extending PCR31). The doc
-// is verified against the AWS Nitro root before PCR31 is trusted.
-func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
+// is verified against the AWS Nitro root, and its PCR0 must match the stored
+// predecessor PCR0, before PCR31 is trusted.
+func verifyPCR31Commitment(attestDocB64, myPCR0, prevPCR0 string) error {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
 		return fmt.Errorf("decode attestation base64: %w", err)
@@ -474,6 +475,15 @@ func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
 	result, err := verifyAttestationDoc(attestDoc)
 	if err != nil {
 		return fmt.Errorf("verify predecessor attestation: %w", err)
+	}
+	// Bind the attestation to the claimed predecessor: a different, still
+	// validly-signed enclave's document must not be substitutable.
+	attestedPCR0, ok := result.Document.PCRs[0]
+	if !ok {
+		return fmt.Errorf("PCR0 not found in attestation document")
+	}
+	if !strings.EqualFold(hex.EncodeToString(attestedPCR0), prevPCR0) {
+		return fmt.Errorf("attested PCR0 does not match stored MigrationPreviousPCR0")
 	}
 	pcr31, ok := result.Document.PCRs[migrationPCRIndex]
 	if !ok {

@@ -26,11 +26,21 @@ func getDeployment() string {
 	return "dev"
 }
 
+// nonOverridableEnv lists framework-identity vars the SSM env overlay must
+// never set. They are baked into the EIF (measured into PCR0) and name the
+// SSM/KMS namespace; letting the overlay change them would redirect the
+// namespace or flip security-critical checks like COSE skip.
+var nonOverridableEnv = map[string]bool{
+	"ENCLAVE_DEPLOYMENT": true,
+	"ENCLAVE_APP_NAME":   true,
+}
+
 // skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
 // whose local QEMU NSM produces unsigned mock documents. Any other deployment
 // verifies against the AWS Nitro root. The deployment is baked into the EIF at
-// build time (and measured into PCR0), so this security-critical check cannot be
-// flipped at deploy time.
+// build time (measured into PCR0) and cannot be set via the SSM env overlay
+// (nonOverridableEnv), so this security-critical check cannot be flipped at
+// deploy time.
 func skipCOSEVerification() bool {
 	return getDeployment() == "dev"
 }
@@ -161,6 +171,14 @@ func applyEnvOverrides(ctx context.Context, ssmClient ssmGetter, deployment, app
 			// Defensive: skip empty or nested keys so a misconfigured SSM
 			// tree can't surface unexpected env var names.
 			if key == "" || strings.ContainsRune(key, '/') {
+				continue
+			}
+			// Never let the overlay change the framework identity: these are
+			// baked into the EIF (measured into PCR0) and name the SSM/KMS
+			// namespace. Allowing an SSM writer to set them would redirect the
+			// namespace or flip security-critical checks (e.g. COSE skip).
+			if nonOverridableEnv[key] {
+				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
 				continue
 			}
 			if err := os.Setenv(key, *p.Value); err != nil {

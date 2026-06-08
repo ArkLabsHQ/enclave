@@ -203,11 +203,21 @@ func verifyAttestationDoc(doc []byte) (*nitrite.Result, error) {
 		return parseCOSEPayloadInsecure(doc)
 	}
 
+	// Verify the cert chain as of the attestation's own timestamp, not now: the
+	// document is generated at migration time and read by the new enclave at a
+	// later boot, so a short-lived Nitro leaf cert that expired in between must
+	// not reject an otherwise-valid attestation. The timestamp lives inside the
+	// signed payload, so a forged one fails the signature check below.
+	pre, err := parseCOSEPayloadInsecure(doc)
+	if err != nil {
+		return nil, fmt.Errorf("parse attestation timestamp: %w", err)
+	}
+
 	// nitrite returns nil only when the cert chains to a trusted root and the
-	// signature is valid; reject any failure (untrusted, expired, bad signature).
+	// signature is valid; reject any failure (untrusted or bad signature).
 	res, err := nitrite.Verify(doc, nitrite.VerifyOptions{
 		Roots:       attestationRoots,
-		CurrentTime: time.Now(),
+		CurrentTime: time.UnixMilli(int64(pre.Document.Timestamp)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("attestation verification: %w", err)

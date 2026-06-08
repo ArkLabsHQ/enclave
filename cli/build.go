@@ -46,6 +46,7 @@ type buildConfigAppJSON struct {
 	NixNativeBuildInputs []string          `json:"nix_native_build_inputs"`
 	BinaryName           string            `json:"binary_name"`
 	Env                  map[string]string `json:"env"`
+	Vendor               bool              `json:"vendor"`
 }
 
 type buildConfigSecretJSON struct {
@@ -67,16 +68,24 @@ func buildCmd() *cobra.Command {
 		RunE:  runBuild,
 	}
 	cmd.Flags().StringP("config", "c", "", "path to enclave.yaml (defaults to enclave/enclave.yaml or ./enclave.yaml). Use to build a test variant: `enclave build --config enclave/enclave_test.yaml`.")
+	cmd.Flags().Bool("push-cache", false, "Push the built EIF closure to the first Cachix substituter after a successful build. Requires CACHIX_AUTH_TOKEN env var and the `cachix` CLI on PATH.")
 	return cmd
 }
 
 func runBuild(cmd *cobra.Command, args []string) error {
 	configPath, _ := cmd.Flags().GetString("config")
+	pushCache, _ := cmd.Flags().GetBool("push-cache")
 	cfg, err := loadConfigAt(configPath)
 	if err != nil {
 		return err
 	}
-	return runBuildWithConfig(cfg)
+	if err := runBuildWithConfig(cfg); err != nil {
+		return err
+	}
+	if pushCache {
+		return pushToCachix(cfg)
+	}
+	return nil
 }
 
 func runBuildWithConfig(cfg *Config) error {
@@ -179,6 +188,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 			NixNativeBuildInputs: nonNilStrings(cfg.App.NixNativeBuildInputs),
 			BinaryName:           cfg.App.BinaryName,
 			Env:                  resolvedEnv,
+			Vendor:               cfg.App.Vendor,
 		},
 		Secrets: secrets,
 		Runtime: buildConfigRuntimeJSON{
@@ -252,13 +262,7 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 	}
 
 	// 3. Run nix build locally against ./enclave#eif.
-	nixCmd := exec.Command("nix", "build",
-		"--impure",
-		"--extra-experimental-features", "nix-command flakes",
-		"--option", "download-attempts", "3",
-		"--out-link", ".enclave/result",
-		"./enclave#eif",
-	)
+	nixCmd := exec.Command("nix", buildNixArgs(cfg)...)
 	nixCmd.Dir = root
 	nixCmd.Stdout = os.Stdout
 	nixCmd.Stderr = os.Stderr
@@ -342,5 +346,63 @@ func buildSupervisorBinary(cfg *Config, root string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("go install supervisor: %w", err)
 	}
+	return nil
+}
+
+// buildNixArgs returns the argv for `nix build`, including any Cachix
+// substituter / trusted-public-key options derived from cfg.Nix.
+// Extracted as a helper so the argv composition can be unit-tested.
+func buildNixArgs(cfg *Config) []string {
+	args := []string{
+		"build",
+		"--impure",
+		"--extra-experimental-features", "nix-command flakes",
+		"--option", "download-attempts", "3",
+	}
+	if len(cfg.Nix.Substituters) > 0 {
+		args = append(args, "--option", "extra-substituters", strings.Join(cfg.Nix.Substituters, " "))
+	}
+	if len(cfg.Nix.TrustedPublicKeys) > 0 {
+		args = append(args, "--option", "extra-trusted-public-keys", strings.Join(cfg.Nix.TrustedPublicKeys, " "))
+	}
+	args = append(args,
+		"--out-link", ".enclave/result",
+		"./enclave#eif",
+	)
+	return args
+}
+
+// pushToCachix pushes the just-built EIF closure to the first configured
+// Cachix substituter. Requires the `cachix` CLI on PATH and CACHIX_AUTH_TOKEN
+// in the environment. Surfaces install hints when the CLI is missing.
+func pushToCachix(cfg *Config) error {
+	if len(cfg.Nix.Substituters) == 0 {
+		return fmt.Errorf("--push-cache requires at least one entry in nix.substituters in enclave.yaml")
+	}
+	cacheName := CachixCacheName(cfg.Nix.Substituters[0])
+	if cacheName == "" {
+		return fmt.Errorf("--push-cache: nix.substituters[0] %q is not a Cachix URL", cfg.Nix.Substituters[0])
+	}
+	if _, err := exec.LookPath("cachix"); err != nil {
+		return fmt.Errorf("`cachix` CLI not found on PATH — install with: nix profile install nixpkgs#cachix (or see https://docs.cachix.org/installation)")
+	}
+	if os.Getenv("CACHIX_AUTH_TOKEN") == "" {
+		return fmt.Errorf("CACHIX_AUTH_TOKEN env var not set — create a token at https://app.cachix.org/personal-auth-tokens")
+	}
+
+	root, err := findRepoRoot()
+	if err != nil {
+		return err
+	}
+	resultLink := filepath.Join(root, ".enclave", "result")
+
+	fmt.Printf("[build] Pushing closure to cachix cache %q...\n", cacheName)
+	cmd := exec.Command("cachix", "push", cacheName, resultLink)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cachix push: %w", err)
+	}
+	fmt.Printf("[build] Pushed closure to %s\n", cfg.Nix.Substituters[0])
 	return nil
 }

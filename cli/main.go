@@ -36,6 +36,8 @@ func Execute() {
 		traceCmd(),
 		metricsCmd(),
 		migrationStatusCmd(),
+		nixpkgsCmd(),
+		vendorCmd(),
 		testCmd(),
 	)
 

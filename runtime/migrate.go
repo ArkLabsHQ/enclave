@@ -308,21 +308,14 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient SSMAPI, deployment,
 		return "", "", fmt.Errorf("could not read PCR0 from NSM")
 	}
 
-	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
-	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(pcr0Param),
-		Value:     aws.String(pcr0),
-		Type:      ssmtypes.ParameterTypeString,
-		Overwrite: aws.Bool(true),
-	}); err != nil {
-		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
-	}
-
 	attestDocB64, err := getAttestationDocumentB64()
 	if err != nil {
 		return "", "", fmt.Errorf("generate attestation document: %w", err)
 	}
 
+	// Write the attestation first; PCR0 is the commit point. VerifyPredecessor-
+	// Commitment treats a recorded PCR0 as proof the attestation exists, so a
+	// partial write can never leave a predecessor without its attestation.
 	attestParam := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)
 	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(attestParam),
@@ -332,6 +325,16 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient SSMAPI, deployment,
 		Tier:      ssmtypes.ParameterTierAdvanced,
 	}); err != nil {
 		return "", "", fmt.Errorf("store PCR0 attestation in SSM: %w", err)
+	}
+
+	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(pcr0Param),
+		Value:     aws.String(pcr0),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
 	}
 
 	return pcr0, attestDocB64, nil
@@ -457,8 +460,12 @@ func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 stri
 	if err != nil {
 		return fmt.Errorf("read previous attestation: %w", err)
 	}
+	// Fail closed: a predecessor is recorded but its attestation is missing or
+	// UNSET. storePCR0WithAttestation writes the attestation before PCR0, so a
+	// recorded PCR0 always has one — a blank here is a tampered or corrupt
+	// handoff, not a state to trust.
 	if attestB64 == "" {
-		return nil
+		return fmt.Errorf("predecessor PCR0 %s recorded but its attestation is missing", prefix16(prevPCR0))
 	}
 	return verifyPCR31Commitment(attestB64, ownPCR0, prevPCR0)
 }

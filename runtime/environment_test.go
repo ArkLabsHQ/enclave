@@ -27,6 +27,10 @@ type fakeSSM struct {
 	pathCalls      int
 }
 
+func (f *fakeSSM) PutParameter(_ context.Context, _ *ssm.PutParameterInput, _ ...func(*ssm.Options)) (*ssm.PutParameterOutput, error) {
+	return &ssm.PutParameterOutput{}, nil
+}
+
 func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
 	name := aws.ToString(in.Name)
 	f.calls = append(f.calls, name)

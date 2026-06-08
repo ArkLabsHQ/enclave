@@ -283,7 +283,7 @@ const frameworkFlakeNix = `{
         # Fall back to env vars for backwards compatibility.
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -483,7 +483,7 @@ const frameworkFlakeNixNodejs = `{
         # Fall back to env vars for backwards compatibility.
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -1004,7 +1004,7 @@ const frameworkFlakeNixDotnet = `{
 
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -1185,7 +1185,7 @@ const frameworkFlakeNixRust = `{
 
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.

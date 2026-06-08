@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
+	"github.com/hf/nitrite"
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
 )
@@ -185,6 +187,61 @@ func extractPCRFromAttestation(attestationDoc []byte, index uint) ([]byte, error
 	}
 
 	return pcr, nil
+}
+
+// attestationRoots overrides the trust anchor for verifyAttestationDoc; nil uses
+// nitrite's embedded AWS Nitro root. Tests set a synthetic CA pool.
+var attestationRoots *x509.CertPool
+
+// verifyAttestationDoc verifies a COSE Sign1 document against the AWS Nitro root
+// and returns the validated result. The "dev" deployment skips the check (its
+// QEMU NSM is unsigned); any other deployment rejects a forged or unsigned doc.
+func verifyAttestationDoc(doc []byte) (*nitrite.Result, error) {
+	if skipCOSEVerification() {
+		slog.Warn("INSECURE: skipping COSE signature verification of attestation document",
+			"deployment", getDeployment())
+		return parseCOSEPayloadInsecure(doc)
+	}
+
+	// nitrite returns nil only when the cert chains to a trusted root and the
+	// signature is valid; reject any failure (untrusted, expired, bad signature).
+	res, err := nitrite.Verify(doc, nitrite.VerifyOptions{
+		Roots:       attestationRoots,
+		CurrentTime: time.Now(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("attestation verification: %w", err)
+	}
+	return res, nil
+}
+
+// parseCOSEPayloadInsecure decodes a COSE Sign1 envelope without verifying the
+// signature or chain. Reached only when skipCOSEVerification() is true.
+func parseCOSEPayloadInsecure(doc []byte) (*nitrite.Result, error) {
+	var envelope struct {
+		_           struct{} `cbor:",toarray"`
+		Protected   []byte
+		Unprotected cbor.RawMessage
+		Payload     []byte
+		Signature   []byte
+	}
+	if err := cbor.Unmarshal(doc, &envelope); err != nil {
+		return nil, fmt.Errorf("decode COSE Sign1 envelope: %w", err)
+	}
+	if len(envelope.Payload) == 0 {
+		return nil, fmt.Errorf("COSE Sign1 payload empty")
+	}
+	var parsed nitrite.Document
+	if err := cbor.Unmarshal(envelope.Payload, &parsed); err != nil {
+		return nil, fmt.Errorf("decode attestation document: %w", err)
+	}
+	return &nitrite.Result{
+		Document:    &parsed,
+		Protected:   envelope.Protected,
+		Payload:     envelope.Payload,
+		Signature:   envelope.Signature,
+		SignatureOK: false,
+	}, nil
 }
 
 // getAttestationDocumentB64 generates a minimal NSM attestation document (without

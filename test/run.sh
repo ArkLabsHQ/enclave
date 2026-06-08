@@ -802,7 +802,7 @@ echo ""
 # A real migration deploys new code with a different PCR0. The second EIF
 # must be pre-built on the host (see build-migration-eif.sh) and placed at
 # app/.enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
-echo "=== [7/9] Running migration (enclave deploy upgrade) ==="
+echo "=== [7/9] Running migration (tofu apply upgrade) ==="
 MIGRATION_EIF="${SCRIPT_DIR}/app/.enclave/artifacts/image-v2.eif"
 if [ -f "$MIGRATION_EIF" ]; then
   echo "  Using migration EIF: $MIGRATION_EIF"

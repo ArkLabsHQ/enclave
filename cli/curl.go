@@ -15,7 +15,7 @@ func curlCmd() *cobra.Command {
 		Use:   "curl <path>",
 		Short: "Call an endpoint on the deployed enclave",
 		Long: `Makes an HTTP request to the deployed enclave, auto-discovering the
-endpoint from CDK outputs (Elastic IP). TLS verification is skipped
+endpoint from tofu outputs (Elastic IP). TLS verification is skipped
 by default since nitriding uses self-signed certificates.
 
 Examples:

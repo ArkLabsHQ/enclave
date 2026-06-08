@@ -154,7 +154,7 @@ variable "github_token" {
 
 # --- Local artifact overrides ---
 # When set, these skip the GitHub Release download and use local files directly.
-# Used by enclave deploy (CLI builds artifacts locally) and integration tests.
+# Used by tofu apply (CLI builds artifacts locally) and integration tests.
 
 variable "eif_path" {
   description = "Local path to image.eif. Overrides GitHub Release download."

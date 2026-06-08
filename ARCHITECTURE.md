@@ -4,7 +4,7 @@
 
 1. [High-Level Architecture](#1-high-level-architecture)
 2. [Build Flow](#2-build-flow)
-3. [CDK Deployment](#3-cdk-deployment)
+3. [OpenTofu Deployment](#3-opentofu-deployment)
 4. [EC2 Host Bootstrap](#4-ec2-host-bootstrap)
 5. [Host Systemd Services](#5-host-systemd-services)
 6. [Enclave Boot](#6-enclave-boot-startsh)
@@ -81,9 +81,9 @@
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| **CLI** | Root Go module (`cmd/enclave/`) | `init`, `build`, `deploy`, `verify`, `start`, `stop`, `destroy` |
+| **CLI** | Root Go module (`cmd/enclave/`) | `init`, `build`, `tofu`, `verify`, `start`, `stop`, `status` |
 | **Nix Flake** | `flake.nix` | Deterministic EIF build (supervisor + app + nitriding + viproxy) |
-| **CDK Stack** | `cdk.go` | AWS infrastructure (KMS, SSM, EC2, VPC, S3, IAM) |
+| **OpenTofu module** | `cli/tofu_files.go` (scaffolded into `tofu/`) | AWS infrastructure (KMS, SSM, EC2, VPC, S3, IAM) |
 | **supervisor** | `supervisor/` | Host-side all-in-one: management API, in-process gvproxy, in-process IMDS AF_VSOCK forwarder, and enclave lifecycle watchdog. Replaces the former `enclave-watchdog`, `enclave-imds-proxy`, and standalone `gvproxy.service`. |
 | **Runtime** | `runtime/` | In-enclave orchestrator (secrets, attestation, storage, HTTP) |
 | **Nitriding** | Third-party (Brave) | TLS termination, attestation document serving |
@@ -133,7 +133,7 @@ name: my-app
 version: "1.0.0"
 region: us-east-1
 account: "123456789012"    # 12-digit AWS account ID (validated)
-prefix: dev                # deployment prefix (e.g., dev, staging, prod)
+deployment: dev            # deployment name (e.g., dev, staging, prod)
 
 app:
   language: go
@@ -170,7 +170,7 @@ enclave build
     ├─ 1. Load enclave.yaml, validate SDK fields (rev, hash, vendor_hash)
     │
     ├─ 2. Generate .enclave/build-config.json from enclave.yaml
-    │      Template substitution: {{region}}, {{prefix}}, {{version}}
+    │      Template substitution: {{region}}, {{deployment}}, {{version}}
     │      Includes: APP_BINARY_NAME, secrets config, env vars
     │
     ├─ 3. git add --intent-to-add (make files visible to Nix flakes)
@@ -245,27 +245,29 @@ enclave build
 
 ---
 
-## 3. CDK Deployment
+## 3. OpenTofu Deployment
 
-### 3.1 Deploy Command (`enclave deploy`)
+### 3.1 Deploy Flow (`enclave tofu` + `tofu apply`)
 
 ```
-enclave deploy
+enclave tofu
     │
     ├─ Load config, validate SDK
-    ├─ Read PCR0 from .enclave/artifacts/pcr.json
+    ├─ Scaffold the OpenTofu module into tofu/ (from cli/tofu_files.go)
+    └─ Write tofu/terraform.tfvars.json (EIF + supervisor paths, PCR0)
+
+tofu init && tofu apply
+    │
     ├─ Create/resolve KMS key
     ├─ Pre-create SSM parameters for secrets
-    ├─ Synth CDK stack (inline, no cdk.json)
-    │   └─ Inject AZ context (Go CDK has no context provider)
-    ├─ cdk deploy --app enclave/cdk.out --outputs-file enclave/cdk-outputs.json
+    ├─ Provision VPC, EC2, EIP, S3, IAM, ECR (resources prefixed ${deployment}-${app_name})
     └─ Apply KMS policy using enclave's PCR0
 ```
 
 ### 3.2 AWS Resources Created
 
 ```
-CDK Stack: NitroIntrospectorStack
+Resource prefix: ${deployment}-${app_name}
 │
 ├─ KMS
 │   └─ EncryptionKey
@@ -1499,7 +1501,7 @@ supervisor orchestrates:
     │
     ├─ 2. Upload new EIF to S3
     │
-    ├─ 3. CDK deploy (updates EC2 instance)
+    ├─ 3. tofu apply (updates EC2 instance)
     │      New EIF path, same infrastructure
     │
     ├─ 4. Stop old enclave
@@ -1853,7 +1855,7 @@ Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
 1. INIT        enclave init → scaffold project (17 files + enclave.yaml)
 2. CONFIGURE   Edit enclave.yaml (secrets, app coordinates, SDK version)
 3. BUILD       enclave build → Nix → EIF (image.eif) + PCR values + supervisor binary
-4. DEPLOY      enclave deploy → CDK → AWS resources + EC2 instance
+4. DEPLOY      enclave tofu + tofu apply → AWS resources + EC2 instance
 5. BOOTSTRAP   EC2 user_data → install packages, download assets, start services
 6. BOOT        nitro-cli run-enclave → /app/runtime (links nitriding + viproxy)
 7. INIT        Supervisor: generate keys → load credentials → lock KMS → decrypt secrets

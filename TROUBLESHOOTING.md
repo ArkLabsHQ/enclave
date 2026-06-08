@@ -46,7 +46,7 @@
 |-----------|----------|---------|
 | Host supervisor (gvproxy, IMDS, lifecycle, management API) | systemd journal | `journalctl -u enclave-supervisor -f` |
 | In-enclave runtime (nitriding, app, runtime binary) | `GET /enclave-logs` via supervisor | Appears in supervisor's CloudWatch stream |
-| CDK deploy | Terminal output | Check `cdk-outputs.json` for stack outputs |
+| OpenTofu deploy | Terminal output | Run `tofu output` for deployment outputs |
 
 All logs are JSON-structured. Use `jq` to filter:
 

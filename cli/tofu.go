@@ -64,7 +64,7 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 	vars := tofuVars{
 		Region:            cfg.Region,
 		Account:           cfg.Account,
-		Deployment:        cfg.Prefix,
+		Deployment:        cfg.Deployment,
 		AppName:           cfg.Name,
 		InstanceType:      cfg.InstanceType,
 		Local:             os.Getenv("LOCAL_DEPLOYMENT") == "true",
@@ -115,8 +115,8 @@ type backendOverride struct {
 // enclave.yaml. Used as defaults in prompts and as the fallback when the
 // operator hasn't overridden anything.
 func defaultBackendValues(cfg *Config) (bucket, table, region string) {
-	bucket = fmt.Sprintf("%s-%s-tfstate-%s-%s", cfg.Prefix, cfg.Name, cfg.Account, cfg.Region)
-	table = fmt.Sprintf("%s-%s-tfstate-lock", cfg.Prefix, cfg.Name)
+	bucket = fmt.Sprintf("%s-%s-tfstate-%s-%s", cfg.Deployment, cfg.Name, cfg.Account, cfg.Region)
+	table = fmt.Sprintf("%s-%s-tfstate-lock", cfg.Deployment, cfg.Name)
 	region = cfg.Region
 	return
 }

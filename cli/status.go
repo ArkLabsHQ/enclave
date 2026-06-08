@@ -48,7 +48,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Enclave Status")
 	fmt.Println("==============")
-	fmt.Printf("  Deployment:  %s-%s\n", cfg.Prefix, cfg.Name)
+	fmt.Printf("  Deployment:  %s-%s\n", cfg.Deployment, cfg.Name)
 	fmt.Printf("  Region:      %s\n", cfg.Region)
 	fmt.Printf("  Instance ID: %s\n", instanceID)
 	fmt.Printf("  Elastic IP:  %s\n", elasticIP)

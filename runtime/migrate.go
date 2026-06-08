@@ -464,15 +464,20 @@ func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 stri
 }
 
 // verifyPCR31Commitment: nil iff the previous enclave's attestation document
-// committed to handing off to THIS enclave's PCR0 (by extending PCR31).
+// committed to handing off to THIS enclave's PCR0 (by extending PCR31). The doc
+// is verified against the AWS Nitro root before PCR31 is trusted.
 func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
 		return fmt.Errorf("decode attestation base64: %w", err)
 	}
-	pcr31, err := extractPCRFromAttestation(attestDoc, migrationPCRIndex)
+	result, err := verifyAttestationDoc(attestDoc)
 	if err != nil {
-		return fmt.Errorf("extract PCR%d: %w", migrationPCRIndex, err)
+		return fmt.Errorf("verify predecessor attestation: %w", err)
+	}
+	pcr31, ok := result.Document.PCRs[migrationPCRIndex]
+	if !ok {
+		return fmt.Errorf("PCR%d not found in attestation document", migrationPCRIndex)
 	}
 	myPCR0Bytes, err := hex.DecodeString(myPCR0)
 	if err != nil {

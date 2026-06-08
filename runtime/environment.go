@@ -26,6 +26,15 @@ func getDeployment() string {
 	return "dev"
 }
 
+// skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
+// whose local QEMU NSM produces unsigned mock documents. Any other deployment
+// verifies against the AWS Nitro root. The deployment is baked into the EIF at
+// build time (and measured into PCR0), so this security-critical check cannot be
+// flipped at deploy time.
+func skipCOSEVerification() bool {
+	return getDeployment() == "dev"
+}
+
 func getAppName() string {
 	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
 		return name

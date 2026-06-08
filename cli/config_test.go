@@ -24,7 +24,7 @@ name: myapp
 version: "1.0.0"
 region: us-east-1
 account: "123456789012"
-prefix: prod
+deployment: prod
 instance_type: c6i.xlarge
 migration_cooldown: "5m"
 previous_pcr0: abc123
@@ -56,8 +56,8 @@ sdk:
 	if cfg.Version != "1.0.0" {
 		t.Errorf("Version = %q, want %q", cfg.Version, "1.0.0")
 	}
-	if cfg.Prefix != "prod" {
-		t.Errorf("Prefix = %q, want %q", cfg.Prefix, "prod")
+	if cfg.Deployment != "prod" {
+		t.Errorf("Prefix = %q, want %q", cfg.Deployment, "prod")
 	}
 	if cfg.InstanceType != "c6i.xlarge" {
 		t.Errorf("InstanceType = %q, want %q", cfg.InstanceType, "c6i.xlarge")
@@ -144,8 +144,8 @@ region: eu-west-1
 		t.Fatalf("loadConfig: %v", err)
 	}
 
-	if cfg.Prefix != "dev" {
-		t.Errorf("Prefix = %q, want %q", cfg.Prefix, "dev")
+	if cfg.Deployment != "dev" {
+		t.Errorf("Prefix = %q, want %q", cfg.Deployment, "dev")
 	}
 	if cfg.Version != "dev" {
 		t.Errorf("Version = %q, want %q", cfg.Version, "dev")

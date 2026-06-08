@@ -12,7 +12,7 @@ import (
 const testYAML = `name: myapp
 region: us-east-1
 account: "123456789012"
-prefix: dev
+deployment: dev
 runtime:
   rev: x
   hash: sha256-x
@@ -72,7 +72,7 @@ func TestWriteTofuVars_Route53ZoneID(t *testing.T) {
 				Name:    "myapp",
 				Region:  "us-east-1",
 				Account: "123456789012",
-				Prefix:  "dev",
+				Deployment:  "dev",
 				TLS: TLSConfig{
 					FQDN:          "api.example.com",
 					Provider:      "letsencrypt",
@@ -410,7 +410,7 @@ func TestWriteBackendConfig_AppliesOverride(t *testing.T) {
 		Name:    "myapp",
 		Region:  "us-east-1",
 		Account: "123456789012",
-		Prefix:  "dev",
+		Deployment:  "dev",
 	}
 	override := &backendOverride{
 		bucket: "custom-bucket-name",
@@ -449,7 +449,7 @@ func TestWriteBackendConfig_NilOverrideUsesDefaults(t *testing.T) {
 		Name:    "myapp",
 		Region:  "us-east-1",
 		Account: "123456789012",
-		Prefix:  "dev",
+		Deployment:  "dev",
 	}
 	if err := writeBackendConfig(cfg, root, nil); err != nil {
 		t.Fatalf("writeBackendConfig: %v", err)

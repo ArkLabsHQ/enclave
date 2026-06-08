@@ -64,7 +64,7 @@ Your enclave app is a plain HTTP server — no SDK imports needed. The framework
 - Docker (for reproducible EIF builds via pinned NixOS container)
 - [Nix](https://nixos.org/) (for hash computation and local builds)
 - AWS CLI v2 with appropriate credentials
-- AWS CDK CLI (`npm install -g aws-cdk`)
+- [OpenTofu CLI](https://opentofu.org)
 - `jq`
 - **Go apps:** Go 1.25+
 - **Node.js apps:** Node.js 22+
@@ -258,7 +258,8 @@ Outputs `artifacts/image.eif` and `artifacts/pcr.json` with PCR0, PCR1, PCR2 mea
 ### 7. Deploy
 
 ```sh
-enclave deploy             # deploy CDK stack (VPC, EC2, KMS, IAM, secrets)
+enclave tofu                       # scaffold the OpenTofu module into ./tofu/
+cd tofu && tofu init && tofu apply # provision VPC, EC2, KMS, IAM, secrets
 ```
 
 ### 8. Verify
@@ -267,7 +268,7 @@ enclave deploy             # deploy CDK stack (VPC, EC2, KMS, IAM, secrets)
 enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ```
 
-`enclave deploy` prints both the elastic IP and the expected PCR0 after a successful apply; pass them through to `enclave verify`.
+`tofu apply` prints both the elastic IP and the expected PCR0 after a successful apply; pass them through to `enclave verify`.
 
 ## Updating Your App
 
@@ -279,7 +280,7 @@ The enclave build fetches your app source from GitHub at the exact commit specif
 git add . && git commit -m "update" && git push
 enclave update     # fast: updates nix_rev + nix_hash only (~1 second)
 enclave build
-enclave deploy
+cd tofu && tofu apply
 ```
 
 **Dependency changes (go.mod/go.sum or package.json/package-lock.json):**
@@ -288,7 +289,7 @@ enclave deploy
 git add . && git commit -m "update deps" && git push
 enclave setup      # full: recomputes all hashes including vendor/deps hash
 enclave build
-enclave deploy
+cd tofu && tofu apply
 ```
 
 ## CI/CD Workflows
@@ -297,10 +298,10 @@ The `enclave init` and `enclave generate template` commands scaffold three GitHu
 
 ### Deploy (`deploy-enclave.yml`)
 
-Triggered manually via `workflow_dispatch`. Builds the EIF, deploys the CDK stack, and verifies the running enclave:
+Triggered manually via `workflow_dispatch`. Builds the EIF, provisions the OpenTofu infrastructure, and verifies the running enclave:
 
 1. **Build** — installs the CLI, pulls the Nix Docker image, runs `enclave build`
-2. **Deploy** — runs `enclave deploy` (creates/updates VPC, EC2, KMS, IAM, S3, secrets)
+2. **Deploy** — runs `enclave tofu init` then `tofu apply` (creates/updates VPC, EC2, KMS, IAM, S3, secrets)
 3. **Publish manifest** — creates a GitHub Release (`deployment.json`) with PCR values and Elastic IP
 4. **Attest** — generates [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) for both `deployment.json` and `pcr.json`
 5. **Verify** — runs `enclave verify` against the live enclave (waits up to 5 minutes for boot)
@@ -317,11 +318,10 @@ Triggered manually via `workflow_dispatch`. Builds the EIF, deploys the CDK stac
 
 ### Destroy (`destroy-enclave.yml`)
 
-Triggered manually via `workflow_dispatch`. Tears down the CDK stack:
+Triggered manually via `workflow_dispatch`. Tears down the OpenTofu infrastructure:
 
 1. Installs the CLI and authenticates via OIDC
-2. Creates placeholder build artifacts (CDK synthesis needs them even for destroy)
-3. Runs `enclave destroy --force`
+2. Runs `tofu init` then `tofu destroy` in the `tofu/` module
 
 Uses the same `AWS_ROLE_ARN` and `AWS_REGION` repo variables as the deploy workflow.
 
@@ -382,10 +382,10 @@ make install   # install to $GOPATH/bin
 | `enclave nixpkgs pin` | Pin `nixpkgs` to the tip of `nixos-25.11` (writes enclave.yaml + flake.nix). See [BINARY-CACHE.md](BINARY-CACHE.md). |
 | `enclave nixpkgs pin --check` | Validate the existing nixpkgs pin without bumping it |
 | `enclave vendor --path <dir>` | Run `cargo vendor` / `go mod vendor` in the upstream app source (language taken from enclave.yaml). Then commit `vendor/`, run `enclave setup`, and set `app.vendor: true`. |
-| `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |
+| `tofu apply` (in `./tofu/`) | Provision infrastructure (VPC, EC2, KMS, IAM, secrets) after `enclave tofu` |
 | `enclave verify` | Verify attestation document and PCR0 against local build |
 | `enclave status` | Show deployment status |
-| `enclave destroy` | Tear down the CDK stack |
+| `tofu destroy` (in `./tofu/`) | Tear down the OpenTofu infrastructure |
 
 ## API Endpoints
 
@@ -434,7 +434,7 @@ The enclave provides persistent encrypted storage backed by S3 with automatic KM
 
 - On first boot, a 256-bit **Data Encryption Key (DEK)** is generated via KMS and stored (encrypted) in SSM
 - Data is encrypted with **AES-256-GCM** (random 12-byte nonce per write) before upload to S3
-- The storage bucket is provisioned by the CDK stack and discovered via SSM parameter
+- The storage bucket is provisioned by the OpenTofu module and discovered via SSM parameter
 - DEK is automatically re-encrypted during locked-key migration
 
 ```sh
@@ -728,10 +728,9 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 ├── setup.go                     # Auto-populate app nix hashes
 ├── update.go                    # Fast update (rev + source hash only)
 ├── template.go                  # Template generation (Go, Node.js)
-├── deploy.go                    # CDK deploy + secret provisioning
-├── destroy.go                   # Stack teardown + KMS key cleanup
+├── tofu.go                      # `enclave tofu` scaffold command
+├── tofu_files.go                # OpenTofu module definition (emitted into ./tofu/)
 ├── verify.go                    # Attestation verification
-├── cdk.go                       # AWS CDK stack definition (Go)
 ├── init.go                      # Scaffold command + config template
 ├── framework_files.go           # Framework files as Go string constants
 ├── version.go                   # SDK hash vars (set via ldflags)

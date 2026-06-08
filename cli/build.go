@@ -23,7 +23,7 @@ type buildConfigJSON struct {
 	Name              string                  `json:"name"`
 	Version           string                  `json:"version"`
 	Region            string                  `json:"region"`
-	Prefix            string                  `json:"prefix"`
+	Deployment        string                  `json:"deployment"`
 	App               buildConfigAppJSON      `json:"app"`
 	Secrets           []buildConfigSecretJSON `json:"secrets"`
 	Runtime           buildConfigRuntimeJSON  `json:"runtime"`
@@ -149,13 +149,13 @@ func nonNilStrings(xs []string) []string {
 }
 
 // generateBuildConfig writes build-config.json from enclave.yaml config.
-// Template variables in env values ({{region}}, {{prefix}}, {{version}}) are substituted.
+// Template variables in env values ({{region}}, {{deployment}}, {{version}}) are substituted.
 func generateBuildConfig(cfg *Config, root string) error {
 	// Resolve template variables in env values.
 	resolvedEnv := make(map[string]string)
 	for k, v := range cfg.App.Env {
 		v = strings.ReplaceAll(v, "{{region}}", cfg.Region)
-		v = strings.ReplaceAll(v, "{{prefix}}", cfg.Prefix)
+		v = strings.ReplaceAll(v, "{{deployment}}", cfg.Deployment)
 		v = strings.ReplaceAll(v, "{{version}}", cfg.Version)
 		resolvedEnv[k] = v
 	}
@@ -170,10 +170,10 @@ func generateBuildConfig(cfg *Config, root string) error {
 	}
 
 	bc := buildConfigJSON{
-		Name:    cfg.Name,
-		Version: cfg.Version,
-		Region:  cfg.Region,
-		Prefix:  cfg.Prefix,
+		Name:       cfg.Name,
+		Version:    cfg.Version,
+		Region:     cfg.Region,
+		Deployment: cfg.Deployment,
 		App: buildConfigAppJSON{
 			Language:             cfg.App.Language,
 			NixOwner:             cfg.App.NixOwner,
@@ -249,8 +249,8 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 		return nil, fmt.Errorf("create artifacts dir: %w", err)
 	}
 
-	fmt.Printf("[build] Building EIF locally with nix (version=%s, region=%s, prefix=%s)\n",
-		cfg.Version, cfg.Region, cfg.Prefix)
+	fmt.Printf("[build] Building EIF locally with nix (version=%s, region=%s, deployment=%s)\n",
+		cfg.Version, cfg.Region, cfg.Deployment)
 
 	// 2. Ensure Nix-visible files are tracked by git (flakes only see tracked files).
 	ensureGitTracked(root, "enclave/flake.nix", "enclave/enclave.yaml")
@@ -268,9 +268,6 @@ func BuildEIF(cfg *Config, root string) (*PCRValues, error) {
 	nixCmd.Stderr = os.Stderr
 	nixCmd.Env = append(os.Environ(),
 		"BUILD_CONFIG_PATH="+absConfigPath,
-		"VERSION="+cfg.Version,
-		"AWS_REGION="+cfg.Region,
-		"CDK_PREFIX="+cfg.Prefix,
 	)
 
 	if err := nixCmd.Run(); err != nil {

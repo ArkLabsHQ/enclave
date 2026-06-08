@@ -9,9 +9,9 @@ import (
 
 // TestBuildComposeDoc asserts the generated compose has the four
 // baseline services with image tags derived from the framework
-// runtime version + cfg.Name / cfg.Prefix wired into the test-runner.
+// runtime version + cfg.Name / cfg.Deployment wired into the test-runner.
 func TestBuildComposeDoc(t *testing.T) {
-	cfg := &Config{Name: "my-app", Prefix: "dev"}
+	cfg := &Config{Name: "my-app", Deployment: "dev"}
 	doc := buildComposeDoc(cfg, "0.0.99")
 
 	want := []string{"local-kms", "aws-mocks", "localstack", "test-runner"}
@@ -42,7 +42,7 @@ func TestBuildComposeDoc(t *testing.T) {
 // hand-edits survive re-runs) unless force=true.
 func TestWriteTestComposeMergeOnlyNew(t *testing.T) {
 	root := t.TempDir()
-	cfg := &Config{Name: "my-app", Prefix: "dev"}
+	cfg := &Config{Name: "my-app", Deployment: "dev"}
 
 	// Need a non-empty runtimeRev for writeTestCompose; restore at end.
 	prev := runtimeRev
@@ -101,7 +101,7 @@ func TestWriteTestComposeIncludesMarker(t *testing.T) {
 	runtimeRev = "v0.0.99"
 	t.Cleanup(func() { runtimeRev = prev })
 
-	if _, err := writeTestCompose(&Config{Name: "app", Prefix: "dev"}, root, false); err != nil {
+	if _, err := writeTestCompose(&Config{Name: "app", Deployment: "dev"}, root, false); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(root, composeFilePath))
@@ -117,7 +117,7 @@ func TestWriteTestComposeUnknownVersion(t *testing.T) {
 	runtimeRev = ""
 	t.Cleanup(func() { runtimeRev = prev })
 
-	_, err := writeTestCompose(&Config{Name: "app", Prefix: "dev"}, t.TempDir(), false)
+	_, err := writeTestCompose(&Config{Name: "app", Deployment: "dev"}, t.TempDir(), false)
 	if err == nil {
 		t.Fatal("expected error when runtimeRev is empty")
 	}

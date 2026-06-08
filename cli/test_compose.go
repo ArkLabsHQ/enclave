@@ -176,7 +176,7 @@ func buildComposeDoc(cfg *Config, frameworkVersion string) composeDoc {
 				// via 127.0.0.1:<published-port> instead.
 				Environment: map[string]string{
 					"ENCLAVE_APP_NAME":      cfg.Name,
-					"ENCLAVE_DEPLOYMENT":    cfg.Prefix,
+					"ENCLAVE_DEPLOYMENT":    cfg.Deployment,
 					"AWS_ENDPOINT_URL_KMS":  "http://127.0.0.1:4000",
 					"AWS_ENDPOINT_URL_SSM":  "http://127.0.0.1:4566",
 					"AWS_ENDPOINT_URL_STS":  "http://127.0.0.1:4566",

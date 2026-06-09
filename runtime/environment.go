@@ -125,6 +125,36 @@ func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
 }
 
+// kmsKeyIDParam: SSM path for the active primary KMS key ID. Flipping this is
+// the atomic migration commit point.
+func kmsKeyIDParam() string {
+	return fmt.Sprintf("/%s/%s/KMSKeyID", getDeployment(), getAppName())
+}
+
+// stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
+// own state at genesis (and after adopting a migration). Scoped by key ID.
+func stateOriginReceiptParam(keyID string) string {
+	return fmt.Sprintf("/%s/%s/StateOriginReceipt/%s", getDeployment(), getAppName(), keyID)
+}
+
+// migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
+// writes over a successor's state during a migration handoff. Scoped by the
+// successor key ID.
+func migrationStateOriginReceiptParam(keyID string) string {
+	return fmt.Sprintf("/%s/%s/MigrationStateOriginReceipt/%s", getDeployment(), getAppName(), keyID)
+}
+
+// migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0.
+func migrationPreviousPCR0Param() string {
+	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", getDeployment(), getAppName())
+}
+
+// migrationPreviousPCR0AttestationParam: SSM path for the predecessor enclave's
+// attestation document.
+func migrationPreviousPCR0AttestationParam() string {
+	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
+}
+
 // ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by
 // loadDeployTLSConfig for known one-off lookups; GetParametersByPath drives
 // the deploy-time env overlay (no need to enumerate keys at build time).

@@ -40,6 +40,7 @@ type Migrator struct {
 	aws           *AWSClient
 	kms           *KMS
 	staticSecrets *StaticSecrets
+	stateOrigin   *StateOrigin
 	storage       *Storage
 	auth          func(http.ResponseWriter, *http.Request) bool
 
@@ -254,6 +255,14 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 	pcr0, _, err := storePCR0WithAttestation(ctx, m.aws.SSM, deployment, appName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Emit the migration-transition receipt over the successor's state_root,
+	// before the KMSKeyID flip, so the successor can verify the handoff on first
+	// boot. PCR31 already committed to new_pcr0 above.
+	if err := m.stateOrigin.writeTransitionReceipt(ctx, migrationKeyID); err != nil {
+		http.Error(w, fmt.Sprintf("write migration-transition receipt: %v", err), http.StatusInternalServerError)
 		return
 	}
 

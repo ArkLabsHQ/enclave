@@ -171,6 +171,7 @@ type RuntimeInfo struct {
 	MigrationPending           bool               `json:"migration_pending"`
 	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
 	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
+	KMSKeyLocked bool `json:"kms_key_locked"`
 }
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
@@ -226,6 +227,7 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			MigrationPending:           migrationPending,
 			PCR0Signature:              e.signature.Snapshot(),
 			UpstreamApp:                UpstreamAppInfo{Exited: upstreamExited, Error: upstreamErr},
+			KMSKeyLocked:               kmsKeyLocked(),
 		})
 	}
 }

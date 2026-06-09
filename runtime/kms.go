@@ -258,6 +258,10 @@ func (k *KMS) readKMSKeyID(ctx context.Context, paramName string) (string, error
 	return v, nil
 }
 
+func (k *KMS) PeekKeyID(ctx context.Context) (string, error) {
+	return k.readKMSKeyID(ctx, kmsKeyIDParam())
+}
+
 // GetKeyID reads the primary KMS key ID from SSM at /<dep>/<app>/KMSKeyID.
 func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 	deployment := getDeployment()
@@ -280,8 +284,11 @@ func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// VerifyKeyAuthorization errors if keyID's policy doesn't admit this enclave's PCR0
-// for Decrypt. Verification only — keys are policy-locked at CreateKey time.
+// VerifyKeyAuthorization errors unless keyID's policy admits this enclave's
+// PCR0 for Decrypt AND has the expected lock posture: Decrypt is PCR0-gated
+// (no un-gated decrypt path) and kms:PutKeyPolicy is held by nobody when locked
+// / root-only when unlocked. Verification only — keys are policy-locked at
+// CreateKey time.
 func (k *KMS) VerifyKeyAuthorization(ctx context.Context, keyID string) error {
 	pcr0 := getPCR0()
 	if pcr0 == "" {
@@ -298,8 +305,8 @@ func (k *KMS) VerifyKeyAuthorization(ctx context.Context, keyID string) error {
 	if out.Policy != nil {
 		policyText = *out.Policy
 	}
-	if policyAdmitsPCR0(policyText, pcr0) {
-		return nil
+	if err := verifyKeyPolicyPosture(policyText, pcr0, kmsKeyLocked()); err != nil {
+		return fmt.Errorf("KMS key %s policy posture (ours: %s...): %w", keyID, pcr0[:16], err)
 	}
-	return fmt.Errorf("KMS key %s does not admit our PCR0 (ours: %s...)", keyID, pcr0[:16])
+	return nil
 }

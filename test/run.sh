@@ -1049,6 +1049,61 @@ if [ -x "$ENCLAVE_CLI" ]; then
 fi
 
 
+# Step 8.7: State-origin tamper (issue #131). The boot-time state_root commits to
+# every ciphertext the runtime owns, so overwriting one in SSM — as a host with
+# un-gated KMS Encrypt could — must make resume fail closed, not decrypt
+# attacker-known bytes. Drive the bounce via the supervisor's /stop (sets the
+# stopped latch, so the watchdog won't relaunch underneath us) and /start.
+echo ""
+echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
+TAMPER_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" $LOCALSTACK \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+DEK_PARAM="/dev/my-app/StorageDEK/Ciphertext/${TAMPER_KEY_ID}"
+ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$TAMPER_KEY_ID" ] || [ -z "$ORIG_DEK" ]; then
+  echo "  FAIL: could not read KMSKeyID / StorageDEK ciphertext from SSM" >&2
+  exit 1
+fi
+
+restart_enclave() {
+  curl -sf -X POST "${SUPERVISOR_URL}/stop"  >/dev/null 2>&1 || true
+  curl -sf -X POST "${SUPERVISOR_URL}/start" >/dev/null 2>&1 || true
+}
+
+# Swap the storage-DEK ciphertext for a different (valid base64) value, then
+# bounce the enclave so it takes the resume path against the tampered state.
+aws ssm put-parameter --name "$DEK_PARAM" --value "dGFtcGVyZWQtY2lwaGVydGV4dA==" \
+  --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+restart_enclave
+
+# Resume must reject it: /health must NOT reach 200. The 30s window stays under
+# the watchdog's 60s boot-grace.
+echo "  Asserting enclave stays unhealthy on tampered state (30s)..."
+TAMPER_HEALTHY="false"
+for _ in $(seq 1 30); do
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+    "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
+  if [ "$CODE" = "200" ]; then TAMPER_HEALTHY="true"; break; fi
+  sleep 1
+done
+if [ "$TAMPER_HEALTHY" = "true" ]; then
+  echo "  FAIL: enclave became healthy on a tampered ciphertext (state-origin check bypassed)" >&2
+  aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+  restart_enclave
+  exit 1
+fi
+echo "  PASS: tampered StorageDEK ciphertext → enclave fails closed (no 200 in 30s)"
+
+# Restore the original ciphertext and confirm a clean resume recovers — also
+# proves the bounce mechanism itself works (so the fail-closed wasn't a no-boot).
+aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+restart_enclave
+wait_for_enclave "resume after state-origin restore"
+echo "  PASS: restored ciphertext → enclave resumes healthy"
+echo ""
+
+
 # Step 9: rollback — v3 is baked with a wrong app name, so its Init fails
 # (GetKeyID 404 at /dev/my-app-wrong/KMSKeyID) → /health stays 503 → the
 # supervisor's awaitEnclaveReady times out → rollbackMigration restores v2.

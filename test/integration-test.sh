@@ -118,6 +118,15 @@ else
   fail "Previous PCR0" "could not fetch enclave-info"
 fi
 
+# Test 9b: kms_key_locked exposed in enclave-info (issue #131 — clients inspect
+# the KMS lock posture to trust the operator can't reach the secrets).
+KMS_LOCKED=$(echo "$INFO" | jq -r 'if has("kms_key_locked") then .kms_key_locked | tostring else "missing" end' 2>/dev/null || echo "missing")
+if [ "$KMS_LOCKED" = "true" ] || [ "$KMS_LOCKED" = "false" ]; then
+  pass "kms_key_locked present in enclave-info (${KMS_LOCKED})"
+else
+  fail "kms_key_locked" "missing or non-boolean (got: ${KMS_LOCKED})"
+fi
+
 # Test 10: Dynamic secrets round-trip (PUT → GET → LIST → DELETE).
 echo "[10/28] Dynamic secrets"
 DYN_RESP=$($CURL "${BASE_URL}/test/dynamic-secrets" 2>/dev/null || echo "")

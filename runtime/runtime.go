@@ -132,6 +132,7 @@ type Runtime struct {
 	attestation   *Attestation
 	kms           *KMS
 	staticSecrets *StaticSecrets
+	stateOrigin   *StateOrigin
 	dynamic       *DynamicSecrets
 	storage       *Storage
 	migrator      *Migrator
@@ -232,39 +233,33 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init attestation: %w", err)
 	}
 
+	// State-origin provenance (issue #131), shared with the Migrator.
+	e.stateOrigin = NewStateOrigin(e.aws.SSM, e.staticSecrets.Secrets())
+
 	// Migrator needs Storage too, but Storage isn't fully initialized yet.
 	// Wire it in after Storage.Init below; /v1/start-migration is gated on
 	// initOK so the late wire-up is safe.
 	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
+	e.migrator.stateOrigin = e.stateOrigin
 
-	keyID, err := e.kms.EnsureKeyID(ctx)
+	// Establish the startup-state protocol (issue #131): classify → ensureKey →
+	// verify → load → write receipt. PeekKeyID reads the key without minting one.
+	ownPCR0 := getPCR0()
+	if ownPCR0 == "" {
+		slog.Error("read PCR0 from NSM")
+		return fmt.Errorf("could not read PCR0 from NSM")
+	}
+	rawKeyID, err := e.kms.PeekKeyID(ctx)
 	if err != nil {
-		slog.Error("ensure KMS key ID", "error", err)
-		return fmt.Errorf("ensure KMS key ID: %w", err)
+		slog.Error("peek KMS key ID", "error", err)
+		return fmt.Errorf("peek KMS key ID: %w", err)
 	}
-	if err := e.kms.VerifyKeyAuthorization(ctx, keyID); err != nil {
-		slog.Error("verify KMS key admits us", "error", err)
-		return fmt.Errorf("verify KMS key admits us: %w", err)
-	}
-	if err := e.migrator.VerifyPredecessorCommitment(ctx, getPCR0()); err != nil {
-		slog.Error("verify predecessor PCR31 commitment", "error", err)
-		return fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
-	}
-
-	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {
-		slog.Error("load secrets from KMS", "error", err)
-		return fmt.Errorf("load secrets from KMS: %w", err)
-	}
-	if err := e.staticSecrets.ExtendPCRs(); err != nil {
-		slog.Error("extend PCRs with secret pubkeys", "error", err)
-		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
-	}
-
-	slog.Info("initializing storage")
-	e.migrator.storage = e.storage
-	if err := e.storage.Init(ctx, keyID); err != nil {
-		slog.Error("init storage", "error", err)
-		return fmt.Errorf("init storage: %w", err)
+	if err := e.stateOrigin.Establish(ctx, rawKeyID, ownPCR0,
+		func() (string, error) { return e.ensureActiveKey(ctx, ownPCR0) },
+		func(keyID string) error { return e.loadState(ctx, keyID) },
+	); err != nil {
+		slog.Error("establish startup state", "error", err)
+		return err
 	}
 
 	e.dynamic = NewDynamicSecrets(e.storage, e.metrics, e.staticSecrets, e.checkRuntimeToken)
@@ -285,6 +280,39 @@ func (e *Runtime) Init(ctx context.Context) error {
 	if e.tracing != nil && e.tracing.shipCh != nil {
 		e.tracing.aws = e.aws
 		go e.tracing.RunShipper(ctx)
+	}
+	return nil
+}
+
+// ensureActiveKey returns the active KMS key ID — minting a PCR0-locked one on
+// genesis — after verifying its policy and any predecessor handoff.
+func (e *Runtime) ensureActiveKey(ctx context.Context, ownPCR0 string) (string, error) {
+	keyID, err := e.kms.EnsureKeyID(ctx)
+	if err != nil {
+		return "", fmt.Errorf("ensure KMS key ID: %w", err)
+	}
+	if err := e.kms.VerifyKeyAuthorization(ctx, keyID); err != nil {
+		return "", fmt.Errorf("verify KMS key admits us: %w", err)
+	}
+	if err := e.migrator.VerifyPredecessorCommitment(ctx, ownPCR0); err != nil {
+		return "", fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
+	}
+	return keyID, nil
+}
+
+// loadState decrypts the runtime-owned secrets and storage DEK under keyID,
+// extends the secret PCRs, and brings up Storage.
+func (e *Runtime) loadState(ctx context.Context, keyID string) error {
+	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {
+		return fmt.Errorf("load secrets from KMS: %w", err)
+	}
+	if err := e.staticSecrets.ExtendPCRs(); err != nil {
+		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
+	}
+	slog.Info("initializing storage")
+	e.migrator.storage = e.storage
+	if err := e.storage.Init(ctx, keyID); err != nil {
+		return fmt.Errorf("init storage: %w", err)
 	}
 	return nil
 }

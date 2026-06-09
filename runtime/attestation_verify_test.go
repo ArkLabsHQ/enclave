@@ -58,12 +58,13 @@ func useAttestationRoots(t *testing.T, pool *x509.CertPool) {
 func buildSignedAttestation(t *testing.T, pcrs map[uint][]byte) signedAttestation {
 	t.Helper()
 	now := time.Now()
-	return buildSignedAttestationCustom(t, pcrs, now.Add(-time.Hour), now.Add(time.Hour), now)
+	return buildSignedAttestationCustom(t, pcrs, now.Add(-time.Hour), now.Add(time.Hour), now, nil)
 }
 
-// buildSignedAttestationCustom lets a test control the cert validity window and
-// the document timestamp (to exercise verification as-of the attestation time).
-func buildSignedAttestationCustom(t *testing.T, pcrs map[uint][]byte, certNotBefore, certNotAfter, timestamp time.Time) signedAttestation {
+// buildSignedAttestationCustom lets a test control the cert validity window, the
+// document timestamp (to exercise verification as-of the attestation time), and
+// the user_data the document carries (nil for none).
+func buildSignedAttestationCustom(t *testing.T, pcrs map[uint][]byte, certNotBefore, certNotAfter, timestamp time.Time, userData []byte) signedAttestation {
 	t.Helper()
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
@@ -112,6 +113,7 @@ func buildSignedAttestationCustom(t *testing.T, pcrs map[uint][]byte, certNotBef
 		PCRs:        pcrs,
 		Certificate: leafDER,
 		CABundle:    [][]byte{caDER},
+		UserData:    userData,
 	}
 	payload, err := cbor.Marshal(&doc)
 	if err != nil {
@@ -321,7 +323,7 @@ func TestVerifyPCR31Commitment_ExpiredCertValidAtTimestamp(t *testing.T) {
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
 	// Cert window is entirely in the past; the timestamp falls inside it.
 	att := buildSignedAttestationCustom(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0),
-		now.Add(-3*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour))
+		now.Add(-3*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour), nil)
 	useAttestationRoots(t, att.roots)
 
 	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err != nil {

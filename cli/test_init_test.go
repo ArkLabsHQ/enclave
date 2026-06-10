@@ -118,10 +118,5 @@ func TestWriteTestComposeUnknownVersion(t *testing.T) {
 	t.Cleanup(func() { runtimeRev = prev })
 
 	_, err := writeTestCompose(&Config{Name: "app", Deployment: "dev"}, t.TempDir(), false)
-	if err == nil {
-		t.Fatal("expected error when runtimeRev is empty")
-	}
-	if !strings.Contains(err.Error(), "framework runtime version unknown") {
-		t.Errorf("error mentions wrong cause: %v", err)
-	}
+	requireErrContains(t, err, "framework runtime version unknown")
 }

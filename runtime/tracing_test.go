@@ -187,9 +187,7 @@ func TestParseOTLPSpans_StatusCodes(t *testing.T) {
 
 func TestParseOTLPSpans_InvalidProtobuf(t *testing.T) {
 	_, err := parseOTLPSpans([]byte("garbage"))
-	if err == nil {
-		t.Fatal("expected error")
-	}
+	requireErrContains(t, err, "unmarshal OTLP traces")
 }
 
 // --- HTTP handler tests ---

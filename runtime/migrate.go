@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -475,11 +476,17 @@ func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 stri
 // is verified against the AWS Nitro root, and its PCR0 must match the stored
 // predecessor PCR0, before PCR31 is trusted.
 func verifyPCR31Commitment(attestDocB64, myPCR0, prevPCR0 string) error {
+	return verifyPCR31CommitmentWithRoots(attestDocB64, myPCR0, prevPCR0, nil)
+}
+
+// verifyPCR31CommitmentWithRoots is verifyPCR31Commitment with an explicit trust
+// anchor (nil → nitrite's embedded AWS Nitro root). Tests pass a synthetic CA.
+func verifyPCR31CommitmentWithRoots(attestDocB64, myPCR0, prevPCR0 string, roots *x509.CertPool) error {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
 		return fmt.Errorf("decode attestation base64: %w", err)
 	}
-	result, err := verifyAttestationDoc(attestDoc)
+	result, err := verifyAttestationDoc(attestDoc, roots)
 	if err != nil {
 		return fmt.Errorf("verify predecessor attestation: %w", err)
 	}

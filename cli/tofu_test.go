@@ -69,10 +69,10 @@ func TestWriteTofuVars_Route53ZoneID(t *testing.T) {
 			}
 
 			cfg := &Config{
-				Name:    "myapp",
-				Region:  "us-east-1",
-				Account: "123456789012",
-				Deployment:  "dev",
+				Name:       "myapp",
+				Region:     "us-east-1",
+				Account:    "123456789012",
+				Deployment: "dev",
 				TLS: TLSConfig{
 					FQDN:          "api.example.com",
 					Provider:      "letsencrypt",
@@ -259,12 +259,7 @@ func TestTofuEnv_RejectsMismatchedKeyValuePairs(t *testing.T) {
 	writeSentinelMainTF(t, tmp)
 
 	err := runTofuEnv([]string{"A", "B"}, []string{"1"})
-	if err == nil {
-		t.Fatal("expected error for mismatched --key/--value counts, got nil")
-	}
-	if !strings.Contains(err.Error(), "pairs") {
-		t.Errorf("error = %q, want substring 'pairs'", err.Error())
-	}
+	requireErrContains(t, err, "pairs")
 }
 
 func TestTofuEnv_RejectsInvalidKeyName(t *testing.T) {
@@ -272,24 +267,14 @@ func TestTofuEnv_RejectsInvalidKeyName(t *testing.T) {
 	writeSentinelMainTF(t, tmp)
 
 	err := runTofuEnv([]string{"lowercase-bad"}, []string{"val"})
-	if err == nil {
-		t.Fatal("expected error for invalid env var name, got nil")
-	}
-	if !strings.Contains(err.Error(), "invalid env var name") {
-		t.Errorf("error = %q, want substring 'invalid env var name'", err.Error())
-	}
+	requireErrContains(t, err, "invalid env var name")
 }
 
 func TestTofuEnv_RefusesWithoutScaffold(t *testing.T) {
 	chdirTemp(t)
 	// Don't create tofu/main.tf — precondition should fail.
 	err := runTofuEnv([]string{"FOO"}, []string{"bar"})
-	if err == nil {
-		t.Fatal("expected error when tofu/main.tf missing, got nil")
-	}
-	if !strings.Contains(err.Error(), "tofu/main.tf not found") {
-		t.Errorf("error = %q, want substring 'tofu/main.tf not found'", err.Error())
-	}
+	requireErrContains(t, err, "tofu/main.tf not found")
 }
 
 func TestTofuEnv_RejectsEmptyKeyValueArgs(t *testing.T) {
@@ -297,9 +282,7 @@ func TestTofuEnv_RejectsEmptyKeyValueArgs(t *testing.T) {
 	writeSentinelMainTF(t, tmp)
 
 	err := runTofuEnv(nil, nil)
-	if err == nil {
-		t.Fatal("expected error for no --key/--value pairs, got nil")
-	}
+	requireErrContains(t, err, "at least one --key/--value pair is required")
 }
 
 // TestTofuEnv_PreservesCommasAndNewlines guards against the StringSlice
@@ -337,12 +320,7 @@ func TestTofuUpdate_FailsWithoutScaffold(t *testing.T) {
 
 	cmd := tofuUpdateCmd()
 	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when tofu/main.tf is missing, got nil")
-	}
-	if !strings.Contains(err.Error(), "tofu/main.tf not found") {
-		t.Errorf("error = %q, want substring 'tofu/main.tf not found'", err.Error())
-	}
+	requireErrContains(t, err, "tofu/main.tf not found")
 }
 
 // TestYesNo verifies the y/n prompt parsing and default semantics.
@@ -407,10 +385,10 @@ func TestWriteBackendConfig_AppliesOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &Config{
-		Name:    "myapp",
-		Region:  "us-east-1",
-		Account: "123456789012",
-		Deployment:  "dev",
+		Name:       "myapp",
+		Region:     "us-east-1",
+		Account:    "123456789012",
+		Deployment: "dev",
 	}
 	override := &backendOverride{
 		bucket: "custom-bucket-name",
@@ -446,10 +424,10 @@ func TestWriteBackendConfig_NilOverrideUsesDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &Config{
-		Name:    "myapp",
-		Region:  "us-east-1",
-		Account: "123456789012",
-		Deployment:  "dev",
+		Name:       "myapp",
+		Region:     "us-east-1",
+		Account:    "123456789012",
+		Deployment: "dev",
 	}
 	if err := writeBackendConfig(cfg, root, nil); err != nil {
 		t.Fatalf("writeBackendConfig: %v", err)

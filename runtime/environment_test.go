@@ -134,9 +134,7 @@ func TestLoadDeployTLSConfig(t *testing.T) {
 
 	t.Run("ssm error surfaces", func(t *testing.T) {
 		_, err := loadDeployTLSConfig(context.Background(), &fakeSSM{err: errors.New("AccessDenied")})
-		if err == nil {
-			t.Error("expected error when SSM fails")
-		}
+		requireErrContains(t, err, "ssm get-parameter")
 	})
 }
 
@@ -234,9 +232,7 @@ func TestApplyEnvOverrides_SkipsNestedAndEmpty(t *testing.T) {
 func TestApplyEnvOverrides_SSMError(t *testing.T) {
 	fake := &fakeSSM{err: errors.New("access denied")}
 	err := applyEnvOverrides(context.Background(), fake, "dev", "myapp")
-	if err == nil {
-		t.Fatal("expected error when SSM fails")
-	}
+	requireErrContains(t, err, "ssm get-parameters-by-path")
 }
 
 // The overlay must never change framework-identity vars: an SSM writer could

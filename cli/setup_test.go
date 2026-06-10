@@ -10,11 +10,12 @@ import (
 
 func TestParseGitRemoteURL(t *testing.T) {
 	tests := []struct {
-		name      string
-		url       string
-		wantOwner string
-		wantRepo  string
-		wantErr   bool
+		name            string
+		url             string
+		wantOwner       string
+		wantRepo        string
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name:      "SSH",
@@ -41,19 +42,22 @@ func TestParseGitRemoteURL(t *testing.T) {
 			wantRepo:  "Repo",
 		},
 		{
-			name:    "invalid SSH missing colon",
-			url:     "git@github.com/Owner/Repo",
-			wantErr: true,
+			name:            "invalid SSH missing colon",
+			url:             "git@github.com/Owner/Repo",
+			wantErr:         true,
+			wantErrContains: "cannot parse SSH remote URL",
 		},
 		{
-			name:    "invalid no path",
-			url:     "https://github.com",
-			wantErr: true,
+			name:            "invalid no path",
+			url:             "https://github.com",
+			wantErr:         true,
+			wantErrContains: "cannot parse owner/repo from remote URL",
 		},
 		{
-			name:    "invalid single segment",
-			url:     "https://github.com/onlyone",
-			wantErr: true,
+			name:            "invalid single segment",
+			url:             "https://github.com/onlyone",
+			wantErr:         true,
+			wantErrContains: "cannot parse owner/repo from remote URL",
 		},
 	}
 
@@ -61,9 +65,7 @@ func TestParseGitRemoteURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			owner, repo, err := parseGitRemoteURL(tt.url)
 			if tt.wantErr {
-				if err == nil {
-					t.Errorf("expected error for %q", tt.url)
-				}
+				requireErrContains(t, err, tt.wantErrContains)
 				return
 			}
 			if err != nil {

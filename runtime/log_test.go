@@ -222,9 +222,7 @@ func TestParseOTLPLogs_SeverityMapping(t *testing.T) {
 
 func TestParseOTLPLogs_InvalidProtobuf(t *testing.T) {
 	_, err := parseOTLPLogs([]byte("not protobuf"))
-	if err == nil {
-		t.Fatal("expected error for invalid protobuf")
-	}
+	requireErrContains(t, err, "unmarshal OTLP logs")
 }
 
 // --- HTTP handler tests ---

@@ -27,12 +27,20 @@ func TestVendorCommandFor_Go(t *testing.T) {
 }
 
 func TestVendorCommandFor_UnsupportedLanguages(t *testing.T) {
-	for _, lang := range []string{"nodejs", "dotnet", "python", "", "RUST"} {
-		t.Run(lang, func(t *testing.T) {
-			_, _, err := vendorCommandFor(lang)
-			if err == nil {
-				t.Errorf("expected error for language %q", lang)
-			}
+	tests := []struct {
+		lang            string
+		wantErrContains string
+	}{
+		{"nodejs", "vendor mode is not supported for language=nodejs"},
+		{"dotnet", "vendor mode is not needed for language=dotnet"},
+		{"python", `unknown language "python"`},
+		{"", `unknown language ""`},
+		{"RUST", `unknown language "RUST"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang, func(t *testing.T) {
+			_, _, err := vendorCommandFor(tt.lang)
+			requireErrContains(t, err, tt.wantErrContains)
 		})
 	}
 }

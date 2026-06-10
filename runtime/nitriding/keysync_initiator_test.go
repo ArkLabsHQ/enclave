@@ -50,9 +50,7 @@ func TestRequestAttDoc(t *testing.T) {
 	defer srv.Close()
 
 	_, err := requestAttDoc(srv.URL, []byte{})
-	if err == nil {
-		t.Fatal("Client code should have rejected non-Base64 data but didn't.")
-	}
+	requireErrContains(t, err, "failed to fetch attestation doc from remote enclave")
 }
 
 func TestRequestAttDocDoS(t *testing.T) {

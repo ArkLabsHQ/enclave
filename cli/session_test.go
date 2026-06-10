@@ -85,12 +85,8 @@ func TestFetchSupervisor_HTTPError(t *testing.T) {
 	ac := &awsClients{region: "us-east-1", sessions: fake}
 
 	_, err := ac.fetchSupervisor(context.Background(), "i-test", "/enclave-logs")
-	if err == nil {
-		t.Fatal("expected error for 502 response, got nil")
-	}
-	if !strings.Contains(err.Error(), "502") || !strings.Contains(err.Error(), "upstream unavailable") {
-		t.Errorf("error = %q, expected to contain 502 and body", err)
-	}
+	requireErrContains(t, err, "502")
+	requireErrContains(t, err, "upstream unavailable")
 	if fake.cleanups != 1 {
 		t.Errorf("cleanups = %d, want 1 (error path must still tear down session)", fake.cleanups)
 	}

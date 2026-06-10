@@ -129,7 +129,7 @@ func TestSchnorrRejectsWrongPubkey(t *testing.T) {
 	}
 }
 
-func TestKeyBindingAppKeyHash(t *testing.T) {
+func TestKeyBindingSigningKey(t *testing.T) {
 	doc := loadTestAttestation(t)
 
 	result, _ := nitrite.Verify(doc, nitrite.VerifyOptions{
@@ -149,21 +149,21 @@ func TestKeyBindingAppKeyHash(t *testing.T) {
 		t.Fatalf("bad multihash prefix at offset 34: %02x %02x", userData[34], userData[35])
 	}
 
-	appKeyHash := userData[36:68]
+	signingKeyHash := userData[36:68]
 
-	// appKeyHash should not be all zeros.
+	// signingKeyHash should not be all zeros.
 	allZero := true
-	for _, b := range appKeyHash {
+	for _, b := range signingKeyHash {
 		if b != 0 {
 			allZero = false
 			break
 		}
 	}
 	if allZero {
-		t.Fatal("appKeyHash is all zeros")
+		t.Fatal("signingKeyHash is all zeros")
 	}
 
-	// Verify SHA256(attestation_pubkey) matches appKeyHash.
+	// Verify SHA256(attestation_pubkey) matches signingKeyHash.
 	// The pubkey is from the enclave-info response.
 	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
 	pubkeyBytes, err := hex.DecodeString(pubkeyHex)
@@ -172,9 +172,50 @@ func TestKeyBindingAppKeyHash(t *testing.T) {
 	}
 
 	expectedHash := sha256.Sum256(pubkeyBytes)
-	if string(expectedHash[:]) != string(appKeyHash) {
-		t.Fatalf("appKeyHash mismatch:\n  expected: %s\n  got:      %s",
+	if string(expectedHash[:]) != string(signingKeyHash) {
+		t.Fatalf("signingKeyHash mismatch:\n  expected: %s\n  got:      %s",
 			hex.EncodeToString(expectedHash[:]),
-			hex.EncodeToString(appKeyHash))
+			hex.EncodeToString(signingKeyHash))
+	}
+}
+
+func TestIsAllZeroHex(t *testing.T) {
+	cases := map[string]bool{
+		"":                                 true,
+		"00":                               true,
+		strings.Repeat("0", 64):            true,
+		"abc123":                           false,
+		"0000000000000000000000000000000a": false,
+	}
+	for in, want := range cases {
+		if got := isAllZeroHex(in); got != want {
+			t.Errorf("isAllZeroHex(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestVerifyLeafCertPin(t *testing.T) {
+	cert := []byte("a fake DER certificate")
+	sum := sha256.Sum256(cert)
+	good := hex.EncodeToString(sum[:])
+
+	// Match (case-insensitive).
+	if err := verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)); err != nil {
+		t.Fatalf("matching cert must pin: %v", err)
+	}
+	// Mismatch.
+	if err := verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)); err == nil {
+		t.Fatal("mismatched fingerprint must be rejected")
+	}
+	// No peer cert.
+	if err := verifyLeafCertPin(nil, good); err == nil {
+		t.Fatal("missing peer certificate must be rejected")
+	}
+	// Empty / all-zero expected hash (uninitialized binding).
+	if err := verifyLeafCertPin([][]byte{cert}, ""); err == nil {
+		t.Fatal("empty expected hash must be rejected")
+	}
+	if err := verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("all-zero expected hash must be rejected")
 	}
 }

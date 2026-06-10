@@ -29,7 +29,6 @@ type Config struct {
 	AppWebSrv          *url.URL // Loopback URL the catch-all revProxy forwards to.
 	UpstreamProtocol   string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
 	WaitForApp         bool     // Block TLS listener until the app POSTs /enclave/ready.
-	MockCertFp         string   // Test-only override for the TLS cert fingerprint.
 }
 
 // Validate returns an error if any required field is unset.

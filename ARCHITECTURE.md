@@ -446,7 +446,7 @@ everything in-process:
     │
     ├─ 4. runtime.Init(ctx)
     │      Generates ephemeral secp256k1 attestation key, calls
-    │      nitEnc.SetAttestationKeyHash(hash) directly (no HTTP).
+    │      nitEnc.SetSigningKeyHash(hash) directly (no HTTP).
     │      Loads KMS secrets, extends PCRs, etc.
     │
     └─ 5. exec user app as child process (/app/{binary_name})
@@ -1658,14 +1658,14 @@ The client library (`client/client.go`) performs full attestation verification b
        │  { attestation_pubkey: "02abc...", ... }   │
        │                                            │
        │  5. VERIFY ATTESTATION KEY BINDING         │
-       │     a. Extract appKeyHash from attestation │
+       │     a. Get signingKeyHash from attestation │
        │        document UserData bytes [36:68]     │
        │        (nitriding bakes SHA256(pubkey)     │
        │         into attestation UserData)         │
        │     b. Parse attestation_pubkey from       │
        │        /v1/enclave-info response           │
        │     c. Compute SHA256(pubkey)              │
-       │     d. Assert: SHA256(pubkey) == appKeyHash│
+       │     d. Assert: SHA256(pk) == signingKeyHash│
        │        (proves the signing key belongs     │
        │         to this specific attested enclave) │
        │                                            │

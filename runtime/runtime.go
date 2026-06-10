@@ -19,7 +19,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -489,10 +488,10 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 	e.attestation.SetRegistrar(r)
 }
 
-// SetAttestationKeyHash registers the SHA-256 hash of the user app's
-// attestation key for inclusion in NSM attestation documents.
-func (e *Runtime) SetAttestationKeyHash(hash [32]byte) {
-	copy(e.hashes.appKeyHash[:], hash[:])
+// SetSigningKeyHash registers the SHA-256 hash of the enclave's
+// attestation signing key for inclusion in NSM attestation documents.
+func (e *Runtime) SetSigningKeyHash(hash [32]byte) {
+	copy(e.hashes.signingKeyHash[:], hash[:])
 }
 
 // SetKeyMaterial registers the enclave's key material so an identical
@@ -960,18 +959,9 @@ func (e *Runtime) configureACME() error {
 	return nil
 }
 
-// setCertFingerprint extracts the SHA-256 fingerprint of the first
-// non-CA certificate in raw and stores it in e.hashes.tlsKeyHash so
-// it appears in NSM attestation documents.
+// setCertFingerprint stores the SHA-256 of the first non-CA cert in raw into
+// e.hashes.tlsKeyHash. Errors if the chain has no non-CA leaf (fail closed).
 func (e *Runtime) setCertFingerprint(raw []byte) error {
-	if e.cfg.MockCertFp != "" {
-		hash, err := hex.DecodeString(e.cfg.MockCertFp)
-		if err != nil {
-			return errors.New("decode mock cert fingerprint")
-		}
-		copy(e.hashes.tlsKeyHash[:], hash)
-		return nil
-	}
 	for {
 		block, rest := pem.Decode(raw)
 		if block == nil {
@@ -988,7 +978,7 @@ func (e *Runtime) setCertFingerprint(raw []byte) error {
 			}
 		}
 		if len(rest) == 0 {
-			return nil
+			return errors.New("no non-CA leaf certificate found in TLS chain")
 		}
 		raw = rest
 	}

@@ -12,8 +12,8 @@ func TestAttestationHashesSerialize(t *testing.T) {
 	for i := range h.tlsKeyHash {
 		h.tlsKeyHash[i] = byte(i)
 	}
-	for i := range h.appKeyHash {
-		h.appKeyHash[i] = byte(i + 1)
+	for i := range h.signingKeyHash {
+		h.signingKeyHash[i] = byte(i + 1)
 	}
 
 	got := h.Serialize()
@@ -36,9 +36,9 @@ func TestAttestationHashesSerialize(t *testing.T) {
 		t.Fatalf("tlsKeyHash bytes: got %x, want %x", got[tlsStart:tlsEnd], h.tlsKeyHash[:])
 	}
 
-	appStart := tlsEnd + len(hashSeparator) + len(hashPrefix)
-	if !bytes.Equal(got[appStart:], h.appKeyHash[:]) {
-		t.Fatalf("appKeyHash bytes: got %x, want %x", got[appStart:], h.appKeyHash[:])
+	sigKeyStart := tlsEnd + len(hashSeparator) + len(hashPrefix)
+	if !bytes.Equal(got[sigKeyStart:], h.signingKeyHash[:]) {
+		t.Fatalf("signingKeyHash bytes: got %x, want %x", got[sigKeyStart:], h.signingKeyHash[:])
 	}
 }
 

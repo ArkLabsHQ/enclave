@@ -848,8 +848,8 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// UserData format (nitriding v1.4.2):
-	//   "sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
-	// Total 79 bytes. appKeyHash at bytes 47:79.
+	//   "sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ signingKeyHash(32)
+	// Total 79 bytes. signingKeyHash at bytes 47:79.
 	results["user_data"] = hex.EncodeToString(doc.UserData)
 	results["user_data_length"] = len(doc.UserData)
 
@@ -859,13 +859,13 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 		tlsStart   = len(hashPrefix)
 		tlsEnd     = tlsStart + 32
 		sepStart   = tlsEnd
-		appPrefix  = sepStart + len(hashSep)
-		appStart   = appPrefix + len(hashPrefix)
-		appEnd     = appStart + 32
+		sigKeyPrefix  = sepStart + len(hashSep)
+		sigKeyStart   = sigKeyPrefix + len(hashPrefix)
+		sigKeyEnd     = sigKeyStart + 32
 	)
 
-	if len(doc.UserData) < appEnd {
-		results["error"] = fmt.Sprintf("UserData too short: %d bytes (need %d)", len(doc.UserData), appEnd)
+	if len(doc.UserData) < sigKeyEnd {
+		results["error"] = fmt.Sprintf("UserData too short: %d bytes (need %d)", len(doc.UserData), sigKeyEnd)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
@@ -876,31 +876,31 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(results)
 		return
 	}
-	if string(doc.UserData[sepStart:appPrefix]) != hashSep {
-		results["error"] = fmt.Sprintf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(doc.UserData[sepStart:appPrefix]))
+	if string(doc.UserData[sepStart:sigKeyPrefix]) != hashSep {
+		results["error"] = fmt.Sprintf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(doc.UserData[sepStart:sigKeyPrefix]))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
-	if !bytes.Equal(doc.UserData[appPrefix:appStart], []byte(hashPrefix)) {
-		results["error"] = fmt.Sprintf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(doc.UserData[appPrefix:appStart]))
+	if !bytes.Equal(doc.UserData[sigKeyPrefix:sigKeyStart], []byte(hashPrefix)) {
+		results["error"] = fmt.Sprintf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, sigKeyPrefix, string(doc.UserData[sigKeyPrefix:sigKeyStart]))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
 
-	appKeyHash := doc.UserData[appStart:appEnd]
-	results["app_key_hash"] = hex.EncodeToString(appKeyHash)
+	signingKeyHash := doc.UserData[sigKeyStart:sigKeyEnd]
+	results["signing_key_hash"] = hex.EncodeToString(signingKeyHash)
 
-	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal appKeyHash.
-	bindingValid := bytes.Equal(pubkeyHash[:], appKeyHash)
+	// Step 4: Verify binding — SHA256(attestation_pubkey) must equal signingKeyHash.
+	bindingValid := bytes.Equal(pubkeyHash[:], signingKeyHash)
 	results["binding_valid"] = bindingValid
 
 	if bindingValid {
 		results["status"] = "ok"
 	} else {
-		results["error"] = fmt.Sprintf("binding mismatch: SHA256(pubkey)=%s, appKeyHash=%s",
-			hex.EncodeToString(pubkeyHash[:]), hex.EncodeToString(appKeyHash))
+		results["error"] = fmt.Sprintf("binding mismatch: SHA256(pubkey)=%s, signingKeyHash=%s",
+			hex.EncodeToString(pubkeyHash[:]), hex.EncodeToString(signingKeyHash))
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 

@@ -1,11 +1,19 @@
 package runtime
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -182,4 +190,47 @@ func TestUpstreamAppInfo_JSONShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSetCertFingerprint covers the #129 hardening: a chain with no non-CA leaf
+// must fail TLS setup rather than silently leave an all-zero tlsKeyHash.
+func TestSetCertFingerprint(t *testing.T) {
+	e := &Runtime{hashes: &AttestationHashes{}}
+
+	// CA-only chain → error (no leaf to fingerprint).
+	if err := e.setCertFingerprint(genCertPEM(t, true)); err == nil {
+		t.Fatal("CA-only chain must error (no non-CA leaf)")
+	}
+	if e.hashes.tlsKeyHash != ([32]byte{}) {
+		t.Fatal("tlsKeyHash must stay zero when no leaf is found")
+	}
+
+	// A non-CA leaf → fingerprint set, no error.
+	if err := e.setCertFingerprint(genCertPEM(t, false)); err != nil {
+		t.Fatalf("leaf cert must set fingerprint: %v", err)
+	}
+	if e.hashes.tlsKeyHash == ([32]byte{}) {
+		t.Fatal("tlsKeyHash must be set after a non-CA leaf")
+	}
+}
+
+func genCertPEM(t *testing.T, isCA bool) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  isCA,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }

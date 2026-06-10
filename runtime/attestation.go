@@ -23,15 +23,15 @@ import (
 // application's attestation public key so it's embedded in NSM attestation
 // documents.
 //
-// Implemented by *Runtime itself (see SetAttestationKeyHash in runtime.go).
+// Implemented by *Runtime itself (see SetSigningKeyHash in runtime.go).
 // Tests inject a fake.
 type AttestationHashRegistrar interface {
-	SetAttestationKeyHash(hash [32]byte)
+	SetSigningKeyHash(hash [32]byte)
 }
 
 // Attestation owns the ephemeral secp256k1 attestation key and the
 // nitriding registrar. Init() generates the key and registers its hash
-// so it appears in NSM attestation documents under appKeyHash.
+// so it appears in NSM attestation documents under signingKeyHash.
 type Attestation struct {
 	key       *btcec.PrivateKey
 	registrar AttestationHashRegistrar
@@ -67,7 +67,7 @@ func (a *Attestation) Init() error {
 		return fmt.Errorf("no attestation registrar wired; call SetRegistrar before Init")
 	}
 	hash := sha256.Sum256(privKey.PubKey().SerializeCompressed())
-	a.registrar.SetAttestationKeyHash(hash)
+	a.registrar.SetSigningKeyHash(hash)
 	return nil
 }
 
@@ -106,18 +106,17 @@ type attestationDocument struct {
 }
 
 // AttestationHashes is the user_data payload embedded in NSM attestation
-// documents so clients can bind the document to the TLS cert and (optionally)
-// the user app's registered public key.
+// documents, binding the document to the TLS cert and the response-signing key.
 type AttestationHashes struct {
 	tlsKeyHash [sha256.Size]byte
-	appKeyHash [sha256.Size]byte
+	signingKeyHash [sha256.Size]byte
 }
 
 // Serialize returns "sha256:<tls>;sha256:<app>" matching the format clients
 // expect when verifying the attestation document.
 func (a *AttestationHashes) Serialize() []byte {
 	return []byte(fmt.Sprintf("%s%s%s%s%s",
-		hashPrefix, a.tlsKeyHash, hashSeparator, hashPrefix, a.appKeyHash))
+		hashPrefix, a.tlsKeyHash, hashSeparator, hashPrefix, a.signingKeyHash))
 }
 
 // buildAttestationDocument creates an attestation document with an RSA public key.

@@ -65,8 +65,7 @@ func configHandler(cfg *Config) http.HandlerFunc {
 }
 
 // attestationHandler serves an NSM attestation document whose user_data
-// binds the TLS cert fingerprint and (optionally) the app's registered
-// pubkey hash.
+// binds the TLS cert fingerprint and the attestation signing key hash.
 func attestationHandler(useProfiling bool, hashes *AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if useProfiling {
@@ -141,7 +140,7 @@ func hashHandler(e *Runtime) http.HandlerFunc {
 			http.Error(w, errHashWrongSize.Error(), http.StatusBadRequest)
 			return
 		}
-		copy(e.hashes.appKeyHash[:], keyHash)
+		copy(e.hashes.signingKeyHash[:], keyHash)
 		w.WriteHeader(http.StatusOK)
 	}
 }

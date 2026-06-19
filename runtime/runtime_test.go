@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -12,9 +14,11 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 )
 
@@ -211,6 +215,88 @@ func TestSetCertFingerprint(t *testing.T) {
 	}
 	if e.hashes.tlsKeyHash == ([32]byte{}) {
 		t.Fatal("tlsKeyHash must be set after a non-CA leaf")
+	}
+}
+
+// memCache is an in-memory autocert.Cache for exercising the ACME
+// renewal-rebind path; Put simulates autocert issuing or rotating a cert.
+type memCache struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (c *memCache) Get(_ context.Context, key string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.data[key]
+	if !ok {
+		return nil, autocert.ErrCacheMiss
+	}
+	return v, nil
+}
+
+func (c *memCache) Put(_ context.Context, key string, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.data == nil {
+		c.data = map[string][]byte{}
+	}
+	c.data[key] = data
+	return nil
+}
+
+func (c *memCache) Delete(_ context.Context, key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.data, key)
+	return nil
+}
+
+// TestRebindCertFingerprint covers the ACME renewal-rebind path: unbound until
+// issuance, binds the first leaf, then re-binds when the cert rotates.
+func TestRebindCertFingerprint(t *testing.T) {
+	const fqdn = "enclave.example.com"
+	e := &Runtime{cfg: &Config{FQDN: fqdn}, hashes: &AttestationHashes{}}
+	cache := &memCache{}
+	var zero [sha256.Size]byte
+
+	// Before issuance the cache misses: fingerprint stays zero.
+	if got := e.rebindCertFingerprint(cache, zero); got != zero {
+		t.Fatal("fingerprint must stay zero before the first cert is issued")
+	}
+	if e.hashes.tlsKeyHash != zero {
+		t.Fatal("attestation must remain unbound before issuance")
+	}
+
+	// First issuance binds the leaf fingerprint.
+	leaf1 := genCertPEM(t, false)
+	want1, err := leafFingerprint(leaf1)
+	if err != nil {
+		t.Fatalf("fingerprint leaf1: %v", err)
+	}
+	_ = cache.Put(context.Background(), fqdn, leaf1)
+	bound := e.rebindCertFingerprint(cache, zero)
+	if bound != want1 || e.hashes.tlsKeyHash != want1 {
+		t.Fatal("first issuance must bind the leaf fingerprint into the attestation")
+	}
+
+	// An unchanged poll is a no-op.
+	if got := e.rebindCertFingerprint(cache, bound); got != want1 {
+		t.Fatal("unchanged cert must not alter the bound fingerprint")
+	}
+
+	// Renewal: a rotated leaf re-binds the fingerprint.
+	leaf2 := genCertPEM(t, false)
+	want2, err := leafFingerprint(leaf2)
+	if err != nil {
+		t.Fatalf("fingerprint leaf2: %v", err)
+	}
+	if want2 == want1 {
+		t.Fatal("test setup: renewed leaf must differ from the original")
+	}
+	_ = cache.Put(context.Background(), fqdn, leaf2)
+	if got := e.rebindCertFingerprint(cache, bound); got != want2 || e.hashes.tlsKeyHash != want2 {
+		t.Fatal("renewal must re-bind the attestation to the new leaf")
 	}
 }
 

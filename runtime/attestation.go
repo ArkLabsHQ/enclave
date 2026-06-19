@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -107,14 +108,33 @@ type attestationDocument struct {
 
 // AttestationHashes is the user_data payload embedded in NSM attestation
 // documents, binding the document to the TLS cert and the response-signing key.
+// The fields are mutated (ACME renewal, signing-key registration) while
+// Serialize reads them per request, so all access is guarded by mu.
 type AttestationHashes struct {
-	tlsKeyHash [sha256.Size]byte
+	mu             sync.RWMutex
+	tlsKeyHash     [sha256.Size]byte
 	signingKeyHash [sha256.Size]byte
+}
+
+// SetTLSKeyHash records the fingerprint of the live TLS leaf cert.
+func (a *AttestationHashes) SetTLSKeyHash(h [sha256.Size]byte) {
+	a.mu.Lock()
+	a.tlsKeyHash = h
+	a.mu.Unlock()
+}
+
+// SetSigningKeyHash records the hash of the app's response-signing key.
+func (a *AttestationHashes) SetSigningKeyHash(h [sha256.Size]byte) {
+	a.mu.Lock()
+	a.signingKeyHash = h
+	a.mu.Unlock()
 }
 
 // Serialize returns "sha256:<tls>;sha256:<app>" matching the format clients
 // expect when verifying the attestation document.
 func (a *AttestationHashes) Serialize() []byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return []byte(fmt.Sprintf("%s%s%s%s%s",
 		hashPrefix, a.tlsKeyHash, hashSeparator, hashPrefix, a.signingKeyHash))
 }

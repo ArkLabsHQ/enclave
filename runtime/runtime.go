@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -491,7 +492,7 @@ func (e *Runtime) SetAttestationRegistrar(r AttestationHashRegistrar) {
 // SetSigningKeyHash registers the SHA-256 hash of the enclave's
 // attestation signing key for inclusion in NSM attestation documents.
 func (e *Runtime) SetSigningKeyHash(hash [32]byte) {
-	copy(e.hashes.signingKeyHash[:], hash[:])
+	e.hashes.SetSigningKeyHash(hash)
 }
 
 // SetKeyMaterial registers the enclave's key material so an identical
@@ -937,48 +938,90 @@ func (e *Runtime) configureACME() error {
 	}
 	e.tlsGetCert = mgr.GetCertificate
 
-	// Block on the cert appearing in the cache before computing its
-	// fingerprint. autocert populates the cache asynchronously after the
-	// first TLS handshake.
-	go func() {
-		var raw []byte
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			got, err := cache.Get(ctx, e.cfg.FQDN)
-			cancel()
-			if err == nil {
-				raw = got
-				break
-			}
-			time.Sleep(5 * time.Second)
-		}
-		if err := e.setCertFingerprint(raw); err != nil {
-			slog.Error("set cert fingerprint", "error", err)
-		}
-	}()
+	// autocert rewrites the cache on every renewal, so the attested fingerprint
+	// must track the cache rather than sample it once.
+	go e.watchACMECert(cache)
 	return nil
 }
 
-// setCertFingerprint stores the SHA-256 of the first non-CA cert in raw into
-// e.hashes.tlsKeyHash. Errors if the chain has no non-CA leaf (fail closed).
+const (
+	acmeInitialPoll = 5 * time.Second // poll before the first cert is issued
+	acmeRenewPoll   = time.Hour       // poll once bound, to catch renewals
+)
+
+// watchACMECert binds the first issued ACME cert's fingerprint, then re-binds
+// whenever autocert rotates the leaf. Returns when Stop closes e.stop.
+func (e *Runtime) watchACMECert(cache autocert.Cache) {
+	var bound [sha256.Size]byte // zero until first bind
+	for {
+		bound = e.rebindCertFingerprint(cache, bound)
+
+		poll := acmeRenewPoll
+		if bound == ([sha256.Size]byte{}) {
+			poll = acmeInitialPoll
+		}
+		select {
+		case <-e.stop:
+			return
+		case <-time.After(poll):
+		}
+	}
+}
+
+// rebindCertFingerprint re-binds the attestation hash if the cached leaf's
+// fingerprint differs from bound, and returns the fingerprint now in effect.
+func (e *Runtime) rebindCertFingerprint(cache autocert.Cache, bound [sha256.Size]byte) [sha256.Size]byte {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	raw, err := cache.Get(ctx, e.cfg.FQDN)
+	cancel()
+
+	switch {
+	case err != nil:
+		if bound != ([sha256.Size]byte{}) { // a miss is expected before first issuance
+			slog.Warn("ACME cert cache read failed", "error", err)
+		}
+	default:
+		h, ferr := leafFingerprint(raw)
+		if ferr != nil {
+			slog.Error("ACME cert fingerprint", "error", ferr)
+		} else if h != bound {
+			e.hashes.SetTLSKeyHash(h)
+			bound = h
+			slog.Info("TLS: bound attestation to ACME cert", "sha256", hex.EncodeToString(h[:]))
+		}
+	}
+	return bound
+}
+
+// setCertFingerprint binds the leaf fingerprint of the PEM chain raw into the
+// attestation hashes. Errors if the chain has no non-CA leaf (fail closed).
 func (e *Runtime) setCertFingerprint(raw []byte) error {
+	h, err := leafFingerprint(raw)
+	if err != nil {
+		return err
+	}
+	e.hashes.SetTLSKeyHash(h)
+	return nil
+}
+
+// leafFingerprint returns the SHA-256 of the first non-CA cert in the PEM chain.
+func leafFingerprint(raw []byte) ([sha256.Size]byte, error) {
 	for {
 		block, rest := pem.Decode(raw)
 		if block == nil {
-			return errors.New("pem.Decode found no PEM data")
+			return [sha256.Size]byte{}, errors.New("pem.Decode found no PEM data")
 		}
 		if block.Type == "CERTIFICATE" {
 			cert, err := x509.ParseCertificate(block.Bytes)
 			if err != nil {
-				return fmt.Errorf("parse certificate: %w", err)
+				return [sha256.Size]byte{}, fmt.Errorf("parse certificate: %w", err)
 			}
 			if !cert.IsCA {
-				e.hashes.tlsKeyHash = sha256.Sum256(cert.Raw)
-				return nil
+				return sha256.Sum256(cert.Raw), nil
 			}
 		}
 		if len(rest) == 0 {
-			return errors.New("no non-CA leaf certificate found in TLS chain")
+			return [sha256.Size]byte{}, errors.New("no non-CA leaf certificate found in TLS chain")
 		}
 		raw = rest
 	}

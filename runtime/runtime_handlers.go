@@ -140,7 +140,9 @@ func hashHandler(e *Runtime) http.HandlerFunc {
 			http.Error(w, errHashWrongSize.Error(), http.StatusBadRequest)
 			return
 		}
-		copy(e.hashes.signingKeyHash[:], keyHash)
+		var h [sha256.Size]byte
+		copy(h[:], keyHash)
+		e.hashes.SetSigningKeyHash(h)
 		w.WriteHeader(http.StatusOK)
 	}
 }

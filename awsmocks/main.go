@@ -1,5 +1,5 @@
-// awsmocks bundles a KMS-Decrypt-with-Recipient proxy (:4000, wraps
-// plaintext in CMS EnvelopedData for the attesting enclave's RSA key)
+// awsmocks bundles a KMS Decrypt/GenerateDataKey-with-Recipient proxy (:4000,
+// wraps plaintext in CMS EnvelopedData for the attesting enclave's RSA key)
 // and an IMDSv2 stub (:1338) into one binary.
 package main
 
@@ -82,6 +82,28 @@ type kmsDecryptResponseWithRecipient struct {
 	EncryptionAlgorithm    string `json:"EncryptionAlgorithm,omitempty"`
 }
 
+type kmsGenerateDataKeyRequest struct {
+	KeyId         string        `json:"KeyId,omitempty"`
+	NumberOfBytes int           `json:"NumberOfBytes,omitempty"`
+	KeySpec       string        `json:"KeySpec,omitempty"`
+	Recipient     *kmsRecipient `json:"Recipient,omitempty"`
+}
+
+type kmsGenerateDataKeyResponse struct {
+	KeyId          string `json:"KeyId,omitempty"`
+	CiphertextBlob string `json:"CiphertextBlob,omitempty"`
+	Plaintext      string `json:"Plaintext,omitempty"`
+}
+
+// kmsGenerateDataKeyResponseWithRecipient mirrors AWS: with a Recipient, KMS
+// returns the wrapped key (CiphertextBlob) plus the plaintext enveloped to the
+// enclave (CiphertextForRecipient) and omits Plaintext.
+type kmsGenerateDataKeyResponseWithRecipient struct {
+	KeyId                  string `json:"KeyId,omitempty"`
+	CiphertextBlob         string `json:"CiphertextBlob,omitempty"`
+	CiphertextForRecipient string `json:"CiphertextForRecipient,omitempty"`
+}
+
 type imdsCredentials struct {
 	Code            string `json:"Code"`
 	LastUpdated     string `json:"LastUpdated"`
@@ -123,9 +145,15 @@ func runKMSProxy(listenAddr string, upstream *url.URL) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Amz-Target") == "TrentService.Decrypt" && r.Method == http.MethodPost {
-			handleDecrypt(w, r, upstream, proxy)
-			return
+		if r.Method == http.MethodPost {
+			switch r.Header.Get("X-Amz-Target") {
+			case "TrentService.Decrypt":
+				handleDecrypt(w, r, upstream, proxy)
+				return
+			case "TrentService.GenerateDataKey":
+				handleGenerateDataKey(w, r, upstream, proxy)
+				return
+			}
 		}
 		proxy.ServeHTTP(w, r)
 	})
@@ -203,39 +231,8 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 		return
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String()+"/", bytes.NewReader(strippedBody))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("create upstream request: %v", err), http.StatusInternalServerError)
-		return
-	}
-	for _, h := range []string{"X-Amz-Target", "Content-Type", "Authorization", "X-Amz-Date", "X-Amz-Security-Token"} {
-		if v := r.Header.Get(h); v != "" {
-			upstreamReq.Header.Set(h, v)
-		}
-	}
-	upstreamReq.ContentLength = int64(len(strippedBody))
-
-	resp, err := http.DefaultClient.Do(upstreamReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("upstream request: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read upstream response: %v", err), http.StatusBadGateway)
-		return
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		for k, vals := range resp.Header {
-			for _, v := range vals {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBody)
+	respBody, ok := forwardToUpstream(w, r, upstream, strippedBody)
+	if !ok {
 		return
 	}
 
@@ -266,6 +263,122 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 	w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// handleGenerateDataKey mirrors handleDecrypt for GenerateDataKey: local-kms has
+// no Recipient support, so the proxy strips the attestation, forwards, then
+// CMS-envelopes the returned Plaintext into CiphertextForRecipient — keeping the
+// wrapped CiphertextBlob and dropping Plaintext, as real Nitro KMS does.
+func handleGenerateDataKey(w http.ResponseWriter, r *http.Request, upstream *url.URL, proxy *httputil.ReverseProxy) {
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	var req kmsGenerateDataKeyRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, fmt.Sprintf("parse request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.Recipient == nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		proxy.ServeHTTP(w, r)
+		return
+	}
+
+	rsaPub, err := extractRSAPubKeyFromAttestationDoc(req.Recipient.AttestationDocument)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("extract RSA key from attestation doc: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	req.Recipient = nil
+	strippedBody, err := json.Marshal(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("marshal stripped request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	respBody, ok := forwardToUpstream(w, r, upstream, strippedBody)
+	if !ok {
+		return
+	}
+
+	var genResp kmsGenerateDataKeyResponse
+	if err := json.Unmarshal(respBody, &genResp); err != nil {
+		http.Error(w, fmt.Sprintf("parse upstream response: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	plaintext, err := base64.StdEncoding.DecodeString(genResp.Plaintext)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("decode plaintext: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	cmsData, err := buildCMSEnvelopedData(plaintext, rsaPub)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("build CMS EnvelopedData: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	result := kmsGenerateDataKeyResponseWithRecipient{
+		KeyId:                  genResp.KeyId,
+		CiphertextBlob:         genResp.CiphertextBlob,
+		CiphertextForRecipient: base64.StdEncoding.EncodeToString(cmsData),
+	}
+
+	w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// forwardToUpstream sends the Recipient-stripped body to the upstream KMS,
+// copying the AWS signing headers. On a 200 it returns the response body; on a
+// transport error or non-200 it writes the error/passthrough to w and returns
+// ok=false.
+func forwardToUpstream(w http.ResponseWriter, r *http.Request, upstream *url.URL, strippedBody []byte) ([]byte, bool) {
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String()+"/", bytes.NewReader(strippedBody))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create upstream request: %v", err), http.StatusInternalServerError)
+		return nil, false
+	}
+	for _, h := range []string{"X-Amz-Target", "Content-Type", "Authorization", "X-Amz-Date", "X-Amz-Security-Token"} {
+		if v := r.Header.Get(h); v != "" {
+			upstreamReq.Header.Set(h, v)
+		}
+	}
+	upstreamReq.ContentLength = int64(len(strippedBody))
+
+	resp, err := http.DefaultClient.Do(upstreamReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("upstream request: %v", err), http.StatusBadGateway)
+		return nil, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read upstream response: %v", err), http.StatusBadGateway)
+		return nil, false
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		for k, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(respBody)
+		return nil, false
+	}
+
+	return respBody, true
 }
 
 // buildCMSEnvelopedData mirrors AWS Nitro KMS's response shape:

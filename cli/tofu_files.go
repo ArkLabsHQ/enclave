@@ -44,6 +44,7 @@ module "enclave" {
   secrets           = var.secrets
   migration_cooldown = var.migration_cooldown
   expected_pcr0     = var.expected_pcr0
+  is_kms_key_locked = var.is_kms_key_locked
   supervisor_url          = var.supervisor_url
   github_owner  = var.github_owner
   github_repo   = var.github_repo
@@ -117,6 +118,12 @@ variable "expected_pcr0" {
   description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
   type        = string
   default     = ""
+}
+
+variable "is_kms_key_locked" {
+  description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
+  type        = bool
+  default     = false
 }
 
 variable "supervisor_url" {
@@ -246,6 +253,10 @@ const tofuModuleEnclaveMain = `terraform {
 locals {
   prefix = "${var.deployment}-${var.app_name}"
 
+  # SSM namespace segment for KMS-subtree paths (key id + ciphertexts), so the
+  # lock posture is an IAM-enforceable boundary. Must match the runtime/supervisor.
+  lock_segment = var.is_kms_key_locked ? "locked" : "unlocked"
+
   # Availability zones for VPC subnets.
   az_a = "${var.region}a"
   az_b = "${var.region}b"
@@ -307,6 +318,12 @@ variable "expected_pcr0" {
   description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
   type        = string
   default     = ""
+}
+
+variable "is_kms_key_locked" {
+  description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
+  type        = bool
+  default     = false
 }
 
 variable "supervisor_url" {
@@ -392,7 +409,7 @@ variable "tls" {
 # the EC2 destroy provisioner shells out to the supervisor to schedule key
 # deletion before the role is torn down.
 resource "aws_ssm_parameter" "kms_key_id" {
-  name      = "/${var.deployment}/${var.app_name}/KMSKeyID"
+  name      = "/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID"
   type      = "String"
   value     = "UNSET"
   overwrite = true
@@ -560,9 +577,9 @@ data "aws_iam_policy_document" "enclave" {
       "ssm:PutParameter",
     ]
     resources = concat(
-      [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${s.name}/Ciphertext/*"],
+      [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/${s.name}/Ciphertext/*"],
       [
-        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext/*",
+        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/StorageDEK/Ciphertext/*",
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_requested_at.arn,
@@ -597,7 +614,7 @@ data "aws_iam_policy_document" "enclave" {
     sid     = "SSMKMSKeyID"
     actions = ["ssm:GetParameter", "ssm:PutParameter"]
     resources = [
-      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/KMSKeyID",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID",
     ]
   }
 
@@ -855,17 +872,18 @@ resource "null_resource" "ciphertext_cleanup" {
     region       = var.region
     deployment   = var.deployment
     app_name     = var.app_name
+    lock_segment = local.lock_segment
     secret_names = jsonencode([for s in var.secrets : s.name])
   }
 
   provisioner "local-exec" {
     when    = destroy
     command = <<-EOT
-      REGION="${self.triggers.region}"; DEP="${self.triggers.deployment}"; APP="${self.triggers.app_name}"
+      REGION="${self.triggers.region}"; DEP="${self.triggers.deployment}"; APP="${self.triggers.app_name}"; LOCK="${self.triggers.lock_segment}"
       for S in $(echo '${self.triggers.secret_names}' | jq -r '.[]' 2>/dev/null); do
-        aws ssm delete-parameters-by-path --path "/$DEP/$APP/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+        aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
       done
-      aws ssm delete-parameters-by-path --path "/$DEP/$APP/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+      aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
     EOT
   }
 }
@@ -1160,6 +1178,7 @@ resource "aws_instance" "nitro" {
     eif_s3_url               = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     supervisor_binary_s3_url = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
     migration_cooldown       = var.migration_cooldown
+    is_kms_key_locked        = var.is_kms_key_locked
   })
 
   tags = {

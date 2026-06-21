@@ -262,7 +262,7 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 
 	// Atomic commit: from here, all boots use the migration key.
 	if _, err := m.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
+		Name:      aws.String(kmsKeyIDParam()),
 		Value:     aws.String(migrationKeyID),
 		Type:      ssmtypes.ParameterTypeString,
 		Overwrite: aws.Bool(true),

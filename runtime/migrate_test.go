@@ -120,10 +120,24 @@ func TestSecretCiphertextParam_KeyScoped(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
 	const keyID = "1234abcd-12ab-34cd-56ef-1234567890ab"
-	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/signing-key/Ciphertext/"+keyID; got != want {
+
+	// Default (unlocked) namespace.
+	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/unlocked/signing-key/Ciphertext/"+keyID; got != want {
 		t.Fatalf("secretCiphertextParam: got %q, want %q", got, want)
 	}
-	if got, want := storageDEKCiphertextParam(keyID), "/dev/my-app/StorageDEK/Ciphertext/"+keyID; got != want {
+	if got, want := storageDEKCiphertextParam(keyID), "/dev/my-app/unlocked/StorageDEK/Ciphertext/"+keyID; got != want {
 		t.Fatalf("storageDEKCiphertextParam: got %q, want %q", got, want)
+	}
+	if got, want := kmsKeyIDParam(), "/dev/my-app/unlocked/KMSKeyID"; got != want {
+		t.Fatalf("kmsKeyIDParam: got %q, want %q", got, want)
+	}
+
+	// Locked namespace is a distinct path.
+	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/locked/signing-key/Ciphertext/"+keyID; got != want {
+		t.Fatalf("locked secretCiphertextParam: got %q, want %q", got, want)
+	}
+	if got, want := kmsKeyIDParam(), "/dev/my-app/locked/KMSKeyID"; got != want {
+		t.Fatalf("locked kmsKeyIDParam: got %q, want %q", got, want)
 	}
 }

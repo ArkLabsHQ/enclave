@@ -240,20 +240,31 @@ func TestApplyEnvOverrides_SSMError(t *testing.T) {
 func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
+	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
 	_ = os.Unsetenv("SAFE_KEY")
 	fake := &fakeSSM{params: map[string]string{
-		"/prod/myapp/env/ENCLAVE_DEPLOYMENT": "dev",
-		"/prod/myapp/env/ENCLAVE_APP_NAME":   "evil",
-		"/prod/myapp/env/SAFE_KEY":           "ok",
+		"/prod/myapp/env/ENCLAVE_DEPLOYMENT":         "dev",
+		"/prod/myapp/env/ENCLAVE_APP_NAME":           "evil",
+		"/prod/myapp/env/ENCLAVE_KMS_KEY_LOCKED":     "false",
+		"/prod/myapp/env/ENCLAVE_MIGRATION_COOLDOWN": "0s",
+		"/prod/myapp/env/ENCLAVE_SECRETS_CONFIG":     `[{"name":"evil"}]`,
+		"/prod/myapp/env/SAFE_KEY":                   "ok",
 	}}
 	if err := applyEnvOverrides(context.Background(), fake, "prod", "myapp"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := os.Getenv("ENCLAVE_DEPLOYMENT"); got != "prod" {
-		t.Errorf("ENCLAVE_DEPLOYMENT overridden via overlay to %q; must stay %q", got, "prod")
-	}
-	if got := os.Getenv("ENCLAVE_APP_NAME"); got != "myapp" {
-		t.Errorf("ENCLAVE_APP_NAME overridden via overlay to %q; must stay %q", got, "myapp")
+	for k, want := range map[string]string{
+		"ENCLAVE_DEPLOYMENT":         "prod",
+		"ENCLAVE_APP_NAME":           "myapp",
+		"ENCLAVE_KMS_KEY_LOCKED":     "true",
+		"ENCLAVE_MIGRATION_COOLDOWN": "1m",
+		"ENCLAVE_SECRETS_CONFIG":     "[]",
+	} {
+		if got := os.Getenv(k); got != want {
+			t.Errorf("%s overridden via overlay to %q; must stay %q", k, got, want)
+		}
 	}
 	if got := os.Getenv("SAFE_KEY"); got != "ok" {
 		t.Errorf("non-identity key should still apply, got %q", got)

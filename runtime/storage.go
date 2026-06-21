@@ -86,17 +86,16 @@ func (s *Storage) Init(ctx context.Context, keyID string) error {
 	}
 
 	if ciphertextB64 == "" {
-		// First boot for this KMS key: generate a new DEK.
-		out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
-			KeyId:   aws.String(keyID),
-			KeySpec: kmstypes.DataKeySpecAes256,
-		})
+		// First boot for this KMS key: generate a new DEK. For a locked
+		// deployment generateDataKey mints it attested, satisfying the
+		// PCR0-gated policy.
+		ciphertextBlob, dek, err := s.kms.generateDataKey(ctx, keyID)
 		if err != nil {
 			return fmt.Errorf("generate DEK: %w", err)
 		}
-		s.dek = out.Plaintext
+		s.dek = dek
 
-		encoded := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
+		encoded := base64.StdEncoding.EncodeToString(ciphertextBlob)
 		if err := s.kms.StoreCiphertext(ctx, dekParam, encoded); err != nil {
 			return fmt.Errorf("store DEK: %w", err)
 		}

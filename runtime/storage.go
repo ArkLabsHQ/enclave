@@ -30,6 +30,25 @@ var ErrNotFound = errors.New("key not found")
 // nonceSize is the AES-GCM nonce length.
 const nonceSize = 12
 
+// Storage blob layout: storageFormatV1 || nonce || ct+tag.
+const (
+	// storageFormatV1 is the version prefix of an AAD-bound storage blob. It
+	// distinguishes the current format from any future one and lets Load reject
+	// unversioned (legacy nil-AAD) objects.
+	storageFormatV1 byte = 0x01
+
+	// gcmTagSize is the AES-GCM authentication tag length appended by Seal;
+	// it always equals cipher.AEAD.Overhead() for standard GCM.
+	gcmTagSize = 16
+
+	// storageHeaderLen is the plaintext-independent prefix: version byte + nonce.
+	storageHeaderLen = 1 + nonceSize
+
+	// minStorageBlobLen is the smallest valid v1 blob — the header plus a tag,
+	// i.e. an envelope wrapping empty plaintext. Anything shorter is corrupt.
+	minStorageBlobLen = storageHeaderLen + gcmTagSize
+)
+
 // =============================================================================
 // Storage subsystem
 // =============================================================================
@@ -38,6 +57,13 @@ const nonceSize = 12
 // AES-256 DEK. The DEK lives only in process memory; it's KMS-decrypted at
 // boot from a ciphertext stored in SSM. All Store/Load/Delete operations
 // transparently AES-GCM encrypt/decrypt against the DEK.
+//
+// Each object's AAD binds it to its (deployment, app, key) location (see
+// storageAAD), so a host cannot relabel/swap ciphertext between keys or replay
+// it across deployments — the GCM tag check fails on Load. Not yet defended:
+// rollback/replay of an *older* value of the same key, and deletion (a removed
+// object is indistinguishable from a never-written one). Both need a versioned
+// manifest with an external monotonic anchor (issue #134, Tier 1/2).
 type Storage struct {
 	bucketName string
 	dek        []byte
@@ -192,6 +218,63 @@ func decryptDEK(ctx context.Context, kmsClient KMSAPI, keyID, ciphertextB64 stri
 	return nil, fmt.Errorf("KMS decrypt failed after 3 attempts: %w", lastErr)
 }
 
+// storageAAD binds a blob to its (deployment, app, key) location, mirroring the
+// S3 object key ("data/"+key). Sealing under it makes relabel/swap and
+// cross-deployment replay fail the GCM tag check on Load.
+func storageAAD(key string) []byte {
+	return []byte(getDeployment() + "/" + getAppName() + "/data/" + key)
+}
+
+// sealStorage AES-256-GCM-seals plaintext under dek, authenticating aad, and
+// returns the v1 envelope: storageFormatV1 || nonce || ct+tag.
+func sealStorage(dek, plaintext, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	nonce := make([]byte, nonceSize)
+	if _, err := secureRandom(nonce); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	ct := gcm.Seal(nil, nonce, plaintext, aad)
+
+	blob := make([]byte, 0, storageHeaderLen+len(ct))
+	blob = append(blob, storageFormatV1)
+	blob = append(blob, nonce...)
+	blob = append(blob, ct...)
+	return blob, nil
+}
+
+// openStorage decrypts a v1 storage blob, requiring the version prefix and the
+// matching aad. Unversioned (legacy nil-AAD) or short objects are rejected.
+func openStorage(dek, blob, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	if len(blob) < minStorageBlobLen || blob[0] != storageFormatV1 {
+		return nil, fmt.Errorf("corrupt or unversioned storage object")
+	}
+	nonce := blob[1:storageHeaderLen]
+	ct := blob[storageHeaderLen:]
+
+	plaintext, err := gcm.Open(nil, nonce, ct, aad)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	return plaintext, nil
+}
+
 // Store encrypts data with the DEK and persists it to S3.
 func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
 	if s.metrics != nil {
@@ -204,26 +287,13 @@ func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
 		return fmt.Errorf("storage not initialized")
 	}
 
-	block, err := aes.NewCipher(s.dek)
+	blob, err := sealStorage(s.dek, data, storageAAD(key))
 	if err != nil {
-		return fmt.Errorf("create cipher: %w", err)
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
+		return err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("create GCM: %w", err)
-	}
-
-	nonce := make([]byte, nonceSize)
-	if _, err := secureRandom(nonce); err != nil {
-		return fmt.Errorf("generate nonce: %w", err)
-	}
-
-	ciphertext := gcm.Seal(nil, nonce, data, nil)
-
-	// S3 object: nonce || ciphertext+tag
-	blob := make([]byte, 0, nonceSize+len(ciphertext))
-	blob = append(blob, nonce...)
-	blob = append(blob, ciphertext...)
 
 	_, err = s.kms.aws.S3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucketName),
@@ -269,27 +339,13 @@ func (s *Storage) Load(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("read S3 object: %w", err)
 	}
 
-	if len(blob) < nonceSize+1 {
-		return nil, fmt.Errorf("corrupt storage object: too short")
-	}
-
-	nonce := blob[:nonceSize]
-	ciphertext := blob[nonceSize:]
-
-	block, err := aes.NewCipher(s.dek)
+	plaintext, err := openStorage(s.dek, blob, storageAAD(key))
 	if err != nil {
-		return nil, fmt.Errorf("create cipher: %w", err)
+		if s.metrics != nil {
+			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
+		}
+		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("create GCM: %w", err)
-	}
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt: %w", err)
-	}
-
 	return plaintext, nil
 }
 

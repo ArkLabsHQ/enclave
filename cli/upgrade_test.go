@@ -21,12 +21,13 @@ app:
 `
 
 	tests := []struct {
-		name     string
-		content  string
-		key      string
-		newValue string
-		want     string
-		wantErr  bool
+		name            string
+		content         string
+		key             string
+		newValue        string
+		want            string
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name:     "rev does not touch nix_rev",
@@ -121,16 +122,18 @@ app:
 			want:     "runtime:  # supervisor coordinates\n  rev: \"v0.0.99\"\n",
 		},
 		{
-			name:    "no runtime block is an error",
-			content: "name: \"x\"\napp:\n  nix_rev: \"a\"\n",
-			key:     "rev",
-			wantErr: true,
+			name:            "no runtime block is an error",
+			content:         "name: \"x\"\napp:\n  nix_rev: \"a\"\n",
+			key:             "rev",
+			wantErr:         true,
+			wantErrContains: "no 'runtime:' block found",
 		},
 		{
-			name:    "key outside the runtime block is not matched",
-			content: "runtime:\n  rev: \"v0.0.62\"\napp:\n  hash: \"do-not-touch\"\n",
-			key:     "hash",
-			wantErr: true,
+			name:            "key outside the runtime block is not matched",
+			content:         "runtime:\n  rev: \"v0.0.62\"\napp:\n  hash: \"do-not-touch\"\n",
+			key:             "hash",
+			wantErr:         true,
+			wantErrContains: "key 'runtime.hash' not found",
 		},
 	}
 
@@ -138,9 +141,7 @@ app:
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := replaceRuntimeBlockValue(tt.content, tt.key, tt.newValue)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got nil (output %q)", got)
-				}
+				requireErrContains(t, err, tt.wantErrContains)
 				return
 			}
 			if err != nil {

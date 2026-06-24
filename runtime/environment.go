@@ -26,13 +26,17 @@ func getDeployment() string {
 	return "dev"
 }
 
-// nonOverridableEnv lists vars the SSM env overlay must never set: identity vars
-// name the SSM/KMS namespace; a short anchor window would let the operator wait
-// out the Object Lock and roll back undetected.
+// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
+// SSM/KMS namespace and lock posture, the managed-secret set, and security
+// timing — a short anchor window would let the operator wait out the Object Lock
+// and roll back undetected.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":    true,
-	"ENCLAVE_APP_NAME":      true,
-	"ENCLAVE_ANCHOR_WINDOW": true,
+	"ENCLAVE_DEPLOYMENT":         true,
+	"ENCLAVE_APP_NAME":           true,
+	"ENCLAVE_ANCHOR_WINDOW":      true,
+	"ENCLAVE_KMS_KEY_LOCKED":     true,
+	"ENCLAVE_MIGRATION_COOLDOWN": true,
+	"ENCLAVE_SECRETS_CONFIG":     true,
 }
 
 // skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
@@ -60,6 +64,22 @@ func getStaticSecretsConfig() string {
 // recovery principal). The choice is permanent at first lock.
 func kmsKeyLocked() bool {
 	return os.Getenv("ENCLAVE_KMS_KEY_LOCKED") == "true"
+}
+
+// lockSegment is the SSM namespace segment ("locked"|"unlocked") inserted after
+// /{deployment}/{app}/ in every KMS-subtree path, so the lock posture is an
+// IAM-enforceable boundary: a locked deployment can never read or write the
+// unlocked namespace's key or ciphertexts (and vice versa).
+func lockSegment() string {
+	if kmsKeyLocked() {
+		return "locked"
+	}
+	return "unlocked"
+}
+
+// kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
+func kmsKeyIDParam() string {
+	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
 }
 
 func getMigrationCooldown() time.Duration {
@@ -135,21 +155,15 @@ func spanBufferSize() int {
 	return 1000
 }
 
-// secretCiphertextParam: SSM path for a secret's KMS ciphertext, scoped by the
-// KMS key ID. Flipping /{dep}/{app}/KMSKeyID is the atomic migration commit.
+// secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
+// scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func secretCiphertextParam(secretName, keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), secretName, keyID)
+	return fmt.Sprintf("/%s/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), secretName, keyID)
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, scoped by key ID.
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
 func storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
-}
-
-// kmsKeyIDParam: SSM path for the active primary KMS key ID. Flipping this is
-// the atomic migration commit point.
-func kmsKeyIDParam() string {
-	return fmt.Sprintf("/%s/%s/KMSKeyID", getDeployment(), getAppName())
+	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its

@@ -189,14 +189,11 @@ func extractPCRFromAttestation(attestationDoc []byte, index uint) ([]byte, error
 	return pcr, nil
 }
 
-// attestationRoots overrides the trust anchor for verifyAttestationDoc; nil uses
-// nitrite's embedded AWS Nitro root. Tests set a synthetic CA pool.
-var attestationRoots *x509.CertPool
-
-// verifyAttestationDoc verifies a COSE Sign1 document against the AWS Nitro root
-// and returns the validated result. The "dev" deployment skips the check (its
-// QEMU NSM is unsigned); any other deployment rejects a forged or unsigned doc.
-func verifyAttestationDoc(doc []byte) (*nitrite.Result, error) {
+// verifyAttestationDoc verifies a COSE Sign1 document against roots (nil uses
+// nitrite's embedded AWS Nitro root) and returns the validated result. The "dev"
+// deployment skips the check (its QEMU NSM is unsigned); any other deployment
+// rejects a forged or unsigned doc.
+func verifyAttestationDoc(doc []byte, roots *x509.CertPool) (*nitrite.Result, error) {
 	if skipCOSEVerification() {
 		slog.Warn("INSECURE: skipping COSE signature verification of attestation document",
 			"deployment", getDeployment())
@@ -216,7 +213,7 @@ func verifyAttestationDoc(doc []byte) (*nitrite.Result, error) {
 	// nitrite returns nil only when the cert chains to a trusted root and the
 	// signature is valid; reject any failure (untrusted or bad signature).
 	res, err := nitrite.Verify(doc, nitrite.VerifyOptions{
-		Roots:       attestationRoots,
+		Roots:       roots,
 		CurrentTime: time.UnixMilli(int64(pre.Document.Timestamp)),
 	})
 	if err != nil {

@@ -49,7 +49,27 @@ func getSupervisorAddr() string {
 	return "127.0.0.1:8443"
 }
 
-// ssmParamPath returns /<deployment>/<app>/<name>.
+// ssmParamPath returns /<deployment>/<app>/<name>. Used for migration-state
+// params, which are NOT lock-namespaced — see kmsSubtreeParamPath for KMS state.
 func ssmParamPath(name string) string {
 	return fmt.Sprintf("/%s/%s/%s", getDeployment(), getAppName(), name)
+}
+
+// kmsKeyLocked mirrors the runtime: the EIF's lock posture, plumbed to the host
+// supervisor via user_data.
+func kmsKeyLocked() bool {
+	return os.Getenv("ENCLAVE_KMS_KEY_LOCKED") == "true"
+}
+
+func lockSegment() string {
+	if kmsKeyLocked() {
+		return "locked"
+	}
+	return "unlocked"
+}
+
+// kmsSubtreeParamPath returns /<deployment>/<app>/<lock>/<name>. Use ONLY for
+// KMS-subtree params (KMSKeyID); migration-state params stay on ssmParamPath.
+func kmsSubtreeParamPath(name string) string {
+	return fmt.Sprintf("/%s/%s/%s/%s", getDeployment(), getAppName(), lockSegment(), name)
 }

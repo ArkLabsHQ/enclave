@@ -112,9 +112,7 @@ func TestSchnorrRejectsWrongBody(t *testing.T) {
 	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
 
 	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	if err == nil {
-		t.Fatal("expected Schnorr verification to fail with wrong body")
-	}
+	requireErrContains(t, err, "signature verification failed")
 }
 
 func TestSchnorrRejectsWrongPubkey(t *testing.T) {
@@ -124,9 +122,7 @@ func TestSchnorrRejectsWrongPubkey(t *testing.T) {
 	pubkeyHex := "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	if err == nil {
-		t.Fatal("expected Schnorr verification to fail with wrong pubkey")
-	}
+	requireErrContains(t, err, "signature verification failed")
 }
 
 func TestKeyBindingAppKeyHash(t *testing.T) {

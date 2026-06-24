@@ -11,9 +11,10 @@ import (
 // =============================================================================
 
 // KMSPolicyBuilder builds the locked KMS key policy passed to CreateKey.
-// Decrypt is PCR0-attestation-gated; the EC2 role gets Encrypt /
-// GenerateDataKey / GetKeyPolicy / ScheduleKeyDeletion (no PutKeyPolicy).
-// WithRootRecovery is the only path to mutate the policy post-creation.
+// Decrypt and GenerateDataKey are PCR0-attestation-gated, so only an attested
+// enclave can read or mint under the key; the EC2 role also gets Encrypt /
+// GetKeyPolicy / ScheduleKeyDeletion (no PutKeyPolicy). WithRootRecovery is the
+// only path to mutate the policy post-creation.
 type KMSPolicyBuilder struct {
 	roleARN         string
 	pcr0Values      []string
@@ -25,8 +26,9 @@ func NewKMSPolicyBuilder() *KMSPolicyBuilder {
 	return &KMSPolicyBuilder{}
 }
 
-// ForRole sets the EC2 instance role ARN that's granted Encrypt /
-// GenerateDataKey / GetKeyPolicy / ScheduleKeyDeletion. Required.
+// ForRole sets the EC2 instance role ARN granted the key operations: Decrypt
+// and GenerateDataKey (attestation-gated), plus Encrypt / GetKeyPolicy /
+// ScheduleKeyDeletion. Required.
 func (b *KMSPolicyBuilder) ForRole(arn string) *KMSPolicyBuilder {
 	b.roleARN = arn
 	return b
@@ -54,10 +56,10 @@ func (b *KMSPolicyBuilder) Build() string {
 	condVal, _ := json.Marshal(b.pcr0Values)
 	roleJSON, _ := json.Marshal(b.roleARN)
 	base := fmt.Sprintf(`    {
-      "Sid": "EnclaveDecryptWithAttestation",
+      "Sid": "EnclaveAttestedOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %s},
-      "Action": "kms:Decrypt",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
       "Resource": "*",
       "Condition": {
         "StringEqualsIgnoreCase": {
@@ -69,7 +71,7 @@ func (b *KMSPolicyBuilder) Build() string {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %s},
-      "Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
+      "Action": ["kms:Encrypt", "kms:GetKeyPolicy"],
       "Resource": "*"
     },
     {

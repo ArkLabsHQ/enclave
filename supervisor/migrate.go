@@ -205,7 +205,7 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	m.cleanupHostArtifacts(p, eifBackup)
 	exitAfter := m.maybeUpdateSupervisor(ctx, p, req)
 
-	newKeyID, _ := m.getParam(ctx, "KMSKeyID")
+	newKeyID, _ := m.getParamAt(ctx, kmsSubtreeParamPath("KMSKeyID"))
 	p.complete(stepSupervisorUpdate, fmt.Sprintf("Migration complete. New KMS key: %s", newKeyID))
 
 	if exitAfter && m.requestShutdown != nil {
@@ -292,7 +292,7 @@ func (m *Migration) runCooldown(ctx context.Context, p *migrateEmitter) bool {
 
 func (m *Migration) readCurrentKMSKey(ctx context.Context, p *migrateEmitter) (string, error) {
 	p.progress(stepReadCurrentKey, "Reading current KMS key ID...")
-	keyID, err := m.getParam(ctx, "KMSKeyID")
+	keyID, err := m.getParamAt(ctx, kmsSubtreeParamPath("KMSKeyID"))
 	if err != nil || keyID == "" {
 		p.errorf(stepReadCurrentKey, "KMSKeyID not found in SSM: %v", err)
 		if err == nil {
@@ -568,7 +568,7 @@ type deletionResponse struct {
 func (m *Migration) handleScheduleKeyDeletion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	kmsParam := ssmParamPath("KMSKeyID")
+	kmsParam := kmsSubtreeParamPath("KMSKeyID")
 	kmsOut, err := m.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(kmsParam),
 		WithDecryption: aws.Bool(false),
@@ -603,8 +603,14 @@ func (m *Migration) handleScheduleKeyDeletion(w http.ResponseWriter, r *http.Req
 }
 
 func (m *Migration) getParam(ctx context.Context, name string) (string, error) {
+	return m.getParamAt(ctx, ssmParamPath(name))
+}
+
+// getParamAt reads an SSM param at an explicit path (UNSET treated as ""). Used
+// for KMS-subtree params, whose path carries the lock segment.
+func (m *Migration) getParamAt(ctx context.Context, path string) (string, error) {
 	out, err := m.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
-		Name: aws.String(ssmParamPath(name)),
+		Name: aws.String(path),
 	})
 	if err != nil {
 		return "", err

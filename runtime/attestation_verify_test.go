@@ -42,8 +42,8 @@ func pcr31Commitment(t *testing.T, pcr0Hex string) []byte {
 	return sum[:]
 }
 
-// useAttestationRoots points verifyAttestationDoc at the given pool for the
-// duration of the test.
+// useAttestationRoots points the state-origin verifiers at the given pool for
+// the duration of the test.
 func useAttestationRoots(t *testing.T, pool *x509.CertPool) {
 	t.Helper()
 	prev := attestationRoots
@@ -240,9 +240,8 @@ func TestVerifyPCR31Commitment_ValidSignedDocPasses(t *testing.T) {
 	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
 	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
-	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err != nil {
+	if err := verifyPCR31CommitmentWithRoots(att.docB64, myPCR0, prevPCR0, att.roots); err != nil {
 		t.Fatalf("valid commitment should verify, got: %v", err)
 	}
 }
@@ -257,9 +256,8 @@ func TestVerifyPCR31Commitment_ForgedDocRejected(t *testing.T) {
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
 	forged := buildForgedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 
-	if err := verifyPCR31Commitment(forged, myPCR0, prevPCR0); err == nil {
-		t.Fatal("forged (unsigned) attestation with correct PCR31 must be rejected")
-	}
+	err := verifyPCR31CommitmentWithRoots(forged, myPCR0, prevPCR0, nil)
+	requireErrContains(t, err, "verify predecessor attestation")
 }
 
 // A document signed by a CA that is not in the trust store must be rejected,
@@ -272,11 +270,10 @@ func TestVerifyPCR31Commitment_UntrustedSignerRejected(t *testing.T) {
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
 	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
 	other := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0))
-	useAttestationRoots(t, other.roots) // trust a different CA
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
-		t.Fatal("attestation from an untrusted CA must be rejected")
-	}
+	// Verify against a different CA than the one that signed att.
+	err := verifyPCR31CommitmentWithRoots(att.docB64, myPCR0, prevPCR0, other.roots)
+	requireErrContains(t, err, "verify predecessor attestation")
 }
 
 // A validly signed document that commits to a different target PCR0 must fail
@@ -289,11 +286,9 @@ func TestVerifyPCR31Commitment_WrongTargetRejected(t *testing.T) {
 	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
 	att := buildSignedAttestation(t, predecessorPCRs(t, prevPCR0Bytes, otherPCR0))
-	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
-		t.Fatal("commitment to a different PCR0 must be rejected")
-	}
+	err := verifyPCR31CommitmentWithRoots(att.docB64, myPCR0, prevPCR0, att.roots)
+	requireErrContains(t, err, "previous enclave committed to a different target PCR0")
 }
 
 // A validly signed document whose PCR0 does not match the stored predecessor
@@ -305,11 +300,9 @@ func TestVerifyPCR31Commitment_PCR0MismatchRejected(t *testing.T) {
 	prevPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
 	wrongPCR0Bytes := bytes.Repeat([]byte{0x77}, 48) // doc attests a different PCR0
 	att := buildSignedAttestation(t, predecessorPCRs(t, wrongPCR0Bytes, myPCR0))
-	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err == nil {
-		t.Fatal("attestation whose PCR0 differs from MigrationPreviousPCR0 must be rejected")
-	}
+	err := verifyPCR31CommitmentWithRoots(att.docB64, myPCR0, prevPCR0, att.roots)
+	requireErrContains(t, err, "attested PCR0 does not match stored MigrationPreviousPCR0")
 }
 
 // A cert that has expired by now but was valid at the attestation timestamp must
@@ -324,9 +317,8 @@ func TestVerifyPCR31Commitment_ExpiredCertValidAtTimestamp(t *testing.T) {
 	// Cert window is entirely in the past; the timestamp falls inside it.
 	att := buildSignedAttestationCustom(t, predecessorPCRs(t, prevPCR0Bytes, myPCR0),
 		now.Add(-3*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour), nil)
-	useAttestationRoots(t, att.roots)
 
-	if err := verifyPCR31Commitment(att.docB64, myPCR0, prevPCR0); err != nil {
+	if err := verifyPCR31CommitmentWithRoots(att.docB64, myPCR0, prevPCR0, att.roots); err != nil {
 		t.Fatalf("attestation valid at its timestamp must verify despite a now-expired cert, got: %v", err)
 	}
 }

@@ -934,12 +934,15 @@ selfApplyKMSPolicy()
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "EnclaveDecryptWithAttestation",
+      "Sid": "EnclaveAttestedOperations",
       "Effect": "Allow",
       "Principal": {
         "AWS": "arn:aws:iam::123456789012:role/EnclaveRole"
       },
-      "Action": "kms:Decrypt",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
       "Resource": "*",
       "Condition": {
         "StringEqualsIgnoreCase": {
@@ -955,8 +958,7 @@ selfApplyKMSPolicy()
       },
       "Action": [
         "kms:Encrypt",
-        "kms:GetKeyPolicy",
-        "kms:GenerateDataKey"
+        "kms:GetKeyPolicy"
       ],
       "Resource": "*"
     },

@@ -291,12 +291,13 @@ provider "aws" {
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
   endpoints {
-    s3  = "http://127.0.0.1:4566"
-    ssm = "http://127.0.0.1:4566"
-    sts = "http://127.0.0.1:4566"
-    iam = "http://127.0.0.1:4566"
-    kms = "http://127.0.0.1:4566"
-    ec2 = "http://127.0.0.1:4566"
+    s3       = "http://127.0.0.1:4566"
+    ssm      = "http://127.0.0.1:4566"
+    sts      = "http://127.0.0.1:4566"
+    iam      = "http://127.0.0.1:4566"
+    kms      = "http://127.0.0.1:4566"
+    ec2      = "http://127.0.0.1:4566"
+    dynamodb = "http://127.0.0.1:4566"
   }
 }
 OVERRIDE
@@ -965,15 +966,6 @@ else
   exit 1
 fi
 
-# Verify dynamic secrets API works after restart.
-DYN_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secrets" 2>/dev/null || echo "")
-if echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secrets round-trip works after restart"
-else
-  echo "  FAIL: Dynamic secrets broken after restart: ${DYN_RESP:0:120}" >&2
-  exit 1
-fi
-
 # Verify attestation pubkey + PCR16 survived migration (written in integration test 15).
 # GET /test/attestation-persistence re-derives current values and compares to stored.
 # 200+ok=true → SIGNING_KEY intact and derivation matches. 404 → storage lost. 500 → mismatch.
@@ -983,16 +975,6 @@ if echo "$ATTEST_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
 else
   echo "  FAIL: Attestation data lost or changed during migration!" >&2
   echo "$ATTEST_PERSIST_RESP" | jq . >&2
-  exit 1
-fi
-
-# Verify dynamic secret created before migration survived restart (written in integration test 14).
-# GET /test/dynamic-secret-persistence reads the known secret and compares value byte-for-byte.
-DYN_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secret survived migration+restart"
-else
-  echo "  FAIL: Dynamic secret lost or corrupted during migration: ${DYN_PERSIST_RESP:0:200}" >&2
   exit 1
 fi
 

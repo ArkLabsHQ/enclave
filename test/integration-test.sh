@@ -103,6 +103,16 @@ else
   fail "Storage round-trip" "${STORAGE_RESP:0:120}"
 fi
 
+# Test 8b: Full Redis surface — hashes, lists, sets, sorted sets, streams,
+# MULTI/EXEC, SCAN, pub/sub — exercised through the real go-redis client.
+echo "[8b/28] Redis data types + transactions + pub/sub"
+TYPES_RESP=$($CURL "${BASE_URL}/test/redis-types" 2>/dev/null || echo "")
+if echo "$TYPES_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  pass "Redis types/tx/pubsub (hash,list,set,zset,stream,transaction,scan,pubsub)"
+else
+  fail "Redis data types" "${TYPES_RESP:0:200}"
+fi
+
 # Test 9: previous_pcr0 is "genesis" on first boot (no prior enclave).
 echo "[9/28] Previous PCR0"
 if [ -n "$INFO" ]; then
@@ -125,16 +135,6 @@ if [ "$KMS_LOCKED" = "true" ] || [ "$KMS_LOCKED" = "false" ]; then
   pass "kms_key_locked present in enclave-info (${KMS_LOCKED})"
 else
   fail "kms_key_locked" "missing or non-boolean (got: ${KMS_LOCKED})"
-fi
-
-# Test 10: Dynamic secrets round-trip (PUT → GET → LIST → DELETE).
-echo "[10/28] Dynamic secrets"
-DYN_RESP=$($CURL "${BASE_URL}/test/dynamic-secrets" 2>/dev/null || echo "")
-if [ -n "$DYN_RESP" ] && echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  DYN_LISTED=$(echo "$DYN_RESP" | jq -r '.listed // false' 2>/dev/null || echo "false")
-  pass "Dynamic secrets round-trip (listed=$DYN_LISTED)"
-else
-  fail "Dynamic secrets" "${DYN_RESP:0:120}"
 fi
 
 # Test 11: PCR secret derivation + attestation document PCR16 verification.
@@ -186,15 +186,6 @@ if echo "$PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
   pass "Storage persistence write"
 else
   fail "Storage persistence write" "${PERSIST_RESP:0:120}"
-fi
-
-# Test 14: Dynamic secret persistence — write a known secret for post-migration verification.
-echo "[14/28] Dynamic secret persistence (write)"
-DYN_PERSIST_RESP=$($CURL -X POST "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  pass "Dynamic secret persistence write"
-else
-  fail "Dynamic secret persistence write" "${DYN_PERSIST_RESP:0:120}"
 fi
 
 # Test 15: Attestation persistence — write pubkey + PCR16 hash for post-migration verification.

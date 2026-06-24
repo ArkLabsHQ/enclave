@@ -26,20 +26,13 @@ import (
 // Metrics holds OTEL metric instruments for the enclave supervisor.
 type Metrics struct {
 	// Supervisor counters.
-	HTTPRequests        metric.Int64Counter
-	HTTPErrors          metric.Int64Counter
-	AppProxiedRequests  metric.Int64Counter // requests forwarded to the user app via revProxy
-	AppProxiedErrors    metric.Int64Counter // failures dialing or talking to the user app
-	KMSOperations  metric.Int64Counter
-	KMSErrors      metric.Int64Counter
-	StorageReads   metric.Int64Counter
-	StorageWrites  metric.Int64Counter
-	StorageDeletes metric.Int64Counter
-	StorageErrors  metric.Int64Counter
-	SecretReads    metric.Int64Counter
-	SecretWrites   metric.Int64Counter
-	SecretDeletes  metric.Int64Counter
-	LogEntries     metric.Int64Counter
+	HTTPRequests       metric.Int64Counter
+	HTTPErrors         metric.Int64Counter
+	AppProxiedRequests metric.Int64Counter // requests forwarded to the user app via revProxy
+	AppProxiedErrors   metric.Int64Counter // failures dialing or talking to the user app
+	KMSOperations      metric.Int64Counter
+	KMSErrors          metric.Int64Counter
+	LogEntries         metric.Int64Counter
 
 	// Snapshot state: accumulated values for JSON export.
 	mu       sync.Mutex
@@ -80,13 +73,6 @@ func NewMetrics() *Metrics {
 	m.AppProxiedErrors = newCounter(meter, "enclave_app_proxied_errors_total", "Total failures forwarding requests to the user app (dial / connect errors).")
 	m.KMSOperations = newCounter(meter, "enclave_kms_operations_total", "Total KMS Decrypt operations attempted.")
 	m.KMSErrors = newCounter(meter, "enclave_kms_errors_total", "Total failed KMS operations.")
-	m.StorageReads = newCounter(meter, "enclave_storage_reads_total", "Total encrypted storage read operations.")
-	m.StorageWrites = newCounter(meter, "enclave_storage_writes_total", "Total encrypted storage write operations.")
-	m.StorageDeletes = newCounter(meter, "enclave_storage_deletes_total", "Total encrypted storage delete operations.")
-	m.StorageErrors = newCounter(meter, "enclave_storage_errors_total", "Total failed storage operations.")
-	m.SecretReads = newCounter(meter, "enclave_secret_reads_total", "Total dynamic secret read operations.")
-	m.SecretWrites = newCounter(meter, "enclave_secret_writes_total", "Total dynamic secret write operations.")
-	m.SecretDeletes = newCounter(meter, "enclave_secret_deletes_total", "Total dynamic secret delete operations.")
 	m.LogEntries = newCounter(meter, "enclave_log_entries_total", "Total log entries accepted.")
 	go m.collectRuntime()
 	return m

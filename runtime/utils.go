@@ -9,10 +9,22 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"sync"
 
 	"github.com/hf/nsm"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
+
+// envMu serializes os.Setenv across the secret-loading goroutines.
+var envMu sync.Mutex
+
+// safeSetenv wraps os.Setenv under envMu to prevent concurrent env mutations.
+func safeSetenv(key, value string) error {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Setenv(key, value)
+}
 
 // =============================================================================
 // Random source

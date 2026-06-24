@@ -26,13 +26,13 @@ func getDeployment() string {
 	return "dev"
 }
 
-// nonOverridableEnv lists framework-identity vars the SSM env overlay must
-// never set. They are baked into the EIF (measured into PCR0) and name the
-// SSM/KMS namespace; letting the overlay change them would redirect the
-// namespace or flip security-critical checks like COSE skip.
+// nonOverridableEnv lists vars the SSM env overlay must never set: identity vars
+// name the SSM/KMS namespace; a short anchor window would let the operator wait
+// out the Object Lock and roll back undetected.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT": true,
-	"ENCLAVE_APP_NAME":   true,
+	"ENCLAVE_DEPLOYMENT":    true,
+	"ENCLAVE_APP_NAME":      true,
+	"ENCLAVE_ANCHOR_WINDOW": true,
 }
 
 // skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
@@ -72,6 +72,27 @@ func getMigrationCooldown() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// respPort is the TLS port for the RESP K/V listener; 0 disables it.
+func respPort() uint16 {
+	if s := strings.TrimSpace(os.Getenv("ENCLAVE_KV_RESP_PORT")); s != "" {
+		if n, err := strconv.ParseUint(s, 10, 16); err == nil {
+			return uint16(n)
+		}
+	}
+	return 6379
+}
+
+// anchorWindow is the Object-Lock retain-until duration set on each anchor
+// object. Defaults to ~10 years.
+func anchorWindow() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("ENCLAVE_ANCHOR_WINDOW")); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * 365 * 24 * time.Hour
 }
 
 func logBufferSize() int {

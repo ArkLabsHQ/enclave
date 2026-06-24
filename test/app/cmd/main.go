@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -112,13 +114,11 @@ func main() {
 	mux.HandleFunc("GET /", handleRoot)
 	mux.HandleFunc("GET /test/secrets", handleTestSecrets)
 	mux.HandleFunc("GET /test/storage", handleTestStorage)
+	mux.HandleFunc("GET /test/redis-types", handleTestRedisTypes)
 	mux.HandleFunc("POST /test/storage-persistence", handleTestStoragePersistenceWrite)
 	mux.HandleFunc("GET /test/storage-persistence", handleTestStoragePersistenceVerify)
 	mux.HandleFunc("GET /test/attestation", handleTestAttestation)
 	mux.HandleFunc("GET /test/attestation-document", handleTestAttestationDocument)
-	mux.HandleFunc("GET /test/dynamic-secrets", handleTestDynamicSecrets)
-	mux.HandleFunc("POST /test/dynamic-secret-persistence", handleTestDynamicSecretPersistenceWrite)
-	mux.HandleFunc("GET /test/dynamic-secret-persistence", handleTestDynamicSecretPersistenceVerify)
 	mux.HandleFunc("GET /test/pcr-secrets", handleTestPCRSecrets)
 	mux.HandleFunc("POST /test/attestation-persistence", handleTestAttestationPersistenceWrite)
 	mux.HandleFunc("GET /test/attestation-persistence", handleTestAttestationPersistenceVerify)
@@ -294,57 +294,40 @@ func handleTestSecrets(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// handleTestStorage exercises the storage API: put, get, verify, delete.
+// handleTestStorage exercises the K/V store with a real Redis client over the
+// enclave's RESP listener: SET, GET, verify, DEL.
 func handleTestStorage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
+	rdb, err := redisClient()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
+	defer rdb.Close()
+	ctx := r.Context()
 
 	testKey := fmt.Sprintf("test/%s", uuid.NewString())
 	testValue := fmt.Sprintf("test-data-%d", time.Now().UnixNano())
+	results := map[string]any{"key": testKey}
 
-	results := map[string]any{
-		"key": testKey,
-	}
-
-	// PUT: store test data.
-	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/storage/"+testKey, bytes.NewReader([]byte(testValue)))
-	putReq.Header.Set("Authorization", "Bearer "+token)
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		results["error"] = fmt.Sprintf("put request failed: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
-	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
-		results["error"] = fmt.Sprintf("put returned %d", putResp.StatusCode)
+	if err := rdb.Set(ctx, testKey, testValue, 0).Err(); err != nil {
+		results["error"] = fmt.Sprintf("SET failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
 	results["put"] = "ok"
 
-	// GET: read it back.
-	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/storage/"+testKey, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
-	getResp, err := http.DefaultClient.Do(getReq)
+	got, err := rdb.Get(ctx, testKey).Result()
 	if err != nil {
-		results["error"] = fmt.Sprintf("get request failed: %v", err)
+		results["error"] = fmt.Sprintf("GET failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
-	body, _ := io.ReadAll(getResp.Body)
-	getResp.Body.Close()
-
-	if string(body) != testValue {
-		results["error"] = fmt.Sprintf("value mismatch: got %q, want %q", string(body), testValue)
+	if got != testValue {
+		results["error"] = fmt.Sprintf("value mismatch: got %q, want %q", got, testValue)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
@@ -352,17 +335,12 @@ func handleTestStorage(w http.ResponseWriter, r *http.Request) {
 	results["get"] = "ok"
 	results["roundtrip"] = true
 
-	// DELETE: clean up.
-	delReq, _ := http.NewRequest("DELETE", supervisorURL+"/v1/storage/"+testKey, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	delResp, err := http.DefaultClient.Do(delReq)
-	if err != nil {
-		results["error"] = fmt.Sprintf("delete request failed: %v", err)
+	if err := rdb.Del(ctx, testKey).Err(); err != nil {
+		results["error"] = fmt.Sprintf("DEL failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(results)
 		return
 	}
-	delResp.Body.Close()
 	results["delete"] = "ok"
 
 	results["status"] = "ok"
@@ -374,262 +352,159 @@ const (
 	storagePersistValue = "persistent-test-value"
 )
 
-// handleTestStoragePersistenceWrite (POST) unconditionally writes the well-known
-// key+value to storage. Deletes any stale value first so re-runs don't carry
-// over data from a previous test run.
+// handleTestStoragePersistenceWrite (POST) writes the well-known key+value,
+// deleting any stale value first so re-runs don't carry over old data.
 func handleTestStoragePersistenceWrite(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
-	}
-	// Delete first (idempotent — 404 is fine).
-	delReq, _ := http.NewRequest("DELETE", supervisorURL+"/v1/storage/"+storagePersistKey, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	resp, _ := http.DefaultClient.Do(delReq)
-	if resp != nil {
-		resp.Body.Close()
-	}
-	// Write the known value.
-	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/storage/"+storagePersistKey, bytes.NewReader([]byte(storagePersistValue)))
-	putReq.Header.Set("Authorization", "Bearer "+token)
-	putResp, err := http.DefaultClient.Do(putReq)
+	rdb, err := redisClient()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"put failed: %v"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
-		http.Error(w, fmt.Sprintf(`{"error":"put returned %d"}`, putResp.StatusCode), http.StatusInternalServerError)
+	defer rdb.Close()
+	ctx := r.Context()
+
+	if err := rdb.Del(ctx, storagePersistKey).Err(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"DEL failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	if err := rdb.Set(ctx, storagePersistKey, storagePersistValue, 0).Err(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"SET failed: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "key": storagePersistKey})
 }
 
 // handleTestStoragePersistenceVerify (GET) reads the well-known key and compares
-// it to the expected value. Returns 404 if the key is missing (data lost during
+// it to the expected value. 404 if the key is missing (data lost during
 // migration), 500 if the value is wrong, 200 if it matches exactly.
 func handleTestStoragePersistenceVerify(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
-	}
-	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/storage/"+storagePersistKey, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
-	getResp, err := http.DefaultClient.Do(getReq)
+	rdb, err := redisClient()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"get failed: %v"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	body, _ := io.ReadAll(getResp.Body)
-	getResp.Body.Close()
-	if getResp.StatusCode == http.StatusNotFound {
+	defer rdb.Close()
+
+	got, err := rdb.Get(r.Context(), storagePersistKey).Result()
+	if errors.Is(err, redis.Nil) {
 		http.Error(w, `{"error":"key not found — data lost during migration"}`, http.StatusNotFound)
 		return
 	}
-	if getResp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf(`{"error":"storage get returned %d"}`, getResp.StatusCode), http.StatusInternalServerError)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"GET failed: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
-	if string(body) != storagePersistValue {
-		http.Error(w, fmt.Sprintf(`{"error":"value mismatch: got %q, want %q"}`, string(body), storagePersistValue), http.StatusInternalServerError)
+	if got != storagePersistValue {
+		http.Error(w, fmt.Sprintf(`{"error":"value mismatch: got %q, want %q"}`, got, storagePersistValue), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "key": storagePersistKey})
 }
 
-// handleTestDynamicSecrets exercises the dynamic secrets API:
-// PUT → GET → verify → list → DELETE.
-func handleTestDynamicSecrets(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
+// redisClient builds a go-redis client for the enclave's RESP listener over
+// loopback TLS, authenticating with the runtime token. The listener serves the
+// attestation-bound cert (issued for the FQDN), so loopback dials skip
+// verification — same trust domain, inside the enclave.
+func redisClient() (*redis.Client, error) {
 	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
+		return nil, errors.New("ENCLAVE_RUNTIME_TOKEN not set")
 	}
+	port := os.Getenv("ENCLAVE_KV_RESP_PORT")
+	if port == "" {
+		port = "6379"
+	}
+	return redis.NewClient(&redis.Options{
+		Addr:      "127.0.0.1:" + port,
+		Password:  token,
+		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+	}), nil
+}
 
-	secretName := fmt.Sprintf("test-secret-%s", uuid.NewString()[:8])
-	secretValue := fmt.Sprintf("value-%d", time.Now().UnixNano())
-	results := map[string]any{"name": secretName}
-
-	// PUT: create dynamic secret.
-	putBody, _ := json.Marshal(map[string]string{
-		"value":   secretValue,
-		"env_var": "TEST_DYNAMIC_" + fmt.Sprintf("%d", time.Now().UnixNano()%10000),
-	})
-	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/secrets/"+secretName, bytes.NewReader(putBody))
-	putReq.Header.Set("Authorization", "Bearer "+token)
-	putReq.Header.Set("Content-Type", "application/json")
-	putResp, err := http.DefaultClient.Do(putReq)
+// handleTestRedisTypes exercises the full Redis surface — hashes, lists, sets,
+// sorted sets, streams, MULTI/EXEC transactions, SCAN, and pub/sub — through the
+// real go-redis client, proving the enclave speaks them end to end.
+func handleTestRedisTypes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	rdb, err := redisClient()
 	if err != nil {
-		results["error"] = fmt.Sprintf("put secret failed: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
-		results["error"] = fmt.Sprintf("put secret returned %d", putResp.StatusCode)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
-	}
-	results["put"] = "ok"
+	defer rdb.Close()
+	ctx := r.Context()
+	p := fmt.Sprintf("itest:%d:", time.Now().UnixNano()) // unique per run
+	results := map[string]any{}
 
-	// GET: read it back.
-	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/secrets/"+secretName, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
-	getResp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		results["error"] = fmt.Sprintf("get secret failed: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
-	}
-	getBody, _ := io.ReadAll(getResp.Body)
-	getResp.Body.Close()
-	if getResp.StatusCode != http.StatusOK {
-		results["error"] = fmt.Sprintf("get secret returned %d: %s", getResp.StatusCode, string(getBody))
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
+	if err := rdb.HSet(ctx, p+"h", "f1", "v1", "f2", "v2").Err(); err == nil {
+		hm, e := rdb.HGetAll(ctx, p+"h").Result()
+		results["hash"] = e == nil && hm["f1"] == "v1" && hm["f2"] == "v2"
 	}
 
-	var secretResp struct {
-		Value string `json:"value"`
-	}
-	json.Unmarshal(getBody, &secretResp)
-	if secretResp.Value != secretValue {
-		results["error"] = fmt.Sprintf("value mismatch: got %q, want %q", secretResp.Value, secretValue)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
-	}
-	results["get"] = "ok"
-	results["roundtrip"] = true
+	rdb.RPush(ctx, p+"l", "a", "b", "c")
+	lr, e := rdb.LRange(ctx, p+"l", 0, -1).Result()
+	results["list"] = e == nil && strings.Join(lr, ",") == "a,b,c"
 
-	// LIST: verify it appears.
-	listReq, _ := http.NewRequest("GET", supervisorURL+"/v1/secrets", nil)
-	listReq.Header.Set("Authorization", "Bearer "+token)
-	listResp, err := http.DefaultClient.Do(listReq)
-	if err == nil {
-		listBody, _ := io.ReadAll(listResp.Body)
-		listResp.Body.Close()
-		var listResult struct {
-			Secrets []struct{ Name string } `json:"secrets"`
+	rdb.SAdd(ctx, p+"s", "x", "y", "x")
+	sc, e := rdb.SCard(ctx, p+"s").Result()
+	results["set"] = e == nil && sc == 2
+
+	rdb.ZAdd(ctx, p+"z", redis.Z{Score: 2, Member: "b"}, redis.Z{Score: 1, Member: "a"})
+	zr, e := rdb.ZRange(ctx, p+"z", 0, -1).Result()
+	results["zset"] = e == nil && strings.Join(zr, ",") == "a,b"
+
+	id, e := rdb.XAdd(ctx, &redis.XAddArgs{Stream: p + "st", Values: map[string]any{"f": "v"}}).Result()
+	xl, _ := rdb.XLen(ctx, p+"st").Result()
+	results["stream"] = e == nil && id != "" && xl == 1
+
+	// MULTI/EXEC: SET then INCR commit atomically; INCR returns 2.
+	pipe := rdb.TxPipeline()
+	pipe.Set(ctx, p+"tx", "1", 0)
+	incr := pipe.Incr(ctx, p+"tx")
+	_, e = pipe.Exec(ctx)
+	results["transaction"] = e == nil && incr.Val() == 2
+
+	// SCAN finds the keys created above (6 data keys under the prefix).
+	found := 0
+	iter := rdb.Scan(ctx, 0, p+"*", 10).Iterator()
+	for iter.Next(ctx) {
+		found++
+	}
+	results["scan"] = iter.Err() == nil && found >= 6
+
+	results["pubsub"] = testPubSub(ctx, rdb, p+"chan")
+
+	ok := true
+	for _, v := range results {
+		if b, _ := v.(bool); !b {
+			ok = false
 		}
-		json.Unmarshal(listBody, &listResult)
-		found := false
-		for _, s := range listResult.Secrets {
-			if s.Name == secretName {
-				found = true
-				break
-			}
-		}
-		results["listed"] = found
 	}
-
-	// DELETE: clean up.
-	delReq, _ := http.NewRequest("DELETE", supervisorURL+"/v1/secrets/"+secretName, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	delResp, err := http.DefaultClient.Do(delReq)
-	if err != nil {
-		results["error"] = fmt.Sprintf("delete secret failed: %v", err)
+	results["ok"] = ok
+	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(results)
-		return
 	}
-	delResp.Body.Close()
-	results["delete"] = "ok"
-
-	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
 }
 
-const (
-	dynPersistName  = "migration-persist-secret"
-	dynPersistValue = "pre-migration-value"
-	dynPersistEnv   = "TEST_PERSIST_SECRET"
-)
-
-// handleTestDynamicSecretPersistenceWrite (POST) unconditionally writes the
-// well-known dynamic secret. Deletes any stale value first.
-func handleTestDynamicSecretPersistenceWrite(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
+// testPubSub subscribes, publishes, and confirms delivery on one channel.
+func testPubSub(ctx context.Context, rdb *redis.Client, channel string) bool {
+	sub := rdb.Subscribe(ctx, channel)
+	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil { // subscribe confirmation
+		return false
 	}
-	// Delete first (idempotent).
-	delReq, _ := http.NewRequest("DELETE", supervisorURL+"/v1/secrets/"+dynPersistName, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	resp, _ := http.DefaultClient.Do(delReq)
-	if resp != nil {
-		resp.Body.Close()
+	if err := rdb.Publish(ctx, channel, "hello").Err(); err != nil {
+		return false
 	}
-	putBody, _ := json.Marshal(map[string]string{"value": dynPersistValue, "env_var": dynPersistEnv})
-	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/secrets/"+dynPersistName, bytes.NewReader(putBody))
-	putReq.Header.Set("Authorization", "Bearer "+token)
-	putReq.Header.Set("Content-Type", "application/json")
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"put failed: %v"}`, err), http.StatusInternalServerError)
-		return
-	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
-		http.Error(w, fmt.Sprintf(`{"error":"put returned %d"}`, putResp.StatusCode), http.StatusInternalServerError)
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "name": dynPersistName})
+	mctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	msg, err := sub.ReceiveMessage(mctx)
+	return err == nil && msg.Payload == "hello"
 }
 
-// handleTestDynamicSecretPersistenceVerify (GET) reads the well-known dynamic
-// secret and compares it to the expected value. Returns 404 if missing, 500 if
-// the value is wrong, 200 if it matches.
-func handleTestDynamicSecretPersistenceVerify(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
-	}
-	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/secrets/"+dynPersistName, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
-	getResp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"get failed: %v"}`, err), http.StatusInternalServerError)
-		return
-	}
-	body, _ := io.ReadAll(getResp.Body)
-	getResp.Body.Close()
-	if getResp.StatusCode == http.StatusNotFound {
-		http.Error(w, `{"error":"secret not found — data lost during migration"}`, http.StatusNotFound)
-		return
-	}
-	if getResp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf(`{"error":"get returned %d"}`, getResp.StatusCode), http.StatusInternalServerError)
-		return
-	}
-	var secretResp struct {
-		Value string `json:"value"`
-	}
-	json.Unmarshal(body, &secretResp)
-	if secretResp.Value != dynPersistValue {
-		http.Error(w, fmt.Sprintf(`{"error":"value mismatch: got %q, want %q"}`, secretResp.Value, dynPersistValue), http.StatusInternalServerError)
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "name": dynPersistName})
-}
-
-// handleTestPCRSecrets verifies secret-to-PCR derivation math and that the
-// NSM returns a valid attestation document with PCR16 matching the expected value.
-// PCR16 is extended with SHA256(compressed_pubkey) and then locked by the SDK,
 // so QEMU's NSM includes it in the attestation document (locked PCRs are included).
 func handleTestPCRSecrets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1008,11 +883,6 @@ func deriveAttestationValues() (pubkey, pcr16 string, err error) {
 // all three to encrypted storage. Deletes any stale value first.
 func handleTestAttestationPersistenceWrite(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
-	}
 	pubkey, pcr16, err := deriveAttestationValues()
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -1030,29 +900,20 @@ func handleTestAttestationPersistenceWrite(w http.ResponseWriter, r *http.Reques
 	}
 	json.Unmarshal(infoBody, &info)
 
-	// Delete stale value first.
-	delReq, _ := http.NewRequest("DELETE", supervisorURL+"/v1/storage/"+attestPersistStorageKey, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	resp, _ := http.DefaultClient.Do(delReq)
-	if resp != nil {
-		resp.Body.Close()
+	rdb, err := redisClient()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
 	}
+	defer rdb.Close()
 
 	storeData, _ := json.Marshal(map[string]string{
 		"pubkey":        pubkey,
 		"pcr16":         pcr16,
 		"attest_pubkey": info.AttestationPubkey,
 	})
-	putReq, _ := http.NewRequest("PUT", supervisorURL+"/v1/storage/"+attestPersistStorageKey, bytes.NewReader(storeData))
-	putReq.Header.Set("Authorization", "Bearer "+token)
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"storage put: %v"}`, err), http.StatusInternalServerError)
-		return
-	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
-		http.Error(w, fmt.Sprintf(`{"error":"storage put returned %d"}`, putResp.StatusCode), http.StatusInternalServerError)
+	if err := rdb.Set(r.Context(), attestPersistStorageKey, storeData, 0).Err(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"SET failed: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "pubkey": pubkey, "pcr16": pcr16})
@@ -1063,31 +924,25 @@ func handleTestAttestationPersistenceWrite(w http.ResponseWriter, r *http.Reques
 // data is missing, 500 if pubkey or PCR16 changed, 200 if both match.
 func handleTestAttestationPersistenceVerify(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
-	if token == "" {
-		http.Error(w, `{"error":"ENCLAVE_RUNTIME_TOKEN not set"}`, http.StatusInternalServerError)
-		return
-	}
 	currentPubkey, currentPCR16, err := deriveAttestationValues()
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	getReq, _ := http.NewRequest("GET", supervisorURL+"/v1/storage/"+attestPersistStorageKey, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
-	getResp, err := http.DefaultClient.Do(getReq)
+	rdb, err := redisClient()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"storage get: %v"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	storedBody, _ := io.ReadAll(getResp.Body)
-	getResp.Body.Close()
-	if getResp.StatusCode == http.StatusNotFound {
+	defer rdb.Close()
+
+	storedBody, err := rdb.Get(r.Context(), attestPersistStorageKey).Bytes()
+	if errors.Is(err, redis.Nil) {
 		http.Error(w, `{"error":"attestation data not found — storage lost during migration"}`, http.StatusNotFound)
 		return
 	}
-	if getResp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf(`{"error":"storage get returned %d"}`, getResp.StatusCode), http.StatusInternalServerError)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"GET failed: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
 	var stored struct {

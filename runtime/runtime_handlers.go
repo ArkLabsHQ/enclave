@@ -164,14 +164,13 @@ type RuntimeInfo struct {
 	PreviousPCR0               string             `json:"previous_pcr0"`
 	PreviousPCR0Attestation    string             `json:"previous_pcr0_attestation,omitempty"`
 	AttestationPubkey          string             `json:"attestation_pubkey,omitempty"`
-	DynamicSecrets             int64              `json:"dynamic_secrets"`
 	Metrics                    map[string]any     `json:"metrics"`
 	MigrationCooldownSeconds   int                `json:"migration_cooldown_seconds"`
 	MigrationCooldownRemaining int                `json:"migration_cooldown_remaining,omitempty"`
 	MigrationPending           bool               `json:"migration_pending"`
 	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
 	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
-	KMSKeyLocked bool `json:"kms_key_locked"`
+	KMSKeyLocked               bool               `json:"kms_key_locked"`
 }
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
@@ -220,7 +219,6 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			PreviousPCR0:               previousPCR0,
 			PreviousPCR0Attestation:    previousPCR0Attestation,
 			AttestationPubkey:          e.AttestationPubkey(),
-			DynamicSecrets:             e.dynamic.Count(),
 			Metrics:                    enclaveMetrics.MetricsSnapshot(),
 			MigrationCooldownSeconds:   cooldownSeconds,
 			MigrationCooldownRemaining: cooldownRemaining,

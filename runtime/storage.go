@@ -6,13 +6,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -53,35 +49,18 @@ const (
 // Storage subsystem
 // =============================================================================
 
-// Storage owns the encrypted persistent K/V store backed by S3 and a single
-// AES-256 DEK. The DEK lives only in process memory; it's KMS-decrypted at
-// boot from a ciphertext stored in SSM. All Store/Load/Delete operations
-// transparently AES-GCM encrypt/decrypt against the DEK.
-//
-// Each object's AAD binds it to its (deployment, app, key) location (see
-// storageAAD), so a host cannot relabel/swap ciphertext between keys or replay
-// it across deployments — the GCM tag check fails on Load. Not yet defended:
-// rollback/replay of an *older* value of the same key, and deletion (a removed
-// object is indistinguishable from a never-written one). Both need a versioned
-// manifest with an external monotonic anchor (issue #134, Tier 1/2).
+// Storage is the AES-256-GCM encrypted S3 store backing the ACME TLS-cert cache
+// (acme_cache.go); Store/Load/Delete AAD-bind each object to its (deployment,
+// app, key) location. The DEK is shared with the K/V store.
 type Storage struct {
 	bucketName string
 	dek        []byte
 	kms        *KMS
-	metrics    *Metrics
-	auth       func(http.ResponseWriter, *http.Request) bool
 }
 
-// NewStorage constructs the storage subsystem. kms is required for Init();
-// metrics may be nil. auth is the bearer-token check; nil = no auth.
-// Init-state gating is handled by Runtime middleware applied during
-// RegisterRoutes — handlers don't check init themselves.
-func NewStorage(kms *KMS, metrics *Metrics, auth func(http.ResponseWriter, *http.Request) bool) *Storage {
-	return &Storage{
-		kms:     kms,
-		metrics: metrics,
-		auth:    auth,
-	}
+// NewStorage constructs the storage subsystem. kms is required for Init().
+func NewStorage(kms *KMS) *Storage {
+	return &Storage{kms: kms}
 }
 
 // HasDEK reports whether the DEK is loaded (storage is operational).
@@ -277,21 +256,12 @@ func openStorage(dek, blob, aad []byte) ([]byte, error) {
 
 // Store encrypts data with the DEK and persists it to S3.
 func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
-	if s.metrics != nil {
-		s.metrics.Inc(s.metrics.StorageWrites, "storage_writes_total")
-	}
 	if s.dek == nil {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return fmt.Errorf("storage not initialized")
 	}
 
 	blob, err := sealStorage(s.dek, data, storageAAD(key))
 	if err != nil {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return err
 	}
 
@@ -301,9 +271,6 @@ func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
 		Body:   bytes.NewReader(blob),
 	})
 	if err != nil {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return fmt.Errorf("S3 put: %w", err)
 	}
 	return nil
@@ -311,13 +278,7 @@ func (s *Storage) Store(ctx context.Context, key string, data []byte) error {
 
 // Load retrieves and decrypts data from S3. Returns ErrNotFound if missing.
 func (s *Storage) Load(ctx context.Context, key string) ([]byte, error) {
-	if s.metrics != nil {
-		s.metrics.Inc(s.metrics.StorageReads, "storage_reads_total")
-	}
 	if s.dek == nil {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
@@ -341,9 +302,6 @@ func (s *Storage) Load(ctx context.Context, key string) ([]byte, error) {
 
 	plaintext, err := openStorage(s.dek, blob, storageAAD(key))
 	if err != nil {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return nil, err
 	}
 	return plaintext, nil
@@ -351,13 +309,7 @@ func (s *Storage) Load(ctx context.Context, key string) ([]byte, error) {
 
 // Delete removes a key from storage.
 func (s *Storage) Delete(ctx context.Context, key string) error {
-	if s.metrics != nil {
-		s.metrics.Inc(s.metrics.StorageDeletes, "storage_deletes_total")
-	}
 	if s.bucketName == "" {
-		if s.metrics != nil {
-			s.metrics.Inc(s.metrics.StorageErrors, "storage_errors_total")
-		}
 		return fmt.Errorf("storage not initialized")
 	}
 
@@ -370,181 +322,3 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 	}
 	return nil
 }
-
-// List returns keys under the given prefix in storage.
-func (s *Storage) List(ctx context.Context, prefix string) ([]string, error) {
-	if s.bucketName == "" {
-		return nil, fmt.Errorf("storage not initialized")
-	}
-
-	s3Prefix := "data/" + prefix
-	var keys []string
-	var continuationToken *string
-
-	for {
-		out, err := s.kms.aws.S3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucketName),
-			Prefix:            aws.String(s3Prefix),
-			ContinuationToken: continuationToken,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("S3 list: %w", err)
-		}
-
-		for _, obj := range out.Contents {
-			if obj.Key != nil {
-				keys = append(keys, strings.TrimPrefix(*obj.Key, "data/"))
-			}
-		}
-
-		if !aws.ToBool(out.IsTruncated) {
-			break
-		}
-		continuationToken = out.NextContinuationToken
-	}
-
-	return keys, nil
-}
-
-// =============================================================================
-// HTTP handlers
-// =============================================================================
-
-// RegisterRoutes attaches the storage endpoints on mux.
-func (s *Storage) RegisterRoutes(mux Mux) {
-	mux.HandleFunc("PUT /v1/storage/{key...}", s.handlePut)
-	mux.HandleFunc("GET /v1/storage/{key...}", s.handleGet)
-	mux.HandleFunc("DELETE /v1/storage/{key...}", s.handleDelete)
-	mux.HandleFunc("GET /v1/storage", s.handleList)
-}
-
-// handlePut handles PUT /v1/storage/{key...}. The body is stored as raw bytes.
-func (s *Storage) handlePut(w http.ResponseWriter, r *http.Request) {
-	if s.auth != nil && !s.auth(w, r) {
-		return
-	}
-
-	key := r.PathValue("key")
-	if key == "" {
-		http.Error(w, "key is required", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "secrets/") {
-		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "acme/") {
-		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB limit
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-
-	if err := s.Store(r.Context(), key, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(struct {
-		Key    string `json:"key"`
-		Status string `json:"status"`
-	}{Key: key, Status: "stored"})
-}
-
-// handleGet handles GET /v1/storage/{key...}. Returns raw decrypted bytes.
-func (s *Storage) handleGet(w http.ResponseWriter, r *http.Request) {
-	if s.auth != nil && !s.auth(w, r) {
-		return
-	}
-
-	key := r.PathValue("key")
-	if key == "" {
-		http.Error(w, "key is required", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "secrets/") {
-		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "acme/") {
-		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
-		return
-	}
-
-	data, err := s.Load(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			http.Error(w, "key not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/octet-stream")
-	_, _ = w.Write(data)
-}
-
-// handleDelete handles DELETE /v1/storage/{key...}.
-func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if s.auth != nil && !s.auth(w, r) {
-		return
-	}
-
-	key := r.PathValue("key")
-	if key == "" {
-		http.Error(w, "key is required", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "secrets/") {
-		http.Error(w, "use /v1/secrets endpoints for secret management", http.StatusBadRequest)
-		return
-	}
-	if strings.HasPrefix(key, "acme/") {
-		http.Error(w, "the acme/ namespace is reserved for the TLS cert cache", http.StatusBadRequest)
-		return
-	}
-
-	if err := s.Delete(r.Context(), key); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Key    string `json:"key"`
-		Status string `json:"status"`
-	}{Key: key, Status: "deleted"})
-}
-
-// handleList handles GET /v1/storage?prefix=...
-func (s *Storage) handleList(w http.ResponseWriter, r *http.Request) {
-	if s.auth != nil && !s.auth(w, r) {
-		return
-	}
-
-	prefix := r.URL.Query().Get("prefix")
-
-	keys, err := s.List(r.Context(), prefix)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if keys == nil {
-		keys = []string{}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(keys)
-}
-
-// silenceUnused references unused imports during transitional compile passes.
-var _ = slog.Info

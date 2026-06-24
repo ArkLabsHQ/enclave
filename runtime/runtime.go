@@ -115,6 +115,11 @@ type Runtime struct {
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
 	initOK   atomic.Bool // Init returned without error
 
+	// rollbackHalt is set by the freshness anchor's per-read version-floor check
+	// when it detects a rollback of the K/V store; flips /health to 503 and
+	// refuses RESP ops.
+	rollbackHalt atomic.Bool
+
 	// Upstream app state — set by MarkUpstreamExited (called from
 	// cmd/runtime/main.go when the user app exits).
 	upstreamExited atomic.Bool
@@ -133,8 +138,9 @@ type Runtime struct {
 	kms           *KMS
 	staticSecrets *StaticSecrets
 	stateOrigin   *StateOrigin
-	dynamic       *DynamicSecrets
 	storage       *Storage
+	kvStore       *KVStore
+	respSrv       *RESPServer
 	migrator      *Migrator
 	environment   *Environment
 	signature     *Signature
@@ -176,7 +182,7 @@ func New(cfg *Config) (*Runtime, error) {
 }
 
 // Init brings up the AWS-backed subsystems: AWS clients, KMS key
-// authorization, the attestation key, static and dynamic secrets, storage,
+// authorization, the attestation key, secrets, the K/V store,
 // and the migration handshake. May block on KMS. Idempotent on the
 // initDone fence — handlers can safely read subsystem fields once it
 // returns, regardless of success.
@@ -226,7 +232,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 	e.staticSecrets = staticSecrets
 
-	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
+	e.storage = NewStorage(e.kms)
+	e.kvStore = NewKVStore(e.kms, nil)
+	e.kvStore.anchor = &FreshnessAnchor{kv: e.kvStore, s3: e.kms.aws.S3, window: anchorWindow(), halt: &e.rollbackHalt}
+	e.respSrv = NewRESPServer(e.kvStore, e.runtimeToken)
+	e.respSrv.halt = &e.rollbackHalt
 
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
@@ -260,11 +270,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 	); err != nil {
 		slog.Error("establish startup state", "error", err)
 		return err
-	}
-
-	e.dynamic = NewDynamicSecrets(e.storage, e.metrics, e.staticSecrets, e.checkRuntimeToken)
-	if _, err := e.dynamic.Init(ctx); err != nil {
-		slog.Warn("load dynamic secrets failed", "error", err)
 	}
 
 	e.registerGatedRoutes()
@@ -313,6 +318,18 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 	e.migrator.storage = e.storage
 	if err := e.storage.Init(ctx, keyID); err != nil {
 		return fmt.Errorf("init storage: %w", err)
+	}
+	if err := e.kvStore.Init(ctx, keyID); err != nil {
+		return fmt.Errorf("init kv store: %w", err)
+	}
+	if e.kvStore.Enabled() {
+		if err := e.kvStore.anchor.Init(ctx); err != nil {
+			return fmt.Errorf("init freshness anchor: %w", err)
+		}
+		// Boot gate: fail closed if the live store is already rolled back.
+		if err := e.kvStore.anchor.Establish(ctx); err != nil {
+			return fmt.Errorf("freshness anchor establish: %w", err)
+		}
 	}
 	return nil
 }
@@ -368,10 +385,6 @@ func (e *Runtime) Stop() error {
 //	POST   /v1/metrics                    (OTLP ingest)
 //	GET    /v1/enclave-metrics            (JSON snapshot)
 //	POST   /v1/start-migration            (gated: requireInitOK)
-//	{PUT,GET,DELETE} /v1/storage/{key...} (gated: requireInitDone)
-//	GET    /v1/storage                    (gated: requireInitDone)
-//	{PUT,GET,DELETE} /v1/secrets/{name}   (gated: requireInitDone)
-//	GET    /v1/secrets                    (gated: requireInitDone)
 //	POST   /v1/logs                       (OTLP ingest)
 //	GET    /v1/enclave-logs               (JSON history)
 //	POST   /v1/traces                     (OTLP ingest)
@@ -446,14 +459,38 @@ func (e *Runtime) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (e *Runtime) RuntimeToken() string      { return e.runtimeToken }
+func (e *Runtime) RuntimeToken() string { return e.runtimeToken }
+
+// checkRuntimeToken validates the Authorization: Bearer <token> header against
+// the runtime token; subsystems pass it as their auth callback.
+func (e *Runtime) checkRuntimeToken(w http.ResponseWriter, r *http.Request) bool {
+	if e.runtimeToken == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "invalid Authorization format, expected Bearer token", http.StatusUnauthorized)
+		return false
+	}
+	if strings.TrimPrefix(auth, prefix) != e.runtimeToken {
+		http.Error(w, "invalid management token", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
 func (e *Runtime) Logging() *Logging         { return e.logging }
 func (e *Runtime) Tracing() *Tracing         { return e.tracing }
 func (e *Runtime) AttestationPubkey() string { return e.attestation.Pubkey() }
 
 // IsReady reports whether Init completed successfully. /health uses this
 // to distinguish "ready" from "initializing" / "failed".
-func (e *Runtime) IsReady() bool { return e.initOK.Load() }
+func (e *Runtime) IsReady() bool { return e.initOK.Load() && !e.rollbackHalt.Load() }
 
 // MarkUpstreamExited records that the user app has exited. The runtime
 // keeps running so /v1/start-migration and other admin endpoints stay
@@ -704,7 +741,32 @@ func (e *Runtime) runListeners() error {
 			}
 		}
 	}()
+
+	go e.serveRESP()
 	return nil
+}
+
+// serveRESP brings up the RESP listener (reusing the public server's
+// attestation-bound TLS) once init settles, if a port and K/V table are
+// configured. A bind/serve failure is logged but non-fatal to the runtime.
+func (e *Runtime) serveRESP() {
+	<-e.storageReady
+	port := respPort()
+	if port == 0 || !e.kvStore.Enabled() {
+		slog.Info("RESP listener disabled", "port", port, "kv_enabled", e.kvStore.Enabled())
+		return
+	}
+	addr := fmt.Sprintf(":%d", port)
+	raw, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("RESP listener bind failed", "addr", addr, "error", err)
+		return
+	}
+	lis := tls.NewListener(raw, e.pubSrv.TLSConfig)
+	slog.Info("starting RESP listener", "addr", addr)
+	if err := e.respSrv.Serve(lis); err != nil {
+		slog.Error("RESP listener exited", "error", err)
+	}
 }
 
 // ListenErr returns a channel that fires once if either listener fails to
@@ -1112,13 +1174,6 @@ func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 func (e *Runtime) registerGatedRoutes() {
 	if e.mux == nil {
 		return
-	}
-	gated := &gatedMux{inner: e.mux, gate: e.requireInitDone}
-	if e.storage != nil {
-		e.storage.RegisterRoutes(gated)
-	}
-	if e.dynamic != nil {
-		e.dynamic.RegisterRoutes(gated)
 	}
 	strict := &gatedMux{inner: e.mux, gate: e.requireInitOK}
 	if e.migrator != nil {

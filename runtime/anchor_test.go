@@ -25,8 +25,10 @@ import (
 // =============================================================================
 
 type s3Version struct {
-	id   string
-	body []byte
+	id          string
+	body        []byte
+	lockMode    s3types.ObjectLockMode
+	retainUntil *time.Time
 }
 
 type fakeS3 struct {
@@ -44,7 +46,7 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 	f.seq++
 	id := strconv.Itoa(f.seq)
 	key := aws.ToString(in.Key)
-	f.objects[key] = append(f.objects[key], s3Version{id: id, body: body})
+	f.objects[key] = append(f.objects[key], s3Version{id: id, body: body, lockMode: in.ObjectLockMode, retainUntil: in.ObjectLockRetainUntilDate})
 	return &s3.PutObjectOutput{VersionId: aws.String(id)}, nil
 }
 

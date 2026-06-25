@@ -39,6 +39,25 @@ func newAWSClients(ctx context.Context, region, profile string) (*awsClients, er
 	return newAWSClientsWithEnv(ctx, region, profile, nil)
 }
 
+// newAnonymousS3Client builds an S3 client that signs nothing (anonymous) — so any
+// party with no AWS account can read the public lineage/anchor buckets. Honors
+// AWS_ENDPOINT_URL_S3 for LocalStack.
+func newAnonymousS3Client(ctx context.Context, region string) (*s3.Client, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(region),
+		awsconfig.WithCredentialsProvider(aws.AnonymousCredentials{}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load anonymous AWS config: %w", err)
+	}
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if ep := os.Getenv("AWS_ENDPOINT_URL_S3"); ep != "" {
+			o.BaseEndpoint = aws.String(ep)
+			o.UsePathStyle = true
+		}
+	}), nil
+}
+
 // newAWSClientsWithEnv creates AWS clients, optionally overriding endpoints
 // from the app env map (AWS_ENDPOINT_URL_KMS, AWS_ENDPOINT_URL_SSM, etc).
 func newAWSClientsWithEnv(ctx context.Context, region, profile string, appEnv map[string]string) (*awsClients, error) {

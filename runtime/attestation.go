@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -29,45 +30,82 @@ type AttestationHashRegistrar interface {
 	SetAttestationKeyHash(hash [32]byte)
 }
 
-// Attestation owns the ephemeral secp256k1 attestation key and the
-// nitriding registrar. Init() generates the key and registers its hash
-// so it appears in NSM attestation documents under appKeyHash.
+// identityPCRIndex commits the identity pubkey hash; sits just below the migration
+// PCR (31), and secrets are kept strictly below it (see StaticSecrets.ExtendPCRs).
+const identityPCRIndex = 30
+
+// Attestation owns the enclave's persistent, per-generation identity key — the same
+// secp256k1 key that signs HTTP responses, is the attestation appKeyHash, and is
+// committed to identityPCRIndex, binding live signatures to the PCR0 lineage. Sealed
+// in SSM by keyID; reloaded on reboot, rotated on migration.
 type Attestation struct {
 	key       *btcec.PrivateKey
 	registrar AttestationHashRegistrar
 }
 
-// NewAttestation constructs an empty Attestation. Call SetRegistrar
-// before Init.
+// NewAttestation constructs an empty Attestation. Call SetRegistrar before Init.
 func NewAttestation() *Attestation {
 	return &Attestation{}
 }
 
-// SetRegistrar wires the in-process nitriding enclave as the recipient
-// of the attestation key hash. Call this before Init.
+// SetRegistrar wires the in-process nitriding enclave as the recipient of the
+// attestation key hash. Call this before Init.
 func (a *Attestation) SetRegistrar(r AttestationHashRegistrar) {
 	a.registrar = r
 }
 
-// Init generates an ephemeral secp256k1 keypair and registers its public
-// key hash with the configured registrar.
+// Init validates the registrar wiring. The signing key itself is the persistent
+// identity key, loaded later by Load once the active KMS key is known.
 func (a *Attestation) Init() error {
-	keyBytes := make([]byte, 32)
-	if _, err := secureRandom(keyBytes); err != nil {
-		return fmt.Errorf("generate random bytes: %w", err)
-	}
-
-	privKey, _ := btcec.PrivKeyFromBytes(keyBytes)
-	if privKey == nil {
-		return fmt.Errorf("invalid secp256k1 key from random bytes")
-	}
-	a.key = privKey
-
 	if a.registrar == nil {
 		return fmt.Errorf("no attestation registrar wired; call SetRegistrar before Init")
 	}
-	hash := sha256.Sum256(privKey.PubKey().SerializeCompressed())
-	a.registrar.SetAttestationKeyHash(hash)
+	return nil
+}
+
+// Load loads the sealed identity key for keyID (or mints+seals a fresh one on the
+// first boot of a generation) and registers its pubkey hash as the appKeyHash.
+func (a *Attestation) Load(ctx context.Context, kms *KMS, keyID string) error {
+	if a.registrar == nil {
+		return fmt.Errorf("no attestation registrar wired; call SetRegistrar before Load")
+	}
+	param := identityKeyCiphertextParam(keyID)
+	ciphertextB64, err := kms.LoadCiphertext(ctx, param)
+	if err != nil {
+		return fmt.Errorf("load identity key: %w", err)
+	}
+	if ciphertextB64 == "" {
+		blob, seed, err := kms.generateDataKey(ctx, keyID)
+		if err != nil {
+			return fmt.Errorf("generate identity key: %w", err)
+		}
+		a.key, _ = btcec.PrivKeyFromBytes(seed)
+		if err := kms.StoreCiphertext(ctx, param, base64.StdEncoding.EncodeToString(blob)); err != nil {
+			return fmt.Errorf("store identity key: %w", err)
+		}
+	} else {
+		seed, err := decryptDEK(ctx, kms.aws.KMS, keyID, ciphertextB64)
+		if err != nil {
+			return fmt.Errorf("decrypt identity key: %w", err)
+		}
+		a.key, _ = btcec.PrivKeyFromBytes(seed)
+	}
+	a.registrar.SetAttestationKeyHash(sha256.Sum256(a.key.PubKey().SerializeCompressed()))
+	return nil
+}
+
+// ExtendPCR commits sha256(identity pubkey) to identityPCRIndex and locks it.
+func (a *Attestation) ExtendPCR() error {
+	if a.key == nil {
+		return fmt.Errorf("identity key not loaded")
+	}
+	hash := sha256.Sum256(a.key.PubKey().SerializeCompressed())
+	if err := extendPCR(identityPCRIndex, hash[:]); err != nil {
+		return fmt.Errorf("extend PCR%d with identity pubkey: %w", identityPCRIndex, err)
+	}
+	if err := lockPCR(identityPCRIndex); err != nil {
+		return fmt.Errorf("lock PCR%d: %w", identityPCRIndex, err)
+	}
 	return nil
 }
 
@@ -255,6 +293,13 @@ func parseCOSEPayloadInsecure(doc []byte) (*nitrite.Result, error) {
 // an RSA public key) and returns it as base64. The document is a COSE Sign1 structure
 // signed by AWS Nitro hardware, proving this enclave's PCR values.
 func getAttestationDocumentB64() (string, error) {
+	return getAttestationDocumentB64WithUserData(nil)
+}
+
+// getAttestationDocumentB64WithUserData is getAttestationDocumentB64 with a custom
+// user_data field (e.g. sha256(deployment descriptor) for the genesis lineage entry).
+// This is independent of the response-signing AttestationHashes user_data format.
+func getAttestationDocumentB64WithUserData(userData []byte) (string, error) {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
 		return "", fmt.Errorf("open NSM session: %w", err)
@@ -267,7 +312,8 @@ func getAttestationDocumentB64() (string, error) {
 	}
 
 	resp, err := session.Send(&request.Attestation{
-		Nonce: nonce,
+		Nonce:    nonce,
+		UserData: userData,
 	})
 	if err != nil {
 		return "", fmt.Errorf("attestation request failed: %w", err)

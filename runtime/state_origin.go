@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -86,8 +87,10 @@ func sha256OfB64(b64 string) ([]byte, error) {
 // StateOrigin owns startup-state provenance: state_root computation, boot
 // classification, and receipt write/verify. Shared by Runtime and Migrator.
 type StateOrigin struct {
-	ssm     SSMAPI
-	secrets []StaticSecret
+	ssm          SSMAPI
+	secrets      []StaticSecret
+	lineage      *PCR0Lineage // immutable PCR0 version-history log; nil only in tests
+	anchorBucket string       // canonical freshness-anchor bucket name, for the genesis descriptor
 }
 
 func NewStateOrigin(ssm SSMAPI, secrets []StaticSecret) *StateOrigin {
@@ -130,8 +133,96 @@ func (s *StateOrigin) Establish(ctx context.Context, rawKeyID, ownPCR0 string, e
 			return fmt.Errorf("write state-origin receipt: %w", err)
 		}
 		slog.Info("wrote state-origin receipt", "mode", mode.String(), "key_id", prefix16(keyID))
+		// Append to the immutable PCR0 lineage log (audit-only; failures are logged).
+		// On genesis, also build the deployment descriptor, write it to SSM, and bind
+		// sha256(descriptor) into the self-attestation's user_data.
+		if s.lineage != nil {
+			var userData, descriptor []byte
+			if mode == modeGenesis {
+				desc := s.genesisDescriptor(ownPCR0)
+				if d, err := canonicalCBOR.Marshal(desc); err == nil {
+					descriptor = d
+					if h, err := descriptorHash(desc); err == nil {
+						userData = h
+					}
+					if err := s.writeGenesisDescriptor(ctx, desc); err != nil {
+						slog.Warn("write genesis descriptor", "error", err)
+					}
+				}
+			}
+			if selfAttest, err := getAttestationDocumentB64WithUserData(userData); err != nil {
+				slog.Warn("self-attest for PCR0 lineage", "mode", mode.String(), "error", err)
+			} else if err := s.recordLineage(ctx, ownPCR0, mode, selfAttest, descriptor); err != nil {
+				slog.Warn("record PCR0 lineage", "mode", mode.String(), "error", err)
+			}
+		}
 	}
 	return nil
+}
+
+// genesisDescriptor builds the deployment descriptor — the out-of-band-pinnable root
+// of trust: genesis PCR0 + canonical bucket names + region.
+func (s *StateOrigin) genesisDescriptor(ownPCR0 string) deploymentDescriptorV1 {
+	lineageBucket := ""
+	if s.lineage != nil {
+		lineageBucket = s.lineage.bucket
+	}
+	return deploymentDescriptorV1{
+		Schema:        descriptorSchemaV1,
+		Deployment:    getDeployment(),
+		App:           getAppName(),
+		Region:        getRegion(),
+		GenesisPCR0:   ownPCR0,
+		AnchorBucket:  s.anchorBucket,
+		LineageBucket: lineageBucket,
+	}
+}
+
+// writeGenesisDescriptor stores the descriptor as JSON in SSM so /v1/enclave-info can
+// surface it (discovery only; trust comes from the out-of-band pin + attestation).
+func (s *StateOrigin) writeGenesisDescriptor(ctx context.Context, desc deploymentDescriptorV1) error {
+	j, err := json.Marshal(desc)
+	if err != nil {
+		return err
+	}
+	_, err = s.ssm.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(genesisDescriptorParam()),
+		Value:     aws.String(string(j)),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	return err
+}
+
+// recordLineage appends this enclave's lineage entry: its own self-attestation (plus,
+// for genesis, the descriptor), and on a genuine migration the predecessor's, which
+// PCR31-commits to this enclave.
+func (s *StateOrigin) recordLineage(ctx context.Context, ownPCR0 string, mode startupMode, selfAttest string, descriptor []byte) error {
+	entry := lineageEntryV1{
+		Schema:          lineageSchemaV1,
+		Purpose:         lineagePurposeGenesis,
+		SelfPCR0:        ownPCR0,
+		SelfAttestation: selfAttest,
+		Descriptor:      descriptor,
+	}
+	if mode == modeMigration {
+		prevPCR0, err := readSSMParamOptional(ctx, s.ssm, migrationPreviousPCR0Param())
+		if err != nil {
+			return err
+		}
+		// A genuine predecessor (not genesis, not rollback-onto-self) carries the
+		// PCR31 commitment; mirror VerifyPredecessorCommitment's gate.
+		if prevPCR0 != "" && !strings.EqualFold(prevPCR0, ownPCR0) {
+			prevAttest, err := readSSMParamOptional(ctx, s.ssm, migrationPreviousPCR0AttestationParam())
+			if err != nil {
+				return err
+			}
+			entry.Purpose = lineagePurposeMigration
+			entry.PrevPCR0 = prevPCR0
+			entry.PrevAttestation = prevAttest
+		}
+	}
+	return s.lineage.record(ctx, entry)
 }
 
 // stateRoot returns the canonical state_root over the artifacts owned for keyID.

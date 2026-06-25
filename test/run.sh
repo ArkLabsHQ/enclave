@@ -636,6 +636,48 @@ echo "=== [4/9] Running integration tests ==="
 ./integration-test.sh
 echo ""
 
+# Step 4b: Genesis PCR0 lineage — one entry (v1), bound to the live enclave.
+echo "=== [4b/9] Genesis PCR0 lineage verification ==="
+GENESIS_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" 2>/dev/null || echo "")
+if [ -n "$GENESIS_PCR0" ]; then
+  if (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" verify-lineage \
+        --genesis-pcr0 "$GENESIS_PCR0" --current-pcr0 "$GENESIS_PCR0" \
+        --base-url "https://localhost:${HOST_TLS_PORT:-8443}" > /tmp/verify-lineage-genesis.log 2>&1); then
+    echo "  PASS: genesis PCR0 lineage verified + live enclave bound to head"
+  else
+    echo "  FAIL: genesis verify-lineage failed" >&2
+    cat /tmp/verify-lineage-genesis.log >&2
+    exit 1
+  fi
+else
+  echo "  WARN: skipping genesis verify-lineage (no pcr.json PCR0)"
+fi
+echo ""
+
+# Step 4c: pinnable descriptor + CREDENTIAL-LESS verification. The genesis enclave
+# attested the descriptor (genesis PCR0 + canonical bucket names); `enclave descriptor`
+# publishes it, and any party (no AWS account) verifies the chain + descriptor binding
+# over anonymous public-bucket reads.
+echo "=== [4c/9] Credential-less descriptor verification ==="
+if (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" descriptor -o /tmp/deployment-descriptor.json > /tmp/descriptor.log 2>&1); then
+  echo "  PASS: emitted deployment-descriptor.json — $(jq -c '{anchor_bucket, lineage_bucket}' /tmp/deployment-descriptor.json 2>/dev/null)"
+  # No AWS credentials: anonymous reads of the public lineage bucket.
+  if (env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+        "$ENCLAVE_CLI" verify-lineage --descriptor /tmp/deployment-descriptor.json \
+        --base-url "https://localhost:${HOST_TLS_PORT:-8443}" > /tmp/verify-descriptor.log 2>&1); then
+    echo "  PASS: credential-less verify-lineage --descriptor (chain + descriptor binding)"
+  else
+    echo "  FAIL: credential-less verify-lineage --descriptor failed" >&2
+    cat /tmp/verify-descriptor.log >&2
+    exit 1
+  fi
+else
+  echo "  FAIL: 'enclave descriptor' emission failed" >&2
+  cat /tmp/descriptor.log >&2
+  exit 1
+fi
+echo ""
+
 # Step 5: Verify migration cooldown fields in enclave-info (pre-migration).
 echo "=== [5/9] Migration cooldown: pre-migration check ==="
 COOLDOWN_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
@@ -978,6 +1020,52 @@ else
   exit 1
 fi
 
+# The framework identity key (= HTTP response-signing key) rotates per generation,
+# so after a migration it must DIFFER from the pre-migration one.
+if echo "$ATTEST_PERSIST_RESP" | jq -e '.identity_rotated == true' >/dev/null 2>&1; then
+  echo "  PASS: identity key rotated across migration (per-generation)"
+else
+  echo "  FAIL: identity key did not rotate after migration" >&2
+  echo "$ATTEST_PERSIST_RESP" | jq -c '{pre_migration_identity_pubkey,post_migration_identity_pubkey,identity_rotated}' >&2
+  exit 1
+fi
+
+# PCR0 lineage chain: genesis (v1) → migration (v2), each link Nitro-attested and
+# bound to the live enclave via the persistent identity PCR. deployment=dev makes
+# verify-lineage skip the signature check (mock NSM), still verifying PCR0/PCR31/
+# chain + the live↔head identity binding.
+LINEAGE_GENESIS_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
+V2_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" 2>/dev/null \
+  || jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" 2>/dev/null || echo "")
+if [ -n "$LINEAGE_GENESIS_PCR0" ] && [ -n "$V2_PCR0" ]; then
+  if (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" verify-lineage \
+        --genesis-pcr0 "$LINEAGE_GENESIS_PCR0" --current-pcr0 "$V2_PCR0" \
+        --base-url "https://localhost:${HOST_TLS_PORT:-8443}" > /tmp/verify-lineage.log 2>&1); then
+    echo "  PASS: PCR0 lineage verified v1→v2 + live enclave bound to chain head"
+  else
+    echo "  FAIL: verify-lineage failed after migration" >&2
+    cat /tmp/verify-lineage.log >&2
+    exit 1
+  fi
+else
+  echo "  WARN: skipping verify-lineage (missing v1/v2 PCR0: genesis=${LINEAGE_GENESIS_PCR0:0:8} v2=${V2_PCR0:0:8})"
+fi
+
+# Credential-less descriptor verify after migration: the descriptor still pins the
+# v1 genesis; any party walks v1→v2 and binds the live v2 enclave, all anonymous.
+if [ -f /tmp/deployment-descriptor.json ]; then
+  if (env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+        "$ENCLAVE_CLI" verify-lineage --descriptor /tmp/deployment-descriptor.json \
+        --current-pcr0 "$V2_PCR0" \
+        --base-url "https://localhost:${HOST_TLS_PORT:-8443}" > /tmp/verify-descriptor-v2.log 2>&1); then
+    echo "  PASS: credential-less verify-lineage --descriptor v1→v2 + live v2 bound"
+  else
+    echo "  FAIL: credential-less post-migration verify-lineage --descriptor failed" >&2
+    cat /tmp/verify-descriptor-v2.log >&2
+    exit 1
+  fi
+fi
+
 # Step 8.5: Verify new atomic-migration observability endpoints and CLI commands.
 echo ""
 echo "=== [8.5/9] Atomic migration observability checks ==="
@@ -1038,9 +1126,9 @@ fi
 # stopped latch, so the watchdog won't relaunch underneath us) and /start.
 echo ""
 echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
-TAMPER_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" $LOCALSTACK \
+TAMPER_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/unlocked/KMSKeyID" $LOCALSTACK \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-DEK_PARAM="/dev/my-app/StorageDEK/Ciphertext/${TAMPER_KEY_ID}"
+DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${TAMPER_KEY_ID}"
 ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
 if [ -z "$TAMPER_KEY_ID" ] || [ -z "$ORIG_DEK" ]; then

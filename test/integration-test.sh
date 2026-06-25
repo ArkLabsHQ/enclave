@@ -166,12 +166,15 @@ if [ -n "$ATTEST_DOC_RESP" ] && echo "$ATTEST_DOC_RESP" | jq -e '.status == "ok"
   PCR_COUNT=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr_count // 0' 2>/dev/null || echo "0")
   PCR0_NONZERO=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr0_nonzero // false' 2>/dev/null || echo "false")
   PCR16_OK=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr16_verified // false' 2>/dev/null || echo "false")
+  PCR30_OK=$(echo "$ATTEST_DOC_RESP" | jq -r '.pcr30_verified // false' 2>/dev/null || echo "false")
   if [ "$PCR0_NONZERO" != "true" ]; then
     fail "PCR0 is zero or missing" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr0_present,pcr0_nonzero}')"
   elif [ "$PCR16_OK" != "true" ]; then
     fail "PCR16 verification failed" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr16_verified,pcr16}')"
+  elif [ "$PCR30_OK" != "true" ]; then
+    fail "PCR30 identity binding failed" "$(echo "$ATTEST_DOC_RESP" | jq -c '{pcr30_verified,pcr30,identity_pubkey}')"
   else
-    pass "Attestation doc: ${PCR_COUNT} PCRs, PCR0 valid, PCR16 verified"
+    pass "Attestation doc: ${PCR_COUNT} PCRs, PCR0 valid, PCR16 + PCR30 (identity) verified"
   fi
 else
   fail "Attestation document" "${ATTEST_DOC_RESP:0:120}"

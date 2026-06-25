@@ -27,13 +27,10 @@ func getDeployment() string {
 }
 
 // nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM/KMS namespace and lock posture, the managed-secret set, and security
-// timing — a short anchor window would let the operator wait out the Object Lock
-// and roll back undetected.
+// SSM/KMS namespace and lock posture and the managed-secret set.
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":         true,
 	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_ANCHOR_WINDOW":      true,
 	"ENCLAVE_KMS_KEY_LOCKED":     true,
 	"ENCLAVE_MIGRATION_COOLDOWN": true,
 	"ENCLAVE_SECRETS_CONFIG":     true,
@@ -104,16 +101,10 @@ func respPort() uint16 {
 	return 6379
 }
 
-// anchorWindow is the Object-Lock retain-until duration set on each anchor
-// object. Defaults to ~10 years.
-func anchorWindow() time.Duration {
-	if s := strings.TrimSpace(os.Getenv("ENCLAVE_ANCHOR_WINDOW")); s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
-	}
-	return 10 * 365 * 24 * time.Hour
-}
+// anchorWindow is the Object-Lock retain-until duration set on every freshness-anchor
+// and lineage object (~10 years). A compile-time constant, never an env var: a long
+// window is the point — letting the operator shorten it would let them delete history.
+const anchorWindow = 10 * 365 * 24 * time.Hour
 
 func logBufferSize() int {
 	if s := os.Getenv("ENCLAVE_LOG_BUFFER_SIZE"); s != "" {
@@ -166,6 +157,11 @@ func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
+// identityKeyCiphertextParam: SSM path for the persistent identity key's KMS ciphertext, lock-scoped and key-scoped.
+func identityKeyCiphertextParam(keyID string) string {
+	return fmt.Sprintf("/%s/%s/%s/IdentityKey/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
+}
+
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
 // own state at genesis (and after adopting a migration). Scoped by key ID.
 func stateOriginReceiptParam(keyID string) string {
@@ -188,6 +184,23 @@ func migrationPreviousPCR0Param() string {
 // attestation document.
 func migrationPreviousPCR0AttestationParam() string {
 	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
+}
+
+// genesisDescriptorParam: SSM path for the JSON deployment descriptor written at
+// genesis (genesis PCR0 + canonical bucket names), surfaced by /v1/enclave-info.
+func genesisDescriptorParam() string {
+	return fmt.Sprintf("/%s/%s/GenesisDescriptor", getDeployment(), getAppName())
+}
+
+// getRegion returns the deployment's AWS region (for the descriptor, so a
+// credential-less verifier can reach the public buckets). Defaults to us-east-1.
+func getRegion() string {
+	for _, k := range []string{"ENCLAVE_AWS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return "us-east-1"
 }
 
 // ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by

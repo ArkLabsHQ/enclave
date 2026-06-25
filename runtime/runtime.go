@@ -141,6 +141,8 @@ type Runtime struct {
 	storage       *Storage
 	kvStore       *KVStore
 	respSrv       *RESPServer
+	lineage       *PCR0Lineage
+	genesis       *GenesisInfo // cached deployment descriptor for /v1/enclave-info
 	migrator      *Migrator
 	environment   *Environment
 	signature     *Signature
@@ -234,9 +236,10 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	e.storage = NewStorage(e.kms)
 	e.kvStore = NewKVStore(e.kms, nil)
-	e.kvStore.anchor = &FreshnessAnchor{kv: e.kvStore, s3: e.kms.aws.S3, window: anchorWindow(), halt: &e.rollbackHalt}
+	e.kvStore.anchor = &FreshnessAnchor{kv: e.kvStore, s3: e.kms.aws.S3, window: anchorWindow, halt: &e.rollbackHalt}
 	e.respSrv = NewRESPServer(e.kvStore, e.runtimeToken)
 	e.respSrv.halt = &e.rollbackHalt
+	e.lineage = &PCR0Lineage{s3: e.kms.aws.S3, ssm: e.aws.SSM, window: anchorWindow}
 
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
@@ -245,6 +248,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	// State-origin provenance (issue #131), shared with the Migrator.
 	e.stateOrigin = NewStateOrigin(e.aws.SSM, e.staticSecrets.Secrets())
+	if err := e.lineage.Init(ctx); err != nil {
+		slog.Error("init PCR0 lineage", "error", err)
+		return fmt.Errorf("init PCR0 lineage: %w", err)
+	}
+	e.stateOrigin.lineage = e.lineage
 
 	// Migrator needs Storage too, but Storage isn't fully initialized yet.
 	// Wire it in after Storage.Init below; /v1/start-migration is gated on
@@ -271,6 +279,7 @@ func (e *Runtime) Init(ctx context.Context) error {
 		slog.Error("establish startup state", "error", err)
 		return err
 	}
+	e.genesis = loadGenesisInfo(ctx, e.aws.SSM)
 
 	e.registerGatedRoutes()
 
@@ -314,6 +323,15 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 	if err := e.staticSecrets.ExtendPCRs(); err != nil {
 		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 	}
+	// Persistent identity key (also the HTTP response-signing key): load — or mint,
+	// on the first boot of this generation — and commit its pubkey hash to the
+	// identity PCR, binding this enclave to its PCR0-lineage entry.
+	if err := e.attestation.Load(ctx, e.kms, keyID); err != nil {
+		return fmt.Errorf("load identity key: %w", err)
+	}
+	if err := e.attestation.ExtendPCR(); err != nil {
+		return fmt.Errorf("extend identity PCR: %w", err)
+	}
 	slog.Info("initializing storage")
 	e.migrator.storage = e.storage
 	if err := e.storage.Init(ctx, keyID); err != nil {
@@ -326,6 +344,7 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 		if err := e.kvStore.anchor.Init(ctx); err != nil {
 			return fmt.Errorf("init freshness anchor: %w", err)
 		}
+		e.stateOrigin.anchorBucket = e.kvStore.anchor.bucket // for the genesis descriptor
 		// Boot gate: fail closed if the live store is already rolled back.
 		if err := e.kvStore.anchor.Establish(ctx); err != nil {
 			return fmt.Errorf("freshness anchor establish: %w", err)

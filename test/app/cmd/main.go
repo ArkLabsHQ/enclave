@@ -648,6 +648,25 @@ func handleTestAttestationDocument(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Verify PCR30 (persistent identity key) == SHA384(0⁴⁸ ‖ sha256(identity pubkey)).
+	// The identity pubkey is the same key that signs responses (X-Attestation-Pubkey).
+	if infoResp, err := http.Get(supervisorURL + "/v1/enclave-info"); err == nil {
+		identityPubkey := infoResp.Header.Get("X-Attestation-Pubkey")
+		infoResp.Body.Close()
+		results["identity_pubkey"] = identityPubkey
+		if pubkeyBytes, err := hex.DecodeString(identityPubkey); err == nil && len(pubkeyBytes) > 0 {
+			h := sha256.Sum256(pubkeyBytes)
+			var zeros48 [48]byte
+			expectedPCR30 := sha512.Sum384(append(zeros48[:], h[:]...))
+			if pcr30, ok := doc.PCRs[30]; ok {
+				results["pcr30"] = hex.EncodeToString(pcr30)
+				results["pcr30_verified"] = hex.EncodeToString(pcr30) == hex.EncodeToString(expectedPCR30[:])
+			} else {
+				results["pcr30_verified"] = false
+			}
+		}
+	}
+
 	results["status"] = "ok"
 	json.NewEncoder(w).Encode(results)
 }
@@ -946,8 +965,9 @@ func handleTestAttestationPersistenceVerify(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var stored struct {
-		Pubkey string `json:"pubkey"`
-		PCR16  string `json:"pcr16"`
+		Pubkey       string `json:"pubkey"`
+		PCR16        string `json:"pcr16"`
+		AttestPubkey string `json:"attest_pubkey"`
 	}
 	json.Unmarshal(storedBody, &stored)
 
@@ -959,6 +979,21 @@ func handleTestAttestationPersistenceVerify(w http.ResponseWriter, r *http.Reque
 		"post_migration_pcr16":  currentPCR16,
 		"pcr16_match":           stored.PCR16 == currentPCR16,
 	}
+
+	// The framework identity key rotates per generation, so after a migration the
+	// current attestation_pubkey must DIFFER from the stored (pre-migration) one.
+	if infoResp, err := http.Get(supervisorURL + "/v1/enclave-info"); err == nil {
+		var info struct {
+			AttestationPubkey string `json:"attestation_pubkey"`
+		}
+		infoBody, _ := io.ReadAll(infoResp.Body)
+		infoResp.Body.Close()
+		json.Unmarshal(infoBody, &info)
+		results["pre_migration_identity_pubkey"] = stored.AttestPubkey
+		results["post_migration_identity_pubkey"] = info.AttestationPubkey
+		results["identity_rotated"] = stored.AttestPubkey != "" && info.AttestationPubkey != "" && stored.AttestPubkey != info.AttestationPubkey
+	}
+
 	if stored.Pubkey != currentPubkey || stored.PCR16 != currentPCR16 {
 		results["error"] = "attestation values changed after migration"
 		w.WriteHeader(http.StatusInternalServerError)

@@ -12,6 +12,7 @@ package runtime
 // (Attest, the limit reader) live in the nitriding subpackage.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -171,6 +172,17 @@ type RuntimeInfo struct {
 	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
 	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
 	KMSKeyLocked               bool               `json:"kms_key_locked"`
+	Genesis                    *GenesisInfo       `json:"genesis,omitempty"`
+}
+
+// GenesisInfo surfaces the deployment descriptor (genesis PCR0 + canonical bucket
+// names) for client discovery. Trust comes from the out-of-band pin + the descriptor
+// attested in the genesis lineage entry — not from this (operator-mutable) field.
+type GenesisInfo struct {
+	PCR0          string `json:"pcr0"`
+	Region        string `json:"region,omitempty"`
+	AnchorBucket  string `json:"anchor_bucket,omitempty"`
+	LineageBucket string `json:"lineage_bucket,omitempty"`
 }
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
@@ -226,7 +238,27 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			PCR0Signature:              e.signature.Snapshot(),
 			UpstreamApp:                UpstreamAppInfo{Exited: upstreamExited, Error: upstreamErr},
 			KMSKeyLocked:               kmsKeyLocked(),
+			Genesis:                    e.genesis,
 		})
+	}
+}
+
+// loadGenesisInfo reads the genesis deployment descriptor from SSM (written at
+// genesis). Best-effort discovery; nil if absent.
+func loadGenesisInfo(ctx context.Context, ssm SSMAPI) *GenesisInfo {
+	raw, err := readSSMParamOptional(ctx, ssm, genesisDescriptorParam())
+	if err != nil || raw == "" {
+		return nil
+	}
+	var d deploymentDescriptorV1
+	if json.Unmarshal([]byte(raw), &d) != nil {
+		return nil
+	}
+	return &GenesisInfo{
+		PCR0:          d.GenesisPCR0,
+		Region:        d.Region,
+		AnchorBucket:  d.AnchorBucket,
+		LineageBucket: d.LineageBucket,
 	}
 }
 

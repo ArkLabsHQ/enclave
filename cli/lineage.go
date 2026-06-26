@@ -28,9 +28,6 @@ const (
 	lineageSchemaV1         = "enclave.pcr0_lineage.v1"
 	lineagePurposeGenesis   = "genesis"
 	lineagePurposeMigration = "migration"
-
-	// identityPCRIndex must match runtime/attestation.go.
-	identityPCRIndex uint = 30
 )
 
 // lineageEntryV1 mirrors runtime/lineage.go; the cbor tags must stay in sync.
@@ -56,8 +53,8 @@ func verifyLineageCmd() *cobra.Command {
 			"the current head. Each link is verified against the AWS Nitro root.\n" +
 			"With --descriptor deployment.json, runs credential-less (anonymous public-bucket\n" +
 			"reads) and verifies the genesis-attested descriptor — usable by any party. With\n" +
-			"--base-url, also attests the live enclave and binds it to the chain head via the\n" +
-			"persistent identity PCR.\n" +
+			"--base-url, also attests the live enclave and binds it to the chain head via\n" +
+			"its PCR0.\n" +
 			"The dev deployment skips the Nitro signature check (mock NSM, no AWS root).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runVerifyLineage(cmd.Context(), lineageOpts{
@@ -70,7 +67,7 @@ func verifyLineageCmd() *cobra.Command {
 	cmd.Flags().StringVar(&genesisPCR0, "genesis-pcr0", "", "Pinned genesis PCR0 hex — the root of trust (required unless --descriptor)")
 	cmd.Flags().StringVar(&currentPCR0, "current-pcr0", "", "Expected head PCR0 hex (optional; asserted if set)")
 	cmd.Flags().StringVar(&bucketFlag, "lineage-bucket", "", "Lineage bucket name (default: SSM LineageBucketName)")
-	cmd.Flags().StringVar(&baseURL, "base-url", "", "Live enclave URL — bind it to the chain head via the identity PCR (optional)")
+	cmd.Flags().StringVar(&baseURL, "base-url", "", "Live enclave URL — bind it to the chain head via PCR0 (optional)")
 	cmd.Flags().BoolVar(&strictTLS, "strict-tls", false, "Require a CA-signed TLS cert when attesting --base-url")
 	return cmd
 }
@@ -221,9 +218,9 @@ func prefix16(s string) string {
 	return s
 }
 
-// bindLiveEnclaveToHead proves the live enclave is the chain head: the identity PCR in
-// its live attestation must equal the one in the head's self-attestation. Defeats a
-// forwarded evil-twin lineage — a different enclave has a different identity key.
+// bindLiveEnclaveToHead proves the live enclave runs the chain-head version: the PCR0
+// in its live AWS-Nitro attestation must equal the head entry's PCR0. A same-PCR0
+// enclave is the head version by definition; a different version fails here.
 func bindLiveEnclaveToHead(opts lineageOpts, head lineageEntryV1) error {
 	client := verifyHTTPClient(!opts.strictTLS)
 
@@ -231,42 +228,16 @@ func bindLiveEnclaveToHead(opts lineageOpts, head lineageEntryV1) error {
 	if err != nil {
 		return fmt.Errorf("attest live enclave: %w", err)
 	}
-	livePCR, ok := livePCRs[identityPCRIndex]
+	livePCR0, ok := livePCRs[0]
 	if !ok {
-		return fmt.Errorf("live enclave exposes no identity PCR%d (identity-key feature not enabled)", identityPCRIndex)
+		return fmt.Errorf("live enclave attestation missing PCR0")
+	}
+	if !strings.EqualFold(hex.EncodeToString(livePCR0), head.SelfPCR0) {
+		return fmt.Errorf("live enclave PCR0 %s does not match chain head %s — possible evil-twin lineage",
+			hex.EncodeToString(livePCR0), head.SelfPCR0)
 	}
 
-	// Bind the reported identity pubkey to the live attestation: its hash must be
-	// what an honest enclave extends into the identity PCR.
-	info, err := fetchEnclaveInfo(client, opts.baseURL)
-	if err != nil {
-		return fmt.Errorf("fetch enclave info: %w", err)
-	}
-	if info.AttestationPubkey == "" {
-		return fmt.Errorf("live enclave reports no attestation/identity pubkey")
-	}
-	pubkey, err := hex.DecodeString(info.AttestationPubkey)
-	if err != nil {
-		return fmt.Errorf("decode identity pubkey: %w", err)
-	}
-	if !bytes.Equal(identityPCRValue(pubkey), livePCR) {
-		return fmt.Errorf("reported identity pubkey is not the one committed in PCR%d", identityPCRIndex)
-	}
-
-	// The head entry's self-attestation must carry the SAME identity PCR.
-	headPCRs, err := attestedPCRs(head.SelfAttestation, head.SelfPCR0, opts.skipSig)
-	if err != nil {
-		return fmt.Errorf("head self-attestation: %w", err)
-	}
-	headPCR, ok := headPCRs[identityPCRIndex]
-	if !ok {
-		return fmt.Errorf("chain head has no identity PCR%d (recorded before the identity-key feature)", identityPCRIndex)
-	}
-	if !bytes.Equal(headPCR, livePCR) {
-		return fmt.Errorf("live enclave identity does not match chain head — possible evil-twin lineage")
-	}
-
-	fmt.Printf("[verify-lineage] live enclave bound to chain head via identity PCR%d (pubkey %s).\n", identityPCRIndex, info.AttestationPubkey)
+	fmt.Printf("[verify-lineage] live enclave bound to chain head via PCR0 %s.\n", head.SelfPCR0)
 	return nil
 }
 
@@ -305,14 +276,6 @@ func liveAttestationPCRs(client *http.Client, baseURL string, skipSig bool) (map
 		return nil, fmt.Errorf("decode attestation document: %w", err)
 	}
 	return attestationPCRs(raw, skipSig)
-}
-
-// identityPCRValue is the value an honest enclave extends into the identity PCR for
-// a given compressed pubkey: extend-from-zero with sha256(pubkey).
-func identityPCRValue(pubkeyCompressed []byte) []byte {
-	h := sha256.Sum256(pubkeyCompressed)
-	sum := sha512.Sum384(append(make([]byte, 48), h[:]...))
-	return sum[:]
 }
 
 // loadLineageEntries lists and Nitro-verifies every lineage object version, returning

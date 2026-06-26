@@ -323,15 +323,6 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 	if err := e.staticSecrets.ExtendPCRs(); err != nil {
 		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 	}
-	// Persistent identity key (also the HTTP response-signing key): load — or mint,
-	// on the first boot of this generation — and commit its pubkey hash to the
-	// identity PCR, binding this enclave to its PCR0-lineage entry.
-	if err := e.attestation.Load(ctx, e.kms, keyID); err != nil {
-		return fmt.Errorf("load identity key: %w", err)
-	}
-	if err := e.attestation.ExtendPCR(); err != nil {
-		return fmt.Errorf("extend identity PCR: %w", err)
-	}
 	slog.Info("initializing storage")
 	e.migrator.storage = e.storage
 	if err := e.storage.Init(ctx, keyID); err != nil {

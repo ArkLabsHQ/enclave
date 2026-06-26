@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 )
@@ -93,20 +92,6 @@ func TestWalkLineage(t *testing.T) {
 			t.Fatalf("chain = %v, err = %v; want just [aa] (cc unreachable)", chain, err)
 		}
 	})
-}
-
-func TestIdentityPCRValue(t *testing.T) {
-	pub := bytes.Repeat([]byte{0x02}, 33)
-	v := identityPCRValue(pub)
-	if len(v) != 48 {
-		t.Fatalf("identity PCR value len = %d, want 48 (SHA-384)", len(v))
-	}
-	if !bytes.Equal(v, identityPCRValue(pub)) {
-		t.Fatal("identityPCRValue is not deterministic")
-	}
-	if bytes.Equal(v, identityPCRValue(bytes.Repeat([]byte{0x03}, 33))) {
-		t.Fatal("distinct pubkeys produced the same identity PCR value")
-	}
 }
 
 func TestPCR31Commitment(t *testing.T) {

@@ -157,11 +157,6 @@ func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
-// identityKeyCiphertextParam: SSM path for the persistent identity key's KMS ciphertext, lock-scoped and key-scoped.
-func identityKeyCiphertextParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/IdentityKey/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
-}
-
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
 // own state at genesis (and after adopting a migration). Scoped by key ID.
 func stateOriginReceiptParam(keyID string) string {

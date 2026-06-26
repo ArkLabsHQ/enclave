@@ -218,8 +218,8 @@ func (s *StaticSecrets) decryptExisting(ctx context.Context, keyID, ciphertextB6
 func (s *StaticSecrets) ExtendPCRs() error {
 	for i, sec := range s.secrets {
 		pcrIndex := uint(16) + uint(i)
-		if pcrIndex >= identityPCRIndex {
-			return fmt.Errorf("secret %q: PCR index %d would collide with the reserved identity (PCR%d) / migration (PCR%d) PCRs", sec.Name, pcrIndex, identityPCRIndex, migrationPCRIndex)
+		if pcrIndex >= migrationPCRIndex {
+			return fmt.Errorf("secret %q: PCR index %d would collide with migration PCR (PCR%d)", sec.Name, pcrIndex, migrationPCRIndex)
 		}
 
 		secretHex := os.Getenv(sec.EnvVar)

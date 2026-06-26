@@ -1020,20 +1020,10 @@ else
   exit 1
 fi
 
-# The framework identity key (= HTTP response-signing key) rotates per generation,
-# so after a migration it must DIFFER from the pre-migration one.
-if echo "$ATTEST_PERSIST_RESP" | jq -e '.identity_rotated == true' >/dev/null 2>&1; then
-  echo "  PASS: identity key rotated across migration (per-generation)"
-else
-  echo "  FAIL: identity key did not rotate after migration" >&2
-  echo "$ATTEST_PERSIST_RESP" | jq -c '{pre_migration_identity_pubkey,post_migration_identity_pubkey,identity_rotated}' >&2
-  exit 1
-fi
-
 # PCR0 lineage chain: genesis (v1) → migration (v2), each link Nitro-attested and
-# bound to the live enclave via the persistent identity PCR. deployment=dev makes
-# verify-lineage skip the signature check (mock NSM), still verifying PCR0/PCR31/
-# chain + the live↔head identity binding.
+# bound to the live enclave via its PCR0. deployment=dev makes verify-lineage skip
+# the signature check (mock NSM), still verifying PCR0/PCR31/chain + the live↔head
+# PCR0 binding.
 LINEAGE_GENESIS_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
 V2_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" 2>/dev/null \
   || jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" 2>/dev/null || echo "")

@@ -637,7 +637,6 @@ data "aws_iam_policy_document" "enclave" {
       [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/${s.name}/Ciphertext/*"],
       [
         "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/StorageDEK/Ciphertext/*",
-        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/IdentityKey/Ciphertext/*",
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_requested_at.arn,
@@ -1089,7 +1088,6 @@ resource "null_resource" "ciphertext_cleanup" {
         aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
       done
       aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
-      aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/IdentityKey/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
     EOT
   }
 }

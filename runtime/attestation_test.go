@@ -44,21 +44,9 @@ func TestAttestationHashesSerialize(t *testing.T) {
 	}
 }
 
-// The identity key (which also signs HTTP responses) is reserved a PCR strictly
-// below the migration PCR, has a key-scoped SSM ciphertext param, and exposes a
-// compressed pubkey and a working signature.
-func TestAttestation_Identity(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-
-	if identityPCRIndex >= migrationPCRIndex {
-		t.Fatalf("identity PCR %d must be below migration PCR %d", identityPCRIndex, migrationPCRIndex)
-	}
-	param := identityKeyCiphertextParam("KID-1")
-	if !strings.Contains(param, "/prod/myapp/") || !strings.Contains(param, "/IdentityKey/Ciphertext/KID-1") {
-		t.Fatalf("unexpected identity param %q", param)
-	}
-
+// A loaded attestation key reports ready, exposes a compressed pubkey, and
+// produces a working response signature.
+func TestAttestation_KeyReadyAndSigns(t *testing.T) {
 	a := &Attestation{}
 	if a.Ready() || a.Pubkey() != "" {
 		t.Fatal("empty Attestation should not be ready")
@@ -70,7 +58,7 @@ func TestAttestation_Identity(t *testing.T) {
 		t.Fatalf("loaded key: ready=%v pubkeyLen=%d", a.Ready(), len(a.Pubkey()))
 	}
 	if a.Sign([]byte("hello")) == "" {
-		t.Fatal("the identity key must sign HTTP responses")
+		t.Fatal("the attestation key must sign HTTP responses")
 	}
 }
 

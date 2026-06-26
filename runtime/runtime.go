@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
+	"golang.org/x/sys/unix"
 
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
@@ -365,6 +367,34 @@ func (e *Runtime) Start() error {
 	// after the deploy-time TLS config is read from SSM). Start only binds
 	// the listener; pubSrv.TLSConfig already carries the getCertificate callback.
 	return e.runListeners()
+}
+
+// StartClockSync binds CLOCK_REALTIME to the hypervisor's PTP clock (/dev/ptp0),
+// which the host cannot forge or skew. Hard-steps at boot, then slews for the
+// enclave's lifetime. No-op if /dev/ptp0 is absent (e.g. QEMU without ptp_kvm).
+// Call once during boot, before listeners serve and outbound TLS validates certs.
+func (e *Runtime) StartClockSync() {
+	file, err := os.OpenFile(ptpDevicePath, os.O_RDONLY, 0)
+	if err != nil {
+		slog.Warn("clock sync disabled: /dev/ptp0 unavailable", "error", err)
+		return
+	}
+	// The clock id is derived from the live fd, so runClockSync keeps it open.
+	phc := fdToClockID(file.Fd())
+
+	var ptp unix.Timespec
+	if err := unix.ClockGettime(phc, &ptp); err != nil {
+		slog.Warn("clock sync disabled: cannot read PTP clock", "error", err)
+		_ = file.Close()
+		return
+	}
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
+		slog.Warn("clock sync: initial hard-step failed; slew loop will converge", "error", err)
+	} else {
+		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
+	}
+
+	go runClockSync(e.stop, file, phc)
 }
 
 // Stop closes the lifecycle channel and shuts down both HTTP servers.

@@ -46,6 +46,9 @@ func main() {
 		slog.Debug("write /etc/resolv.conf", "error", err)
 	}
 
+	// Sync the clock before anything dials AWS (TLS cert validation) or serves traffic.
+	enc.StartClockSync()
+
 	// IMDS forwarder must be up before Start: certcache and metrics dial IMDS.
 	if err := runtime.StartViproxy(); err != nil {
 		slog.Error("viproxy start failed", "error", err)

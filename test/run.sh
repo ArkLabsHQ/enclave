@@ -631,6 +631,11 @@ else
 fi
 echo ""
 
+# Clock sync engages only when /dev/ptp0 is present (KVM runner); informational, never fails.
+CLOCK_SYNC_LINE=$(grep -iE "clock sync" /tmp/boot-qemu.log 2>/dev/null | head -1)
+echo "  INFO: clock sync — ${CLOCK_SYNC_LINE:-<no clock-sync log line in boot-qemu.log>}"
+echo ""
+
 # Step 4: Run integration tests.
 echo "=== [4/9] Running integration tests ==="
 ./integration-test.sh

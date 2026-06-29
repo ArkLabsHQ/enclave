@@ -219,6 +219,12 @@ func (s *StaticSecrets) decryptExisting(ctx context.Context, keyID, ciphertextB6
 // and extends PCR(16 + index) with SHA256(compressed_pubkey). Each PCR is
 // then locked so it can't be re-extended.
 func (s *StaticSecrets) ExtendPCRs() error {
+	n, err := NewNsm()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = n.Close() }()
+
 	for i, sec := range s.secrets {
 		pcrIndex := uint(16) + uint(i)
 		if pcrIndex >= migrationPCRIndex {
@@ -243,10 +249,10 @@ func (s *StaticSecrets) ExtendPCRs() error {
 		pubkeyBytes := privKey.PubKey().SerializeCompressed()
 		hash := sha256.Sum256(pubkeyBytes)
 
-		if err := extendPCR(pcrIndex, hash[:]); err != nil {
+		if err := n.extendPCR(pcrIndex, hash[:]); err != nil {
 			return fmt.Errorf("extend PCR%d with secret %q pubkey: %w", pcrIndex, sec.Name, err)
 		}
-		if err := lockPCR(pcrIndex); err != nil {
+		if err := n.lockPCR(pcrIndex); err != nil {
 			return fmt.Errorf("lock PCR%d after secret %q: %w", pcrIndex, sec.Name, err)
 		}
 	}

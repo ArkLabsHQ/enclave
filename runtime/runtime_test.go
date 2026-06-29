@@ -2,23 +2,13 @@ package runtime
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
-	"time"
 
-	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 )
 
@@ -196,127 +186,62 @@ func TestUpstreamAppInfo_JSONShape(t *testing.T) {
 	}
 }
 
-// TestSetCertFingerprint covers the #129 hardening: a chain with no non-CA leaf
-// must fail TLS setup rather than silently leave an all-zero tlsKeyHash.
-func TestSetCertFingerprint(t *testing.T) {
-	e := &Runtime{hashes: &AttestationHashes{}}
-
-	// CA-only chain → error (no leaf to fingerprint).
-	if err := e.setCertFingerprint(genCertPEM(t, true)); err == nil {
-		t.Fatal("CA-only chain must error (no non-CA leaf)")
-	}
-	if e.hashes.tlsKeyHash != ([32]byte{}) {
-		t.Fatal("tlsKeyHash must stay zero when no leaf is found")
+// TestGenSelfSignedCert covers the #129 hardening: genSelfSignedCert must bind
+// the served leaf's fingerprint into the attestation rather than leave an
+// all-zero tlsKeyHash, and the bound hash must match the cert it serves.
+func TestGenSelfSignedCert(t *testing.T) {
+	e := &Runtime{cfg: &Config{FQDN: "enclave.example.com"}, hashes: &AttestationHashes{}}
+	if e.hashes.tlsKeyHash != ([sha256.Size]byte{}) {
+		t.Fatal("attestation must start unbound")
 	}
 
-	// A non-CA leaf → fingerprint set, no error.
-	if err := e.setCertFingerprint(genCertPEM(t, false)); err != nil {
-		t.Fatalf("leaf cert must set fingerprint: %v", err)
+	if err := e.genSelfSignedCert(); err != nil {
+		t.Fatalf("genSelfSignedCert: %v", err)
 	}
-	if e.hashes.tlsKeyHash == ([32]byte{}) {
-		t.Fatal("tlsKeyHash must be set after a non-CA leaf")
-	}
-}
-
-// memCache is an in-memory autocert.Cache for exercising the ACME
-// renewal-rebind path; Put simulates autocert issuing or rotating a cert.
-type memCache struct {
-	mu   sync.Mutex
-	data map[string][]byte
-}
-
-func (c *memCache) Get(_ context.Context, key string) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v, ok := c.data[key]
-	if !ok {
-		return nil, autocert.ErrCacheMiss
-	}
-	return v, nil
-}
-
-func (c *memCache) Put(_ context.Context, key string, data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.data == nil {
-		c.data = map[string][]byte{}
-	}
-	c.data[key] = data
-	return nil
-}
-
-func (c *memCache) Delete(_ context.Context, key string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.data, key)
-	return nil
-}
-
-// TestRebindCertFingerprint covers the ACME renewal-rebind path: unbound until
-// issuance, binds the first leaf, then re-binds when the cert rotates.
-func TestRebindCertFingerprint(t *testing.T) {
-	const fqdn = "enclave.example.com"
-	e := &Runtime{cfg: &Config{FQDN: fqdn}, hashes: &AttestationHashes{}}
-	cache := &memCache{}
-	var zero [sha256.Size]byte
-
-	// Before issuance the cache misses: fingerprint stays zero.
-	if got := e.rebindCertFingerprint(cache, zero); got != zero {
-		t.Fatal("fingerprint must stay zero before the first cert is issued")
-	}
-	if e.hashes.tlsKeyHash != zero {
-		t.Fatal("attestation must remain unbound before issuance")
+	if e.hashes.tlsKeyHash == ([sha256.Size]byte{}) {
+		t.Fatal("tlsKeyHash must be bound after genSelfSignedCert")
 	}
 
-	// First issuance binds the leaf fingerprint.
-	leaf1 := genCertPEM(t, false)
-	want1, err := leafFingerprint(leaf1)
+	cert, err := e.tlsGetCert(nil)
 	if err != nil {
-		t.Fatalf("fingerprint leaf1: %v", err)
+		t.Fatalf("tlsGetCert: %v", err)
 	}
-	_ = cache.Put(context.Background(), fqdn, leaf1)
-	bound := e.rebindCertFingerprint(cache, zero)
-	if bound != want1 || e.hashes.tlsKeyHash != want1 {
-		t.Fatal("first issuance must bind the leaf fingerprint into the attestation")
-	}
-
-	// An unchanged poll is a no-op.
-	if got := e.rebindCertFingerprint(cache, bound); got != want1 {
-		t.Fatal("unchanged cert must not alter the bound fingerprint")
-	}
-
-	// Renewal: a rotated leaf re-binds the fingerprint.
-	leaf2 := genCertPEM(t, false)
-	want2, err := leafFingerprint(leaf2)
-	if err != nil {
-		t.Fatalf("fingerprint leaf2: %v", err)
-	}
-	if want2 == want1 {
-		t.Fatal("test setup: renewed leaf must differ from the original")
-	}
-	_ = cache.Put(context.Background(), fqdn, leaf2)
-	if got := e.rebindCertFingerprint(cache, bound); got != want2 || e.hashes.tlsKeyHash != want2 {
-		t.Fatal("renewal must re-bind the attestation to the new leaf")
+	if want := sha256.Sum256(cert.Certificate[0]); e.hashes.tlsKeyHash != want {
+		t.Fatal("bound fingerprint must match the served leaf certificate")
 	}
 }
 
-func genCertPEM(t *testing.T, isCA bool) []byte {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
+// A recorded predecessor with a missing/UNSET attestation must fail closed —
+// otherwise blanking the SSM param bypasses the PCR31 commitment check.
+func TestVerifyPredecessorCommitment_FailsClosedOnMissingAttestation(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+
+	e := &Runtime{aws: &AWSClient{SSM: &fakeSSM{params: map[string]string{
+		"/prod/myapp/MigrationPreviousPCR0": "aabbcc",
+	}}}}
+
+	if err := e.VerifyPredecessorCommitment(context.Background(), "ddeeff"); err == nil {
+		t.Fatal("must fail closed when predecessor PCR0 is set but attestation is missing")
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  isCA,
-		BasicConstraintsValid: true,
+}
+
+// Genesis (no predecessor) and rolled-back-onto-self must remain no-ops and not
+// require an attestation.
+func TestVerifyPredecessorCommitment_NoOpWhenGenesisOrSelf(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	ctx := context.Background()
+
+	genesis := &Runtime{aws: &AWSClient{SSM: &fakeSSM{params: map[string]string{}}}}
+	if err := genesis.VerifyPredecessorCommitment(ctx, "ddeeff"); err != nil {
+		t.Fatalf("genesis should be a no-op, got: %v", err)
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create cert: %v", err)
+
+	self := &Runtime{aws: &AWSClient{SSM: &fakeSSM{params: map[string]string{
+		"/prod/myapp/MigrationPreviousPCR0": "ddeeff",
+	}}}}
+	if err := self.VerifyPredecessorCommitment(ctx, "ddeeff"); err != nil {
+		t.Fatalf("self-handoff should be a no-op, got: %v", err)
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }

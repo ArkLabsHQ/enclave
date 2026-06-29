@@ -54,7 +54,7 @@ type Options struct {
 	CacheTTL time.Duration
 
 	// InsecureTLS, when explicitly true, disables TLS cert pinning (raw,
-	// unverified TLS). Default pins to the attested tlsKeyHash (#129).
+	// unverified TLS). Default pins to the attested tlsKeyHash.
 	InsecureTLS *bool
 
 	// StrictTLS adds public CA + hostname validation on top of the pin (it
@@ -62,7 +62,7 @@ type Options struct {
 	StrictTLS bool
 
 	// SkipKeyBinding still verifies PCR0 and pins the TLS cert, but skips the
-	// signing-key binding and Schnorr check. Set by `enclave curl` (#129).
+	// signing-key binding and Schnorr check.
 	SkipKeyBinding bool
 
 	// InsecureSkipCOSEVerify skips COSE Sign1 signature + AWS Nitro root cert

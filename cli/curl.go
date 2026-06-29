@@ -119,7 +119,7 @@ func runCurl(cmd *cobra.Command, args []string) error {
 	}
 
 	// Verified: pin the live cert to the attested fingerprint, then send the
-	// user's request on the pinned connection (#129: curl checks PCR0 only).
+	// user's request on the pinned connection (curl checks PCR0 only).
 	c, err := client.New(baseURL, client.Options{ExpectedPCR0: expectedPCR0, StrictTLS: strictTLS, SkipKeyBinding: true})
 	if err != nil {
 		return err

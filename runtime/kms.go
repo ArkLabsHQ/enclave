@@ -91,7 +91,7 @@ func (k *KMS) LoadCiphertext(ctx context.Context, paramName string) (string, err
 // any other read error) is fatal — the placeholder must exist, otherwise the
 // runtime is pointed at the wrong SSM namespace and shouldn't silently mint
 // a key there.
-func (k *KMS) EnsureKeyID(ctx context.Context) (string, error) {
+func (k *KMS) EnsureKeyID(ctx context.Context, pcr0 string) (string, error) {
 	deployment := getDeployment()
 	appName := getAppName()
 	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
@@ -113,7 +113,6 @@ func (k *KMS) EnsureKeyID(ctx context.Context) (string, error) {
 		}
 	}
 
-	pcr0 := getPCR0()
 	if pcr0 == "" {
 		return "", fmt.Errorf("could not read PCR0 from NSM")
 	}
@@ -289,8 +288,7 @@ func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 // (no un-gated decrypt path) and kms:PutKeyPolicy is held by nobody when locked
 // / root-only when unlocked. Verification only — keys are policy-locked at
 // CreateKey time.
-func (k *KMS) VerifyKeyAuthorization(ctx context.Context, keyID string) error {
-	pcr0 := getPCR0()
+func (k *KMS) VerifyKeyAuthorization(ctx context.Context, keyID, pcr0 string) error {
 	if pcr0 == "" {
 		return fmt.Errorf("could not read PCR0 from NSM")
 	}

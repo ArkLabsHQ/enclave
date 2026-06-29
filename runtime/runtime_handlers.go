@@ -205,11 +205,11 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			return
 		}
 
-		cooldownSeconds, cooldownRemaining, migrationPending := e.migrator.CooldownStatus(r.Context())
+		cooldownSeconds, cooldownRemaining, migrationPending := e.CooldownStatus(r.Context())
 
 		previousPCR0 := "genesis"
 		previousPCR0Attestation := ""
-		if info, err := e.migrator.GetPreviousPCR0Info(r.Context()); err == nil && info != nil {
+		if info, err := e.GetPreviousPCR0Info(r.Context()); err == nil && info != nil {
 			previousPCR0 = info.PCR0
 			previousPCR0Attestation = info.Attestation
 		}

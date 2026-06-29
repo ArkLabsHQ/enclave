@@ -20,28 +20,29 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
-	"github.com/hf/nsm"
-	"github.com/hf/nsm/request"
 	"github.com/mdlayher/vsock"
-	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
-	"golang.org/x/net/http2"
 
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
@@ -53,6 +54,9 @@ const (
 	acmeStagingDirectoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
 	certificateOrg          = "AWS Nitro enclave application"
 	certificateValidity     = time.Hour * 24 * 356
+
+	migrationPCRIndex            = 31
+	keyDeletionPendingDays int32 = 7
 
 	// Routes served on the public TLS mux (pubSrv) and the internal HTTP
 	// mux (privSrv). Paths are scoped under /enclave so they don't collide
@@ -81,6 +85,11 @@ var (
 // Runtime wraps their handlers with init-gating middleware transparently.
 type Mux interface {
 	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+}
+
+type PreviousPCR0Info struct {
+	PCR0        string
+	Attestation string
 }
 
 // Runtime is the singleton supervisor that owns every long-lived piece of
@@ -131,13 +140,20 @@ type Runtime struct {
 	logging       *Logging
 	attestation   *Attestation
 	kms           *KMS
+	nsm           *Nsm
 	staticSecrets *StaticSecrets
 	stateOrigin   *StateOrigin
 	dynamic       *DynamicSecrets
 	storage       *Storage
-	migrator      *Migrator
 	environment   *Environment
 	signature     *Signature
+
+	cooldownMu        sync.Mutex
+	cooldownPending   bool
+	cooldownRemaining int
+	cooldownFetchedAt time.Time
+
+	auth func(http.ResponseWriter, *http.Request) bool
 }
 
 // New returns a Runtime safe to use for serving management endpoints.
@@ -233,18 +249,25 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("init attestation: %w", err)
 	}
 
-	// State-origin provenance (issue #131), shared with the Migrator.
+	// State-origin provenance.
 	e.stateOrigin = NewStateOrigin(e.aws.SSM, e.staticSecrets.Secrets())
+	e.nsm, err = NewNsm()
+	if err != nil {
+		slog.Error("open NSM session", "error", err)
+	}
 
 	// Migrator needs Storage too, but Storage isn't fully initialized yet.
 	// Wire it in after Storage.Init below; /v1/start-migration is gated on
 	// initOK so the late wire-up is safe.
-	e.migrator = NewMigrator(e.aws, e.kms, e.staticSecrets, nil, e.checkRuntimeToken)
-	e.migrator.stateOrigin = e.stateOrigin
 
 	// Establish the startup-state protocol (issue #131): classify → ensureKey →
 	// verify → load → write receipt. PeekKeyID reads the key without minting one.
-	ownPCR0 := getPCR0()
+	ownPCR0, err := e.nsm.getPCR0()
+	if err != nil {
+		slog.Error("read PCR0 from NSM", "error", err)
+		return fmt.Errorf("read PCR0 from NSM: %w", err)
+	}
+
 	if ownPCR0 == "" {
 		slog.Error("read PCR0 from NSM")
 		return fmt.Errorf("could not read PCR0 from NSM")
@@ -287,14 +310,14 @@ func (e *Runtime) Init(ctx context.Context) error {
 // ensureActiveKey returns the active KMS key ID — minting a PCR0-locked one on
 // genesis — after verifying its policy and any predecessor handoff.
 func (e *Runtime) ensureActiveKey(ctx context.Context, ownPCR0 string) (string, error) {
-	keyID, err := e.kms.EnsureKeyID(ctx)
+	keyID, err := e.kms.EnsureKeyID(ctx, ownPCR0)
 	if err != nil {
 		return "", fmt.Errorf("ensure KMS key ID: %w", err)
 	}
-	if err := e.kms.VerifyKeyAuthorization(ctx, keyID); err != nil {
+	if err := e.kms.VerifyKeyAuthorization(ctx, keyID, ownPCR0); err != nil {
 		return "", fmt.Errorf("verify KMS key admits us: %w", err)
 	}
-	if err := e.migrator.VerifyPredecessorCommitment(ctx, ownPCR0); err != nil {
+	if err := e.VerifyPredecessorCommitment(ctx, ownPCR0); err != nil {
 		return "", fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
 	}
 	return keyID, nil
@@ -310,7 +333,7 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 	}
 	slog.Info("initializing storage")
-	e.migrator.storage = e.storage
+
 	if err := e.storage.Init(ctx, keyID); err != nil {
 		return fmt.Errorf("init storage: %w", err)
 	}
@@ -458,7 +481,7 @@ func (e *Runtime) IsReady() bool { return e.initOK.Load() }
 // MarkUpstreamExited records that the user app has exited. The runtime
 // keeps running so /v1/start-migration and other admin endpoints stay
 // reachable — without this latch, cmd/runtime/main.go used to call stop()
-// and tear the whole runtime down (issue #122). Pass nil for a clean exit,
+// and tear the whole runtime down. Pass nil for a clean exit,
 // a non-nil error otherwise.
 func (e *Runtime) MarkUpstreamExited(err error) {
 	msg := ""
@@ -538,65 +561,6 @@ func (e *Runtime) configureHTTPServers() error {
 	e.configureExternalHttpServer(adminMux)
 	e.configureInternalHttpServer(adminMux)
 	return nil
-}
-
-// protocolSwitchTransport forwards each proxied request to the user app over
-// the same HTTP version the client used — h2c for HTTP/2 inbound, HTTP/1.1 for
-// HTTP/1.1 — via the inbound ProtoMajor that ReverseProxy preserves on RoundTrip.
-type protocolSwitchTransport struct {
-	h1  http.RoundTripper
-	h2c http.RoundTripper
-}
-
-func (t *protocolSwitchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.ProtoMajor == 1 {
-		return t.h1.RoundTrip(r)
-	}
-	return t.h2c.RoundTrip(r)
-}
-
-// upstreamTransport builds the reverse-proxy transport for the runtime->app
-// hop, selected by ENCLAVE_NITRIDING_UPSTREAM: "h2c" or "h1" pin a single
-// protocol; "auto" (the default) matches the inbound protocol per request.
-// h2c is required for gRPC; h1 suits a plain HTTP/1.1 app.
-func upstreamTransport(mode string) http.RoundTripper {
-	h1 := &http.Transport{}
-	h2c := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
-		},
-	}
-	switch mode {
-	case "h2c":
-		return h2c
-	case "h1":
-		return h1
-	default:
-		return &protocolSwitchTransport{h1: h1, h2c: h2c}
-	}
-}
-
-// corsWildcard wraps an http.Handler to send permissive CORS headers on every
-// response and short-circuit OPTIONS preflight with 204. Used on the runtime's
-// /v1/* admin endpoints so a browser SPA can call them cross-origin (e.g.,
-// GET /v1/enclave-info for attestation). The catch-all upstream proxy is not
-// wrapped — the user app sets its own CORS on its own responses.
-func corsWildcard(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("Access-Control-Allow-Origin", "*")
-		h.Set("Access-Control-Allow-Methods", "*")
-		h.Set("Access-Control-Allow-Headers", "*")
-		h.Set("Access-Control-Expose-Headers", "*")
-		h.Set("Access-Control-Max-Age", "600")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // configureExternalHttpServer builds pubSrv: the external TLS listener
@@ -808,7 +772,38 @@ func (e *Runtime) genSelfSignedCert() error {
 	if pemCert == nil {
 		return errors.New("encode certificate to PEM")
 	}
-	if err := e.setCertFingerprint(pemCert); err != nil {
+
+	leafFingerprint := func(raw []byte) ([sha256.Size]byte, error) {
+		for len(raw) > 0 {
+			var block *pem.Block
+			block, raw = pem.Decode(raw)
+			if block == nil {
+				return [sha256.Size]byte{}, errors.New("pem.Decode found no PEM data")
+			}
+			if block.Type != "CERTIFICATE" {
+				continue
+			}
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return [sha256.Size]byte{}, fmt.Errorf("parse certificate: %w", err)
+			}
+			if !cert.IsCA {
+				return sha256.Sum256(cert.Raw), nil
+			}
+		}
+		return [sha256.Size]byte{}, errors.New("no non-CA leaf certificate found in TLS chain")
+	}
+
+	setCertFingerprint := func(raw []byte) error {
+		h, err := leafFingerprint(raw)
+		if err != nil {
+			return err
+		}
+		e.hashes.SetTLSKeyHash(h)
+		return nil
+	}
+
+	if err := setCertFingerprint(pemCert); err != nil {
 		return err
 	}
 	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
@@ -827,87 +822,6 @@ func (e *Runtime) genSelfSignedCert() error {
 		return &cert, nil
 	}
 	return nil
-}
-
-// acmeClientForDirectory returns the acme.Client autocert should use for the
-// given directory selector, or nil to let autocert default to Let's Encrypt
-// production. A value beginning with "https://" is a literal ACME directory URL
-// (a private or test ACME server such as Pebble); "letsencrypt-staging" maps to
-// the Let's Encrypt staging directory; anything else returns (nil, nil).
-//
-// When caPEM is non-empty it is installed as the sole root for the client's
-// HTTPS transport, so the enclave can verify a private ACME server's own
-// (non-public) API certificate. caPEM is irrelevant for the public Let's
-// Encrypt endpoints, which chain to the system roots baked into the EIF.
-func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
-	var dirURL string
-	switch {
-	case strings.HasPrefix(directory, "https://"):
-		dirURL = directory
-	case directory == "letsencrypt-staging":
-		dirURL = acmeStagingDirectoryURL
-	default:
-		return nil, nil
-	}
-	client := &acme.Client{DirectoryURL: dirURL}
-	if caPEM != "" {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, errors.New("ENCLAVE_NITRIDING_ACME_CA: no certificates parsed")
-		}
-		client.HTTPClient = &http.Client{
-			Timeout: 90 * time.Second,
-			Transport: newACMERoundTripper(&http.Transport{
-				Proxy:           http.ProxyFromEnvironment,
-				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-			}),
-		}
-	}
-	return client, nil
-}
-
-// acmeRoundTripper is the ACME client's HTTP transport. It works around Pebble
-// omitting the Location header on its finalize-order response, which leaves
-// x/crypto/acme unable to poll the order: the order URL, remembered from an
-// earlier Location header, is re-attached to any response missing one. A no-op
-// against a directory that sets Location, such as real Let's Encrypt.
-type acmeRoundTripper struct {
-	base http.RoundTripper
-	mu   sync.Mutex
-	urls map[string]string // resource ID (trailing path segment) -> resource URL
-}
-
-func newACMERoundTripper(base http.RoundTripper) *acmeRoundTripper {
-	return &acmeRoundTripper{base: base, urls: make(map[string]string)}
-}
-
-func lastPathSegment(s string) string {
-	if i := strings.LastIndexByte(s, '/'); i >= 0 {
-		return s[i+1:]
-	}
-	return s
-}
-
-func (rt *acmeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := rt.base.RoundTrip(req)
-	if err != nil {
-		slog.Warn("ACME http", "method", req.Method, "url", req.URL.String(), "error", err)
-		return resp, err
-	}
-
-	loc := resp.Header.Get("Location")
-	rt.mu.Lock()
-	if loc != "" {
-		rt.urls[lastPathSegment(loc)] = loc
-	} else if known := rt.urls[lastPathSegment(req.URL.Path)]; known != "" {
-		resp.Header.Set("Location", known)
-		loc = known
-	}
-	rt.mu.Unlock()
-
-	slog.Info("ACME http",
-		"method", req.Method, "url", req.URL.String(), "status", resp.StatusCode, "location", loc)
-	return resp, err
 }
 
 // configureACME wires Let's Encrypt as the TLS cert source via autocert.
@@ -936,179 +850,25 @@ func (e *Runtime) configureACME() error {
 	if client != nil {
 		mgr.Client = client
 	}
-	e.tlsGetCert = mgr.GetCertificate
 
-	// autocert rewrites the cache on every renewal, so the attested fingerprint
-	// must track the cache rather than sample it once.
-	go e.watchACMECert(cache)
-	return nil
-}
-
-const (
-	acmeInitialPoll = 5 * time.Second // poll before the first cert is issued
-	acmeRenewPoll   = time.Hour       // poll once bound, to catch renewals
-)
-
-// watchACMECert binds the first issued ACME cert's fingerprint, then re-binds
-// whenever autocert rotates the leaf. Returns when Stop closes e.stop.
-func (e *Runtime) watchACMECert(cache autocert.Cache) {
-	var bound [sha256.Size]byte // zero until first bind
-	for {
-		bound = e.rebindCertFingerprint(cache, bound)
-
-		poll := acmeRenewPoll
-		if bound == ([sha256.Size]byte{}) {
-			poll = acmeInitialPoll
-		}
-		select {
-		case <-e.stop:
-			return
-		case <-time.After(poll):
-		}
-	}
-}
-
-// rebindCertFingerprint re-binds the attestation hash if the cached leaf's
-// fingerprint differs from bound, and returns the fingerprint now in effect.
-func (e *Runtime) rebindCertFingerprint(cache autocert.Cache, bound [sha256.Size]byte) [sha256.Size]byte {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	raw, err := cache.Get(ctx, e.cfg.FQDN)
-	cancel()
-
-	switch {
-	case err != nil:
-		if bound != ([sha256.Size]byte{}) { // a miss is expected before first issuance
-			slog.Warn("ACME cert cache read failed", "error", err)
-		}
-	default:
-		h, ferr := leafFingerprint(raw)
-		if ferr != nil {
-			slog.Error("ACME cert fingerprint", "error", ferr)
-		} else if h != bound {
-			e.hashes.SetTLSKeyHash(h)
-			bound = h
+	bindLeafFingerprint := func(leafDER []byte) {
+		h := sha256.Sum256(leafDER)
+		if e.hashes.SetTLSKeyHashIfChanged(h) {
 			slog.Info("TLS: bound attestation to ACME cert", "sha256", hex.EncodeToString(h[:]))
 		}
 	}
-	return bound
-}
 
-// setCertFingerprint binds the leaf fingerprint of the PEM chain raw into the
-// attestation hashes. Errors if the chain has no non-CA leaf (fail closed).
-func (e *Runtime) setCertFingerprint(raw []byte) error {
-	h, err := leafFingerprint(raw)
-	if err != nil {
-		return err
+	// autocert serves (and caches) the leaf from GetCertificate and rotates it on
+	// renewal. Wrap it so the attested fingerprint tracks the live leaf, re-binding
+	// on rotation — no separate polling loop needed.
+	e.tlsGetCert = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cert, err := mgr.GetCertificate(hello)
+		if err == nil && cert != nil && len(cert.Certificate) > 0 {
+			bindLeafFingerprint(cert.Certificate[0])
+		}
+		return cert, err
 	}
-	e.hashes.SetTLSKeyHash(h)
 	return nil
-}
-
-// leafFingerprint returns the SHA-256 of the first non-CA cert in the PEM chain.
-func leafFingerprint(raw []byte) ([sha256.Size]byte, error) {
-	for {
-		block, rest := pem.Decode(raw)
-		if block == nil {
-			return [sha256.Size]byte{}, errors.New("pem.Decode found no PEM data")
-		}
-		if block.Type == "CERTIFICATE" {
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				return [sha256.Size]byte{}, fmt.Errorf("parse certificate: %w", err)
-			}
-			if !cert.IsCA {
-				return sha256.Sum256(cert.Raw), nil
-			}
-		}
-		if len(rest) == 0 {
-			return [sha256.Size]byte{}, errors.New("no non-CA leaf certificate found in TLS chain")
-		}
-		raw = rest
-	}
-}
-
-// LoggingMiddleware emits a structured slog entry for each request and
-// increments the request / error counters. Wraps the response writer in
-// a statusWriter to capture the final status code without buffering.
-func LoggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(sw, r)
-		slog.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", sw.status,
-			"duration_ms", time.Since(start).Milliseconds(),
-		)
-		enclaveMetrics.Inc(enclaveMetrics.HTTPRequests, "http_requests_total")
-		if sw.status >= 400 {
-			enclaveMetrics.Inc(enclaveMetrics.HTTPErrors, "http_errors_total")
-		}
-	})
-}
-
-// responseRecorder buffers a response body and status so Middleware can
-// sign the body before forwarding to the real ResponseWriter.
-type responseRecorder struct {
-	headers http.Header
-	body    *bytes.Buffer
-	status  int
-}
-
-func (r *responseRecorder) Header() http.Header         { return r.headers }
-func (r *responseRecorder) WriteHeader(code int)        { r.status = code }
-func (r *responseRecorder) Write(b []byte) (int, error) { return r.body.Write(b) }
-func (r *responseRecorder) ReadFrom(s io.Reader) (int64, error) {
-	return io.Copy(r.body, s)
-}
-
-// statusWriter wraps http.ResponseWriter to expose the final status code
-// for LoggingMiddleware. Delegates Flush so HTTP/2 streaming (gRPC
-// server-streaming responses) is not buffered when this middleware sits
-// in the chain.
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// isGRPCRequest reports whether r is a native gRPC or gRPC-Web call.
-// Native gRPC (application/grpc*) requires HTTP/2; gRPC-Web
-// (application/grpc-web*) rides either HTTP/1.1 or HTTP/2. Buffering
-// either breaks server-streaming — native gRPC also loses its
-// grpc-status / grpc-message trailers — so the response-signing
-// middleware needs to short-circuit for both.
-func isGRPCRequest(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "application/grpc-web") {
-		return true
-	}
-	if r.ProtoMajor != 2 {
-		return false
-	}
-	return strings.HasPrefix(ct, "application/grpc")
-}
-
-// gatedMux wraps an http.ServeMux so every HandleFunc call is rewrapped
-// in a gating middleware (e.g. requireInitDone or requireInitOK).
-type gatedMux struct {
-	inner *http.ServeMux
-	gate  func(http.Handler) http.Handler
-}
-
-func (g *gatedMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
-	g.inner.Handle(pattern, g.gate(http.HandlerFunc(handler)))
 }
 
 // requireInitDone rejects requests until Init returns (success or
@@ -1154,64 +914,362 @@ func (e *Runtime) registerGatedRoutes() {
 		e.dynamic.RegisterRoutes(gated)
 	}
 	strict := &gatedMux{inner: e.mux, gate: e.requireInitOK}
-	if e.migrator != nil {
-		e.migrator.RegisterRoutes(strict)
-	}
+	strict.HandleFunc("POST /v1/start-migration", e.handleStartMigration)
 }
 
-// lockPCR pins a PCR so further ExtendPCR calls are rejected by the NSM.
-func lockPCR(index uint) error {
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return fmt.Errorf("open NSM session: %w", err)
+// handleStartMigration mints the migration key PCR0-locked at birth, re-encrypts
+// secrets + DEK into its key-scoped SSM paths, verifies them, then flips
+// KMSKeyID (one atomic write) and schedules the old key for deletion.
+func (e *Runtime) handleStartMigration(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NewPCR0 string `json:"new_pcr0"`
 	}
-	defer func() { _ = session.Close() }()
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewPCR0 == "" {
+		http.Error(w, "new_pcr0 is required in request body", http.StatusBadRequest)
+		return
+	}
+	if len(req.NewPCR0) != 96 {
+		http.Error(w, "new_pcr0 must be 96 hex characters (SHA-384)", http.StatusBadRequest)
+		return
+	}
+	if _, err := hex.DecodeString(req.NewPCR0); err != nil {
+		http.Error(w, "new_pcr0 must be valid hex", http.StatusBadRequest)
+		return
+	}
 
-	resp, err := session.Send(&request.LockPCR{Index: uint16(index)})
+	ctx := r.Context()
+	deployment := getDeployment()
+	appName := getAppName()
+
+	ownPCR0, err := e.nsm.getPCR0()
 	if err != nil {
-		return fmt.Errorf("LockPCR(%d): %w", index, err)
+		http.Error(w, fmt.Sprintf("could not read own PCR0 from NSM: %v", err), http.StatusInternalServerError)
+		return
 	}
-	if resp.Error != "" {
-		return fmt.Errorf("LockPCR(%d): NSM error: %s", index, resp.Error)
+
+	if ownPCR0 == "" {
+		http.Error(w, "could not read own PCR0 from NSM", http.StatusInternalServerError)
+		return
 	}
-	return nil
+
+	newPCR0Bytes, _ := hex.DecodeString(req.NewPCR0)
+	if err := e.nsm.commitPCR(req.NewPCR0, newPCR0Bytes, migrationPCRIndex); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Mint the migration key with the final PCR0-locked policy in one call.
+	// No external principal ever holds authority over the key.
+	migrationKeyID, err := e.kms.CreateMigrationKey(ctx, ownPCR0, req.NewPCR0)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create migration key: %v", err), http.StatusInternalServerError)
+		return
+	}
+	slog.Info("created migration KMS key", "key_id", migrationKeyID, "own_pcr0", prefix16(ownPCR0), "new_pcr0", prefix16(req.NewPCR0))
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		pendingDays := keyDeletionPendingDays
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, derr := e.aws.KMS.ScheduleKeyDeletion(cleanupCtx, &kms.ScheduleKeyDeletionInput{
+			KeyId:               aws.String(migrationKeyID),
+			PendingWindowInDays: &pendingDays,
+		}); derr != nil {
+			slog.Warn("schedule unused migration key for deletion failed", "key_id", migrationKeyID, "error", derr)
+		} else {
+			slog.Info("scheduled unused migration key for deletion (handleStartMigration failed before commit)", "key_id", migrationKeyID)
+		}
+	}()
+
+	type encryptedSecret struct {
+		name          string
+		keyBytes      []byte
+		ciphertextB64 string
+	}
+	var encryptedSecrets []encryptedSecret
+	for _, secret := range e.staticSecrets.Secrets() {
+		secretValue := os.Getenv(secret.EnvVar)
+		if secretValue == "" {
+			continue
+		}
+		keyBytes, err := hex.DecodeString(secretValue)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid key format for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+		ciphertextB64, err := e.kms.Encrypt(ctx, migrationKeyID, keyBytes)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("KMS encrypt failed for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+		ciphertextParam := secretCiphertextParam(secret.Name, migrationKeyID)
+		if err := e.kms.StoreCiphertext(ctx, ciphertextParam, ciphertextB64); err != nil {
+			http.Error(w, fmt.Sprintf("SSM store failed for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+		encryptedSecrets = append(encryptedSecrets, encryptedSecret{
+			name:          secret.Name,
+			keyBytes:      keyBytes,
+			ciphertextB64: ciphertextB64,
+		})
+	}
+
+	if err := e.storage.ExportDEK(ctx, migrationKeyID); err != nil {
+		http.Error(w, fmt.Sprintf("storage DEK export failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Verify before commit: ownPCR0 is in the policy, so we can decrypt our own writes.
+	for _, es := range encryptedSecrets {
+		decrypted, err := decryptDEK(ctx, e.kms.aws.KMS, migrationKeyID, es.ciphertextB64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("verify: decrypt failed for %s: %v", es.name, err), http.StatusInternalServerError)
+			return
+		}
+		if !bytes.Equal(decrypted, es.keyBytes) {
+			http.Error(w, fmt.Sprintf("verify: ciphertext mismatch for %s", es.name), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Record this enclave as the next one's predecessor (with attestation)
+	// before flipping KMSKeyID, so a failure here leaves nothing committed.
+	pcr0, _, err := e.storePCR0WithAttestation(ctx, deployment, appName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Emit the migration-transition receipt over the successor's state_root,
+	// before the KMSKeyID flip, so the successor can verify the handoff on first
+	// boot. PCR31 already committed to new_pcr0 above.
+	if err := e.stateOrigin.writeTransitionReceipt(ctx, migrationKeyID); err != nil {
+		http.Error(w, fmt.Sprintf("write migration-transition receipt: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	oldKeyID, _ := e.kms.GetKeyID(ctx) // for deletion below
+
+	// Atomic commit: from here, all boots use the migration key.
+	if _, err := e.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
+		Value:     aws.String(migrationKeyID),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		http.Error(w, fmt.Sprintf("update KMSKeyID: %v", err), http.StatusInternalServerError)
+		return
+	}
+	committed = true
+	slog.Info("KMSKeyID updated to migration key", "key_id", migrationKeyID)
+
+	// Schedule old key for deletion (best-effort — failure is non-fatal).
+	if oldKeyID != "" && oldKeyID != migrationKeyID {
+		pendingDays := keyDeletionPendingDays
+		if _, err := e.aws.KMS.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
+			KeyId:               aws.String(oldKeyID),
+			PendingWindowInDays: &pendingDays,
+		}); err != nil {
+			slog.Warn("schedule old key deletion failed", "key_id", oldKeyID, "error", err)
+		} else {
+			slog.Info("scheduled old KMS key for deletion", "key_id", oldKeyID, "pending_days", keyDeletionPendingDays)
+		}
+	}
+
+	var exportedNames []string
+	for _, es := range encryptedSecrets {
+		exportedNames = append(exportedNames, es.name)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		PCR0     string   `json:"pcr0"`
+		Exported []string `json:"exported"`
+	}{
+		PCR0:     pcr0,
+		Exported: exportedNames,
+	})
 }
 
-// extendPCR appends data to PCR[index]'s rolling hash.
-func extendPCR(index uint, data []byte) error {
-	session, err := nsm.OpenDefaultSession()
+// storePCR0WithAttestation writes the old enclave's PCR0 and attestation doc
+// directly to MigrationPreviousPCR0 / MigrationPreviousPCR0Attestation.
+func (e *Runtime) storePCR0WithAttestation(ctx context.Context, deployment, appName string) (string, string, error) {
+	pcr0, err := e.nsm.getPCR0()
 	if err != nil {
-		return fmt.Errorf("open NSM session: %w", err)
+		return "", "", fmt.Errorf("could not read PCR0 from NSM: %w", err)
 	}
-	defer func() { _ = session.Close() }()
 
-	resp, err := session.Send(&request.ExtendPCR{Index: uint16(index), Data: data})
+	if pcr0 == "" {
+		return "", "", fmt.Errorf("could not read PCR0 from NSM")
+	}
+
+	attestDocB64, err := getAttestationDocumentB64()
 	if err != nil {
-		return fmt.Errorf("ExtendPCR(%d): %w", index, err)
+		return "", "", fmt.Errorf("generate attestation document: %w", err)
 	}
-	if resp.Error != "" {
-		return fmt.Errorf("ExtendPCR(%d): NSM error: %s", index, resp.Error)
+
+	// Write the attestation first; PCR0 is the commit point. VerifyPredecessor-
+	// Commitment treats a recorded PCR0 as proof the attestation exists, so a
+	// partial write can never leave a predecessor without its attestation.
+	attestParam := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)
+	if _, err := e.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(attestParam),
+		Value:     aws.String(attestDocB64),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+		Tier:      ssmtypes.ParameterTierAdvanced,
+	}); err != nil {
+		return "", "", fmt.Errorf("store PCR0 attestation in SSM: %w", err)
 	}
-	return nil
+
+	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
+	if _, err := e.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(pcr0Param),
+		Value:     aws.String(pcr0),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
+	}
+
+	return pcr0, attestDocB64, nil
 }
 
-// describePCR returns PCR[index]'s current value and its lock state.
-func describePCR(index uint) (data []byte, locked bool, err error) {
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return nil, false, fmt.Errorf("open NSM session: %w", err)
-	}
-	defer func() { _ = session.Close() }()
+func (e *Runtime) CooldownStatus(ctx context.Context) (configuredSeconds, remaining int, pending bool) {
+	cooldown := getMigrationCooldown()
+	configuredSeconds = int(cooldown.Seconds())
 
-	resp, err := session.Send(&request.DescribePCR{Index: uint16(index)})
+	e.cooldownMu.Lock()
+	if time.Since(e.cooldownFetchedAt) < 5*time.Second {
+		rem := e.cooldownRemaining
+		pend := e.cooldownPending
+		e.cooldownMu.Unlock()
+		return configuredSeconds, rem, pend
+	}
+	e.cooldownMu.Unlock()
+
+	if e.aws == nil {
+		return configuredSeconds, 0, false
+	}
+	deployment := getDeployment()
+	appName := getAppName()
+
+	requestedAtStr, err := readSSMParam(ctx, e.aws.SSM, fmt.Sprintf("/%s/%s/MigrationRequestedAt", deployment, appName))
+	if err != nil || requestedAtStr == "" {
+		e.cooldownMu.Lock()
+		e.cooldownPending = false
+		e.cooldownRemaining = 0
+		e.cooldownFetchedAt = time.Now()
+		e.cooldownMu.Unlock()
+		return configuredSeconds, 0, false
+	}
+
+	requestedAt, err := time.Parse(time.RFC3339, requestedAtStr)
 	if err != nil {
-		return nil, false, fmt.Errorf("DescribePCR(%d): %w", index, err)
+		return configuredSeconds, 0, false
 	}
-	if resp.Error != "" {
-		return nil, false, fmt.Errorf("DescribePCR(%d): NSM error: %s", index, resp.Error)
+
+	deadline := requestedAt.Add(cooldown)
+	rem := time.Until(deadline)
+	if rem < 0 {
+		rem = 0
 	}
-	if resp.DescribePCR == nil {
-		return nil, false, fmt.Errorf("DescribePCR(%d): empty response", index)
+
+	e.cooldownMu.Lock()
+	e.cooldownPending = true
+	e.cooldownRemaining = int(rem.Seconds())
+	e.cooldownFetchedAt = time.Now()
+	e.cooldownMu.Unlock()
+
+	return configuredSeconds, int(rem.Seconds()), true
+}
+
+// VerifyPredecessorCommitment checks that the previous enclave's stored
+// attestation document committed (via PCR31) to handing off to ownPCR0.
+// No-op when there's no predecessor (genesis), or when the chain entry
+// points at our own PCR0 — that's the rolled-back-onto-self case: this
+// enclave wrote the attestation before a failed migration, and its PCR31
+// commits to the failed target rather than to itself.
+func (e *Runtime) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 string) error {
+	deployment := getDeployment()
+	appName := getAppName()
+	prevPCR0, err := readSSMParamOptional(ctx, e.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
+	if err != nil {
+		return fmt.Errorf("read previous PCR0: %w", err)
 	}
-	return resp.DescribePCR.Data, resp.DescribePCR.Lock, nil
+	if prevPCR0 == "" || strings.EqualFold(prevPCR0, ownPCR0) {
+		return nil
+	}
+	attestB64, err := readSSMParamOptional(ctx, e.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName))
+	if err != nil {
+		return fmt.Errorf("read previous attestation: %w", err)
+	}
+	// Fail closed: a predecessor is recorded but its attestation is missing or
+	// UNSET. storePCR0WithAttestation writes the attestation before PCR0, so a
+	// recorded PCR0 always has one — a blank here is a tampered or corrupt
+	// handoff, not a state to trust.
+	if attestB64 == "" {
+		return fmt.Errorf("predecessor PCR0 %s recorded but its attestation is missing", prefix16(prevPCR0))
+	}
+	return verifyPCR31Commitment(attestB64, ownPCR0, prevPCR0)
+}
+
+func (e *Runtime) GetPreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
+	pcr0, err := readSSMParam(ctx, e.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", getDeployment(), getAppName()))
+	if err != nil {
+		return nil, err
+	}
+	attest, err := readSSMParam(ctx, e.aws.SSM, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName()))
+	if err != nil {
+		return nil, err
+	}
+	return &PreviousPCR0Info{PCR0: pcr0, Attestation: attest}, nil
+}
+
+// readSSMParam returns an error if the parameter is missing or set to "UNSET".
+func readSSMParam(ctx context.Context, ssmClient SSMAPI, paramName string) (string, error) {
+	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(paramName),
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", fmt.Errorf("parameter %s has no value", paramName)
+	}
+	value := strings.TrimSpace(*out.Parameter.Value)
+	if value == "" || value == "UNSET" {
+		return "", fmt.Errorf("parameter %s is unset", paramName)
+	}
+	return value, nil
+}
+
+// readSSMParamOptional is like readSSMParam but returns ("", nil) when the
+// param is missing or holds the tofu placeholder "UNSET". Real SSM errors
+// (network, IAM) still propagate.
+func readSSMParamOptional(ctx context.Context, ssmClient SSMAPI, paramName string) (string, error) {
+	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(paramName),
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		var pnf *ssmtypes.ParameterNotFound
+		if errors.As(err, &pnf) {
+			return "", nil
+		}
+		return "", fmt.Errorf("ssm get-parameter %s: %w", paramName, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", nil
+	}
+	v := strings.TrimSpace(*out.Parameter.Value)
+	if v == "" || v == "UNSET" {
+		return "", nil
+	}
+	return v, nil
 }

@@ -94,3 +94,8 @@ func anyValueToString(v *commonpb.AnyValue) string {
 		return fmt.Sprintf("%v", anyValueToGo(v))
 	}
 }
+
+// prefix16 truncates a hex PCR0 / KMS key ID for less noisy log fields.
+func prefix16(s string) string {
+	return s[:min(16, len(s))]
+}

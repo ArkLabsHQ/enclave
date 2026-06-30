@@ -37,7 +37,7 @@ type Config struct {
 	Version           string         `yaml:"version"`
 	Region            string         `yaml:"region"`
 	Account           string         `yaml:"account"`
-	Prefix            string         `yaml:"prefix"`
+	Deployment        string         `yaml:"deployment"`
 	Profile           string         `yaml:"profile"`
 	App               AppConfig      `yaml:"app"`
 	Secrets           []SecretConfig `yaml:"secrets"`
@@ -163,8 +163,8 @@ func loadConfigAt(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("invalid %s: %w", configFile, err)
 	}
 	// Apply defaults.
-	if cfg.Prefix == "" {
-		cfg.Prefix = "dev"
+	if cfg.Deployment == "" {
+		cfg.Deployment = "dev"
 	}
 	if cfg.Version == "" {
 		cfg.Version = "dev"

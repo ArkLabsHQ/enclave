@@ -143,21 +143,18 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 		return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
 	}
 
-	out, err := s.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
-		KeyId:         aws.String(keyID),
-		NumberOfBytes: aws.Int32(32),
-	})
+	ciphertextBlob, plaintext, err := s.kms.generateDataKey(ctx, keyID)
 	if err != nil {
-		return fmt.Errorf("kms generate data key: %w", err)
+		return err
 	}
 
-	ciphertextB64 = base64.StdEncoding.EncodeToString(out.CiphertextBlob)
+	ciphertextB64 = base64.StdEncoding.EncodeToString(ciphertextBlob)
 
 	if err := s.kms.StoreCiphertext(ctx, paramName, ciphertextB64); err != nil {
 		return err
 	}
 
-	secretHex := hex.EncodeToString(out.Plaintext)
+	secretHex := hex.EncodeToString(plaintext)
 	if err := safeSetenv(secret.EnvVar, secretHex); err != nil {
 		return fmt.Errorf("set %s: %w", secret.EnvVar, err)
 	}

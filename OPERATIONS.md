@@ -78,7 +78,7 @@ The host-side `enclave-supervisor.service` runs with `Restart=always`. Inside th
 
 If the EC2 instance itself fails:
 
-1. The CDK stack creates a new instance from the same AMI
+1. The OpenTofu module creates a new instance from the same AMI
 2. The new instance boots, runs `user_data` which starts the enclave
 3. The enclave decrypts secrets from SSM using KMS attestation (same PCR0)
 4. Storage data persists in S3 — the new instance picks up where the old one left off
@@ -114,15 +114,16 @@ The new enclave self-applies a PCR0-restricted policy on boot, locking Decrypt t
 ### Deploy
 
 ```bash
-enclave deploy
+enclave tofu
+cd tofu && tofu init && tofu apply
 ```
 
-This runs `cdk deploy` with the configuration from `enclave.yaml`, builds the EIF, uploads it to S3, and starts the enclave.
+`enclave tofu` scaffolds the OpenTofu module from the configuration in `enclave.yaml`. Running `tofu apply` provisions the infrastructure, uploads the EIF to S3, and starts the enclave.
 
 ### Destroy
 
 ```bash
-enclave destroy
+cd tofu && tofu destroy
 ```
 
 **Warning**: this deletes all infrastructure including the KMS key and S3 bucket. Secrets and storage data will be permanently lost.
@@ -133,7 +134,7 @@ enclave destroy
 enclave status
 ```
 
-Shows the current enclave state, instance ID, and CDK stack outputs.
+Shows the current enclave state, instance ID, and tofu outputs.
 
 
 ## Wire-format notes

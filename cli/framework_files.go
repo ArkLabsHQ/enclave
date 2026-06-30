@@ -241,6 +241,7 @@ ENCLAVE_NITRIDING_ENABLED=true
 ENCLAVE_DEPLOYMENT=${dev_mode}
 ENCLAVE_AWS_REGION=${region}
 ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
+ENCLAVE_KMS_KEY_LOCKED=${is_kms_key_locked}
 MEMORY_MIB=4320
 CPU_COUNT=2
 GVPROXY_FORWARD_PORTS=443
@@ -283,7 +284,7 @@ const frameworkFlakeNix = `{
         # Fall back to env vars for backwards compatibility.
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -483,7 +484,7 @@ const frameworkFlakeNixNodejs = `{
         # Fall back to env vars for backwards compatibility.
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -1004,7 +1005,7 @@ const frameworkFlakeNixDotnet = `{
 
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.
@@ -1185,7 +1186,7 @@ const frameworkFlakeNixRust = `{
 
         version = buildCfg.version;
         region = buildCfg.region;
-        deployment = buildCfg.prefix;
+        deployment = buildCfg.deployment;
 
         # Resolve user-supplied package names from enclave.yaml
         # (nix_build_inputs / nix_native_build_inputs) against nixpkgs.

@@ -223,9 +223,7 @@ func TestCLI_Tofu_Remote_RequiresOwnerRepo(t *testing.T) {
 	tofuCmd.Dir = dir
 	tofuCmd.Stdin = nil // /dev/null — never let the subprocess inherit a TTY
 	out, err := tofuCmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected --remote without owner/repo to error, got success:\n%s", out)
-	}
+	requireErrContains(t, err, "exit status 1")
 	if !strings.Contains(string(out), "nix_owner") || !strings.Contains(string(out), "nix_repo") {
 		t.Errorf("error message should mention nix_owner/nix_repo, got: %s", out)
 	}

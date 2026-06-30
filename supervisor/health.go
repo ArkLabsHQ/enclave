@@ -106,7 +106,7 @@ func (h *Health) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if _, err := h.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
-		Name: aws.String(ssmParamPath("KMSKeyID")),
+		Name: aws.String(kmsSubtreeParamPath("KMSKeyID")),
 	}); err != nil {
 		checks["ssm"] = "fail: " + err.Error()
 		allOK = false

@@ -16,7 +16,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
@@ -63,7 +63,7 @@ app:
   # For deploy-time env vars (the common case), run:
   #   enclave tofu env --key MY_KEY --value foo
   # then 'tofu apply' — no rebuild needed.
-  # Template vars: {{region}}, {{prefix}}, {{version}}
+  # Template vars: {{region}}, {{deployment}}, {{version}}
   env: {}
 
 # Secrets managed by KMS inside the enclave.
@@ -271,7 +271,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Version:     %s\n", cfg.Version)
 	fmt.Printf("  Region:      %s\n", cfg.Region)
 	fmt.Printf("  Account:     %s\n", cfg.Account)
-	fmt.Printf("  Prefix:      %s\n", cfg.Prefix)
+	fmt.Printf("  Deployment:      %s\n", cfg.Deployment)
 	fmt.Printf("  Instance:    %s\n", cfg.InstanceType)
 	fmt.Println()
 	fmt.Printf("  Runtime Rev:     %.12s\n", cfg.Runtime.Rev)

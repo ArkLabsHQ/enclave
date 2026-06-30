@@ -62,10 +62,10 @@ The framework provides an **irreversible security guarantee**: once a KMS key is
 ### Lifecycle Workflow
 
 ```
-enclave init  →  enclave setup  →  enclave tofu  →  enclave build  →  enclave deploy
+enclave init  →  enclave setup  →  enclave tofu  →  enclave build  →  tofu apply
                                                                    →  enclave verify
                                                                    →  enclave status
-                                                                   →  enclave destroy
+                                                                   →  tofu destroy
 ```
 
 ### 1. `enclave init` — Project Scaffolding
@@ -132,12 +132,12 @@ Builds the Enclave Image File (EIF) using **Nix inside Docker** for full reprodu
 
 Anyone can rebuild the same EIF and get identical PCR values, proving the binary hasn't been tampered with.
 
-### 4. `enclave deploy` — AWS Deployment
+### 4. `enclave tofu` + `tofu apply` — AWS Deployment
 
 Handles both fresh deployments and upgrades:
 
 **Fresh deploy:**
-- Synthesizes and deploys a CDK stack (VPC, EC2, KMS, SSM, IAM, EIP)
+- `enclave tofu` scaffolds the OpenTofu module, then `tofu apply` provisions the infrastructure (VPC, EC2, KMS, SSM, IAM, EIP)
 - Applies KMS key policy with PCR0 attestation condition
 - Waits for instance readiness
 
@@ -168,9 +168,9 @@ Shows instance state, KMS key state, lock status, and enclave version.
 
 Removes `kms:PutKeyPolicy` and `kms:ScheduleKeyDeletion` from the admin, making the KMS policy **permanent and irrevocable**. After locking, only an enclave with the correct PCR0 can decrypt secrets — even the AWS root account cannot override this.
 
-### 8. `enclave destroy` — Teardown
+### 8. `tofu destroy` — Teardown
 
-Destroys all AWS infrastructure via `cdk destroy`.
+Destroys all AWS infrastructure via `tofu destroy`.
 
 ---
 
@@ -260,9 +260,9 @@ The supervisor is the main process inside the enclave. It:
 
 ---
 
-## CDK Infrastructure Stack
+## OpenTofu Infrastructure
 
-Deployed via Go CDK (`cdk.go`):
+Deployed via the OpenTofu module scaffolded by `enclave tofu`:
 
 | Resource | Purpose |
 |----------|---------|
@@ -326,7 +326,7 @@ A developer using this framework:
 1. Writes a standard Go HTTP server (no enclave code)
 2. Runs `enclave init` to scaffold the project
 3. Configures secrets and app source in `enclave.yaml`
-4. Runs `enclave build` → `enclave deploy` → `enclave verify`
+4. Runs `enclave build` → `enclave tofu` → `tofu apply` → `enclave verify`
 5. Their app runs inside a Nitro Enclave with hardware-attested secrets, signed responses, and an immutable upgrade chain
 
 The framework abstracts away all Nitro Enclave complexity — NSM sessions, vsock networking, attestation documents, KMS recipient attestation, PCR management, and upgrade key migration.

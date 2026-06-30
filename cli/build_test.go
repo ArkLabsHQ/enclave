@@ -17,7 +17,7 @@ func TestGenerateBuildConfig(t *testing.T) {
 		Name:    "testapp",
 		Version: "1.2.3",
 		Region:  "us-west-2",
-		Prefix:  "staging",
+		Deployment:  "staging",
 		App: AppConfig{
 			Language:       "go",
 			NixOwner:       "myorg",
@@ -94,12 +94,12 @@ func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
 		Name:    "app",
 		Version: "2.0.0",
 		Region:  "eu-west-1",
-		Prefix:  "prod",
+		Deployment:  "prod",
 		App: AppConfig{
 			BinaryName: "app",
 			Env: map[string]string{
 				"DEPLOY_REGION":  "{{region}}",
-				"DEPLOY_PREFIX":  "{{prefix}}",
+				"DEPLOY_PREFIX":  "{{deployment}}",
 				"DEPLOY_VERSION": "{{version}}",
 			},
 		},
@@ -125,7 +125,7 @@ func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
 		t.Errorf("{{region}} not resolved: got %q", bc.App.Env["DEPLOY_REGION"])
 	}
 	if bc.App.Env["DEPLOY_PREFIX"] != "prod" {
-		t.Errorf("{{prefix}} not resolved: got %q", bc.App.Env["DEPLOY_PREFIX"])
+		t.Errorf("{{deployment}} not resolved: got %q", bc.App.Env["DEPLOY_PREFIX"])
 	}
 	if bc.App.Env["DEPLOY_VERSION"] != "2.0.0" {
 		t.Errorf("{{version}} not resolved: got %q", bc.App.Env["DEPLOY_VERSION"])

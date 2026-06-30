@@ -5,7 +5,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1
 region: us-east-1                # AWS region
 account: "000000000000"                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                  # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds (for testing)

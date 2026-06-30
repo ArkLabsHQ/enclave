@@ -30,7 +30,7 @@ func Validate(ctx context.Context) error {
 	}
 
 	ssmClient := ssm.NewFromConfig(awsCfg)
-	paramName := ssmParamPath("KMSKeyID")
+	paramName := kmsSubtreeParamPath("KMSKeyID")
 	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
 		Name: aws.String(paramName),
 	})

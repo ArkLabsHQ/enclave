@@ -27,6 +27,10 @@ type fakeSSM struct {
 	pathCalls      int
 }
 
+func (f *fakeSSM) PutParameter(_ context.Context, _ *ssm.PutParameterInput, _ ...func(*ssm.Options)) (*ssm.PutParameterOutput, error) {
+	return &ssm.PutParameterOutput{}, nil
+}
+
 func (f *fakeSSM) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
 	name := aws.ToString(in.Name)
 	f.calls = append(f.calls, name)
@@ -130,9 +134,7 @@ func TestLoadDeployTLSConfig(t *testing.T) {
 
 	t.Run("ssm error surfaces", func(t *testing.T) {
 		_, err := loadDeployTLSConfig(context.Background(), &fakeSSM{err: errors.New("AccessDenied")})
-		if err == nil {
-			t.Error("expected error when SSM fails")
-		}
+		requireErrContains(t, err, "ssm get-parameter")
 	})
 }
 
@@ -230,7 +232,41 @@ func TestApplyEnvOverrides_SkipsNestedAndEmpty(t *testing.T) {
 func TestApplyEnvOverrides_SSMError(t *testing.T) {
 	fake := &fakeSSM{err: errors.New("access denied")}
 	err := applyEnvOverrides(context.Background(), fake, "dev", "myapp")
-	if err == nil {
-		t.Fatal("expected error when SSM fails")
+	requireErrContains(t, err, "ssm get-parameters-by-path")
+}
+
+// The overlay must never change framework-identity vars: an SSM writer could
+// otherwise set ENCLAVE_DEPLOYMENT=dev to flip the COSE-verification skip.
+func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
+	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
+	_ = os.Unsetenv("SAFE_KEY")
+	fake := &fakeSSM{params: map[string]string{
+		"/prod/myapp/env/ENCLAVE_DEPLOYMENT":         "dev",
+		"/prod/myapp/env/ENCLAVE_APP_NAME":           "evil",
+		"/prod/myapp/env/ENCLAVE_KMS_KEY_LOCKED":     "false",
+		"/prod/myapp/env/ENCLAVE_MIGRATION_COOLDOWN": "0s",
+		"/prod/myapp/env/ENCLAVE_SECRETS_CONFIG":     `[{"name":"evil"}]`,
+		"/prod/myapp/env/SAFE_KEY":                   "ok",
+	}}
+	if err := applyEnvOverrides(context.Background(), fake, "prod", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for k, want := range map[string]string{
+		"ENCLAVE_DEPLOYMENT":         "prod",
+		"ENCLAVE_APP_NAME":           "myapp",
+		"ENCLAVE_KMS_KEY_LOCKED":     "true",
+		"ENCLAVE_MIGRATION_COOLDOWN": "1m",
+		"ENCLAVE_SECRETS_CONFIG":     "[]",
+	} {
+		if got := os.Getenv(k); got != want {
+			t.Errorf("%s overridden via overlay to %q; must stay %q", k, got, want)
+		}
+	}
+	if got := os.Getenv("SAFE_KEY"); got != "ok" {
+		t.Errorf("non-identity key should still apply, got %q", got)
 	}
 }

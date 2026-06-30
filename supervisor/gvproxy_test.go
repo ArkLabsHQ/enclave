@@ -7,10 +7,11 @@ import (
 
 func TestParseForwardPorts(t *testing.T) {
 	tests := []struct {
-		name    string
-		spec    string
-		want    map[string]string
-		wantErr bool
+		name            string
+		spec            string
+		want            map[string]string
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name: "empty",
@@ -46,14 +47,16 @@ func TestParseForwardPorts(t *testing.T) {
 			},
 		},
 		{
-			name:    "invalid host port",
-			spec:    "abc:443",
-			wantErr: true,
+			name:            "invalid host port",
+			spec:            "abc:443",
+			wantErr:         true,
+			wantErrContains: "invalid host port",
 		},
 		{
-			name:    "invalid vm port",
-			spec:    "443:xyz",
-			wantErr: true,
+			name:            "invalid vm port",
+			spec:            "443:xyz",
+			wantErr:         true,
+			wantErrContains: "invalid VM port",
 		},
 		{
 			name: "whitespace-only noise is ignored",
@@ -65,9 +68,7 @@ func TestParseForwardPorts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseForwardPorts(tc.spec)
 			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got nil (result: %v)", got)
-				}
+				requireErrContains(t, err, tc.wantErrContains)
 				return
 			}
 			if err != nil {

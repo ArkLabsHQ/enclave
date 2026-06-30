@@ -24,7 +24,7 @@ name: myapp
 version: "1.0.0"
 region: us-east-1
 account: "123456789012"
-prefix: prod
+deployment: prod
 instance_type: c6i.xlarge
 migration_cooldown: "5m"
 previous_pcr0: abc123
@@ -56,8 +56,8 @@ sdk:
 	if cfg.Version != "1.0.0" {
 		t.Errorf("Version = %q, want %q", cfg.Version, "1.0.0")
 	}
-	if cfg.Prefix != "prod" {
-		t.Errorf("Prefix = %q, want %q", cfg.Prefix, "prod")
+	if cfg.Deployment != "prod" {
+		t.Errorf("Prefix = %q, want %q", cfg.Deployment, "prod")
 	}
 	if cfg.InstanceType != "c6i.xlarge" {
 		t.Errorf("InstanceType = %q, want %q", cfg.InstanceType, "c6i.xlarge")
@@ -144,8 +144,8 @@ region: eu-west-1
 		t.Fatalf("loadConfig: %v", err)
 	}
 
-	if cfg.Prefix != "dev" {
-		t.Errorf("Prefix = %q, want %q", cfg.Prefix, "dev")
+	if cfg.Deployment != "dev" {
+		t.Errorf("Prefix = %q, want %q", cfg.Deployment, "dev")
 	}
 	if cfg.Version != "dev" {
 		t.Errorf("Version = %q, want %q", cfg.Version, "dev")
@@ -175,9 +175,7 @@ func TestLoadConfig_MissingName(t *testing.T) {
 region: us-east-1
 `)
 	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("expected error for missing name")
-	}
+	requireErrContains(t, err, "'name' is required")
 }
 
 func TestLoadConfig_MissingRegion(t *testing.T) {
@@ -185,9 +183,7 @@ func TestLoadConfig_MissingRegion(t *testing.T) {
 name: myapp
 `)
 	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("expected error for missing region")
-	}
+	requireErrContains(t, err, "'region' is required")
 }
 
 func TestLoadConfig_InvalidMigrationCooldown(t *testing.T) {
@@ -197,15 +193,14 @@ region: us-east-1
 migration_cooldown: "not-a-duration"
 `)
 	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("expected error for invalid migration_cooldown")
-	}
+	requireErrContains(t, err, "invalid migration_cooldown")
 }
 
 func TestLoadConfig_SecretValidation(t *testing.T) {
 	tests := []struct {
-		name    string
-		secrets string
+		name            string
+		secrets         string
+		wantErrContains string
 	}{
 		{
 			name: "duplicate name",
@@ -215,6 +210,7 @@ secrets:
     env_var: KEY_ONE
   - name: key1
     env_var: KEY_TWO`,
+			wantErrContains: "duplicate secret name",
 		},
 		{
 			name: "duplicate env_var",
@@ -224,6 +220,7 @@ secrets:
     env_var: MY_KEY
   - name: key2
     env_var: MY_KEY`,
+			wantErrContains: "duplicate secret env_var",
 		},
 		{
 			name: "reserved ENCLAVE_ prefix",
@@ -231,6 +228,7 @@ secrets:
 secrets:
   - name: key1
     env_var: ENCLAVE_SECRET`,
+			wantErrContains: `uses reserved prefix "ENCLAVE_"`,
 		},
 		{
 			name: "reserved AWS_ prefix",
@@ -238,6 +236,7 @@ secrets:
 secrets:
   - name: key1
     env_var: AWS_SECRET`,
+			wantErrContains: `uses reserved prefix "AWS_"`,
 		},
 		{
 			name: "invalid secret name format",
@@ -245,6 +244,7 @@ secrets:
 secrets:
   - name: 1invalid
     env_var: MY_KEY`,
+			wantErrContains: "must be alphanumeric with underscores",
 		},
 		{
 			name: "invalid env_var format",
@@ -252,6 +252,7 @@ secrets:
 secrets:
   - name: valid
     env_var: lowercase`,
+			wantErrContains: "must be uppercase alphanumeric",
 		},
 		{
 			name: "missing secret name",
@@ -259,6 +260,7 @@ secrets:
 secrets:
   - name: ""
     env_var: MY_KEY`,
+			wantErrContains: "secrets[0].name is required",
 		},
 		{
 			name: "missing env_var",
@@ -266,6 +268,7 @@ secrets:
 secrets:
   - name: key1
     env_var: ""`,
+			wantErrContains: "secrets[0].env_var is required",
 		},
 	}
 
@@ -273,9 +276,7 @@ secrets:
 		t.Run(tt.name, func(t *testing.T) {
 			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.secrets)
 			_, err := loadConfig()
-			if err == nil {
-				t.Errorf("expected error for %s", tt.name)
-			}
+			requireErrContains(t, err, tt.wantErrContains)
 		})
 	}
 }
@@ -312,18 +313,20 @@ func TestValidateSDK(t *testing.T) {
 	for _, field := range []string{"rev", "hash", "vendor_hash"} {
 		t.Run("missing_"+field, func(t *testing.T) {
 			sdk := RuntimeConfig{Rev: "abc", Hash: "sha256-x", VendorHash: "sha256-y"}
+			var wantErrContains string
 			switch field {
 			case "rev":
 				sdk.Rev = ""
+				wantErrContains = "'runtime.rev' is required"
 			case "hash":
 				sdk.Hash = ""
+				wantErrContains = "'runtime.hash' is required"
 			case "vendor_hash":
 				sdk.VendorHash = ""
+				wantErrContains = "'runtime.vendor_hash' is required"
 			}
 			cfg := &Config{Runtime: sdk}
-			if err := cfg.validateRuntime(); err == nil {
-				t.Errorf("expected error for missing %s", field)
-			}
+			requireErrContains(t, cfg.validateRuntime(), wantErrContains)
 		})
 	}
 }
@@ -555,9 +558,10 @@ func TestCachixCacheName(t *testing.T) {
 
 func TestLoadConfig_VendorValidation(t *testing.T) {
 	tests := []struct {
-		name    string
-		body    string
-		wantErr bool
+		name            string
+		body            string
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name: "rust with vendor: true and empty hash is ok",
@@ -584,7 +588,8 @@ app:
   language: nodejs
   vendor: true
 `,
-			wantErr: true,
+			wantErr:         true,
+			wantErrContains: "app.vendor=true is only supported for language go|rust",
 		},
 		{
 			name: "dotnet with vendor: true is rejected",
@@ -593,7 +598,8 @@ app:
   language: dotnet
   vendor: true
 `,
-			wantErr: true,
+			wantErr:         true,
+			wantErrContains: "app.vendor=true is only supported for language go|rust",
 		},
 		{
 			name: "rust with vendor: true and non-empty hash is rejected (mutex)",
@@ -603,7 +609,8 @@ app:
   vendor: true
   nix_vendor_hash: "sha256-abc="
 `,
-			wantErr: true,
+			wantErr:         true,
+			wantErrContains: "app.vendor=true is mutually exclusive with app.nix_vendor_hash",
 		},
 		{
 			name: "vendor omitted defaults to false (no validation triggered)",
@@ -620,9 +627,7 @@ app:
 			writeConfig(t, "name: myapp\nregion: us-east-1\n"+tt.body)
 			cfg, err := loadConfig()
 			if tt.wantErr {
-				if err == nil {
-					t.Errorf("expected error for %s, got nil", tt.name)
-				}
+				requireErrContains(t, err, tt.wantErrContains)
 				return
 			}
 			if err != nil {

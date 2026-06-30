@@ -192,7 +192,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
@@ -235,7 +235,7 @@ app:
   # For deploy-time env vars (the common case), run:
   #   enclave tofu env --key MY_KEY --value foo
   # then 'tofu apply' — no rebuild needed.
-  # Template vars: {{region}}, {{prefix}}, {{version}}
+  # Template vars: {{region}}, {{deployment}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
     # MY_APP_REGION: "{{region}}"
@@ -289,7 +289,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
@@ -330,7 +330,7 @@ app:
   # For deploy-time env vars (the common case), run:
   #   enclave tofu env --key MY_KEY --value foo
   # then 'tofu apply' — no rebuild needed.
-  # Template vars: {{region}}, {{prefix}}, {{version}}
+  # Template vars: {{region}}, {{deployment}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
     # MY_APP_REGION: "{{region}}"
@@ -396,7 +396,7 @@ An application that runs inside an [AWS Nitro Enclave](https://aws.amazon.com/ec
 - Docker
 - [Nix](https://nixos.org/)
 - AWS CLI v2
-- AWS CDK CLI (` + "`npm install -g aws-cdk`" + `)
+- [OpenTofu CLI](https://opentofu.org)
 - jq
 
 ## Quick Start
@@ -446,7 +446,7 @@ enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
-` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
+` + "`" + `tofu apply` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 
@@ -490,7 +490,7 @@ An application that runs inside an [AWS Nitro Enclave](https://aws.amazon.com/ec
 - Docker
 - [Nix](https://nixos.org/)
 - AWS CLI v2
-- AWS CDK CLI (` + "`npm install -g aws-cdk`" + `)
+- [OpenTofu CLI](https://opentofu.org)
 - jq
 
 ## Quick Start
@@ -540,7 +540,7 @@ enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
-` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
+` + "`" + `tofu apply` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 
@@ -587,7 +587,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
@@ -629,7 +629,7 @@ app:
   # For deploy-time env vars (the common case), run:
   #   enclave tofu env --key MY_KEY --value foo
   # then 'tofu apply' — no rebuild needed.
-  # Template vars: {{region}}, {{prefix}}, {{version}}
+  # Template vars: {{region}}, {{deployment}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
     # MY_APP_REGION: "{{region}}"
@@ -700,7 +700,7 @@ An application that runs inside an [AWS Nitro Enclave](https://aws.amazon.com/ec
 - Docker
 - [Nix](https://nixos.org/)
 - AWS CLI v2
-- AWS CDK CLI (` + "`npm install -g aws-cdk`" + `)
+- [OpenTofu CLI](https://opentofu.org)
 - jq
 
 ## Quick Start
@@ -750,7 +750,7 @@ enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
 ` + "```" + `
 
 Verifies the running enclave's attestation document matches your local build.
-` + "`" + `enclave deploy` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
+` + "`" + `tofu apply` + "`" + ` prints both the elastic IP and the expected PCR0 after a successful apply.
 
 ## Writing Your App
 
@@ -803,7 +803,7 @@ name: my-app                     # App name (used in stack name, EIF name)
 version: 0.0.1                   # Build version (semver, baked into binary via ldflags)
 region: us-east-1                # AWS region
 account: ""                      # AWS account ID (required)
-prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
+deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
@@ -897,8 +897,9 @@ attestation, encrypted secrets, and response signing.
    enclave setup
 3. Build the enclave image:
    enclave build
-4. Deploy:
-   enclave deploy
+4. Generate the OpenTofu module and deploy:
+   enclave tofu
+   cd tofu && tofu init && tofu apply
 
 ## Updating Dependencies
 

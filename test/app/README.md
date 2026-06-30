@@ -8,7 +8,7 @@ An application that runs inside an [AWS Nitro Enclave](https://aws.amazon.com/ec
 - Docker
 - [Nix](https://nixos.org/)
 - AWS CLI v2
-- AWS CDK CLI (`npm install -g aws-cdk`)
+- [OpenTofu CLI](https://opentofu.org)
 - jq
 
 ## Quick Start
@@ -46,10 +46,11 @@ Produces a reproducible EIF image with deterministic PCR0 measurements.
 ### 5. Deploy
 
 ```sh
-enclave deploy
+enclave tofu
+cd tofu && tofu init && tofu apply
 ```
 
-Creates the full AWS stack: VPC, EC2, KMS key, IAM roles, and secrets.
+Creates the full AWS infrastructure: VPC, EC2, KMS key, IAM roles, and secrets.
 
 ### 6. Verify
 

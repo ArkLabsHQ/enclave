@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -261,7 +262,7 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 
 	// Atomic commit: from here, all boots use the migration key.
 	if _, err := m.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
+		Name:      aws.String(kmsKeyIDParam()),
 		Value:     aws.String(migrationKeyID),
 		Type:      ssmtypes.ParameterTypeString,
 		Overwrite: aws.Bool(true),
@@ -308,21 +309,14 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient SSMAPI, deployment,
 		return "", "", fmt.Errorf("could not read PCR0 from NSM")
 	}
 
-	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
-	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(pcr0Param),
-		Value:     aws.String(pcr0),
-		Type:      ssmtypes.ParameterTypeString,
-		Overwrite: aws.Bool(true),
-	}); err != nil {
-		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
-	}
-
 	attestDocB64, err := getAttestationDocumentB64()
 	if err != nil {
 		return "", "", fmt.Errorf("generate attestation document: %w", err)
 	}
 
+	// Write the attestation first; PCR0 is the commit point. VerifyPredecessor-
+	// Commitment treats a recorded PCR0 as proof the attestation exists, so a
+	// partial write can never leave a predecessor without its attestation.
 	attestParam := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)
 	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(attestParam),
@@ -332,6 +326,16 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient SSMAPI, deployment,
 		Tier:      ssmtypes.ParameterTierAdvanced,
 	}); err != nil {
 		return "", "", fmt.Errorf("store PCR0 attestation in SSM: %w", err)
+	}
+
+	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
+	if _, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(pcr0Param),
+		Value:     aws.String(pcr0),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	}); err != nil {
+		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
 	}
 
 	return pcr0, attestDocB64, nil
@@ -457,22 +461,47 @@ func (m *Migrator) VerifyPredecessorCommitment(ctx context.Context, ownPCR0 stri
 	if err != nil {
 		return fmt.Errorf("read previous attestation: %w", err)
 	}
+	// Fail closed: a predecessor is recorded but its attestation is missing or
+	// UNSET. storePCR0WithAttestation writes the attestation before PCR0, so a
+	// recorded PCR0 always has one — a blank here is a tampered or corrupt
+	// handoff, not a state to trust.
 	if attestB64 == "" {
-		return nil
+		return fmt.Errorf("predecessor PCR0 %s recorded but its attestation is missing", prefix16(prevPCR0))
 	}
-	return verifyPCR31Commitment(attestB64, ownPCR0)
+	return verifyPCR31Commitment(attestB64, ownPCR0, prevPCR0)
 }
 
 // verifyPCR31Commitment: nil iff the previous enclave's attestation document
-// committed to handing off to THIS enclave's PCR0 (by extending PCR31).
-func verifyPCR31Commitment(attestDocB64, myPCR0 string) error {
+// committed to handing off to THIS enclave's PCR0 (by extending PCR31). The doc
+// is verified against the AWS Nitro root, and its PCR0 must match the stored
+// predecessor PCR0, before PCR31 is trusted.
+func verifyPCR31Commitment(attestDocB64, myPCR0, prevPCR0 string) error {
+	return verifyPCR31CommitmentWithRoots(attestDocB64, myPCR0, prevPCR0, nil)
+}
+
+// verifyPCR31CommitmentWithRoots is verifyPCR31Commitment with an explicit trust
+// anchor (nil → nitrite's embedded AWS Nitro root). Tests pass a synthetic CA.
+func verifyPCR31CommitmentWithRoots(attestDocB64, myPCR0, prevPCR0 string, roots *x509.CertPool) error {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
 		return fmt.Errorf("decode attestation base64: %w", err)
 	}
-	pcr31, err := extractPCRFromAttestation(attestDoc, migrationPCRIndex)
+	result, err := verifyAttestationDoc(attestDoc, roots)
 	if err != nil {
-		return fmt.Errorf("extract PCR%d: %w", migrationPCRIndex, err)
+		return fmt.Errorf("verify predecessor attestation: %w", err)
+	}
+	// Bind the attestation to the claimed predecessor: a different, still
+	// validly-signed enclave's document must not be substitutable.
+	attestedPCR0, ok := result.Document.PCRs[0]
+	if !ok {
+		return fmt.Errorf("PCR0 not found in attestation document")
+	}
+	if !strings.EqualFold(hex.EncodeToString(attestedPCR0), prevPCR0) {
+		return fmt.Errorf("attested PCR0 does not match stored MigrationPreviousPCR0")
+	}
+	pcr31, ok := result.Document.PCRs[migrationPCRIndex]
+	if !ok {
+		return fmt.Errorf("PCR%d not found in attestation document", migrationPCRIndex)
 	}
 	myPCR0Bytes, err := hex.DecodeString(myPCR0)
 	if err != nil {

@@ -1,9 +1,46 @@
 package runtime
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
+
+// A recorded predecessor with a missing/UNSET attestation must fail closed —
+// otherwise blanking the SSM param bypasses the PCR31 commitment check.
+func TestVerifyPredecessorCommitment_FailsClosedOnMissingAttestation(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+
+	fake := &fakeSSM{params: map[string]string{
+		"/prod/myapp/MigrationPreviousPCR0": "aabbcc",
+	}}
+	m := &Migrator{aws: &AWSClient{SSM: fake}}
+
+	if err := m.VerifyPredecessorCommitment(context.Background(), "ddeeff"); err == nil {
+		t.Fatal("must fail closed when predecessor PCR0 is set but attestation is missing")
+	}
+}
+
+// Genesis (no predecessor) and rolled-back-onto-self must remain no-ops and not
+// require an attestation.
+func TestVerifyPredecessorCommitment_NoOpWhenGenesisOrSelf(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	ctx := context.Background()
+
+	genesis := &Migrator{aws: &AWSClient{SSM: &fakeSSM{params: map[string]string{}}}}
+	if err := genesis.VerifyPredecessorCommitment(ctx, "ddeeff"); err != nil {
+		t.Fatalf("genesis should be a no-op, got: %v", err)
+	}
+
+	self := &Migrator{aws: &AWSClient{SSM: &fakeSSM{params: map[string]string{
+		"/prod/myapp/MigrationPreviousPCR0": "ddeeff",
+	}}}}
+	if err := self.VerifyPredecessorCommitment(ctx, "ddeeff"); err != nil {
+		t.Fatalf("self-handoff should be a no-op, got: %v", err)
+	}
+}
 
 // --- KMSPolicyBuilder tests ---
 
@@ -83,10 +120,24 @@ func TestSecretCiphertextParam_KeyScoped(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
 	t.Setenv("ENCLAVE_APP_NAME", "my-app")
 	const keyID = "1234abcd-12ab-34cd-56ef-1234567890ab"
-	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/signing-key/Ciphertext/"+keyID; got != want {
+
+	// Default (unlocked) namespace.
+	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/unlocked/signing-key/Ciphertext/"+keyID; got != want {
 		t.Fatalf("secretCiphertextParam: got %q, want %q", got, want)
 	}
-	if got, want := storageDEKCiphertextParam(keyID), "/dev/my-app/StorageDEK/Ciphertext/"+keyID; got != want {
+	if got, want := storageDEKCiphertextParam(keyID), "/dev/my-app/unlocked/StorageDEK/Ciphertext/"+keyID; got != want {
 		t.Fatalf("storageDEKCiphertextParam: got %q, want %q", got, want)
+	}
+	if got, want := kmsKeyIDParam(), "/dev/my-app/unlocked/KMSKeyID"; got != want {
+		t.Fatalf("kmsKeyIDParam: got %q, want %q", got, want)
+	}
+
+	// Locked namespace is a distinct path.
+	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	if got, want := secretCiphertextParam("signing-key", keyID), "/dev/my-app/locked/signing-key/Ciphertext/"+keyID; got != want {
+		t.Fatalf("locked secretCiphertextParam: got %q, want %q", got, want)
+	}
+	if got, want := kmsKeyIDParam(), "/dev/my-app/locked/KMSKeyID"; got != want {
+		t.Fatalf("locked kmsKeyIDParam: got %q, want %q", got, want)
 	}
 }

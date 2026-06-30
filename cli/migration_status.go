@@ -45,7 +45,7 @@ func runMigrationStatus(ctx context.Context, asJSON bool) error {
 		return err
 	}
 
-	deployment := cfg.Prefix
+	deployment := cfg.Deployment
 	if deployment == "" {
 		deployment = "dev"
 	}

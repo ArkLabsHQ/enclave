@@ -26,6 +26,29 @@ func getDeployment() string {
 	return "dev"
 }
 
+// nonOverridableEnv lists framework-identity vars the SSM env overlay must
+// never set. They are baked into the EIF (measured into PCR0) and define the
+// SSM/KMS namespace, the set of managed secrets, and security-critical timing;
+// letting the overlay change them would redirect the namespace, flip checks
+// like COSE skip or the KMS lock posture, or alter which secrets exist.
+var nonOverridableEnv = map[string]bool{
+	"ENCLAVE_DEPLOYMENT":         true,
+	"ENCLAVE_APP_NAME":           true,
+	"ENCLAVE_KMS_KEY_LOCKED":     true,
+	"ENCLAVE_MIGRATION_COOLDOWN": true,
+	"ENCLAVE_SECRETS_CONFIG":     true,
+}
+
+// skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
+// whose local QEMU NSM produces unsigned mock documents. Any other deployment
+// verifies against the AWS Nitro root. The deployment is baked into the EIF at
+// build time (measured into PCR0) and cannot be set via the SSM env overlay
+// (nonOverridableEnv), so this security-critical check cannot be flipped at
+// deploy time.
+func skipCOSEVerification() bool {
+	return getDeployment() == "dev"
+}
+
 func getAppName() string {
 	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
 		return name
@@ -41,6 +64,22 @@ func getStaticSecretsConfig() string {
 // recovery principal). The choice is permanent at first lock.
 func kmsKeyLocked() bool {
 	return os.Getenv("ENCLAVE_KMS_KEY_LOCKED") == "true"
+}
+
+// lockSegment is the SSM namespace segment ("locked"|"unlocked") inserted after
+// /{deployment}/{app}/ in every KMS-subtree path, so the lock posture is an
+// IAM-enforceable boundary: a locked deployment can never read or write the
+// unlocked namespace's key or ciphertexts (and vice versa).
+func lockSegment() string {
+	if kmsKeyLocked() {
+		return "locked"
+	}
+	return "unlocked"
+}
+
+// kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
+func kmsKeyIDParam() string {
+	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
 }
 
 func getMigrationCooldown() time.Duration {
@@ -95,15 +134,15 @@ func spanBufferSize() int {
 	return 1000
 }
 
-// secretCiphertextParam: SSM path for a secret's KMS ciphertext, scoped by the
-// KMS key ID. Flipping /{dep}/{app}/KMSKeyID is the atomic migration commit.
+// secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
+// scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func secretCiphertextParam(secretName, keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), secretName, keyID)
+	return fmt.Sprintf("/%s/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), secretName, keyID)
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, scoped by key ID.
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
 func storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
+	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
 // ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by
@@ -152,6 +191,14 @@ func applyEnvOverrides(ctx context.Context, ssmClient ssmGetter, deployment, app
 			// Defensive: skip empty or nested keys so a misconfigured SSM
 			// tree can't surface unexpected env var names.
 			if key == "" || strings.ContainsRune(key, '/') {
+				continue
+			}
+			// Never let the overlay change the framework identity: these are
+			// baked into the EIF (measured into PCR0) and name the SSM/KMS
+			// namespace. Allowing an SSM writer to set them would redirect the
+			// namespace or flip security-critical checks (e.g. COSE skip).
+			if nonOverridableEnv[key] {
+				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
 				continue
 			}
 			if err := os.Setenv(key, *p.Value); err != nil {

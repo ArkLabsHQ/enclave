@@ -602,10 +602,6 @@ func (m *Migration) handleScheduleKeyDeletion(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func (m *Migration) getParam(ctx context.Context, name string) (string, error) {
-	return m.getParamAt(ctx, ssmParamPath(name))
-}
-
 // getParamAt reads an SSM param at an explicit path (UNSET treated as ""). Used
 // for KMS-subtree params, whose path carries the lock segment.
 func (m *Migration) getParamAt(ctx context.Context, path string) (string, error) {

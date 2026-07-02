@@ -72,6 +72,12 @@ func safeSetenv(key, value string) error {
 	return os.Setenv(key, value)
 }
 
+func sefeGetenv(key string) string {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Getenv(key)
+}
+
 // =============================================================================
 // DynamicSecrets subsystem
 // =============================================================================

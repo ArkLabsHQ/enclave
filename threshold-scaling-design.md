@@ -1,5 +1,29 @@
 # Threshold-shared static secrets for horizontal enclave scaling
 
+## Implementation status (2026-07-01)
+
+Done + green across `threshold-magic` and the enclave repo (all unit tests pass;
+one known-red: `TestCLI_Build`, the real Nix EIF build, pending the deferred
+module-publish + `vendorHash`):
+- **A** Store decoupled from BadgerDB (`thresholdsdk/badgerstore`).
+- **B** `WithAuthorize` hook on `NewLeader` (+ tests).
+- **C** `kind: signing` config field + validation (+ tests).
+- **E** leader/follower wiring `runtime/threshold_secret.go`; exported
+  `thresholdcore.LeaderGroupPubkey(a0)` (verified against real ceremonies) so the
+  master publishes the taproot-tweaked group key without a DKG.
+- **F** `runtime/threshold_store.go` (Store over encrypted S3+DEK).
+- **G** attested admission handshake `runtime/threshold_handshake.go` (leader
+  responder `/enclave/threshold/{nonce,admit}` + follower initiator; mutual PCR
+  attestation, NaCl-sealed payload, one-shot nonces) + `nitriding.GetPCRs`.
+- **D** `LoadAll`/`ExtendPCRs` skip threshold secrets; setup phase in `Init`.
+- **I** deps wired via local `replace` + vendored (Nix deferred by decision).
+- Enclave-side discovery: follower reads leader URL from SSM
+  (`thresholdLeaderParam`) with env override.
+
+Remaining — **H (host-side infra, untestable here):** master supervisor publishes
+the leader handshake URL to `…/Threshold/Leader` SSM; add the relay port to
+`GVPROXY_FORWARD_PORTS`; tofu leader-only target group + SG rules.
+
 ## Context / problem
 
 Today, scaling enclaves horizontally means **every replica independently pulls
@@ -12,12 +36,12 @@ that only moves an opaque blob.
 
 ## Goal
 
-For a secret **tagged `signing`/`dkg`**: the **master** creates the secret
+For a secret **tagged `signing`**: the **master** creates the secret
 normally (existing KMS path), then acts as a `threshold-sdk` **leader** and
 splits it into Shamir shares. Master keeps its own share; each **joiner**
 receives *its own share* as the secret. A **majority** (`t = ⌊n/2⌋+1`)
 reconstructs/signs. **Untagged secrets are unchanged.** Leader sits **behind a
-load balancer**; `signing` and `dkg` are **synonyms** (same threshold path).
+load balancer**; `signing` is the only threshold kind.
 
 ## The insight that keeps threshold-sdk unmodified
 
@@ -34,17 +58,17 @@ secret. No change to threshold-sdk crypto is required for secret injection.
 - `buildConfigSecretJSON` (`cli/build.go:52`)
 - `StaticSecret` (`runtime/static_secret.go:31`)
 
-each get `Kind string`. Valid values: `""` / `static` / `signing` / `dkg`.
+each get `Kind string`. Valid values: `""` / `static` / `signing`.
 `ENCLAVE_SECRETS_CONFIG` JSON carries it automatically (no `flake.nix` change).
 Surface the field in the `cli/init.go` template and `cli/tofu.go`.
 
 ### 2. Runtime branch in `LoadAll` / `LoadOrGenerate` (`runtime/static_secret.go:95`)
 - untagged → existing path (unchanged)
-- `signing`/`dkg`, **master role** → creates/loads the secret via the existing
+- `signing`, **master role** → creates/loads the secret via the existing
   KMS path; app env var = **full secret** (hex), exactly as today. The master
   additionally runs the threshold leader (part 3), seeding `a0` = this full
   secret and storing its own share.
-- `signing`/`dkg`, **joiner role** → does **not** fetch the full secret from KMS;
+- `signing`, **joiner role** → does **not** fetch the full secret from KMS;
   obtains **its own share** from the leader and sets the app env var = **share**
   (hex).
 - Both roles expose a companion `<ENVVAR>_GROUP_PUBKEY`. `ExtendPCRs` extends

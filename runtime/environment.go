@@ -134,6 +134,7 @@ func spanBufferSize() int {
 	return 1000
 }
 
+
 // secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
 // scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func secretCiphertextParam(secretName, keyID string) string {
@@ -143,6 +144,13 @@ func secretCiphertextParam(secretName, keyID string) string {
 // storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
 func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
+}
+
+// thresholdLeaderParam: SSM path where the master supervisor publishes the
+// threshold leader's reachable handshake base URL (e.g. https://host:443), for
+// joiner enclaves to discover. Lock-scoped so locked/unlocked deployments differ.
+func thresholdLeaderParam() string {
+	return fmt.Sprintf("/%s/%s/%s/Threshold/Leader", getDeployment(), getAppName(), lockSegment())
 }
 
 // ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by

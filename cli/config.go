@@ -13,15 +13,15 @@ import (
 )
 
 var (
-	accountIDRegex   = regexp.MustCompile(`^\d{12}$`)
-	secretNameRegex  = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
-	envVarRegex      = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-	fqdnRegex        = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
-	commitSHARegex   = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	cachixHostRegex  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
-	publicKeyRegex   = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
+	accountIDRegex  = regexp.MustCompile(`^\d{12}$`)
+	secretNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+	envVarRegex     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	fqdnRegex       = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+	commitSHARegex  = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	cachixHostRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
+	publicKeyRegex  = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
 	// SRI sha256: "sha256-" + 43 base64 chars + "=" (32 raw bytes → 44 base64).
-	sriSha256Regex   = regexp.MustCompile(`^sha256-[A-Za-z0-9+/]{43}=$`)
+	sriSha256Regex = regexp.MustCompile(`^sha256-[A-Za-z0-9+/]{43}=$`)
 )
 
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
@@ -108,6 +108,12 @@ type AppConfig struct {
 type SecretConfig struct {
 	Name   string `yaml:"name" json:"name"`       // SSM parameter name component
 	EnvVar string `yaml:"env_var" json:"env_var"` // Env var passed to upstream app
+	Kind   string `yaml:"kind" json:"kind,omitempty"`
+}
+
+// IsThreshold reports whether the secret is threshold-shared (kind "signing").
+func (s SecretConfig) IsThreshold() bool {
+	return s.Kind == "signing"
 }
 
 // RuntimeConfig defines the SDK coordinates for the enclave supervisor binary.
@@ -219,6 +225,11 @@ func loadConfigAt(configPath string) (*Config, error) {
 		}
 		if !envVarRegex.MatchString(s.EnvVar) {
 			return nil, fmt.Errorf("%s: secrets[%d].env_var %q must be uppercase alphanumeric with underscores", configFile, i, s.EnvVar)
+		}
+		switch s.Kind {
+		case "", "static", "signing":
+		default:
+			return nil, fmt.Errorf("%s: secrets[%d].kind %q must be one of static, signing", configFile, i, s.Kind)
 		}
 		for _, prefix := range reservedEnvPrefixes {
 			if len(s.EnvVar) >= len(prefix) && s.EnvVar[:len(prefix)] == prefix {

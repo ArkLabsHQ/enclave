@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/hf/nitrite"
 	"github.com/hf/nsm"
@@ -96,6 +97,35 @@ func Attest(nonce, userData, publicKey []byte) ([]byte, error) {
 // ArePCRsIdentical reports whether two PCR maps have the same keys and values.
 func ArePCRsIdentical(ourPCRs, theirPCRs map[uint][]byte) bool {
 	return arePCRsIdentical(ourPCRs, theirPCRs)
+}
+
+func ArePCRsIdenticalForKeys(ourPCRs, theirPCRs map[uint][]byte, keys []uint) bool {
+	for _, k := range keys {
+		ourValue, ok := ourPCRs[k]
+		if !ok {
+			return false
+		}
+		theirValue, ok := theirPCRs[k]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(ourValue, theirValue) {
+			return false
+		}
+	}
+	return true
+}
+
+// GetPCRs returns this enclave's current PCR values (from a fresh attestation).
+// Used by peer-to-peer handshakes to compare a remote enclave's PCRs to our own.
+func GetPCRs() (map[uint][]byte, error) {
+	return getPCRValues()
+}
+
+// CurrentTime returns the clock nitrite verification should use (UTC now).
+// Exposed so peer handshakes verify remote attestations against the same clock.
+func CurrentTime() time.Time {
+	return currentTime()
 }
 
 // attest takes as input a nonce, user-provided data and a public key, and then

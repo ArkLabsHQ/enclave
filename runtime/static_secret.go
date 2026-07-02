@@ -31,6 +31,12 @@ import (
 type StaticSecret struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
+	Kind   string `json:"kind,omitempty"`
+}
+
+// IsThreshold reports whether the secret is threshold-shared (kind "signing").
+func (s StaticSecret) IsSigning() bool {
+	return s.Kind == "signing"
 }
 
 // loadStaticSecretsConfig parses ENCLAVE_SECRETS_CONFIG (a JSON array of
@@ -58,16 +64,17 @@ func loadStaticSecretsConfig() ([]StaticSecret, error) {
 type StaticSecrets struct {
 	secrets []StaticSecret
 	kms     *KMS
+	scaling *ScalingEntity
 }
 
 // NewStaticSecrets constructs the subsystem and parses the configured
 // secrets list from the EIF-baked env var.
-func NewStaticSecrets(kms *KMS) (*StaticSecrets, error) {
+func NewStaticSecrets(kms *KMS, scaling *ScalingEntity) (*StaticSecrets, error) {
 	secs, err := loadStaticSecretsConfig()
 	if err != nil {
 		return nil, err
 	}
-	return &StaticSecrets{secrets: secs, kms: kms}, nil
+	return &StaticSecrets{secrets: secs, kms: kms, scaling: scaling}, nil
 }
 
 // Secrets returns the configured list (read-only — used by Migration).
@@ -141,6 +148,27 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 
 	if ciphertextB64 != "" {
 		return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
+	}
+
+	if s.scaling != nil && !s.scaling.IsLeader() {
+		if err := s.scaling.DeriveFollowerKey(ctx, secret); err != nil {
+			return fmt.Errorf("derive follower key: %w", err)
+		}
+
+		// await the env var to be set by the scaling subsystem (via RequestReshare)
+		ctx, cancel := context.WithTimeout(ctx, followerReshareKeyTimeout)
+		defer cancel()
+		for {
+			if strings.TrimSpace(os.Getenv(secret.EnvVar)) != "" {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("timeout waiting for follower key to be set in env var %s", secret.EnvVar)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+
 	}
 
 	ciphertextBlob, plaintext, err := s.kms.generateDataKey(ctx, keyID)
@@ -217,6 +245,9 @@ func (s *StaticSecrets) decryptExisting(ctx context.Context, keyID, ciphertextB6
 // then locked so it can't be re-extended.
 func (s *StaticSecrets) ExtendPCRs() error {
 	for i, sec := range s.secrets {
+		if sec.IsSigning() {
+			continue // TODO (Joshua): Decide If Signing Secrets Should be Extended
+		}
 		pcrIndex := uint(16) + uint(i)
 		if pcrIndex >= migrationPCRIndex {
 			return fmt.Errorf("secret %q: PCR index %d would collide with migration PCR (PCR%d)", sec.Name, pcrIndex, migrationPCRIndex)
@@ -260,4 +291,8 @@ func normalizeSecretHex(plaintext []byte) string {
 		}
 	}
 	return hex.EncodeToString(plaintext)
+}
+
+func isSigningSecret(secret StaticSecret) bool {
+	return secret.Kind == "signing"
 }

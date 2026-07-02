@@ -52,6 +52,7 @@ type buildConfigAppJSON struct {
 type buildConfigSecretJSON struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
+	Kind   string `json:"kind,omitempty"`
 }
 
 type buildConfigRuntimeJSON struct {

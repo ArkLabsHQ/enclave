@@ -15,6 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+
+	"github.com/edgebitio/nitro-enclaves-sdk-go/crypto/cms"
+	"github.com/hf/nsm"
 )
 
 // =============================================================================
@@ -44,6 +47,45 @@ func (k *KMS) Encrypt(ctx context.Context, keyID string, plaintext []byte) (stri
 		return "", fmt.Errorf("kms encrypt: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(out.CiphertextBlob), nil
+}
+
+// generateDataKey mints a fresh 256-bit data key under keyID and returns the
+// KMS-wrapped ciphertext (to persist) alongside its plaintext. GenerateDataKey
+// is PCR0-attestation-gated in the key policy, so the call carries a fresh NSM
+// attestation as Recipient — the same mechanism the decrypt path uses — and the
+// plaintext comes back encrypted to this enclave's ephemeral key (recovered from
+// CiphertextForRecipient), never crossing the host in the clear.
+func (k *KMS) generateDataKey(ctx context.Context, keyID string) (ciphertextBlob, plaintext []byte, err error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open nsm session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	out, err := k.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
+		KeyId:         aws.String(keyID),
+		NumberOfBytes: aws.Int32(32),
+		Recipient: &kmstypes.RecipientInfo{
+			AttestationDocument:    attestationDoc,
+			KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
+		},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("kms generate data key: %w", err)
+	}
+	if len(out.CiphertextForRecipient) == 0 {
+		return nil, nil, fmt.Errorf("kms generate data key returned empty CiphertextForRecipient")
+	}
+	plaintext, err = cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+	}
+	return out.CiphertextBlob, plaintext, nil
 }
 
 // StoreCiphertext stores a base64 ciphertext in SSM at paramName.
@@ -94,7 +136,7 @@ func (k *KMS) LoadCiphertext(ctx context.Context, paramName string) (string, err
 func (k *KMS) EnsureKeyID(ctx context.Context, pcr0 string) (string, error) {
 	deployment := getDeployment()
 	appName := getAppName()
-	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
+	paramName := kmsKeyIDParam()
 
 	out, err := k.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(paramName),
@@ -263,9 +305,7 @@ func (k *KMS) PeekKeyID(ctx context.Context) (string, error) {
 
 // GetKeyID reads the primary KMS key ID from SSM at /<dep>/<app>/KMSKeyID.
 func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
-	deployment := getDeployment()
-	appName := getAppName()
-	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
+	paramName := kmsKeyIDParam()
 	out, err := k.aws.SSM.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(paramName),
 		WithDecryption: aws.Bool(false),

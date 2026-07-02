@@ -26,13 +26,17 @@ func getDeployment() string {
 	return "dev"
 }
 
-// nonOverridableEnv lists framework-identity vars the SSM env overlay must
-// never set. They are baked into the EIF (measured into PCR0) and name the
-// SSM/KMS namespace; letting the overlay change them would redirect the
-// namespace or flip security-critical checks like COSE skip.
+// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
+// SSM/KMS namespace and lock posture, the managed-secret set, and security
+// timing — a short anchor window would let the operator wait out the Object Lock
+// and roll back undetected.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT": true,
-	"ENCLAVE_APP_NAME":   true,
+	"ENCLAVE_DEPLOYMENT":         true,
+	"ENCLAVE_APP_NAME":           true,
+	"ENCLAVE_ANCHOR_WINDOW":      true,
+	"ENCLAVE_KMS_KEY_LOCKED":     true,
+	"ENCLAVE_MIGRATION_COOLDOWN": true,
+	"ENCLAVE_SECRETS_CONFIG":     true,
 }
 
 // skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
@@ -62,6 +66,22 @@ func kmsKeyLocked() bool {
 	return os.Getenv("ENCLAVE_KMS_KEY_LOCKED") == "true"
 }
 
+// lockSegment is the SSM namespace segment ("locked"|"unlocked") inserted after
+// /{deployment}/{app}/ in every KMS-subtree path, so the lock posture is an
+// IAM-enforceable boundary: a locked deployment can never read or write the
+// unlocked namespace's key or ciphertexts (and vice versa).
+func lockSegment() string {
+	if kmsKeyLocked() {
+		return "locked"
+	}
+	return "unlocked"
+}
+
+// kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
+func kmsKeyIDParam() string {
+	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
+}
+
 func getMigrationCooldown() time.Duration {
 	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
 	if v == "" {
@@ -72,6 +92,27 @@ func getMigrationCooldown() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// respPort is the TLS port for the RESP K/V listener; 0 disables it.
+func respPort() uint16 {
+	if s := strings.TrimSpace(os.Getenv("ENCLAVE_KV_RESP_PORT")); s != "" {
+		if n, err := strconv.ParseUint(s, 10, 16); err == nil {
+			return uint16(n)
+		}
+	}
+	return 6379
+}
+
+// anchorWindow is the Object-Lock retain-until duration set on each anchor
+// object. Defaults to ~10 years.
+func anchorWindow() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("ENCLAVE_ANCHOR_WINDOW")); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * 365 * 24 * time.Hour
 }
 
 func logBufferSize() int {
@@ -114,21 +155,15 @@ func spanBufferSize() int {
 	return 1000
 }
 
-// secretCiphertextParam: SSM path for a secret's KMS ciphertext, scoped by the
-// KMS key ID. Flipping /{dep}/{app}/KMSKeyID is the atomic migration commit.
+// secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
+// scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func secretCiphertextParam(secretName, keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), secretName, keyID)
+	return fmt.Sprintf("/%s/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), secretName, keyID)
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, scoped by key ID.
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
 func storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), keyID)
-}
-
-// kmsKeyIDParam: SSM path for the active primary KMS key ID. Flipping this is
-// the atomic migration commit point.
-func kmsKeyIDParam() string {
-	return fmt.Sprintf("/%s/%s/KMSKeyID", getDeployment(), getAppName())
+	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its

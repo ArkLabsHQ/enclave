@@ -1,12 +1,3 @@
-// Package runtime is the in-process supervisor that boots inside an AWS
-// Nitro Enclave. A single *Runtime owns the TLS edge on :ExtPort, the
-// internal loopback listener on :IntPort, the catch-all reverse proxy to
-// the user app, and every supporting subsystem (KMS, storage, secrets,
-// tracing, logging, migration).
-//
-// cmd/runtime/main.go constructs a Runtime via New(cfg), wraps it with
-// the response-signing and logging middleware, calls Start to bind the
-// listeners, then Init to bring up AWS-backed subsystems.
 package runtime
 
 import (
@@ -124,6 +115,8 @@ type Runtime struct {
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
 	initOK   atomic.Bool // Init returned without error
 
+	rollbackHalt atomic.Bool
+
 	// Upstream app state — set by MarkUpstreamExited (called from
 	// cmd/runtime/main.go when the user app exits).
 	upstreamExited atomic.Bool
@@ -143,8 +136,9 @@ type Runtime struct {
 	nsm           *Nsm
 	staticSecrets *StaticSecrets
 	stateOrigin   *StateOrigin
-	dynamic       *DynamicSecrets
 	storage       *Storage
+	kvStore       *KVStore
+	respSrv       *RESPServer
 	environment   *Environment
 	signature     *Signature
 
@@ -192,7 +186,7 @@ func New(cfg *Config) (*Runtime, error) {
 }
 
 // Init brings up the AWS-backed subsystems: AWS clients, KMS key
-// authorization, the attestation key, static and dynamic secrets, storage,
+// authorization, the attestation key, secrets, the K/V store,
 // and the migration handshake. May block on KMS. Idempotent on the
 // initDone fence — handlers can safely read subsystem fields once it
 // returns, regardless of success.
@@ -242,7 +236,11 @@ func (e *Runtime) Init(ctx context.Context) error {
 	}
 	e.staticSecrets = staticSecrets
 
-	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
+	e.storage = NewStorage(e.kms)
+	e.kvStore = NewKVStore(e.kms, nil)
+	e.kvStore.anchor = &FreshnessAnchor{kv: e.kvStore, s3: e.kms.aws.S3, window: anchorWindow(), halt: &e.rollbackHalt}
+	e.respSrv = NewRESPServer(e.kvStore, e.runtimeToken)
+	e.respSrv.halt = &e.rollbackHalt
 
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
@@ -256,12 +254,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 		slog.Error("open NSM session", "error", err)
 	}
 
-	// Migrator needs Storage too, but Storage isn't fully initialized yet.
-	// Wire it in after Storage.Init below; /v1/start-migration is gated on
-	// initOK so the late wire-up is safe.
-
-	// Establish the startup-state protocol (issue #131): classify → ensureKey →
-	// verify → load → write receipt. PeekKeyID reads the key without minting one.
 	ownPCR0, err := e.nsm.getPCR0()
 	if err != nil {
 		slog.Error("read PCR0 from NSM", "error", err)
@@ -283,11 +275,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 	); err != nil {
 		slog.Error("establish startup state", "error", err)
 		return err
-	}
-
-	e.dynamic = NewDynamicSecrets(e.storage, e.metrics, e.staticSecrets, e.checkRuntimeToken)
-	if _, err := e.dynamic.Init(ctx); err != nil {
-		slog.Warn("load dynamic secrets failed", "error", err)
 	}
 
 	e.registerGatedRoutes()
@@ -337,6 +324,17 @@ func (e *Runtime) loadState(ctx context.Context, keyID string) error {
 	if err := e.storage.Init(ctx, keyID); err != nil {
 		return fmt.Errorf("init storage: %w", err)
 	}
+	if err := e.kvStore.Init(ctx, keyID); err != nil {
+		return fmt.Errorf("init kv store: %w", err)
+	}
+	if e.kvStore.Enabled() {
+		if err := e.kvStore.anchor.Init(ctx); err != nil {
+			return fmt.Errorf("init freshness anchor: %w", err)
+		}
+		if err := e.kvStore.anchor.Establish(ctx); err != nil {
+			return fmt.Errorf("freshness anchor establish: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -357,9 +355,6 @@ func (e *Runtime) Start() error {
 	}
 	go nitriding.RunNetworking(e.cfg.HostProxyPort, e.stop)
 
-	// The TLS cert source is installed later by configureTLS (during Init,
-	// after the deploy-time TLS config is read from SSM). Start only binds
-	// the listener; pubSrv.TLSConfig already carries the getCertificate callback.
 	return e.runListeners()
 }
 
@@ -391,10 +386,6 @@ func (e *Runtime) Stop() error {
 //	POST   /v1/metrics                    (OTLP ingest)
 //	GET    /v1/enclave-metrics            (JSON snapshot)
 //	POST   /v1/start-migration            (gated: requireInitOK)
-//	{PUT,GET,DELETE} /v1/storage/{key...} (gated: requireInitDone)
-//	GET    /v1/storage                    (gated: requireInitDone)
-//	{PUT,GET,DELETE} /v1/secrets/{name}   (gated: requireInitDone)
-//	GET    /v1/secrets                    (gated: requireInitDone)
 //	POST   /v1/logs                       (OTLP ingest)
 //	GET    /v1/enclave-logs               (JSON history)
 //	POST   /v1/traces                     (OTLP ingest)
@@ -469,14 +460,36 @@ func (e *Runtime) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (e *Runtime) RuntimeToken() string      { return e.runtimeToken }
+func (e *Runtime) RuntimeToken() string { return e.runtimeToken }
+
+func (e *Runtime) checkRuntimeToken(w http.ResponseWriter, r *http.Request) bool {
+	if e.runtimeToken == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "invalid Authorization format, expected Bearer token", http.StatusUnauthorized)
+		return false
+	}
+	if strings.TrimPrefix(auth, prefix) != e.runtimeToken {
+		http.Error(w, "invalid management token", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
 func (e *Runtime) Logging() *Logging         { return e.logging }
 func (e *Runtime) Tracing() *Tracing         { return e.tracing }
 func (e *Runtime) AttestationPubkey() string { return e.attestation.Pubkey() }
 
 // IsReady reports whether Init completed successfully. /health uses this
 // to distinguish "ready" from "initializing" / "failed".
-func (e *Runtime) IsReady() bool { return e.initOK.Load() }
+func (e *Runtime) IsReady() bool { return e.initOK.Load() && !e.rollbackHalt.Load() }
 
 // MarkUpstreamExited records that the user app has exited. The runtime
 // keeps running so /v1/start-migration and other admin endpoints stay
@@ -668,7 +681,29 @@ func (e *Runtime) runListeners() error {
 			}
 		}
 	}()
+
+	go e.serveRESP()
 	return nil
+}
+
+func (e *Runtime) serveRESP() {
+	<-e.storageReady
+	port := respPort()
+	if port == 0 || !e.kvStore.Enabled() {
+		slog.Info("RESP listener disabled", "port", port, "kv_enabled", e.kvStore.Enabled())
+		return
+	}
+	addr := fmt.Sprintf(":%d", port)
+	raw, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("RESP listener bind failed", "addr", addr, "error", err)
+		return
+	}
+	lis := tls.NewListener(raw, e.pubSrv.TLSConfig)
+	slog.Info("starting RESP listener", "addr", addr)
+	if err := e.respSrv.Serve(lis); err != nil {
+		slog.Error("RESP listener exited", "error", err)
+	}
 }
 
 // ListenErr returns a channel that fires once if either listener fails to
@@ -905,13 +940,6 @@ func (e *Runtime) requireInitOK(next http.Handler) http.Handler {
 func (e *Runtime) registerGatedRoutes() {
 	if e.mux == nil {
 		return
-	}
-	gated := &gatedMux{inner: e.mux, gate: e.requireInitDone}
-	if e.storage != nil {
-		e.storage.RegisterRoutes(gated)
-	}
-	if e.dynamic != nil {
-		e.dynamic.RegisterRoutes(gated)
 	}
 	strict := &gatedMux{inner: e.mux, gate: e.requireInitOK}
 	strict.HandleFunc("POST /v1/start-migration", e.handleStartMigration)

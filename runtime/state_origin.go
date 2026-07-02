@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -240,6 +241,10 @@ func (s *StateOrigin) putReceipt(ctx context.Context, stateRoot []byte, purpose,
 	return nil
 }
 
+// attestationRoots overrides the trust anchor for state-origin receipt
+// verification; nil (production) uses the default Nitro root. Set only by tests.
+var attestationRoots *x509.CertPool
+
 // verifyStateOriginReceipt: nil iff receiptB64 is a genuine NSM doc with PCR0
 // expectedPCR0Hex and user_data {expectedPurpose, expectedStateRoot}.
 func verifyStateOriginReceipt(receiptB64 string, expectedStateRoot []byte, expectedPCR0Hex, expectedPurpose string) error {
@@ -248,7 +253,7 @@ func verifyStateOriginReceipt(receiptB64 string, expectedStateRoot []byte, expec
 		return fmt.Errorf("decode receipt base64: %w", err)
 	}
 
-	res, err := verifyAttestationDoc(doc)
+	res, err := verifyAttestationDoc(doc, attestationRoots)
 	if err != nil {
 		return fmt.Errorf("verify receipt attestation: %w", err)
 	}
@@ -286,7 +291,7 @@ func verifyMigrationTransitionReceipt(receiptB64 string, expectedStateRoot []byt
 		return fmt.Errorf("decode migration receipt base64: %w", err)
 	}
 
-	res, err := verifyAttestationDoc(doc)
+	res, err := verifyAttestationDoc(doc, attestationRoots)
 	if err != nil {
 		return fmt.Errorf("verify migration receipt attestation: %w", err)
 	}

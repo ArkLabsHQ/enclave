@@ -44,6 +44,7 @@ module "enclave" {
   secrets           = var.secrets
   migration_cooldown = var.migration_cooldown
   expected_pcr0     = var.expected_pcr0
+  is_kms_key_locked = var.is_kms_key_locked
   supervisor_url          = var.supervisor_url
   github_owner  = var.github_owner
   github_repo   = var.github_repo
@@ -117,6 +118,12 @@ variable "expected_pcr0" {
   description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
   type        = string
   default     = ""
+}
+
+variable "is_kms_key_locked" {
+  description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
+  type        = bool
+  default     = false
 }
 
 variable "supervisor_url" {
@@ -246,6 +253,10 @@ const tofuModuleEnclaveMain = `terraform {
 locals {
   prefix = "${var.deployment}-${var.app_name}"
 
+  # SSM namespace segment for KMS-subtree paths (key id + ciphertexts), so the
+  # lock posture is an IAM-enforceable boundary. Must match the runtime/supervisor.
+  lock_segment = var.is_kms_key_locked ? "locked" : "unlocked"
+
   # Availability zones for VPC subnets.
   az_a = "${var.region}a"
   az_b = "${var.region}b"
@@ -307,6 +318,12 @@ variable "expected_pcr0" {
   description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
   type        = string
   default     = ""
+}
+
+variable "is_kms_key_locked" {
+  description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
+  type        = bool
+  default     = false
 }
 
 variable "supervisor_url" {
@@ -392,7 +409,7 @@ variable "tls" {
 # the EC2 destroy provisioner shells out to the supervisor to schedule key
 # deletion before the role is torn down.
 resource "aws_ssm_parameter" "kms_key_id" {
-  name      = "/${var.deployment}/${var.app_name}/KMSKeyID"
+  name      = "/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID"
   type      = "String"
   value     = "UNSET"
   overwrite = true
@@ -550,6 +567,45 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
+  # S3: the freshness anchor. No DeleteObject and no BypassGovernanceRetention,
+  # so even this shared grant can't remove a locked anchor. PutObjectRetention
+  # sets the compliance retain-until on each put.
+  statement {
+    sid = "S3AnchorObjectLock"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:PutObjectRetention",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      aws_s3_bucket.anchor.arn,
+      "${aws_s3_bucket.anchor.arn}/*",
+    ]
+  }
+
+  # DynamoDB: the encrypted, versioned K/V store. Shared with the EC2 role, so it
+  # doesn't exclude the operator; rollback is prevented by the S3 anchor instead
+  # (see runtime/anchor.go). Scan backs the boot gate's version-vector read.
+  statement {
+    sid = "DynamoDBKVStore"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+      "dynamodb:BatchGetItem",
+      "dynamodb:BatchWriteItem",
+      "dynamodb:TransactWriteItems",
+      "dynamodb:DescribeTable",
+    ]
+    resources = [aws_dynamodb_table.kv.arn]
+  }
+
   # SSM: read/write on secret + DEK ciphertext parameters. Paths are key-scoped
   # (/.../{secret}/Ciphertext/{kmsKeyId}) and created by the runtime at boot /
   # migration, so the wildcard covers every KMS key generation.
@@ -560,9 +616,9 @@ data "aws_iam_policy_document" "enclave" {
       "ssm:PutParameter",
     ]
     resources = concat(
-      [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${s.name}/Ciphertext/*"],
+      [for s in var.secrets : "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/${s.name}/Ciphertext/*"],
       [
-        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StorageDEK/Ciphertext/*",
+        "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/StorageDEK/Ciphertext/*",
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
         aws_ssm_parameter.migration_requested_at.arn,
@@ -576,6 +632,7 @@ data "aws_iam_policy_document" "enclave" {
     actions = ["ssm:GetParameter"]
     resources = [
       aws_ssm_parameter.storage_bucket_name.arn,
+      aws_ssm_parameter.anchor_bucket_name.arn,
       aws_ssm_parameter.pcr0_pubkey.arn,
       aws_ssm_parameter.pcr0_value.arn,
       aws_ssm_parameter.pcr0_signature.arn,
@@ -597,7 +654,7 @@ data "aws_iam_policy_document" "enclave" {
     sid     = "SSMKMSKeyID"
     actions = ["ssm:GetParameter", "ssm:PutParameter"]
     resources = [
-      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/KMSKeyID",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID",
     ]
   }
 
@@ -806,6 +863,89 @@ resource "aws_s3_bucket_policy" "storage_ssl" {
   })
 }
 
+# Freshness anchor bucket. Object Lock (compliance) makes each anchor immutable
+# even to account root; the enclave sets the per-object retain-until on PutObject.
+# Versioning is required for Object Lock.
+resource "aws_s3_bucket" "anchor" {
+  bucket_prefix       = "${local.prefix}-anchor-"
+  object_lock_enabled = true
+  force_destroy       = var.local
+}
+
+resource "aws_s3_bucket_versioning" "anchor" {
+  bucket = aws_s3_bucket.anchor.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "anchor" {
+  bucket = aws_s3_bucket.anchor.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_policy" "anchor_ssl" {
+  count  = var.local ? 0 : 1
+  bucket = aws_s3_bucket.anchor.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnforceSSL"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.anchor.arn,
+        "${aws_s3_bucket.anchor.arn}/*",
+      ]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+}
+
+# =============================================================================
+# DynamoDB — encrypted, versioned K/V store (RESP/Redis backend, issue #134)
+# =============================================================================
+
+# Composite key (pk hash + sk range): each logical key is a head item plus, for
+# large values, version-keyed chunk items. Values are AES-GCM-sealed by the
+# enclave before they land here (DynamoDB SSE is operator-readable). TTL on the
+# expires attribute reclaims expired items; point-in-time recovery is on.
+resource "aws_dynamodb_table" "kv" {
+  name         = "${local.prefix}-kv"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  # Allow tofu destroy to remove a non-empty table in local/test runs.
+  deletion_protection_enabled = var.local ? false : true
+}
+
 # =============================================================================
 # SSM
 # =============================================================================
@@ -855,17 +995,18 @@ resource "null_resource" "ciphertext_cleanup" {
     region       = var.region
     deployment   = var.deployment
     app_name     = var.app_name
+    lock_segment = local.lock_segment
     secret_names = jsonencode([for s in var.secrets : s.name])
   }
 
   provisioner "local-exec" {
     when    = destroy
     command = <<-EOT
-      REGION="${self.triggers.region}"; DEP="${self.triggers.deployment}"; APP="${self.triggers.app_name}"
+      REGION="${self.triggers.region}"; DEP="${self.triggers.deployment}"; APP="${self.triggers.app_name}"; LOCK="${self.triggers.lock_segment}"
       for S in $(echo '${self.triggers.secret_names}' | jq -r '.[]' 2>/dev/null); do
-        aws ssm delete-parameters-by-path --path "/$DEP/$APP/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+        aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/$S/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
       done
-      aws ssm delete-parameters-by-path --path "/$DEP/$APP/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
+      aws ssm delete-parameters-by-path --path "/$DEP/$APP/$LOCK/StorageDEK/Ciphertext" --recursive --region "$REGION" 2>/dev/null || true
     EOT
   }
 }
@@ -875,6 +1016,23 @@ resource "aws_ssm_parameter" "storage_bucket_name" {
   name      = "/${var.deployment}/${var.app_name}/StorageBucketName"
   type      = "String"
   value     = aws_s3_bucket.storage.id
+  overwrite = true
+}
+
+# The runtime discovers the K/V table here (kvTableNameParam); absent = disabled.
+resource "aws_ssm_parameter" "kv_table_name" {
+  name      = "/${var.deployment}/${var.app_name}/KVTableName"
+  type      = "String"
+  value     = aws_dynamodb_table.kv.name
+  overwrite = true
+}
+
+# The runtime discovers the freshness-anchor bucket here (anchorBucketParam);
+# absent = anchor disabled.
+resource "aws_ssm_parameter" "anchor_bucket_name" {
+  name      = "/${var.deployment}/${var.app_name}/AnchorBucketName"
+  type      = "String"
+  value     = aws_s3_bucket.anchor.id
   overwrite = true
 }
 
@@ -1160,6 +1318,7 @@ resource "aws_instance" "nitro" {
     eif_s3_url               = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     supervisor_binary_s3_url = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
     migration_cooldown       = var.migration_cooldown
+    is_kms_key_locked        = var.is_kms_key_locked
   })
 
   tags = {

@@ -19,6 +19,7 @@ type tofuVars struct {
 	Secrets           []SecretConfig `json:"secrets"`
 	MigrationCooldown string         `json:"migration_cooldown"`
 	ExpectedPCR0      string         `json:"expected_pcr0,omitempty"`
+	IsKMSKeyLocked    bool           `json:"is_kms_key_locked"`
 
 	// GitHub Release coordinates for build artifacts (EIF, supervisor).
 	GithubOwner string `json:"github_owner"`
@@ -71,6 +72,7 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 		Secrets:           cfg.Secrets,
 		MigrationCooldown: cfg.MigrationCooldown,
 		ExpectedPCR0:      readPCR0FromArtifacts(absRoot),
+		IsKMSKeyLocked:    cfg.IsKMSKeyLocked,
 
 		GithubOwner: cfg.App.NixOwner,
 		GithubRepo:  cfg.App.NixRepo,

@@ -291,12 +291,13 @@ provider "aws" {
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
   endpoints {
-    s3  = "http://127.0.0.1:4566"
-    ssm = "http://127.0.0.1:4566"
-    sts = "http://127.0.0.1:4566"
-    iam = "http://127.0.0.1:4566"
-    kms = "http://127.0.0.1:4566"
-    ec2 = "http://127.0.0.1:4566"
+    s3       = "http://127.0.0.1:4566"
+    ssm      = "http://127.0.0.1:4566"
+    sts      = "http://127.0.0.1:4566"
+    iam      = "http://127.0.0.1:4566"
+    kms      = "http://127.0.0.1:4566"
+    ec2      = "http://127.0.0.1:4566"
+    dynamodb = "http://127.0.0.1:4566"
   }
 }
 OVERRIDE
@@ -510,7 +511,7 @@ tofu_destroy
 
 tofu_apply
 
-# tofu leaves SSM /dev/my-app/KMSKeyID = "UNSET"; the enclave's EnsureKeyID
+# tofu leaves SSM /dev/my-app/unlocked/KMSKeyID = "UNSET"; the enclave's EnsureKeyID
 # calls CreateKey on the first boot, registers the new ID, and locks the
 # policy to its own PCR0 at creation time.
 
@@ -605,7 +606,7 @@ echo ""
 # The enclave's selfApplyKMSPolicy() runs at boot and calls PutKeyPolicy on
 # the local-kms mock (port 4000). After boot, the policy should carry the
 # fourth statement granting AWS account root the recovery action set.
-KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" \
+KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/unlocked/KMSKeyID" \
   --endpoint-url "http://127.0.0.1:4566" --region us-east-1 \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
 if [ -n "$KMS_KEY_ID" ]; then
@@ -965,15 +966,6 @@ else
   exit 1
 fi
 
-# Verify dynamic secrets API works after restart.
-DYN_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secrets" 2>/dev/null || echo "")
-if echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secrets round-trip works after restart"
-else
-  echo "  FAIL: Dynamic secrets broken after restart: ${DYN_RESP:0:120}" >&2
-  exit 1
-fi
-
 # Verify attestation pubkey + PCR16 survived migration (written in integration test 15).
 # GET /test/attestation-persistence re-derives current values and compares to stored.
 # 200+ok=true → SIGNING_KEY intact and derivation matches. 404 → storage lost. 500 → mismatch.
@@ -983,16 +975,6 @@ if echo "$ATTEST_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
 else
   echo "  FAIL: Attestation data lost or changed during migration!" >&2
   echo "$ATTEST_PERSIST_RESP" | jq . >&2
-  exit 1
-fi
-
-# Verify dynamic secret created before migration survived restart (written in integration test 14).
-# GET /test/dynamic-secret-persistence reads the known secret and compares value byte-for-byte.
-DYN_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secret survived migration+restart"
-else
-  echo "  FAIL: Dynamic secret lost or corrupted during migration: ${DYN_PERSIST_RESP:0:200}" >&2
   exit 1
 fi
 
@@ -1021,19 +1003,19 @@ fi
 # After a migration, KMSKeyID names the new key and the secret's ciphertext
 # lives at the key-scoped path under it (flipping KMSKeyID is the atomic commit).
 NEW_KEY=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/KMSKeyID" \
+  --name "/dev/my-app/unlocked/KMSKeyID" \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
 if [ -z "$NEW_KEY" ] || [ "$NEW_KEY" = "UNSET" ]; then
   echo "  FAIL: KMSKeyID empty after migration" >&2
   exit 1
 fi
 NEW_CT=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/signing_key/Ciphertext/$NEW_KEY" \
+  --name "/dev/my-app/unlocked/signing_key/Ciphertext/$NEW_KEY" \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
 if [ -n "$NEW_CT" ] && [ "$NEW_CT" != "UNSET" ]; then
   echo "  PASS: signing_key ciphertext present under new key (key-scoped commit)"
 else
-  echo "  FAIL: /dev/my-app/signing_key/Ciphertext/$NEW_KEY missing after migration" >&2
+  echo "  FAIL: /dev/my-app/unlocked/signing_key/Ciphertext/$NEW_KEY missing after migration" >&2
   exit 1
 fi
 
@@ -1105,7 +1087,7 @@ echo ""
 
 
 # Step 9: rollback — v3 is baked with a wrong app name, so its Init fails
-# (GetKeyID 404 at /dev/my-app-wrong/KMSKeyID) → /health stays 503 → the
+# (GetKeyID 404 at /dev/my-app-wrong/unlocked/KMSKeyID) → /health stays 503 → the
 # supervisor's awaitEnclaveReady times out → rollbackMigration restores v2.
 echo ""
 echo "=== [9/10] Rollback test: v3 Init fails on wrong app name ==="
@@ -1262,11 +1244,11 @@ echo "=== [11/11] Recovery rehearsal: root rewrites policy with new PCR0 ==="
 # is the load-bearing operation of the lockout-recovery story: rebuild an
 # EIF, root pivots the lock to its PCR0, the new attested enclave decrypts.
 
-RECOVERY_KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" \
+RECOVERY_KMS_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/unlocked/KMSKeyID" \
   --endpoint-url "http://127.0.0.1:4566" --region us-east-1 \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
 if [ -z "$RECOVERY_KMS_KEY_ID" ]; then
-  echo "  FAIL: could not read /dev/my-app/KMSKeyID from SSM" >&2
+  echo "  FAIL: could not read /dev/my-app/unlocked/KMSKeyID from SSM" >&2
   exit 1
 fi
 
@@ -1284,7 +1266,7 @@ fi
 # is structurally valid. The original RootRecovery statement stays, so a
 # subsequent recovery call would still be possible.
 NEW_PCR0=$(printf 'cafe%.0s' {1..24})  # 96 hex chars
-ENCLAVE_PRINCIPAL=$(echo "$CURRENT_POLICY" | jq -r '.Statement[] | select(.Sid=="EnclaveDecryptWithAttestation") | .Principal.AWS')
+ENCLAVE_PRINCIPAL=$(echo "$CURRENT_POLICY" | jq -r '.Statement[] | select(.Sid=="EnclaveAttestedOperations") | .Principal.AWS')
 if [ -z "$ENCLAVE_PRINCIPAL" ] || [ "$ENCLAVE_PRINCIPAL" = "null" ]; then
   echo "  FAIL: could not extract enclave Principal from policy" >&2
   exit 1

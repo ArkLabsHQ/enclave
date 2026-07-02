@@ -193,9 +193,7 @@ func TestParseOTLPMetrics_Gauge(t *testing.T) {
 
 func TestParseOTLPMetrics_InvalidProtobuf(t *testing.T) {
 	_, err := parseOTLPMetrics([]byte("bad data"))
-	if err == nil {
-		t.Fatal("expected error")
-	}
+	requireErrContains(t, err, "unmarshal OTLP metrics")
 }
 
 // --- HTTP handler tests ---

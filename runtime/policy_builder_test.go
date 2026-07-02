@@ -79,6 +79,20 @@ func TestBuildKMSPolicy_AllowsDecryptEncryptDelete(t *testing.T) {
 	}
 }
 
+// TestBuildKMSPolicy_GenerateDataKeyAttestationGated verifies GenerateDataKey is
+// gated on the attestation condition (next to Decrypt) and is NOT in the ungated
+// EnclaveOperations statement — so only an attested enclave can mint, while
+// Encrypt stays ungated for migration re-wrap.
+func TestBuildKMSPolicy_GenerateDataKeyAttestationGated(t *testing.T) {
+	policy := NewKMSPolicyBuilder().ForRole("arn:aws:iam::123:role/ec2").LockedToPCR0Values([]string{strings.Repeat("a", 96)}).Build()
+	if !strings.Contains(policy, `["kms:Decrypt", "kms:GenerateDataKey"]`) {
+		t.Fatalf("GenerateDataKey must be gated alongside Decrypt, got:\n%s", policy)
+	}
+	if !strings.Contains(policy, `["kms:Encrypt", "kms:GetKeyPolicy"]`) {
+		t.Fatalf("ungated EnclaveOperations must be Encrypt + GetKeyPolicy only, got:\n%s", policy)
+	}
+}
+
 // TestBuildKMSPolicy_NoRecovery verifies that an empty recoveryAccount
 // produces the historical 3-statement policy with no RootRecovery Sid.
 func TestBuildKMSPolicy_NoRecovery(t *testing.T) {

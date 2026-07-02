@@ -32,7 +32,7 @@ func TestACMEStorageCache_StorageUnavailable(t *testing.T) {
 		storage func() *Storage
 	}{
 		{"nil storage", func() *Storage { return nil }},
-		{"storage without DEK", func() *Storage { return NewStorage(nil, nil, nil) }},
+		{"storage without DEK", func() *Storage { return NewStorage(nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &acmeStorageCache{ready: closedReadyChan(), storage: tc.storage}

@@ -95,13 +95,14 @@ type ScalingEntity struct {
 	leaderURL      string // follower: leader handshake base URL (e.g. https://host:443)
 	leader         *sdk.Leader
 	follower       *sdk.Follower
-	signingSecrets []StaticSecrets // signing secrets to derive shares for
+	signingSecrets []StaticSecrets                                             // signing secrets to derive shares for
+	onShare        func(ctx context.Context, label string, share []byte) error // onShare persists+materializes a share delivered by a reshare ceremony.
 }
 
 func newScalingEntity() (*ScalingEntity, error) {
-	role := os.Getenv("ENCLAVE_THRESHOLD_ROLE")
+	role := os.Getenv("ENCLAVE_SCALING_ROLE")
 	if role != scalingRoleFollower && role != scalingRoleLeader {
-		return nil, fmt.Errorf("invalid ENCLAVE_THRESHOLD_ROLE %q, want %q or %q", role, scalingRoleLeader, scalingRoleFollower)
+		return nil, fmt.Errorf("invalid ENCLAVE_SCALING_ROLE %q, want %q or %q", role, scalingRoleLeader, scalingRoleFollower)
 	}
 
 	e := &ScalingEntity{
@@ -165,6 +166,11 @@ func (a *ScalingEntity) IsLeader() bool {
 	return a.role == scalingRoleLeader
 }
 
+// SetShareHandler wires the sink for reshared follower shares.
+func (a *ScalingEntity) SetShareHandler(fn func(ctx context.Context, label string, share []byte) error) {
+	a.onShare = fn
+}
+
 func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
 	hostSk, err := a.loadOrGenerateHostKey(ctx)
 	if err != nil {
@@ -208,19 +214,25 @@ func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey
 		}
 	}()
 
+	// The leader is a full participant, so each ceremony hands it its own share
+	go func() {
+		for out := range leader.Keys() {
+			a.handleShare(scalingRoleLeader, out.Label, out.Secshare)
+		}
+	}()
+
 	a.leader = leader
 
 	return nil
 }
 
 func (a *ScalingEntity) DeriveFollowerKey(ctx context.Context, StaticSecret StaticSecret) error {
-	// TODO (Joshua) Fix: Ask For Reshare
-	// err := a.follower.RequestReshare(ctx, StaticSecret.EnvVar)
-	// if err != nil {
-	// 	return fmt.Errorf("request reshare: %w", err)
-	// }
+	err := a.follower.RequestReshare(ctx, StaticSecret.EnvVar)
+	if err != nil {
+		return fmt.Errorf("request reshare: %w", err)
+	}
 
-	return fmt.Errorf("request reshare not implemented yet")
+	return nil
 
 }
 
@@ -256,26 +268,30 @@ func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateK
 		}
 	}()
 
-	// Drain derived shares as they arrive from reshare ceremonies.
 	go func() {
-		// TODO (Joshua): Share Name should be included in the reshare message so we can map it to the correct StaticSecret.EnvVar
-		tempShareName := "TEMP_SHARE_NAME"
 		for out := range follower.Keys() {
-			if len(out.Secshare) == 0 {
-				slog.Warn("threshold follower received empty share", "envvar", tempShareName)
-				continue
-			}
-			if err := safeSetenv(tempShareName, hex.EncodeToString(out.Secshare)); err != nil {
-				slog.Warn("threshold follower failed to set share envvar", "envvar", tempShareName, "error", err)
-				continue
-			}
-
+			a.handleShare(scalingRoleFollower, out.Label, out.Secshare)
 		}
-		// TODO (Joshua): Store the ciphertext of secrets
 	}()
 
 	a.follower = follower
 	return nil
+}
+
+// handleShare feeds one (re-)DKG output to the wired handler, which persists the
+// share and sets its env var.
+func (a *ScalingEntity) handleShare(role, label string, share []byte) {
+	if len(share) == 0 {
+		slog.Warn("threshold "+role+" received empty share", "envvar", label)
+		return
+	}
+	if a.onShare == nil {
+		slog.Error("threshold "+role+" received share with no handler wired; not persisted", "envvar", label)
+		return
+	}
+	if err := a.onShare(context.Background(), label, share); err != nil {
+		slog.Warn("threshold "+role+" failed to store share", "envvar", label, "error", err)
+	}
 }
 
 // RegisterRoutes attaches the leader-side handshake endpoints. Called only on a

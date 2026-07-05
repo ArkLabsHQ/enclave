@@ -126,19 +126,19 @@ type Runtime struct {
 	keyMaterial any                // arbitrary peer-syncable state
 
 	// Subsystems — built in Init, registered via RegisterRoutes.
-	aws            *AWSClient
-	metrics        *Metrics
-	tracing        *Tracing
-	logging        *Logging
-	attestation    *Attestation
-	kms            *KMS
-	staticSecrets  *StaticSecrets
-	dynamic        *DynamicSecrets
-	storage        *Storage
-	migrator       *Migrator
-	environment    *Environment
-	scalingEntity  *ScalingEntity
-	signature      *Signature
+	aws           *AWSClient
+	metrics       *Metrics
+	tracing       *Tracing
+	logging       *Logging
+	attestation   *Attestation
+	kms           *KMS
+	staticSecrets *StaticSecrets
+	dynamic       *DynamicSecrets
+	storage       *Storage
+	migrator      *Migrator
+	environment   *Environment
+	scalingEntity *ScalingEntity
+	signature     *Signature
 }
 
 // New returns a Runtime safe to use for serving management endpoints.
@@ -168,8 +168,16 @@ func New(cfg *Config) (*Runtime, error) {
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
 	r.tracing = NewTracing(enclaveMetrics, nil, r.checkRuntimeToken)
-	// The threshold subsystem is built here (reads role/addressing from env) so a
-	// leader's admission routes can mount on pubSrv; Storage is attached in Init.
+	// Build the scaling subsystem here — it only reads role/addressing from env — so a
+	// leader's admission routes mount on pubSrv in configureHTTPServers below. Its
+	// AWS-backed bring-up (KMS, share handler, relay) happens later in Init.
+	if os.Getenv("ENCLAVE_SCALING_ROLE") != "" {
+		scalingEntity, err := newScalingEntity()
+		if err != nil {
+			return nil, fmt.Errorf("init scaling entity: %w", err)
+		}
+		r.scalingEntity = scalingEntity
+	}
 	if cfg != nil {
 		if err := r.configureHTTPServers(); err != nil {
 			return nil, fmt.Errorf("configure HTTP servers: %w", err)
@@ -224,30 +232,19 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
 
-	// Decide If Scaling is enabled and if this node
-	if os.Getenv("ENCLAVE_THRESHOLD_ROLE") != "" {
-		scalingEntity, err := newScalingEntity()
-		if err != nil {
-			slog.Error("init scaling entity", "error", err)
-			return fmt.Errorf("init scaling entity: %w", err)
-		}
-
-		err = scalingEntity.Init(ctx, e.storage)
-		if err != nil {
-			slog.Error("init scaling entity", "error", err)
-			return fmt.Errorf("init scaling entity: %w", err)
-		}
-
-		e.scalingEntity = scalingEntity
-
-	}
-
 	staticSecrets, err := NewStaticSecrets(e.kms, e.scalingEntity)
 	if err != nil {
 		slog.Error("load static secrets config", "error", err)
 		return fmt.Errorf("load static secrets config: %w", err)
 	}
 	e.staticSecrets = staticSecrets
+
+	// The scaling entity was constructed in New (so its routes could mount); wire its
+	// AWS-backed deps now — KMS, and the share handler before Init starts the drains.
+	if e.scalingEntity != nil {
+		e.scalingEntity.kms = e.kms
+		e.scalingEntity.SetShareHandler(staticSecrets.StoreDerivedSecret)
+	}
 
 	if err := e.attestation.Init(); err != nil {
 		slog.Error("init attestation", "error", err)
@@ -271,6 +268,13 @@ func (e *Runtime) Init(ctx context.Context) error {
 	if err := e.migrator.VerifyPredecessorCommitment(ctx, getPCR0()); err != nil {
 		slog.Error("verify predecessor PCR31 commitment", "error", err)
 		return fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
+	}
+
+	if e.scalingEntity != nil {
+		if err := e.scalingEntity.Init(ctx, e.storage); err != nil {
+			slog.Error("init scaling entity", "error", err)
+			return fmt.Errorf("init scaling entity: %w", err)
+		}
 	}
 
 	if err := e.staticSecrets.LoadAll(ctx, keyID); err != nil {
@@ -534,7 +538,6 @@ func (e *Runtime) configureHTTPServers() error {
 	return nil
 }
 
-
 // protocolSwitchTransport forwards each proxied request to the user app over
 // the same HTTP version the client used — h2c for HTTP/2 inbound, HTTP/1.1 for
 // HTTP/1.1 — via the inbound ProtoMajor that ReverseProxy preserves on RoundTrip.
@@ -612,11 +615,10 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 	pm.Get(pathRoot, rootHandler(e.cfg))
 	pm.Get(pathConfig, configHandler(e.cfg))
 
-	// Leader-only scaling relay, followers use.
-	if e.scalingEntity != nil { 
+	// Leader-only admission handshake endpoints; a follower never serves these.
+	if e.scalingEntity != nil && e.scalingEntity.IsLeader() {
 		e.scalingEntity.RegisterRoutes(pm.Get, pm.Post)
 	}
-	
 
 	pm.Handle("/v1/*", corsWildcard(admin))
 	pm.Handle("/health", admin)

@@ -28,10 +28,14 @@ import (
 // StaticSecret defines a secret managed by KMS inside the enclave runtime
 // (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
 // into the configured env var, which the child app inherits via os.Environ().
+//
+// ShareEnvVar is leader-only if share is being used: the leader keeps the master in EnvVar and its own share
+// alongside it in ShareEnvVar. It is empty for followers and non-threshold secrets.
 type StaticSecret struct {
-	Name   string `json:"name"`
-	EnvVar string `json:"env_var"`
-	Kind   string `json:"kind,omitempty"`
+	Name        string `json:"name"`
+	EnvVar      string `json:"env_var"`
+	ShareEnvVar string `json:"share_env_var,omitempty"`
+	Kind        string `json:"kind,omitempty"`
 }
 
 // IsThreshold reports whether the secret is threshold-shared (kind "signing").
@@ -147,6 +151,9 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 	}
 
 	if ciphertextB64 != "" {
+		if secret.IsSigning() {
+			return s.loadSharedSecret(ctx, keyID, ciphertextB64, secret)
+		}
 		return s.decryptExisting(ctx, keyID, ciphertextB64, secret.EnvVar)
 	}
 
@@ -155,15 +162,17 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 			return fmt.Errorf("derive follower key: %w", err)
 		}
 
-		// await the env var to be set by the scaling subsystem (via RequestReshare)
-		ctx, cancel := context.WithTimeout(ctx, followerReshareKeyTimeout)
+		// Await the share: the reshare ceremony delivers it asynchronously on the
+		// follower's Keys() channel, and StoreDerivedSecret persists it and sets the
+		// env var. We only wait for that to happen here.
+		waitCtx, cancel := context.WithTimeout(ctx, followerReshareKeyTimeout)
 		defer cancel()
 		for {
 			if strings.TrimSpace(os.Getenv(secret.EnvVar)) != "" {
 				return nil
 			}
 			select {
-			case <-ctx.Done():
+			case <-waitCtx.Done():
 				return fmt.Errorf("timeout waiting for follower key to be set in env var %s", secret.EnvVar)
 			case <-time.After(100 * time.Millisecond):
 			}
@@ -176,36 +185,90 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 		return err
 	}
 
-	ciphertextB64 = base64.StdEncoding.EncodeToString(ciphertextBlob)
-
-	if err := s.kms.StoreCiphertext(ctx, paramName, ciphertextB64); err != nil {
-		return err
+	// A leader signing secret mints its master (a0) into an envelope
+	if secret.IsSigning() {
+		return s.storeSharedSecret(ctx, keyID, secret, sharedSecret{Master: hex.EncodeToString(plaintext)})
 	}
 
-	secretHex := hex.EncodeToString(plaintext)
-	if err := safeSetenv(secret.EnvVar, secretHex); err != nil {
+	if err := s.kms.StoreCiphertext(ctx, paramName, base64.StdEncoding.EncodeToString(ciphertextBlob)); err != nil {
+		return err
+	}
+	if err := safeSetenv(secret.EnvVar, hex.EncodeToString(plaintext)); err != nil {
 		return fmt.Errorf("set %s: %w", secret.EnvVar, err)
 	}
 
 	return nil
 }
 
-// decryptExisting decrypts the ciphertext from SSM using KMS with attestation.
+// StoreDerivedSecret is the sink for a share from a (re-)DKG ceremony, called from
+// both roles' Keys()-drain goroutines. It bundles the share into the secret's
+// envelope and persists it, so a later boot skips the ceremony. label is the
+// secret's EnvVar.
+func (s *StaticSecrets) StoreDerivedSecret(ctx context.Context, label string, share []byte) error {
+	secret, ok := s.secretByEnvVar(label)
+	if !ok {
+		return fmt.Errorf("no configured secret for reshare label %q", label)
+	}
+	keyID, err := s.kms.GetKeyID(ctx)
+	if err != nil {
+		return fmt.Errorf("get kms key id: %w", err)
+	}
+
+	env := sharedSecret{Share: hex.EncodeToString(share)}
+	if s.scaling != nil && s.scaling.IsLeader() {
+		if secret.ShareEnvVar == "" {
+			return fmt.Errorf("signing secret %q needs share_env_var on a leader", secret.Name)
+		}
+		// Preserve the master already loaded in EnvVar so persisting the share does not drop it.
+		master := strings.TrimSpace(os.Getenv(secret.EnvVar))
+		if master == "" {
+			return fmt.Errorf("leader master secret %q not loaded before its share", secret.Name)
+		}
+		env.Master = master
+	}
+	return s.storeSharedSecret(ctx, keyID, secret, env)
+}
+
+// secretByEnvVar resolves a configured secret by its env var (the reshare label).
+func (s *StaticSecrets) secretByEnvVar(envVar string) (StaticSecret, bool) {
+	for _, sec := range s.secrets {
+		if sec.EnvVar == envVar {
+			return sec, true
+		}
+	}
+	return StaticSecret{}, false
+}
+
+// decryptExisting decrypts a raw (non-signing) secret's ciphertext and sets its env
+// var. Signing secrets use the sharedSecret envelope instead (loadSharedSecret).
 func (s *StaticSecrets) decryptExisting(ctx context.Context, keyID, ciphertextB64, envVar string) error {
+	plaintext, err := s.decryptCiphertext(ctx, keyID, ciphertextB64)
+	if err != nil {
+		return err
+	}
+	if err := safeSetenv(envVar, normalizeSecretHex(plaintext)); err != nil {
+		return fmt.Errorf("set %s: %w", envVar, err)
+	}
+	return nil
+}
+
+// decryptCiphertext KMS-decrypts a base64 ciphertext to its raw plaintext, carrying
+// a fresh NSM attestation as Recipient so the PCR0-gated key policy admits the call.
+func (s *StaticSecrets) decryptCiphertext(ctx context.Context, keyID, ciphertextB64 string) ([]byte, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
 	if err != nil {
-		return fmt.Errorf("decode ciphertext: %w", err)
+		return nil, fmt.Errorf("decode ciphertext: %w", err)
 	}
 
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
-		return fmt.Errorf("open nsm session: %w", err)
+		return nil, fmt.Errorf("open nsm session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
 	attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	input := &kms.DecryptInput{
@@ -219,25 +282,82 @@ func (s *StaticSecrets) decryptExisting(ctx context.Context, keyID, ciphertextB6
 
 	out, err := s.kms.aws.KMS.Decrypt(ctx, input)
 	if err != nil {
-		return fmt.Errorf("kms decrypt: %w", err)
+		return nil, fmt.Errorf("kms decrypt: %w", err)
 	}
 
 	if len(out.CiphertextForRecipient) == 0 {
-		return fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
+		return nil, fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
 	}
 
 	plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
 	if err != nil {
-		return fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+		return nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
 	}
+	return plaintext, nil
+}
 
-	secretHex := normalizeSecretHex(plaintext)
+// sharedSecret is the plaintext of a "signing" secret's ciphertext: the master seed
+// (a0) and this node's threshold share, bundled under one SSM slot so both are read  and written atomically
+type sharedSecret struct {
+	Master string `json:"master,omitempty"` // hex; the a0/full secret (leader only)
+	Share  string `json:"share,omitempty"`  // hex; this node's threshold share
+}
 
-	if err := safeSetenv(envVar, secretHex); err != nil {
-		return fmt.Errorf("set %s: %w", envVar, err)
+// applySharedSecret materializes a decrypted envelope into env vars. A leader keeps
+// the master in EnvVar and its share in ShareEnvVar; a follower has no master, so its
+// share is the material it signs with and goes to EnvVar.
+func applySharedSecret(secret StaticSecret, env sharedSecret) error {
+	if env.Master != "" {
+		if err := safeSetenv(secret.EnvVar, env.Master); err != nil {
+			return fmt.Errorf("set %s: %w", secret.EnvVar, err)
+		}
+		if env.Share != "" {
+			if secret.ShareEnvVar == "" {
+				return fmt.Errorf("signing secret %q needs share_env_var on a leader", secret.Name)
+			}
+			if err := safeSetenv(secret.ShareEnvVar, env.Share); err != nil {
+				return fmt.Errorf("set %s: %w", secret.ShareEnvVar, err)
+			}
+		}
+		return nil
 	}
+	if env.Share != "" {
+		if err := safeSetenv(secret.EnvVar, env.Share); err != nil {
+			return fmt.Errorf("set %s: %w", secret.EnvVar, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("shared secret %q has neither master nor share", secret.Name)
+}
 
-	return nil
+// loadSharedSecret decrypts a signing secret's envelope and applies it to env vars.
+func (s *StaticSecrets) loadSharedSecret(ctx context.Context, keyID, ciphertextB64 string, secret StaticSecret) error {
+	plaintext, err := s.decryptCiphertext(ctx, keyID, ciphertextB64)
+	if err != nil {
+		return err
+	}
+	var env sharedSecret
+	if err := json.Unmarshal(plaintext, &env); err != nil {
+		return fmt.Errorf("parse shared secret %q: %w", secret.Name, err)
+	}
+	return applySharedSecret(secret, env)
+}
+
+// storeSharedSecret encrypts a signing secret's envelope, persists it to the single
+// key-scoped slot, and materializes it into env vars.
+func (s *StaticSecrets) storeSharedSecret(ctx context.Context, keyID string, secret StaticSecret, env sharedSecret) error {
+	plaintext, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	ciphertextB64, err := s.kms.Encrypt(ctx, keyID, plaintext)
+	if err != nil {
+		return err
+	}
+	if err := s.kms.StoreCiphertext(ctx, secretCiphertextParam(secret.Name, keyID), ciphertextB64); err != nil {
+		return err
+	}
+	return applySharedSecret(secret, env)
 }
 
 // ExtendPCRs derives the secp256k1 compressed public key for each secret

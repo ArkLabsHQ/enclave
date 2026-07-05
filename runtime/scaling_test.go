@@ -5,71 +5,72 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"testing"
-
-	sdk "thresholdsdk"
 )
 
 func TestScalingRoleParsing(t *testing.T) {
-	t.Setenv("ENCLAVE_THRESHOLD_ROLE", "")
-	if ts := NewSigningSecrets(nil); !ts.IsLeader() {
-		t.Errorf("empty role should default to leader")
+	// An unset or invalid role is rejected.
+	t.Setenv("ENCLAVE_SCALING_ROLE", "")
+	if _, err := newScalingEntity(); err == nil {
+		t.Errorf("empty role should be rejected")
 	}
 
-	t.Setenv("ENCLAVE_THRESHOLD_ROLE", "follower")
-	ts := NewSigningSecrets(nil)
-	if ts.IsLeader() {
-		t.Errorf("role=follower should not be leader")
-	}
-	if ts.Admission() != nil {
-		t.Errorf("a follower must not expose an admission responder")
-	}
-
-	t.Setenv("ENCLAVE_THRESHOLD_ROLE", "leader")
-	ts = NewSigningSecrets(nil)
-	if ts.Admission() == nil {
-		t.Errorf("a leader must expose an admission responder")
-	}
-}
-
-func TestThresholdAddressingDefaults(t *testing.T) {
+	// Leader.
 	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	t.Setenv("ENCLAVE_SCALING_LISTEN_ADDR", "")
-	t.Setenv("ENCLAVE_SCALING_RELAY_ADDR", "")
-	ts := NewSigningSecrets(nil)
-	if ts.listenAddr != defaultRelayListenAddr {
-		t.Errorf("listenAddr = %q, want default %q", ts.listenAddr, defaultRelayListenAddr)
+	leader, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("leader: %v", err)
 	}
-	if ts.relayAddr != defaultRelayListenAddr {
-		t.Errorf("relayAddr should fall back to listenAddr, got %q", ts.relayAddr)
+	if !leader.IsLeader() {
+		t.Errorf("role=leader should be a leader")
+	}
+
+	// A follower requires a leader address.
+	t.Setenv("ENCLAVE_SCALING_ROLE", "follower")
+	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "")
+	if _, err := newScalingEntity(); err == nil {
+		t.Errorf("follower without ENCLAVE_SCALING_LEADER_ADDR should error")
+	}
+	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "https://leader:443")
+	follower, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("follower: %v", err)
+	}
+	if follower.IsLeader() {
+		t.Errorf("role=follower should not be a leader")
 	}
 }
 
-func TestGroupPubkeyEnvVar(t *testing.T) {
-	if got := groupPubkeyEnvVar("SIGNING_KEY"); got != "SIGNING_KEY_GROUP_PUBKEY" {
-		t.Errorf("groupPubkeyEnvVar = %q", got)
+func TestScalingListenPortDefault(t *testing.T) {
+	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
+	t.Setenv("ENCLAVE_SCALING_LISTEN_PORT", "")
+	ts, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("newScalingEntity: %v", err)
+	}
+	if ts.listenPort != defaultRelayPort {
+		t.Errorf("listenPort = %q, want default %q", ts.listenPort, defaultRelayPort)
 	}
 }
 
 func TestThresholdStoreLeaderSecret(t *testing.T) {
-	secret := []byte("this-is-a-32-byte-leader-secret!")
-	s := newThresholdStore(nil, secret)
-	got, err := s.GetLeaderSecret()
+	s := newThresholdStore(nil)
+	t.Setenv("SIGNING_KEY", "0a0b0c")
+	got, err := s.GetLeaderSecret("SIGNING_KEY")
 	if err != nil {
 		t.Fatalf("GetLeaderSecret: %v", err)
 	}
-	if string(got) != string(secret) {
-		t.Errorf("GetLeaderSecret returned wrong bytes")
+	if string(got) != string([]byte{0x0a, 0x0b, 0x0c}) {
+		t.Errorf("a0 = %x, want 0a0b0c", got)
 	}
 
-	// A follower store carries no leader secret.
-	empty := newThresholdStore(nil, nil)
-	if _, err := empty.GetLeaderSecret(); err != sdk.ErrNotFound {
-		t.Errorf("empty leader secret should return ErrNotFound, got %v", err)
+	t.Setenv("SIGNING_KEY", "")
+	if _, err := s.GetLeaderSecret("SIGNING_KEY"); err == nil {
+		t.Error("expected error when the master env var is empty")
 	}
 }
 
 func TestThresholdStoreRecoveryKey(t *testing.T) {
-	s := newThresholdStore(nil, nil)
+	s := newThresholdStore(nil)
 	key := s.recoveryKey([]byte{0xab, 0xcd})
 	if key != thresholdRecoveryPrefix+"abcd" {
 		t.Errorf("recoveryKey = %q", key)
@@ -77,7 +78,11 @@ func TestThresholdStoreRecoveryKey(t *testing.T) {
 }
 
 func TestAdmissionNonceOneShotAndExpiry(t *testing.T) {
-	a := newScalingEntity()
+	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
+	a, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("newScalingEntity: %v", err)
+	}
 
 	b64, err := a.issueNonce()
 	if err != nil {
@@ -102,7 +107,11 @@ func TestAdmissionNonceOneShotAndExpiry(t *testing.T) {
 }
 
 func TestAdmissionAuthorizeGate(t *testing.T) {
-	a := newScalingEntity()
+	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
+	a, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("newScalingEntity: %v", err)
+	}
 	hostpub := []byte{0x02, 0x01, 0x02, 0x03}
 
 	if a.IsAuthorized(hostpub) {
@@ -128,13 +137,13 @@ func TestAdmitDataRoundTrip(t *testing.T) {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
 
-	resp := admitResponseData{LeaderPub: []byte{0x03, 0xbb}, RelayAddr: "10.0.0.5:9000"}
+	resp := admitResponseData{LeaderPub: []byte{0x03, 0xbb}, RelayPort: "9000"}
 	b, _ = json.Marshal(resp)
 	var gotResp admitResponseData
 	if err := json.Unmarshal(b, &gotResp); err != nil {
 		t.Fatal(err)
 	}
-	if gotResp.RelayAddr != "10.0.0.5:9000" || hex.EncodeToString(gotResp.LeaderPub) != "03bb" {
+	if gotResp.RelayPort != "9000" || hex.EncodeToString(gotResp.LeaderPub) != "03bb" {
 		t.Errorf("resp round-trip mismatch: %+v", gotResp)
 	}
 }

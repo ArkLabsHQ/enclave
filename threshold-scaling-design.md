@@ -75,7 +75,7 @@ Surface the field in the `cli/init.go` template and `cli/tofu.go`.
   with the **group pubkey** (fleet-identical), not the per-node share/secret.
 
 ### 3. Role wiring — new `runtime/threshold_secret.go`
-- role via env `ENCLAVE_THRESHOLD_ROLE` (leader|follower); the leader's relay
+- role via env `ENCLAVE_SCALING_ROLE` (leader|follower); the leader's relay
   address is discovered via the supervisor-brokered channel (part 7), **not** a
   hardcoded env. The joiner does **not** need a pre-shared leader pubkey — it
   pins the leader's threshold host pubkey during the attested handshake (part 5).
@@ -135,7 +135,7 @@ vsock/TCP — `runtime.go:574-621`), because peers reach each other over the
 network; the internal server is loopback-only (`127.0.0.1:IntPort`) and
 unreachable by peers. Add two threshold-admission endpoints there (separate from
 the generic `/enclave/state` keysync so semantics stay clean), enabled only when
-`ENCLAVE_THRESHOLD_ROLE=leader`:
+`ENCLAVE_SCALING_ROLE=leader`:
 - `GET /enclave/threshold/nonce` → fresh nonce (existing `keysync_shared` nonce).
 - `POST /enclave/threshold/admit` → verify the joiner's attestation
   (`nitrite.Verify` + `arePCRsIdentical` vs our PCRs), extract the joiner's
@@ -197,7 +197,7 @@ current master), distinct from the app LB that fronts client traffic.
   within the same SG across the VPC — open the relay + handshake ports on it.
 
 **Leader identity.** The master is a **designated** role
-(`ENCLAVE_THRESHOLD_ROLE=leader`), not elected — its supervisor publishes the
+(`ENCLAVE_SCALING_ROLE=leader`), not elected — its supervisor publishes the
 channel; joiners consume it. Dynamic election / failover (first-boot-wins via SSM
 or the deployed DynamoDB KV table + heartbeat, updating `Threshold/Leader`) is
 the documented upgrade path, out of scope this pass.

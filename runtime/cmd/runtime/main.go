@@ -2,14 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
-	"time"
 
 	runtime "github.com/ArkLabsHQ/introspector-enclave/runtime"
 	// Imported for its init() — seeds /dev/random from /dev/nsm before main()
@@ -18,128 +14,22 @@ import (
 )
 
 func main() {
-	cfg, err := runtime.BuildNitridingConfig()
+	cfg, err := runtime.LoadConfig()
 	if err != nil {
-		slog.Error("build runtime config", "error", err)
+		slog.Error("load runtime config", "error", err)
 		os.Exit(1)
 	}
 
-	enc, err := runtime.New(cfg)
-	if err != nil {
-		slog.Error("runtime.New", "error", err)
+	if cfg == nil {
+		slog.Error("load runtime config", "error", "nil config")
 		os.Exit(1)
 	}
 
-	slog.SetDefault(slog.New(
-		runtime.NewBufferHandler(enc.Logging()),
-	))
-	runtime.InitMetrics()
-	tracing := enc.Tracing()
-
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	defer func() { _ = tracing.Shutdown(ctx) }()
 
-	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
-		slog.Debug("write /etc/resolv.conf", "error", err)
-	}
-
-	// IMDS forwarder must be up before Start: certcache and metrics dial IMDS.
-	if err := runtime.StartViproxy(); err != nil {
-		slog.Error("viproxy start failed", "error", err)
+	if err := runtime.Run(ctx, *cfg); err != nil {
+		slog.Error("runtime failed", "error", err)
 		os.Exit(1)
 	}
-
-	enc.UseMiddleware(enc.Middleware)
-	enc.UseMiddleware(runtime.LoggingMiddleware)
-
-	if err := enc.Start(); err != nil {
-		slog.Error("runtime.Start", "error", err)
-		os.Exit(1)
-	}
-	defer func() { _ = enc.Stop() }()
-	enc.SetAttestationRegistrar(enc)
-
-	initCtx := ctx
-	if t := envOr("ENCLAVE_INIT_TIMEOUT", ""); t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			var cancel context.CancelFunc
-			initCtx, cancel = context.WithTimeout(ctx, d)
-			defer cancel()
-			slog.Info("init timeout configured", "timeout", d.String())
-		}
-	}
-
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
-	slog.Info("supervisor started", "app_port", appPort, "version", runtime.Version)
-
-	if err := enc.Init(initCtx); err != nil {
-		slog.Error("enclave init failed — app will NOT be started", "error", err)
-		<-ctx.Done()
-		slog.Info("shutting down (init failed, no child)")
-	} else {
-		appBinary := envOr("APP_BINARY_NAME", "app")
-		appPath := fmt.Sprintf("/app/%s", appBinary)
-
-		child := exec.Command(appPath)
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		child.Env = append(os.Environ(),
-			"ENCLAVE_APP_PORT="+appPort,
-			"PORT="+appPort,
-			"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-			"ENCLAVE_RUNTIME_TOKEN="+enc.RuntimeToken(),
-		)
-		if err := child.Start(); err != nil {
-			slog.Error("start child failed", "path", appPath, "error", err)
-			os.Exit(1)
-		}
-		slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
-
-		childDone := make(chan error, 1)
-		go func() { childDone <- child.Wait() }()
-
-		select {
-		case err := <-childDone:
-			// Upstream app exited. Record the state on the runtime
-			if err != nil {
-				slog.Error("upstream app exited — runtime stays alive", "error", err)
-			} else {
-				slog.Warn("upstream app exited cleanly — runtime stays alive")
-			}
-			enc.MarkUpstreamExited(err)
-			// Wait for explicit shutdown or a listener failure.
-			select {
-			case lerr := <-enc.ListenErr():
-				slog.Error("HTTP listener failed after app exit", "error", lerr)
-				os.Exit(1)
-			case <-ctx.Done():
-				slog.Info("shutting down (upstream app already exited)")
-			}
-		case err := <-enc.ListenErr():
-			slog.Error("HTTP listener failed", "error", err)
-			_ = child.Process.Signal(syscall.SIGTERM)
-			<-childDone
-			os.Exit(1)
-		case <-ctx.Done():
-			slog.Info("shutting down")
-			_ = child.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-childDone:
-			case <-time.After(10 * time.Second):
-				slog.Warn("child did not exit, sending SIGKILL")
-				_ = child.Process.Kill()
-				<-childDone
-			}
-		}
-	}
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

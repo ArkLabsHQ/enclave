@@ -28,7 +28,7 @@ type Metrics struct {
 	// Supervisor counters.
 	HTTPRequests       metric.Int64Counter
 	HTTPErrors         metric.Int64Counter
-	AppProxiedRequests metric.Int64Counter // requests forwarded to the user app via revProxy
+	AppProxiedRequests metric.Int64Counter // user-app proxy requests
 	AppProxiedErrors   metric.Int64Counter // failures dialing or talking to the user app
 	KMSOperations      metric.Int64Counter
 	KMSErrors          metric.Int64Counter
@@ -47,19 +47,7 @@ type Metrics struct {
 	runtimeMetrics map[string]float64
 }
 
-// enclaveMetrics is the package-level pointer set by InitMetrics() / NewMetrics().
-// Phase-B1 migration step: converted from a value-typed global into a pointer
-// initialised by a constructor. Phase-C subsystems take *Metrics by injection
-// instead of reading this var, after which it is removed.
-var enclaveMetrics *Metrics
-
-// GetMetrics returns the package-level metrics instance.
-func GetMetrics() *Metrics {
-	return enclaveMetrics
-}
-
-// NewMetrics builds a fresh Metrics instance with all OTEL counters
-// registered and the runtime/proc collector started in the background.
+// NewMetrics registers counters and starts runtime collection.
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		counters:       make(map[string]int64),
@@ -67,25 +55,38 @@ func NewMetrics() *Metrics {
 		runtimeMetrics: make(map[string]float64),
 	}
 	meter := otel.Meter("runtime")
-	m.HTTPRequests = newCounter(meter, "enclave_http_requests_total", "Total HTTP requests handled by the enclave supervisor.")
-	m.HTTPErrors = newCounter(meter, "enclave_http_errors_total", "Total HTTP responses with status 4xx or 5xx.")
-	m.AppProxiedRequests = newCounter(meter, "enclave_app_proxied_requests_total", "Total requests forwarded to the user app via the reverse proxy.")
-	m.AppProxiedErrors = newCounter(meter, "enclave_app_proxied_errors_total", "Total failures forwarding requests to the user app (dial / connect errors).")
-	m.KMSOperations = newCounter(meter, "enclave_kms_operations_total", "Total KMS Decrypt operations attempted.")
+	m.HTTPRequests = newCounter(
+		meter,
+		"enclave_http_requests_total",
+		"Total HTTP requests handled by the enclave supervisor.",
+	)
+	m.HTTPErrors = newCounter(
+		meter,
+		"enclave_http_errors_total",
+		"Total HTTP responses with status 4xx or 5xx.",
+	)
+	m.AppProxiedRequests = newCounter(
+		meter,
+		"enclave_app_proxied_requests_total",
+		"Total requests forwarded to the user app via the reverse proxy.",
+	)
+	m.AppProxiedErrors = newCounter(
+		meter,
+		"enclave_app_proxied_errors_total",
+		"Total failures forwarding requests to the user app (dial / connect errors).",
+	)
+	m.KMSOperations = newCounter(
+		meter,
+		"enclave_kms_operations_total",
+		"Total KMS Decrypt operations attempted.",
+	)
 	m.KMSErrors = newCounter(meter, "enclave_kms_errors_total", "Total failed KMS operations.")
 	m.LogEntries = newCounter(meter, "enclave_log_entries_total", "Total log entries accepted.")
 	go m.collectRuntime()
 	return m
 }
 
-// InitMetrics initializes the package-level singleton. Kept for the legacy
-// cmd/runtime/main.go entry point that calls it before runtime.New().
-func InitMetrics() {
-	enclaveMetrics = NewMetrics()
-}
-
-// newCounter creates and registers an OTEL counter, wrapping it to also track
-// in our local counters map for snapshot export.
+// newCounter registers an OTEL counter.
 func newCounter(meter metric.Meter, name, desc string) metric.Int64Counter {
 	c, err := meter.Int64Counter(name, metric.WithDescription(desc))
 	if err != nil {
@@ -180,7 +181,48 @@ func (m *Metrics) collectRuntime() {
 	}
 }
 
-// readProcCPU reads /proc/stat for CPU usage.
+// updateFromOTLPMetrics stores OTLP datapoints in m.appMetrics.
+// Returns the number of data points processed.
+func (m *Metrics) updateFromOTLPMetrics(body []byte) (int, error) {
+	var req colmetricspb.ExportMetricsServiceRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		return 0, fmt.Errorf("unmarshal OTLP metrics: %w", err)
+	}
+
+	count := 0
+	for _, rm := range req.ResourceMetrics {
+		for _, sm := range rm.ScopeMetrics {
+			for _, metric := range sm.Metrics {
+				name := metric.Name
+				switch data := metric.Data.(type) {
+				case *metricspb.Metric_Sum:
+					for _, dp := range data.Sum.DataPoints {
+						val := dataPointValue(dp)
+						m.SetAppMetric(name, val)
+						count++
+					}
+				case *metricspb.Metric_Gauge:
+					for _, dp := range data.Gauge.DataPoints {
+						val := dataPointValue(dp)
+						m.SetAppMetric(name, val)
+						count++
+					}
+				case *metricspb.Metric_Histogram:
+					for _, dp := range data.Histogram.DataPoints {
+						if dp.Sum != nil {
+							m.SetAppMetric(name+"_sum", *dp.Sum)
+						}
+						m.SetAppMetric(name+"_count", float64(dp.Count))
+						count++
+					}
+				}
+			}
+		}
+	}
+	return count, nil
+}
+
+// readProcCPU reads CPU counters from /proc/stat.
 func readProcCPU() (map[string]float64, error) {
 	f, err := os.Open("/proc/stat")
 	if err != nil {
@@ -244,80 +286,41 @@ func readProcMeminfo() (map[string]float64, error) {
 	return result, nil
 }
 
-// handleMetricGet returns a JSON snapshot of all metrics.
+// HandleMetricGet returns a JSON snapshot of all metrics.
 // GET /v1/enclave-metrics
-func (e *Runtime) handleMetricGet(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(enclaveMetrics.MetricsSnapshot())
+func HandleMetricGet(metrics *Metrics) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(metrics.MetricsSnapshot())
+	}
 }
 
-// handleMetricPost accepts OTLP metrics from the app.
-// POST /v1/metrics (Content-Type: application/x-protobuf)
-func (e *Runtime) handleMetricPost(w http.ResponseWriter, r *http.Request) {
-	if !e.checkRuntimeToken(w, r) {
-		return
-	}
+// HandleMetricPost accepts OTLP protobuf metrics.
+func HandleMetricPost(metrics *Metrics) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := http.MaxBytesReader(w, r.Body, 1<<20)
+		defer func() { _ = body.Close() }()
 
-	body := http.MaxBytesReader(w, r.Body, 1<<20)
-	defer func() { _ = body.Close() }()
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
-		return
-	}
-
-	count, err := parseOTLPMetrics(data)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"parse OTLP metrics: %s"}`, err), http.StatusBadRequest)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]int{"accepted": count})
-}
-
-// parseOTLPMetrics parses an OTLP ExportMetricsServiceRequest and stores
-// the metric values in the global enclaveMetrics.appMetrics map.
-// Returns the number of data points processed.
-func parseOTLPMetrics(body []byte) (int, error) {
-	var req colmetricspb.ExportMetricsServiceRequest
-	if err := proto.Unmarshal(body, &req); err != nil {
-		return 0, fmt.Errorf("unmarshal OTLP metrics: %w", err)
-	}
-
-	count := 0
-	for _, rm := range req.ResourceMetrics {
-		for _, sm := range rm.ScopeMetrics {
-			for _, m := range sm.Metrics {
-				name := m.Name
-				switch data := m.Data.(type) {
-				case *metricspb.Metric_Sum:
-					for _, dp := range data.Sum.DataPoints {
-						val := dataPointValue(dp)
-						enclaveMetrics.SetAppMetric(name, val)
-						count++
-					}
-				case *metricspb.Metric_Gauge:
-					for _, dp := range data.Gauge.DataPoints {
-						val := dataPointValue(dp)
-						enclaveMetrics.SetAppMetric(name, val)
-						count++
-					}
-				case *metricspb.Metric_Histogram:
-					for _, dp := range data.Histogram.DataPoints {
-						if dp.Sum != nil {
-							enclaveMetrics.SetAppMetric(name+"_sum", *dp.Sum)
-						}
-						enclaveMetrics.SetAppMetric(name+"_count", float64(dp.Count))
-						count++
-					}
-				}
-			}
+		data, err := io.ReadAll(body)
+		if err != nil {
+			http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+			return
 		}
+
+		count, err := metrics.updateFromOTLPMetrics(data)
+		if err != nil {
+			http.Error(
+				w,
+				fmt.Sprintf(`{"error":"parse OTLP metrics: %s"}`, err),
+				http.StatusBadRequest,
+			)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]int{"accepted": count})
 	}
-	return count, nil
 }
 
 // dataPointValue extracts the numeric value from a NumberDataPoint.

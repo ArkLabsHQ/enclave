@@ -1,6 +1,6 @@
 package runtime
 
-// Per-write rollback prevention via DEK-sealed, Object-Lock-immutable anchors; version bound into object name and seal AAD.
+// Per-write rollback prevention via DEK-sealed Object Lock anchors.
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,39 +34,85 @@ type anchorEntryV1 struct {
 	Timestamp int64  `cbor:"ts"`
 }
 
-// FreshnessAnchor records and verifies per-write anchors; nil receiver or empty bucket disables it.
-type FreshnessAnchor struct {
-	kv     *KVStore
+// FreshnessAnchor records and verifies per-write anchors.
+type FreshnessAnchor interface {
+	// Establish loads watermark and fails if live is behind.
+	Establish(ctx context.Context, live map[string]uint64) error
+	Record(ctx context.Context, key string, version uint64) error
+	CheckFresh(key string, version uint64) error
+}
+
+type freshnessAnchor struct {
+	rt     RuntimeState
 	s3     S3API
+	dek    DEK
 	bucket string
 	window time.Duration
+	enc    cbor.EncMode
 
 	mu           sync.RWMutex
 	versionFloor map[string]uint64
-	halt         *atomic.Bool
 }
 
-// Init resolves the anchor bucket from SSM; empty/unset leaves it disabled.
-func (a *FreshnessAnchor) Init(ctx context.Context) error {
-	if a == nil {
-		return nil
-	}
-	bucket, err := readSSMParamOptional(ctx, a.kv.kms.aws.SSM, anchorBucketParam())
+func NewFreshnessAnchor(
+	ctx context.Context,
+	rt RuntimeState,
+	s3 S3API,
+	dek DEK,
+	ssm SSM,
+) (FreshnessAnchor, error) {
+	bucket, err := ssm.MustGet(ctx, anchorBucketParam())
 	if err != nil {
-		return fmt.Errorf("read anchor bucket name: %w", err)
+		return nil, fmt.Errorf("read anchor bucket name: %w", err)
 	}
-	a.bucket = bucket
+
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
+	}
+
+	return &freshnessAnchor{
+		rt:     rt,
+		s3:     s3,
+		dek:    dek,
+		bucket: bucket,
+		window: anchorWindow(),
+		enc:    enc,
+	}, nil
+}
+
+func (a *freshnessAnchor) Establish(ctx context.Context, live map[string]uint64) error {
+	keys, err := a.anchoredKeys(ctx)
+	if err != nil {
+		return err
+	}
+	versionFloor := make(map[string]uint64, len(keys))
+	for _, key := range keys {
+		anchored, err := a.anchoredVersion(ctx, key)
+		if err != nil {
+			return err
+		}
+		if live[key] < anchored {
+			a.rt.NotifyHalt()
+			return fmt.Errorf(
+				"%w: key %q live=%d anchored=%d",
+				ErrRollbackDetected,
+				key,
+				live[key],
+				anchored,
+			)
+		}
+		versionFloor[key] = anchored
+	}
+	a.mu.Lock()
+	a.versionFloor = versionFloor
+	a.mu.Unlock()
 	return nil
 }
 
-func (a *FreshnessAnchor) enabled() bool { return a != nil && a.bucket != "" }
-
-// record writes the locked anchor for a committed version.
-func (a *FreshnessAnchor) record(ctx context.Context, key string, version uint64) error {
-	if !a.enabled() {
-		return nil
-	}
-	body, err := canonicalCBOR.Marshal(anchorEntryV1{
+// Record writes the locked anchor for a committed version.
+func (a *freshnessAnchor) Record(ctx context.Context, key string, version uint64) error {
+	body, err := a.enc.Marshal(anchorEntryV1{
 		Schema:    anchorSchemaV1,
 		Key:       key,
 		Version:   version,
@@ -76,7 +121,7 @@ func (a *FreshnessAnchor) record(ctx context.Context, key string, version uint64
 	if err != nil {
 		return err
 	}
-	sealed, err := sealStorage(a.kv.dek, body, anchorAAD(key, version))
+	sealed, err := a.dek.Seal(body, anchorAAD(key, version))
 	if err != nil {
 		return err
 	}
@@ -93,7 +138,25 @@ func (a *FreshnessAnchor) record(ctx context.Context, key string, version uint64
 	return nil
 }
 
-func (a *FreshnessAnchor) setVersionFloor(key string, version uint64) {
+// CheckFresh fails if liveVersion is below the watermark.
+func (a *freshnessAnchor) CheckFresh(key string, liveVersion uint64) error {
+	a.mu.RLock()
+	want, ok := a.versionFloor[key]
+	a.mu.RUnlock()
+	if ok && liveVersion < want {
+		a.rt.NotifyHalt()
+		return fmt.Errorf(
+			"%w: key %q live=%d anchored=%d",
+			ErrRollbackDetected,
+			key,
+			liveVersion,
+			want,
+		)
+	}
+	return nil
+}
+
+func (a *freshnessAnchor) setVersionFloor(key string, version uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.versionFloor == nil {
@@ -104,58 +167,8 @@ func (a *FreshnessAnchor) setVersionFloor(key string, version uint64) {
 	}
 }
 
-// checkFresh fails closed if a live head's version is below the watermark; missing heads are left to the boot gate.
-func (a *FreshnessAnchor) checkFresh(key string, liveVersion uint64) error {
-	if !a.enabled() {
-		return nil
-	}
-	a.mu.RLock()
-	want, ok := a.versionFloor[key]
-	a.mu.RUnlock()
-	if ok && liveVersion < want {
-		if a.halt != nil {
-			a.halt.Store(true)
-		}
-		return fmt.Errorf("%w: key %q live=%d anchored=%d", ErrRollbackDetected, key, liveVersion, want)
-	}
-	return nil
-}
-
-// Establish is the boot gate: loads the watermark and fails closed on any live version already below it.
-func (a *FreshnessAnchor) Establish(ctx context.Context) error {
-	if !a.enabled() {
-		return nil
-	}
-	live, err := a.kv.VersionVector(ctx)
-	if err != nil {
-		return fmt.Errorf("anchor establish: read live versions: %w", err)
-	}
-	keys, err := a.anchoredKeys(ctx)
-	if err != nil {
-		return err
-	}
-	versionFloor := make(map[string]uint64, len(keys))
-	for _, key := range keys {
-		anchored, err := a.anchoredVersion(ctx, key)
-		if err != nil {
-			return err
-		}
-		if live[key] < anchored {
-			return fmt.Errorf("%w: key %q live=%d anchored=%d", ErrRollbackDetected, key, live[key], anchored)
-		}
-		versionFloor[key] = anchored
-	}
-	a.mu.Lock()
-	a.versionFloor = versionFloor
-	a.mu.Unlock()
-	return nil
-}
-
-// anchoredVersion returns the highest version with a validly-sealed object (tampered ones fail seal/AAD and are skipped), 0 if never anchored.
-func (a *FreshnessAnchor) anchoredVersion(ctx context.Context, key string) (uint64, error) {
-	if !a.enabled() {
-		return 0, nil
-	}
+// anchoredVersion returns the highest valid sealed version, or 0.
+func (a *freshnessAnchor) anchoredVersion(ctx context.Context, key string) (uint64, error) {
 	byVersion, err := a.listObjectVersions(ctx, anchorPrefix+key+"/", key)
 	if err != nil {
 		return 0, err
@@ -175,8 +188,8 @@ func (a *FreshnessAnchor) anchoredVersion(ctx context.Context, key string) (uint
 	return 0, nil
 }
 
-// anchoredKeys lists every distinct anchored key via ListObjectVersions so a delete marker can't hide one.
-func (a *FreshnessAnchor) anchoredKeys(ctx context.Context) ([]string, error) {
+// anchoredKeys lists keys via versions so a delete marker can't hide one.
+func (a *freshnessAnchor) anchoredKeys(ctx context.Context) ([]string, error) {
 	seen := map[string]struct{}{}
 	var keyMarker, versionMarker *string
 	for {
@@ -206,7 +219,10 @@ func (a *FreshnessAnchor) anchoredKeys(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
-func (a *FreshnessAnchor) listObjectVersions(ctx context.Context, prefix, key string) (map[uint64][]string, error) {
+func (a *freshnessAnchor) listObjectVersions(
+	ctx context.Context,
+	prefix, key string,
+) (map[uint64][]string, error) {
 	byVersion := map[uint64][]string{}
 	var keyMarker, versionMarker *string
 	for {
@@ -234,7 +250,12 @@ func (a *FreshnessAnchor) listObjectVersions(ctx context.Context, prefix, key st
 	return byVersion, nil
 }
 
-func (a *FreshnessAnchor) opens(ctx context.Context, key string, version uint64, versionID string) bool {
+func (a *freshnessAnchor) opens(
+	ctx context.Context,
+	key string,
+	version uint64,
+	versionID string,
+) bool {
 	out, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:    aws.String(a.bucket),
 		Key:       aws.String(anchorObjectKey(key, version)),
@@ -248,7 +269,7 @@ func (a *FreshnessAnchor) opens(ctx context.Context, key string, version uint64,
 	if err != nil {
 		return false
 	}
-	plain, err := openStorage(a.kv.dek, sealed, anchorAAD(key, version))
+	plain, err := a.dek.Open(sealed, anchorAAD(key, version))
 	if err != nil {
 		return false
 	}

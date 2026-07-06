@@ -15,25 +15,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/kms"
-	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 )
 
-// KVStore: rollback-resistant, confidential K/V on DynamoDB (issue #134). Values are AES-256-GCM-sealed under the in-enclave DEK; version-CAS writes serialize honest writers; the S3 Object-Lock freshness anchor (anchor.go) fails closed on version regression.
+// DynamoDB KV: sealed values, version-CAS writes, S3 freshness anchors.
 
-// ErrKVNotFound is returned by Get/Incr when a key is absent or expired.
+// ErrKVNotFound reports an absent or expired key.
 var ErrKVNotFound = errors.New("kv: key not found")
 
-// ErrKVDisabled is returned when no table is provisioned.
+// ErrKVDisabled indicates KV storage is unavailable.
 var ErrKVDisabled = errors.New("kv: store not initialized (no table provisioned)")
 
 // ErrValueTooLarge is returned when a value exceeds the configured maximum.
 var ErrValueTooLarge = errors.New("kv: value exceeds maximum size")
 
-// ErrNotInteger is returned by Incr when the value isn't a base-10 integer.
+// ErrNotInteger reports a non-base-10 integer value.
 var ErrNotInteger = errors.New("value is not an integer or out of range")
 
-// ErrWrongType is returned when a command targets a key holding a different type.
+// ErrWrongType reports Redis WRONGTYPE.
 var ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
 
 // errConcurrentModification: a write lost the version CAS; callers re-read and retry.
@@ -105,7 +103,7 @@ type kvChunkItem struct {
 	Blob         []byte `dynamodbav:"blob"`
 }
 
-// kvKey is a bare primary key (for GetItem/DeleteItem/BatchGet).
+// kvKey is a DynamoDB primary key.
 type kvKey struct {
 	PartitionKey string `dynamodbav:"pk"`
 	SortKey      string `dynamodbav:"sk"`
@@ -126,84 +124,76 @@ func (h kvHead) gone() bool {
 	return !h.exists || h.Deleted || h.expired()
 }
 
-// KVStore owns the DEK and the DynamoDB-backed key/value engine.
-type KVStore struct {
-	kms       *KMS             // DEK lifecycle + AWS clients
-	ddb       DynamoDBAPI      // DynamoDB client; falls back to kms.aws.DDB (overridable in tests)
-	anchor    *FreshnessAnchor // per-write S3 Object-Lock rollback anchor; nil/disabled = no-op
+// kvStore owns the DEK and DynamoDB engine.
+type kvStore struct {
+	ddb       DynamoDBAPI
+	dek       DEK
+	anchor    FreshnessAnchor
 	tableName string
-	dek       []byte
 	maxValue  int
 }
 
-// kvKeyInfo is one live key and its Redis type, returned by ScanKeys.
-type kvKeyInfo struct {
+// KVKeyInfo is one live key and its Redis type.
+type KVKeyInfo struct {
 	Key  string
 	Type string // "string"/"hash"/...
 }
 
-// Enabled reports whether a table is provisioned and the DEK is loaded.
-func (kv *KVStore) Enabled() bool { return kv != nil && kv.tableName != "" && kv.dek != nil }
-
-// Init discovers the table (SSM) and loads/generates the storage DEK; absent a table, the store stays disabled.
-func (kv *KVStore) Init(ctx context.Context, keyID string) error {
-	tableName, err := readSSMParamOptional(ctx, kv.kms.aws.SSM, kvTableNameParam())
-	if err != nil {
-		return fmt.Errorf("read KV table name: %w", err)
-	}
-	if tableName == "" {
-		return nil // no table provisioned, KV disabled
-	}
-	kv.tableName = tableName
-
-	dekParam := storageDEKCiphertextParam(keyID)
-	ciphertextB64, err := kv.kms.LoadCiphertext(ctx, dekParam)
-	if err != nil {
-		return fmt.Errorf("load DEK from SSM: %w", err)
-	}
-	if ciphertextB64 == "" {
-		out, err := kv.kms.aws.KMS.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
-			KeyId:   aws.String(keyID),
-			KeySpec: kmstypes.DataKeySpecAes256,
-		})
-		if err != nil {
-			return fmt.Errorf("generate DEK: %w", err)
-		}
-		kv.dek = out.Plaintext
-		encoded := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
-		if err := kv.kms.StoreCiphertext(ctx, dekParam, encoded); err != nil {
-			return fmt.Errorf("store DEK: %w", err)
-		}
-		return nil
-	}
-	dek, err := decryptDEK(ctx, kv.kms.aws.KMS, keyID, ciphertextB64)
-	if err != nil {
-		return fmt.Errorf("decrypt DEK: %w", err)
-	}
-	kv.dek = dek
-	return nil
+type KVStore interface {
+	ScanKeys(ctx context.Context, cursor string, count int) ([]KVKeyInfo, string, error)
+	SetMode(
+		ctx context.Context,
+		key string,
+		value []byte,
+		ttlSeconds int64,
+		mode setMode,
+	) (uint64, bool, error)
+	Get(ctx context.Context, key string) ([]byte, uint64, error)
+	Exists(ctx context.Context, key string) (bool, error)
+	Del(ctx context.Context, key string) (bool, uint64, error)
+	TTL(ctx context.Context, key string) (int64, error)
+	Expire(ctx context.Context, key string, ttlSeconds int64) (bool, uint64, error)
+	Persist(ctx context.Context, key string) (bool, error)
+	Version(ctx context.Context, key string) (uint64, error)
+	Incr(ctx context.Context, key string, delta int64) (int64, uint64, error)
+	Append(ctx context.Context, key string, suffix []byte) (int, error)
+	GetSet(ctx context.Context, key string, value []byte) (old []byte, existed bool, err error)
+	Rename(ctx context.Context, src, dst string) error
+	TypeOf(ctx context.Context, key string) (string, error)
+	ReadTyped(ctx context.Context, key, kvType string) (value []byte, exists bool, err error)
+	ModifyTyped(
+		ctx context.Context,
+		key, kvType string,
+		fn func(cur []byte) (next []byte, del bool, err error),
+	) (uint64, error)
 }
 
-// DEK exposes the in-memory DEK (used by Migration.exportStorageDEK).
-func (kv *KVStore) DEK() []byte { return kv.dek }
+func NewKVStore(
+	ctx context.Context,
+	ddb DynamoDBAPI,
+	ssm SSM,
+	dek DEK,
+	anchor FreshnessAnchor,
+) (KVStore, error) {
+	tableName, err := ssm.MustGet(ctx, kvTableNameParam())
+	if err != nil {
+		return nil, fmt.Errorf("read KV table name: %w", err)
+	}
 
-// HasDEK reports whether the DEK is loaded.
-func (kv *KVStore) HasDEK() bool { return kv != nil && kv.dek != nil }
-
-// VersionVector returns the current version of every key (tombstones included), for the freshness anchor.
-func (kv *KVStore) VersionVector(ctx context.Context) (map[string]uint64, error) {
 	expr, err := expression.NewBuilder().
 		WithFilter(expression.Name(attrSortKey).Equal(expression.Value(kvHeadSK))).
 		Build()
 	if err != nil {
 		return nil, err
 	}
+
 	prefix := fmt.Sprintf("%s/%s/", getDeployment(), getAppName())
-	out := map[string]uint64{}
+
+	live := map[string]uint64{}
 	var startKey map[string]ddbtypes.AttributeValue
 	for {
-		res, err := kv.ddb.Scan(ctx, &dynamodb.ScanInput{
-			TableName:                 &kv.tableName,
+		res, err := ddb.Scan(ctx, &dynamodb.ScanInput{
+			TableName:                 &tableName,
 			FilterExpression:          expr.Filter(),
 			ExpressionAttributeNames:  expr.Names(),
 			ExpressionAttributeValues: expr.Values(),
@@ -217,21 +207,33 @@ func (kv *KVStore) VersionVector(ctx context.Context) (map[string]uint64, error)
 			if err := attributevalue.UnmarshalMap(raw, &item); err != nil {
 				return nil, fmt.Errorf("kv version vector decode: %w", err)
 			}
-			out[strings.TrimPrefix(item.PartitionKey, prefix)] = item.Version
+			live[strings.TrimPrefix(item.PartitionKey, prefix)] = item.Version
 		}
 		if len(res.LastEvaluatedKey) == 0 {
 			break
 		}
 		startKey = res.LastEvaluatedKey
 	}
-	return out, nil
+
+	if err := anchor.Establish(ctx, live); err != nil {
+		return nil, fmt.Errorf("kv version vector decode: %w", err)
+	}
+
+	return &kvStore{
+		ddb:       ddb,
+		dek:       dek,
+		anchor:    anchor,
+		tableName: tableName,
+		maxValue:  kvMaxValue(),
+	}, nil
 }
 
 // ScanKeys returns one page of live keys after cursor plus the next cursor ("0" when complete); backs SCAN.
-func (kv *KVStore) ScanKeys(ctx context.Context, cursor string, count int) ([]kvKeyInfo, string, error) {
-	if !kv.Enabled() {
-		return nil, "0", ErrKVDisabled
-	}
+func (kv *kvStore) ScanKeys(
+	ctx context.Context,
+	cursor string,
+	count int,
+) ([]KVKeyInfo, string, error) {
 	start, err := decodeScanCursor(cursor)
 	if err != nil {
 		return nil, "0", err
@@ -257,7 +259,7 @@ func (kv *KVStore) ScanKeys(ctx context.Context, cursor string, count int) ([]kv
 		return nil, "0", fmt.Errorf("kv scan: %w", err)
 	}
 	prefix := fmt.Sprintf("%s/%s/", getDeployment(), getAppName())
-	var keys []kvKeyInfo
+	var keys []KVKeyInfo
 	for _, raw := range res.Items {
 		var item kvHeadItem
 		if err := attributevalue.UnmarshalMap(raw, &item); err != nil {
@@ -270,7 +272,7 @@ func (kv *KVStore) ScanKeys(ctx context.Context, cursor string, count int) ([]kv
 		if t == "" {
 			t = "string"
 		}
-		keys = append(keys, kvKeyInfo{Key: strings.TrimPrefix(item.PartitionKey, prefix), Type: t})
+		keys = append(keys, KVKeyInfo{Key: strings.TrimPrefix(item.PartitionKey, prefix), Type: t})
 	}
 	next, err := encodeScanCursor(res.LastEvaluatedKey)
 	if err != nil {
@@ -279,11 +281,14 @@ func (kv *KVStore) ScanKeys(ctx context.Context, cursor string, count int) ([]kv
 	return keys, next, nil
 }
 
-// SetMode stores value subject to mode (ok=false ⇒ NX/XX unmet); the existence test and version-CAS write share one read so NX/XX are atomic.
-func (kv *KVStore) SetMode(ctx context.Context, key string, value []byte, ttlSeconds int64, mode setMode) (uint64, bool, error) {
-	if !kv.Enabled() {
-		return 0, false, ErrKVDisabled
-	}
+// SetMode enforces NX/XX atomically with the version-CAS write.
+func (kv *kvStore) SetMode(
+	ctx context.Context,
+	key string,
+	value []byte,
+	ttlSeconds int64,
+	mode setMode,
+) (uint64, bool, error) {
 	if len(value) > kv.maxValue {
 		return 0, false, ErrValueTooLarge
 	}
@@ -298,9 +303,9 @@ func (kv *KVStore) SetMode(ctx context.Context, key string, value []byte, ttlSec
 		}
 		switch {
 		case mode == setNX && !h.gone():
-			return 0, false, nil // key present → NX fails
+			return 0, false, nil
 		case mode == setXX && h.gone():
-			return 0, false, nil // key absent → XX fails
+			return 0, false, nil
 		}
 		v, err := kv.write(ctx, key, value, "", h, expires)
 		if err == nil {
@@ -315,10 +320,7 @@ func (kv *KVStore) SetMode(ctx context.Context, key string, value []byte, ttlSec
 }
 
 // Get returns the value and its version, or ErrKVNotFound if absent/deleted/expired.
-func (kv *KVStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	if !kv.Enabled() {
-		return nil, 0, ErrKVDisabled
-	}
+func (kv *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return nil, 0, err
@@ -337,10 +339,7 @@ func (kv *KVStore) Get(ctx context.Context, key string) ([]byte, uint64, error) 
 }
 
 // Exists reports whether key is present (not absent/deleted/expired).
-func (kv *KVStore) Exists(ctx context.Context, key string) (bool, error) {
-	if !kv.Enabled() {
-		return false, ErrKVDisabled
-	}
+func (kv *kvStore) Exists(ctx context.Context, key string) (bool, error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return false, err
@@ -349,10 +348,7 @@ func (kv *KVStore) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 // Del tombstones key (bumps version, marks deleted, reclaims chunks) so the version stays monotonic across delete/recreate.
-func (kv *KVStore) Del(ctx context.Context, key string) (bool, uint64, error) {
-	if !kv.Enabled() {
-		return false, 0, ErrKVDisabled
-	}
+func (kv *kvStore) Del(ctx context.Context, key string) (bool, uint64, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -374,10 +370,7 @@ func (kv *KVStore) Del(ctx context.Context, key string) (bool, uint64, error) {
 }
 
 // TTL returns remaining seconds (>=0), -1 if no expiry, -2 if absent (Redis TTL semantics).
-func (kv *KVStore) TTL(ctx context.Context, key string) (int64, error) {
-	if !kv.Enabled() {
-		return -2, ErrKVDisabled
-	}
+func (kv *kvStore) TTL(ctx context.Context, key string) (int64, error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return -2, err
@@ -392,10 +385,7 @@ func (kv *KVStore) TTL(ctx context.Context, key string) (int64, error) {
 }
 
 // Expire sets a TTL on an existing key without rewriting its value, returning whether it existed and the unchanged version.
-func (kv *KVStore) Expire(ctx context.Context, key string, ttlSeconds int64) (bool, uint64, error) {
-	if !kv.Enabled() {
-		return false, 0, ErrKVDisabled
-	}
+func (kv *kvStore) Expire(ctx context.Context, key string, ttlSeconds int64) (bool, uint64, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -404,7 +394,10 @@ func (kv *KVStore) Expire(ctx context.Context, key string, ttlSeconds int64) (bo
 		if h.gone() {
 			return false, h.Version, nil
 		}
-		upd := expression.Set(expression.Name(attrExpires), expression.Value(time.Now().Unix()+ttlSeconds))
+		upd := expression.Set(
+			expression.Name(attrExpires),
+			expression.Value(time.Now().Unix()+ttlSeconds),
+		)
 		cond := expression.Name(attrVersion).Equal(expression.Value(h.Version))
 		expr, err := expression.NewBuilder().WithUpdate(upd).WithCondition(cond).Build()
 		if err != nil {
@@ -434,10 +427,7 @@ func (kv *KVStore) Expire(ctx context.Context, key string, ttlSeconds int64) (bo
 }
 
 // Persist removes the TTL from key; true if one was removed, false if none or gone (Redis PERSIST).
-func (kv *KVStore) Persist(ctx context.Context, key string) (bool, error) {
-	if !kv.Enabled() {
-		return false, ErrKVDisabled
-	}
+func (kv *kvStore) Persist(ctx context.Context, key string) (bool, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -476,10 +466,7 @@ func (kv *KVStore) Persist(ctx context.Context, key string) (bool, error) {
 }
 
 // Version returns the current head version of key (0 if no head); WATCH compares this to detect modification.
-func (kv *KVStore) Version(ctx context.Context, key string) (uint64, error) {
-	if !kv.Enabled() {
-		return 0, ErrKVDisabled
-	}
+func (kv *kvStore) Version(ctx context.Context, key string) (uint64, error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return 0, err
@@ -490,11 +477,8 @@ func (kv *KVStore) Version(ctx context.Context, key string) (uint64, error) {
 	return h.Version, nil
 }
 
-// Incr adds delta to the integer value at key (absent/deleted = 0), preserving any TTL.
-func (kv *KVStore) Incr(ctx context.Context, key string, delta int64) (int64, uint64, error) {
-	if !kv.Enabled() {
-		return 0, 0, ErrKVDisabled
-	}
+// Incr adds delta; missing/expired starts at 0; live TTL stays.
+func (kv *kvStore) Incr(ctx context.Context, key string, delta int64) (int64, uint64, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -532,10 +516,7 @@ func (kv *KVStore) Incr(ctx context.Context, key string, delta int64) (int64, ui
 }
 
 // Append concatenates suffix to the string at key (creating it if absent), preserving any TTL.
-func (kv *KVStore) Append(ctx context.Context, key string, suffix []byte) (int, error) {
-	if !kv.Enabled() {
-		return 0, ErrKVDisabled
-	}
+func (kv *kvStore) Append(ctx context.Context, key string, suffix []byte) (int, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -565,10 +546,11 @@ func (kv *KVStore) Append(ctx context.Context, key string, suffix []byte) (int, 
 }
 
 // GetSet sets key to value (clearing any TTL, like SET) and returns the old string value.
-func (kv *KVStore) GetSet(ctx context.Context, key string, value []byte) (old []byte, existed bool, err error) {
-	if !kv.Enabled() {
-		return nil, false, ErrKVDisabled
-	}
+func (kv *kvStore) GetSet(
+	ctx context.Context,
+	key string,
+	value []byte,
+) (old []byte, existed bool, err error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -596,10 +578,7 @@ func (kv *KVStore) GetSet(ctx context.Context, key string, value []byte) (old []
 }
 
 // Rename moves the value (any type, preserving TTL) from src to dst and tombstones src; not atomic across the two keys.
-func (kv *KVStore) Rename(ctx context.Context, src, dst string) error {
-	if !kv.Enabled() {
-		return ErrKVDisabled
-	}
+func (kv *kvStore) Rename(ctx context.Context, src, dst string) error {
 	h, err := kv.readHead(ctx, src)
 	if err != nil {
 		return err
@@ -622,13 +601,10 @@ func (kv *KVStore) Rename(ctx context.Context, src, dst string) error {
 	return err
 }
 
-// Typed values: each collection is one sealed blob carried as the key's value, tagged with its type; logic lives in kvtypes.go.
+// Typed values are one sealed, type-tagged blob per key.
 
 // TypeOf returns the Redis type name of key: "none", "string", or the collection type.
-func (kv *KVStore) TypeOf(ctx context.Context, key string) (string, error) {
-	if !kv.Enabled() {
-		return "", ErrKVDisabled
-	}
+func (kv *kvStore) TypeOf(ctx context.Context, key string) (string, error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return "", err
@@ -643,10 +619,10 @@ func (kv *KVStore) TypeOf(ctx context.Context, key string) (string, error) {
 }
 
 // ReadTyped returns the decrypted value bytes for key, requiring type kvType (ErrWrongType otherwise).
-func (kv *KVStore) ReadTyped(ctx context.Context, key, kvType string) (value []byte, exists bool, err error) {
-	if !kv.Enabled() {
-		return nil, false, ErrKVDisabled
-	}
+func (kv *kvStore) ReadTyped(
+	ctx context.Context,
+	key, kvType string,
+) (value []byte, exists bool, err error) {
 	h, err := kv.readHead(ctx, key)
 	if err != nil {
 		return nil, false, err
@@ -665,10 +641,11 @@ func (kv *KVStore) ReadTyped(ctx context.Context, key, kvType string) (value []b
 }
 
 // ModifyTyped runs a version-CAS read-modify-write on a typed value; a lost CAS re-runs fn, so fn must be idempotent.
-func (kv *KVStore) ModifyTyped(ctx context.Context, key, kvType string, fn func(cur []byte) (next []byte, del bool, err error)) (uint64, error) {
-	if !kv.Enabled() {
-		return 0, ErrKVDisabled
-	}
+func (kv *kvStore) ModifyTyped(
+	ctx context.Context,
+	key, kvType string,
+	fn func(cur []byte) (next []byte, del bool, err error),
+) (uint64, error) {
 	for attempt := 0; attempt <= kvMaxWriteRetries; attempt++ {
 		h, err := kv.readHead(ctx, key)
 		if err != nil {
@@ -717,7 +694,7 @@ func (kv *KVStore) ModifyTyped(ctx context.Context, key, kvType string, fn func(
 }
 
 // readHead fetches a key's head item with a strongly-consistent read.
-func (kv *KVStore) readHead(ctx context.Context, key string) (kvHead, error) {
+func (kv *kvStore) readHead(ctx context.Context, key string) (kvHead, error) {
 	k, err := marshalKey(getPartitionKey(key), kvHeadSK)
 	if err != nil {
 		return kvHead{}, err
@@ -737,13 +714,20 @@ func (kv *KVStore) readHead(ctx context.Context, key string) (kvHead, error) {
 	if err := attributevalue.UnmarshalMap(out.Item, &item); err != nil {
 		return kvHead{}, fmt.Errorf("decode head %q: %w", key, err)
 	}
-	if err := kv.anchor.checkFresh(key, item.Version); err != nil {
+	if err := kv.anchor.CheckFresh(key, item.Version); err != nil {
 		return kvHead{}, err
 	}
 	return kvHead{kvHeadItem: item, exists: true}, nil
 }
 
-func (kv *KVStore) write(ctx context.Context, key string, value []byte, kvType string, cur kvHead, expires int64) (uint64, error) {
+func (kv *kvStore) write(
+	ctx context.Context,
+	key string,
+	value []byte,
+	kvType string,
+	cur kvHead,
+	expires int64,
+) (uint64, error) {
 	next := cur.Version + 1
 	var version uint64
 	var err error
@@ -756,14 +740,22 @@ func (kv *KVStore) write(ctx context.Context, key string, value []byte, kvType s
 		return 0, err
 	}
 	// Anchor after the DynamoDB commit so anchored ≤ live; a failure here leaves the write committed but unanchored.
-	if err := kv.anchor.record(ctx, key, version); err != nil {
+	if err := kv.anchor.Record(ctx, key, version); err != nil {
 		return 0, fmt.Errorf("kv set %q: anchor: %w", key, err)
 	}
 	return version, nil
 }
 
-func (kv *KVStore) writeSmall(ctx context.Context, key string, value []byte, kvType string, cur kvHead, next uint64, expires int64) (uint64, error) {
-	blob, err := sealStorage(kv.dek, value, getAAD(key, next, 0, 0))
+func (kv *kvStore) writeSmall(
+	ctx context.Context,
+	key string,
+	value []byte,
+	kvType string,
+	cur kvHead,
+	next uint64,
+	expires int64,
+) (uint64, error) {
+	blob, err := kv.dek.Seal(value, getAAD(key, next, 0, 0))
 	if err != nil {
 		return 0, err
 	}
@@ -772,10 +764,13 @@ func (kv *KVStore) writeSmall(ctx context.Context, key string, value []byte, kvT
 		Set(expression.Name(attrBlob), expression.Value(blob)).
 		Set(expression.Name(attrChunks), expression.Value(0)).
 		Set(expression.Name(attrNBytes), expression.Value(len(value))).
-		Remove(expression.Name(attrDeleted)) // clear any tombstone — this is a live value again
+		Remove(expression.Name(attrDeleted)) // clear tombstone
 	upd = setType(upd, kvType)
 	upd = setExpires(upd, expires)
-	expr, err := expression.NewBuilder().WithUpdate(upd).WithCondition(versionCAS(cur.Version)).Build()
+	expr, err := expression.NewBuilder().
+		WithUpdate(upd).
+		WithCondition(versionCAS(cur.Version)).
+		Build()
 	if err != nil {
 		return 0, err
 	}
@@ -803,16 +798,30 @@ func (kv *KVStore) writeSmall(ctx context.Context, key string, value []byte, kvT
 	return next, nil
 }
 
-func (kv *KVStore) writeChunked(ctx context.Context, key string, value []byte, kvType string, cur kvHead, next uint64, expires int64) (uint64, error) {
+func (kv *kvStore) writeChunked(
+	ctx context.Context,
+	key string,
+	value []byte,
+	kvType string,
+	cur kvHead,
+	next uint64,
+	expires int64,
+) (uint64, error) {
 	chunks := splitChunks(value, kvChunkSize)
 	chunkItems := make([]map[string]ddbtypes.AttributeValue, len(chunks))
 	total := 0
 	for i, c := range chunks {
-		b, err := sealStorage(kv.dek, c, getAAD(key, next, i, len(chunks)))
+		b, err := kv.dek.Seal(c, getAAD(key, next, i, len(chunks)))
 		if err != nil {
 			return 0, err
 		}
-		item, err := attributevalue.MarshalMap(kvChunkItem{PartitionKey: getPartitionKey(key), SortKey: getChunkSortKey(next, i), Blob: b})
+		item, err := attributevalue.MarshalMap(
+			kvChunkItem{
+				PartitionKey: getPartitionKey(key),
+				SortKey:      getChunkSortKey(next, i),
+				Blob:         b,
+			},
+		)
 		if err != nil {
 			return 0, err
 		}
@@ -825,10 +834,13 @@ func (kv *KVStore) writeChunked(ctx context.Context, key string, value []byte, k
 		Set(expression.Name(attrChunks), expression.Value(len(chunks))).
 		Set(expression.Name(attrNBytes), expression.Value(len(value))).
 		Remove(expression.Name(attrBlob)).
-		Remove(expression.Name(attrDeleted)) // clear any tombstone — this is a live value again
+		Remove(expression.Name(attrDeleted)) // clear tombstone
 	upd = setType(upd, kvType)
 	upd = setExpires(upd, expires)
-	expr, err := expression.NewBuilder().WithUpdate(upd).WithCondition(versionCAS(cur.Version)).Build()
+	expr, err := expression.NewBuilder().
+		WithUpdate(upd).
+		WithCondition(versionCAS(cur.Version)).
+		Build()
 	if err != nil {
 		return 0, err
 	}
@@ -849,7 +861,12 @@ func (kv *KVStore) writeChunked(ctx context.Context, key string, value []byte, k
 		// One atomic transaction: chunks + head flip commit together.
 		items := make([]ddbtypes.TransactWriteItem, 0, len(chunkItems)+1)
 		for _, item := range chunkItems {
-			items = append(items, ddbtypes.TransactWriteItem{Put: &ddbtypes.Put{TableName: &kv.tableName, Item: item}})
+			items = append(
+				items,
+				ddbtypes.TransactWriteItem{
+					Put: &ddbtypes.Put{TableName: &kv.tableName, Item: item},
+				},
+			)
 		}
 		items = append(items, ddbtypes.TransactWriteItem{Update: headUpdate})
 		if _, err := kv.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items}); err != nil {
@@ -885,9 +902,9 @@ func (kv *KVStore) writeChunked(ctx context.Context, key string, value []byte, k
 }
 
 // readValue decrypts the value for a head, reassembling chunks when needed.
-func (kv *KVStore) readValue(ctx context.Context, key string, h kvHead) ([]byte, error) {
+func (kv *kvStore) readValue(ctx context.Context, key string, h kvHead) ([]byte, error) {
 	if h.Chunks == 0 {
-		pt, err := openStorage(kv.dek, h.Blob, getAAD(key, h.Version, 0, 0))
+		pt, err := kv.dek.Open(h.Blob, getAAD(key, h.Version, 0, 0))
 		if err != nil {
 			return nil, fmt.Errorf("kv get %q: %w", key, err)
 		}
@@ -899,19 +916,27 @@ func (kv *KVStore) readValue(ctx context.Context, key string, h kvHead) ([]byte,
 	}
 	out := make([]byte, 0, h.NBytes)
 	for i, blob := range chunks {
-		pt, err := openStorage(kv.dek, blob, getAAD(key, h.Version, i, h.Chunks))
+		pt, err := kv.dek.Open(blob, getAAD(key, h.Version, i, h.Chunks))
 		if err != nil {
 			return nil, fmt.Errorf("kv get %q chunk %d: %w", key, i, err)
 		}
 		out = append(out, pt...)
 	}
 	if int64(len(out)) != h.NBytes {
-		return nil, fmt.Errorf("kv get %q: reassembled size %d != recorded %d", key, len(out), h.NBytes)
+		return nil, fmt.Errorf(
+			"kv get %q: reassembled size %d != recorded %d",
+			key,
+			len(out),
+			h.NBytes,
+		)
 	}
 	return out, nil
 }
 
-func (kv *KVStore) putChunks(ctx context.Context, items []map[string]ddbtypes.AttributeValue) error {
+func (kv *kvStore) putChunks(
+	ctx context.Context,
+	items []map[string]ddbtypes.AttributeValue,
+) error {
 	const batch = 25 // DynamoDB BatchWriteItem limit
 	for start := 0; start < len(items); start += batch {
 		end := min(start+batch, len(items))
@@ -927,7 +952,7 @@ func (kv *KVStore) putChunks(ctx context.Context, items []map[string]ddbtypes.At
 }
 
 // batchWrite issues a BatchWriteItem and retries any UnprocessedItems.
-func (kv *KVStore) batchWrite(ctx context.Context, reqs []ddbtypes.WriteRequest) error {
+func (kv *kvStore) batchWrite(ctx context.Context, reqs []ddbtypes.WriteRequest) error {
 	pending := map[string][]ddbtypes.WriteRequest{kv.tableName: reqs}
 	for attempt := 0; attempt < 5 && len(pending) > 0; attempt++ {
 		out, err := kv.ddb.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: pending})
@@ -945,7 +970,12 @@ func (kv *KVStore) batchWrite(ctx context.Context, reqs []ddbtypes.WriteRequest)
 	return nil
 }
 
-func (kv *KVStore) getChunks(ctx context.Context, key string, version uint64, count int) ([][]byte, error) {
+func (kv *kvStore) getChunks(
+	ctx context.Context,
+	key string,
+	version uint64,
+	count int,
+) ([][]byte, error) {
 	out := make([][]byte, count)
 	const batch = 100 // BatchGetItem limit
 	for start := 0; start < count; start += batch {
@@ -983,7 +1013,10 @@ func (kv *KVStore) getChunks(ctx context.Context, key string, version uint64, co
 }
 
 // batchGet issues a BatchGetItem (consistent) and retries UnprocessedKeys.
-func (kv *KVStore) batchGet(ctx context.Context, keys []map[string]ddbtypes.AttributeValue) ([]map[string]ddbtypes.AttributeValue, error) {
+func (kv *kvStore) batchGet(
+	ctx context.Context,
+	keys []map[string]ddbtypes.AttributeValue,
+) ([]map[string]ddbtypes.AttributeValue, error) {
 	var items []map[string]ddbtypes.AttributeValue
 	pending := map[string]ddbtypes.KeysAndAttributes{
 		kv.tableName: {Keys: keys, ConsistentRead: aws.Bool(true)},
@@ -1006,7 +1039,7 @@ func (kv *KVStore) batchGet(ctx context.Context, keys []map[string]ddbtypes.Attr
 }
 
 // writeTombstone marks key deleted at the next version; the head stays so the version counter is monotonic across delete/recreate.
-func (kv *KVStore) writeTombstone(ctx context.Context, key string, cur kvHead) (uint64, error) {
+func (kv *kvStore) writeTombstone(ctx context.Context, key string, cur kvHead) (uint64, error) {
 	next := cur.Version + 1
 	upd := expression.
 		Set(expression.Name(attrVersion), expression.Value(next)).
@@ -1015,7 +1048,10 @@ func (kv *KVStore) writeTombstone(ctx context.Context, key string, cur kvHead) (
 		Remove(expression.Name(attrBlob)).
 		Remove(expression.Name(attrNBytes)).
 		Remove(expression.Name(attrExpires))
-	expr, err := expression.NewBuilder().WithUpdate(upd).WithCondition(versionCAS(cur.Version)).Build()
+	expr, err := expression.NewBuilder().
+		WithUpdate(upd).
+		WithCondition(versionCAS(cur.Version)).
+		Build()
 	if err != nil {
 		return 0, err
 	}
@@ -1039,14 +1075,14 @@ func (kv *KVStore) writeTombstone(ctx context.Context, key string, cur kvHead) (
 	if cur.Chunks > 0 {
 		kv.gcChunks(ctx, key, cur.Version, cur.Chunks)
 	}
-	if err := kv.anchor.record(ctx, key, next); err != nil {
+	if err := kv.anchor.Record(ctx, key, next); err != nil {
 		return 0, fmt.Errorf("kv del %q: anchor: %w", key, err)
 	}
 	return next, nil
 }
 
 // gcChunks best-effort deletes a stale version's chunk items.
-func (kv *KVStore) gcChunks(ctx context.Context, key string, version uint64, count int) {
+func (kv *kvStore) gcChunks(ctx context.Context, key string, version uint64, count int) {
 	const batch = 25
 	for start := 0; start < count; start += batch {
 		end := min(start+batch, count)
@@ -1056,18 +1092,13 @@ func (kv *KVStore) gcChunks(ctx context.Context, key string, version uint64, cou
 			if err != nil {
 				continue
 			}
-			reqs = append(reqs, ddbtypes.WriteRequest{DeleteRequest: &ddbtypes.DeleteRequest{Key: k}})
+			reqs = append(
+				reqs,
+				ddbtypes.WriteRequest{DeleteRequest: &ddbtypes.DeleteRequest{Key: k}},
+			)
 		}
-		_ = kv.batchWrite(ctx, reqs) // best-effort; a periodic sweep catches misses
+		_ = kv.batchWrite(ctx, reqs) // best-effort; ignore cleanup failure
 	}
-}
-
-// NewKVStore constructs the subsystem; a nil ddb uses the shared client from kms.aws.
-func NewKVStore(kms *KMS, ddb DynamoDBAPI) *KVStore {
-	if ddb == nil {
-		ddb = kms.aws.DDB
-	}
-	return &KVStore{kms: kms, ddb: ddb, maxValue: kvMaxValue()}
 }
 
 // encodeScanCursor packs a LastEvaluatedKey into an opaque cursor ("0" when exhausted).
@@ -1098,18 +1129,19 @@ func decodeScanCursor(cursor string) (map[string]ddbtypes.AttributeValue, error)
 }
 
 func kvMaxValue() int {
-	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("ENCLAVE_KV_MAX_VALUE_BYTES"))); err == nil && n > 0 {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("ENCLAVE_KV_MAX_VALUE_BYTES"))); err == nil &&
+		n > 0 {
 		return n
 	}
 	return kvDefaultMaxValue
 }
 
-// kvTableNameParam: SSM path where tofu publishes the DynamoDB table name.
+// kvTableNameParam returns the SSM table-name parameter.
 func kvTableNameParam() string {
 	return fmt.Sprintf("/%s/%s/KVTableName", getDeployment(), getAppName())
 }
 
-// getAAD binds a chunk to {deployment, app, key, version, chunkIndex, chunkCount} so any replay/relabel fails the GCM tag check.
+// getAAD binds chunks to deployment/app/key/version/index/count.
 func getAAD(key string, version uint64, chunkIndex, chunkCount int) []byte {
 	return fmt.Appendf(nil, "%s/%s/kv/%s/v%d/c%d/%d",
 		getDeployment(), getAppName(), key, version, chunkIndex, chunkCount)

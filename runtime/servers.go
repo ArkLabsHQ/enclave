@@ -1,0 +1,639 @@
+package runtime
+
+// servers.go wires public/private muxes, admin handlers, reverse proxy, and listeners.
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/http/pprof"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/mdlayher/vsock"
+	"golang.org/x/net/http2"
+)
+
+const (
+	indexPage      = "This host runs inside an AWS Nitro Enclave.\n"
+	nonceNumDigits = 40 // 20-byte nonce, hex-encoded
+)
+
+var (
+	errFailedReqBody = errors.New("failed to read request body")
+	errHashWrongSize = errors.New("given hash is of invalid size")
+
+	errBadForm        = "failed to parse POST form data"
+	errNoNonce        = "could not find nonce in URL query parameters"
+	errBadNonceFormat = fmt.Sprintf(
+		"unexpected nonce format; must be %d-digit hex string",
+		nonceNumDigits,
+	)
+	errFailedAttestation = "failed to obtain attestation document from hypervisor"
+	errProfilingSet      = "attestation disabled because profiling is enabled"
+)
+
+type Servers interface {
+	Start(ctx context.Context, cfg Config)
+	StartRESPServer(ctx context.Context, resp RESPServer) error
+	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
+	ConfigureMigrationHandler(ctx context.Context, migrator Migrator) error
+}
+
+type servers struct {
+	ext     *http.Server
+	int     *http.Server
+	sm      *http.ServeMux
+	im      *http.ServeMux
+	em      *http.ServeMux
+	rt      RuntimeState
+	signer  AttestationSigner
+	metrics *Metrics
+}
+
+func SetupHttpServers(
+	rt RuntimeState,
+	cfg Config,
+	nsm NSM,
+	metrics *Metrics,
+	logging *Logging,
+	tracing *Tracing,
+	signer AttestationSigner,
+	hashes AttestationHashes,
+	authToken string,
+) Servers {
+	loggingMW := metricsMiddleware(metrics)
+	attestationMW := attestationMiddleware(signer)
+
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
+	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
+
+	revProxy := httputil.NewSingleHostReverseProxy(cfg.AppWebSrv)
+	revProxy.BufferPool = nitriding.NewBufPool()
+	revProxy.Transport = upstreamTransport(cfg.UpstreamProtocol)
+	revProxy.FlushInterval = -1
+	revProxy.ModifyResponse = func(*http.Response) error {
+		metrics.Inc(metrics.AppProxiedRequests, "enclave_app_proxied_requests_total")
+		return nil
+	}
+	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		metrics.Inc(metrics.AppProxiedErrors, "enclave_app_proxied_errors_total")
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
+	sm := http.NewServeMux()
+	sm.HandleFunc("POST /v1/metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
+	sm.HandleFunc("GET /v1/enclave-metrics", HandleMetricGet(metrics))
+	sm.Handle("GET /health", healthHandler(rt))
+	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(logging)))
+	sm.HandleFunc("GET /v1/enclave-logs", handleLogsGet(logging))
+	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
+	sm.HandleFunc("GET /v1/enclave-traces", HandleTracingGet(tracing))
+
+	em := http.NewServeMux()
+	em.HandleFunc("GET /enclave/attestation", attestationHandler(cfg.UseProfiling, nsm, hashes))
+	em.HandleFunc("GET /enclave", rootHandler(cfg))
+	em.HandleFunc("GET /enclave/config", configHandler(cfg))
+	em.Handle("/v1/", corsWildcard(sm))
+	em.Handle("/health", sm)
+	em.Handle("/", revProxy)
+
+	if cfg.UseProfiling {
+		profiler := http.NewServeMux()
+		profiler.HandleFunc("GET /debug/pprof/", pprof.Index)
+		profiler.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		profiler.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		profiler.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		profiler.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+		profiler.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		// Q: Should this be on the external HTTP server? Auth?
+		em.Handle("/enclave/debug/", http.StripPrefix("/enclave", profiler))
+	}
+
+	im := http.NewServeMux()
+	// Q: Do we need this?
+	im.HandleFunc("POST /enclave/hash", hashHandler(hashes))
+	im.Handle("/v1/", sm)
+	im.Handle("/health", sm)
+
+	ext := &http.Server{
+		Handler: loggingMW(attestationMW(em)),
+		TLSConfig: &tls.Config{
+			GetCertificate: certCallback(rt, cfg),
+			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
+		},
+	}
+
+	if cfg.DisableKeepAlives {
+		ext.SetKeepAlivesEnabled(false)
+	}
+
+	int := &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
+		Handler: loggingMW(attestationMW(im)),
+	}
+
+	return &servers{
+		ext:     ext,
+		int:     int,
+		sm:      sm,
+		em:      em,
+		im:      im,
+		rt:      rt,
+		signer:  signer,
+		metrics: metrics,
+	}
+}
+
+func (s *servers) Start(ctx context.Context, cfg Config) {
+	go func() {
+		if err := s.int.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.rt.NotifyListenerError(fmt.Errorf("private listener: %w", err))
+		}
+	}()
+
+	go func() {
+		var lis net.Listener
+		var err error
+		if cfg.UseVsockForExtPort {
+			lis, err = vsock.Listen(uint32(cfg.ExtPort), nil)
+		} else {
+			lis, err = net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
+		}
+		if err != nil {
+			s.rt.NotifyListenerError(fmt.Errorf("listen on external port: %w", err))
+			return
+		}
+
+		if err := s.ext.ServeTLS(lis, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.rt.NotifyListenerError(fmt.Errorf("public listener: %w", err))
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		_ = s.int.Close()
+		_ = s.ext.Close()
+	}()
+}
+
+func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {
+	port := respPort()
+	addr := fmt.Sprintf(":%d", port)
+
+	raw, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("RESP listener bind failed", "addr", addr, "error", err)
+		return err
+	}
+
+	lis := tls.NewListener(raw, s.ext.TLSConfig)
+	slog.Info("starting RESP listener", "addr", addr)
+
+	go func() {
+		<-ctx.Done()
+		_ = lis.Close()
+	}()
+
+	go func() {
+		if err := resp.Serve(lis); err != nil && ctx.Err() == nil {
+			slog.Error("RESP listener exited", "error", err)
+			s.rt.NotifyListenerError(fmt.Errorf("RESP listener: %w", err))
+		}
+	}()
+
+	return nil
+}
+
+type PCR0SignatureInfo struct {
+	PubkeyPEM    string `json:"pubkey_pem"`
+	PCR0Hex      string `json:"pcr0_hex"`
+	SignatureB64 string `json:"signature_b64"`
+}
+
+// RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
+type RuntimeInfo struct {
+	Version                    string             `json:"version"`
+	PreviousPCR0               string             `json:"previous_pcr0"`
+	PreviousPCR0Attestation    string             `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey          string             `json:"attestation_pubkey,omitempty"`
+	Metrics                    map[string]any     `json:"metrics"`
+	MigrationCooldownSeconds   int                `json:"migration_cooldown_seconds"`
+	MigrationCooldownRemaining int                `json:"migration_cooldown_remaining,omitempty"`
+	MigrationPending           bool               `json:"migration_pending"`
+	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
+	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
+	KMSKeyLocked               bool               `json:"kms_key_locked"`
+}
+
+func (s *servers) ConfigureEnclaveInfoHandler(
+	ctx context.Context,
+	migrator Migrator,
+	ssm SSM,
+) error {
+	deployment := getDeployment()
+	appName := getAppName()
+	pubkeyPath := fmt.Sprintf("/%s/%s/Signing/PubkeyPEM", deployment, appName)
+	pcr0Path := fmt.Sprintf("/%s/%s/Signing/PCR0", deployment, appName)
+	sigPath := fmt.Sprintf("/%s/%s/Signing/Signature", deployment, appName)
+
+	pubkey, err := ssm.MayGet(ctx, pubkeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to load signature pubkey: %w", err)
+	}
+
+	pcr0, err := ssm.MayGet(ctx, pcr0Path)
+	if err != nil {
+		return fmt.Errorf("failed to load signature PCR0: %w", err)
+	}
+
+	sig, err := ssm.MayGet(ctx, sigPath)
+	if err != nil {
+		return fmt.Errorf("failed to load signature: %w", err)
+	}
+
+	// Q: What is this for? Do we still need it?
+	pcr0SigInfo := &PCR0SignatureInfo{
+		PubkeyPEM:    pubkey,
+		PCR0Hex:      pcr0,
+		SignatureB64: sig,
+	}
+
+	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		cooldownStatus, err := migrator.CooldownStatus(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprint("failed to get cooldown status: %w", err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		prevInfo, err := migrator.PreviousPCR0Info(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprint("failed to get previous PCR0 info: %w", err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(RuntimeInfo{
+			Version:                    Version,
+			PreviousPCR0:               prevInfo.PCR0,
+			PreviousPCR0Attestation:    prevInfo.Attestation,
+			AttestationPubkey:          s.signer.Pubkey(),
+			Metrics:                    s.metrics.MetricsSnapshot(),
+			MigrationCooldownSeconds:   cooldownStatus.ConfiguredSeconds,
+			MigrationCooldownRemaining: cooldownStatus.RemainingSeconds,
+			MigrationPending:           cooldownStatus.Pending,
+			PCR0Signature:              pcr0SigInfo,
+			UpstreamApp:                s.rt.UpstreamAppInfo(),
+			KMSKeyLocked:               kmsKeyLocked(),
+		})
+	})
+
+	return nil
+}
+
+func (s *servers) ConfigureMigrationHandler(ctx context.Context, migrator Migrator) error {
+	s.em.HandleFunc("POST /v1/start-migration", func(w http.ResponseWriter, r *http.Request) {
+		var req StartMigrationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if err := req.Validate(); err != nil {
+			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		res, err := migrator.StartMigration(r.Context(), req.NewPCR0)
+		if err != nil {
+			http.Error(
+				w,
+				fmt.Sprintf("failed to start migration: %v", err),
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
+	})
+
+	return nil
+}
+
+func attestationMiddleware(signer AttestationSigner) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Skip signing for gRPC; attested TLS verifies identity, and buffering breaks streams.
+			if isGRPCRequest(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			rec := &responseRecorder{
+				headers: w.Header(),
+				body:    &bytes.Buffer{},
+				status:  http.StatusOK,
+			}
+			next.ServeHTTP(rec, r)
+
+			body := rec.body.Bytes()
+			if sig := signer.Sign(body); sig != "" {
+				w.Header().Set("X-Attestation-Signature", sig)
+				w.Header().Set("X-Attestation-Pubkey", signer.Pubkey())
+			} else {
+				w.Header().Set("X-Attestation-Error", "signing-failed")
+			}
+			w.WriteHeader(rec.status)
+			_, _ = w.Write(body)
+		})
+	}
+}
+
+func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(sw, r)
+			slog.Info(
+				"http request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.status,
+				"duration_ms", time.Since(start).Milliseconds(),
+			)
+			metrics.Inc(metrics.HTTPRequests, "http_requests_total")
+			if sw.status >= 400 {
+				metrics.Inc(metrics.HTTPErrors, "http_errors_total")
+			}
+		})
+	}
+}
+
+func withTokenAuth(token string, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			handler(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+			return
+		}
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(
+				w,
+				"invalid Authorization format, expected Bearer token",
+				http.StatusUnauthorized,
+			)
+			return
+		}
+		if strings.TrimPrefix(auth, prefix) != token {
+			http.Error(w, "invalid management token", http.StatusForbidden)
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
+// certCallback fills missing SNI with cfg.FQDN so ACME works for IP/loopback probes.
+func certCallback(rt RuntimeState, cfg Config) TLSCertCallback {
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		getCert, err := rt.GetTLSCertCallback(hello.Context())
+		if err != nil {
+			return nil, nil
+		}
+
+		if hello.ServerName == "" && cfg.FQDN != "" {
+			h := *hello
+			h.ServerName = cfg.FQDN
+			return getCert(&h)
+		}
+		return getCert(hello)
+	}
+}
+
+func formatIndexPage(appURL *url.URL) string {
+	page := indexPage
+	if appURL != nil {
+		page += fmt.Sprintf("\nIt runs the following code: %s\n", appURL.String())
+	}
+	return page
+}
+
+func rootHandler(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
+	}
+}
+
+func configHandler(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintln(w, cfg)
+	}
+}
+
+// attestationHandler serves NSM attestation binding TLS and response-signing key hashes.
+func attestationHandler(useProfiling bool, nsm NSM, hashes AttestationHashes) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Q: Why does enabling profiling disable the attestation endpoint?
+		if useProfiling {
+			http.Error(w, errProfilingSet, http.StatusServiceUnavailable)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, errBadForm, http.StatusBadRequest)
+			return
+		}
+		nonce := strings.ToLower(r.URL.Query().Get("nonce"))
+		if nonce == "" {
+			http.Error(w, errNoNonce, http.StatusBadRequest)
+			return
+		}
+
+		rawNonce, err := hex.DecodeString(nonce)
+		if err != nil {
+			http.Error(w, errBadNonceFormat, http.StatusBadRequest)
+			return
+		}
+
+		doc, _, err := nsm.BuildAttestationDocument(
+			WithNonce(rawNonce),
+			WithUserData(hashes.Serialize()),
+		)
+		if err != nil {
+			http.Error(w, errFailedAttestation, http.StatusInternalServerError)
+			return
+		}
+
+		_, _ = fmt.Fprintln(w, base64.StdEncoding.EncodeToString(doc))
+	}
+}
+
+func hashHandler(hashes AttestationHashes) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		maxReadLen := base64.StdEncoding.EncodedLen(sha256.Size) + 1
+		body, err := io.ReadAll(nitriding.NewLimitReader(r.Body, maxReadLen))
+		if errors.Is(err, nitriding.ErrTooMuchToRead) {
+			http.Error(w, nitriding.ErrTooMuchToRead.Error(), http.StatusBadRequest)
+			return
+		}
+		if err != nil {
+			http.Error(w, errFailedReqBody.Error(), http.StatusInternalServerError)
+			return
+		}
+		keyHash, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(body)))
+		if err != nil {
+			http.Error(w, "base64 decode failed", http.StatusBadRequest)
+			return
+		}
+		if len(keyHash) != sha256.Size {
+			http.Error(w, errHashWrongSize.Error(), http.StatusBadRequest)
+			return
+		}
+		var h [sha256.Size]byte
+		copy(h[:], keyHash)
+		hashes.SetSigningKeyHash(h)
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// UpstreamAppInfo reports whether the user app process has exited and, if
+// so, the error from its exit. The runtime stays alive after app exit so
+// admin endpoints remain reachable.
+type UpstreamAppInfo struct {
+	Exited bool   `json:"exited"`
+	Error  string `json:"error,omitempty"`
+}
+
+// healthHandler returns 200 once Ready() is true, 503 otherwise.
+func healthHandler(rt RuntimeState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !rt.Ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "initializing"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	}
+}
+
+// protocolSwitchTransport forwards each proxied request to the user app over
+// the same HTTP version the client used — h2c for HTTP/2 inbound, HTTP/1.1 for
+// HTTP/1.1 — via the inbound ProtoMajor that ReverseProxy preserves on RoundTrip.
+type protocolSwitchTransport struct {
+	h1  http.RoundTripper
+	h2c http.RoundTripper
+}
+
+func (t *protocolSwitchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.ProtoMajor == 1 {
+		return t.h1.RoundTrip(r)
+	}
+	return t.h2c.RoundTrip(r)
+}
+
+// upstreamTransport builds the reverse-proxy transport for the runtime->app
+// hop, selected by ENCLAVE_NITRIDING_UPSTREAM: "h2c" or "h1" pin a single
+// protocol; "auto" (the default) matches the inbound protocol per request.
+// h2c is required for gRPC; h1 suits a plain HTTP/1.1 app.
+func upstreamTransport(mode string) http.RoundTripper {
+	h1 := &http.Transport{}
+	h2c := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	switch mode {
+	case "h2c":
+		return h2c
+	case "h1":
+		return h1
+	default:
+		return &protocolSwitchTransport{h1: h1, h2c: h2c}
+	}
+}
+
+// corsWildcard adds permissive CORS to /v1/* admin endpoints; app CORS stays upstream.
+func corsWildcard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "*")
+		h.Set("Access-Control-Allow-Headers", "*")
+		h.Set("Access-Control-Expose-Headers", "*")
+		h.Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// responseRecorder buffers body/status for response-signing middleware.
+type responseRecorder struct {
+	headers http.Header
+	body    *bytes.Buffer
+	status  int
+}
+
+func (r *responseRecorder) Header() http.Header         { return r.headers }
+func (r *responseRecorder) WriteHeader(code int)        { r.status = code }
+func (r *responseRecorder) Write(b []byte) (int, error) { return r.body.Write(b) }
+func (r *responseRecorder) ReadFrom(s io.Reader) (int64, error) {
+	return io.Copy(r.body, s)
+}
+
+// statusWriter captures status and forwards Flush for streaming responses.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// isGRPCRequest detects gRPC/gRPC-Web so signing middleware can avoid buffering.
+func isGRPCRequest(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "application/grpc-web") {
+		return true
+	}
+	if r.ProtoMajor != 2 {
+		return false
+	}
+	return strings.HasPrefix(ct, "application/grpc")
+}

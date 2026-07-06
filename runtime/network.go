@@ -1,36 +1,58 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/viproxy"
 	"github.com/mdlayher/vsock"
 )
 
-// Viproxy defaults
-//
-//	IN_ADDRS=127.0.0.1:80 OUT_ADDRS=3:8002 /app/proxy
-//
-// Inside the enclave, local traffic to 127.0.0.1:80 (the AWS SDK's IMDS
-// endpoint) is forwarded over AF_VSOCK to the EC2 host (CID 3) on port 8002,
-// where the host supervisor's IMDS forwarder reaches the real 169.254.169.254.
+// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
 const (
 	viproxyDefaultIn  = "127.0.0.1:80"
 	viproxyDefaultOut = "3:8002"
 	imdsEndpointEnv   = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
 )
 
-// StartViproxy launches the in-process IMDS forwarder unless disabled via
+func StartNetorking(ctx context.Context, cfg Config) error {
+	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0o644); err != nil {
+		slog.Debug("write /etc/resolv.conf", "error", err)
+	}
+
+	// Start IMDS proxy before AWS clients load credentials.
+	if err := startViproxy(); err != nil {
+		return fmt.Errorf("failed to start viproxy: %w", err)
+	}
+
+	if nitriding.InEnclave() {
+		if err := nitriding.SetFdLimit(cfg.FdCur, cfg.FdMax); err != nil {
+			slog.Warn("set fd limit", "error", err)
+		}
+		if err := nitriding.ConfigureLoIface(); err != nil {
+			return fmt.Errorf("failed to start enclave HTTP server %w", err)
+		}
+	}
+
+	go nitriding.RunNetworking(ctx, cfg.HostProxyPort)
+
+	return nil
+}
+
+// startViproxy launches the in-process IMDS forwarder unless disabled via
 // ENCLAVE_VIPROXY_ENABLED=false. It returns once the listener is bound.
 //
 // Also sets AWS_EC2_METADATA_SERVICE_ENDPOINT so the AWS SDK targets the
 // local forwarder instead of the real (unreachable from inside an enclave)
 // 169.254.169.254.
-func StartViproxy() error {
+func startViproxy() error {
 	if strings.EqualFold(envDefault("ENCLAVE_VIPROXY_ENABLED", "true"), "false") {
 		return nil
 	}

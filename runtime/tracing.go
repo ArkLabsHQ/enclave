@@ -16,20 +16,113 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/trace"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 )
 
-// =============================================================================
-// SpanEntry + SpanBuffer
-// =============================================================================
+// Tracing owns the span buffer and optional CloudWatch shipper.
+type Tracing struct {
+	buf    *spanBuffer
+	shipCh chan spanEntry
+	cw     CloudWatchLogsAPI
+}
 
-// SpanEntry is a single trace span from the app or supervisor.
-type SpanEntry struct {
+// NewTracing sends supervisor spans to the local span buffer.
+func NewTracing(cw CloudWatchLogsAPI) *Tracing {
+	t := &Tracing{
+		buf: newSpanBuffer(spanBufferSize()),
+	}
+
+	if cloudwatchLogsEnabled() {
+		t.cw = cw
+		t.shipCh = make(chan spanEntry, 1000)
+	}
+
+	exporter := &bufferSpanExporter{buf: t.buf, shipCh: t.shipCh}
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(nil),
+	))
+
+	return t
+}
+
+// StartCloudWatchExport ships span batches to CloudWatch; no-op when disabled.
+func (t *Tracing) StartCloudWatchExport(ctx context.Context) error {
+	if t.shipCh == nil {
+		return nil
+	}
+	deployment := getDeployment()
+	appName := getAppName()
+	logGroup := fmt.Sprintf("/enclave/%s/%s/traces", deployment, appName)
+	logStream := time.Now().UTC().Format("2006-01-02T15-04-05Z")
+
+	if err := ensureLogGroupAndStream(ctx, t.cw, logGroup, logStream); err != nil {
+		return err
+	}
+
+	var batch []cwltypes.InputLogEvent
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		sort.Slice(batch, func(i, j int) bool {
+			return *batch[i].Timestamp < *batch[j].Timestamp
+		})
+		_, err := t.cw.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
+			LogGroupName:  aws.String(logGroup),
+			LogStreamName: aws.String(logStream),
+			LogEvents:     batch,
+		})
+		if err != nil {
+			slog.Warn("span shipper: PutLogEvents failed", "error", err, "count", len(batch))
+			return
+		}
+		batch = nil
+	}
+
+	go func() {
+		ticker := time.NewTicker(logShipInterval())
+		defer ticker.Stop()
+		slog.Info("span shipper started", "log_group", logGroup, "log_stream", logStream)
+
+		for {
+			select {
+			case <-ctx.Done():
+				flush()
+				return
+			case entry, ok := <-t.shipCh:
+				if !ok {
+					flush()
+					return
+				}
+				msg, _ := json.Marshal(entry)
+				ts := time.Now().UnixMilli()
+				if tt, err := time.Parse(time.RFC3339Nano, entry.Start); err == nil {
+					ts = tt.UnixMilli()
+				}
+				batch = append(batch, cwltypes.InputLogEvent{
+					Message:   aws.String(string(msg)),
+					Timestamp: aws.Int64(ts),
+				})
+				if len(batch) >= 100 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
+
+	return nil
+}
+
+// spanEntry is a single trace span from the app or supervisor.
+type spanEntry struct {
 	ID         string         `json:"id"`
 	TraceID    string         `json:"trace_id"`
 	ParentID   string         `json:"parent_id,omitempty"`
@@ -41,28 +134,27 @@ type SpanEntry struct {
 	Source     string         `json:"source"` // "app" or "supervisor"
 }
 
-// SpanBuffer is a bounded ring buffer for span entries.
-type SpanBuffer struct {
+// spanBuffer is a bounded ring buffer for span entries.
+type spanBuffer struct {
 	mu      sync.Mutex
-	entries []SpanEntry
+	entries []spanEntry
 	cap     int
 	head    int
 	count   int
 }
 
-// NewSpanBuffer creates a ring buffer with the given capacity.
-func NewSpanBuffer(capacity int) *SpanBuffer {
+func newSpanBuffer(capacity int) *spanBuffer {
 	if capacity <= 0 {
 		capacity = 1000
 	}
-	return &SpanBuffer{
-		entries: make([]SpanEntry, capacity),
+	return &spanBuffer{
+		entries: make([]spanEntry, capacity),
 		cap:     capacity,
 	}
 }
 
-// Add appends span entries, evicting oldest when full.
-func (sb *SpanBuffer) Add(entries ...SpanEntry) {
+// add appends spans, evicting oldest.
+func (sb *spanBuffer) add(entries ...spanEntry) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	for _, e := range entries {
@@ -74,8 +166,8 @@ func (sb *SpanBuffer) Add(entries ...SpanEntry) {
 	}
 }
 
-// Query returns span entries matching filters, oldest first.
-func (sb *SpanBuffer) Query(since time.Time, service string, limit int) []SpanEntry {
+// query filters spans oldest-first.
+func (sb *spanBuffer) query(since time.Time, service string, limit int) []spanEntry {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
@@ -84,7 +176,7 @@ func (sb *SpanBuffer) Query(since time.Time, service string, limit int) []SpanEn
 		start = sb.head
 	}
 
-	result := make([]SpanEntry, 0, sb.count)
+	result := make([]spanEntry, 0, sb.count)
 	for i := 0; i < sb.count; i++ {
 		idx := (start + i) % sb.cap
 		e := sb.entries[idx]
@@ -109,249 +201,84 @@ func (sb *SpanBuffer) Query(since time.Time, service string, limit int) []SpanEn
 	return result
 }
 
-// =============================================================================
-// Tracing subsystem
-// =============================================================================
+// HandleTracingPost accepts OTLP protobuf spans.
+func HandleTracingPost(t *Tracing) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := http.MaxBytesReader(w, r.Body, 1<<20)
+		defer func() { _ = body.Close() }()
 
-// Tracing owns the in-memory SpanBuffer, the CloudWatch ship channel, and
-// the OTEL tracer used by supervisor instrumentation. Spans from in-process
-// tracer.Start calls and from OTLP HTTP ingest both land in the same buf.
-type Tracing struct {
-	buf     *SpanBuffer
-	shipCh  chan SpanEntry
-	tracer  trace.Tracer
-	tp      *sdktrace.TracerProvider
-	metrics *Metrics
-	aws     *AWSClient
-	auth    func(http.ResponseWriter, *http.Request) bool
-}
-
-// NewTracing constructs the tracing subsystem and starts the OTEL
-// TracerProvider. Spans are exported directly into the SpanBuffer (no
-// network). metrics may be nil for tests; aws is required for the
-// CloudWatch shipper but may be nil when shipping is disabled.
-func NewTracing(metrics *Metrics, aws *AWSClient, auth func(http.ResponseWriter, *http.Request) bool) *Tracing {
-	t := &Tracing{
-		buf:     NewSpanBuffer(spanBufferSize()),
-		metrics: metrics,
-		aws:     aws,
-		auth:    auth,
-	}
-	if cloudwatchLogsEnabled() {
-		t.shipCh = make(chan SpanEntry, 1000)
-	}
-
-	exporter := &bufferSpanExporter{buf: t.buf, shipCh: t.shipCh}
-	t.tp = sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(nil), // default resource
-	)
-	otel.SetTracerProvider(t.tp)
-	t.tracer = t.tp.Tracer("runtime")
-	return t
-}
-
-// Buffer exposes the SpanBuffer.
-func (t *Tracing) Buffer() *SpanBuffer { return t.buf }
-
-// Shutdown stops the underlying OTEL TracerProvider, flushing pending spans.
-func (t *Tracing) Shutdown(ctx context.Context) error {
-	if t == nil || t.tp == nil {
-		return nil
-	}
-	return t.tp.Shutdown(ctx)
-}
-
-// Span starts a new span on the supervisor tracer.
-// Usage: ctx, span := r.tracing.Span(ctx, "init.kms_policy")
-// defer span.End()
-func (t *Tracing) Span(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
-	if t == nil || t.tracer == nil {
-		return ctx, trace.SpanFromContext(ctx) // noop if tracing not initialized
-	}
-	return t.tracer.Start(ctx, name, trace.WithAttributes(attrs...))
-}
-
-// SpanError records an error on a span and sets its status to error.
-func SpanError(span trace.Span, err error) {
-	if err == nil {
-		return
-	}
-	span.RecordError(err)
-	span.SetStatus(2, err.Error()) // codes.Error = 2
-}
-
-// SpanOK sets a span's status to OK.
-func SpanOK(span trace.Span) {
-	span.SetStatus(1, "") // codes.Ok = 1
-}
-
-// SpanSetAttr adds attributes to a span.
-func SpanSetAttr(span trace.Span, attrs ...attribute.KeyValue) {
-	span.SetAttributes(attrs...)
-}
-
-// Attr helpers for common span attributes.
-func AttrString(key, val string) attribute.KeyValue  { return attribute.String(key, val) }
-func AttrInt(key string, val int) attribute.KeyValue { return attribute.Int(key, val) }
-func AttrError(err error) attribute.KeyValue         { return attribute.String("error", fmt.Sprint(err)) }
-
-// RegisterRoutes attaches the trace endpoints on mux.
-func (t *Tracing) RegisterRoutes(mux Mux) {
-	mux.HandleFunc("POST /v1/traces", t.handlePost)
-	mux.HandleFunc("GET /v1/enclave-traces", t.handleGet)
-}
-
-// handlePost accepts OTLP trace spans from the app.
-// POST /v1/traces (Content-Type: application/x-protobuf)
-func (t *Tracing) handlePost(w http.ResponseWriter, r *http.Request) {
-	if t.auth != nil && !t.auth(w, r) {
-		return
-	}
-
-	body := http.MaxBytesReader(w, r.Body, 1<<20)
-	defer func() { _ = body.Close() }()
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
-		return
-	}
-
-	entries, err := parseOTLPSpans(data)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"parse OTLP traces: %s"}`, err), http.StatusBadRequest)
-		return
-	}
-
-	t.buf.Add(entries...)
-
-	if t.shipCh != nil {
-		for _, entry := range entries {
-			select {
-			case t.shipCh <- entry:
-			default:
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]int{"accepted": len(entries)})
-}
-
-// handleGet returns buffered spans.
-// GET /v1/enclave-traces?since=RFC3339&limit=100&service=app|supervisor
-func (t *Tracing) handleGet(w http.ResponseWriter, r *http.Request) {
-	var since time.Time
-	if s := r.URL.Query().Get("since"); s != "" {
-		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-			since = t
-		} else if t, err := time.Parse(time.RFC3339, s); err == nil {
-			since = t
-		}
-	}
-
-	service := r.URL.Query().Get("service")
-	limit := 0
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 {
-			limit = n
-		}
-	}
-
-	entries := t.buf.Query(since, service, limit)
-	if entries == nil {
-		entries = []SpanEntry{}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(entries)
-}
-
-// RunShipper batches span entries and ships to CloudWatch Logs.
-// No-op if shipping is disabled (shipCh is nil) or AWS clients are missing.
-func (t *Tracing) RunShipper(ctx context.Context) {
-	if t.shipCh == nil || t.aws == nil {
-		return
-	}
-	client := t.aws.CWL
-	deployment := getDeployment()
-	appName := getAppName()
-	logGroup := fmt.Sprintf("/enclave/%s/%s/traces", deployment, appName)
-	logStream := time.Now().UTC().Format("2006-01-02T15-04-05Z")
-
-	if err := ensureLogGroupAndStream(ctx, client, logGroup, logStream); err != nil {
-		slog.Error("span shipper: failed to create log group/stream", "error", err)
-		return
-	}
-
-	slog.Info("span shipper started", "log_group", logGroup, "log_stream", logStream)
-
-	ticker := time.NewTicker(logShipInterval())
-	defer ticker.Stop()
-
-	var batch []cwltypes.InputLogEvent
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		sort.Slice(batch, func(i, j int) bool {
-			return *batch[i].Timestamp < *batch[j].Timestamp
-		})
-		_, err := client.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
-			LogGroupName:  aws.String(logGroup),
-			LogStreamName: aws.String(logStream),
-			LogEvents:     batch,
-		})
+		data, err := io.ReadAll(body)
 		if err != nil {
-			slog.Warn("span shipper: PutLogEvents failed", "error", err, "count", len(batch))
+			http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
 			return
 		}
-		batch = nil
-	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
+		entries, err := parseOTLPSpans(data)
+		if err != nil {
+			http.Error(
+				w,
+				fmt.Sprintf(`{"error":"parse OTLP traces: %s"}`, err),
+				http.StatusBadRequest,
+			)
 			return
-		case entry, ok := <-t.shipCh:
-			if !ok {
-				flush()
-				return
-			}
-			msg, _ := json.Marshal(entry)
-			ts := time.Now().UnixMilli()
-			if tt, err := time.Parse(time.RFC3339Nano, entry.Start); err == nil {
-				ts = tt.UnixMilli()
-			}
-			batch = append(batch, cwltypes.InputLogEvent{
-				Message:   aws.String(string(msg)),
-				Timestamp: aws.Int64(ts),
-			})
-			if len(batch) >= 100 {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
 		}
+
+		t.buf.add(entries...)
+
+		if t.shipCh != nil {
+			for _, entry := range entries {
+				select {
+				case t.shipCh <- entry:
+				default:
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]int{"accepted": len(entries)})
 	}
 }
 
-// =============================================================================
-// OTLP ingest helpers (used by handlePost)
-// =============================================================================
+// HandleTracingGet returns buffered spans.
+// GET /v1/enclave-traces?since=RFC3339&limit=100&service=app|supervisor
+func HandleTracingGet(t *Tracing) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var since time.Time
+		if s := r.URL.Query().Get("since"); s != "" {
+			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				since = t
+			} else if t, err := time.Parse(time.RFC3339, s); err == nil {
+				since = t
+			}
+		}
 
-// parseOTLPSpans parses an OTLP ExportTraceServiceRequest and converts to SpanEntry.
-func parseOTLPSpans(body []byte) ([]SpanEntry, error) {
+		service := r.URL.Query().Get("service")
+		limit := 0
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 {
+				limit = n
+			}
+		}
+
+		entries := t.buf.query(since, service, limit)
+		if entries == nil {
+			entries = []spanEntry{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(entries)
+	}
+}
+
+// parseOTLPSpans decodes OTLP traces.
+func parseOTLPSpans(body []byte) ([]spanEntry, error) {
 	var req coltracepb.ExportTraceServiceRequest
 	if err := proto.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("unmarshal OTLP traces: %w", err)
 	}
 
-	var entries []SpanEntry
+	var entries []spanEntry
 	for _, rs := range req.ResourceSpans {
 		resourceAttrs := make(map[string]any)
 		if rs.Resource != nil {
@@ -369,8 +296,7 @@ func parseOTLPSpans(body []byte) ([]SpanEntry, error) {
 	return entries, nil
 }
 
-// spanToEntry converts an OTLP Span to a SpanEntry.
-func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) SpanEntry {
+func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) spanEntry {
 	attrs := make(map[string]any, len(resourceAttrs)+len(span.Attributes))
 	for k, v := range resourceAttrs {
 		attrs[k] = v
@@ -394,7 +320,7 @@ func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) SpanEntry {
 		}
 	}
 
-	return SpanEntry{
+	return spanEntry{
 		ID:         fmt.Sprintf("%x", span.SpanId),
 		TraceID:    fmt.Sprintf("%x", span.TraceId),
 		ParentID:   fmt.Sprintf("%x", span.ParentSpanId),
@@ -407,22 +333,16 @@ func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) SpanEntry {
 	}
 }
 
-// =============================================================================
-// bufferSpanExporter — sdktrace.SpanExporter that writes to SpanBuffer
-// =============================================================================
-
-// bufferSpanExporter implements sdktrace.SpanExporter by writing spans
-// directly to the SpanBuffer. No network hop — supervisor-emitted spans
-// go straight into the in-memory buffer (and optionally to CloudWatch).
+// bufferSpanExporter writes supervisor spans to the local buffer.
 type bufferSpanExporter struct {
-	buf    *SpanBuffer
-	shipCh chan SpanEntry
+	buf    *spanBuffer
+	shipCh chan spanEntry
 }
 
 func (e *bufferSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
 	for _, s := range spans {
 		entry := readOnlySpanToEntry(s)
-		e.buf.Add(entry)
+		e.buf.add(entry)
 		if e.shipCh != nil {
 			select {
 			case e.shipCh <- entry:
@@ -438,7 +358,7 @@ func (e *bufferSpanExporter) Shutdown(_ context.Context) error {
 }
 
 // readOnlySpanToEntry converts an OTEL SDK ReadOnlySpan to our SpanEntry.
-func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) SpanEntry {
+func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) spanEntry {
 	attrs := make(map[string]any)
 	for _, kv := range s.Attributes() {
 		attrs[string(kv.Key)] = kv.Value.Emit()
@@ -454,13 +374,13 @@ func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) SpanEntry {
 
 	status := "unset"
 	switch s.Status().Code {
-	case 1: // OK
+	case codes.Ok:
 		status = "ok"
-	case 2: // Error
+	case codes.Error:
 		status = "error"
 	}
 
-	return SpanEntry{
+	return spanEntry{
 		ID:         s.SpanContext().SpanID().String(),
 		TraceID:    s.SpanContext().TraceID().String(),
 		ParentID:   s.Parent().SpanID().String(),

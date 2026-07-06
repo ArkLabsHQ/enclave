@@ -3,9 +3,12 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -14,69 +17,166 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
-// Minimal interface views over the AWS SDK clients. Each lists only the
-// methods the runtime actually calls. Concrete *kms.Client, *ssm.Client,
-// etc. satisfy these by having matching method signatures, so subsystem
-// constructors take an interface and tests can supply a fake without
-// pulling in the whole SDK.
-
 // KMSAPI is the subset of *kms.Client used by the runtime.
 type KMSAPI interface {
-	Encrypt(ctx context.Context, params *kms.EncryptInput, optFns ...func(*kms.Options)) (*kms.EncryptOutput, error)
-	Decrypt(ctx context.Context, params *kms.DecryptInput, optFns ...func(*kms.Options)) (*kms.DecryptOutput, error)
-	GenerateDataKey(ctx context.Context, params *kms.GenerateDataKeyInput, optFns ...func(*kms.Options)) (*kms.GenerateDataKeyOutput, error)
-	GetKeyPolicy(ctx context.Context, params *kms.GetKeyPolicyInput, optFns ...func(*kms.Options)) (*kms.GetKeyPolicyOutput, error)
-	ScheduleKeyDeletion(ctx context.Context, params *kms.ScheduleKeyDeletionInput, optFns ...func(*kms.Options)) (*kms.ScheduleKeyDeletionOutput, error)
-	CreateKey(ctx context.Context, params *kms.CreateKeyInput, optFns ...func(*kms.Options)) (*kms.CreateKeyOutput, error)
+	Encrypt(
+		ctx context.Context,
+		params *kms.EncryptInput,
+		optFns ...func(*kms.Options),
+	) (*kms.EncryptOutput, error)
+	Decrypt(
+		ctx context.Context,
+		params *kms.DecryptInput,
+		optFns ...func(*kms.Options),
+	) (*kms.DecryptOutput, error)
+	GenerateDataKey(
+		ctx context.Context,
+		params *kms.GenerateDataKeyInput,
+		optFns ...func(*kms.Options),
+	) (*kms.GenerateDataKeyOutput, error)
+	GetKeyPolicy(
+		ctx context.Context,
+		params *kms.GetKeyPolicyInput,
+		optFns ...func(*kms.Options),
+	) (*kms.GetKeyPolicyOutput, error)
+	CreateKey(
+		ctx context.Context,
+		params *kms.CreateKeyInput,
+		optFns ...func(*kms.Options),
+	) (*kms.CreateKeyOutput, error)
 }
 
 // SSMAPI is the subset of *ssm.Client used by the runtime.
 type SSMAPI interface {
-	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
-	GetParametersByPath(ctx context.Context, params *ssm.GetParametersByPathInput, optFns ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error)
-	PutParameter(ctx context.Context, params *ssm.PutParameterInput, optFns ...func(*ssm.Options)) (*ssm.PutParameterOutput, error)
+	GetParameter(
+		ctx context.Context,
+		params *ssm.GetParameterInput,
+		optFns ...func(*ssm.Options),
+	) (*ssm.GetParameterOutput, error)
+	GetParametersByPath(
+		ctx context.Context,
+		params *ssm.GetParametersByPathInput,
+		optFns ...func(*ssm.Options),
+	) (*ssm.GetParametersByPathOutput, error)
+	PutParameter(
+		ctx context.Context,
+		params *ssm.PutParameterInput,
+		optFns ...func(*ssm.Options),
+	) (*ssm.PutParameterOutput, error)
 }
 
 // S3API is the subset of *s3.Client used by the runtime.
 type S3API interface {
-	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
-	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
-	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
-	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-	ListObjectVersions(ctx context.Context, params *s3.ListObjectVersionsInput, optFns ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error)
+	GetObject(
+		ctx context.Context,
+		params *s3.GetObjectInput,
+		optFns ...func(*s3.Options),
+	) (*s3.GetObjectOutput, error)
+	PutObject(
+		ctx context.Context,
+		params *s3.PutObjectInput,
+		optFns ...func(*s3.Options),
+	) (*s3.PutObjectOutput, error)
+	DeleteObject(
+		ctx context.Context,
+		params *s3.DeleteObjectInput,
+		optFns ...func(*s3.Options),
+	) (*s3.DeleteObjectOutput, error)
+	ListObjectsV2(
+		ctx context.Context,
+		params *s3.ListObjectsV2Input,
+		optFns ...func(*s3.Options),
+	) (*s3.ListObjectsV2Output, error)
+	ListObjectVersions(
+		ctx context.Context,
+		params *s3.ListObjectVersionsInput,
+		optFns ...func(*s3.Options),
+	) (*s3.ListObjectVersionsOutput, error)
 }
 
 // STSAPI is the subset of *sts.Client used by the runtime.
 type STSAPI interface {
-	GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error)
+	GetCallerIdentity(
+		ctx context.Context,
+		params *sts.GetCallerIdentityInput,
+		optFns ...func(*sts.Options),
+	) (*sts.GetCallerIdentityOutput, error)
 }
 
 // DynamoDBAPI is the subset of *dynamodb.Client used by the K/V store.
 type DynamoDBAPI interface {
-	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
-	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
-	UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
-	DeleteItem(ctx context.Context, params *dynamodb.DeleteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
-	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
-	Scan(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
-	BatchGetItem(ctx context.Context, params *dynamodb.BatchGetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchGetItemOutput, error)
-	BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error)
-	TransactWriteItems(ctx context.Context, params *dynamodb.TransactWriteItemsInput, optFns ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+	GetItem(
+		ctx context.Context,
+		params *dynamodb.GetItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.GetItemOutput, error)
+	PutItem(
+		ctx context.Context,
+		params *dynamodb.PutItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.PutItemOutput, error)
+	UpdateItem(
+		ctx context.Context,
+		params *dynamodb.UpdateItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.UpdateItemOutput, error)
+	DeleteItem(
+		ctx context.Context,
+		params *dynamodb.DeleteItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.DeleteItemOutput, error)
+	Query(
+		ctx context.Context,
+		params *dynamodb.QueryInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.QueryOutput, error)
+	Scan(
+		ctx context.Context,
+		params *dynamodb.ScanInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.ScanOutput, error)
+	BatchGetItem(
+		ctx context.Context,
+		params *dynamodb.BatchGetItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.BatchGetItemOutput, error)
+	BatchWriteItem(
+		ctx context.Context,
+		params *dynamodb.BatchWriteItemInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.BatchWriteItemOutput, error)
+	TransactWriteItems(
+		ctx context.Context,
+		params *dynamodb.TransactWriteItemsInput,
+		optFns ...func(*dynamodb.Options),
+	) (*dynamodb.TransactWriteItemsOutput, error)
 }
 
 // CloudWatchLogsAPI is the subset of *cloudwatchlogs.Client used by the runtime.
 type CloudWatchLogsAPI interface {
-	PutLogEvents(ctx context.Context, params *cloudwatchlogs.PutLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error)
-	CreateLogGroup(ctx context.Context, params *cloudwatchlogs.CreateLogGroupInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.CreateLogGroupOutput, error)
-	CreateLogStream(ctx context.Context, params *cloudwatchlogs.CreateLogStreamInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.CreateLogStreamOutput, error)
-	PutRetentionPolicy(ctx context.Context, params *cloudwatchlogs.PutRetentionPolicyInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutRetentionPolicyOutput, error)
+	PutLogEvents(
+		ctx context.Context,
+		params *cloudwatchlogs.PutLogEventsInput,
+		optFns ...func(*cloudwatchlogs.Options),
+	) (*cloudwatchlogs.PutLogEventsOutput, error)
+	CreateLogGroup(
+		ctx context.Context,
+		params *cloudwatchlogs.CreateLogGroupInput,
+		optFns ...func(*cloudwatchlogs.Options),
+	) (*cloudwatchlogs.CreateLogGroupOutput, error)
+	CreateLogStream(
+		ctx context.Context,
+		params *cloudwatchlogs.CreateLogStreamInput,
+		optFns ...func(*cloudwatchlogs.Options),
+	) (*cloudwatchlogs.CreateLogStreamOutput, error)
+	PutRetentionPolicy(
+		ctx context.Context,
+		params *cloudwatchlogs.PutRetentionPolicyInput,
+		optFns ...func(*cloudwatchlogs.Options),
+	) (*cloudwatchlogs.PutRetentionPolicyOutput, error)
 }
 
-// AWSClient bundles every AWS SDK client the runtime needs, built from a
-// single shared aws.Config. Constructed once in New() via NewAWSClients
-// and passed by pointer to every subsystem that needs AWS access — so
-// loadAWSConfigWithIMDS is called exactly once per supervisor process,
-// not 45 times like the pre-refactor code.
+// AWSClient bundles runtime AWS clients from one shared config.
 type AWSClient struct {
 	KMS KMSAPI
 	SSM SSMAPI
@@ -159,4 +259,33 @@ func newCloudWatchLogsClient(cfg aws.Config) *cloudwatchlogs.Client {
 		})
 	}
 	return cloudwatchlogs.NewFromConfig(cfg)
+}
+
+// loadAWSConfigWithIMDS loads AWS config using SDK defaults.
+// startViproxy points IMDS at the local forwarder before clients are built.
+func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
+	region := os.Getenv("ENCLAVE_AWS_REGION")
+
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	opts := []func(*awscfg.LoadOptions) error{
+		awscfg.WithRegion(region),
+		awscfg.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}),
+	}
+
+	// If IMDS endpoint is set via the standard env var, the SDK picks it up
+	// automatically. For the legacy IMDS_ENDPOINT env var, explicitly configure it.
+	if endpoint := os.Getenv("IMDS_ENDPOINT"); endpoint != "" &&
+		os.Getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT") == "" {
+		opts = append(opts, awscfg.WithEC2IMDSEndpoint("http://"+endpoint))
+	}
+
+	cfg, err := awscfg.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return aws.Config{}, err
+	}
+
+	return cfg, nil
 }

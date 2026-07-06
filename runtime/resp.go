@@ -11,42 +11,30 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/tidwall/redcon"
 )
 
-// RESP server: Redis-protocol front-end (redcon) over attestation-bound TLS, backed by KVStore.
+// RESP server backed by KVStore.
 
-// kvEngine is the subset of *KVStore the RESP layer drives.
-type kvEngine interface {
-	Get(ctx context.Context, key string) ([]byte, uint64, error)
-	SetMode(ctx context.Context, key string, value []byte, ttlSeconds int64, mode setMode) (uint64, bool, error)
-	Exists(ctx context.Context, key string) (bool, error)
-	Del(ctx context.Context, key string) (bool, uint64, error)
-	TTL(ctx context.Context, key string) (int64, error)
-	Expire(ctx context.Context, key string, ttlSeconds int64) (bool, uint64, error)
-	Incr(ctx context.Context, key string, delta int64) (int64, uint64, error)
-	Append(ctx context.Context, key string, suffix []byte) (int, error)
-	GetSet(ctx context.Context, key string, value []byte) (old []byte, existed bool, err error)
-	Rename(ctx context.Context, src, dst string) error
-	Persist(ctx context.Context, key string) (bool, error)
-	ScanKeys(ctx context.Context, cursor string, count int) ([]kvKeyInfo, string, error)
-	Version(ctx context.Context, key string) (uint64, error)
-	TypeOf(ctx context.Context, key string) (string, error)
-	ReadTyped(ctx context.Context, key, kvType string) ([]byte, bool, error)
-	ModifyTyped(ctx context.Context, key, kvType string, fn func(cur []byte) ([]byte, bool, error)) (uint64, error)
+type RESPServer interface {
+	Serve(ln net.Listener) error
 }
 
-// RESPServer dispatches RESP commands to the KV engine.
-type RESPServer struct {
-	kv         kvEngine
-	authToken  string // runtime bearer token; every connection must AUTH with it
+// respServer dispatches RESP commands to the KV engine.
+type respServer struct {
+	rt         RuntimeState
+	kv         KVStore
+	authToken  string // AUTH password
 	cmdTimeout time.Duration
-	halt       *atomic.Bool  // when set (rollback detected), data-plane commands are refused
 	pubsub     redcon.PubSub // shared SUBSCRIBE/PUBLISH state
+}
+
+// NewRESPServer returns an AUTH-gated RESP server.
+func NewRESPServer(rt RuntimeState, kv KVStore, authToken string) RESPServer {
+	return &respServer{rt: rt, kv: kv, authToken: authToken, cmdTimeout: 10 * time.Second}
 }
 
 // connState is per-connection state: auth status and any in-flight MULTI transaction.
@@ -57,19 +45,16 @@ type connState struct {
 	watched map[string]uint64 // WATCHed key → version at WATCH time
 }
 
-// zEntry is one sorted-set member with its score.
 type zEntry struct {
 	member string
 	score  float64
 }
 
-// streamEntry is one stream entry: an ID plus flat field/value pairs.
 type streamEntry struct {
 	ID     string   `cbor:"id"`
 	Fields []string `cbor:"f"`
 }
 
-// streamID is a parsed stream ID ("{ms}-{seq}").
 type streamID struct{ ms, seq uint64 }
 
 func (a streamID) cmp(b streamID) int {
@@ -85,19 +70,19 @@ func (a streamID) cmp(b streamID) int {
 
 func (id streamID) String() string { return fmt.Sprintf("%d-%d", id.ms, id.seq) }
 
-// Serve runs the RESP protocol on ln; blocks until the listener closes.
-func (s *RESPServer) Serve(ln net.Listener) error {
+// Serve blocks on the RESP listener.
+func (s *respServer) Serve(ln net.Listener) error {
 	return redcon.Serve(ln, s.handle, s.accept, s.closed)
 }
 
-func (s *RESPServer) accept(conn redcon.Conn) bool {
+func (s *respServer) accept(conn redcon.Conn) bool {
 	conn.SetContext(&connState{})
 	return true
 }
 
-func (s *RESPServer) closed(_ redcon.Conn, _ error) {}
+func (s *respServer) closed(_ redcon.Conn, _ error) {}
 
-func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) handle(conn redcon.Conn, cmd redcon.Command) {
 	name := strings.ToUpper(string(cmd.Args[0]))
 	st, _ := conn.Context().(*connState)
 
@@ -124,7 +109,7 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteArray(0)
 		return
 	case "CLIENT":
-		// CLIENT SETINFO/SETNAME expect a status reply; anything but +OK desyncs go-redis.
+		// go-redis CLIENT SETINFO/SETNAME wants +OK.
 		conn.WriteString("OK")
 		return
 	}
@@ -134,16 +119,18 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	if s.halt != nil && s.halt.Load() {
+	if s.rt.Halted() {
 		conn.WriteError("ERR storage halted: rollback detected")
 		return
 	}
 
-	// Pub/Sub: SUBSCRIBE/PSUBSCRIBE detach into redcon's PubSub loop; PUBLISH stays on the normal path.
+	// SUBSCRIBE enters redcon PubSub; PUBLISH stays here.
 	switch name {
 	case "SUBSCRIBE", "PSUBSCRIBE":
 		if len(cmd.Args) < 2 {
-			conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(name) + "' command")
+			conn.WriteError(
+				"ERR wrong number of arguments for '" + strings.ToLower(name) + "' command",
+			)
 			return
 		}
 		for _, ch := range cmd.Args[1:] {
@@ -162,7 +149,7 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteInt(s.pubsub.Publish(string(cmd.Args[1]), string(cmd.Args[2])))
 		return
 	case "UNSUBSCRIBE", "PUNSUBSCRIBE":
-		// Only fires for a non-subscribed conn; reply with the empty confirmation.
+		// Non-subscribed conn: empty unsubscribe reply.
 		conn.WriteArray(3)
 		conn.WriteBulkString(strings.ToLower(name))
 		conn.WriteNull()
@@ -190,7 +177,7 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	// Inside a MULTI, queue everything else rather than running it.
+	// Queue non-control commands in MULTI.
 	if st.inMulti {
 		st.queued = append(st.queued, copyCommand(cmd))
 		conn.WriteString("QUEUED")
@@ -202,160 +189,165 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 	s.dispatchData(ctx, conn, name, cmd)
 }
 
-// dispatchData runs a single data-plane command (live path and EXEC replay).
-func (s *RESPServer) dispatchData(ctx context.Context, conn redcon.Conn, name string, cmd redcon.Command) {
+// dispatchData runs one queued-capable command.
+func (s *respServer) dispatchData(
+	ctx context.Context,
+	conn redcon.Conn,
+	name string,
+	cmd redcon.Command,
+) {
 	switch name {
 	// Strings and generic key ops.
-	case "GET": // get the string value, or nil if absent
+	case "GET":
 		s.cmdGet(ctx, conn, cmd)
-	case "SET": // set value; EX/PX = expire secs/ms, NX/XX = only if absent/present
+	case "SET":
 		s.cmdSet(ctx, conn, cmd)
-	case "SETEX": // SET with EXpiry: set value + TTL in seconds
+	case "SETEX":
 		s.cmdSetEx(ctx, conn, cmd)
-	case "SETNX": // SET if Not eXists → 1 if set, 0 if already present
+	case "SETNX":
 		s.cmdSetNx(ctx, conn, cmd)
-	case "DEL", "UNLINK": // DELete keys → count removed
+	case "DEL", "UNLINK":
 		s.cmdDel(ctx, conn, cmd)
-	case "EXISTS": // count how many of the given keys exist
+	case "EXISTS":
 		s.cmdExists(ctx, conn, cmd)
-	case "EXPIRE": // set a TTL on a key, in seconds
+	case "EXPIRE":
 		s.cmdExpire(ctx, conn, cmd)
-	case "TTL": // Time-To-Live → seconds left, -1 (no expiry), -2 (missing)
+	case "TTL":
 		s.cmdTTL(ctx, conn, cmd)
-	case "INCR": // INCRement the integer value by 1
+	case "INCR":
 		s.cmdIncrBy(ctx, conn, cmd, 1, false)
-	case "DECR": // DECRement the integer value by 1
+	case "DECR":
 		s.cmdIncrBy(ctx, conn, cmd, -1, false)
-	case "INCRBY": // INCRement BY a given delta
+	case "INCRBY":
 		s.cmdIncrBy(ctx, conn, cmd, 0, true)
-	case "DECRBY": // DECRement BY a given delta
+	case "DECRBY":
 		s.cmdIncrBy(ctx, conn, cmd, 0, true)
-	case "MGET": // Multi-GET → one value per key (nil for missing)
+	case "MGET":
 		s.cmdMGet(ctx, conn, cmd)
-	case "MSET": // Multi-SET → set many key/value pairs
+	case "MSET":
 		s.cmdMSet(ctx, conn, cmd)
-	case "GETDEL": // GET the value, then DELete the key
+	case "GETDEL":
 		s.cmdGetDel(ctx, conn, cmd)
-	case "GETSET": // GET the old value, then SET a new one
+	case "GETSET":
 		s.cmdGetSet(ctx, conn, cmd)
-	case "APPEND": // APPEND to the string value → new length
+	case "APPEND":
 		s.cmdAppend(ctx, conn, cmd)
-	case "STRLEN": // STRing LENgth of the value
+	case "STRLEN":
 		s.cmdStrlen(ctx, conn, cmd)
-	case "RENAME": // RENAME a key (any type), preserving its TTL
+	case "RENAME":
 		s.cmdRename(ctx, conn, cmd)
-	case "KEYS": // all KEYS matching a glob (full scan; prefer SCAN)
+	case "KEYS":
 		s.cmdKeys(ctx, conn, cmd)
-	case "TYPE": // the key's data type → string/hash/list/set/zset/stream/none
+	case "TYPE":
 		s.cmdType(ctx, conn, cmd)
-	case "PERSIST": // remove a key's TTL → 1 if one was removed
+	case "PERSIST":
 		s.cmdPersist(ctx, conn, cmd)
-	case "PTTL": // TTL in milliseconds (P = ms) → ms left, -1, -2
+	case "PTTL":
 		s.cmdPTTL(ctx, conn, cmd)
 	// Server / introspection.
-	case "SCAN": // incrementally iterate keys: SCAN cursor [MATCH][COUNT][TYPE]
+	case "SCAN":
 		s.cmdScan(ctx, conn, cmd)
-	case "INFO": // server info text
+	case "INFO":
 		s.cmdInfo(conn)
-	case "CONFIG": // CONFIG GET/SET — minimal
+	case "CONFIG":
 		cmdConfig(conn, cmd)
-	// Hashes (field→value maps; H = hash).
-	case "HSET", "HMSET": // Hash SET fields → number of new fields
+	// Hashes.
+	case "HSET", "HMSET":
 		s.cmdHSet(ctx, conn, cmd)
-	case "HSETNX": // Hash SET if Not eXists → 1 if set
+	case "HSETNX":
 		s.cmdHSetNX(ctx, conn, cmd)
-	case "HGET": // Hash GET one field's value, or nil
+	case "HGET":
 		s.cmdHGet(ctx, conn, cmd)
-	case "HMGET": // Hash Multi-GET several fields' values
+	case "HMGET":
 		s.cmdHMGet(ctx, conn, cmd)
-	case "HDEL": // Hash DELete fields → count removed
+	case "HDEL":
 		s.cmdHDel(ctx, conn, cmd)
-	case "HGETALL": // Hash GET ALL field/value pairs
+	case "HGETALL":
 		s.cmdHGetAll(ctx, conn, cmd)
-	case "HKEYS": // Hash field names (KEYS)
+	case "HKEYS":
 		s.cmdHKeys(ctx, conn, cmd)
-	case "HVALS": // Hash field VALueS
+	case "HVALS":
 		s.cmdHVals(ctx, conn, cmd)
-	case "HLEN": // Hash LENgth → number of fields
+	case "HLEN":
 		s.cmdHLen(ctx, conn, cmd)
-	case "HEXISTS": // does a Hash field EXIST → 0/1
+	case "HEXISTS":
 		s.cmdHExists(ctx, conn, cmd)
-	case "HINCRBY": // Hash INCRement a field BY a delta → new value
+	case "HINCRBY":
 		s.cmdHIncrBy(ctx, conn, cmd)
-	// Lists (ordered; L/R = from the left/right end).
-	case "LPUSH": // Left PUSH: prepend value(s) → new length
+	// Lists.
+	case "LPUSH":
 		s.cmdPush(ctx, conn, cmd, true)
-	case "RPUSH": // Right PUSH: append value(s) → new length
+	case "RPUSH":
 		s.cmdPush(ctx, conn, cmd, false)
-	case "LPOP": // Left POP: remove from the head [count]
+	case "LPOP":
 		s.cmdPop(ctx, conn, cmd, true)
-	case "RPOP": // Right POP: remove from the tail [count]
+	case "RPOP":
 		s.cmdPop(ctx, conn, cmd, false)
-	case "LLEN": // List LENgth
+	case "LLEN":
 		s.cmdLLen(ctx, conn, cmd)
-	case "LRANGE": // List RANGE: elements from start..stop
+	case "LRANGE":
 		s.cmdLRange(ctx, conn, cmd)
-	case "LINDEX": // List element at INDEX, or nil
+	case "LINDEX":
 		s.cmdLIndex(ctx, conn, cmd)
-	case "LSET": // List SET the element at an index
+	case "LSET":
 		s.cmdLSet(ctx, conn, cmd)
-	case "LREM": // List REMove occurrences of a value → count removed
+	case "LREM":
 		s.cmdLRem(ctx, conn, cmd)
-	case "LTRIM": // List TRIM to a start..stop range
+	case "LTRIM":
 		s.cmdLTrim(ctx, conn, cmd)
-	// Sets (unordered, unique; S = set).
-	case "SADD": // Set ADD members → number of new members
+	// Sets.
+	case "SADD":
 		s.cmdSAdd(ctx, conn, cmd)
-	case "SREM": // Set REMove members → count removed
+	case "SREM":
 		s.cmdSRem(ctx, conn, cmd)
-	case "SMEMBERS": // all Set MEMBERS
+	case "SMEMBERS":
 		s.cmdSMembers(ctx, conn, cmd)
-	case "SISMEMBER": // Set IS-MEMBER → 0/1
+	case "SISMEMBER":
 		s.cmdSIsMember(ctx, conn, cmd)
-	case "SCARD": // Set CARDinality → member count
+	case "SCARD":
 		s.cmdSCard(ctx, conn, cmd)
-	case "SPOP": // Set POP: remove & return random member(s)
+	case "SPOP":
 		s.cmdSPop(ctx, conn, cmd)
-	case "SUNION": // Set UNION across keys
+	case "SUNION":
 		s.cmdSetOp(ctx, conn, cmd, "union")
-	case "SINTER": // Set INTERsection across keys
+	case "SINTER":
 		s.cmdSetOp(ctx, conn, cmd, "inter")
-	case "SDIFF": // Set DIFFerence: first key minus the rest
+	case "SDIFF":
 		s.cmdSetOp(ctx, conn, cmd, "diff")
-	// Sorted sets (members ordered by score; Z = sorted set).
-	case "ZADD": // sorted-set ADD score/member pairs → new members
+	// Sorted sets.
+	case "ZADD":
 		s.cmdZAdd(ctx, conn, cmd)
-	case "ZSCORE": // sorted-set SCORE of a member, or nil
+	case "ZSCORE":
 		s.cmdZScore(ctx, conn, cmd)
-	case "ZRANK": // sorted-set RANK (0-based position by score), or nil
+	case "ZRANK":
 		s.cmdZRank(ctx, conn, cmd)
-	case "ZREM": // sorted-set REMove members → count removed
+	case "ZREM":
 		s.cmdZRem(ctx, conn, cmd)
-	case "ZCARD": // sorted-set CARDinality → member count
+	case "ZCARD":
 		s.cmdZCard(ctx, conn, cmd)
-	case "ZINCRBY": // sorted-set INCRement a member's score BY a delta
+	case "ZINCRBY":
 		s.cmdZIncrBy(ctx, conn, cmd)
-	case "ZRANGE": // sorted-set RANGE by rank [WITHSCORES]
+	case "ZRANGE":
 		s.cmdZRange(ctx, conn, cmd)
-	case "ZRANGEBYSCORE": // sorted-set RANGE BY SCORE min..max [WITHSCORES]
+	case "ZRANGEBYSCORE":
 		s.cmdZRangeByScore(ctx, conn, cmd)
-	// Streams (append-only logs; X = stream).
-	case "XADD": // stream ADD an entry (ID or * to auto-generate)
+	// Streams.
+	case "XADD":
 		s.cmdXAdd(ctx, conn, cmd)
-	case "XLEN": // stream LENgth → entry count
+	case "XLEN":
 		s.cmdXLen(ctx, conn, cmd)
-	case "XRANGE": // stream RANGE of entries by ID [COUNT n]
+	case "XRANGE":
 		s.cmdXRange(ctx, conn, cmd)
-	case "XREAD": // stream READ entries after given IDs
+	case "XREAD":
 		s.cmdXRead(ctx, conn, cmd)
 	default:
 		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 	}
 }
 
-// Transactions: MULTI/EXEC/DISCARD/WATCH. EXEC runs queued commands sequentially (not atomic); WATCH aborts EXEC if a watched key's version changed.
+// Transactions: EXEC replays sequentially; WATCH aborts on version change.
 
-func (s *RESPServer) cmdMulti(conn redcon.Conn, st *connState) {
+func (s *respServer) cmdMulti(conn redcon.Conn, st *connState) {
 	if st.inMulti {
 		conn.WriteError("ERR MULTI calls can not be nested")
 		return
@@ -365,7 +357,7 @@ func (s *RESPServer) cmdMulti(conn redcon.Conn, st *connState) {
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdDiscard(conn redcon.Conn, st *connState) {
+func (s *respServer) cmdDiscard(conn redcon.Conn, st *connState) {
 	if !st.inMulti {
 		conn.WriteError("ERR DISCARD without MULTI")
 		return
@@ -376,7 +368,7 @@ func (s *RESPServer) cmdDiscard(conn redcon.Conn, st *connState) {
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdWatch(conn redcon.Conn, st *connState, cmd redcon.Command) {
+func (s *respServer) cmdWatch(conn redcon.Conn, st *connState, cmd redcon.Command) {
 	if st.inMulti {
 		conn.WriteError("ERR WATCH inside MULTI is not allowed")
 		return
@@ -401,7 +393,7 @@ func (s *RESPServer) cmdWatch(conn redcon.Conn, st *connState, cmd redcon.Comman
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdExec(conn redcon.Conn, st *connState) {
+func (s *respServer) cmdExec(conn redcon.Conn, st *connState) {
 	if !st.inMulti {
 		conn.WriteError("ERR EXEC without MULTI")
 		return
@@ -431,8 +423,8 @@ func (s *RESPServer) cmdExec(conn redcon.Conn, st *connState) {
 	}
 }
 
-func (s *RESPServer) cmdAuth(conn redcon.Conn, st *connState, cmd redcon.Command) {
-	// AUTH [user] password — the last arg is the password.
+func (s *respServer) cmdAuth(conn redcon.Conn, st *connState, cmd redcon.Command) {
+	// AUTH [user] password; password is last arg.
 	pw := cmd.Args[len(cmd.Args)-1]
 	if subtle.ConstantTimeCompare(pw, []byte(s.authToken)) != 1 {
 		conn.WriteError("WRONGPASS invalid username-password pair")
@@ -444,7 +436,7 @@ func (s *RESPServer) cmdAuth(conn redcon.Conn, st *connState, cmd redcon.Command
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'get' command")
 		return
@@ -460,7 +452,7 @@ func (s *RESPServer) cmdGet(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 	}
 }
 
-func (s *RESPServer) cmdSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'set' command")
 		return
@@ -516,7 +508,7 @@ func (s *RESPServer) cmdSet(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdSetEx(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSetEx(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'setex' command")
 		return
@@ -534,7 +526,7 @@ func (s *RESPServer) cmdSetEx(ctx context.Context, conn redcon.Conn, cmd redcon.
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdSetNx(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSetNx(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'setnx' command")
 		return
@@ -551,7 +543,7 @@ func (s *RESPServer) cmdSetNx(ctx context.Context, conn redcon.Conn, cmd redcon.
 	conn.WriteInt(1)
 }
 
-func (s *RESPServer) cmdDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for 'del' command")
 		return
@@ -570,7 +562,7 @@ func (s *RESPServer) cmdDel(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 	conn.WriteInt(n)
 }
 
-func (s *RESPServer) cmdExists(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdExists(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for 'exists' command")
 		return
@@ -589,7 +581,7 @@ func (s *RESPServer) cmdExists(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteInt(n)
 }
 
-func (s *RESPServer) cmdExpire(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdExpire(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'expire' command")
 		return
@@ -607,7 +599,7 @@ func (s *RESPServer) cmdExpire(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteInt(boolToInt(ok))
 }
 
-func (s *RESPServer) cmdTTL(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdTTL(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'ttl' command")
 		return
@@ -621,7 +613,13 @@ func (s *RESPServer) cmdTTL(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 }
 
 // cmdIncrBy handles INCR/DECR (fixed delta) and INCRBY/DECRBY (arg delta).
-func (s *RESPServer) cmdIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon.Command, delta int64, fromArg bool) {
+func (s *respServer) cmdIncrBy(
+	ctx context.Context,
+	conn redcon.Conn,
+	cmd redcon.Command,
+	delta int64,
+	fromArg bool,
+) {
 	want := 2
 	if fromArg {
 		want = 3
@@ -649,7 +647,7 @@ func (s *RESPServer) cmdIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteInt64(v)
 }
 
-func (s *RESPServer) cmdMGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdMGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for 'mget' command")
 		return
@@ -658,14 +656,14 @@ func (s *RESPServer) cmdMGet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	for _, k := range cmd.Args[1:] {
 		val, _, err := s.kv.Get(ctx, string(k))
 		if err != nil {
-			conn.WriteNull() // missing/error → nil element, per Redis MGET
+			conn.WriteNull() // Get error -> nil element.
 			continue
 		}
 		conn.WriteBulk(val)
 	}
 }
 
-func (s *RESPServer) cmdMSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdMSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 || len(cmd.Args)%2 != 1 {
 		conn.WriteError("ERR wrong number of arguments for 'mset' command")
 		return
@@ -679,7 +677,7 @@ func (s *RESPServer) cmdMSet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteString("OK")
 }
 
-func (s *RESPServer) cmdGetDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdGetDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'getdel' command")
 		return
@@ -701,7 +699,7 @@ func (s *RESPServer) cmdGetDel(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteBulk(val)
 }
 
-func (s *RESPServer) cmdAppend(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdAppend(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'append' command")
 		return
@@ -714,7 +712,7 @@ func (s *RESPServer) cmdAppend(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteInt(n)
 }
 
-func (s *RESPServer) cmdGetSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdGetSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'getset' command")
 		return
@@ -730,7 +728,7 @@ func (s *RESPServer) cmdGetSet(ctx context.Context, conn redcon.Conn, cmd redcon
 	}
 }
 
-func (s *RESPServer) cmdRename(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdRename(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'rename' command")
 		return
@@ -747,7 +745,7 @@ func (s *RESPServer) cmdRename(ctx context.Context, conn redcon.Conn, cmd redcon
 }
 
 // cmdKeys returns every key matching the pattern in one full scan; prefer SCAN.
-func (s *RESPServer) cmdKeys(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdKeys(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'keys' command")
 		return
@@ -777,7 +775,7 @@ func (s *RESPServer) cmdKeys(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 }
 
-func (s *RESPServer) cmdStrlen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdStrlen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'strlen' command")
 		return
@@ -793,7 +791,7 @@ func (s *RESPServer) cmdStrlen(ctx context.Context, conn redcon.Conn, cmd redcon
 	}
 }
 
-func (s *RESPServer) cmdType(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdType(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'type' command")
 		return
@@ -806,7 +804,7 @@ func (s *RESPServer) cmdType(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteString(t)
 }
 
-func (s *RESPServer) cmdPersist(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdPersist(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'persist' command")
 		return
@@ -819,7 +817,7 @@ func (s *RESPServer) cmdPersist(ctx context.Context, conn redcon.Conn, cmd redco
 	conn.WriteInt(boolToInt(ok))
 }
 
-func (s *RESPServer) cmdPTTL(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdPTTL(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'pttl' command")
 		return
@@ -837,7 +835,7 @@ func (s *RESPServer) cmdPTTL(ctx context.Context, conn redcon.Conn, cmd redcon.C
 }
 
 // cmdScan incrementally iterates: SCAN cursor [MATCH pattern] [COUNT n] [TYPE t].
-func (s *RESPServer) cmdScan(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdScan(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for 'scan' command")
 		return
@@ -888,7 +886,7 @@ func (s *RESPServer) cmdScan(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 }
 
-func (s *RESPServer) cmdInfo(conn redcon.Conn) {
+func (s *respServer) cmdInfo(conn redcon.Conn) {
 	conn.WriteBulkString("# Server\r\n" +
 		"redis_version:7.0.0-introspector-enclave\r\n" +
 		"redis_mode:standalone\r\n" +
@@ -896,10 +894,8 @@ func (s *RESPServer) cmdInfo(conn redcon.Conn) {
 		"# Keyspace\r\n")
 }
 
-// helpers
-
-// cmdHello negotiates protocol version and optionally authenticates: HELLO <ver> [AUTH user pass] [SETNAME name].
-func (s *RESPServer) cmdHello(conn redcon.Conn, st *connState, cmd redcon.Command) {
+// cmdHello handles HELLO <ver> [AUTH user pass] [SETNAME name].
+func (s *respServer) cmdHello(conn redcon.Conn, st *connState, cmd redcon.Command) {
 	args := cmd.Args[1:]
 	proto := "2"
 	i := 0
@@ -947,9 +943,9 @@ func (s *RESPServer) cmdHello(conn redcon.Conn, st *connState, cmd redcon.Comman
 	}
 	var b strings.Builder
 	if proto == "3" {
-		b.WriteString(fmt.Sprintf("%%%d\r\n", len(fields)+2))
+		fmt.Fprintf(&b, "%%%d\r\n", len(fields)+2)
 	} else {
-		b.WriteString(fmt.Sprintf("*%d\r\n", (len(fields)+2)*2))
+		fmt.Fprintf(&b, "*%d\r\n", (len(fields)+2)*2)
 	}
 	for _, f := range fields {
 		b.WriteString(respBulk(f[0]))
@@ -964,12 +960,12 @@ func (s *RESPServer) cmdHello(conn redcon.Conn, st *connState, cmd redcon.Comman
 	conn.WriteRaw([]byte(b.String()))
 }
 
-// Data types (hash/list/set/zset/stream) are each one AEAD-sealed CBOR blob per key; every op is a read-modify-write on the whole collection.
+// Collections are one sealed CBOR blob per key; writes rewrite it.
 
 // Hash — map[string]string
 
 // hashField reads one field from key, or returns ok=false (absent key or field).
-func (s *RESPServer) hashField(ctx context.Context, key, field string) (string, bool, error) {
+func (s *respServer) hashField(ctx context.Context, key, field string) (string, bool, error) {
 	b, exists, err := s.kv.ReadTyped(ctx, key, typeHash)
 	if err != nil || !exists {
 		return "", false, err
@@ -982,28 +978,33 @@ func (s *RESPServer) hashField(ctx context.Context, key, field string) (string, 
 	return v, ok, nil
 }
 
-func (s *RESPServer) cmdHSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 4 || len(cmd.Args)%2 != 0 {
 		conn.WriteError("ERR wrong number of arguments for 'hset' command")
 		return
 	}
 	var added int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeHash, func(cur []byte) ([]byte, bool, error) {
-		added = 0
-		m, err := decodeHash(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for i := 2; i < len(cmd.Args); i += 2 {
-			f := string(cmd.Args[i])
-			if _, ok := m[f]; !ok {
-				added++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeHash,
+		func(cur []byte) ([]byte, bool, error) {
+			added = 0
+			m, err := decodeHash(cur)
+			if err != nil {
+				return nil, false, err
 			}
-			m[f] = string(cmd.Args[i+1])
-		}
-		b, err := cbor.Marshal(m)
-		return b, false, err
-	})
+			for i := 2; i < len(cmd.Args); i += 2 {
+				f := string(cmd.Args[i])
+				if _, ok := m[f]; !ok {
+					added++
+				}
+				m[f] = string(cmd.Args[i+1])
+			}
+			b, err := cbor.Marshal(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1015,26 +1016,31 @@ func (s *RESPServer) cmdHSet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(added)
 }
 
-func (s *RESPServer) cmdHSetNX(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHSetNX(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'hsetnx' command")
 		return
 	}
 	var set bool
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeHash, func(cur []byte) ([]byte, bool, error) {
-		set = false
-		m, err := decodeHash(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		if _, ok := m[string(cmd.Args[2])]; ok {
-			return cur, false, nil // field exists → no-op
-		}
-		set = true
-		m[string(cmd.Args[2])] = string(cmd.Args[3])
-		b, err := cbor.Marshal(m)
-		return b, false, err
-	})
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeHash,
+		func(cur []byte) ([]byte, bool, error) {
+			set = false
+			m, err := decodeHash(cur)
+			if err != nil {
+				return nil, false, err
+			}
+			if _, ok := m[string(cmd.Args[2])]; ok {
+				return cur, false, nil // no-op
+			}
+			set = true
+			m[string(cmd.Args[2])] = string(cmd.Args[3])
+			b, err := cbor.Marshal(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1042,7 +1048,7 @@ func (s *RESPServer) cmdHSetNX(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteInt(boolToInt(set))
 }
 
-func (s *RESPServer) cmdHGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'hget' command")
 		return
@@ -1058,7 +1064,7 @@ func (s *RESPServer) cmdHGet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 }
 
-func (s *RESPServer) cmdHMGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHMGet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'hmget' command")
 		return
@@ -1083,30 +1089,35 @@ func (s *RESPServer) cmdHMGet(ctx context.Context, conn redcon.Conn, cmd redcon.
 	}
 }
 
-func (s *RESPServer) cmdHDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHDel(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'hdel' command")
 		return
 	}
 	var removed int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeHash, func(cur []byte) ([]byte, bool, error) {
-		removed = 0
-		m, err := decodeHash(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, f := range cmd.Args[2:] {
-			if _, ok := m[string(f)]; ok {
-				delete(m, string(f))
-				removed++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeHash,
+		func(cur []byte) ([]byte, bool, error) {
+			removed = 0
+			m, err := decodeHash(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		if len(m) == 0 {
-			return nil, true, nil // last field gone → delete the key
-		}
-		b, err := cbor.Marshal(m)
-		return b, false, err
-	})
+			for _, f := range cmd.Args[2:] {
+				if _, ok := m[string(f)]; ok {
+					delete(m, string(f))
+					removed++
+				}
+			}
+			if len(m) == 0 {
+				return nil, true, nil // last field gone → delete the key
+			}
+			b, err := cbor.Marshal(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1114,7 +1125,7 @@ func (s *RESPServer) cmdHDel(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(removed)
 }
 
-func (s *RESPServer) cmdHGetAll(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHGetAll(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'hgetall' command")
 		return
@@ -1131,7 +1142,7 @@ func (s *RESPServer) cmdHGetAll(ctx context.Context, conn redcon.Conn, cmd redco
 	}
 }
 
-func (s *RESPServer) cmdHKeys(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHKeys(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'hkeys' command")
 		return
@@ -1147,7 +1158,7 @@ func (s *RESPServer) cmdHKeys(ctx context.Context, conn redcon.Conn, cmd redcon.
 	}
 }
 
-func (s *RESPServer) cmdHVals(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHVals(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'hvals' command")
 		return
@@ -1163,7 +1174,7 @@ func (s *RESPServer) cmdHVals(ctx context.Context, conn redcon.Conn, cmd redcon.
 	}
 }
 
-func (s *RESPServer) cmdHLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'hlen' command")
 		return
@@ -1176,7 +1187,7 @@ func (s *RESPServer) cmdHLen(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(len(m))
 }
 
-func (s *RESPServer) cmdHExists(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHExists(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'hexists' command")
 		return
@@ -1189,7 +1200,7 @@ func (s *RESPServer) cmdHExists(ctx context.Context, conn redcon.Conn, cmd redco
 	conn.WriteInt(boolToInt(ok))
 }
 
-func (s *RESPServer) cmdHIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdHIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'hincrby' command")
 		return
@@ -1201,22 +1212,27 @@ func (s *RESPServer) cmdHIncrBy(ctx context.Context, conn redcon.Conn, cmd redco
 	}
 	field := string(cmd.Args[2])
 	var result int64
-	_, err = s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeHash, func(cur []byte) ([]byte, bool, error) {
-		m, err := decodeHash(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		base := int64(0)
-		if existing, ok := m[field]; ok {
-			if base, err = strconv.ParseInt(existing, 10, 64); err != nil {
-				return nil, false, ErrNotInteger
+	_, err = s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeHash,
+		func(cur []byte) ([]byte, bool, error) {
+			m, err := decodeHash(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		result = base + delta
-		m[field] = strconv.FormatInt(result, 10)
-		b, err := cbor.Marshal(m)
-		return b, false, err
-	})
+			base := int64(0)
+			if existing, ok := m[field]; ok {
+				if base, err = strconv.ParseInt(existing, 10, 64); err != nil {
+					return nil, false, ErrNotInteger
+				}
+			}
+			result = base + delta
+			m[field] = strconv.FormatInt(result, 10)
+			b, err := cbor.Marshal(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1225,7 +1241,7 @@ func (s *RESPServer) cmdHIncrBy(ctx context.Context, conn redcon.Conn, cmd redco
 }
 
 // readHash returns the decoded hash at key (empty if absent), enforcing the type.
-func (s *RESPServer) readHash(ctx context.Context, key string) (map[string]string, error) {
+func (s *respServer) readHash(ctx context.Context, key string) (map[string]string, error) {
 	b, _, err := s.kv.ReadTyped(ctx, key, typeHash)
 	if err != nil {
 		return nil, err
@@ -1235,7 +1251,7 @@ func (s *RESPServer) readHash(ctx context.Context, key string) (map[string]strin
 
 // List — ordered []string
 
-func (s *RESPServer) readList(ctx context.Context, key string) ([]string, error) {
+func (s *respServer) readList(ctx context.Context, key string) ([]string, error) {
 	b, _, err := s.kv.ReadTyped(ctx, key, typeList)
 	if err != nil {
 		return nil, err
@@ -1243,29 +1259,34 @@ func (s *RESPServer) readList(ctx context.Context, key string) ([]string, error)
 	return decodeList(b)
 }
 
-// cmdPush handles LPUSH (left=true) and RPUSH. Returns the new length.
-func (s *RESPServer) cmdPush(ctx context.Context, conn redcon.Conn, cmd redcon.Command, left bool) {
+// cmdPush handles LPUSH/RPUSH.
+func (s *respServer) cmdPush(ctx context.Context, conn redcon.Conn, cmd redcon.Command, left bool) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
 	var n int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeList, func(cur []byte) ([]byte, bool, error) {
-		l, err := decodeList(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, v := range cmd.Args[2:] {
-			if left {
-				l = append([]string{string(v)}, l...)
-			} else {
-				l = append(l, string(v))
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeList,
+		func(cur []byte) ([]byte, bool, error) {
+			l, err := decodeList(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		n = len(l)
-		b, err := cbor.Marshal(l)
-		return b, false, err
-	})
+			for _, v := range cmd.Args[2:] {
+				if left {
+					l = append([]string{string(v)}, l...)
+				} else {
+					l = append(l, string(v))
+				}
+			}
+			n = len(l)
+			b, err := cbor.Marshal(l)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1274,7 +1295,7 @@ func (s *RESPServer) cmdPush(ctx context.Context, conn redcon.Conn, cmd redcon.C
 }
 
 // cmdPop handles LPOP (left=true) and RPOP, with an optional count.
-func (s *RESPServer) cmdPop(ctx context.Context, conn redcon.Conn, cmd redcon.Command, left bool) {
+func (s *respServer) cmdPop(ctx context.Context, conn redcon.Conn, cmd redcon.Command, left bool) {
 	if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
 		conn.WriteError("ERR wrong number of arguments")
 		return
@@ -1289,28 +1310,33 @@ func (s *RESPServer) cmdPop(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 		count, hasCount = c, true
 	}
 	var popped []string
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeList, func(cur []byte) ([]byte, bool, error) {
-		popped = nil
-		l, err := decodeList(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		k := min(count, len(l))
-		if left {
-			popped = append(popped, l[:k]...)
-			l = l[k:]
-		} else {
-			for i := 0; i < k; i++ {
-				popped = append(popped, l[len(l)-1-i])
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeList,
+		func(cur []byte) ([]byte, bool, error) {
+			popped = nil
+			l, err := decodeList(cur)
+			if err != nil {
+				return nil, false, err
 			}
-			l = l[:len(l)-k]
-		}
-		if len(l) == 0 {
-			return nil, true, nil
-		}
-		b, err := cbor.Marshal(l)
-		return b, false, err
-	})
+			k := min(count, len(l))
+			if left {
+				popped = append(popped, l[:k]...)
+				l = l[k:]
+			} else {
+				for i := 0; i < k; i++ {
+					popped = append(popped, l[len(l)-1-i])
+				}
+				l = l[:len(l)-k]
+			}
+			if len(l) == 0 {
+				return nil, true, nil
+			}
+			b, err := cbor.Marshal(l)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1324,7 +1350,7 @@ func (s *RESPServer) cmdPop(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 		return
 	}
 	if len(popped) == 0 {
-		conn.WriteNull() // null array for an empty/missing list
+		conn.WriteNull() // nil for empty/missing list
 		return
 	}
 	conn.WriteArray(len(popped))
@@ -1333,7 +1359,7 @@ func (s *RESPServer) cmdPop(ctx context.Context, conn redcon.Conn, cmd redcon.Co
 	}
 }
 
-func (s *RESPServer) cmdLLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'llen' command")
 		return
@@ -1346,7 +1372,7 @@ func (s *RESPServer) cmdLLen(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(len(l))
 }
 
-func (s *RESPServer) cmdLRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'lrange' command")
 		return
@@ -1373,7 +1399,7 @@ func (s *RESPServer) cmdLRange(ctx context.Context, conn redcon.Conn, cmd redcon
 	}
 }
 
-func (s *RESPServer) cmdLIndex(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLIndex(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'lindex' command")
 		return
@@ -1398,7 +1424,7 @@ func (s *RESPServer) cmdLIndex(ctx context.Context, conn redcon.Conn, cmd redcon
 	conn.WriteBulkString(l[idx])
 }
 
-func (s *RESPServer) cmdLSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLSet(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'lset' command")
 		return
@@ -1409,28 +1435,33 @@ func (s *RESPServer) cmdLSet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 		return
 	}
 	var noKey, oob bool
-	_, merr := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeList, func(cur []byte) ([]byte, bool, error) {
-		noKey, oob = false, false
-		l, err := decodeList(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		if len(l) == 0 {
-			noKey = true
-			return cur, false, nil
-		}
-		i := idx
-		if i < 0 {
-			i += len(l)
-		}
-		if i < 0 || i >= len(l) {
-			oob = true
-			return cur, false, nil
-		}
-		l[i] = string(cmd.Args[3])
-		b, err := cbor.Marshal(l)
-		return b, false, err
-	})
+	_, merr := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeList,
+		func(cur []byte) ([]byte, bool, error) {
+			noKey, oob = false, false
+			l, err := decodeList(cur)
+			if err != nil {
+				return nil, false, err
+			}
+			if len(l) == 0 {
+				noKey = true
+				return cur, false, nil
+			}
+			i := idx
+			if i < 0 {
+				i += len(l)
+			}
+			if i < 0 || i >= len(l) {
+				oob = true
+				return cur, false, nil
+			}
+			l[i] = string(cmd.Args[3])
+			b, err := cbor.Marshal(l)
+			return b, false, err
+		},
+	)
 	switch {
 	case merr != nil:
 		writeKVErr(conn, merr)
@@ -1443,7 +1474,7 @@ func (s *RESPServer) cmdLSet(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 }
 
-func (s *RESPServer) cmdLRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'lrem' command")
 		return
@@ -1455,19 +1486,24 @@ func (s *RESPServer) cmdLRem(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 	target := string(cmd.Args[3])
 	var removed int
-	_, merr := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeList, func(cur []byte) ([]byte, bool, error) {
-		removed = 0
-		l, err := decodeList(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		l, removed = listRem(l, target, count)
-		if len(l) == 0 {
-			return nil, true, nil
-		}
-		b, err := cbor.Marshal(l)
-		return b, false, err
-	})
+	_, merr := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeList,
+		func(cur []byte) ([]byte, bool, error) {
+			removed = 0
+			l, err := decodeList(cur)
+			if err != nil {
+				return nil, false, err
+			}
+			l, removed = listRem(l, target, count)
+			if len(l) == 0 {
+				return nil, true, nil
+			}
+			b, err := cbor.Marshal(l)
+			return b, false, err
+		},
+	)
 	if merr != nil {
 		writeKVErr(conn, merr)
 		return
@@ -1475,7 +1511,7 @@ func (s *RESPServer) cmdLRem(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(removed)
 }
 
-func (s *RESPServer) cmdLTrim(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdLTrim(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'ltrim' command")
 		return
@@ -1486,19 +1522,24 @@ func (s *RESPServer) cmdLTrim(ctx context.Context, conn redcon.Conn, cmd redcon.
 		conn.WriteError("ERR value is not an integer or out of range")
 		return
 	}
-	_, merr := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeList, func(cur []byte) ([]byte, bool, error) {
-		l, err := decodeList(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		lo, hi := clampRange(start, stop, len(l))
-		if lo > hi {
-			return nil, true, nil // trimmed to empty → delete
-		}
-		l = append([]string(nil), l[lo:hi+1]...)
-		b, err := cbor.Marshal(l)
-		return b, false, err
-	})
+	_, merr := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeList,
+		func(cur []byte) ([]byte, bool, error) {
+			l, err := decodeList(cur)
+			if err != nil {
+				return nil, false, err
+			}
+			lo, hi := clampRange(start, stop, len(l))
+			if lo > hi {
+				return nil, true, nil // trimmed to empty → delete
+			}
+			l = append([]string(nil), l[lo:hi+1]...)
+			b, err := cbor.Marshal(l)
+			return b, false, err
+		},
+	)
 	if merr != nil {
 		writeKVErr(conn, merr)
 		return
@@ -1508,7 +1549,7 @@ func (s *RESPServer) cmdLTrim(ctx context.Context, conn redcon.Conn, cmd redcon.
 
 // Set — unordered unique strings (CBOR []string members, used as a map)
 
-func (s *RESPServer) readSet(ctx context.Context, key string) (map[string]struct{}, error) {
+func (s *respServer) readSet(ctx context.Context, key string) (map[string]struct{}, error) {
 	b, _, err := s.kv.ReadTyped(ctx, key, typeSet)
 	if err != nil {
 		return nil, err
@@ -1516,27 +1557,32 @@ func (s *RESPServer) readSet(ctx context.Context, key string) (map[string]struct
 	return decodeSet(b)
 }
 
-func (s *RESPServer) cmdSAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'sadd' command")
 		return
 	}
 	var added int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeSet, func(cur []byte) ([]byte, bool, error) {
-		added = 0
-		m, err := decodeSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, v := range cmd.Args[2:] {
-			if _, ok := m[string(v)]; !ok {
-				m[string(v)] = struct{}{}
-				added++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeSet,
+		func(cur []byte) ([]byte, bool, error) {
+			added = 0
+			m, err := decodeSet(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		b, err := encodeSet(m)
-		return b, false, err
-	})
+			for _, v := range cmd.Args[2:] {
+				if _, ok := m[string(v)]; !ok {
+					m[string(v)] = struct{}{}
+					added++
+				}
+			}
+			b, err := encodeSet(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1544,30 +1590,35 @@ func (s *RESPServer) cmdSAdd(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(added)
 }
 
-func (s *RESPServer) cmdSRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'srem' command")
 		return
 	}
 	var removed int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeSet, func(cur []byte) ([]byte, bool, error) {
-		removed = 0
-		m, err := decodeSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, v := range cmd.Args[2:] {
-			if _, ok := m[string(v)]; ok {
-				delete(m, string(v))
-				removed++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeSet,
+		func(cur []byte) ([]byte, bool, error) {
+			removed = 0
+			m, err := decodeSet(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		if len(m) == 0 {
-			return nil, true, nil
-		}
-		b, err := encodeSet(m)
-		return b, false, err
-	})
+			for _, v := range cmd.Args[2:] {
+				if _, ok := m[string(v)]; ok {
+					delete(m, string(v))
+					removed++
+				}
+			}
+			if len(m) == 0 {
+				return nil, true, nil
+			}
+			b, err := encodeSet(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1575,7 +1626,7 @@ func (s *RESPServer) cmdSRem(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(removed)
 }
 
-func (s *RESPServer) cmdSMembers(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSMembers(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'smembers' command")
 		return
@@ -1588,7 +1639,7 @@ func (s *RESPServer) cmdSMembers(ctx context.Context, conn redcon.Conn, cmd redc
 	writeStringSet(conn, m)
 }
 
-func (s *RESPServer) cmdSIsMember(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSIsMember(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'sismember' command")
 		return
@@ -1602,7 +1653,7 @@ func (s *RESPServer) cmdSIsMember(ctx context.Context, conn redcon.Conn, cmd red
 	conn.WriteInt(boolToInt(ok))
 }
 
-func (s *RESPServer) cmdSCard(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSCard(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'scard' command")
 		return
@@ -1615,7 +1666,7 @@ func (s *RESPServer) cmdSCard(ctx context.Context, conn redcon.Conn, cmd redcon.
 	conn.WriteInt(len(m))
 }
 
-func (s *RESPServer) cmdSPop(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdSPop(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
 		conn.WriteError("ERR wrong number of arguments for 'spop' command")
 		return
@@ -1630,25 +1681,30 @@ func (s *RESPServer) cmdSPop(ctx context.Context, conn redcon.Conn, cmd redcon.C
 		count, hasCount = c, true
 	}
 	var popped []string
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeSet, func(cur []byte) ([]byte, bool, error) {
-		popped = nil
-		m, err := decodeSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for v := range m { // Go randomizes map iteration → effectively random
-			if len(popped) >= count {
-				break
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeSet,
+		func(cur []byte) ([]byte, bool, error) {
+			popped = nil
+			m, err := decodeSet(cur)
+			if err != nil {
+				return nil, false, err
 			}
-			popped = append(popped, v)
-			delete(m, v)
-		}
-		if len(m) == 0 {
-			return nil, true, nil
-		}
-		b, err := encodeSet(m)
-		return b, false, err
-	})
+			for v := range m { // arbitrary map order
+				if len(popped) >= count {
+					break
+				}
+				popped = append(popped, v)
+				delete(m, v)
+			}
+			if len(m) == 0 {
+				return nil, true, nil
+			}
+			b, err := encodeSet(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1668,7 +1724,12 @@ func (s *RESPServer) cmdSPop(ctx context.Context, conn redcon.Conn, cmd redcon.C
 }
 
 // cmdSetOp handles SUNION/SINTER/SDIFF over one or more set keys.
-func (s *RESPServer) cmdSetOp(ctx context.Context, conn redcon.Conn, cmd redcon.Command, op string) {
+func (s *respServer) cmdSetOp(
+	ctx context.Context,
+	conn redcon.Conn,
+	cmd redcon.Command,
+	op string,
+) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments")
 		return
@@ -1710,7 +1771,7 @@ func (s *RESPServer) cmdSetOp(ctx context.Context, conn redcon.Conn, cmd redcon.
 
 // Sorted set — member→score (CBOR map[string]float64), ordered by (score, member)
 
-func (s *RESPServer) readZSet(ctx context.Context, key string) (map[string]float64, error) {
+func (s *respServer) readZSet(ctx context.Context, key string) (map[string]float64, error) {
 	b, _, err := s.kv.ReadTyped(ctx, key, typeZSet)
 	if err != nil {
 		return nil, err
@@ -1718,7 +1779,7 @@ func (s *RESPServer) readZSet(ctx context.Context, key string) (map[string]float
 	return decodeZSet(b)
 }
 
-func (s *RESPServer) cmdZAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 4 || len(cmd.Args)%2 != 0 {
 		conn.WriteError("ERR wrong number of arguments for 'zadd' command")
 		return
@@ -1733,22 +1794,27 @@ func (s *RESPServer) cmdZAdd(ctx context.Context, conn redcon.Conn, cmd redcon.C
 		scores = append(scores, v)
 	}
 	var added int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeZSet, func(cur []byte) ([]byte, bool, error) {
-		added = 0
-		m, err := decodeZSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for i := 2; i < len(cmd.Args); i += 2 {
-			member := string(cmd.Args[i+1])
-			if _, ok := m[member]; !ok {
-				added++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeZSet,
+		func(cur []byte) ([]byte, bool, error) {
+			added = 0
+			m, err := decodeZSet(cur)
+			if err != nil {
+				return nil, false, err
 			}
-			m[member] = scores[(i-2)/2]
-		}
-		b, err := encodeZSet(m)
-		return b, false, err
-	})
+			for i := 2; i < len(cmd.Args); i += 2 {
+				member := string(cmd.Args[i+1])
+				if _, ok := m[member]; !ok {
+					added++
+				}
+				m[member] = scores[(i-2)/2]
+			}
+			b, err := encodeZSet(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1756,7 +1822,7 @@ func (s *RESPServer) cmdZAdd(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(added)
 }
 
-func (s *RESPServer) cmdZScore(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZScore(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'zscore' command")
 		return
@@ -1773,7 +1839,7 @@ func (s *RESPServer) cmdZScore(ctx context.Context, conn redcon.Conn, cmd redcon
 	}
 }
 
-func (s *RESPServer) cmdZRank(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZRank(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for 'zrank' command")
 		return
@@ -1796,30 +1862,35 @@ func (s *RESPServer) cmdZRank(ctx context.Context, conn redcon.Conn, cmd redcon.
 	}
 }
 
-func (s *RESPServer) cmdZRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZRem(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for 'zrem' command")
 		return
 	}
 	var removed int
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeZSet, func(cur []byte) ([]byte, bool, error) {
-		removed = 0
-		m, err := decodeZSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, member := range cmd.Args[2:] {
-			if _, ok := m[string(member)]; ok {
-				delete(m, string(member))
-				removed++
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeZSet,
+		func(cur []byte) ([]byte, bool, error) {
+			removed = 0
+			m, err := decodeZSet(cur)
+			if err != nil {
+				return nil, false, err
 			}
-		}
-		if len(m) == 0 {
-			return nil, true, nil
-		}
-		b, err := encodeZSet(m)
-		return b, false, err
-	})
+			for _, member := range cmd.Args[2:] {
+				if _, ok := m[string(member)]; ok {
+					delete(m, string(member))
+					removed++
+				}
+			}
+			if len(m) == 0 {
+				return nil, true, nil
+			}
+			b, err := encodeZSet(m)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1827,7 +1898,7 @@ func (s *RESPServer) cmdZRem(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(removed)
 }
 
-func (s *RESPServer) cmdZCard(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZCard(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'zcard' command")
 		return
@@ -1840,7 +1911,7 @@ func (s *RESPServer) cmdZCard(ctx context.Context, conn redcon.Conn, cmd redcon.
 	conn.WriteInt(len(m))
 }
 
-func (s *RESPServer) cmdZIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZIncrBy(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for 'zincrby' command")
 		return
@@ -1852,16 +1923,21 @@ func (s *RESPServer) cmdZIncrBy(ctx context.Context, conn redcon.Conn, cmd redco
 	}
 	member := string(cmd.Args[3])
 	var result float64
-	_, merr := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeZSet, func(cur []byte) ([]byte, bool, error) {
-		m, err := decodeZSet(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		result = m[member] + delta
-		m[member] = result
-		b, err := encodeZSet(m)
-		return b, false, err
-	})
+	_, merr := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeZSet,
+		func(cur []byte) ([]byte, bool, error) {
+			m, err := decodeZSet(cur)
+			if err != nil {
+				return nil, false, err
+			}
+			result = m[member] + delta
+			m[member] = result
+			b, err := encodeZSet(m)
+			return b, false, err
+		},
+	)
 	if merr != nil {
 		writeKVErr(conn, merr)
 		return
@@ -1869,7 +1945,7 @@ func (s *RESPServer) cmdZIncrBy(ctx context.Context, conn redcon.Conn, cmd redco
 	conn.WriteBulkString(formatScore(result))
 }
 
-func (s *RESPServer) cmdZRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 4 {
 		conn.WriteError("ERR wrong number of arguments for 'zrange' command")
 		return
@@ -1895,7 +1971,7 @@ func (s *RESPServer) cmdZRange(ctx context.Context, conn redcon.Conn, cmd redcon
 	writeZRange(conn, entries[lo:hi+1], withScores)
 }
 
-func (s *RESPServer) cmdZRangeByScore(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdZRangeByScore(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 4 {
 		conn.WriteError("ERR wrong number of arguments for 'zrangebyscore' command")
 		return
@@ -1925,7 +2001,7 @@ func (s *RESPServer) cmdZRangeByScore(ctx context.Context, conn redcon.Conn, cmd
 
 // Stream — append-only log of {ID, field/value pairs}, ordered by ID
 
-func (s *RESPServer) readStream(ctx context.Context, key string) ([]streamEntry, error) {
+func (s *respServer) readStream(ctx context.Context, key string) ([]streamEntry, error) {
 	b, _, err := s.kv.ReadTyped(ctx, key, typeStream)
 	if err != nil {
 		return nil, err
@@ -1933,7 +2009,7 @@ func (s *RESPServer) readStream(ctx context.Context, key string) ([]streamEntry,
 	return decodeStream(b)
 }
 
-func (s *RESPServer) cmdXAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdXAdd(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	// XADD key ID field value [field value ...]
 	if len(cmd.Args) < 5 || len(cmd.Args)%2 != 1 {
 		conn.WriteError("ERR wrong number of arguments for 'xadd' command")
@@ -1946,30 +2022,37 @@ func (s *RESPServer) cmdXAdd(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	}
 	nowMS := uint64(time.Now().UnixMilli())
 	var newID string
-	_, err := s.kv.ModifyTyped(ctx, string(cmd.Args[1]), typeStream, func(cur []byte) ([]byte, bool, error) {
-		entries, err := decodeStream(cur)
-		if err != nil {
-			return nil, false, err
-		}
-		var last streamID
-		hasLast := len(entries) > 0
-		if hasLast {
-			if last, err = parseStreamID(entries[len(entries)-1].ID, 0); err != nil {
+	_, err := s.kv.ModifyTyped(
+		ctx,
+		string(cmd.Args[1]),
+		typeStream,
+		func(cur []byte) ([]byte, bool, error) {
+			entries, err := decodeStream(cur)
+			if err != nil {
 				return nil, false, err
 			}
-		}
-		id, err := nextStreamID(idArg, last, hasLast, nowMS)
-		if err != nil {
-			return nil, false, err
-		}
-		if hasLast && id.cmp(last) <= 0 {
-			return nil, false, errors.New("The ID specified in XADD is equal or smaller than the target stream top item")
-		}
-		newID = id.String()
-		entries = append(entries, streamEntry{ID: newID, Fields: fields})
-		b, err := cbor.Marshal(entries)
-		return b, false, err
-	})
+			var last streamID
+			hasLast := len(entries) > 0
+			if hasLast {
+				if last, err = parseStreamID(entries[len(entries)-1].ID, 0); err != nil {
+					return nil, false, err
+				}
+			}
+			id, err := nextStreamID(idArg, last, hasLast, nowMS)
+			if err != nil {
+				return nil, false, err
+			}
+			if hasLast && id.cmp(last) <= 0 {
+				return nil, false, errors.New(
+					"the ID specified in XADD is equal or smaller than the target stream top item",
+				)
+			}
+			newID = id.String()
+			entries = append(entries, streamEntry{ID: newID, Fields: fields})
+			b, err := cbor.Marshal(entries)
+			return b, false, err
+		},
+	)
 	if err != nil {
 		writeKVErr(conn, err)
 		return
@@ -1977,7 +2060,7 @@ func (s *RESPServer) cmdXAdd(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteBulkString(newID)
 }
 
-func (s *RESPServer) cmdXLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdXLen(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for 'xlen' command")
 		return
@@ -1990,7 +2073,7 @@ func (s *RESPServer) cmdXLen(ctx context.Context, conn redcon.Conn, cmd redcon.C
 	conn.WriteInt(len(entries))
 }
 
-func (s *RESPServer) cmdXRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdXRange(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	// XRANGE key start end [COUNT n]
 	if len(cmd.Args) != 4 && len(cmd.Args) != 6 {
 		conn.WriteError("ERR wrong number of arguments for 'xrange' command")
@@ -2024,7 +2107,7 @@ func (s *RESPServer) cmdXRange(ctx context.Context, conn redcon.Conn, cmd redcon
 	writeStreamEntries(conn, matched)
 }
 
-func (s *RESPServer) cmdXRead(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
+func (s *respServer) cmdXRead(ctx context.Context, conn redcon.Conn, cmd redcon.Command) {
 	// XREAD [COUNT n] STREAMS key [key...] id [id...]  (non-blocking; no BLOCK)
 	i := 1
 	count := -1
@@ -2043,7 +2126,9 @@ func (s *RESPServer) cmdXRead(ctx context.Context, conn redcon.Conn, cmd redcon.
 	i++
 	rest := cmd.Args[i:]
 	if len(rest) == 0 || len(rest)%2 != 0 {
-		conn.WriteError("ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.")
+		conn.WriteError(
+			"ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.",
+		)
 		return
 	}
 	n := len(rest) / 2
@@ -2095,13 +2180,6 @@ func (s *RESPServer) cmdXRead(ctx context.Context, conn redcon.Conn, cmd redcon.
 	}
 }
 
-// Free functions / helpers
-
-// NewRESPServer builds the server; authToken gates every connection via AUTH.
-func NewRESPServer(kv kvEngine, authToken string) *RESPServer {
-	return &RESPServer{kv: kv, authToken: authToken, cmdTimeout: 10 * time.Second}
-}
-
 // copyCommand deep-copies a redcon.Command so it survives queuing (redcon reuses its read buffer).
 func copyCommand(cmd redcon.Command) redcon.Command {
 	out := redcon.Command{Raw: append([]byte(nil), cmd.Raw...)}
@@ -2141,7 +2219,7 @@ func cmdConfig(conn redcon.Conn, cmd redcon.Command) {
 	}
 }
 
-// globMatch implements Redis-style key glob matching ('*', '?', '[...]' classes, '\' escaping; '*' spans '/').
+// globMatch implements Redis key globs.
 func globMatch(pattern, s string) bool {
 	for len(pattern) > 0 {
 		switch pattern[0] {
@@ -2197,7 +2275,7 @@ func globMatch(pattern, s string) bool {
 	return len(s) == 0
 }
 
-// globClass matches c against a '[...]' class, returning (matched, pattern-after-class, well-formed).
+// globClass parses one [...] class.
 func globClass(pattern string, c byte) (bool, string, bool) {
 	i := 1
 	negate := false
@@ -2285,7 +2363,7 @@ func decodeList(b []byte) ([]string, error) {
 	return l, cbor.Unmarshal(b, &l)
 }
 
-// listRem removes occurrences of v (count>0 from head, count<0 from tail, 0 all); returns list and count removed.
+// listRem removes v by Redis LREM count rules.
 func listRem(l []string, v string, count int) ([]string, int) {
 	out := l[:0:0]
 	removed := 0
@@ -2412,7 +2490,7 @@ func writeZRange(conn redcon.Conn, entries []zEntry, withScores bool) {
 	}
 }
 
-// parseScoreBound parses a ZRANGEBYSCORE bound: a float, "+inf"/"-inf", or "(" for exclusive.
+// parseScoreBound parses optional "(" plus float/+inf/-inf.
 func parseScoreBound(s string) (val float64, exclusive bool, err error) {
 	if strings.HasPrefix(s, "(") {
 		exclusive, s = true, s[1:]
@@ -2432,12 +2510,12 @@ func parseStreamID(s string, defaultSeq uint64) (streamID, error) {
 	ms, rest, hasSeq := strings.Cut(s, "-")
 	msv, err := strconv.ParseUint(ms, 10, 64)
 	if err != nil {
-		return streamID{}, errors.New("Invalid stream ID specified as stream command argument")
+		return streamID{}, errors.New("invalid stream ID specified as stream command argument")
 	}
 	seq := defaultSeq
 	if hasSeq {
 		if seq, err = strconv.ParseUint(rest, 10, 64); err != nil {
-			return streamID{}, errors.New("Invalid stream ID specified as stream command argument")
+			return streamID{}, errors.New("invalid stream ID specified as stream command argument")
 		}
 	}
 	return streamID{msv, seq}, nil
@@ -2467,7 +2545,7 @@ func nextStreamID(arg string, last streamID, hasLast bool, nowMS uint64) (stream
 	ms, rest, hasSeq := strings.Cut(arg, "-")
 	msv, err := strconv.ParseUint(ms, 10, 64)
 	if err != nil {
-		return streamID{}, errors.New("Invalid stream ID specified as stream command argument")
+		return streamID{}, errors.New("invalid stream ID specified as stream command argument")
 	}
 	if hasSeq && rest == "*" {
 		seq := uint64(0)

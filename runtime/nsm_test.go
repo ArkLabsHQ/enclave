@@ -454,7 +454,24 @@ func buildSignedAttestationCustom(
 	pcrs map[uint][]byte,
 	certNotBefore, certNotAfter, timestamp time.Time,
 	userData []byte,
+	publicKey ...[]byte,
 ) signedAttestation {
+	t.Helper()
+	return newTestAttestationSigner(t, certNotBefore, certNotAfter).
+		build(t, pcrs, timestamp, userData, publicKey...)
+}
+
+type testAttestationSigner struct {
+	caDER   []byte
+	leafDER []byte
+	leafKey *ecdsa.PrivateKey
+	roots   *x509.CertPool
+}
+
+func newTestAttestationSigner(
+	t *testing.T,
+	certNotBefore, certNotAfter time.Time,
+) *testAttestationSigner {
 	t.Helper()
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P384(), cryptorand.Reader)
@@ -494,25 +511,48 @@ func buildSignedAttestationCustom(
 	)
 	require.NoError(t, err)
 
-	payload, err := cbor.Marshal(&nitrite.Document{
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+
+	return &testAttestationSigner{
+		caDER:   caDER,
+		leafDER: leafDER,
+		leafKey: leafKey,
+		roots:   roots,
+	}
+}
+
+func (s *testAttestationSigner) build(
+	t *testing.T,
+	pcrs map[uint][]byte,
+	timestamp time.Time,
+	userData []byte,
+	publicKey ...[]byte,
+) signedAttestation {
+	t.Helper()
+
+	document := &nitrite.Document{
 		ModuleID:    "test-module",
 		Timestamp:   uint64(timestamp.UnixMilli()),
 		Digest:      "SHA384",
 		PCRs:        pcrs,
-		Certificate: leafDER,
-		CABundle:    [][]byte{caDER},
+		Certificate: s.leafDER,
+		CABundle:    [][]byte{s.caDER},
 		UserData:    userData,
-	})
+	}
+	if len(publicKey) > 0 {
+		document.PublicKey = publicKey[0]
+	}
+
+	payload, err := cbor.Marshal(document)
 	require.NoError(t, err)
 
-	roots := x509.NewCertPool()
-	roots.AddCert(caCert)
-	doc := coseSign1(t, payload, leafKey)
+	doc := coseSign1(t, payload, s.leafKey)
 
 	return signedAttestation{
 		doc:    doc,
 		docB64: base64.StdEncoding.EncodeToString(doc),
-		roots:  roots,
+		roots:  s.roots,
 	}
 }
 
@@ -605,6 +645,7 @@ type fakeNSM struct {
 	verifyResult *nitrite.Result
 	verifyErr    error
 	verifyDocs   [][]byte
+	verifyRoots  *x509.CertPool
 }
 
 func (f *fakeNSM) OpenSession() (nsmSession, error) {
@@ -619,6 +660,12 @@ func (f *fakeNSM) OpenSession() (nsmSession, error) {
 
 func (f *fakeNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
 	f.verifyDocs = append(f.verifyDocs, append([]byte(nil), doc...))
+	if f.verifyErr != nil || f.verifyResult != nil {
+		return f.verifyResult, f.verifyErr
+	}
+	if f.verifyRoots != nil {
+		return (&awsNSM{roots: f.verifyRoots}).VerifyAttestationSig(doc)
+	}
 	return f.verifyResult, f.verifyErr
 }
 
@@ -632,7 +679,25 @@ type fakeNSMSession struct {
 	sendFunc  func(request.Request) (response.Response, error)
 	requests  []request.Request
 
+	t                *testing.T
+	pcrs             map[uint][]byte
+	locks            map[uint]bool
+	attestationSign  *testAttestationSigner
+	attestationRoots *x509.CertPool
+
 	closed bool
+}
+
+func newStatefulNSMSession(t *testing.T, pcrs map[uint][]byte) *fakeNSMSession {
+	t.Helper()
+	now := time.Now()
+	return &fakeNSMSession{
+		t:                t,
+		pcrs:             clonePCRs(pcrs),
+		locks:            map[uint]bool{},
+		attestationSign:  newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour)),
+		attestationRoots: x509.NewCertPool(),
+	}
 }
 
 func (f *fakeNSMSession) Read(p []byte) (int, error) {
@@ -657,11 +722,62 @@ func (f *fakeNSMSession) Send(req request.Request) (response.Response, error) {
 		return f.sendFunc(req)
 	}
 	if len(f.responses) == 0 {
+		if f.pcrs != nil {
+			return f.sendStateful(req)
+		}
 		return response.Response{}, nil
 	}
 	res := f.responses[0]
 	f.responses = f.responses[1:]
 	return res, nil
+}
+
+func (f *fakeNSMSession) sendStateful(req request.Request) (response.Response, error) {
+	switch r := req.(type) {
+	case *request.DescribePCR:
+		index := uint(r.Index)
+		return response.Response{DescribePCR: &response.DescribePCR{
+			Data: f.currentPCR(index),
+			Lock: f.locks[index],
+		}}, nil
+	case *request.ExtendPCR:
+		index := uint(r.Index)
+		if f.locks[index] {
+			return response.Response{Error: "PCR is locked"}, nil
+		}
+		cur := f.currentPCR(index)
+		h := sha512.Sum384(append(cur, r.Data...))
+		f.pcrs[index] = append([]byte(nil), h[:]...)
+		return response.Response{ExtendPCR: &response.ExtendPCR{Data: f.currentPCR(index)}}, nil
+	case *request.LockPCR:
+		if f.locks == nil {
+			f.locks = map[uint]bool{}
+		}
+		f.locks[uint(r.Index)] = true
+		return response.Response{LockPCR: &response.LockPCR{}}, nil
+	case *request.Attestation:
+		if f.t == nil {
+			return response.Response{}, errors.New("stateful fake NSM session missing testing.T")
+		}
+		if f.attestationSign == nil {
+			now := time.Now()
+			f.attestationSign = newTestAttestationSigner(
+				f.t, now.Add(-time.Hour), now.Add(time.Hour),
+			)
+		}
+		att := buildSignedAttestationForRequest(f.t, f.attestationSign, clonePCRs(f.pcrs), r)
+		f.attestationRoots = att.roots
+		return attestationDocumentResponse(att.doc), nil
+	default:
+		return response.Response{}, nil
+	}
+}
+
+func (f *fakeNSMSession) currentPCR(index uint) []byte {
+	if pcr, ok := f.pcrs[index]; ok {
+		return append([]byte(nil), pcr...)
+	}
+	return make([]byte, 48)
 }
 
 func (f *fakeNSMSession) Close() error {
@@ -671,6 +787,30 @@ func (f *fakeNSMSession) Close() error {
 
 func attestationResult(pcrs map[uint][]byte, userData []byte) *nitrite.Result {
 	return &nitrite.Result{Document: &nitrite.Document{PCRs: pcrs, UserData: userData}}
+}
+
+func buildSignedAttestationForRequest(
+	t *testing.T,
+	signer *testAttestationSigner,
+	pcrs map[uint][]byte,
+	req *request.Attestation,
+) signedAttestation {
+	t.Helper()
+	return signer.build(
+		t,
+		pcrs,
+		time.Now(),
+		req.UserData,
+		req.PublicKey,
+	)
+}
+
+func clonePCRs(pcrs map[uint][]byte) map[uint][]byte {
+	out := make(map[uint][]byte, len(pcrs))
+	for index, pcr := range pcrs {
+		out[index] = append([]byte(nil), pcr...)
+	}
+	return out
 }
 
 func attestationDocumentResponse(doc []byte) response.Response {

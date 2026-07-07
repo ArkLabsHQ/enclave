@@ -39,9 +39,10 @@ import (
 )
 
 type fakeSSM struct {
-	params map[string]string
-	err    error
-	calls  []string
+	params  map[string]string
+	err     error
+	putErrs map[string]error
+	calls   []string
 
 	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
 	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
@@ -60,6 +61,9 @@ func (f *fakeSSM) PutParameter(
 ) (*ssm.PutParameterOutput, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if err := f.putErrs[aws.ToString(in.Name)]; err != nil {
+		return nil, err
 	}
 	if f.params == nil {
 		f.params = map[string]string{}
@@ -206,10 +210,12 @@ func (f *fakeSTS) GetCallerIdentity(
 }
 
 type fakeKMS struct {
-	mu    sync.Mutex
-	seq   int
-	keys  map[string]string
-	blobs map[string][]byte
+	mu           sync.Mutex
+	seq          int
+	keys         map[string]string
+	blobs        map[string][]byte
+	encryptErr   error
+	createKeyErr error
 }
 
 func newFakeKMS() *fakeKMS { return &fakeKMS{keys: map[string]string{}, blobs: map[string][]byte{}} }
@@ -241,6 +247,9 @@ func (f *fakeKMS) Encrypt(
 	in *kms.EncryptInput,
 	_ ...func(*kms.Options),
 ) (*kms.EncryptOutput, error) {
+	if f.encryptErr != nil {
+		return nil, f.encryptErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -327,6 +336,9 @@ func (f *fakeKMS) CreateKey(
 	in *kms.CreateKeyInput,
 	_ ...func(*kms.Options),
 ) (*kms.CreateKeyOutput, error) {
+	if f.createKeyErr != nil {
+		return nil, f.createKeyErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()

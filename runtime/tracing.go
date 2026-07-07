@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
@@ -48,6 +49,10 @@ func NewTracing(cw CloudWatchLogsAPI) *Tracing {
 	))
 
 	return t
+}
+
+func (t *Tracing) Span(ctx context.Context, name string) (context.Context, trace.Span) {
+	return otel.GetTracerProvider().Tracer("runtime").Start(ctx, name)
 }
 
 // StartCloudWatchExport ships span batches to CloudWatch; no-op when disabled.

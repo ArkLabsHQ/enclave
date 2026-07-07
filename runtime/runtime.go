@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/otel/codes"
 )
 
 type RuntimeState interface {
@@ -50,6 +52,15 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := tracing.StartCloudWatchExport(ctx); err != nil {
 		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
 	}
+
+	ctx, initSpan := tracing.Span(ctx, "init")
+	initSpanEnded := false
+
+	defer func() {
+		if !initSpanEnded {
+			initSpan.End()
+		}
+	}()
 
 	logging := NewLogging(metrics, aws.CWL)
 	slog.SetDefault(slog.New(NewBufferHandler(logging)))
@@ -180,6 +191,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
+
+	initSpan.SetStatus(codes.Ok, "")
+	initSpan.End()
+	initSpanEnded = true
 
 	return supervise(ctx, rt, app)
 }

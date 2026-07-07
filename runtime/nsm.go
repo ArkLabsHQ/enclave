@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"crypto/rsa"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -162,7 +163,7 @@ func lockPCR(session nsmSession, index uint) error {
 }
 
 // ExtendPCR appends data to PCR[index]'s rolling hash.
-func (n *nsmW) ExtendPCR(index uint, data []byte) error {
+func (n *nsmW) ExtendPCR(index uint, value []byte) error {
 	session, err := n.nsm.OpenSession()
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
@@ -170,11 +171,11 @@ func (n *nsmW) ExtendPCR(index uint, data []byte) error {
 
 	defer func() { _ = session.Close() }()
 
-	return extendPCR(session, index, data)
+	return extendPCR(session, index, value)
 }
 
-func extendPCR(session nsmSession, index uint, data []byte) error {
-	resp, err := session.Send(&request.ExtendPCR{Index: uint16(index), Data: data})
+func extendPCR(session nsmSession, index uint, value []byte) error {
+	resp, err := session.Send(&request.ExtendPCR{Index: uint16(index), Data: value})
 	if err != nil {
 		return fmt.Errorf("ExtendPCR(%d): %w", index, err)
 	}
@@ -230,7 +231,7 @@ func (n *nsmW) PCR0() ([]byte, error) {
 	return pcr, nil
 }
 
-func (n *nsmW) CommitPCR(index uint, data []byte) error {
+func (n *nsmW) CommitPCR(index uint, value []byte) error {
 	session, err := n.nsm.OpenSession()
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
@@ -238,16 +239,19 @@ func (n *nsmW) CommitPCR(index uint, data []byte) error {
 
 	defer func() { _ = session.Close() }()
 
-	return commitPCR(session, index, data)
+	return commitPCR(session, index, value)
 }
 
-func commitPCR(session nsmSession, index uint, data []byte) error {
+func commitPCR(session nsmSession, index uint, value []byte) error {
 	cur, locked, err := describePCR(session, index)
 	if err != nil {
 		return fmt.Errorf("describePCR(%d): %w", index, err)
 	}
+
+	extendedValue := pcrExtendFromZero(value)
+
 	switch {
-	case bytes.Equal(cur, data):
+	case bytes.Equal(cur, extendedValue):
 		if !locked {
 			if err := lockPCR(session, index); err != nil {
 				return fmt.Errorf("lock PCR%d: %w", index, err)
@@ -256,13 +260,13 @@ func commitPCR(session nsmSession, index uint, data []byte) error {
 		slog.Info(
 			"PCR already committed to value, skipped re-extension",
 			"index", index,
-			"data", prefix16(hex.EncodeToString(data)),
+			"data", prefix16(hex.EncodeToString(value)),
 		)
 		return nil
 	case !bytes.Equal(cur, make([]byte, len(cur))):
 		return fmt.Errorf("PCR%d holds an unexpected value: %s", index, hex.EncodeToString(cur))
 	}
-	if err := extendPCR(session, index, data); err != nil {
+	if err := extendPCR(session, index, value); err != nil {
 		return fmt.Errorf("failed to extend PCR%d: %w", index, err)
 	}
 	if err := lockPCR(session, index); err != nil {
@@ -351,6 +355,11 @@ func buildAttestationDocument(
 	}
 
 	return res.Attestation.Document, privateKey, nil
+}
+
+func pcrExtendFromZero(data []byte) []byte {
+	h := sha512.Sum384(append(make([]byte, 48), data...))
+	return h[:]
 }
 
 type nsmAPI interface {

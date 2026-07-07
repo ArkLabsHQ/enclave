@@ -318,7 +318,9 @@ func TestPCRMethods(t *testing.T) {
 	t.Run("ExtendPCR sends request.ExtendPCR", func(t *testing.T) {
 		data := []byte("extension")
 		session := &fakeNSMSession{
-			responses: []response.Response{{ExtendPCR: &response.ExtendPCR{Data: data}}},
+			responses: []response.Response{
+				{ExtendPCR: &response.ExtendPCR{Data: pcrExtendFromZero(data)}},
+			},
 		}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
 
@@ -334,9 +336,10 @@ func TestPCRMethods(t *testing.T) {
 
 	t.Run("DescribePCR returns data and locked", func(t *testing.T) {
 		data := bytes.Repeat([]byte{0xcd}, 48)
+		extended := pcrExtendFromZero(data)
 		session := &fakeNSMSession{
 			responses: []response.Response{
-				{DescribePCR: &response.DescribePCR{Data: data, Lock: true}},
+				{DescribePCR: &response.DescribePCR{Data: extended, Lock: true}},
 			},
 		}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
@@ -345,7 +348,7 @@ func TestPCRMethods(t *testing.T) {
 
 		require.NoError(t, err)
 		require.True(t, locked)
-		require.Equal(t, data, got)
+		require.Equal(t, extended, got)
 		req, ok := session.requests[0].(*request.DescribePCR)
 		require.True(t, ok)
 		require.Equal(t, uint16(9), req.Index)
@@ -354,12 +357,13 @@ func TestPCRMethods(t *testing.T) {
 
 func TestCommitPCR(t *testing.T) {
 	data := bytes.Repeat([]byte{0xaa}, 48)
+	extended := pcrExtendFromZero(data)
 	zero := make([]byte, 48)
 
 	t.Run("zero current PCR extends then locks", func(t *testing.T) {
 		session := &fakeNSMSession{responses: []response.Response{
 			{DescribePCR: &response.DescribePCR{Data: zero, Lock: false}},
-			{ExtendPCR: &response.ExtendPCR{Data: data}},
+			{ExtendPCR: &response.ExtendPCR{Data: extended}},
 			{LockPCR: &response.LockPCR{}},
 		}}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
@@ -382,7 +386,7 @@ func TestCommitPCR(t *testing.T) {
 
 	t.Run("already equal and unlocked locks only", func(t *testing.T) {
 		session := &fakeNSMSession{responses: []response.Response{
-			{DescribePCR: &response.DescribePCR{Data: data, Lock: false}},
+			{DescribePCR: &response.DescribePCR{Data: extended, Lock: false}},
 			{LockPCR: &response.LockPCR{}},
 		}}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
@@ -401,7 +405,7 @@ func TestCommitPCR(t *testing.T) {
 
 	t.Run("already equal and locked no-op", func(t *testing.T) {
 		session := &fakeNSMSession{responses: []response.Response{
-			{DescribePCR: &response.DescribePCR{Data: data, Lock: true}},
+			{DescribePCR: &response.DescribePCR{Data: extended, Lock: true}},
 		}}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
 
@@ -416,7 +420,10 @@ func TestCommitPCR(t *testing.T) {
 
 	t.Run("unexpected current PCR errors", func(t *testing.T) {
 		session := &fakeNSMSession{responses: []response.Response{
-			{DescribePCR: &response.DescribePCR{Data: bytes.Repeat([]byte{0xbb}, 48), Lock: false}},
+			{DescribePCR: &response.DescribePCR{
+				Data: pcrExtendFromZero(bytes.Repeat([]byte{0xbb}, 48)),
+				Lock: false,
+			}},
 		}}
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
 

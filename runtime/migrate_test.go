@@ -93,7 +93,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		nsm := predecessorNSM(t, currentPCR0Bytes, map[uint][]byte{
 			0:                 prevPCR0Bytes,
-			migrationPCRIndex: currentPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		})
 
 		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{

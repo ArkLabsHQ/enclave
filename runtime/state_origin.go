@@ -173,7 +173,7 @@ func EstablishStateOrigin(
 
 		// Verify PCR31 if this migration is not a rollback (curPCR0 != prevPCR0)
 		if !strings.EqualFold(prevPCR0, curPCR0) {
-			expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcr0ToPCR31(pcr0))
+			expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(pcr0))
 		}
 
 		if err := verifyStateOriginReceipt(

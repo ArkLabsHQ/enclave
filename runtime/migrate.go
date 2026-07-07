@@ -3,7 +3,6 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -137,8 +136,7 @@ func (m *migrator) StartMigration(
 	}
 	ownPCR0 := hex.EncodeToString(pcr0)
 
-	pcr31 := pcr0ToPCR31(newPCR0Bytes)
-	if err := m.nsm.CommitPCR(migrationPCRIndex, pcr31); err != nil {
+	if err := m.nsm.CommitPCR(migrationPCRIndex, newPCR0Bytes); err != nil {
 		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
 
@@ -269,13 +267,8 @@ func VerifyPredecessorCommitment(ctx context.Context, nsm NSM, ssm SSM) error {
 
 	return nsm.VerifyAttestation(previousPRCOAttest, map[uint]string{
 		0:                 ssmPreviousPRCO,
-		migrationPCRIndex: hex.EncodeToString(currentPCR0),
+		migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(currentPCR0)),
 	}, nil)
-}
-
-func pcr0ToPCR31(pcr0 []byte) []byte {
-	sha512 := sha512.Sum384(append(make([]byte, 48), pcr0...))
-	return sha512[:]
 }
 
 func validateNewPCR0(pcr0 string) ([]byte, error) {

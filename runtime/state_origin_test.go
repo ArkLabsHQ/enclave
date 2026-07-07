@@ -248,7 +248,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
 	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	stateRoot := []byte("successor-state-root")
-	pcr31 := pcr0ToPCR31(ownPCR0)
+	pcr31 := pcrExtendFromZero(ownPCR0)
 	att := signedReceipt(t, map[uint][]byte{
 		0:                 prevPCR0,
 		migrationPCRIndex: pcr31,
@@ -274,7 +274,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 		stateRoot,
 		map[uint]string{
 			0:                 hex.EncodeToString(prevPCR0),
-			migrationPCRIndex: hex.EncodeToString(pcr0ToPCR31(bytes.Repeat([]byte{0x33}, 48))),
+			migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(bytes.Repeat([]byte{0x33}, 48))),
 		},
 	)
 	require.Error(t, err)
@@ -418,7 +418,7 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 	t.Run("accepts valid handoff", func(t *testing.T) {
 		fake, root, roots, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
-			migrationPCRIndex: pcr0ToPCR31(ownPCR0),
+			migrationPCRIndex: pcrExtendFromZero(ownPCR0),
 		})
 		require.NoError(t, err)
 		require.NoError(t, verifyStateOriginReceipt(
@@ -433,7 +433,7 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 	t.Run("rejects wrong PCR31", func(t *testing.T) {
 		_, _, _, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
-			migrationPCRIndex: pcr0ToPCR31(wrongPCR0),
+			migrationPCRIndex: pcrExtendFromZero(wrongPCR0),
 		})
 		require.Error(t, err)
 	})
@@ -441,7 +441,7 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 	t.Run("rollback onto self skips PCR31", func(t *testing.T) {
 		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
 			0:                 ownPCR0,
-			migrationPCRIndex: pcr0ToPCR31(failedTargetPCR0),
+			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
 		})
 		require.NoError(t, err)
 	})
@@ -449,7 +449,7 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 	t.Run("rollback still requires predecessor signer", func(t *testing.T) {
 		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
 			0:                 wrongPCR0,
-			migrationPCRIndex: pcr0ToPCR31(failedTargetPCR0),
+			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
 		})
 		require.Error(t, err)
 	})

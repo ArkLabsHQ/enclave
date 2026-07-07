@@ -1038,12 +1038,10 @@ fi
 # stopped latch, so the watchdog won't relaunch underneath us) and /start.
 echo ""
 echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
-TAMPER_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" $LOCALSTACK \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-DEK_PARAM="/dev/my-app/StorageDEK/Ciphertext/${TAMPER_KEY_ID}"
+DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${NEW_KEY}"
 ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$TAMPER_KEY_ID" ] || [ -z "$ORIG_DEK" ]; then
+if [ -z "$ORIG_DEK" ]; then
   echo "  FAIL: could not read KMSKeyID / StorageDEK ciphertext from SSM" >&2
   exit 1
 fi

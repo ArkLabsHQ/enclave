@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/hf/nitrite"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
@@ -51,14 +52,22 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	attestationParam := migrationPreviousPCR0AttestationParam()
 
 	t.Run("missing previous PCR0", func(t *testing.T) {
-		err := VerifyPredecessorCommitment(ctx, nil, NewSSM(&fakeSSM{}))
+		err := VerifyPredecessorCommitment(
+			ctx,
+			predecessorNSM(t, currentPCR0Bytes, nil),
+			NewSSM(&fakeSSM{}),
+		)
 		require.Error(t, err)
 	})
 
 	t.Run("mismatched previous PCR0", func(t *testing.T) {
-		err := VerifyPredecessorCommitment(ctx, nil, NewSSM(&fakeSSM{params: map[string]string{
-			previousParam: strings.Repeat("0", 96),
-		}}))
+		err := VerifyPredecessorCommitment(
+			ctx,
+			predecessorNSM(t, currentPCR0Bytes, nil),
+			NewSSM(&fakeSSM{params: map[string]string{
+				previousParam: strings.Repeat("0", 96),
+			}}),
+		)
 		require.Error(t, err)
 	})
 
@@ -73,17 +82,21 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				err := VerifyPredecessorCommitment(ctx, nil, NewSSM(&fakeSSM{params: tc.params}))
+				err := VerifyPredecessorCommitment(
+					ctx,
+					predecessorNSM(t, currentPCR0Bytes, nil),
+					NewSSM(&fakeSSM{params: tc.params}),
+				)
 				require.Error(t, err)
 			})
 		}
 	})
 
 	t.Run("wrong PCR31", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, map[uint][]byte{
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
 			0:                 prevPCR0Bytes,
 			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
-		})
+		}, nil))
 
 		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
 			previousParam:    prevPCR0,
@@ -94,13 +107,31 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	})
 
 	t.Run("success", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, map[uint][]byte{
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
 			0:                 prevPCR0Bytes,
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		})
+		}, nil))
 
 		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
 			previousParam:    strings.ToUpper(prevPCR0),
+			attestationParam: attestation,
+		}}))
+
+		require.NoError(t, err)
+	})
+
+	t.Run("rollback-to-self ignores PCR31 target", func(t *testing.T) {
+		failedTargetPCR0Bytes := bytes.Repeat([]byte{0xef}, 48)
+
+		// The first arg is the fresh rollback boot PCR0; the map is the stored
+		// predecessor attestation from the earlier v2 -> v3 migration attempt.
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 currentPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0Bytes),
+		}, nil))
+
+		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
+			previousParam:    hex.EncodeToString(currentPCR0Bytes),
 			attestationParam: attestation,
 		}}))
 
@@ -361,14 +392,14 @@ func TestStartMigration(t *testing.T) {
 	})
 }
 
-func predecessorNSM(t *testing.T, currentPCR0 []byte, predecessorPCRs map[uint][]byte) NSM {
+func predecessorNSM(t *testing.T, currentPCR0 []byte, verifyResult *nitrite.Result) NSM {
 	t.Helper()
 	session := &fakeNSMSession{responses: []response.Response{
 		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: currentPCR0})),
 	}}
 	return &nsmW{nsm: &fakeNSM{
 		session:      session,
-		verifyResult: attestationResult(predecessorPCRs, nil),
+		verifyResult: verifyResult,
 	}}
 }
 

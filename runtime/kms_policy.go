@@ -3,6 +3,7 @@ package runtime
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -77,10 +78,10 @@ func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bo
 	}
 	var policy struct {
 		Statement []struct {
-			Effect    string                 `json:"Effect"`
-			Principal json.RawMessage        `json:"Principal"`
-			Action    json.RawMessage        `json:"Action"`
-			Condition map[string]interface{} `json:"Condition"`
+			Effect    string          `json:"Effect"`
+			Principal json.RawMessage `json:"Principal"`
+			Action    json.RawMessage `json:"Action"`
+			Condition map[string]any  `json:"Condition"`
 		} `json:"Statement"`
 	}
 	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
@@ -121,6 +122,50 @@ func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bo
 		return fmt.Errorf("policy PCR0 set does not match expected PCR0 set")
 	}
 	return nil
+}
+
+func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
+	if policyJSON == "" {
+		return nil, fmt.Errorf("empty KMS key policy")
+	}
+
+	var policy struct {
+		Statement []struct {
+			Effect    string          `json:"Effect"`
+			Principal json.RawMessage `json:"Principal"`
+			Action    json.RawMessage `json:"Action"`
+			Condition map[string]any  `json:"Condition"`
+		} `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
+		return nil, fmt.Errorf("parse KMS key policy: %w", err)
+	}
+
+	admittedPCR0s := map[string]bool{}
+	for _, stmt := range policy.Statement {
+		if !strings.EqualFold(stmt.Effect, "Allow") {
+			continue
+		}
+		actions := normalizePolicyStrings(stmt.Action)
+
+		if actionsGrant(actions, "kms:Decrypt") {
+			pcr0s, ok := pcr0ConditionValues(stmt.Condition)
+			if !ok {
+				return nil, fmt.Errorf(
+					"policy grants kms:Decrypt without a RecipientAttestation:PCR0 condition",
+				)
+			}
+			for _, pcr0 := range pcr0s {
+				admittedPCR0s[strings.ToLower(pcr0)] = true
+			}
+		}
+	}
+
+	if len(admittedPCR0s) <= 0 {
+		return nil, fmt.Errorf("policy does not grant kms:Decrypt to any RecipientAttestation:PCR0")
+	}
+
+	return admittedPCR0s, nil
 }
 
 type kmsPolicyDocument struct {
@@ -184,8 +229,8 @@ func arnAccount(arn string) (string, error) {
 // pcr0ConditionValues returns the exact PCR0 values from the KMS attestation
 // condition this runtime builds. AWS policies may encode the value as either a
 // string or an array of strings; any other shape is rejected.
-func pcr0ConditionValues(cond map[string]interface{}) ([]string, bool) {
-	ops, ok := cond["StringEqualsIgnoreCase"].(map[string]interface{})
+func pcr0ConditionValues(cond map[string]any) ([]string, bool) {
+	ops, ok := cond["StringEqualsIgnoreCase"].(map[string]any)
 	if !ok {
 		return nil, false
 	}
@@ -200,7 +245,7 @@ func pcr0ConditionValues(cond map[string]interface{}) ([]string, bool) {
 			return nil, false
 		}
 		return []string{v}, true
-	case []interface{}:
+	case []any:
 		values := make([]string, 0, len(v))
 		for _, item := range v {
 			s, ok := item.(string)
@@ -211,10 +256,8 @@ func pcr0ConditionValues(cond map[string]interface{}) ([]string, bool) {
 		}
 		return values, len(values) > 0
 	case []string:
-		for _, s := range v {
-			if s == "" {
-				return nil, false
-			}
+		if slices.Contains(v, "") {
+			return nil, false
 		}
 		return v, len(v) > 0
 	default:

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	kmscmd "github.com/aws/aws-sdk-go-v2/service/kms"
@@ -48,10 +49,11 @@ func FetchOrCreatePrimaryKMS(
 	sts STSAPI,
 	ssm SSM,
 ) (PrimaryKMS, error) {
-	pcr0, err := nsm.PCR0()
+	curPCR0, err := nsm.PCR0()
 	if err != nil {
 		return nil, fmt.Errorf("could not read PCR0 from NSM")
 	}
+	curPCR0Hex := hex.EncodeToString(curPCR0)
 
 	keyID, err := ssm.MayGet(ctx, kmsKeyIDParam())
 	if err != nil {
@@ -70,22 +72,68 @@ func FetchOrCreatePrimaryKMS(
 		if out.Policy == nil {
 			return nil, fmt.Errorf("KMS key policy empty: %s", keyID)
 		}
-
-		expectedPCR0s := []string{hex.EncodeToString(pcr0)}
-		previousPCR0, err := ssm.MayGet(ctx, migrationPreviousPCR0Param())
+		expectedPCR0s := []string{curPCR0Hex}
+		prevPCR0, err := ssm.MayGet(ctx, migrationPreviousPCR0Param())
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch migration previous PCR0: %w", err)
 		}
-		if previousPCR0 != "" {
-			// Verified earlier by VerifyPredecessorCommitment.
-			expectedPCR0s = append(expectedPCR0s, previousPCR0)
+		switch {
+		case prevPCR0 == "":
+			// genesis/current key
+		case !strings.EqualFold(prevPCR0, curPCR0Hex):
+			// normal migration successor boot
+			expectedPCR0s = append(expectedPCR0s, prevPCR0)
+		default:
+			// rollback-to-self: derive failed target from policy, prove PCR31 committed it
+			admitted, err := KeyPolicyAdmittedPCR0s(*out.Policy)
+			if err != nil {
+				return nil, err
+			}
+			if len(admitted) != 2 {
+				return nil, fmt.Errorf(
+					"rollback KMS policy must admit current PCR0 and one target PCR0",
+				)
+			}
+			if !admitted[curPCR0Hex] {
+				return nil, fmt.Errorf("rollback KMS policy does not admit current PCR0")
+			}
+
+			delete(admitted, curPCR0Hex)
+			otherPCR0 := ""
+			for k := range admitted {
+				otherPCR0 = k
+			}
+			migrationAttest, err := ssm.MustGet(ctx, migrationPreviousPCR0AttestationParam())
+			if err != nil {
+				return nil, fmt.Errorf(
+					"failed to read previous PCR0 attestation SSM param: %w",
+					err,
+				)
+			}
+			otherPCR0Bytes, err := hex.DecodeString(otherPCR0)
+			if err != nil {
+				return nil, fmt.Errorf("failed decode other admitted PCR0: %w", err)
+
+			}
+			// verify the rollback-from PCR0 was committed to in the migration attestation
+			if err := nsm.VerifyAttestation(migrationAttest, map[uint]string{
+				0:                 curPCR0Hex,
+				migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(otherPCR0Bytes)),
+			}, nil); err != nil {
+				return nil, fmt.Errorf(
+					"other admitted PCR0 does not match PCR31 in migration attestation: %w",
+					err,
+				)
+			}
+
+			expectedPCR0s = append(expectedPCR0s, otherPCR0)
 		}
 
 		if err := VerifyKeyPolicyPosture(*out.Policy, expectedPCR0s, kmsKeyLocked()); err != nil {
 			return nil, fmt.Errorf(
 				"KMS key %s policy posture mismatch (ours: %s...): %w",
 				keyID,
-				pcr0[:16],
+				curPCR0Hex[:16],
 				err,
 			)
 		}
@@ -105,7 +153,7 @@ func FetchOrCreatePrimaryKMS(
 
 	policy, err := BuildKMSPolicy(
 		*identity.Arn,
-		[]string{hex.EncodeToString(pcr0)},
+		[]string{curPCR0Hex},
 		recoveryAccount,
 	)
 	if err != nil {
@@ -134,7 +182,7 @@ func FetchOrCreatePrimaryKMS(
 		return nil, fmt.Errorf("failed to set primary KMS Key ID SSM Param: %w", err)
 	}
 
-	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", pcr0[:16])
+	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", curPCR0Hex[:16])
 
 	return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID, genesis: true}, nil
 }

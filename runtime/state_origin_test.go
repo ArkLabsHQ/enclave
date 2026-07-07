@@ -273,8 +273,10 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 		purposeMigrationTransition,
 		stateRoot,
 		map[uint]string{
-			0:                 hex.EncodeToString(prevPCR0),
-			migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(bytes.Repeat([]byte{0x33}, 48))),
+			0: hex.EncodeToString(prevPCR0),
+			migrationPCRIndex: hex.EncodeToString(
+				pcrExtendFromZero(bytes.Repeat([]byte{0x33}, 48)),
+			),
 		},
 	)
 	require.Error(t, err)
@@ -334,7 +336,7 @@ func TestEstablishStateOriginResumeDetectsCiphertextSwap(t *testing.T) {
 	)
 	nsm := &nsmW{nsm: &fakeNSM{
 		session:      session,
-		verifyResult: attestationResult(map[uint][]byte{0: pcr0}, payload),
+		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
 	}}
 	_, err := EstablishStateOrigin(
 		ctx,
@@ -356,7 +358,7 @@ func TestEstablishStateOriginResumeDetectsCiphertextSwap(t *testing.T) {
 	)
 	nsm = &nsmW{nsm: &fakeNSM{
 		session:      session,
-		verifyResult: attestationResult(map[uint][]byte{0: pcr0}, payload),
+		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
 	}}
 	_, err = EstablishStateOrigin(
 		ctx,
@@ -398,7 +400,7 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 		)
 		nsm := &nsmW{nsm: &fakeNSM{
 			session: session,
-			verifyResult: attestationResult(
+			verifyResult: verifyDocResult(
 				verifiedPCRs,
 				receiptPayload(t, purposeMigrationTransition, root),
 			),

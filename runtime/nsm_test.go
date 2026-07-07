@@ -101,7 +101,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 	})
 
 	t.Run("PCR match and user_data match", func(t *testing.T) {
-		fake := &fakeNSM{verifyResult: attestationResult(map[uint][]byte{0: pcr0}, userData)}
+		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
 		err := nsm.VerifyAttestation(docB64, map[uint]string{0: hex.EncodeToString(pcr0)}, userData)
@@ -110,7 +110,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 	})
 
 	t.Run("missing PCR", func(t *testing.T) {
-		fake := &fakeNSM{verifyResult: attestationResult(map[uint][]byte{1: pcr0}, userData)}
+		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{1: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
 		err := nsm.VerifyAttestation(docB64, map[uint]string{0: hex.EncodeToString(pcr0)}, userData)
@@ -119,7 +119,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 	})
 
 	t.Run("PCR mismatch", func(t *testing.T) {
-		fake := &fakeNSM{verifyResult: attestationResult(map[uint][]byte{0: pcr0}, userData)}
+		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
 		err := nsm.VerifyAttestation(
@@ -132,7 +132,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 	})
 
 	t.Run("user_data mismatch", func(t *testing.T) {
-		fake := &fakeNSM{verifyResult: attestationResult(map[uint][]byte{0: pcr0}, userData)}
+		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
 		err := nsm.VerifyAttestation(
@@ -785,7 +785,7 @@ func (f *fakeNSMSession) Close() error {
 	return nil
 }
 
-func attestationResult(pcrs map[uint][]byte, userData []byte) *nitrite.Result {
+func verifyDocResult(pcrs map[uint][]byte, userData []byte) *nitrite.Result {
 	return &nitrite.Result{Document: &nitrite.Document{PCRs: pcrs, UserData: userData}}
 }
 

@@ -249,7 +249,14 @@ func VerifyPredecessorCommitment(ctx context.Context, nsm NSM, ssm SSM) error {
 		return nil
 	}
 
-	if !strings.EqualFold(eifPreviousPCR0, ssmPreviousPRCO) {
+	currentPCR0, err := nsm.PCR0()
+	if err != nil {
+		return fmt.Errorf("failed to read current PCR0: %w", err)
+	}
+
+	if !strings.EqualFold(eifPreviousPCR0, ssmPreviousPRCO) &&
+		// allow rollback-to-self
+		!strings.EqualFold(ssmPreviousPRCO, hex.EncodeToString(currentPCR0)) {
 		return fmt.Errorf(
 			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
 		)
@@ -260,15 +267,16 @@ func VerifyPredecessorCommitment(ctx context.Context, nsm NSM, ssm SSM) error {
 		return fmt.Errorf("failed to read previous PCR0 attestation SSM param: %w", err)
 	}
 
-	currentPCR0, err := nsm.PCR0()
-	if err != nil {
-		return fmt.Errorf("failed to read current PCR0: %w", err)
+	expectedPCRs := map[uint]string{
+		0: ssmPreviousPRCO,
 	}
 
-	return nsm.VerifyAttestation(previousPRCOAttest, map[uint]string{
-		0:                 ssmPreviousPRCO,
-		migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(currentPCR0)),
-	}, nil)
+	// Verify PCR31 if this is not a rollback (curPCR0 != prevPCR0)
+	if !strings.EqualFold(ssmPreviousPRCO, hex.EncodeToString(currentPCR0)) {
+		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(currentPCR0))
+	}
+
+	return nsm.VerifyAttestation(previousPRCOAttest, expectedPCRs, nil)
 }
 
 func validateNewPCR0(pcr0 string) ([]byte, error) {

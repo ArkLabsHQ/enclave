@@ -134,7 +134,7 @@ func (n *nsmW) BuildAttestationDocument(
 		return nil, nil, fmt.Errorf("open NSM session: %w", err)
 	}
 
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	return buildAttestationDocument(session, opts...)
 }
@@ -145,7 +145,7 @@ func (n *nsmW) LockPCR(index uint) error {
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	return lockPCR(session, index)
 }
@@ -168,7 +168,7 @@ func (n *nsmW) ExtendPCR(index uint, data []byte) error {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
 
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	return extendPCR(session, index, data)
 }
@@ -191,7 +191,7 @@ func (n *nsmW) DescribePCR(index uint) (data []byte, locked bool, err error) {
 		return nil, false, fmt.Errorf("open NSM session: %w", err)
 	}
 
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	return describePCR(session, index)
 }
@@ -216,7 +216,7 @@ func (n *nsmW) PCR0() ([]byte, error) {
 		return nil, fmt.Errorf("open NSM session: %w", err)
 	}
 
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	pcr, err := getPCR(session, 0)
 	if err != nil {
@@ -236,7 +236,7 @@ func (n *nsmW) CommitPCR(index uint, data []byte) error {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
 
-	defer func() { session.Close() }()
+	defer func() { _ = session.Close() }()
 
 	return commitPCR(session, index, data)
 }

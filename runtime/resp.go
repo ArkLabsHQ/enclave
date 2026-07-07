@@ -96,7 +96,7 @@ func (s *respServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		return
 	case "QUIT":
 		conn.WriteString("OK")
-		conn.Close()
+		_ = conn.Close()
 		return
 	case "AUTH":
 		s.cmdAuth(conn, st, cmd)

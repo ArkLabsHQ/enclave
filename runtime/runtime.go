@@ -134,6 +134,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to estabilish state origin: %w", err)
 	}
 
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, secrets); err != nil {
+		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
+	}
+
+	if err := SetStaticSecretEnvVars(secrets); err != nil {
+		return fmt.Errorf("failed to set static secrets env vars: %w", err)
+	}
+
 	migrator := NewMigrator(nsm, kms, ssmWithCache, dek, stateOrigin, secrets)
 
 	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {

@@ -35,6 +35,18 @@ cd "$SCRIPT_DIR"
 boot_qemu() {
   local eif_path="${1:?Usage: boot_qemu <path-to-eif>}"
 
+  # ENCLAVE_START_CMD is intentionally async. After a supervisor restart, the
+  # old QEMU wrapper may still be healthy while a new start command races in;
+  # do not tear down vhost-device-vsock underneath it.
+  if [ -s /tmp/enclave-boot.pid ]; then
+    local existing_pid
+    existing_pid=$(cat /tmp/enclave-boot.pid 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && [ "$existing_pid" != "$$" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "Enclave boot already running (PID $existing_pid)"
+      return 0
+    fi
+  fi
+
   echo $$ > /tmp/enclave-boot.pid
 
   if [ ! -f "$eif_path" ]; then
@@ -1223,6 +1235,8 @@ else
   echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30 attempts (~90s)" >&2
   exit 1
 fi
+
+wait_for_enclave "after supervisor relaunch"
 
 echo ""
 echo "=== [10/11] Final enclave info ==="

@@ -28,6 +28,16 @@ The `elog` logger, `inEnclave` package variable, and `func init()` that upstream
 defined in `main.go` are reproduced verbatim in `package_init.go` so other files
 in the package keep compiling.
 
+**`proxy.go` — stale TAP link cleanup in `setupNetworking`.** Upstream's
+teardown only closes the vsock connection and the tap fd; the interface's IP
+address and default route can survive across retries. When the host-side
+gvproxy restarts (e.g. supervisor relaunch), the reconnect loop in
+`RunNetworking` then fails forever: `configureTapIface` gets EEXIST
+("failed to set link address: file exists") on every attempt, leaving the
+enclave alive but permanently unreachable. We delete any pre-existing
+`tap0` link before creating the TAP device, guaranteeing a clean slate.
+Re-apply this block when syncing to a newer upstream.
+
 ## Syncing to a newer upstream
 
 1. `git diff --stat v1.4.2..<new-tag> -- '*.go' ':!main*' ':!system_darwin*'` against

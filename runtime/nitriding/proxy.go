@@ -65,6 +65,18 @@ func setupNetworking(ctx context.Context, hostProxyPort uint32) error {
 	}
 	elog.Println("Sent HTTP request to EC2 host.")
 
+	// Local modification (see UPSTREAM.md): delete any stale TAP link left
+	// over from a previous tunnel. Upstream's teardown only closes the vsock
+	// conn and the tap fd; the interface's IP address and default route can
+	// survive, making the configureTapIface retry fail forever with EEXIST
+	// ("failed to set link address: file exists").
+	if link, err := netlink.LinkByName(ifaceTap); err == nil {
+		if err := netlink.LinkDel(link); err != nil {
+			return fmt.Errorf("failed to delete stale tap link: %w", err)
+		}
+		elog.Println("Deleted stale TAP link from previous tunnel.")
+	}
+
 	// Create a TAP interface.
 	tap, err := water.New(water.Config{
 		DeviceType:             water.TAP,

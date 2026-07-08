@@ -80,7 +80,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		}
 	}
 
-	if err := l.startEnclave(ctx); err != nil {
+	if err := l.StartOnce(ctx); err != nil {
 		slog.Error("initial enclave start failed", "error", err)
 		// Fall through; restart logic will retry.
 	}
@@ -137,6 +137,13 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(backoff):
+		}
+		// Terminate before restarting: the enclave may be alive but
+		// unreachable (e.g. wedged networking), in which case start paths
+		// guarded by liveness checks (nitro-cli, test harness PID guard)
+		// would no-op forever.
+		if err := l.terminateEnclave(); err != nil {
+			slog.Warn("enclave termination before restart failed", "error", err)
 		}
 		if err := l.startEnclave(ctx); err != nil {
 			slog.Error("enclave restart failed", "error", err)
@@ -382,4 +389,3 @@ func (l *Lifecycle) handleStop(w http.ResponseWriter, r *http.Request) {
 		Message: "enclave terminated",
 	})
 }
-

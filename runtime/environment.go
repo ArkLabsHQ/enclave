@@ -162,13 +162,6 @@ func storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
 }
 
-// thresholdLeaderParam: SSM path where the master supervisor publishes the
-// threshold leader's reachable handshake base URL (e.g. https://host:443), for
-// joiner enclaves to discover. Lock-scoped so locked/unlocked deployments differ.
-func thresholdLeaderParam() string {
-	return fmt.Sprintf("/%s/%s/%s/Threshold/Leader", getDeployment(), getAppName(), lockSegment())
-}
-
 // ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by
 // loadDeployTLSConfig for known one-off lookups; GetParametersByPath drives
 // the deploy-time env overlay (no need to enumerate keys at build time).

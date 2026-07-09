@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -199,35 +198,44 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 
+	currentKeyID, err := m.kms.GetKeyID(ctx)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read current KMS key id: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	type encryptedSecret struct {
 		name          string
-		keyBytes      []byte
+		plaintext     []byte
 		ciphertextB64 string
 	}
 	var encryptedSecrets []encryptedSecret
 	for _, secret := range m.staticSecrets.Secrets() {
-		secretValue := os.Getenv(secret.EnvVar)
-		if secretValue == "" {
-			continue
-		}
-		keyBytes, err := hex.DecodeString(secretValue)
+		oldCiphertextB64, err := m.kms.LoadCiphertext(ctx, secretCiphertextParam(secret.Name, currentKeyID))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("invalid key format for %s", secret.Name), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("read ciphertext for %s: %v", secret.Name, err), http.StatusInternalServerError)
 			return
 		}
-		ciphertextB64, err := m.kms.Encrypt(ctx, migrationKeyID, keyBytes)
+		if oldCiphertextB64 == "" {
+			continue // not yet persisted (e.g. a follower still awaiting its share)
+		}
+		plaintext, err := m.staticSecrets.decryptCiphertext(ctx, currentKeyID, oldCiphertextB64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("decrypt current secret %s: %v", secret.Name, err), http.StatusInternalServerError)
+			return
+		}
+		ciphertextB64, err := m.kms.Encrypt(ctx, migrationKeyID, plaintext)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("KMS encrypt failed for %s", secret.Name), http.StatusInternalServerError)
 			return
 		}
-		ciphertextParam := secretCiphertextParam(secret.Name, migrationKeyID)
-		if err := m.kms.StoreCiphertext(ctx, ciphertextParam, ciphertextB64); err != nil {
+		if err := m.kms.StoreCiphertext(ctx, secretCiphertextParam(secret.Name, migrationKeyID), ciphertextB64); err != nil {
 			http.Error(w, fmt.Sprintf("SSM store failed for %s", secret.Name), http.StatusInternalServerError)
 			return
 		}
 		encryptedSecrets = append(encryptedSecrets, encryptedSecret{
 			name:          secret.Name,
-			keyBytes:      keyBytes,
+			plaintext:     plaintext,
 			ciphertextB64: ciphertextB64,
 		})
 	}
@@ -244,7 +252,7 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, fmt.Sprintf("verify: decrypt failed for %s: %v", es.name, err), http.StatusInternalServerError)
 			return
 		}
-		if !bytes.Equal(decrypted, es.keyBytes) {
+		if !bytes.Equal(decrypted, es.plaintext) {
 			http.Error(w, fmt.Sprintf("verify: ciphertext mismatch for %s", es.name), http.StatusInternalServerError)
 			return
 		}
@@ -258,7 +266,7 @@ func (m *Migrator) handleStartMigration(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	oldKeyID, _ := m.kms.GetKeyID(ctx) // for deletion below
+	oldKeyID := currentKeyID // captured before the commit below flips KMSKeyID
 
 	// Atomic commit: from here, all boots use the migration key.
 	if _, err := m.aws.SSM.PutParameter(ctx, &ssm.PutParameterInput{

@@ -441,10 +441,10 @@ func (e *bufferSpanExporter) Shutdown(_ context.Context) error {
 func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) SpanEntry {
 	attrs := make(map[string]any)
 	for _, kv := range s.Attributes() {
-		attrs[string(kv.Key)] = kv.Value.Emit()
+		attrs[string(kv.Key)] = kv.Value.String()
 	}
 	for _, kv := range s.Resource().Attributes() {
-		attrs["resource."+string(kv.Key)] = kv.Value.Emit()
+		attrs["resource."+string(kv.Key)] = kv.Value.String()
 	}
 
 	var attrsResult map[string]any

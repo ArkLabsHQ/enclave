@@ -422,7 +422,3 @@ func normalizeSecretHex(plaintext []byte) string {
 	}
 	return hex.EncodeToString(plaintext)
 }
-
-func isSigningSecret(secret StaticSecret) bool {
-	return secret.Kind == "signing"
-}

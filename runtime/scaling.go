@@ -95,7 +95,6 @@ type ScalingEntity struct {
 	leaderURL       string // follower: leader handshake base URL (e.g. https://host:443)
 	leader          *sdk.Leader
 	follower        *sdk.Follower
-	signingSecrets  []StaticSecrets                                             // signing secrets to derive shares for
 	onShare         func(ctx context.Context, label string, share []byte) error // onShare persists+materializes a share delivered by a reshare ceremony.
 	getLeaderSecret func(label string) ([]byte, error)                          // leader a0 resolver for GetLeaderSecret; nil on a follower.
 }
@@ -364,10 +363,6 @@ func (a *ScalingEntity) handleNonce(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = io.WriteString(w, b64)
-}
-
-func (a *ScalingEntity) isLeader() bool {
-	return a.role == scalingRoleLeader
 }
 
 func (a *ScalingEntity) handleAdmitFollower(w http.ResponseWriter, r *http.Request) {

@@ -16,7 +16,7 @@ const (
 	hashSeparator = ";"
 )
 
-type AttestationSigner interface {
+type AttestedSigner interface {
 	Pubkey() string
 	PubkeyHash() [sha256.Size]byte
 	Sign(body []byte) string
@@ -29,12 +29,12 @@ type AttestationHashes interface {
 	Serialize() []byte
 }
 
-// AttestationSigner owns the ephemeral secp256k1 response-signing key.
-type attestationSigner struct {
+// AttestedSigner owns the ephemeral secp256k1 response-signing key.
+type attestedSigner struct {
 	key *btcec.PrivateKey
 }
 
-func NewAttestationSigner() (AttestationSigner, error) {
+func NewAttestedSigner() (AttestedSigner, error) {
 	keyBytes := make([]byte, 32)
 	if _, err := secureRandom(keyBytes); err != nil {
 		return nil, fmt.Errorf("generate random bytes: %w", err)
@@ -45,19 +45,19 @@ func NewAttestationSigner() (AttestationSigner, error) {
 		return nil, fmt.Errorf("invalid secp256k1 key from random bytes")
 	}
 
-	return &attestationSigner{key: privKey}, nil
+	return &attestedSigner{key: privKey}, nil
 }
 
-func (a *attestationSigner) Pubkey() string {
+func (a *attestedSigner) Pubkey() string {
 	return hex.EncodeToString(a.key.PubKey().SerializeCompressed())
 }
 
-func (a *attestationSigner) PubkeyHash() [sha256.Size]byte {
+func (a *attestedSigner) PubkeyHash() [sha256.Size]byte {
 	return sha256.Sum256(a.key.PubKey().SerializeCompressed())
 }
 
 // Sign signs body with BIP-340 Schnorr and returns the hex signature
-func (a *attestationSigner) Sign(body []byte) string {
+func (a *attestedSigner) Sign(body []byte) string {
 	msgHash := sha256.Sum256(body)
 	sig, err := schnorr.Sign(a.key, msgHash[:])
 	if err != nil {

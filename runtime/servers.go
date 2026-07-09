@@ -59,7 +59,7 @@ type servers struct {
 	im      *http.ServeMux
 	em      *http.ServeMux
 	rt      RuntimeState
-	signer  AttestationSigner
+	signer  AttestedSigner
 	metrics *Metrics
 }
 
@@ -70,12 +70,12 @@ func SetupHttpServers(
 	metrics *Metrics,
 	logging *Logging,
 	tracing *Tracing,
-	signer AttestationSigner,
+	signer AttestedSigner,
 	hashes AttestationHashes,
 	authToken string,
 ) Servers {
 	metricsMW := metricsMiddleware(metrics)
-	attestationMW := attestationMiddleware(signer)
+	attestationMW := responseSignerMiddleware(signer)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -335,7 +335,7 @@ func (s *servers) ConfigureMigrationHandler(ctx context.Context, migrator Migrat
 	return nil
 }
 
-func attestationMiddleware(signer AttestationSigner) func(http.Handler) http.Handler {
+func responseSignerMiddleware(signer AttestedSigner) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Skip signing for gRPC; attested TLS verifies identity, and buffering breaks streams.

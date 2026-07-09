@@ -54,7 +54,7 @@ func TestAttestationHashes(t *testing.T) {
 }
 
 func TestAttestationSigner(t *testing.T) {
-	signer, err := NewAttestationSigner()
+	signer, err := NewAttestedSigner()
 	require.NoError(t, err)
 
 	pubkeyBytes, err := hex.DecodeString(signer.Pubkey())

@@ -71,7 +71,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	hashes := NewAttestationHashes()
 
-	attestationSigner, err := NewAttestationSigner()
+	attestationSigner, err := NewAttestedSigner()
 	if err != nil {
 		return fmt.Errorf("failed to create attestation signer: %w", err)
 	}

@@ -157,11 +157,11 @@ func TestCorsWildcard(t *testing.T) {
 }
 
 func TestAttestationMiddleware(t *testing.T) {
-	signer, err := NewAttestationSigner()
+	signer, err := NewAttestedSigner()
 	require.NoError(t, err)
 
 	t.Run("signs non grpc response", func(t *testing.T) {
-		h := attestationMiddleware(
+		h := responseSignerMiddleware(
 			signer,
 		)(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +188,7 @@ func TestAttestationMiddleware(t *testing.T) {
 	})
 
 	t.Run("bypasses grpc", func(t *testing.T) {
-		h := attestationMiddleware(
+		h := responseSignerMiddleware(
 			signer,
 		)(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +294,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		migrationPreviousPCR0Param():            "previous",
 		migrationPreviousPCR0AttestationParam(): "attestation",
 	}})
-	signer, err := NewAttestationSigner()
+	signer, err := NewAttestedSigner()
 	require.NoError(t, err)
 	rt := newRuntimeState()
 	metrics := NewMetrics()
@@ -345,12 +345,4 @@ func assertCORSHeaders(t *testing.T, h http.Header) {
 	if h.Get("Access-Control-Max-Age") != "600" {
 		t.Fatalf("Access-Control-Max-Age: got %q, want 600", h.Get("Access-Control-Max-Age"))
 	}
-}
-
-func serializedHashes(tlsHash, signingHash [sha256.Size]byte) []byte {
-	want := append([]byte(hashPrefix), tlsHash[:]...)
-	want = append(want, hashSeparator...)
-	want = append(want, hashPrefix...)
-	want = append(want, signingHash[:]...)
-	return want
 }

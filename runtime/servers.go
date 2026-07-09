@@ -5,7 +5,6 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -124,8 +123,6 @@ func SetupHttpServers(
 	}
 
 	im := http.NewServeMux()
-	// Q: Do we need this?
-	im.HandleFunc("POST /enclave/hash", hashHandler(hashes))
 	im.Handle("/v1/", sm)
 	im.Handle("/health", sm)
 
@@ -488,34 +485,6 @@ func attestationHandler(useProfiling bool, nsm NSM, hashes AttestationHashes) ht
 		}
 
 		_, _ = fmt.Fprintln(w, base64.StdEncoding.EncodeToString(doc))
-	}
-}
-
-func hashHandler(hashes AttestationHashes) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		maxReadLen := base64.StdEncoding.EncodedLen(sha256.Size) + 1
-		body, err := io.ReadAll(nitriding.NewLimitReader(r.Body, maxReadLen))
-		if errors.Is(err, nitriding.ErrTooMuchToRead) {
-			http.Error(w, nitriding.ErrTooMuchToRead.Error(), http.StatusBadRequest)
-			return
-		}
-		if err != nil {
-			http.Error(w, errFailedReqBody.Error(), http.StatusInternalServerError)
-			return
-		}
-		keyHash, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(body)))
-		if err != nil {
-			http.Error(w, "base64 decode failed", http.StatusBadRequest)
-			return
-		}
-		if len(keyHash) != sha256.Size {
-			http.Error(w, errHashWrongSize.Error(), http.StatusBadRequest)
-			return
-		}
-		var h [sha256.Size]byte
-		copy(h[:], keyHash)
-		hashes.SetSigningKeyHash(h)
-		w.WriteHeader(http.StatusOK)
 	}
 }
 

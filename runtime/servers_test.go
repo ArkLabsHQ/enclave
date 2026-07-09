@@ -280,36 +280,6 @@ func TestAttestationHandler(t *testing.T) {
 	})
 }
 
-func TestHashHandler(t *testing.T) {
-	t.Run("stores valid hash", func(t *testing.T) {
-		hashes := NewAttestationHashes()
-		keyHash := sha256.Sum256([]byte("app key"))
-
-		rr := httptest.NewRecorder()
-		hashHandler(hashes).ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/enclave/hash",
-			strings.NewReader(base64.StdEncoding.EncodeToString(keyHash[:]))))
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusOK)
-		}
-		if !bytes.Equal(hashes.Serialize(), serializedHashes([sha256.Size]byte{}, keyHash)) {
-			t.Fatalf("serialized hashes: got %x", hashes.Serialize())
-		}
-	})
-
-	t.Run("rejects wrong hash size", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		hashHandler(
-			NewAttestationHashes(),
-		).ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/enclave/hash",
-			strings.NewReader(base64.StdEncoding.EncodeToString([]byte("short")))))
-
-		if rr.Code != http.StatusBadRequest {
-			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusBadRequest)
-		}
-	})
-}
-
 func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")

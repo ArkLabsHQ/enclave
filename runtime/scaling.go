@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	sdk "thresholdsdk"
+	sdk "github.com/ArkLabsHQ/threshold-magic/threshold_sdk"
 
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"golang.org/x/crypto/nacl/box"

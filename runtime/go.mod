@@ -36,7 +36,8 @@ require (
 )
 
 require (
-	github.com/ArkLabsHQ/thresholdmagic/thresholdcore v0.0.0-00010101000000-000000000000 // indirect
+	github.com/ArkLabsHQ/threshold-magic/threshold_core v0.1.0 // indirect
+	github.com/ArkLabsHQ/threshold-magic/threshold_sdk v0.1.0
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.12 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.20 // indirect
@@ -75,9 +76,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect
-	thresholdsdk v0.0.0-00010101000000-000000000000
 )
-
-replace thresholdsdk => /home/joshua/threshold-magic/threshold_sdk
-
-replace github.com/ArkLabsHQ/thresholdmagic/thresholdcore => /home/joshua/threshold-magic/threshold_core

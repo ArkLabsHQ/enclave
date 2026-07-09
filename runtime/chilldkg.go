@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	sdk "thresholdsdk"
+	sdk "github.com/ArkLabsHQ/threshold-magic/threshold_sdk"
 )
 
 // thresholdRecoveryPrefix namespaces threshold recovery blobs in Storage.

@@ -258,6 +258,15 @@ dump_boot_diagnostics() {
     echo "--- ${lg} ---" >&2
     if [ -s "$lg" ]; then cat "$lg" >&2; else echo "(empty or missing)" >&2; fi
   done
+  # In ACME mode wait_health cannot pass until issuance completes, so a
+  # "hung at init" here is usually the validation return path, not the boot:
+  # if the boot log shows endless pending authZ polls, Pebble's VA cannot
+  # reach the enclave at enclave.test:${HOST_TLS_PORT} (host firewall
+  # dropping the dial, or a port conflict). Check with:
+  #   docker compose --profile acme logs pebble
+  echo "Hint: endless 'ACME http ... /authZ/ ... 200' polls above mean Pebble could not" >&2
+  echo "      dial back to enclave.test:${HOST_TLS_PORT} for TLS-ALPN-01 — check" >&2
+  echo "      'docker compose --profile acme logs pebble' and the host firewall." >&2
 }
 
 # wait_health blocks until /health returns 200 (enclave Init complete). It

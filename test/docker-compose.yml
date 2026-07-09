@@ -113,3 +113,30 @@ services:
       ENCLAVE_APP_NAME: "my-app"
       ENCLAVE_DEPLOYMENT: "dev"
     command: ["./acme-test.sh", "app/.enclave/artifacts/image.eif"]
+
+  # Runs the 1-leader + 2-follower -scaling ceremony 
+  scaling-runner:
+    profiles: ["scaling"]
+    build:
+      context: ../
+      dockerfile: test/Dockerfile.runner
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      aws-mocks:
+        condition: service_healthy
+    environment:
+      SKIP_MOCK_SERVICES: "1"
+      # Must match enclave.yaml `name` — seed-scaling.sh derives SSM paths from it.
+      ENCLAVE_APP_NAME: "my-app"
+      # run-scaling.sh defaults to /tmp/supervisor; the image bakes it here.
+      ENCLAVE_SUPERVISOR: "/usr/local/bin/supervisor"
+      # LocalStack accepts any credentials; seed-scaling.sh's aws calls need them set.
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+    command: ["./run-scaling.sh", "app/.enclave/artifacts/image.eif"]

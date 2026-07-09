@@ -4,8 +4,65 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// TestScalingHandshakeGating verifies the handshake route (mounted unconditionally
+// at New) gates correctly at request time: 503 before Init returns, 404 when there's
+// no leader scaling entity, and a nonce once a leader entity is wired.
+func TestScalingHandshakeGating(t *testing.T) {
+	newReq := func() *http.Request { return httptest.NewRequest("GET", handshakePathNonce, nil) }
+
+	// Before Init returns → 503.
+	e := &Runtime{}
+	w := httptest.NewRecorder()
+	e.scalingHandshakeNonce(w, newReq())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("pre-init: got %d, want 503", w.Code)
+	}
+
+	// Init done, no scaling entity → 404.
+	e.initDone.Store(true)
+	w = httptest.NewRecorder()
+	e.scalingHandshakeNonce(w, newReq())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("no entity: got %d, want 404", w.Code)
+	}
+
+	// Init done, follower → 404 (a follower never serves the handshake).
+	t.Setenv("ENCLAVE_SCALING_ROLE", "follower")
+	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "https://leader:443")
+	follower, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("newScalingEntity follower: %v", err)
+	}
+	e.scalingEntity = follower
+	w = httptest.NewRecorder()
+	e.scalingHandshakeNonce(w, newReq())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("follower: got %d, want 404", w.Code)
+	}
+
+	// Init done, leader → 200 with a base64 nonce body.
+	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
+	leader, err := newScalingEntity()
+	if err != nil {
+		t.Fatalf("newScalingEntity leader: %v", err)
+	}
+	e.scalingEntity = leader
+	w = httptest.NewRecorder()
+	e.scalingHandshakeNonce(w, newReq())
+	if w.Code != http.StatusOK {
+		t.Fatalf("leader: got %d, want 200", w.Code)
+	}
+	if _, err := base64.StdEncoding.DecodeString(strings.TrimSpace(w.Body.String())); err != nil {
+		t.Errorf("leader nonce not base64: %q", w.Body.String())
+	}
+}
 
 func TestScalingRoleParsing(t *testing.T) {
 	// An unset or invalid role is rejected.
@@ -53,8 +110,16 @@ func TestScalingListenPortDefault(t *testing.T) {
 }
 
 func TestThresholdStoreLeaderSecret(t *testing.T) {
-	s := newThresholdStore(nil)
-	t.Setenv("SIGNING_KEY", "0a0b0c")
+	// A leader resolves a0 through the injected resolver (its in-memory master cache).
+	masters := map[string][]byte{"SIGNING_KEY": {0x0a, 0x0b, 0x0c}}
+	resolve := func(label string) ([]byte, error) {
+		m, ok := masters[label]
+		if !ok {
+			return nil, fmt.Errorf("no master for %q", label)
+		}
+		return m, nil
+	}
+	s := newDKGStore(nil, resolve)
 	got, err := s.GetLeaderSecret("SIGNING_KEY")
 	if err != nil {
 		t.Fatalf("GetLeaderSecret: %v", err)
@@ -63,14 +128,18 @@ func TestThresholdStoreLeaderSecret(t *testing.T) {
 		t.Errorf("a0 = %x, want 0a0b0c", got)
 	}
 
-	t.Setenv("SIGNING_KEY", "")
-	if _, err := s.GetLeaderSecret("SIGNING_KEY"); err == nil {
-		t.Error("expected error when the master env var is empty")
+	if _, err := s.GetLeaderSecret("MISSING_KEY"); err == nil {
+		t.Error("expected error when the master is not cached")
+	}
+
+	// A follower has no resolver and must never answer GetLeaderSecret.
+	if _, err := newDKGStore(nil, nil).GetLeaderSecret("SIGNING_KEY"); err == nil {
+		t.Error("expected error when no resolver is wired (follower)")
 	}
 }
 
 func TestThresholdStoreRecoveryKey(t *testing.T) {
-	s := newThresholdStore(nil)
+	s := newDKGStore(nil, nil)
 	key := s.recoveryKey([]byte{0xab, 0xcd})
 	if key != thresholdRecoveryPrefix+"abcd" {
 		t.Errorf("recoveryKey = %q", key)

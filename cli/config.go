@@ -106,9 +106,9 @@ type AppConfig struct {
 // at boot via KMS attestation. The decrypted value is passed to the
 // upstream app as the specified environment variable.
 type SecretConfig struct {
-	Name   string `yaml:"name" json:"name"`       // SSM parameter name component
-	EnvVar string `yaml:"env_var" json:"env_var"` // Env var passed to upstream app
-	Kind   string `yaml:"kind" json:"kind,omitempty"`
+	Name   string `yaml:"name" json:"name"`           // SSM parameter name component
+	EnvVar string `yaml:"env_var" json:"env_var"`     // Env var passed to upstream app
+	Kind   string `yaml:"kind" json:"kind,omitempty"` // "signing" for threshold-shared secrets
 }
 
 // IsThreshold reports whether the secret is threshold-shared (kind "signing").

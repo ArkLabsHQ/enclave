@@ -28,7 +28,7 @@ lint: ## Run golangci-lint on all modules (matches CI)
 	cd supervisor && golangci-lint run ./...
 	cd client && golangci-lint run ./...
 
-.PHONY: test test-build test-run test-rebuild test-acme
+.PHONY: test test-build test-run test-rebuild test-acme test-scaling
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
@@ -83,6 +83,11 @@ test-acme: test-build ## Build the test EIF and run the end-to-end ACME (Pebble)
 	bash test/pebble/gen-certs.sh
 	cd test && docker compose --profile acme down -v
 	cd test && docker compose --profile acme run --build acme-runner
+
+test-scaling: test-build ## Build the test EIF and run the 1-leader + 2-follower threshold-scaling ceremony in the QEMU runner container
+	cd test && docker compose --profile scaling down -v 
+	cd test && docker compose --profile scaling build scaling-runner
+	cd test && docker compose --profile scaling run --rm scaling-runner
 
 .PHONY: test-build-docker test-docker
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)

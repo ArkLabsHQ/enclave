@@ -84,6 +84,14 @@ type Mux interface {
 	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 }
 
+type upstreamPhase int32
+
+const (
+	upstreamNotStarted upstreamPhase = iota // not yet forked
+	upstreamRunning                         // forked and running (stays Running across restarts)
+	upstreamExited                          // has exited
+)
+
 // Runtime is the singleton supervisor that owns every long-lived piece of
 // state inside the enclave: the HTTP servers, the reverse proxy, the
 // attestation key, the KMS / storage / secrets / migration subsystems, and
@@ -116,10 +124,9 @@ type Runtime struct {
 	initDone atomic.Bool // happens-before fence: Init returned (success or failure)
 	initOK   atomic.Bool // Init returned without error
 
-	// Upstream app state — set by MarkUpstreamExited (called from
-	// cmd/runtime/main.go when the user app exits).
-	upstreamExited atomic.Bool
-	upstreamErr    atomic.Value // string; "" when no error or not exited
+	upstreamState   atomic.Int32 // an upstreamPhase
+	upstreamErr     atomic.Value // string; "" when no error or not exited
+	upstreamRestart chan struct{}
 
 	// Attestation state.
 	hashes      *AttestationHashes // embedded in every NSM attestation doc
@@ -158,26 +165,20 @@ func New(cfg *Config) (*Runtime, error) {
 		enclaveMetrics = NewMetrics()
 	}
 	r := &Runtime{
-		cfg:          cfg,
-		metrics:      enclaveMetrics,
-		attestation:  NewAttestation(),
-		signature:    NewSignature(),
-		runtimeToken: token,
-		storageReady: make(chan struct{}),
-		tlsReady:     make(chan struct{}),
+		cfg:             cfg,
+		metrics:         enclaveMetrics,
+		attestation:     NewAttestation(),
+		signature:       NewSignature(),
+		runtimeToken:    token,
+		storageReady:    make(chan struct{}),
+		tlsReady:        make(chan struct{}),
+		upstreamRestart: make(chan struct{}, 1),
 	}
 	r.logging = NewLogging(enclaveMetrics, nil, r.checkRuntimeToken)
 	r.tracing = NewTracing(enclaveMetrics, nil, r.checkRuntimeToken)
-	// Build the scaling subsystem here — it only reads role/addressing from env — so a
-	// leader's admission routes mount on pubSrv in configureHTTPServers below. Its
-	// AWS-backed bring-up (KMS, share handler, relay) happens later in Init.
-	if os.Getenv("ENCLAVE_SCALING_ROLE") != "" {
-		scalingEntity, err := newScalingEntity()
-		if err != nil {
-			return nil, fmt.Errorf("init scaling entity: %w", err)
-		}
-		r.scalingEntity = scalingEntity
-	}
+	// The scaling subsystem is constructed in Init (after the SSM env overlay applies
+	// ENCLAVE_SCALING_ROLE); its handshake routes are mounted here unconditionally and
+	// gate on entity readiness at request time — see configureExternalHttpServer.
 	if cfg != nil {
 		if err := r.configureHTTPServers(); err != nil {
 			return nil, fmt.Errorf("configure HTTP servers: %w", err)
@@ -232,6 +233,15 @@ func (e *Runtime) Init(ctx context.Context) error {
 
 	e.storage = NewStorage(e.kms, e.metrics, e.checkRuntimeToken)
 
+	if os.Getenv("ENCLAVE_SCALING_ROLE") != "" {
+		scalingEntity, err := newScalingEntity()
+		if err != nil {
+			slog.Error("init scaling entity", "error", err)
+			return fmt.Errorf("init scaling entity: %w", err)
+		}
+		e.scalingEntity = scalingEntity
+	}
+
 	staticSecrets, err := NewStaticSecrets(e.kms, e.scalingEntity)
 	if err != nil {
 		slog.Error("load static secrets config", "error", err)
@@ -243,7 +253,14 @@ func (e *Runtime) Init(ctx context.Context) error {
 	// AWS-backed deps now — KMS, and the share handler before Init starts the drains.
 	if e.scalingEntity != nil {
 		e.scalingEntity.kms = e.kms
-		e.scalingEntity.SetShareHandler(staticSecrets.StoreDerivedSecret)
+		e.scalingEntity.SetShareHandler(func(ctx context.Context, label string, share []byte) error {
+			if err := staticSecrets.StoreDerivedSecret(ctx, label, share); err != nil {
+				return err
+			}
+			e.RequestUpstreamRestart()
+			return nil
+		})
+		e.scalingEntity.SetLeaderResolver(staticSecrets.leaderSecret)
 	}
 
 	if err := e.attestation.Init(); err != nil {
@@ -270,6 +287,13 @@ func (e *Runtime) Init(ctx context.Context) error {
 		return fmt.Errorf("verify predecessor PCR31 commitment: %w", err)
 	}
 
+	slog.Info("initializing storage")
+	e.migrator.storage = e.storage
+	if err := e.storage.Init(ctx, keyID); err != nil {
+		slog.Error("init storage", "error", err)
+		return fmt.Errorf("init storage: %w", err)
+	}
+
 	if e.scalingEntity != nil {
 		if err := e.scalingEntity.Init(ctx, e.storage); err != nil {
 			slog.Error("init scaling entity", "error", err)
@@ -284,13 +308,6 @@ func (e *Runtime) Init(ctx context.Context) error {
 	if err := e.staticSecrets.ExtendPCRs(); err != nil {
 		slog.Error("extend PCRs with secret pubkeys", "error", err)
 		return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
-	}
-
-	slog.Info("initializing storage")
-	e.migrator.storage = e.storage
-	if err := e.storage.Init(ctx, keyID); err != nil {
-		slog.Error("init storage", "error", err)
-		return fmt.Errorf("init storage: %w", err)
 	}
 
 	e.dynamic = NewDynamicSecrets(e.storage, e.metrics, e.staticSecrets, e.checkRuntimeToken)
@@ -464,14 +481,14 @@ func (e *Runtime) MarkUpstreamExited(err error) {
 		msg = err.Error()
 	}
 	e.upstreamErr.Store(msg)
-	e.upstreamExited.Store(true)
+	e.upstreamState.Store(int32(upstreamExited))
 }
 
 // UpstreamExited returns whether the user app has exited and the error
 // string from its exit. The error is empty when the app exited cleanly or
 // has not exited at all (check the bool first).
 func (e *Runtime) UpstreamExited() (bool, string) {
-	if !e.upstreamExited.Load() {
+	if upstreamPhase(e.upstreamState.Load()) != upstreamExited {
 		return false, ""
 	}
 	if v := e.upstreamErr.Load(); v != nil {
@@ -480,6 +497,20 @@ func (e *Runtime) UpstreamExited() (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+func (e *Runtime) MarkUpstreamStarted() { e.upstreamState.Store(int32(upstreamRunning)) }
+
+func (e *Runtime) UpstreamRestart() <-chan struct{} { return e.upstreamRestart }
+
+func (e *Runtime) RequestUpstreamRestart() {
+	if upstreamPhase(e.upstreamState.Load()) != upstreamRunning {
+		return
+	}
+	select {
+	case e.upstreamRestart <- struct{}{}:
+	default:
+	}
 }
 
 // SetAttestationRegistrar must be called before Init.
@@ -615,10 +646,8 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 	pm.Get(pathRoot, rootHandler(e.cfg))
 	pm.Get(pathConfig, configHandler(e.cfg))
 
-	// Leader-only admission handshake endpoints; a follower never serves these.
-	if e.scalingEntity != nil && e.scalingEntity.IsLeader() {
-		e.scalingEntity.RegisterRoutes(pm.Get, pm.Post)
-	}
+	pm.Get(handshakePathNonce, e.scalingHandshakeNonce)
+	pm.Post(handshakePathAdmit, e.scalingHandshakeAdmit)
 
 	pm.Handle("/v1/*", corsWildcard(admin))
 	pm.Handle("/health", admin)
@@ -1079,6 +1108,36 @@ type gatedMux struct {
 
 func (g *gatedMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
 	g.inner.Handle(pattern, g.gate(http.HandlerFunc(handler)))
+}
+
+// scalingHandshakeNonce / scalingHandshakeAdmit serve the leader admission handshake,
+// gating on readyLeader since the scaling entity is only built during Init.
+func (e *Runtime) scalingHandshakeNonce(w http.ResponseWriter, r *http.Request) {
+	if a := e.readyLeader(w); a != nil {
+		a.handleNonce(w, r)
+	}
+}
+
+func (e *Runtime) scalingHandshakeAdmit(w http.ResponseWriter, r *http.Request) {
+	if a := e.readyLeader(w); a != nil {
+		a.handleAdmitFollower(w, r)
+	}
+}
+
+// readyLeader returns the scaling entity iff Init has returned and this node is a
+// leader; otherwise it writes 503 (still initializing) or 404 (not a leader) and
+// returns nil. The initDone fence makes reading e.scalingEntity (assigned mid-Init)
+// race-free — the same guarantee the gated admin routes rely on.
+func (e *Runtime) readyLeader(w http.ResponseWriter) *ScalingEntity {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return nil
+	}
+	if e.scalingEntity == nil || !e.scalingEntity.IsLeader() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return nil
+	}
+	return e.scalingEntity
 }
 
 // requireInitDone rejects requests until Init returns (success or

@@ -111,6 +111,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", handleRoot)
 	mux.HandleFunc("GET /test/secrets", handleTestSecrets)
+	mux.HandleFunc("GET /test/scaling", handleTestScaling)
 	mux.HandleFunc("GET /test/storage", handleTestStorage)
 	mux.HandleFunc("POST /test/storage-persistence", handleTestStoragePersistenceWrite)
 	mux.HandleFunc("GET /test/storage-persistence", handleTestStoragePersistenceVerify)
@@ -263,7 +264,37 @@ func handleTestAttestation(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// handleTestSecrets verifies that KMS secrets were loaded into env vars.
+// handleTestScaling reports this enclave's threshold-scaling state so the integration
+// test can verify a ceremony ran. The dedicated "signing" secret scaling_key is
+// exposed in a single env var, SCALING_KEY, which always holds what this node signs
+// with now: its own threshold share once a group has formed (leader and followers
+// alike), or the master on a solo leader before any follower joins. The master is never
+// in an env var. For the present value it also derives the secp256k1 compressed pubkey,
+// so the test can assert scalars are valid and distinct across enclaves without seeing
+// the raw secret material.
+func handleTestScaling(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	describe := func(envName string) map[string]any {
+		v := strings.TrimSpace(os.Getenv(envName))
+		m := map[string]any{"present": v != "", "length": len(v)}
+		if b, err := hex.DecodeString(v); err == nil && len(b) == 32 {
+			priv, _ := btcec.PrivKeyFromBytes(b)
+			if priv != nil {
+				m["pubkey"] = hex.EncodeToString(priv.PubKey().SerializeCompressed())
+			}
+		}
+		return m
+	}
+
+	out := map[string]any{
+		"status":      "ok",
+		"role":        os.Getenv("ENCLAVE_SCALING_ROLE"),
+		"scaling_key": describe("SCALING_KEY"),
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
 func handleTestSecrets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 

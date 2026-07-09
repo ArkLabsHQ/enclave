@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	sdk "thresholdsdk"
@@ -18,11 +17,14 @@ const thresholdRecoveryPrefix = "threshold/recovery/"
 // Storage.
 type DkgStore struct {
 	storage *Storage
+
+	getMaster func(label string) ([]byte, error)
 }
 
-// newThresholdStore builds the adapter over the enclave's encrypted Storage.
-func newThresholdStore(storage *Storage) *DkgStore {
-	return &DkgStore{storage: storage}
+// newDKGStore builds the adapter over the enclave's encrypted Storage. masterFor
+// is nil on a follower; on a leader it points at the in-memory master cache.
+func newDKGStore(storage *Storage, getMaster func(label string) ([]byte, error)) *DkgStore {
+	return &DkgStore{storage: storage, getMaster: getMaster}
 }
 
 func (s *DkgStore) recoveryKey(groupKey []byte) string {
@@ -70,11 +72,10 @@ func (s *DkgStore) List() ([][]byte, error) {
 
 // GetLeaderSecret returns the label's master secret
 func (s *DkgStore) GetLeaderSecret(label string) ([]byte, error) {
-	v := strings.TrimSpace(os.Getenv(label))
-	if v == "" {
-		return nil, fmt.Errorf("leader master for %q not loaded", label)
+	if s.getMaster == nil {
+		return nil, fmt.Errorf("leader master for %q not available (no resolver)", label)
 	}
-	return hex.DecodeString(v)
+	return s.getMaster(label)
 }
 
 // Close is a no-op: the underlying Storage lifecycle is owned by the Runtime.

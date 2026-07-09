@@ -137,6 +137,9 @@ while True:
     cpu_opt="-cpu max"
     echo "  KVM:    not available, using TCG (slow)"
   fi
+  # pass an extra kernel cmdline to the enclave guest to
+  local append_arg=()
+  [ -n "${QEMU_APPEND:-}" ] && { append_arg=(-append "$QEMU_APPEND"); echo "  Append: $QEMU_APPEND"; }
   qemu-system-x86_64 \
     -M "nitro-enclave,vsock=c,id=test-enclave" \
     -kernel "$eif_path" \
@@ -144,6 +147,7 @@ while True:
     -m "$memory" \
     $accel \
     $cpu_opt \
+    ${append_arg[@]+"${append_arg[@]}"} \
     -chardev "socket,id=c,path=${vsock_socket}" &
   qemu_pid=$!
   echo "  PID:    $qemu_pid"
@@ -600,6 +604,7 @@ echo ""
 echo "=== [3/9] Booting enclave in QEMU ==="
 wait_for_enclave "initial boot"
 echo ""
+
 
 # Verify the locked KMS policy includes the default RootRecovery statement.
 # The enclave's selfApplyKMSPolicy() runs at boot and calls PutKeyPolicy on

@@ -212,7 +212,7 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			previousPCR0Attestation = info.Attestation
 		}
 
-		upstreamExited, upstreamErr := e.UpstreamExited()
+		exited, exitErr := e.UpstreamExited()
 
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                    Version,
@@ -225,7 +225,7 @@ func enclaveInfoHandler(e *Runtime) http.HandlerFunc {
 			MigrationCooldownRemaining: cooldownRemaining,
 			MigrationPending:           migrationPending,
 			PCR0Signature:              e.signature.Snapshot(),
-			UpstreamApp:                UpstreamAppInfo{Exited: upstreamExited, Error: upstreamErr},
+			UpstreamApp:                UpstreamAppInfo{Exited: exited, Error: exitErr},
 		})
 	}
 }

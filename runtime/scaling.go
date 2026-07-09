@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -22,7 +23,6 @@ import (
 	sdk "thresholdsdk"
 
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/hf/nitrite"
 	"golang.org/x/crypto/nacl/box"
 
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
@@ -85,18 +85,19 @@ type admitResponseData struct {
 }
 
 type ScalingEntity struct {
-	mu             sync.Mutex
-	kms            *KMS
-	authorized     map[string]bool      // hex(hostpub) admitted after a valid handshake
-	nonces         map[string]time.Time // base64(nonce) -> issued-at (one-shot, TTL-bounded)
-	leaderPub      []byte               // leader's threshold host pubkey, set at StartLeader
-	role           string
-	listenPort     string // leader: port the gRPC relay binds/advertises (on the TAP iface)
-	leaderURL      string // follower: leader handshake base URL (e.g. https://host:443)
-	leader         *sdk.Leader
-	follower       *sdk.Follower
-	signingSecrets []StaticSecrets                                             // signing secrets to derive shares for
-	onShare        func(ctx context.Context, label string, share []byte) error // onShare persists+materializes a share delivered by a reshare ceremony.
+	mu              sync.Mutex
+	kms             *KMS
+	authorized      map[string]bool      // hex(hostpub) admitted after a valid handshake
+	nonces          map[string]time.Time // base64(nonce) -> issued-at (one-shot, TTL-bounded)
+	leaderPub       []byte               // leader's threshold host pubkey, set at StartLeader
+	role            string
+	listenPort      string // leader: port the gRPC relay binds/advertises (on the TAP iface)
+	leaderURL       string // follower: leader handshake base URL (e.g. https://host:443)
+	leader          *sdk.Leader
+	follower        *sdk.Follower
+	signingSecrets  []StaticSecrets                                             // signing secrets to derive shares for
+	onShare         func(ctx context.Context, label string, share []byte) error // onShare persists+materializes a share delivered by a reshare ceremony.
+	getLeaderSecret func(label string) ([]byte, error)                          // leader a0 resolver for GetLeaderSecret; nil on a follower.
 }
 
 func newScalingEntity() (*ScalingEntity, error) {
@@ -166,6 +167,12 @@ func (a *ScalingEntity) IsLeader() bool {
 	return a.role == scalingRoleLeader
 }
 
+// SetLeaderResolver wires the leader's a0 lookup (StaticSecrets.leaderMaster), read by
+// the DKG store to pin the group key. Leave unset on a follower.
+func (a *ScalingEntity) SetLeaderResolver(fn func(label string) ([]byte, error)) {
+	a.getLeaderSecret = fn
+}
+
 // SetShareHandler wires the sink for reshared follower shares.
 func (a *ScalingEntity) SetShareHandler(fn func(ctx context.Context, label string, share []byte) error) {
 	a.onShare = fn
@@ -199,7 +206,8 @@ func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
 }
 
 func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
-	store := newThresholdStore(storage)
+	// The leader resolves a0 from its master cache so the group key pins to the master.
+	store := newDKGStore(storage, a.getLeaderSecret)
 
 	listenAddr := net.JoinHostPort(relayTAPHost, a.listenPort)
 	leader, err := sdk.NewLeader(hostSk, listenAddr, store, sdk.WithAuthorize(a.IsAuthorized))
@@ -237,7 +245,8 @@ func (a *ScalingEntity) DeriveFollowerKey(ctx context.Context, StaticSecret Stat
 }
 
 func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
-	store := newThresholdStore(storage)
+	// A follower has no master, so it never answers GetLeaderSecret (nil resolver).
+	store := newDKGStore(storage, nil)
 
 	myHostPub := hostSk.PubKey().SerializeCompressed()
 
@@ -292,13 +301,6 @@ func (a *ScalingEntity) handleShare(role, label string, share []byte) {
 	if err := a.onShare(context.Background(), label, share); err != nil {
 		slog.Warn("threshold "+role+" failed to store share", "envvar", label, "error", err)
 	}
-}
-
-// RegisterRoutes attaches the leader-side handshake endpoints. Called only on a
-// leader; a follower never serves these.
-func (a *ScalingEntity) RegisterRoutes(get, post func(string, http.HandlerFunc)) {
-	get(handshakePathNonce, a.handleNonce)
-	post(handshakePathAdmit, a.handleAdmitFollower)
 }
 
 // setLeader records the leader's threshold pubkey returned to admitted joiners.
@@ -418,7 +420,9 @@ func (a *ScalingEntity) handleAdmitFollower(w http.ResponseWriter, r *http.Reque
 // identical to ours, and a nonce we issued. Returns the Follower's request data and
 // NaCl box public key.
 func (a *ScalingEntity) verifyFollowerAttestation(doc []byte) (admitRequestData, []byte, error) {
-	res, err := nitrite.Verify(doc, nitrite.VerifyOptions{CurrentTime: nitriding.CurrentTime()})
+	// Dev-aware: honors skipCOSEVerification so the QEMU NSM's unsigned mock docs are
+	// accepted in dev; a real deployment still verifies against the AWS Nitro root.
+	res, err := verifyAttestationDoc(doc, nil)
 	if err != nil {
 		return admitRequestData{}, nil, fmt.Errorf("verify attestation: %w", err)
 	}
@@ -468,7 +472,12 @@ func hostFromURL(baseURL string) (string, error) {
 // attestations. myHostPub is the joiner's own threshold host pubkey (33-byte
 // compressed).
 func followerJoinHandshake(baseURL string, myHostPub []byte) (leaderPub []byte, relayPort string, err error) {
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // see comment
+		},
+	}
 
 	leaderNonce, err := fetchHandshakeNonce(client, baseURL)
 	if err != nil {
@@ -515,7 +524,8 @@ func followerJoinHandshake(baseURL string, myHostPub []byte) (leaderPub []byte, 
 		return nil, "", errors.New("bad leader attestation encoding")
 	}
 
-	res, err := nitrite.Verify(leaderAttestationDoc, nitrite.VerifyOptions{CurrentTime: nitriding.CurrentTime()})
+	// Dev-aware verification (see verifyFollowerAttestation): mock docs pass in dev.
+	res, err := verifyAttestationDoc(leaderAttestationDoc, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("verify leader attestation: %w", err)
 	}

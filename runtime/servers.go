@@ -75,7 +75,7 @@ func SetupHttpServers(
 	hashes AttestationHashes,
 	authToken string,
 ) Servers {
-	loggingMW := metricsMiddleware(metrics)
+	metricsMW := metricsMiddleware(metrics)
 	attestationMW := attestationMiddleware(signer)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
@@ -130,7 +130,7 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: loggingMW(attestationMW(em)),
+		Handler: metricsMW(attestationMW(em)),
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt, cfg),
 			MinVersion:     tls.VersionTLS12,
@@ -144,7 +144,7 @@ func SetupHttpServers(
 
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
-		Handler: loggingMW(attestationMW(im)),
+		Handler: metricsMW(attestationMW(im)),
 	}
 
 	return &servers{

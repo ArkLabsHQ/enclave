@@ -216,12 +216,14 @@ func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCall
 func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
 	var dirURL string
 	switch {
+	case directory == "":
+		return nil, nil
 	case strings.HasPrefix(directory, "https://"):
 		dirURL = directory
 	case directory == "letsencrypt-staging":
 		dirURL = acmeStagingDirectoryURL
 	default:
-		return nil, nil
+		return nil, fmt.Errorf("unrecognized ACME directory %q", directory)
 	}
 	client := &acme.Client{DirectoryURL: dirURL}
 	if caPEM != "" {

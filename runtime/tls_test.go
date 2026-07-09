@@ -111,13 +111,17 @@ func TestACMEClientForDirectory(t *testing.T) {
 		require.Equal(t, acmeStagingDirectoryURL, c.DirectoryURL)
 	})
 
-	for _, dir := range []string{"letsencrypt", "self-signed", ""} {
-		t.Run("no custom client for "+dir, func(t *testing.T) {
-			c, err := acmeClientForDirectory(dir, "")
-			require.NoError(t, err)
-			require.Nil(t, c)
-		})
-	}
+	t.Run("empty directory disables custom client", func(t *testing.T) {
+		c, err := acmeClientForDirectory("", "")
+		require.NoError(t, err)
+		require.Nil(t, c)
+	})
+
+	t.Run("unrecognized directory results in err", func(t *testing.T) {
+		c, err := acmeClientForDirectory("/tmp/certs", "")
+		require.ErrorContains(t, err, "unrecognized ACME directory")
+		require.Nil(t, c)
+	})
 
 	t.Run("malformed CA is an error", func(t *testing.T) {
 		_, err := acmeClientForDirectory("https://pebble.internal/dir", "not a pem")

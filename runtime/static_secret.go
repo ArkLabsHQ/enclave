@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 )
@@ -78,8 +77,7 @@ func FetchOrInitStaticSecrets(
 				)
 			}
 
-			secretHex := hex.EncodeToString(dk.Plaintext)
-			addSecret(s, secretHex)
+			addSecret(s, hex.EncodeToString(dk.Plaintext))
 			continue
 		}
 
@@ -88,17 +86,7 @@ func FetchOrInitStaticSecrets(
 			return nil, fmt.Errorf("failed to decrypt static secret param %s: %w", paramName, err)
 		}
 
-		// Legacy secrets may already be hex.
-		candidate := strings.TrimSpace(string(plaintext))
-		if len(candidate) == 64 {
-			if _, err := hex.DecodeString(candidate); err == nil {
-				addSecret(s, candidate)
-				continue
-			}
-		}
-
-		secretHex := hex.EncodeToString(plaintext)
-		addSecret(s, secretHex)
+		addSecret(s, hex.EncodeToString(plaintext))
 	}
 
 	return secrets, nil

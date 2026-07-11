@@ -189,156 +189,151 @@ func (s *respServer) handle(conn redcon.Conn, cmd redcon.Command) {
 	s.dispatchData(ctx, conn, name, cmd)
 }
 
-// dispatchData runs one queued-capable command.
-func (s *respServer) dispatchData(
-	ctx context.Context,
-	conn redcon.Conn,
-	name string,
-	cmd redcon.Command,
-) {
+// dispatchData runs a single data-plane command (live path and EXEC replay).
+func (s *respServer) dispatchData(ctx context.Context, conn redcon.Conn, name string, cmd redcon.Command) {
 	switch name {
 	// Strings and generic key ops.
-	case "GET":
+	case "GET": // get the string value, or nil if absent
 		s.cmdGet(ctx, conn, cmd)
-	case "SET":
+	case "SET": // set value; EX/PX = expire secs/ms, NX/XX = only if absent/present
 		s.cmdSet(ctx, conn, cmd)
-	case "SETEX":
+	case "SETEX": // SET with EXpiry: set value + TTL in seconds
 		s.cmdSetEx(ctx, conn, cmd)
-	case "SETNX":
+	case "SETNX": // SET if Not eXists → 1 if set, 0 if already present
 		s.cmdSetNx(ctx, conn, cmd)
-	case "DEL", "UNLINK":
+	case "DEL", "UNLINK": // DELete keys → count removed
 		s.cmdDel(ctx, conn, cmd)
-	case "EXISTS":
+	case "EXISTS": // count how many of the given keys exist
 		s.cmdExists(ctx, conn, cmd)
-	case "EXPIRE":
+	case "EXPIRE": // set a TTL on a key, in seconds
 		s.cmdExpire(ctx, conn, cmd)
-	case "TTL":
+	case "TTL": // Time-To-Live → seconds left, -1 (no expiry), -2 (missing)
 		s.cmdTTL(ctx, conn, cmd)
-	case "INCR":
+	case "INCR": // INCRement the integer value by 1
 		s.cmdIncrBy(ctx, conn, cmd, 1, false)
-	case "DECR":
+	case "DECR": // DECRement the integer value by 1
 		s.cmdIncrBy(ctx, conn, cmd, -1, false)
-	case "INCRBY":
+	case "INCRBY": // INCRement BY a given delta
 		s.cmdIncrBy(ctx, conn, cmd, 0, true)
-	case "DECRBY":
+	case "DECRBY": // DECRement BY a given delta
 		s.cmdIncrBy(ctx, conn, cmd, 0, true)
-	case "MGET":
+	case "MGET": // Multi-GET → one value per key (nil for missing)
 		s.cmdMGet(ctx, conn, cmd)
-	case "MSET":
+	case "MSET": // Multi-SET → set many key/value pairs
 		s.cmdMSet(ctx, conn, cmd)
-	case "GETDEL":
+	case "GETDEL": // GET the value, then DELete the key
 		s.cmdGetDel(ctx, conn, cmd)
-	case "GETSET":
+	case "GETSET": // GET the old value, then SET a new one
 		s.cmdGetSet(ctx, conn, cmd)
-	case "APPEND":
+	case "APPEND": // APPEND to the string value → new length
 		s.cmdAppend(ctx, conn, cmd)
-	case "STRLEN":
+	case "STRLEN": // STRing LENgth of the value
 		s.cmdStrlen(ctx, conn, cmd)
-	case "RENAME":
+	case "RENAME": // RENAME a key (any type), preserving its TTL
 		s.cmdRename(ctx, conn, cmd)
-	case "KEYS":
+	case "KEYS": // all KEYS matching a glob (full scan; prefer SCAN)
 		s.cmdKeys(ctx, conn, cmd)
-	case "TYPE":
+	case "TYPE": // the key's data type → string/hash/list/set/zset/stream/none
 		s.cmdType(ctx, conn, cmd)
-	case "PERSIST":
+	case "PERSIST": // remove a key's TTL → 1 if one was removed
 		s.cmdPersist(ctx, conn, cmd)
-	case "PTTL":
+	case "PTTL": // TTL in milliseconds (P = ms) → ms left, -1, -2
 		s.cmdPTTL(ctx, conn, cmd)
 	// Server / introspection.
-	case "SCAN":
+	case "SCAN": // incrementally iterate keys: SCAN cursor [MATCH][COUNT][TYPE]
 		s.cmdScan(ctx, conn, cmd)
-	case "INFO":
+	case "INFO": // server info text
 		s.cmdInfo(conn)
-	case "CONFIG":
+	case "CONFIG": // CONFIG GET/SET — minimal
 		cmdConfig(conn, cmd)
-	// Hashes.
-	case "HSET", "HMSET":
+	// Hashes (field→value maps; H = hash).
+	case "HSET", "HMSET": // Hash SET fields → number of new fields
 		s.cmdHSet(ctx, conn, cmd)
-	case "HSETNX":
+	case "HSETNX": // Hash SET if Not eXists → 1 if set
 		s.cmdHSetNX(ctx, conn, cmd)
-	case "HGET":
+	case "HGET": // Hash GET one field's value, or nil
 		s.cmdHGet(ctx, conn, cmd)
-	case "HMGET":
+	case "HMGET": // Hash Multi-GET several fields' values
 		s.cmdHMGet(ctx, conn, cmd)
-	case "HDEL":
+	case "HDEL": // Hash DELete fields → count removed
 		s.cmdHDel(ctx, conn, cmd)
-	case "HGETALL":
+	case "HGETALL": // Hash GET ALL field/value pairs
 		s.cmdHGetAll(ctx, conn, cmd)
-	case "HKEYS":
+	case "HKEYS": // Hash field names (KEYS)
 		s.cmdHKeys(ctx, conn, cmd)
-	case "HVALS":
+	case "HVALS": // Hash field VALueS
 		s.cmdHVals(ctx, conn, cmd)
-	case "HLEN":
+	case "HLEN": // Hash LENgth → number of fields
 		s.cmdHLen(ctx, conn, cmd)
-	case "HEXISTS":
+	case "HEXISTS": // does a Hash field EXIST → 0/1
 		s.cmdHExists(ctx, conn, cmd)
-	case "HINCRBY":
+	case "HINCRBY": // Hash INCRement a field BY a delta → new value
 		s.cmdHIncrBy(ctx, conn, cmd)
-	// Lists.
-	case "LPUSH":
+	// Lists (ordered; L/R = from the left/right end).
+	case "LPUSH": // Left PUSH: prepend value(s) → new length
 		s.cmdPush(ctx, conn, cmd, true)
-	case "RPUSH":
+	case "RPUSH": // Right PUSH: append value(s) → new length
 		s.cmdPush(ctx, conn, cmd, false)
-	case "LPOP":
+	case "LPOP": // Left POP: remove from the head [count]
 		s.cmdPop(ctx, conn, cmd, true)
-	case "RPOP":
+	case "RPOP": // Right POP: remove from the tail [count]
 		s.cmdPop(ctx, conn, cmd, false)
-	case "LLEN":
+	case "LLEN": // List LENgth
 		s.cmdLLen(ctx, conn, cmd)
-	case "LRANGE":
+	case "LRANGE": // List RANGE: elements from start..stop
 		s.cmdLRange(ctx, conn, cmd)
-	case "LINDEX":
+	case "LINDEX": // List element at INDEX, or nil
 		s.cmdLIndex(ctx, conn, cmd)
-	case "LSET":
+	case "LSET": // List SET the element at an index
 		s.cmdLSet(ctx, conn, cmd)
-	case "LREM":
+	case "LREM": // List REMove occurrences of a value → count removed
 		s.cmdLRem(ctx, conn, cmd)
-	case "LTRIM":
+	case "LTRIM": // List TRIM to a start..stop range
 		s.cmdLTrim(ctx, conn, cmd)
-	// Sets.
-	case "SADD":
+	// Sets (unordered, unique; S = set).
+	case "SADD": // Set ADD members → number of new members
 		s.cmdSAdd(ctx, conn, cmd)
-	case "SREM":
+	case "SREM": // Set REMove members → count removed
 		s.cmdSRem(ctx, conn, cmd)
-	case "SMEMBERS":
+	case "SMEMBERS": // all Set MEMBERS
 		s.cmdSMembers(ctx, conn, cmd)
-	case "SISMEMBER":
+	case "SISMEMBER": // Set IS-MEMBER → 0/1
 		s.cmdSIsMember(ctx, conn, cmd)
-	case "SCARD":
+	case "SCARD": // Set CARDinality → member count
 		s.cmdSCard(ctx, conn, cmd)
-	case "SPOP":
+	case "SPOP": // Set POP: remove & return random member(s)
 		s.cmdSPop(ctx, conn, cmd)
-	case "SUNION":
+	case "SUNION": // Set UNION across keys
 		s.cmdSetOp(ctx, conn, cmd, "union")
-	case "SINTER":
+	case "SINTER": // Set INTERsection across keys
 		s.cmdSetOp(ctx, conn, cmd, "inter")
-	case "SDIFF":
+	case "SDIFF": // Set DIFFerence: first key minus the rest
 		s.cmdSetOp(ctx, conn, cmd, "diff")
-	// Sorted sets.
-	case "ZADD":
+	// Sorted sets (members ordered by score; Z = sorted set).
+	case "ZADD": // sorted-set ADD score/member pairs → new members
 		s.cmdZAdd(ctx, conn, cmd)
-	case "ZSCORE":
+	case "ZSCORE": // sorted-set SCORE of a member, or nil
 		s.cmdZScore(ctx, conn, cmd)
-	case "ZRANK":
+	case "ZRANK": // sorted-set RANK (0-based position by score), or nil
 		s.cmdZRank(ctx, conn, cmd)
-	case "ZREM":
+	case "ZREM": // sorted-set REMove members → count removed
 		s.cmdZRem(ctx, conn, cmd)
-	case "ZCARD":
+	case "ZCARD": // sorted-set CARDinality → member count
 		s.cmdZCard(ctx, conn, cmd)
-	case "ZINCRBY":
+	case "ZINCRBY": // sorted-set INCRement a member's score BY a delta
 		s.cmdZIncrBy(ctx, conn, cmd)
-	case "ZRANGE":
+	case "ZRANGE": // sorted-set RANGE by rank [WITHSCORES]
 		s.cmdZRange(ctx, conn, cmd)
-	case "ZRANGEBYSCORE":
+	case "ZRANGEBYSCORE": // sorted-set RANGE BY SCORE min..max [WITHSCORES]
 		s.cmdZRangeByScore(ctx, conn, cmd)
-	// Streams.
-	case "XADD":
+	// Streams (append-only logs; X = stream).
+	case "XADD": // stream ADD an entry (ID or * to auto-generate)
 		s.cmdXAdd(ctx, conn, cmd)
-	case "XLEN":
+	case "XLEN": // stream LENgth → entry count
 		s.cmdXLen(ctx, conn, cmd)
-	case "XRANGE":
+	case "XRANGE": // stream RANGE of entries by ID [COUNT n]
 		s.cmdXRange(ctx, conn, cmd)
-	case "XREAD":
+	case "XREAD": // stream READ entries after given IDs
 		s.cmdXRead(ctx, conn, cmd)
 	default:
 		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")

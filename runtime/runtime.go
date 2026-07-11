@@ -113,12 +113,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
 
-	staticSecretMeta, err := LoadStaticSecretMetadata()
-	if err != nil {
-		return fmt.Errorf("failed to load static secret metadata: %w", err)
-	}
-
-	startState, err := ClassifyStartState(ctx, kms, ssmWithCache, staticSecretMeta)
+	startState, err := ClassifyStartState(ctx, kms, ssmWithCache)
 	if err != nil {
 		return fmt.Errorf("failed to classify start state: %w", err)
 	}
@@ -126,6 +121,11 @@ func Run(ctx context.Context, cfg Config) error {
 	dek, err := FetchOrInitDEK(ctx, kms, ssmWithCache)
 	if err != nil {
 		return fmt.Errorf("failed to fetch or init DEK: %w", err)
+	}
+
+	staticSecretMeta, err := LoadStaticSecretMetadata()
+	if err != nil {
+		return fmt.Errorf("failed to load static secret metadata: %w", err)
 	}
 
 	secrets, err := FetchOrInitStaticSecrets(ctx, kms, ssmWithCache, staticSecretMeta)

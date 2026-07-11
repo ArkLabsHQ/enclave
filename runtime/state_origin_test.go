@@ -124,34 +124,24 @@ func TestClassifyStartState(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:   "resume complete with receipt",
-			params: withReceipt(stateOriginParams(keyID)),
+			name:   "resume with receipt",
+			params: withReceipt(map[string]string{}),
 			want:   StartStateResume,
 		},
-		{name: "complete without receipt fails", params: stateOriginParams(keyID), wantErr: true},
+		{name: "without receipt fails", params: map[string]string{}, wantErr: true},
 		{
-			name:   "migration complete with transition receipt",
-			params: withMigration(stateOriginParams(keyID)),
+			name:   "migration with transition receipt",
+			params: withMigration(map[string]string{}),
 			want:   StartStateMigration,
 		},
 		{
 			name: "migration artifacts without transition receipt fail",
 			params: func() map[string]string {
-				params := stateOriginParams(keyID)
+				params := map[string]string{}
 				params[migrationPreviousPCR0Param()] = prevPCR0
 				params[migrationPreviousPCR0AttestationParam()] = "attestation"
 				return params
 			}(),
-			wantErr: true,
-		},
-		{name: "partial ciphertexts fail", params: func() map[string]string {
-			params := withReceipt(stateOriginParams(keyID))
-			delete(params, secretCiphertextParam("beta", keyID))
-			return params
-		}(), wantErr: true},
-		{
-			name:    "receipt without ciphertexts fails",
-			params:  withReceipt(map[string]string{kmsKeyIDParam(): keyID}),
 			wantErr: true,
 		},
 	}
@@ -163,7 +153,6 @@ func TestClassifyStartState(t *testing.T) {
 				ctx,
 				&kmsW{keyID: keyID, genesis: tc.genesis},
 				ssm,
-				stateOriginTestSecrets,
 			)
 
 			if tc.wantErr {

@@ -48,7 +48,6 @@ func ClassifyStartState(
 	ctx context.Context,
 	kms PrimaryKMS,
 	ssm SSM,
-	secrets []StaticSecretMetadata,
 ) (StartState, error) {
 	hasMigrationArtifacts, err := hasMigrationArtifacts(ctx, ssm)
 	if err != nil {
@@ -63,22 +62,6 @@ func ClassifyStartState(
 		}
 
 		return StartStateGenesis, nil
-	}
-
-	dekParam := storageDEKCiphertextParam(kms.KeyID())
-	if _, err := ssm.MustGet(ctx, dekParam); err != nil {
-		return StartStateInvalid, fmt.Errorf(
-			"required DEK missing from SSM: %s - %w", dekParam, err,
-		)
-	}
-
-	for _, s := range secrets {
-		param := secretCiphertextParam(s.Name, kms.KeyID())
-		if _, err := ssm.MustGet(ctx, param); err != nil {
-			return StartStateInvalid, fmt.Errorf(
-				"required static secret missing from SSM: %s - %w", param, err,
-			)
-		}
 	}
 
 	receipt, err := ssm.MayGet(ctx, stateOriginReceiptParam(kms.KeyID()))

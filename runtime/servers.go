@@ -31,9 +31,6 @@ const (
 )
 
 var (
-	errFailedReqBody = errors.New("failed to read request body")
-	errHashWrongSize = errors.New("given hash is of invalid size")
-
 	errBadForm        = "failed to parse POST form data"
 	errNoNonce        = "could not find nonce in URL query parameters"
 	errBadNonceFormat = fmt.Sprintf(

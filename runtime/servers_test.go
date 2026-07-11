@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/hf/nsm/request"
@@ -212,20 +211,9 @@ func TestAttestationMiddleware(t *testing.T) {
 }
 
 func TestAttestationHandler(t *testing.T) {
-	t.Run("profiling disables attestation", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		attestationHandler(true, &nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
-			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce="+strings.Repeat("a", nonceNumDigits), nil),
-		)
-
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusServiceUnavailable)
-		}
-	})
-
 	t.Run("missing nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(false, &nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -235,7 +223,7 @@ func TestAttestationHandler(t *testing.T) {
 
 	t.Run("bad nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(false, &nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce=not-hex", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -254,7 +242,7 @@ func TestAttestationHandler(t *testing.T) {
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 
 		rr := httptest.NewRecorder()
-		attestationHandler(false, &nsmW{nsm: &fakeNSM{session: session}}, hashes).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, hashes).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce="+hex.EncodeToString(rawNonce), nil),
 		)
 

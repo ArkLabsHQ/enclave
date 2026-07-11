@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/http/pprof"
 	"net/url"
 	"strings"
 	"time"
@@ -38,7 +37,6 @@ var (
 		nonceNumDigits,
 	)
 	errFailedAttestation = "failed to obtain attestation document from hypervisor"
-	errProfilingSet      = "attestation disabled because profiling is enabled"
 )
 
 type Servers interface {
@@ -99,24 +97,12 @@ func SetupHttpServers(
 	sm.HandleFunc("GET /v1/enclave-traces", HandleTracingGet(tracing))
 
 	em := http.NewServeMux()
-	em.HandleFunc("GET /enclave/attestation", attestationHandler(cfg.UseProfiling, nsm, hashes))
+	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 	em.HandleFunc("GET /enclave", rootHandler(cfg))
 	em.HandleFunc("GET /enclave/config", configHandler(cfg))
 	em.Handle("/v1/", corsWildcard(sm))
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
-
-	if cfg.UseProfiling {
-		profiler := http.NewServeMux()
-		profiler.HandleFunc("GET /debug/pprof/", pprof.Index)
-		profiler.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-		profiler.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-		profiler.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-		profiler.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
-		profiler.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-		// Q: Should this be on the external HTTP server? Auth?
-		em.Handle("/enclave/debug/", http.StripPrefix("/enclave", profiler))
-	}
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
@@ -406,13 +392,8 @@ func configHandler(cfg Config) http.HandlerFunc {
 }
 
 // attestationHandler serves NSM attestation binding TLS and response-signing key hashes.
-func attestationHandler(useProfiling bool, nsm NSM, hashes AttestationHashes) http.HandlerFunc {
+func attestationHandler(nsm NSM, hashes AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Q: Why does enabling profiling disable the attestation endpoint?
-		if useProfiling {
-			http.Error(w, errProfilingSet, http.StatusServiceUnavailable)
-			return
-		}
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, errBadForm, http.StatusBadRequest)
 			return

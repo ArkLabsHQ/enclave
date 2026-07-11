@@ -17,7 +17,6 @@ type Config struct {
 	DisableKeepAlives bool     // Disable HTTP keep-alives on the TLS server.
 	IntPort           uint16   // Internal loopback HTTP listener.
 	HostProxyPort     uint32   // Vsock port the host-side gvproxy listens on.
-	UseProfiling      bool     // Mount net/http/pprof at /enclave/debug.
 	UseACME           bool     // Use ACME instead of self-signed TLS.
 	ACMEDirectory     string   // ACME dir override: "letsencrypt-staging" or https:// URL.
 	ACMEEmail         string   // Optional ACME account contact email.

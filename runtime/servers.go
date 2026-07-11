@@ -206,25 +206,18 @@ func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {
 	return nil
 }
 
-type PCR0SignatureInfo struct {
-	PubkeyPEM    string `json:"pubkey_pem"`
-	PCR0Hex      string `json:"pcr0_hex"`
-	SignatureB64 string `json:"signature_b64"`
-}
-
 // RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
 type RuntimeInfo struct {
-	Version                    string             `json:"version"`
-	PreviousPCR0               string             `json:"previous_pcr0"`
-	PreviousPCR0Attestation    string             `json:"previous_pcr0_attestation,omitempty"`
-	AttestationPubkey          string             `json:"attestation_pubkey,omitempty"`
-	Metrics                    map[string]any     `json:"metrics"`
-	MigrationCooldownSeconds   int                `json:"migration_cooldown_seconds"`
-	MigrationCooldownRemaining int                `json:"migration_cooldown_remaining,omitempty"`
-	MigrationPending           bool               `json:"migration_pending"`
-	PCR0Signature              *PCR0SignatureInfo `json:"pcr0_signature,omitempty"`
-	UpstreamApp                UpstreamAppInfo    `json:"upstream_app"`
-	KMSKeyLocked               bool               `json:"kms_key_locked"`
+	Version                    string          `json:"version"`
+	PreviousPCR0               string          `json:"previous_pcr0"`
+	PreviousPCR0Attestation    string          `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey          string          `json:"attestation_pubkey,omitempty"`
+	Metrics                    map[string]any  `json:"metrics"`
+	MigrationCooldownSeconds   int             `json:"migration_cooldown_seconds"`
+	MigrationCooldownRemaining int             `json:"migration_cooldown_remaining,omitempty"`
+	MigrationPending           bool            `json:"migration_pending"`
+	UpstreamApp                UpstreamAppInfo `json:"upstream_app"`
+	KMSKeyLocked               bool            `json:"kms_key_locked"`
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(
@@ -232,34 +225,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	migrator Migrator,
 	ssm SSM,
 ) error {
-	deployment := getDeployment()
-	appName := getAppName()
-	pubkeyPath := fmt.Sprintf("/%s/%s/Signing/PubkeyPEM", deployment, appName)
-	pcr0Path := fmt.Sprintf("/%s/%s/Signing/PCR0", deployment, appName)
-	sigPath := fmt.Sprintf("/%s/%s/Signing/Signature", deployment, appName)
-
-	pubkey, err := ssm.MayGet(ctx, pubkeyPath)
-	if err != nil {
-		return fmt.Errorf("failed to load signature pubkey: %w", err)
-	}
-
-	pcr0, err := ssm.MayGet(ctx, pcr0Path)
-	if err != nil {
-		return fmt.Errorf("failed to load signature PCR0: %w", err)
-	}
-
-	sig, err := ssm.MayGet(ctx, sigPath)
-	if err != nil {
-		return fmt.Errorf("failed to load signature: %w", err)
-	}
-
-	// Q: What is this for? Do we still need it?
-	pcr0SigInfo := &PCR0SignatureInfo{
-		PubkeyPEM:    pubkey,
-		PCR0Hex:      pcr0,
-		SignatureB64: sig,
-	}
-
 	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -286,7 +251,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			MigrationCooldownSeconds:   cooldownStatus.ConfiguredSeconds,
 			MigrationCooldownRemaining: cooldownStatus.RemainingSeconds,
 			MigrationPending:           cooldownStatus.Pending,
-			PCR0Signature:              pcr0SigInfo,
 			UpstreamApp:                s.rt.UpstreamAppInfo(),
 			KMSKeyLocked:               kmsKeyLocked(),
 		})

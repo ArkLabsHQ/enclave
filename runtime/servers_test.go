@@ -288,9 +288,6 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 	ctx := context.Background()
 	ssm := NewSSM(&fakeSSM{params: map[string]string{
-		"/prod/myapp/Signing/PubkeyPEM":         "pubkey pem",
-		"/prod/myapp/Signing/PCR0":              "pcr0",
-		"/prod/myapp/Signing/Signature":         "signature",
 		migrationPreviousPCR0Param():            "previous",
 		migrationPreviousPCR0AttestationParam(): "attestation",
 	}})
@@ -317,13 +314,8 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		Metrics:                  metrics.MetricsSnapshot(),
 		MigrationCooldownSeconds: 120,
 		MigrationPending:         false,
-		PCR0Signature: &PCR0SignatureInfo{
-			PubkeyPEM:    "pubkey pem",
-			PCR0Hex:      "pcr0",
-			SignatureB64: "signature",
-		},
-		UpstreamApp:  rt.UpstreamAppInfo(),
-		KMSKeyLocked: true,
+		UpstreamApp:              rt.UpstreamAppInfo(),
+		KMSKeyLocked:             true,
 	})
 	require.NoError(t, err)
 	require.JSONEq(t, string(want), rr.Body.String())

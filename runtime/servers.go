@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
-	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )
 
@@ -164,13 +163,7 @@ func (s *servers) Start(ctx context.Context, cfg Config) {
 	}()
 
 	go func() {
-		var lis net.Listener
-		var err error
-		if cfg.UseVsockForExtPort {
-			lis, err = vsock.Listen(uint32(cfg.ExtPort), nil)
-		} else {
-			lis, err = net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
-		}
+		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
 		if err != nil {
 			s.rt.NotifyListenerError(fmt.Errorf("listen on external port: %w", err))
 			return

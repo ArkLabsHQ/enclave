@@ -12,23 +12,22 @@ import (
 // Config holds runtime HTTP/network settings.
 // Q: Many of these fields are not set from env vars, are they dead code?
 type Config struct {
-	FQDN               string   // Hostname the TLS cert is issued for.
-	ExtPort            uint16   // External TLS listener.
-	UseVsockForExtPort bool     // Listen on AF_VSOCK instead of AF_INET.
-	DisableKeepAlives  bool     // Disable HTTP keep-alives on the TLS server.
-	IntPort            uint16   // Internal loopback HTTP listener.
-	HostProxyPort      uint32   // Vsock port the host-side gvproxy listens on.
-	UseProfiling       bool     // Mount net/http/pprof at /enclave/debug.
-	UseACME            bool     // Use ACME instead of self-signed TLS.
-	ACMEDirectory      string   // ACME dir override: "letsencrypt-staging" or https:// URL.
-	ACMEEmail          string   // Optional ACME account contact email.
-	ACMECA             string   // PEM CA bundle for private/test ACME HTTPS.
-	Debug              bool     // Verbose runtime logging.
-	FdCur, FdMax       uint64   // File-descriptor soft/hard limits.
-	AppURL             *url.URL // Public source URL of the user app (informational).
-	AppWebSrv          *url.URL // Loopback URL the catch-all revProxy forwards to.
-	UpstreamProtocol   string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
-	MockCertFp         string   // Test-only TLS cert fingerprint override.
+	FQDN              string   // Hostname the TLS cert is issued for.
+	ExtPort           uint16   // External TLS listener.
+	DisableKeepAlives bool     // Disable HTTP keep-alives on the TLS server.
+	IntPort           uint16   // Internal loopback HTTP listener.
+	HostProxyPort     uint32   // Vsock port the host-side gvproxy listens on.
+	UseProfiling      bool     // Mount net/http/pprof at /enclave/debug.
+	UseACME           bool     // Use ACME instead of self-signed TLS.
+	ACMEDirectory     string   // ACME dir override: "letsencrypt-staging" or https:// URL.
+	ACMEEmail         string   // Optional ACME account contact email.
+	ACMECA            string   // PEM CA bundle for private/test ACME HTTPS.
+	Debug             bool     // Verbose runtime logging.
+	FdCur, FdMax      uint64   // File-descriptor soft/hard limits.
+	AppURL            *url.URL // Public source URL of the user app (informational).
+	AppWebSrv         *url.URL // Loopback URL the catch-all revProxy forwards to.
+	UpstreamProtocol  string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
+	MockCertFp        string   // Test-only TLS cert fingerprint override.
 }
 
 // LoadConfig builds Config from ENCLAVE_* env vars.

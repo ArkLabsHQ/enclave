@@ -37,16 +37,33 @@ var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_KMS_KEY_LOCKED":     true,
 	"ENCLAVE_MIGRATION_COOLDOWN": true,
 	"ENCLAVE_SECRETS_CONFIG":     true,
+	// ENCLAVE_DEV gates COSE-skip and other dev relaxations; it must be baked
+	// (measured into PCR0), never settable by the untrusted host via the overlay.
+	"ENCLAVE_DEV": true,
 }
 
-// skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
-// whose local QEMU NSM produces unsigned mock documents. Any other deployment
-// verifies against the AWS Nitro root. The deployment is baked into the EIF at
-// build time (measured into PCR0) and cannot be set via the SSM env overlay
-// (nonOverridableEnv), so this security-critical check cannot be flipped at
-// deploy time.
-func skipCOSEVerification() bool {
+// IsDev reports whether this is a development build — where the local QEMU NSM
+// emits unsigned mock attestations and localstack stands in for AWS. It gates
+// dev-only relaxations (COSE-skip, and the scaling handshake accepting mock docs).
+//
+// Signalled by an explicit ENCLAVE_DEV flag, falling back to the legacy
+// deployment=="dev" convention so existing dev EIFs keep working. Both sources are
+// baked into the EIF (measured into PCR0) and in nonOverridableEnv, so dev-ness is a
+// measured, immutable property: it can never be flipped on a production enclave via
+// the SSM overlay. Decoupling from the exact deployment name lets per-node dev
+// deployments (e.g. dev-leader / dev-follower) stay dev by baking ENCLAVE_DEV=true.
+func IsDev() bool {
+	if v := strings.TrimSpace(os.Getenv("ENCLAVE_DEV")); v != "" {
+		return strings.EqualFold(v, "true")
+	}
 	return getDeployment() == "dev"
+}
+
+// skipCOSEVerification bypasses COSE signature verification in dev only (the QEMU
+// NSM's documents are unsigned mocks). Any non-dev deployment verifies against the
+// AWS Nitro root.
+func skipCOSEVerification() bool {
+	return IsDev()
 }
 
 func getAppName() string {

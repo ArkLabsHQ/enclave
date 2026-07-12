@@ -243,6 +243,7 @@ func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
+	t.Setenv("ENCLAVE_DEV", "false")
 	_ = os.Unsetenv("SAFE_KEY")
 	fake := &fakeSSM{params: map[string]string{
 		"/prod/myapp/env/ENCLAVE_DEPLOYMENT":         "dev",
@@ -250,6 +251,7 @@ func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
 		"/prod/myapp/env/ENCLAVE_KMS_KEY_LOCKED":     "false",
 		"/prod/myapp/env/ENCLAVE_MIGRATION_COOLDOWN": "0s",
 		"/prod/myapp/env/ENCLAVE_SECRETS_CONFIG":     `[{"name":"evil"}]`,
+		"/prod/myapp/env/ENCLAVE_DEV":                "true",
 		"/prod/myapp/env/SAFE_KEY":                   "ok",
 	}}
 	if err := applyEnvOverrides(context.Background(), fake, "prod", "myapp"); err != nil {
@@ -261,6 +263,7 @@ func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
 		"ENCLAVE_KMS_KEY_LOCKED":     "true",
 		"ENCLAVE_MIGRATION_COOLDOWN": "1m",
 		"ENCLAVE_SECRETS_CONFIG":     "[]",
+		"ENCLAVE_DEV":                "false",
 	} {
 		if got := os.Getenv(k); got != want {
 			t.Errorf("%s overridden via overlay to %q; must stay %q", k, got, want)
@@ -268,5 +271,36 @@ func TestApplyEnvOverrides_SkipsNonOverridable(t *testing.T) {
 	}
 	if got := os.Getenv("SAFE_KEY"); got != "ok" {
 		t.Errorf("non-identity key should still apply, got %q", got)
+	}
+
+}
+
+func TestIsDev(t *testing.T) {
+	// Explicit ENCLAVE_DEV wins over the deployment name, both ways.
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_DEV", "true")
+	if !IsDev() {
+		t.Error("ENCLAVE_DEV=true should be dev even with deployment=prod")
+	}
+	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
+	t.Setenv("ENCLAVE_DEV", "false")
+	if IsDev() {
+		t.Error("ENCLAVE_DEV=false should override the deployment=dev fallback")
+	}
+
+	// Fallback: no ENCLAVE_DEV → legacy deployment=="dev" convention.
+	_ = os.Unsetenv("ENCLAVE_DEV")
+	t.Setenv("ENCLAVE_DEPLOYMENT", "dev")
+	if !IsDev() {
+		t.Error("deployment=dev with no ENCLAVE_DEV should be dev (legacy fallback)")
+	}
+	// Per-node dev deployments are NOT dev unless ENCLAVE_DEV is baked true.
+	t.Setenv("ENCLAVE_DEPLOYMENT", "dev-leader")
+	if IsDev() {
+		t.Error("dev-leader without ENCLAVE_DEV should not be dev via the name fallback")
+	}
+	t.Setenv("ENCLAVE_DEV", "true")
+	if !IsDev() {
+		t.Error("dev-leader with ENCLAVE_DEV=true should be dev")
 	}
 }

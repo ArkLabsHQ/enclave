@@ -175,3 +175,63 @@ All other KMS requests (GenerateDataKey, Encrypt, etc.) pass through unmodified.
 **Credentials not found**: Ensure mock-imds is running and `IMDS_ENDPOINT` is set to `192.168.127.1:1338` in enclave.yaml env overrides.
 
 **gvproxy networking fails**: Ensure port 1024 is in the vhost-device-vsock `forward-listen` list. Check gvproxy logs for connection errors.
+
+## Threshold-Scaling Ceremony Test (1 leader + 2 followers) — EXPERIMENTAL
+
+Exercises the horizontal-scaling path end-to-end: a leader enclave and two follower
+enclaves complete the attested handshake + DKG, and the **second follower joining
+triggers a re-DKG (reshare)** over the committee of three. Files:
+
+| File | Purpose |
+|------|---------|
+| `scaling-vsock-spike.sh` | **C0 go/no-go** — is AF_VSOCK netns-scoped? Run this FIRST. |
+| `seed-scaling.sh` | Seed one deployment's env-override config (role, leader addr, KMSKeyID placeholder). |
+| `docker-compose.scaling.yml` | Three enclave node services (leader + 2 followers), bridge-networked, port-mapped. |
+| `run-scaling.sh` | Orchestrator: seed → staged boot (leader → f1 → f2) → snapshot/poll for the reshare → assert. |
+| `scaling-test.sh` | Assertions over the three `/test/scaling` endpoints + the leader handshake. |
+
+### Why it's experimental (the infra blocker)
+
+Each enclave stack runs a supervisor whose gvproxy binds host AF_VSOCK `vsock:1024`
+and IMDS `vsock:8002` (`supervisor/networking.go`) — host-global. The normal harness
+uses `network_mode: host`, so three stacks would **collide** on those ports. The
+scaling nodes therefore use **bridge networking** (own netns per container), which only
+isolates AF_VSOCK if the kernel scopes vsock per network namespace. That is the C0
+question:
+
+```sh
+sudo ./scaling-vsock-spike.sh      # GO ⇒ proceed;  NO-GO ⇒ use separate micro-VMs
+```
+
+If C0 is NO-GO, single-host multi-enclave via containers is not achievable; the fallback
+is separate micro-VMs (or making the enclave-side vsock dial port configurable, which
+changes the EIF and breaks the identical-PCR requirement admission depends on).
+
+### Run order (after C0 = GO)
+
+```sh
+cd test
+sudo ./scaling-vsock-spike.sh                 # 1. confirm the isolation premise
+./run-scaling.sh                              # 2. seed + boot 3 nodes + assert
+# manual spot-check:
+curl -sk https://localhost:8443/test/scaling  # leader: master + own share
+curl -sk https://localhost:8543/test/scaling  # follower-1: share
+curl -sk https://localhost:8643/test/scaling  # follower-2: share
+```
+
+### Remaining work (post-C0)
+
+`docker-compose.scaling.yml` documents the topology but its per-node boot entrypoint
+(`boot-scaling-node.sh`: vhost-device-vsock + supervisor + QEMU + the follower socat
+bridges) is not yet written — it must be adapted from `run.sh`'s supervisor-launch +
+`boot_qemu` (`run.sh:35-185`, `505-600`), parameterized by the per-role env the compose
+file sets. Build it once C0 confirms the container-isolation approach.
+
+### What the assertions prove
+
+roles parsed (leader/follower/follower); leader handshake route mounted (regression
+guard); leader master + own share present; both follower shares present; **the reshare
+fired** (follower-1's share pubkey changed after follower-2 joined); master + all three
+shares are four distinct valid secp256k1 scalars. Stronger "group pubkey stable across
+reshare == pubkey(master)" needs the unimplemented `<ENVVAR>_GROUP_PUBKEY` (design doc
+part 2) — left as a follow-up.

@@ -75,6 +75,13 @@ secrets:
     env_var: APP_SIGNING_KEY
   # - name: api_token
   #   env_var: APP_API_TOKEN
+  # kind: threshold-share a secret across a horizontally-scaled fleet.
+  #   (unset)/static — every replica decrypts the same full value (default).
+  #   signing        — the master holds the full secret; joiner enclaves get
+  #                    threshold shares (a majority reconstructs it).
+  # - name: group_key
+  #   env_var: APP_GROUP_KEY
+  #   kind: signing
 
 # TLS for the enclave's public HTTPS listener (port 443).
 #   self-signed         — self-signed cert (default). Clients trust the

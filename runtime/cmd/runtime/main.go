@@ -18,6 +18,10 @@ import (
 )
 
 func main() {
+	if runtime.IsDev() {
+		runtime.ApplyDevCmdlineOverrides()
+	}
+
 	cfg, err := runtime.BuildNitridingConfig()
 	if err != nil {
 		slog.Error("build runtime config", "error", err)
@@ -83,55 +87,80 @@ func main() {
 		appBinary := envOr("APP_BINARY_NAME", "app")
 		appPath := fmt.Sprintf("/app/%s", appBinary)
 
-		child := exec.Command(appPath)
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		child.Env = append(os.Environ(),
-			"ENCLAVE_APP_PORT="+appPort,
-			"PORT="+appPort,
-			"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-			"ENCLAVE_RUNTIME_TOKEN="+enc.RuntimeToken(),
-		)
-		if err := child.Start(); err != nil {
-			slog.Error("start child failed", "path", appPath, "error", err)
-			os.Exit(1)
+		startChild := func() (*exec.Cmd, chan error, error) {
+			child := exec.Command(appPath)
+			child.Stdout = os.Stdout
+			child.Stderr = os.Stderr
+			child.Env = append(os.Environ(),
+				"ENCLAVE_APP_PORT="+appPort,
+				"PORT="+appPort,
+				"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
+				"ENCLAVE_RUNTIME_TOKEN="+enc.RuntimeToken(),
+			)
+			if err := child.Start(); err != nil {
+				return nil, nil, err
+			}
+			slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
+			done := make(chan error, 1)
+			go func() { done <- child.Wait() }()
+			return child, done, nil
 		}
-		slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
 
-		childDone := make(chan error, 1)
-		go func() { childDone <- child.Wait() }()
-
-		select {
-		case err := <-childDone:
-			// Upstream app exited. Record the state on the runtime
-			if err != nil {
-				slog.Error("upstream app exited — runtime stays alive", "error", err)
-			} else {
-				slog.Warn("upstream app exited cleanly — runtime stays alive")
-			}
-			enc.MarkUpstreamExited(err)
-			// Wait for explicit shutdown or a listener failure.
-			select {
-			case lerr := <-enc.ListenErr():
-				slog.Error("HTTP listener failed after app exit", "error", lerr)
-				os.Exit(1)
-			case <-ctx.Done():
-				slog.Info("shutting down (upstream app already exited)")
-			}
-		case err := <-enc.ListenErr():
-			slog.Error("HTTP listener failed", "error", err)
-			_ = child.Process.Signal(syscall.SIGTERM)
-			<-childDone
-			os.Exit(1)
-		case <-ctx.Done():
-			slog.Info("shutting down")
+		// stopChild asks the app to exit, escalating to SIGKILL after a grace period.
+		stopChild := func(child *exec.Cmd, done chan error) {
 			_ = child.Process.Signal(syscall.SIGTERM)
 			select {
-			case <-childDone:
+			case <-done:
 			case <-time.After(10 * time.Second):
 				slog.Warn("child did not exit, sending SIGKILL")
 				_ = child.Process.Kill()
-				<-childDone
+				<-done
+			}
+		}
+
+		child, childDone, err := startChild()
+		if err != nil {
+			slog.Error("start child failed", "path", appPath, "error", err)
+			os.Exit(1)
+		}
+
+		enc.MarkUpstreamStarted()
+
+		for {
+			select {
+			case <-enc.UpstreamRestart():
+				slog.Info("restarting app to adopt re-randomized share", "old_pid", child.Process.Pid)
+				stopChild(child, childDone)
+				child, childDone, err = startChild()
+				if err != nil {
+					slog.Error("restart child failed", "path", appPath, "error", err)
+					os.Exit(1)
+				}
+			case err := <-childDone:
+				// Upstream app exited. Record the state on the runtime
+				if err != nil {
+					slog.Error("upstream app exited — runtime stays alive", "error", err)
+				} else {
+					slog.Warn("upstream app exited cleanly — runtime stays alive")
+				}
+				enc.MarkUpstreamExited(err)
+				// Wait for explicit shutdown or a listener failure.
+				select {
+				case lerr := <-enc.ListenErr():
+					slog.Error("HTTP listener failed after app exit", "error", lerr)
+					os.Exit(1)
+				case <-ctx.Done():
+					slog.Info("shutting down (upstream app already exited)")
+				}
+				return
+			case err := <-enc.ListenErr():
+				slog.Error("HTTP listener failed", "error", err)
+				stopChild(child, childDone)
+				os.Exit(1)
+			case <-ctx.Done():
+				slog.Info("shutting down")
+				stopChild(child, childDone)
+				return
 			}
 		}
 	}

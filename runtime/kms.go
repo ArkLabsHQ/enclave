@@ -300,6 +300,47 @@ func (k *KMS) readKMSKeyID(ctx context.Context, paramName string) (string, error
 	return v, nil
 }
 
+// decryptToBytes KMS-decrypts a base64 ciphertext to its raw plaintext, using an
+// NSM attestation so the plaintext is released only to this enclave.
+func (k *KMS) decryptToBytes(ctx context.Context, keyID, ciphertextB64 string) ([]byte, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode ciphertext: %w", err)
+	}
+
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return nil, fmt.Errorf("open nsm session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	attestationDoc, rsaPrivateKey, err := buildAttestationDocument(session)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := k.aws.KMS.Decrypt(ctx, &kms.DecryptInput{
+		KeyId:          aws.String(keyID),
+		CiphertextBlob: ciphertext,
+		Recipient: &kmstypes.RecipientInfo{
+			AttestationDocument:    attestationDoc,
+			KeyEncryptionAlgorithm: kmstypes.KeyEncryptionMechanismRsaesOaepSha256,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kms decrypt: %w", err)
+	}
+	if len(out.CiphertextForRecipient) == 0 {
+		return nil, fmt.Errorf("kms decrypt returned empty CiphertextForRecipient")
+	}
+
+	plaintext, err := cms.DecryptEnvelopedKey(rsaPrivateKey, out.CiphertextForRecipient)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
+	}
+	return plaintext, nil
+}
+
 // GetKeyID reads the primary KMS key ID from SSM at /<dep>/<app>/KMSKeyID.
 func (k *KMS) GetKeyID(ctx context.Context) (string, error) {
 	paramName := kmsKeyIDParam()

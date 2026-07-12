@@ -270,6 +270,15 @@ secrets:
     env_var: ""`,
 			wantErrContains: "secrets[0].env_var is required",
 		},
+		{
+			name: "invalid kind",
+			secrets: `
+secrets:
+  - name: key1
+    env_var: MY_KEY
+    kind: bogus`,
+			wantErrContains: "must be one of static, signing",
+		},
 	}
 
 	for _, tt := range tests {
@@ -278,6 +287,30 @@ secrets:
 			_, err := loadConfig()
 			requireErrContains(t, err, tt.wantErrContains)
 		})
+	}
+}
+
+func TestLoadConfig_ThresholdSecretKind(t *testing.T) {
+	writeConfig(t, `
+name: myapp
+region: us-east-1
+secrets:
+  - name: group_key
+    env_var: GROUP_KEY
+    kind: signing
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if len(cfg.Secrets) != 1 {
+		t.Fatalf("Secrets = %v, want 1", cfg.Secrets)
+	}
+	if cfg.Secrets[0].Kind != "signing" {
+		t.Errorf("Kind = %q, want %q", cfg.Secrets[0].Kind, "signing")
+	}
+	if !cfg.Secrets[0].IsThreshold() {
+		t.Errorf("IsThreshold() = false, want true for kind=signing")
 	}
 }
 

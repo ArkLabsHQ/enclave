@@ -1,0 +1,60 @@
+name: Scaling Integration Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dkg]
+
+jobs:
+  scaling-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up KVM
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Load vsock kernel modules
+        run: |
+          # vhost_vsock backs the host CID (forward-cid=2, the path we validated) and
+          # the shared heartbeat responder; vsock_loopback backs forward-cid=1.
+          sudo modprobe vhost_vsock
+          sudo modprobe vsock_loopback
+          test -e /dev/vsock
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-25.11
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build test EIF
+        run: |
+          go build -o /tmp/enclave-cli ./cli/cmd/enclave
+          export RUNTIME_LOCAL_PATH=$GITHUB_WORKSPACE
+          export SUPERVISOR_LOCAL_PATH=$GITHUB_WORKSPACE
+          export APP_LOCAL_PATH=$GITHUB_WORKSPACE/test/app
+
+          (cd runtime && go mod vendor)
+          (cd test/app && go mod vendor && /tmp/enclave-cli build)
+
+      - name: Run threshold-scaling ceremony
+        run: |
+          cd test
+          docker compose --profile scaling run --build --rm \
+            -e FWD_CID=2 -e BOOT_TIMEOUT=240 scaling-runner
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling-test-logs
+          path: test/*.log
+          if-no-files-found: ignore

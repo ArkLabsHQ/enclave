@@ -5,7 +5,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
@@ -60,12 +64,46 @@ func _getPCRValues() (map[uint][]byte, error) {
 		return nil, err
 	}
 
+	// In dev the QEMU NSM emits unsigned mock documents, so nitrite.Verify (which
+	// requires the AWS Nitro root chain) fails.
+	if devMode() {
+		return pcrsFromAttestationDoc(rawAttDoc)
+	}
+
 	res, err := nitrite.Verify(rawAttDoc, nitrite.VerifyOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	return res.Document.PCRs, nil
+}
+
+func devMode() bool {
+	if v := strings.TrimSpace(os.Getenv("ENCLAVE_DEV")); v != "" {
+		return strings.EqualFold(v, "true")
+	}
+	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")) == "dev"
+}
+
+func pcrsFromAttestationDoc(doc []byte) (map[uint][]byte, error) {
+	var envelope struct {
+		_           struct{} `cbor:",toarray"`
+		Protected   []byte
+		Unprotected cbor.RawMessage
+		Payload     []byte
+		Signature   []byte
+	}
+	if err := cbor.Unmarshal(doc, &envelope); err != nil {
+		return nil, fmt.Errorf("decode COSE Sign1 envelope: %w", err)
+	}
+	if len(envelope.Payload) == 0 {
+		return nil, errors.New("COSE Sign1 payload empty")
+	}
+	var parsed nitrite.Document
+	if err := cbor.Unmarshal(envelope.Payload, &parsed); err != nil {
+		return nil, fmt.Errorf("decode attestation document: %w", err)
+	}
+	return parsed.PCRs, nil
 }
 
 // arePCRsIdentical returns true if (and only if) the two given PCR maps are
@@ -96,6 +134,35 @@ func Attest(nonce, userData, publicKey []byte) ([]byte, error) {
 // ArePCRsIdentical reports whether two PCR maps have the same keys and values.
 func ArePCRsIdentical(ourPCRs, theirPCRs map[uint][]byte) bool {
 	return arePCRsIdentical(ourPCRs, theirPCRs)
+}
+
+func ArePCRsIdenticalForKeys(ourPCRs, theirPCRs map[uint][]byte, keys []uint) bool {
+	for _, k := range keys {
+		ourValue, ok := ourPCRs[k]
+		if !ok {
+			return false
+		}
+		theirValue, ok := theirPCRs[k]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(ourValue, theirValue) {
+			return false
+		}
+	}
+	return true
+}
+
+// GetPCRs returns this enclave's current PCR values (from a fresh attestation).
+// Used by peer-to-peer handshakes to compare a remote enclave's PCRs to our own.
+func GetPCRs() (map[uint][]byte, error) {
+	return getPCRValues()
+}
+
+// CurrentTime returns the clock nitrite verification should use (UTC now).
+// Exposed so peer handshakes verify remote attestations against the same clock.
+func CurrentTime() time.Time {
+	return currentTime()
 }
 
 // attest takes as input a nonce, user-provided data and a public key, and then

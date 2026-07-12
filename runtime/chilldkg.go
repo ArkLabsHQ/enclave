@@ -18,13 +18,14 @@ const thresholdRecoveryPrefix = "threshold/recovery/"
 type DkgStore struct {
 	storage *Storage
 
-	getMaster func(label string) ([]byte, error)
+	getLeaderSecret func(label string) ([]byte, error)
 }
 
-// newDKGStore builds the adapter over the enclave's encrypted Storage. masterFor
-// is nil on a follower; on a leader it points at the in-memory master cache.
-func newDKGStore(storage *Storage, getMaster func(label string) ([]byte, error)) *DkgStore {
-	return &DkgStore{storage: storage, getMaster: getMaster}
+// newDKGStore builds the adapter over the enclave's encrypted Storage.
+// getLeaderSecret is nil on a follower; on a leader it points at the in-memory
+// leader-secret cache.
+func newDKGStore(storage *Storage, getLeaderSecret func(label string) ([]byte, error)) *DkgStore {
+	return &DkgStore{storage: storage, getLeaderSecret: getLeaderSecret}
 }
 
 func (s *DkgStore) recoveryKey(groupKey []byte) string {
@@ -70,12 +71,12 @@ func (s *DkgStore) List() ([][]byte, error) {
 	return out, nil
 }
 
-// GetLeaderSecret returns the label's master secret
+// GetLeaderSecret returns the label's leader secret (a0).
 func (s *DkgStore) GetLeaderSecret(label string) ([]byte, error) {
-	if s.getMaster == nil {
-		return nil, fmt.Errorf("leader master for %q not available (no resolver)", label)
+	if s.getLeaderSecret == nil {
+		return nil, fmt.Errorf("leader secret for %q not available (no resolver)", label)
 	}
-	return s.getMaster(label)
+	return s.getLeaderSecret(label)
 }
 
 // Close is a no-op: the underlying Storage lifecycle is owned by the Runtime.

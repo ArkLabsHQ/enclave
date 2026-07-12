@@ -28,8 +28,8 @@ import (
 
 // StaticSecret is a KMS-managed secret (enclave.yaml `secrets:`), hex-encoded into its
 // env var, which the child app inherits via os.Environ(). For a "signing" secret EnvVar
-// holds what this node signs with now — its share once a group forms, else the master
-// (solo leader); the master itself lives only in the storage envelope.
+// holds what this node signs with now — its share once a group forms, else the leader
+// secret (solo leader); the leader secret otherwise lives only in the storage envelope.
 type StaticSecret struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
@@ -68,10 +68,11 @@ type StaticSecrets struct {
 	kms     *KMS
 	scaling *ScalingEntity
 
-	// leaders caches a leader's master (a0) by EnvVar — the source for a0 pinning, and
-	// how the master survives once its env var is overwritten by this node's share.
-	mu      sync.Mutex
-	leaders map[string][]byte
+	// leaderSecrets caches a leader's secret (a0) by EnvVar — the source for a0 pinning,
+	// and how the leader secret survives once its env var is overwritten by this node's
+	// share.
+	mu            sync.Mutex
+	leaderSecrets map[string][]byte
 }
 
 // NewStaticSecrets constructs the subsystem and parses the configured
@@ -81,7 +82,7 @@ func NewStaticSecrets(kms *KMS, scaling *ScalingEntity) (*StaticSecrets, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &StaticSecrets{secrets: secs, kms: kms, scaling: scaling, leaders: map[string][]byte{}}, nil
+	return &StaticSecrets{secrets: secs, kms: kms, scaling: scaling, leaderSecrets: map[string][]byte{}}, nil
 }
 
 // Secrets returns the configured list (read-only — used by Migration).
@@ -186,9 +187,9 @@ func (s *StaticSecrets) LoadOrGenerate(ctx context.Context, secret StaticSecret,
 		return err
 	}
 
-	// A leader signing secret mints its master (a0) into an envelope
+	// A leader signing secret mints its leader secret (a0) into an envelope
 	if secret.IsSigning() {
-		return s.storeSharedSecret(ctx, keyID, secret, sharedSecret{Master: hex.EncodeToString(plaintext)})
+		return s.storeSharedSecret(ctx, keyID, secret, sharedSecret{Secret: hex.EncodeToString(plaintext)})
 	}
 
 	if err := s.kms.StoreCiphertext(ctx, paramName, base64.StdEncoding.EncodeToString(ciphertextBlob)); err != nil {
@@ -217,14 +218,15 @@ func (s *StaticSecrets) StoreDerivedSecret(ctx context.Context, label string, sh
 
 	env := sharedSecret{Share: hex.EncodeToString(share)}
 	if s.scaling != nil && s.scaling.IsLeader() {
-		// Fold the leader's master (a0) into the envelope so persisting the share
-		// doesn't drop it. The env var now holds the share, so the master is read from
-		// the in-memory cache seeded when the secret was first loaded/generated.
-		master, err := s.leaderSecret(label)
+		// Fold the leader secret (a0) into the envelope so persisting the share
+		// doesn't drop it. The env var now holds the share, so the leader secret is
+		// read from the in-memory cache seeded when the secret was first
+		// loaded/generated.
+		a0, err := s.leaderSecret(label)
 		if err != nil {
-			return fmt.Errorf("leader master secret %q not loaded before its share: %w", secret.Name, err)
+			return fmt.Errorf("leader secret %q not loaded before its share: %w", secret.Name, err)
 		}
-		env.Master = hex.EncodeToString(master)
+		env.Secret = hex.EncodeToString(a0)
 	}
 	return s.storeSharedSecret(ctx, keyID, secret, env)
 }
@@ -296,32 +298,32 @@ func (s *StaticSecrets) decryptCiphertext(ctx context.Context, keyID, ciphertext
 	return plaintext, nil
 }
 
-// sharedSecret is the plaintext of a "signing" secret's ciphertext: the master seed
+// sharedSecret is the plaintext of a "signing" secret's ciphertext: the leader secret
 // (a0) and this node's threshold share, bundled under one SSM slot so both are read  and written atomically
 type sharedSecret struct {
-	Master string `json:"master,omitempty"` // hex; the a0/full secret (leader only)
-	Share  string `json:"share,omitempty"`  // hex; this node's threshold share
+	Secret string `json:"leader_secret,omitempty"` // hex; the a0/full secret (leader only)
+	Share  string `json:"share,omitempty"`         // hex; this node's threshold share
 }
 
 // applySharedSecret sets the secret's env var to what this node signs with now (share
-// if the envelope has one, else master) and caches any master in memory for a0 pinning.
-// The master itself never gets an env var of its own.
+// if the envelope has one, else the leader secret) and caches any leader secret in
+// memory for a0 pinning. Once a group exists, the leader secret has no env var.
 func (s *StaticSecrets) applySharedSecret(secretMetadata StaticSecret, secret sharedSecret) error {
-	if secret.Master != "" {
-		if b, err := hex.DecodeString(secret.Master); err == nil {
+	if secret.Secret != "" {
+		if b, err := hex.DecodeString(secret.Secret); err == nil {
 			s.mu.Lock()
-			s.leaders[secretMetadata.EnvVar] = b
+			s.leaderSecrets[secretMetadata.EnvVar] = b
 			s.mu.Unlock()
 		} else {
-			return fmt.Errorf("decode master for %q: %w", secretMetadata.Name, err)
+			return fmt.Errorf("decode leader secret for %q: %w", secretMetadata.Name, err)
 		}
 	}
 	val := secret.Share
 	if val == "" {
-		val = secret.Master
+		val = secret.Secret
 	}
 	if val == "" {
-		return fmt.Errorf("shared secret %q has neither master nor share", secretMetadata.Name)
+		return fmt.Errorf("shared secret %q has neither leader secret nor share", secretMetadata.Name)
 	}
 	if err := safeSetenv(secretMetadata.EnvVar, val); err != nil {
 		return fmt.Errorf("set %s: %w", secretMetadata.EnvVar, err)
@@ -329,15 +331,15 @@ func (s *StaticSecrets) applySharedSecret(secretMetadata StaticSecret, secret sh
 	return nil
 }
 
-// leaderSecret returns the cached leader master (a0) for a signing secret, keyed by its
+// leaderSecret returns the cached leader secret (a0) for a signing secret, keyed by its
 // EnvVar. Populated only on a leader, once the secret has been loaded or generated.
 func (s *StaticSecrets) leaderSecret(label string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if m, ok := s.leaders[label]; ok {
+	if m, ok := s.leaderSecrets[label]; ok {
 		return m, nil
 	}
-	return nil, fmt.Errorf("leader master for %q not loaded", label)
+	return nil, fmt.Errorf("leader secret for %q not loaded", label)
 }
 
 // loadSharedSecret decrypts a signing secret's envelope and applies it to env vars.

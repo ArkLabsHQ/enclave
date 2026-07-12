@@ -26,20 +26,20 @@ import (
 // Metrics holds OTEL metric instruments for the enclave supervisor.
 type Metrics struct {
 	// Supervisor counters.
-	HTTPRequests        metric.Int64Counter
-	HTTPErrors          metric.Int64Counter
-	AppProxiedRequests  metric.Int64Counter // requests forwarded to the user app via revProxy
-	AppProxiedErrors    metric.Int64Counter // failures dialing or talking to the user app
-	KMSOperations  metric.Int64Counter
-	KMSErrors      metric.Int64Counter
-	StorageReads   metric.Int64Counter
-	StorageWrites  metric.Int64Counter
-	StorageDeletes metric.Int64Counter
-	StorageErrors  metric.Int64Counter
-	SecretReads    metric.Int64Counter
-	SecretWrites   metric.Int64Counter
-	SecretDeletes  metric.Int64Counter
-	LogEntries     metric.Int64Counter
+	HTTPRequests       metric.Int64Counter
+	HTTPErrors         metric.Int64Counter
+	AppProxiedRequests metric.Int64Counter // requests forwarded to the user app via revProxy
+	AppProxiedErrors   metric.Int64Counter // failures dialing or talking to the user app
+	KMSOperations      metric.Int64Counter
+	KMSErrors          metric.Int64Counter
+	StorageReads       metric.Int64Counter
+	StorageWrites      metric.Int64Counter
+	StorageDeletes     metric.Int64Counter
+	StorageErrors      metric.Int64Counter
+	SecretReads        metric.Int64Counter
+	SecretWrites       metric.Int64Counter
+	SecretDeletes      metric.Int64Counter
+	LogEntries         metric.Int64Counter
 
 	// Snapshot state: accumulated values for JSON export.
 	mu       sync.Mutex

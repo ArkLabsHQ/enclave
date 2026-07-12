@@ -268,8 +268,9 @@ func handleTestAttestation(w http.ResponseWriter, r *http.Request) {
 // test can verify a ceremony ran. The dedicated "signing" secret scaling_key is
 // exposed in a single env var, SCALING_KEY, which always holds what this node signs
 // with now: its own threshold share once a group has formed (leader and followers
-// alike), or the master on a solo leader before any follower joins. The master is never
-// in an env var. For the present value it also derives the secp256k1 compressed pubkey,
+// alike), or the leader secret on a solo leader before any follower joins. Once a group
+// forms, the leader secret leaves the env var and lives only in the sealed envelope.
+// For the present value it also derives the secp256k1 compressed pubkey,
 // so the test can assert scalars are valid and distinct across enclaves without seeing
 // the raw secret material.
 func handleTestScaling(w http.ResponseWriter, r *http.Request) {

@@ -166,7 +166,7 @@ func (a *ScalingEntity) IsLeader() bool {
 	return a.role == scalingRoleLeader
 }
 
-// SetLeaderResolver wires the leader's a0 lookup (StaticSecrets.leaderMaster), read by
+// SetLeaderResolver wires the leader's a0 lookup (StaticSecrets.leaderSecret), read by
 // the DKG store to pin the group key. Leave unset on a follower.
 func (a *ScalingEntity) SetLeaderResolver(fn func(label string) ([]byte, error)) {
 	a.getLeaderSecret = fn
@@ -205,7 +205,7 @@ func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
 }
 
 func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
-	// The leader resolves a0 from its master cache so the group key pins to the master.
+	// The leader resolves a0 from its leader-secret cache so the group key pins to it.
 	store := newDKGStore(storage, a.getLeaderSecret)
 
 	listenAddr := net.JoinHostPort(relayTAPHost, a.listenPort)
@@ -244,7 +244,7 @@ func (a *ScalingEntity) DeriveFollowerKey(ctx context.Context, StaticSecret Stat
 }
 
 func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
-	// A follower has no master, so it never answers GetLeaderSecret (nil resolver).
+	// A follower has no leader secret, so it never answers GetLeaderSecret (nil resolver).
 	store := newDKGStore(storage, nil)
 
 	myHostPub := hostSk.PubKey().SerializeCompressed()

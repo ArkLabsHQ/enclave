@@ -110,12 +110,12 @@ func TestScalingListenPortDefault(t *testing.T) {
 }
 
 func TestThresholdStoreLeaderSecret(t *testing.T) {
-	// A leader resolves a0 through the injected resolver (its in-memory master cache).
-	masters := map[string][]byte{"SIGNING_KEY": {0x0a, 0x0b, 0x0c}}
+	// A leader resolves a0 through the injected resolver (its in-memory leader-secret cache).
+	leaderSecrets := map[string][]byte{"SIGNING_KEY": {0x0a, 0x0b, 0x0c}}
 	resolve := func(label string) ([]byte, error) {
-		m, ok := masters[label]
+		m, ok := leaderSecrets[label]
 		if !ok {
-			return nil, fmt.Errorf("no master for %q", label)
+			return nil, fmt.Errorf("no leader secret for %q", label)
 		}
 		return m, nil
 	}
@@ -129,7 +129,7 @@ func TestThresholdStoreLeaderSecret(t *testing.T) {
 	}
 
 	if _, err := s.GetLeaderSecret("MISSING_KEY"); err == nil {
-		t.Error("expected error when the master is not cached")
+		t.Error("expected error when the leader secret is not cached")
 	}
 
 	// A follower has no resolver and must never answer GetLeaderSecret.

@@ -468,16 +468,6 @@ resource "terraform_data" "sign_pcr0" {
   }
 }
 
-data "local_file" "pcr0_pubkey_pem" {
-  filename   = "${local.signing_dir}/pubkey.pem"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
-data "local_file" "pcr0_signature_b64" {
-  filename   = "${local.signing_dir}/signature.b64"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
 # =============================================================================
 # IAM
 # =============================================================================
@@ -612,9 +602,6 @@ data "aws_iam_policy_document" "enclave" {
     resources = [
       aws_ssm_parameter.storage_bucket_name.arn,
       aws_ssm_parameter.anchor_bucket_name.arn,
-      aws_ssm_parameter.pcr0_pubkey.arn,
-      aws_ssm_parameter.pcr0_value.arn,
-      aws_ssm_parameter.pcr0_signature.arn,
     ]
   }
 

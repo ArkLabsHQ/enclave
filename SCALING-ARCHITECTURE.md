@@ -11,9 +11,8 @@
 This work introduces a **new scaling model for enclave applications, built on threshold
 cryptography**. Instead of copying signing keys onto every machine, a cluster of
 enclaves collectively *is* the key: each node holds only a **share**, producing a
-signature requires a **quorum**, and the full key exists on no single node. The public
-key that applications, verifiers, and on-chain addresses depend on **never changes** as
-nodes join or leave.
+signature requires a **quorum**, It makes use of a Leader/Follower system, where the Leader posseses the full secret. The public
+key that applications depends on **never changes** as nodes join or leave.
 
 **Key properties**
 
@@ -176,11 +175,24 @@ flowchart LR
   independent group: ceremonies are labeled by the secret's env var, and the label
   routes every delivered share back to the right secret. Two tagged secrets mean two
   independent share sets and two group keys.
+- **Followers never need to know each other in advance.** The leader is the single
+  source of membership truth: every admitted node's identity key sits in the leader's
+  in-memory committee, and each ceremony begins with the leader broadcasting the **full
+  member roster** (each participant's id and host public key) in a signed,
+  epoch-numbered start command. A follower builds its view of the group *entirely* from
+  that command — it never exchanges keys with peers directly. It accepts the command
+  only under the leader key it pinned during the attested handshake; the epoch blocks
+  replays; and the ceremony's final round has every participant sign the same session
+  transcript (which includes the roster), so if any two nodes were fed different
+  rosters the ceremony fails rather than silently forking.
 - The group public key is **identical** at every stage — pinned to the original secret,
   which only the leader holds (sealed at rest, never exported).
 - Shares are delivered **live** while the node runs — the full path is §5.2.
 - Persistence is a per-node **sealed envelope** (hardware-attestation-gated KMS): the
-  node's current share, plus — on the leader only — the leader secret.
+  node's current share, plus — on the leader only — the leader secret. Membership
+  itself is *not* persisted: the committee lives only in the running leader, so a
+  rebooted follower simply re-runs admission (its host identity key is KMS-persisted,
+  so it re-admits as the same identity) and the next reshare folds it back in.
 
 ### 5.2 From ceremony to running application
 

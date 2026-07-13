@@ -478,27 +478,6 @@ data "local_file" "pcr0_signature_b64" {
   depends_on = [terraform_data.sign_pcr0]
 }
 
-resource "aws_ssm_parameter" "pcr0_pubkey" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
-  type      = "String"
-  value     = data.local_file.pcr0_pubkey_pem.content
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_value" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PCR0"
-  type      = "String"
-  value     = local.effective_pcr0
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_signature" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/Signature"
-  type      = "String"
-  value     = trimspace(data.local_file.pcr0_signature_b64.content)
-  overwrite = true
-}
-
 # =============================================================================
 # IAM
 # =============================================================================

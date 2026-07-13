@@ -4,6 +4,7 @@ package nitriding
 // https://github.com/containers/gvisor-tap-vsock/blob/main/cmd/vm/main_linux.go
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -23,10 +24,10 @@ var (
 
 // RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
 // on failure. hostProxyPort is the vsock port gvproxy listens on (typically 1024).
-func RunNetworking(hostProxyPort uint32, stop chan bool) {
+func RunNetworking(ctx context.Context, hostProxyPort uint32) {
 	var err error
 	for {
-		if err = setupNetworking(hostProxyPort, stop); err == nil {
+		if err = setupNetworking(ctx, hostProxyPort); err == nil {
 			return
 		}
 		elog.Printf("TAP tunnel to EC2 host failed: %v.  Restarting.", err)
@@ -42,7 +43,7 @@ func RunNetworking(hostProxyPort uint32, stop chan bool) {
 //  3. Establish a connection with the proxy running on the host.
 //  4. Spawn goroutines to forward traffic between the TAP device and the proxy
 //     running on the host.
-func setupNetworking(hostProxyPort uint32, stop chan bool) error {
+func setupNetworking(ctx context.Context, hostProxyPort uint32) error {
 	elog.Println("Setting up networking between host and enclave.")
 	defer elog.Println("Tearing down networking between host and enclave.")
 
@@ -63,6 +64,18 @@ func setupNetworking(hostProxyPort uint32, stop chan bool) error {
 		return fmt.Errorf("failed to send POST request to host: %w", err)
 	}
 	elog.Println("Sent HTTP request to EC2 host.")
+
+	// Local modification (see UPSTREAM.md): delete any stale TAP link left
+	// over from a previous tunnel. Upstream's teardown only closes the vsock
+	// conn and the tap fd; the interface's IP address and default route can
+	// survive, making the configureTapIface retry fail forever with EEXIST
+	// ("failed to set link address: file exists").
+	if link, err := netlink.LinkByName(ifaceTap); err == nil {
+		if err := netlink.LinkDel(link); err != nil {
+			return fmt.Errorf("failed to delete stale tap link: %w", err)
+		}
+		elog.Println("Deleted stale TAP link from previous tunnel.")
+	}
 
 	// Create a TAP interface.
 	tap, err := water.New(water.Config{
@@ -97,7 +110,7 @@ func setupNetworking(hostProxyPort uint32, stop chan bool) error {
 	select {
 	case err := <-errCh:
 		return err
-	case <-stop:
+	case <-ctx.Done():
 		elog.Printf("Shutting down networking.")
 		return nil
 	}

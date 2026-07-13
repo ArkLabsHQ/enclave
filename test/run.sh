@@ -35,6 +35,18 @@ cd "$SCRIPT_DIR"
 boot_qemu() {
   local eif_path="${1:?Usage: boot_qemu <path-to-eif>}"
 
+  # ENCLAVE_START_CMD is intentionally async. After a supervisor restart, the
+  # old QEMU wrapper may still be healthy while a new start command races in;
+  # do not tear down vhost-device-vsock underneath it.
+  if [ -s /tmp/enclave-boot.pid ]; then
+    local existing_pid
+    existing_pid=$(cat /tmp/enclave-boot.pid 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && [ "$existing_pid" != "$$" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "Enclave boot already running (PID $existing_pid)"
+      return 0
+    fi
+  fi
+
   echo $$ > /tmp/enclave-boot.pid
 
   if [ ! -f "$eif_path" ]; then
@@ -1038,12 +1050,10 @@ fi
 # stopped latch, so the watchdog won't relaunch underneath us) and /start.
 echo ""
 echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
-TAMPER_KEY_ID=$(aws ssm get-parameter --name "/dev/my-app/KMSKeyID" $LOCALSTACK \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-DEK_PARAM="/dev/my-app/StorageDEK/Ciphertext/${TAMPER_KEY_ID}"
+DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${NEW_KEY}"
 ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
   --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$TAMPER_KEY_ID" ] || [ -z "$ORIG_DEK" ]; then
+if [ -z "$ORIG_DEK" ]; then
   echo "  FAIL: could not read KMSKeyID / StorageDEK ciphertext from SSM" >&2
   exit 1
 fi
@@ -1225,6 +1235,8 @@ else
   echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30 attempts (~90s)" >&2
   exit 1
 fi
+
+wait_for_enclave "after supervisor relaunch"
 
 echo ""
 echo "=== [10/11] Final enclave info ==="

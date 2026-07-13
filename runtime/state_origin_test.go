@@ -3,334 +3,445 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"maps"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/stretchr/testify/require"
 )
 
-// newFakeSSM returns an empty in-memory SSM. The fakeSSM type (a params-backed
-// SSMAPI) is declared in environment_test.go.
-func newFakeSSM() *fakeSSM { return &fakeSSM{params: map[string]string{}} }
-
-func (f *fakeSSM) clone() *fakeSSM {
-	c := newFakeSSM()
-	for k, v := range f.params {
-		c.params[k] = v
-	}
-	return c
+var stateOriginTestSecrets = []StaticSecretMetadata{
+	{Name: "alpha", EnvVar: "ALPHA"},
+	{Name: "beta", EnvVar: "BETA"},
 }
 
-// genesisState populates an SSM map with the complete runtime-owned state a
-// genesis enclave would have written for keyID: the key ID, every secret
-// ciphertext, and the storage DEK ciphertext (arbitrary but valid base64).
-func genesisState(keyID string, secrets []StaticSecret) *fakeSSM {
-	f := newFakeSSM()
-	f.params[kmsKeyIDParam()] = keyID
-	for i, s := range secrets {
-		f.params[secretCiphertextParam(s.Name, keyID)] = base64.StdEncoding.EncodeToString([]byte{byte(i), 0x11, 0x22, 0x33})
-	}
-	f.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString([]byte{0xDE, 0xAD, 0xBE, 0xEF})
-	return f
+func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
+	fake := &fakeSSM{params: map[string]string{}}
+	maps.Copy(fake.params, params)
+	return fake, NewSSM(fake)
 }
 
-func mustDecodeHex(t *testing.T, s string) []byte {
+func stateOriginParams(keyID string) map[string]string {
+	params := map[string]string{
+		kmsKeyIDParam(): keyID,
+		storageDEKCiphertextParam(keyID): base64.StdEncoding.EncodeToString(
+			[]byte{0xde, 0xad, 0xbe, 0xef},
+		),
+	}
+	for i, secret := range stateOriginTestSecrets {
+		params[secretCiphertextParam(secret.Name, keyID)] = base64.StdEncoding.EncodeToString(
+			[]byte{byte(i), 0x11, 0x22, 0x33},
+		)
+	}
+	return params
+}
+
+func mustStateRoot(t *testing.T, ctx context.Context, ssm SSM, keyID string) []byte {
 	t.Helper()
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		t.Fatalf("decode hex: %v", err)
-	}
-	return b
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	require.NoError(t, err)
+	root, err := (&stateOrigin{ssm: ssm, secrets: stateOriginTestSecrets, enc: enc}).stateRoot(
+		ctx,
+		keyID,
+	)
+	require.NoError(t, err)
+	return root
 }
 
-// signedReceipt builds a verifiable attestation carrying a state-origin payload
-// in user_data, for the receipt-verification tests.
-func signedReceipt(t *testing.T, pcrs map[uint][]byte, purpose string, stateRoot []byte) signedAttestation {
+func receiptPayload(t *testing.T, purpose string, stateRoot []byte) []byte {
 	t.Helper()
-	payload, err := canonicalCBOR.Marshal(stateOriginPayloadV1{Purpose: purpose, StateRoot: stateRoot})
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
-	}
+	payload, err := cbor.Marshal(stateOriginPayloadV1{Purpose: purpose, StateRoot: stateRoot})
+	require.NoError(t, err)
+	return payload
+}
+
+func signedReceipt(
+	t *testing.T,
+	pcrs map[uint][]byte,
+	purpose string,
+	stateRoot []byte,
+) signedAttestation {
+	t.Helper()
 	now := time.Now()
-	return buildSignedAttestationCustom(t, pcrs, now.Add(-time.Hour), now.Add(time.Hour), now, payload)
+	return buildSignedAttestationCustom(
+		t,
+		pcrs,
+		now.Add(-time.Hour),
+		now.Add(time.Hour),
+		now,
+		receiptPayload(t, purpose, stateRoot),
+	)
 }
 
-var testSecrets = []StaticSecret{{Name: "alpha", EnvVar: "ALPHA"}, {Name: "beta", EnvVar: "BETA"}}
-
-// --- state_root ---
-
-func TestStateRootV1_DeterministicAndSensitive(t *testing.T) {
+func TestClassifyStartState(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	ctx := context.Background()
-	keyID := "key-aaaa"
-	f := genesisState(keyID, testSecrets)
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
 
-	r1, err := NewStateOrigin(f, testSecrets).stateRoot(ctx, keyID)
-	if err != nil {
-		t.Fatalf("compute state_root: %v", err)
-	}
-	r2, err := NewStateOrigin(f, testSecrets).stateRoot(ctx, keyID)
-	if err != nil {
-		t.Fatalf("compute state_root (again): %v", err)
-	}
-	if !bytes.Equal(r1, r2) {
-		t.Fatal("state_root must be deterministic for the same inputs")
-	}
-
-	// Changing a secret ciphertext must change the root.
-	swapped := f.clone()
-	swapped.params[secretCiphertextParam("alpha", keyID)] = base64.StdEncoding.EncodeToString([]byte{0x99, 0x99})
-	r3, err := NewStateOrigin(swapped, testSecrets).stateRoot(ctx, keyID)
-	if err != nil {
-		t.Fatalf("compute state_root (swapped): %v", err)
-	}
-	if bytes.Equal(r1, r3) {
-		t.Fatal("changing a ciphertext must change state_root")
-	}
-
-	// Changing the storage DEK ciphertext must change the root.
-	dekSwap := f.clone()
-	dekSwap.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString([]byte{0x00})
-	r4, err := NewStateOrigin(dekSwap, testSecrets).stateRoot(ctx, keyID)
-	if err != nil {
-		t.Fatalf("compute state_root (dek swap): %v", err)
-	}
-	if bytes.Equal(r1, r4) {
-		t.Fatal("changing the storage DEK ciphertext must change state_root")
-	}
-
-	// A different key ID is a different commitment.
-	other := genesisState("key-bbbb", testSecrets)
-	r5, err := NewStateOrigin(other, testSecrets).stateRoot(ctx, "key-bbbb")
-	if err != nil {
-		t.Fatalf("compute state_root (other key): %v", err)
-	}
-	if bytes.Equal(r1, r5) {
-		t.Fatal("a different key ID must change state_root")
-	}
-}
-
-func TestStateRootV1_MissingCiphertextErrors(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	ctx := context.Background()
-	keyID := "key-cccc"
-	f := genesisState(keyID, testSecrets)
-	delete(f.params, secretCiphertextParam("beta", keyID))
-	if _, err := NewStateOrigin(f, testSecrets).stateRoot(ctx, keyID); err == nil {
-		t.Fatal("a missing ciphertext must error rather than silently commit to partial state")
-	}
-}
-
-// --- state-origin receipt verification ---
-
-func TestVerifyStateOriginReceipt(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	pcr0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-	stateRoot := []byte("state-root-commitment-bytes")
-
-	att := signedReceipt(t, map[uint][]byte{0: mustDecodeHex(t, pcr0)}, purposeStateOrigin, stateRoot)
-	useAttestationRoots(t, att.roots)
-
-	if err := verifyStateOriginReceipt(att.docB64, stateRoot, pcr0, purposeStateOrigin); err != nil {
-		t.Fatalf("a genuine receipt must verify: %v", err)
-	}
-
-	other := hex.EncodeToString(bytes.Repeat([]byte{0x22}, 48))
-	if err := verifyStateOriginReceipt(att.docB64, stateRoot, other, purposeStateOrigin); err == nil {
-		t.Fatal("a receipt whose PCR0 isn't ours must be rejected")
-	}
-	if err := verifyStateOriginReceipt(att.docB64, stateRoot, pcr0, purposeMigrationTransition); err == nil {
-		t.Fatal("a receipt with the wrong purpose must be rejected")
-	}
-	if err := verifyStateOriginReceipt(att.docB64, []byte("different-root"), pcr0, purposeStateOrigin); err == nil {
-		t.Fatal("a receipt that doesn't cover the recomputed state_root must be rejected")
-	}
-}
-
-func TestVerifyStateOriginReceipt_ForgedRejected(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	pcr0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-	forged := buildForgedAttestation(t, map[uint][]byte{0: mustDecodeHex(t, pcr0)})
-	if err := verifyStateOriginReceipt(forged, []byte("root"), pcr0, purposeStateOrigin); err == nil {
-		t.Fatal("an unsigned/forged receipt must be rejected")
-	}
-}
-
-// --- migration-transition receipt verification ---
-
-func TestVerifyMigrationTransitionReceipt(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	prevPCR0Bytes := bytes.Repeat([]byte{0x99}, 48)
-	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
-	ownPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-	stateRoot := []byte("successor-state-root")
-
-	good := signedReceipt(t, map[uint][]byte{
-		0:                 prevPCR0Bytes,
-		migrationPCRIndex: pcr31Commitment(t, ownPCR0),
-	}, purposeMigrationTransition, stateRoot)
-	useAttestationRoots(t, good.roots)
-
-	if err := verifyMigrationTransitionReceipt(good.docB64, stateRoot, prevPCR0, ownPCR0); err != nil {
-		t.Fatalf("a genuine migration-transition receipt must verify: %v", err)
-	}
-	// Wrong predecessor identity.
-	if err := verifyMigrationTransitionReceipt(good.docB64, stateRoot, hex.EncodeToString(bytes.Repeat([]byte{0x77}, 48)), ownPCR0); err == nil {
-		t.Fatal("a receipt not signed by the recorded predecessor must be rejected")
-	}
-	// Wrong purpose.
-	if err := verifyMigrationTransitionReceipt(good.docB64, stateRoot, prevPCR0, ownPCR0); err != nil {
-		t.Fatalf("sanity: %v", err)
-	}
-	wrongPurpose := signedReceipt(t, map[uint][]byte{
-		0:                 prevPCR0Bytes,
-		migrationPCRIndex: pcr31Commitment(t, ownPCR0),
-	}, purposeStateOrigin, stateRoot)
-	useAttestationRoots(t, wrongPurpose.roots)
-	if err := verifyMigrationTransitionReceipt(wrongPurpose.docB64, stateRoot, prevPCR0, ownPCR0); err == nil {
-		t.Fatal("a state-origin-purposed receipt must not pass as a migration transition")
-	}
-
-	// PCR31 commits to a different successor.
-	wrongTarget := signedReceipt(t, map[uint][]byte{
-		0:                 prevPCR0Bytes,
-		migrationPCRIndex: pcr31Commitment(t, hex.EncodeToString(bytes.Repeat([]byte{0x33}, 48))),
-	}, purposeMigrationTransition, stateRoot)
-	useAttestationRoots(t, wrongTarget.roots)
-	if err := verifyMigrationTransitionReceipt(wrongTarget.docB64, stateRoot, prevPCR0, ownPCR0); err == nil {
-		t.Fatal("a receipt whose PCR31 commits to a different successor must be rejected")
-	}
-}
-
-// Rollback-onto-self: a failed forward migration rolls the predecessor back onto
-// the migration key it created, where MigrationPreviousPCR0 == our own PCR0 and
-// the transition receipt's PCR31 commits to the failed target, not us. It must
-// still verify (the self-signature + state_root coverage is the proof), but a
-// receipt NOT signed by us must still be rejected — skipping PCR31 mustn't open
-// a hole.
-func TestVerifyMigrationTransitionReceipt_RollbackOntoSelf(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	selfPCR0Bytes := bytes.Repeat([]byte{0xab}, 48)
-	selfPCR0 := hex.EncodeToString(selfPCR0Bytes)
-	failedTarget := hex.EncodeToString(bytes.Repeat([]byte{0x33}, 48))
-	stateRoot := []byte("rolled-back-state-root")
-
-	rec := signedReceipt(t, map[uint][]byte{
-		0:                 selfPCR0Bytes,
-		migrationPCRIndex: pcr31Commitment(t, failedTarget),
-	}, purposeMigrationTransition, stateRoot)
-	useAttestationRoots(t, rec.roots)
-	if err := verifyMigrationTransitionReceipt(rec.docB64, stateRoot, selfPCR0, selfPCR0); err != nil {
-		t.Fatalf("rollback-onto-self receipt (predecessor == own) must verify: %v", err)
-	}
-
-	// Recorded predecessor is us, but the receipt is signed by a different PCR0:
-	// must be rejected (the PCR0 check still applies).
-	forged := signedReceipt(t, map[uint][]byte{
-		0:                 bytes.Repeat([]byte{0x77}, 48),
-		migrationPCRIndex: pcr31Commitment(t, failedTarget),
-	}, purposeMigrationTransition, stateRoot)
-	useAttestationRoots(t, forged.roots)
-	if err := verifyMigrationTransitionReceipt(forged.docB64, stateRoot, selfPCR0, selfPCR0); err == nil {
-		t.Fatal("a receipt not signed by us must be rejected even on rollback-onto-self")
-	}
-}
-
-// --- end-to-end resume + the ciphertext-swap property ---
-
-func TestResumeReceipt_RoundTripAndSwapFailsClosed(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	ctx := context.Background()
-	keyID := "key-resume"
-	ownPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-
-	f := genesisState(keyID, testSecrets)
-	stateRoot, err := NewStateOrigin(f, testSecrets).stateRoot(ctx, keyID)
-	if err != nil {
-		t.Fatalf("compute state_root: %v", err)
-	}
-	rec := signedReceipt(t, map[uint][]byte{0: mustDecodeHex(t, ownPCR0)}, purposeStateOrigin, stateRoot)
-	useAttestationRoots(t, rec.roots)
-	f.params[stateOriginReceiptParam(keyID)] = rec.docB64
-
-	if err := NewStateOrigin(f, testSecrets).verifyResume(ctx, keyID, ownPCR0); err != nil {
-		t.Fatalf("a genuine resume must verify: %v", err)
-	}
-
-	// The core property: a host that re-encrypts attacker-known plaintext under
-	// the accepted key and swaps the SSM ciphertext must be detected.
-	f.params[secretCiphertextParam("alpha", keyID)] = base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})
-	if err := NewStateOrigin(f, testSecrets).verifyResume(ctx, keyID, ownPCR0); err == nil {
-		t.Fatal("a swapped ciphertext must fail closed on resume")
-	}
-}
-
-// --- startup classification table ---
-
-func TestClassifyStartupState(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	ctx := context.Background()
 	keyID := "key-classify"
+	prevPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
 
-	withReceipt := func(f *fakeSSM) *fakeSSM {
-		f.params[stateOriginReceiptParam(keyID)] = "cmVjZWlwdA==" // value presence only
-		return f
+	withReceipt := func(params map[string]string) map[string]string {
+		params[stateOriginReceiptParam(keyID)] = "receipt"
+		return params
 	}
-	withMigration := func(f *fakeSSM) *fakeSSM {
-		f.params[migrationStateOriginReceiptParam(keyID)] = "bXI="
-		f.params[migrationPreviousPCR0Param()] = "predpcr0"
-		f.params[migrationPreviousPCR0AttestationParam()] = "cHJlZGF0dA=="
-		return f
+	withMigration := func(params map[string]string) map[string]string {
+		params[migrationStateOriginReceiptParam(keyID)] = "transition"
+		params[migrationPreviousPCR0Param()] = prevPCR0
+		params[migrationPreviousPCR0AttestationParam()] = "attestation"
+		return params
 	}
 
 	cases := []struct {
 		name    string
-		keyID   string
-		ssm     *fakeSSM
-		want    startupMode
+		genesis bool
+		params  map[string]string
+		want    StartState
 		wantErr bool
 	}{
-		{"genesis: clean", "", newFakeSSM(), modeGenesis, false},
-		{"genesis blocked: lingering predecessor", "", withMigration(newFakeSSM()), 0, true},
-		{"resume: complete + receipt", keyID, withReceipt(genesisState(keyID, testSecrets)), modeResume, false},
-		{"fail: complete, no receipt", keyID, genesisState(keyID, testSecrets), 0, true},
-		{"migration: complete + transition receipt + predecessor", keyID, withMigration(genesisState(keyID, testSecrets)), modeMigration, false},
-		{"fail: complete + predecessor but no transition receipt", keyID, func() *fakeSSM {
-			f := genesisState(keyID, testSecrets)
-			f.params[migrationPreviousPCR0Param()] = "predpcr0"
-			f.params[migrationPreviousPCR0AttestationParam()] = "cHJlZGF0dA=="
-			return f
-		}(), 0, true},
-		{"fail: partial ciphertexts", keyID, func() *fakeSSM {
-			f := withReceipt(genesisState(keyID, testSecrets))
-			delete(f.params, secretCiphertextParam("beta", keyID))
-			return f
-		}(), 0, true},
-		{"fail: receipt but no ciphertexts", keyID, func() *fakeSSM {
-			f := newFakeSSM()
-			f.params[kmsKeyIDParam()] = keyID
-			return withReceipt(f)
-		}(), 0, true},
+		{
+			name:    "genesis clean",
+			genesis: true,
+			params:  map[string]string{},
+			want:    StartStateGenesis,
+		},
+		{
+			name:    "genesis blocked by migration artifacts",
+			genesis: true,
+			params:  withMigration(map[string]string{}),
+			wantErr: true,
+		},
+		{
+			name:    "genesis blocked by partial migration artifacts",
+			genesis: true,
+			params: map[string]string{
+				migrationPreviousPCR0Param(): prevPCR0,
+			},
+			wantErr: true,
+		},
+		{
+			name:   "resume with receipt",
+			params: withReceipt(map[string]string{}),
+			want:   StartStateResume,
+		},
+		{name: "without receipt fails", params: map[string]string{}, wantErr: true},
+		{
+			name:   "migration with transition receipt",
+			params: withMigration(map[string]string{}),
+			want:   StartStateMigration,
+		},
+		{
+			name: "migration artifacts without transition receipt fail",
+			params: func() map[string]string {
+				params := map[string]string{}
+				params[migrationPreviousPCR0Param()] = prevPCR0
+				params[migrationPreviousPCR0AttestationParam()] = "attestation"
+				return params
+			}(),
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mode, err := NewStateOrigin(tc.ssm, testSecrets).classify(ctx, tc.keyID)
+			_, ssm := stateOriginTestSSM(tc.params)
+			got, err := ClassifyStartState(
+				ctx,
+				&kmsW{keyID: keyID, genesis: tc.genesis},
+				ssm,
+			)
+
 			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("want fail-closed, got mode=%v", mode)
-				}
+				require.Error(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if mode != tc.want {
-				t.Fatalf("mode = %v, want %v", mode, tc.want)
-			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
 		})
 	}
 }
 
-// verifyKeyPolicyPosture has its own extensive table-driven coverage in
-// policy_posture_test.go.
+func TestVerifyStateOriginReceipt(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+
+	stateRoot := []byte("state-root-commitment")
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	pcr0Hex := hex.EncodeToString(pcr0)
+	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, stateRoot)
+	verifier := NewNSM(WithAttestationRoots(att.roots))
+
+	require.NoError(t, verifyStateOriginReceipt(
+		verifier,
+		att.docB64,
+		purposeStateOrigin,
+		stateRoot,
+		map[uint]string{0: pcr0Hex},
+	))
+
+	cases := []struct {
+		name     string
+		receipt  string
+		purpose  string
+		root     []byte
+		expected map[uint]string
+	}{
+		{
+			name:     "wrong PCR0",
+			receipt:  att.docB64,
+			purpose:  purposeStateOrigin,
+			root:     stateRoot,
+			expected: map[uint]string{0: hex.EncodeToString(bytes.Repeat([]byte{0x22}, 48))},
+		},
+		{
+			name:     "wrong purpose",
+			receipt:  att.docB64,
+			purpose:  purposeMigrationTransition,
+			root:     stateRoot,
+			expected: map[uint]string{0: pcr0Hex},
+		},
+		{
+			name:     "wrong state root",
+			receipt:  att.docB64,
+			purpose:  purposeStateOrigin,
+			root:     []byte("other-root"),
+			expected: map[uint]string{0: pcr0Hex},
+		},
+		{
+			name: "forged receipt",
+			receipt: base64.StdEncoding.EncodeToString(
+				buildForgedAttestation(t, map[uint][]byte{0: pcr0}),
+			),
+			purpose:  purposeStateOrigin,
+			root:     stateRoot,
+			expected: map[uint]string{0: pcr0Hex},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyStateOriginReceipt(verifier, tc.receipt, tc.purpose, tc.root, tc.expected)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+
+	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
+	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	stateRoot := []byte("successor-state-root")
+	pcr31 := pcrExtendFromZero(ownPCR0)
+	att := signedReceipt(t, map[uint][]byte{
+		0:                 prevPCR0,
+		migrationPCRIndex: pcr31,
+	}, purposeMigrationTransition, stateRoot)
+	verifier := NewNSM(WithAttestationRoots(att.roots))
+
+	err := verifyStateOriginReceipt(
+		verifier,
+		att.docB64,
+		purposeMigrationTransition,
+		stateRoot,
+		map[uint]string{
+			0:                 hex.EncodeToString(prevPCR0),
+			migrationPCRIndex: hex.EncodeToString(pcr31),
+		},
+	)
+	require.NoError(t, err)
+
+	err = verifyStateOriginReceipt(
+		verifier,
+		att.docB64,
+		purposeMigrationTransition,
+		stateRoot,
+		map[uint]string{
+			0: hex.EncodeToString(prevPCR0),
+			migrationPCRIndex: hex.EncodeToString(
+				pcrExtendFromZero(bytes.Repeat([]byte{0x33}, 48)),
+			),
+		},
+	)
+	require.Error(t, err)
+}
+
+func TestEstablishStateOriginGenesisWritesReceipt(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+
+	ctx := context.Background()
+	keyID := "key-genesis"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
+	root := mustStateRoot(t, ctx, ssm, keyID)
+	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
+	session := &fakeNSMSession{}
+	session.responses = append(session.responses, attestationDocumentResponse(att.doc))
+	nsm := &nsmW{nsm: &fakeNSM{session: session}}
+
+	_, err := EstablishStateOrigin(
+		ctx,
+		nsm,
+		&kmsW{keyID: keyID, genesis: true},
+		ssm,
+		stateOriginTestSecrets,
+		StartStateGenesis,
+	)
+
+	require.NoError(t, err)
+	written := fake.params[stateOriginReceiptParam(keyID)]
+	require.NoError(t, verifyStateOriginReceipt(
+		NewNSM(WithAttestationRoots(att.roots)),
+		written,
+		purposeStateOrigin,
+		root,
+		map[uint]string{0: hex.EncodeToString(pcr0)},
+	))
+}
+
+func TestEstablishStateOriginResumeDetectsCiphertextSwap(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+
+	ctx := context.Background()
+	keyID := "key-resume"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
+	root := mustStateRoot(t, ctx, ssm, keyID)
+	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
+	fake.params[stateOriginReceiptParam(keyID)] = att.docB64
+	payload := receiptPayload(t, purposeStateOrigin, root)
+
+	session := &fakeNSMSession{}
+	session.responses = append(
+		session.responses,
+		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
+	)
+	nsm := &nsmW{nsm: &fakeNSM{
+		session:      session,
+		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
+	}}
+	_, err := EstablishStateOrigin(
+		ctx,
+		nsm,
+		&kmsW{keyID: keyID},
+		ssm,
+		stateOriginTestSecrets,
+		StartStateResume,
+	)
+	require.NoError(t, err)
+
+	fake.params[secretCiphertextParam("alpha", keyID)] = base64.StdEncoding.EncodeToString(
+		[]byte{0xff, 0xff, 0xff},
+	)
+	session = &fakeNSMSession{}
+	session.responses = append(
+		session.responses,
+		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
+	)
+	nsm = &nsmW{nsm: &fakeNSM{
+		session:      session,
+		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
+	}}
+	_, err = EstablishStateOrigin(
+		ctx,
+		nsm,
+		&kmsW{keyID: keyID},
+		ssm,
+		stateOriginTestSecrets,
+		StartStateResume,
+	)
+	require.Error(t, err)
+}
+
+func TestEstablishStateOriginMigration(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+
+	ctx := context.Background()
+	keyID := "key-migration"
+	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
+	wrongPCR0 := bytes.Repeat([]byte{0x77}, 48)
+	failedTargetPCR0 := bytes.Repeat([]byte{0x33}, 48)
+
+	run := func(t *testing.T, prevPCR0Hex string, verifiedPCRs map[uint][]byte) (*fakeSSM, []byte, *x509.CertPool, error) {
+		t.Helper()
+		fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
+		root := mustStateRoot(t, ctx, ssm, keyID)
+		transition := signedReceipt(t, verifiedPCRs, purposeMigrationTransition, root)
+		stateReceipt := signedReceipt(t, map[uint][]byte{0: ownPCR0}, purposeStateOrigin, root)
+		fake.params[migrationStateOriginReceiptParam(keyID)] = transition.docB64
+		fake.params[migrationPreviousPCR0Param()] = prevPCR0Hex
+		fake.params[migrationPreviousPCR0AttestationParam()] = "previous-attestation"
+
+		session := &fakeNSMSession{}
+		session.responses = append(
+			session.responses,
+			attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: ownPCR0})),
+			attestationDocumentResponse(stateReceipt.doc),
+		)
+		nsm := &nsmW{nsm: &fakeNSM{
+			session: session,
+			verifyResult: verifyDocResult(
+				verifiedPCRs,
+				receiptPayload(t, purposeMigrationTransition, root),
+			),
+		}}
+
+		_, err := EstablishStateOrigin(
+			ctx,
+			nsm,
+			&kmsW{keyID: keyID},
+			ssm,
+			stateOriginTestSecrets,
+			StartStateMigration,
+		)
+		return fake, root, stateReceipt.roots, err
+	}
+
+	t.Run("accepts valid handoff", func(t *testing.T) {
+		fake, root, roots, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
+			0:                 prevPCR0,
+			migrationPCRIndex: pcrExtendFromZero(ownPCR0),
+		})
+		require.NoError(t, err)
+		require.NoError(t, verifyStateOriginReceipt(
+			NewNSM(WithAttestationRoots(roots)),
+			fake.params[stateOriginReceiptParam(keyID)],
+			purposeStateOrigin,
+			root,
+			map[uint]string{0: hex.EncodeToString(ownPCR0)},
+		))
+	})
+
+	t.Run("rejects wrong PCR31", func(t *testing.T) {
+		_, _, _, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
+			0:                 prevPCR0,
+			migrationPCRIndex: pcrExtendFromZero(wrongPCR0),
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("rollback onto self skips PCR31", func(t *testing.T) {
+		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
+			0:                 ownPCR0,
+			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("rollback still requires predecessor signer", func(t *testing.T) {
+		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
+			0:                 wrongPCR0,
+			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
+		})
+		require.Error(t, err)
+	})
+}

@@ -31,7 +31,7 @@ Nitro Enclave ---------------------------------->+
    - Decrypts secrets from KMS using a Nitro attestation document (PCR0-bound)
    - Sets decrypted secrets as environment variables
    - Generates an ephemeral secp256k1 attestation key
-   - Registers `SHA256(attestationPubkey)` with nitriding (embedded as `appKeyHash` in attestation UserData)
+   - Registers `SHA256(attestationPubkey)` with nitriding (embedded as `signingKeyHash` in attestation UserData)
    - Starts the reverse proxy on port 7073 with Schnorr response signing
 3. **your-app** is launched as a child process on port 7074, inheriting secret env vars
 
@@ -395,14 +395,6 @@ The supervisor exposes management endpoints alongside proxied requests to your a
 |--------|------|------|-------------|
 | GET | `/health` | — | Supervisor health check (ready/degraded) |
 | GET | `/v1/enclave-info` | — | Build + runtime metadata (version, attestation key, previous PCR0) |
-| PUT | `/v1/storage/{key}` | Token | Store encrypted data (AES-256-GCM + S3) |
-| GET | `/v1/storage/{key}` | Token | Retrieve and decrypt stored data |
-| DELETE | `/v1/storage/{key}` | Token | Delete stored data |
-| GET | `/v1/storage?prefix=` | Token | List keys matching a prefix |
-| PUT | `/v1/secrets/{name}` | Token | Create/update a dynamic secret |
-| GET | `/v1/secrets/{name}` | Token | Retrieve a dynamic secret |
-| DELETE | `/v1/secrets/{name}` | Token | Delete a dynamic secret |
-| GET | `/v1/secrets` | Token | List all dynamic secrets (metadata only) |
 | GET | `/enclave/attestation` | — | Nitro attestation document (served by nitriding) |
 | `*` | `/*` | — | All other requests proxied to your app on port 7074 |
 
@@ -422,68 +414,67 @@ Every response includes:
 - `X-Attestation-Signature`: BIP-340 Schnorr signature over `SHA256(response_body)`
 - `X-Attestation-Pubkey`: compressed public key of the ephemeral attestation key
 
-Clients verify the signature, then confirm the pubkey hash matches `appKeyHash` in the attestation document's UserData.
+Clients verify the signature, then confirm the pubkey hash matches `signingKeyHash` in the attestation document's UserData.
 
 ### PCR Extension
 
 The supervisor automatically extends PCR registers 16+ during initialization with `SHA256(compressed_secp256k1_pubkey)` for each configured secret. This binds the enclave's cryptographic identity to specific PCR values, which can be verified via the attestation document.
 
-### Encrypted Storage
+### Confidential K/V Store (Redis-compatible)
 
-The enclave provides persistent encrypted storage backed by S3 with automatic KMS envelope encryption:
+The enclave exposes a **rollback-resistant, confidential key/value store** that
+speaks the **Redis (RESP) protocol**, so the upstream app uses any standard Redis
+client. (It replaces the old S3-backed `/v1/storage` HTTP API.)
 
-- On first boot, a 256-bit **Data Encryption Key (DEK)** is generated via KMS and stored (encrypted) in SSM
-- Data is encrypted with **AES-256-GCM** (random 12-byte nonce per write) before upload to S3
-- The storage bucket is provisioned by the OpenTofu module and discovered via SSM parameter
-- DEK is automatically re-encrypted during locked-key migration
+- **Confidential** — every value is **AES-256-GCM sealed under a KMS-issued DEK
+  inside the enclave** before it reaches DynamoDB (DynamoDB server-side
+  encryption is operator-readable); the AAD binds `{deployment, app, key,
+  version, chunk}`.
+- **Rollback-resistant** — every write is anchored to a **compliance-locked,
+  sealed S3 object** (immutable even to account root); the enclave refuses — at
+  boot and on every read — any key whose live version regressed below its
+  anchored version. See [ROLLBACK.md](ROLLBACK.md).
+- **Enclave-internal** — the listener binds loopback inside the enclave (it is
+  not exposed to the network); identity is the attestation-bound TLS channel, and
+  clients `AUTH` with the runtime token.
 
-```sh
-# Store data
-curl -X PUT https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
-  -d 'binary data here'
+Connect from the app (Go, `github.com/redis/go-redis/v9`):
 
-# Retrieve data
-curl https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# List keys by prefix
-curl "https://your-enclave/v1/storage?prefix=my/" \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Delete
-curl -X DELETE https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
+```go
+rdb := redis.NewClient(&redis.Options{
+    Addr:      "127.0.0.1:" + os.Getenv("ENCLAVE_KV_RESP_PORT"), // default 6379
+    Password:  os.Getenv("ENCLAVE_RUNTIME_TOKEN"),               // AUTH token
+    TLSConfig: &tls.Config{InsecureSkipVerify: true},            // loopback, self-cert
+})
+rdb.Set(ctx, "k", "v", 0)
+rdb.HSet(ctx, "h", "field", "value")
 ```
 
-### Dynamic Secrets
+#### Supported commands
 
-Runtime-configurable secrets stored in encrypted S3 (reuses the storage DEK). Unlike static KMS secrets (provisioned at deploy time), dynamic secrets can be created, updated, and deleted at runtime.
+| Category | Commands |
+|---|---|
+| Strings / keys | GET, SET (EX/PX/NX/XX), SETEX, SETNX, GETSET, MGET, MSET, GETDEL, APPEND, STRLEN, TYPE, DEL, EXISTS, RENAME, KEYS, EXPIRE, PERSIST, TTL, PTTL, INCR/DECR/INCRBY/DECRBY |
+| Hashes | HSET, HSETNX, HGET, HMGET, HDEL, HGETALL, HKEYS, HVALS, HLEN, HEXISTS, HINCRBY |
+| Lists | LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LREM, LTRIM |
+| Sets | SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP, SUNION, SINTER, SDIFF |
+| Sorted sets | ZADD, ZSCORE, ZRANK, ZREM, ZCARD, ZINCRBY, ZRANGE, ZRANGEBYSCORE |
+| Streams | XADD, XLEN, XRANGE, XREAD |
+| Transactions | MULTI, EXEC, DISCARD, WATCH, UNWATCH |
+| Pub/Sub | SUBSCRIBE, PSUBSCRIBE, PUBLISH, UNSUBSCRIBE, PUNSUBSCRIBE |
+| Server | SCAN (cursor + MATCH/COUNT/TYPE), INFO, CONFIG GET/SET, PING, AUTH, HELLO |
 
-- Each secret has a `name`, optional `env_var` binding, and `value`
-- When `env_var` is set, the value is injected as an environment variable (conflicts with static secrets are rejected)
-- On boot, all stored dynamic secrets are loaded and their env vars injected
-- Survive enclave restarts and migrations
+#### Not supported (out of scope)
 
-```sh
-# Create a dynamic secret with env var binding
-curl -X PUT https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"env_var": "API_TOKEN", "value": "sk-..."}'
-
-# List all secrets (metadata only, no values)
-curl https://your-enclave/v1/secrets \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Retrieve a secret
-curl https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Delete
-curl -X DELETE https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-```
+- **Lua scripting** (`EVAL`/`EVALSHA`).
+- **Blocking ops** — `BLPOP`/`BRPOP`/`WAIT`, etc. Our DynamoDB backend has no
+  "wait for change", so these would mean polling or in-process waiters that only
+  coordinate within a single enclave instance.
+- **Cross-key transaction atomicity** — `EXEC` runs queued commands sequentially;
+  `WATCH` gives optimistic check-and-set, but not Redis-grade isolation (the
+  per-key DynamoDB model can't guarantee it).
+- Collections are stored as a single sealed blob, so operations are O(collection)
+  rather than Redis's O(1)/O(log n) — intended for confidential, modest-sized data.
 
 ### Management Server
 
@@ -673,7 +664,7 @@ cd test && nix develop . --command ./run.sh
 
 ### What Gets Tested
 
-**15 integration tests** run after enclave boot:
+Integration tests run after enclave boot, including:
 
 1. Health endpoint returns HTTP 200
 2. Enclave info JSON is valid
@@ -682,19 +673,17 @@ cd test && nix develop . --command ./run.sh
 5. SDK version present
 6. App proxy (requests reach user app through nitriding)
 7. KMS secrets loaded (SIGNING_KEY decrypted, correct length)
-8. Encrypted storage round-trip (PUT/GET/DELETE)
-9. Previous PCR0 field present
-10. Dynamic secrets round-trip (PUT/GET/LIST/DELETE)
+8. K/V store round-trip via a real Redis client (SET/GET/DEL)
+9. Redis data types, transactions, and pub/sub (hash/list/set/zset/stream, MULTI/EXEC, SCAN, pub/sub)
+10. Previous PCR0 field present
 11. PCR16 extended with SHA256(compressed secp256k1 pubkey)
-12. Storage persistence write (for migration verification)
-13. Dynamic secret persistence write (for migration verification)
-14. Attestation persistence write (pubkey + PCR16 hash)
-15. Pre-migration Schnorr signature baseline
+12. K/V persistence write (for migration verification)
+13. Attestation persistence write (pubkey + PCR16 hash)
+14. Pre-migration Schnorr signature baseline
 
 **Migration verification** then runs a full locked-key migration and confirms:
 - Secrets decrypted from the new KMS key
-- Persistent storage survived
-- Dynamic secrets preserved
+- K/V data survived (DEK re-imported)
 - Attestation key (SIGNING_KEY) unchanged across migration
 - PCR0 attestation chain intact
 
@@ -739,8 +728,10 @@ The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost
 ├── runtime/                     # Runtime (in-enclave library + binary)
 │   ├── enclave.go               # Init, attestation key, signing middleware, routes
 │   ├── kms_ssm.go               # KMS encrypt/decrypt, SSM storage
-│   ├── storage.go               # Encrypted storage (AES-256-GCM + S3)
-│   ├── secrets.go               # Dynamic secrets API
+│   ├── kvstore.go               # DynamoDB-backed confidential K/V engine
+│   ├── resp.go                  # Redis (RESP) front-end + data-type commands
+│   ├── anchor.go                # S3 Object-Lock rollback freshness anchor
+│   ├── storage.go               # AES-256-GCM + S3 (ACME cert cache)
 │   ├── imds.go                  # IMDS credential fetching
 │   ├── migrate.go               # Key export for locked-key migration
 │   └── cmd/runtime/

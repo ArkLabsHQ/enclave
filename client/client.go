@@ -25,6 +25,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,9 +53,17 @@ type Options struct {
 	// Set to 0 to verify on every request. Default: 60s.
 	CacheTTL time.Duration
 
-	// InsecureTLS skips TLS certificate verification. Default: true.
-	// Nitriding uses self-signed certificates, so this is typically needed.
+	// InsecureTLS, when explicitly true, disables TLS cert pinning (raw,
+	// unverified TLS). Default pins to the attested tlsKeyHash.
 	InsecureTLS *bool
+
+	// StrictTLS adds public CA + hostname validation on top of the pin (it
+	// does not replace it). Mutually exclusive with InsecureTLS.
+	StrictTLS bool
+
+	// SkipKeyBinding still verifies PCR0 and pins the TLS cert, but skips the
+	// signing-key binding and Schnorr check.
+	SkipKeyBinding bool
 
 	// InsecureSkipCOSEVerify skips COSE Sign1 signature + AWS Nitro root cert
 	// chain verification of the attestation document, while keeping PCR0 and
@@ -95,12 +104,29 @@ type AttestationResult struct {
 
 // Client is a verified HTTP client for an AWS Nitro Enclave.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	opts       Options
+	baseURL         string
+	httpClient      *http.Client // pins the live cert to the attested tlsKeyHash
+	bootstrapClient *http.Client // unpinned; only for GET /enclave/attestation
+	opts            Options
 
 	mu          sync.RWMutex
 	cachedState *AttestationResult
+	pinHash     string // attested TLS leaf hash; read by httpClient's pin callback
+}
+
+// setPinHash records the attested fingerprint the main client pins against.
+func (c *Client) setPinHash(h string) {
+	c.mu.Lock()
+	c.pinHash = h
+	c.mu.Unlock()
+}
+
+// currentTLSHash is read by the pin callback each handshake; empty until the
+// bootstrap attestation is verified, so a pre-pin request fails closed.
+func (c *Client) currentTLSHash() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pinHash
 }
 
 // New creates a new enclave client that verifies attestation before
@@ -114,25 +140,59 @@ func New(baseURL string, opts Options) (*Client, error) {
 	if opts.CacheTTL == 0 {
 		opts.CacheTTL = 60 * time.Second
 	}
-
-	insecure := true
-	if opts.InsecureTLS != nil {
-		insecure = *opts.InsecureTLS
+	if opts.StrictTLS && opts.InsecureTLS != nil && *opts.InsecureTLS {
+		return nil, fmt.Errorf("StrictTLS and InsecureTLS are mutually exclusive")
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if insecure {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	}
+	insecure := opts.InsecureTLS != nil && *opts.InsecureTLS
 
-	return &Client{
+	c := &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
+		opts:    opts,
+	}
+
+	// Bootstrap client: only GET /enclave/attestation (no secrets) runs before
+	// the pin. The self-signed cert is accepted; strict mode applies public PKI.
+	bootstrapTransport := http.DefaultTransport.(*http.Transport).Clone()
+	bootstrapTransport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: !opts.StrictTLS,
+		MinVersion:         tls.VersionTLS12,
+	}
+	c.bootstrapClient = &http.Client{Timeout: 30 * time.Second, Transport: bootstrapTransport}
+
+	// Main client: pins every connection to the attested tlsKeyHash.
+	mainTransport := http.DefaultTransport.(*http.Transport).Clone()
+	if insecure {
+		mainTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		mainTransport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: !opts.StrictTLS,
+			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				return verifyLeafCertPin(rawCerts, c.currentTLSHash())
+			},
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: mainTransport}
+
+	return c, nil
+}
+
+// PinnedHTTPClient returns a client that pins the live leaf cert to tlsKeyHashHex
+// (same check as the HTTP/gRPC clients). strict adds public CA/hostname validation.
+func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
+	if isAllZeroHex(tlsKeyHashHex) {
+		return nil, fmt.Errorf("no TLS cert fingerprint to pin against")
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: !strict,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return verifyLeafCertPin(rawCerts, tlsKeyHashHex)
 		},
-		opts: opts,
-	}, nil
+		MinVersion: tls.VersionTLS12,
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
 }
 
 // Get makes a verified GET request to the enclave.
@@ -217,13 +277,20 @@ func (c *Client) ensureVerified(ctx context.Context) (*AttestationResult, error)
 
 // verify performs full attestation verification and caches the result.
 func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
-	// 1. Fetch and verify attestation document.
-	nitResult, err := fetchAndVerifyAttestation(ctx, c.httpClient, c.baseURL, c.opts.ExpectedPCR0, c.opts.InsecureSkipCOSEVerify)
+	// 1. Bootstrap over the unpinned client (carries no secrets).
+	nitResult, err := fetchAndVerifyAttestation(ctx, c.bootstrapClient, c.baseURL, c.opts.ExpectedPCR0, c.opts.InsecureSkipCOSEVerify)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Verify additional PCRs (secret pubkey hashes).
+	// 2. Extract the attested tlsKeyHash and activate the pin before any further request.
+	tlsKeyHash, err := extractTLSKeyHash(nitResult)
+	if err != nil {
+		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
+	}
+	c.setPinHash(tlsKeyHash)
+
+	// 3. Verify additional PCRs (secret pubkey hashes).
 	pcrs := make(map[uint]string)
 	for idx, pcrBytes := range nitResult.Document.PCRs {
 		if len(pcrBytes) > 0 {
@@ -242,16 +309,13 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 		}
 	}
 
-	// 3. Verify attestation key binding.
-	attestKey, err := verifyKeyBinding(ctx, c.httpClient, c.baseURL, nitResult)
-	if err != nil {
-		return nil, fmt.Errorf("key binding verification: %w", err)
-	}
-
-	// 4. Extract tlsKeyHash from user_data so gRPC callers can pin the TLS cert.
-	tlsKeyHash, err := extractTLSKeyHash(nitResult)
-	if err != nil {
-		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
+	// 4. Verify the signing-key binding over the pinned client, unless skipped.
+	var attestKey string
+	if !c.opts.SkipKeyBinding {
+		attestKey, err = verifyKeyBinding(ctx, c.httpClient, c.baseURL, nitResult)
+		if err != nil {
+			return nil, fmt.Errorf("key binding verification: %w", err)
+		}
 	}
 
 	result := &AttestationResult{

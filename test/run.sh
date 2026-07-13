@@ -35,6 +35,18 @@ cd "$SCRIPT_DIR"
 boot_qemu() {
   local eif_path="${1:?Usage: boot_qemu <path-to-eif>}"
 
+  # ENCLAVE_START_CMD is intentionally async. After a supervisor restart, the
+  # old QEMU wrapper may still be healthy while a new start command races in;
+  # do not tear down vhost-device-vsock underneath it.
+  if [ -s /tmp/enclave-boot.pid ]; then
+    local existing_pid
+    existing_pid=$(cat /tmp/enclave-boot.pid 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && [ "$existing_pid" != "$$" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "Enclave boot already running (PID $existing_pid)"
+      return 0
+    fi
+  fi
+
   echo $$ > /tmp/enclave-boot.pid
 
   if [ ! -f "$eif_path" ]; then
@@ -291,12 +303,13 @@ provider "aws" {
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
   endpoints {
-    s3  = "http://127.0.0.1:4566"
-    ssm = "http://127.0.0.1:4566"
-    sts = "http://127.0.0.1:4566"
-    iam = "http://127.0.0.1:4566"
-    kms = "http://127.0.0.1:4566"
-    ec2 = "http://127.0.0.1:4566"
+    s3       = "http://127.0.0.1:4566"
+    ssm      = "http://127.0.0.1:4566"
+    sts      = "http://127.0.0.1:4566"
+    iam      = "http://127.0.0.1:4566"
+    kms      = "http://127.0.0.1:4566"
+    ec2      = "http://127.0.0.1:4566"
+    dynamodb = "http://127.0.0.1:4566"
   }
 }
 OVERRIDE
@@ -965,15 +978,6 @@ else
   exit 1
 fi
 
-# Verify dynamic secrets API works after restart.
-DYN_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secrets" 2>/dev/null || echo "")
-if echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secrets round-trip works after restart"
-else
-  echo "  FAIL: Dynamic secrets broken after restart: ${DYN_RESP:0:120}" >&2
-  exit 1
-fi
-
 # Verify attestation pubkey + PCR16 survived migration (written in integration test 15).
 # GET /test/attestation-persistence re-derives current values and compares to stored.
 # 200+ok=true → SIGNING_KEY intact and derivation matches. 404 → storage lost. 500 → mismatch.
@@ -983,16 +987,6 @@ if echo "$ATTEST_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
 else
   echo "  FAIL: Attestation data lost or changed during migration!" >&2
   echo "$ATTEST_PERSIST_RESP" | jq . >&2
-  exit 1
-fi
-
-# Verify dynamic secret created before migration survived restart (written in integration test 14).
-# GET /test/dynamic-secret-persistence reads the known secret and compares value byte-for-byte.
-DYN_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  echo "  PASS: Dynamic secret survived migration+restart"
-else
-  echo "  FAIL: Dynamic secret lost or corrupted during migration: ${DYN_PERSIST_RESP:0:200}" >&2
   exit 1
 fi
 
@@ -1047,6 +1041,59 @@ if [ -x "$ENCLAVE_CLI" ]; then
     sed 's/^/    /' /tmp/migration-status.out 2>/dev/null | head -10
   fi
 fi
+
+
+# Step 8.7: State-origin tamper (issue #131). The boot-time state_root commits to
+# every ciphertext the runtime owns, so overwriting one in SSM — as a host with
+# un-gated KMS Encrypt could — must make resume fail closed, not decrypt
+# attacker-known bytes. Drive the bounce via the supervisor's /stop (sets the
+# stopped latch, so the watchdog won't relaunch underneath us) and /start.
+echo ""
+echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
+DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${NEW_KEY}"
+ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
+  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$ORIG_DEK" ]; then
+  echo "  FAIL: could not read KMSKeyID / StorageDEK ciphertext from SSM" >&2
+  exit 1
+fi
+
+restart_enclave() {
+  curl -sf -X POST "${SUPERVISOR_URL}/stop"  >/dev/null 2>&1 || true
+  curl -sf -X POST "${SUPERVISOR_URL}/start" >/dev/null 2>&1 || true
+}
+
+# Swap the storage-DEK ciphertext for a different (valid base64) value, then
+# bounce the enclave so it takes the resume path against the tampered state.
+aws ssm put-parameter --name "$DEK_PARAM" --value "dGFtcGVyZWQtY2lwaGVydGV4dA==" \
+  --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+restart_enclave
+
+# Resume must reject it: /health must NOT reach 200. The 30s window stays under
+# the watchdog's 60s boot-grace.
+echo "  Asserting enclave stays unhealthy on tampered state (30s)..."
+TAMPER_HEALTHY="false"
+for _ in $(seq 1 30); do
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+    "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
+  if [ "$CODE" = "200" ]; then TAMPER_HEALTHY="true"; break; fi
+  sleep 1
+done
+if [ "$TAMPER_HEALTHY" = "true" ]; then
+  echo "  FAIL: enclave became healthy on a tampered ciphertext (state-origin check bypassed)" >&2
+  aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+  restart_enclave
+  exit 1
+fi
+echo "  PASS: tampered StorageDEK ciphertext → enclave fails closed (no 200 in 30s)"
+
+# Restore the original ciphertext and confirm a clean resume recovers — also
+# proves the bounce mechanism itself works (so the fail-closed wasn't a no-boot).
+aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+restart_enclave
+wait_for_enclave "resume after state-origin restore"
+echo "  PASS: restored ciphertext → enclave resumes healthy"
+echo ""
 
 
 # Step 9: rollback — v3 is baked with a wrong app name, so its Init fails
@@ -1188,6 +1235,8 @@ else
   echo "  FAIL: Relaunched supervisor /supervisor/health returned $SUP_HEALTH_CODE after 30 attempts (~90s)" >&2
   exit 1
 fi
+
+wait_for_enclave "after supervisor relaunch"
 
 echo ""
 echo "=== [10/11] Final enclave info ==="

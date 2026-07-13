@@ -39,6 +39,7 @@ app:
     AWS_ENDPOINT_URL_SSM: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_STS: "http://host.containers.internal:4566"
     AWS_ENDPOINT_URL_S3: "http://host.containers.internal:4566"
+    AWS_ENDPOINT_URL_DYNAMODB: "http://host.containers.internal:4566"
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
     ENCLAVE_LOG_CLOUDWATCH: "true"
@@ -51,6 +52,10 @@ app:
 secrets:
   - name: signing_key
     env_var: SIGNING_KEY
+
+
+
+
 
 
 

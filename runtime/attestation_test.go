@@ -1,58 +1,76 @@
 package runtime
 
 import (
-	"bytes"
 	"crypto/sha256"
-	"strings"
+	"encoding/hex"
 	"testing"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/stretchr/testify/require"
 )
 
-func TestAttestationHashesSerialize(t *testing.T) {
-	var h AttestationHashes
-	for i := range h.tlsKeyHash {
-		h.tlsKeyHash[i] = byte(i)
-	}
-	for i := range h.appKeyHash {
-		h.appKeyHash[i] = byte(i + 1)
-	}
+func TestAttestationHashes(t *testing.T) {
+	t.Run("zero value serializes fixed user_data format", func(t *testing.T) {
+		h := NewAttestationHashes()
 
-	got := h.Serialize()
+		var zero [sha256.Size]byte
+		want := append([]byte(hashPrefix), zero[:]...)
+		want = append(want, hashSeparator...)
+		want = append(want, hashPrefix...)
+		want = append(want, zero[:]...)
 
-	wantLen := sha256.Size*2 + len(hashPrefix)*2 + len(hashSeparator)
-	if len(got) != wantLen {
-		t.Fatalf("serialized length: got %d, want %d", len(got), wantLen)
-	}
+		require.Equal(t, want, h.Serialize())
+	})
 
-	if !bytes.HasPrefix(got, []byte(hashPrefix)) {
-		t.Fatalf("missing leading hash prefix: got %q", got[:len(hashPrefix)])
-	}
-	if !strings.Contains(string(got), hashSeparator+hashPrefix) {
-		t.Fatalf("missing separator + second prefix in %q", got)
-	}
+	t.Run("set hashes serialize exact raw bytes", func(t *testing.T) {
+		h := NewAttestationHashes()
+		var tlsHash, signingHash [sha256.Size]byte
+		for i := range tlsHash {
+			tlsHash[i] = byte(i)
+			signingHash[i] = byte(sha256.Size - i)
+		}
 
-	tlsStart := len(hashPrefix)
-	tlsEnd := tlsStart + sha256.Size
-	if !bytes.Equal(got[tlsStart:tlsEnd], h.tlsKeyHash[:]) {
-		t.Fatalf("tlsKeyHash bytes: got %x, want %x", got[tlsStart:tlsEnd], h.tlsKeyHash[:])
-	}
+		h.SetTLSKeyHash(tlsHash)
+		h.SetSigningKeyHash(signingHash)
 
-	appStart := tlsEnd + len(hashSeparator) + len(hashPrefix)
-	if !bytes.Equal(got[appStart:], h.appKeyHash[:]) {
-		t.Fatalf("appKeyHash bytes: got %x, want %x", got[appStart:], h.appKeyHash[:])
-	}
+		want := append([]byte(hashPrefix), tlsHash[:]...)
+		want = append(want, hashSeparator...)
+		want = append(want, hashPrefix...)
+		want = append(want, signingHash[:]...)
+
+		require.Equal(t, want, h.Serialize())
+	})
+
+	t.Run("SetTLSKeyHashIfChanged returns true false true", func(t *testing.T) {
+		h := NewAttestationHashes()
+		one := sha256.Sum256([]byte("one"))
+		two := sha256.Sum256([]byte("two"))
+
+		require.True(t, h.SetTLSKeyHashIfChanged(one))
+		require.False(t, h.SetTLSKeyHashIfChanged(one))
+		require.True(t, h.SetTLSKeyHashIfChanged(two))
+	})
 }
 
-func TestAttestationHashesSerializeZeroValue(t *testing.T) {
-	var h AttestationHashes
-	got := h.Serialize()
+func TestAttestationSigner(t *testing.T) {
+	signer, err := NewAttestedSigner()
+	require.NoError(t, err)
 
-	wantLen := sha256.Size*2 + len(hashPrefix)*2 + len(hashSeparator)
-	if len(got) != wantLen {
-		t.Fatalf("zero-value length: got %d, want %d", len(got), wantLen)
-	}
-	zero := make([]byte, sha256.Size)
-	tlsStart := len(hashPrefix)
-	if !bytes.Equal(got[tlsStart:tlsStart+sha256.Size], zero) {
-		t.Fatalf("zero-value tlsKeyHash should be all zeros, got %x", got[tlsStart:tlsStart+sha256.Size])
-	}
+	pubkeyBytes, err := hex.DecodeString(signer.Pubkey())
+	require.NoError(t, err)
+	require.Len(t, pubkeyBytes, 33)
+
+	pubkey, err := btcec.ParsePubKey(pubkeyBytes)
+	require.NoError(t, err)
+	require.Equal(t, sha256.Sum256(pubkeyBytes), signer.PubkeyHash())
+
+	body := []byte("attested response")
+	sigBytes, err := hex.DecodeString(signer.Sign(body))
+	require.NoError(t, err)
+	sig, err := schnorr.ParseSignature(sigBytes)
+	require.NoError(t, err)
+
+	bodyHash := sha256.Sum256(body)
+	require.True(t, sig.Verify(bodyHash[:], pubkey))
 }

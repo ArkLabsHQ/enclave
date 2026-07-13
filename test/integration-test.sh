@@ -103,6 +103,16 @@ else
   fail "Storage round-trip" "${STORAGE_RESP:0:120}"
 fi
 
+# Test 8b: Full Redis surface — hashes, lists, sets, sorted sets, streams,
+# MULTI/EXEC, SCAN, pub/sub — exercised through the real go-redis client.
+echo "[8b/28] Redis data types + transactions + pub/sub"
+TYPES_RESP=$($CURL "${BASE_URL}/test/redis-types" 2>/dev/null || echo "")
+if echo "$TYPES_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  pass "Redis types/tx/pubsub (hash,list,set,zset,stream,transaction,scan,pubsub)"
+else
+  fail "Redis data types" "${TYPES_RESP:0:200}"
+fi
+
 # Test 9: previous_pcr0 is "genesis" on first boot (no prior enclave).
 echo "[9/28] Previous PCR0"
 if [ -n "$INFO" ]; then
@@ -118,14 +128,13 @@ else
   fail "Previous PCR0" "could not fetch enclave-info"
 fi
 
-# Test 10: Dynamic secrets round-trip (PUT → GET → LIST → DELETE).
-echo "[10/28] Dynamic secrets"
-DYN_RESP=$($CURL "${BASE_URL}/test/dynamic-secrets" 2>/dev/null || echo "")
-if [ -n "$DYN_RESP" ] && echo "$DYN_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  DYN_LISTED=$(echo "$DYN_RESP" | jq -r '.listed // false' 2>/dev/null || echo "false")
-  pass "Dynamic secrets round-trip (listed=$DYN_LISTED)"
+# Test 9b: kms_key_locked exposed in enclave-info (issue #131 — clients inspect
+# the KMS lock posture to trust the operator can't reach the secrets).
+KMS_LOCKED=$(echo "$INFO" | jq -r 'if has("kms_key_locked") then .kms_key_locked | tostring else "missing" end' 2>/dev/null || echo "missing")
+if [ "$KMS_LOCKED" = "true" ] || [ "$KMS_LOCKED" = "false" ]; then
+  pass "kms_key_locked present in enclave-info (${KMS_LOCKED})"
 else
-  fail "Dynamic secrets" "${DYN_RESP:0:120}"
+  fail "kms_key_locked" "missing or non-boolean (got: ${KMS_LOCKED})"
 fi
 
 # Test 11: PCR secret derivation + attestation document PCR16 verification.
@@ -177,15 +186,6 @@ if echo "$PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
   pass "Storage persistence write"
 else
   fail "Storage persistence write" "${PERSIST_RESP:0:120}"
-fi
-
-# Test 14: Dynamic secret persistence — write a known secret for post-migration verification.
-echo "[14/28] Dynamic secret persistence (write)"
-DYN_PERSIST_RESP=$($CURL -X POST "${BASE_URL}/test/dynamic-secret-persistence" 2>/dev/null || echo "")
-if echo "$DYN_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  pass "Dynamic secret persistence write"
-else
-  fail "Dynamic secret persistence write" "${DYN_PERSIST_RESP:0:120}"
 fi
 
 # Test 15: Attestation persistence — write pubkey + PCR16 hash for post-migration verification.
@@ -415,7 +415,7 @@ fi
 # must NOT get X-Attestation-Signature — that would imply buffering, which
 # breaks streaming. Use curl to shape an HTTP/2 request like gRPC and check
 # response headers.
-echo "[33/35] gRPC bypasses response-signing middleware"
+echo "[33/33] gRPC bypasses response-signing middleware"
 GRPC_HDRS=$(curl -sk --http2 -D - -o /dev/null --max-time 10 \
   -H 'Content-Type: application/grpc' \
   -X POST "${BASE_URL}/grpc.health.v1.Health/Check" 2>/dev/null || echo "")
@@ -423,39 +423,6 @@ if echo "$GRPC_HDRS" | grep -qi '^x-attestation-signature:'; then
   fail "gRPC middleware bypass" "X-Attestation-Signature header present on gRPC response"
 else
   pass "no X-Attestation-Signature on gRPC response (bypass active)"
-fi
-
-echo "[34/35] PCR0 signature in /v1/enclave-info"
-INFO_LATE=$($CURL "${BASE_URL}/v1/enclave-info" 2>/dev/null || echo "")
-SIG_PUBKEY=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pubkey_pem // empty' 2>/dev/null || echo "")
-SIG_PCR0=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.pcr0_hex // empty' 2>/dev/null || echo "")
-SIG_VALUE=$(echo "$INFO_LATE" | jq -r '.pcr0_signature.signature_b64 // empty' 2>/dev/null || echo "")
-if [ -n "$SIG_PUBKEY" ] && [ -n "$SIG_PCR0" ] && [ -n "$SIG_VALUE" ]; then
-  pass "pcr0_signature block carries pubkey + PCR0 + signature (PCR0: ${SIG_PCR0:0:16}...)"
-else
-  fail "pcr0_signature missing from /v1/enclave-info" "${INFO_LATE:0:200}"
-fi
-
-echo "[35/35] PCR0 signature crypto verification"
-if [ -z "$SIG_PUBKEY" ] || [ -z "$SIG_PCR0" ] || [ -z "$SIG_VALUE" ]; then
-  fail "PCR0 signature verify" "missing field from previous endpoint test"
-else
-  TMP_VERIFY=$(mktemp -d)
-  trap 'rm -rf "$TMP_VERIFY"' EXIT
-  printf '%s' "$SIG_PUBKEY"            > "${TMP_VERIFY}/pubkey.pem"
-  # hex → bytes without xxd (not in slim images)
-  printf '%b' "$(printf '%s' "$SIG_PCR0" | sed 's/../\\x&/g')" \
-                                       > "${TMP_VERIFY}/pcr0.bin"
-  printf '%s' "$SIG_VALUE" | base64 -d > "${TMP_VERIFY}/sig.bin"
-  VERIFY_OUT=$(openssl pkeyutl -verify -pubin \
-        -inkey "${TMP_VERIFY}/pubkey.pem" \
-        -in "${TMP_VERIFY}/pcr0.bin" \
-        -sigfile "${TMP_VERIFY}/sig.bin" 2>&1 || true)
-  if echo "$VERIFY_OUT" | grep -q 'Signature Verified Successfully'; then
-    pass "ECDSA-P384 signature verifies against pubkey + PCR0"
-  else
-    fail "PCR0 signature verify" "openssl rejected the signature: ${VERIFY_OUT}"
-  fi
 fi
 
 echo ""

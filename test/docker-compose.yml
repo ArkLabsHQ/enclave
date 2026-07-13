@@ -2,7 +2,7 @@ services:
   local-kms:
     image: nsmithuk/local-kms
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       KMS_REGION: us-east-1
       KMS_ACCOUNT_ID: "123456789012"
@@ -21,8 +21,8 @@ services:
       context: ../awsmocks
       dockerfile: Dockerfile
     ports:
-      - "4000:4000"
-      - "1338:1338"
+      - "127.0.0.1:4000:4000"
+      - "127.0.0.1:1338:1338"
     environment:
       UPSTREAM_KMS_URL: "http://local-kms:8080"
       KMS_PROXY_LISTEN_ADDR: ":4000"
@@ -40,9 +40,9 @@ services:
   localstack:
     image: localstack/localstack:4.14
     ports:
-      - "4566:4566"
+      - "127.0.0.1:4566:4566"
     environment:
-      SERVICES: ssm,sts,s3,cloudformation,iam,logs,route53,ec2
+      SERVICES: ssm,sts,s3,cloudformation,iam,logs,route53,ec2,dynamodb
       LOCALSTACK_ACKNOWLEDGE_ACCOUNT_REQUIREMENT: "1"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
@@ -73,22 +73,25 @@ services:
     command: ["./run.sh", "app/.enclave/artifacts/image.eif"]
 
   # Pebble — Let's Encrypt's test ACME server, for the end-to-end ACME test
-  # (acme-test.sh). Only started under the "acme" compose profile. Bridge
-  # network: extra_hosts routes the challenge target enclave.test back to the
-  # host, where the supervisor's gvproxy forwards 8443 -> enclave:443.
+  # (acme-test.sh). Only started under the "acme" compose profile. Host
+  # network (like acme-runner): the challenge target enclave.test resolves to
+  # 127.0.0.1, where the supervisor's gvproxy forwards 8443 -> enclave:443.
+  # Loopback keeps the VA dial exempt from host firewalls (NixOS/ufw drop
+  # bridge->host traffic, which stalls TLS-ALPN-01 validation forever) and
+  # avoids relying on Docker's host-gateway mapping. The enclave reaches
+  # Pebble unchanged: host.containers.internal:14000 -> gvproxy NAT ->
+  # 127.0.0.1:14000.
   pebble:
     profiles: ["acme"]
     image: ghcr.io/letsencrypt/pebble:latest
     command: ["-config", "/test/pebble/pebble-config.json", "-strict"]
-    ports:
-      - "14000:14000"
-      - "15000:15000"
+    network_mode: host
     environment:
       PEBBLE_VA_NOSLEEP: "1"
     volumes:
       - ./pebble:/test/pebble:ro
     extra_hosts:
-      - "enclave.test:host-gateway"
+      - "enclave.test:127.0.0.1"
 
   # Runs the end-to-end ACME test (acme-test.sh) — mirrors test-runner.
   acme-runner:

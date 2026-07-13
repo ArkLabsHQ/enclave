@@ -468,37 +468,6 @@ resource "terraform_data" "sign_pcr0" {
   }
 }
 
-data "local_file" "pcr0_pubkey_pem" {
-  filename   = "${local.signing_dir}/pubkey.pem"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
-data "local_file" "pcr0_signature_b64" {
-  filename   = "${local.signing_dir}/signature.b64"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
-resource "aws_ssm_parameter" "pcr0_pubkey" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
-  type      = "String"
-  value     = data.local_file.pcr0_pubkey_pem.content
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_value" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PCR0"
-  type      = "String"
-  value     = local.effective_pcr0
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_signature" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/Signature"
-  type      = "String"
-  value     = trimspace(data.local_file.pcr0_signature_b64.content)
-  overwrite = true
-}
-
 # =============================================================================
 # IAM
 # =============================================================================
@@ -567,6 +536,45 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
+  # S3: the freshness anchor. No DeleteObject and no BypassGovernanceRetention,
+  # so even this shared grant can't remove a locked anchor. PutObjectRetention
+  # sets the compliance retain-until on each put.
+  statement {
+    sid = "S3AnchorObjectLock"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:PutObjectRetention",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      aws_s3_bucket.anchor.arn,
+      "${aws_s3_bucket.anchor.arn}/*",
+    ]
+  }
+
+  # DynamoDB: the encrypted, versioned K/V store. Shared with the EC2 role, so it
+  # doesn't exclude the operator; rollback is prevented by the S3 anchor instead
+  # (see runtime/anchor.go). Scan backs the boot gate's version-vector read.
+  statement {
+    sid = "DynamoDBKVStore"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+      "dynamodb:BatchGetItem",
+      "dynamodb:BatchWriteItem",
+      "dynamodb:TransactWriteItems",
+      "dynamodb:DescribeTable",
+    ]
+    resources = [aws_dynamodb_table.kv.arn]
+  }
+
   # SSM: read/write on secret + DEK ciphertext parameters. Paths are key-scoped
   # (/.../{secret}/Ciphertext/{kmsKeyId}) and created by the runtime at boot /
   # migration, so the wildcard covers every KMS key generation.
@@ -593,9 +601,7 @@ data "aws_iam_policy_document" "enclave" {
     actions = ["ssm:GetParameter"]
     resources = [
       aws_ssm_parameter.storage_bucket_name.arn,
-      aws_ssm_parameter.pcr0_pubkey.arn,
-      aws_ssm_parameter.pcr0_value.arn,
-      aws_ssm_parameter.pcr0_signature.arn,
+      aws_ssm_parameter.anchor_bucket_name.arn,
     ]
   }
 
@@ -823,6 +829,89 @@ resource "aws_s3_bucket_policy" "storage_ssl" {
   })
 }
 
+# Freshness anchor bucket. Object Lock (compliance) makes each anchor immutable
+# even to account root; the enclave sets the per-object retain-until on PutObject.
+# Versioning is required for Object Lock.
+resource "aws_s3_bucket" "anchor" {
+  bucket_prefix       = "${local.prefix}-anchor-"
+  object_lock_enabled = true
+  force_destroy       = var.local
+}
+
+resource "aws_s3_bucket_versioning" "anchor" {
+  bucket = aws_s3_bucket.anchor.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "anchor" {
+  bucket = aws_s3_bucket.anchor.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_policy" "anchor_ssl" {
+  count  = var.local ? 0 : 1
+  bucket = aws_s3_bucket.anchor.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnforceSSL"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.anchor.arn,
+        "${aws_s3_bucket.anchor.arn}/*",
+      ]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+}
+
+# =============================================================================
+# DynamoDB — encrypted, versioned K/V store (RESP/Redis backend, issue #134)
+# =============================================================================
+
+# Composite key (pk hash + sk range): each logical key is a head item plus, for
+# large values, version-keyed chunk items. Values are AES-GCM-sealed by the
+# enclave before they land here (DynamoDB SSE is operator-readable). TTL on the
+# expires attribute reclaims expired items; point-in-time recovery is on.
+resource "aws_dynamodb_table" "kv" {
+  name         = "${local.prefix}-kv"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  # Allow tofu destroy to remove a non-empty table in local/test runs.
+  deletion_protection_enabled = var.local ? false : true
+}
+
 # =============================================================================
 # SSM
 # =============================================================================
@@ -893,6 +982,23 @@ resource "aws_ssm_parameter" "storage_bucket_name" {
   name      = "/${var.deployment}/${var.app_name}/StorageBucketName"
   type      = "String"
   value     = aws_s3_bucket.storage.id
+  overwrite = true
+}
+
+# The runtime discovers the K/V table here (kvTableNameParam); absent = disabled.
+resource "aws_ssm_parameter" "kv_table_name" {
+  name      = "/${var.deployment}/${var.app_name}/KVTableName"
+  type      = "String"
+  value     = aws_dynamodb_table.kv.name
+  overwrite = true
+}
+
+# The runtime discovers the freshness-anchor bucket here (anchorBucketParam);
+# absent = anchor disabled.
+resource "aws_ssm_parameter" "anchor_bucket_name" {
+  name      = "/${var.deployment}/${var.app_name}/AnchorBucketName"
+  type      = "String"
+  value     = aws_s3_bucket.anchor.id
   overwrite = true
 }
 

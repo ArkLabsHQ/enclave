@@ -1,92 +1,100 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3cmd "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// acmeStoragePrefix namespaces ACME cache entries within the encrypted
-// Storage K/V space, keeping them clear of user data and secrets.
-const acmeStoragePrefix = "acme/"
+// acmeStoragePrefix namespaces ACME cache entries in the app S3 bucket.
+const acmeStoragePrefix = "data/acme/"
 
-// errStorageUnavailable signals that storage has settled but is not
-// operational (no bucket provisioned). Internal to acmeStorageCache.await.
-var errStorageUnavailable = errors.New("storage unavailable")
-
-// acmeStorageCache is an autocert.Cache backed by the enclave's encrypted
-// Storage subsystem. Cert material (the leaf cert + key and the ACME account
-// key) is AES-GCM sealed under the storage DEK and persisted in S3, so it
-// survives reboots and migrations without leaving the enclave in plaintext —
-// the enclave reuses one cert instead of re-issuing on every boot, which
-// would otherwise exhaust the Let's Encrypt rate limit.
-//
-// Storage initializes during Runtime.Init, which runs after Start (and thus
-// after configureACME wires this cache). Every operation first waits on
-// ready. If no storage bucket is provisioned the cache degrades to a no-op
-// (a cache miss) — no worse than the in-memory cache it replaces.
+// acmeStorageCache stores autocert material encrypted with the storage DEK in S3.
 type acmeStorageCache struct {
-	ready   <-chan struct{} // closed by Runtime.Init once storage state is settled
-	storage func() *Storage // resolves the Storage subsystem; valid once ready closes
+	s3     S3API
+	dek    DEK
+	bucket string
 }
 
-var _ autocert.Cache = (*acmeStorageCache)(nil)
-
-// await blocks until storage initialization has settled, then returns the
-// operational Storage — or errStorageUnavailable if storage is not
-// provisioned, or the context error if ready does not fire in time.
-func (c *acmeStorageCache) await(ctx context.Context) (*Storage, error) {
-	select {
-	case <-c.ready:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+func NewAcmeStorageCache(ctx context.Context, s3 S3API, dek DEK, ssm SSM) (autocert.Cache, error) {
+	bucketParam := fmt.Sprintf("/%s/%s/StorageBucketName", getDeployment(), getAppName())
+	bucketName, err := ssm.MustGet(ctx, bucketParam)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get storage bucket name SSM param: %w", err)
 	}
-	s := c.storage()
-	if s == nil || !s.HasDEK() {
-		return nil, errStorageUnavailable
-	}
-	return s, nil
+	return &acmeStorageCache{s3: s3, dek: dek, bucket: bucketName}, nil
 }
 
 // Get returns the cached value for key, or autocert.ErrCacheMiss.
 func (c *acmeStorageCache) Get(ctx context.Context, key string) ([]byte, error) {
-	s, err := c.await(ctx)
-	if errors.Is(err, errStorageUnavailable) {
-		return nil, autocert.ErrCacheMiss
+	key = prefixAcmeCacheKey(key)
+
+	out, err := c.s3.GetObject(ctx, &s3cmd.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchKey" {
+			return nil, autocert.ErrCacheMiss
+		}
+		return nil, fmt.Errorf("S3 get: %w", err)
 	}
+	defer func() { _ = out.Body.Close() }()
+
+	blob, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read S3 object: %w", err)
+	}
+
+	plaintext, err := c.dek.Open(blob, []byte(key))
 	if err != nil {
 		return nil, err
 	}
-	data, err := s.Load(ctx, acmeStoragePrefix+key)
-	if errors.Is(err, ErrNotFound) {
-		return nil, autocert.ErrCacheMiss
-	}
-	return data, err
+	return plaintext, nil
 }
 
-// Put persists data under key. With no storage provisioned it is a no-op:
-// a fresh issuance still succeeds, since autocert keeps the cert in its
-// in-memory Manager state for the process lifetime regardless.
+// Put encrypts and stores data under key.
 func (c *acmeStorageCache) Put(ctx context.Context, key string, data []byte) error {
-	s, err := c.await(ctx)
-	if errors.Is(err, errStorageUnavailable) {
-		return nil
-	}
+	key = prefixAcmeCacheKey(key)
+
+	blob, err := c.dek.Seal(data, []byte(key))
 	if err != nil {
 		return err
 	}
-	return s.Store(ctx, acmeStoragePrefix+key, data)
+
+	_, err = c.s3.PutObject(ctx, &s3cmd.PutObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(blob),
+	})
+	if err != nil {
+		return fmt.Errorf("S3 put: %w", err)
+	}
+	return nil
 }
 
 // Delete removes key from the cache.
 func (c *acmeStorageCache) Delete(ctx context.Context, key string) error {
-	s, err := c.await(ctx)
-	if errors.Is(err, errStorageUnavailable) {
-		return nil
-	}
+	key = prefixAcmeCacheKey(key)
+
+	_, err := c.s3.DeleteObject(ctx, &s3cmd.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("S3 delete: %w", err)
 	}
-	return s.Delete(ctx, acmeStoragePrefix+key)
+	return nil
+}
+
+func prefixAcmeCacheKey(key string) string {
+	return getDeployment() + "/" + getAppName() + acmeStoragePrefix + key
 }

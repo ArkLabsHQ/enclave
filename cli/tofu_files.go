@@ -468,37 +468,6 @@ resource "terraform_data" "sign_pcr0" {
   }
 }
 
-data "local_file" "pcr0_pubkey_pem" {
-  filename   = "${local.signing_dir}/pubkey.pem"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
-data "local_file" "pcr0_signature_b64" {
-  filename   = "${local.signing_dir}/signature.b64"
-  depends_on = [terraform_data.sign_pcr0]
-}
-
-resource "aws_ssm_parameter" "pcr0_pubkey" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PubkeyPEM"
-  type      = "String"
-  value     = data.local_file.pcr0_pubkey_pem.content
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_value" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/PCR0"
-  type      = "String"
-  value     = local.effective_pcr0
-  overwrite = true
-}
-
-resource "aws_ssm_parameter" "pcr0_signature" {
-  name      = "/${var.deployment}/${var.app_name}/Signing/Signature"
-  type      = "String"
-  value     = trimspace(data.local_file.pcr0_signature_b64.content)
-  overwrite = true
-}
-
 # =============================================================================
 # IAM
 # =============================================================================
@@ -586,24 +555,6 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
-  # S3: the PCR0 lineage log. Like the anchor, no DeleteObject and no
-  # BypassGovernanceRetention, so a recorded version-history entry is permanent.
-  statement {
-    sid = "S3LineageObjectLock"
-    actions = [
-      "s3:PutObject",
-      "s3:GetObject",
-      "s3:PutObjectRetention",
-      "s3:ListBucket",
-      "s3:ListBucketVersions",
-      "s3:GetBucketLocation",
-    ]
-    resources = [
-      aws_s3_bucket.lineage.arn,
-      "${aws_s3_bucket.lineage.arn}/*",
-    ]
-  }
-
   # DynamoDB: the encrypted, versioned K/V store. Shared with the EC2 role, so it
   # doesn't exclude the operator; rollback is prevented by the S3 anchor instead
   # (see runtime/anchor.go). Scan backs the boot gate's version-vector read.
@@ -651,10 +602,6 @@ data "aws_iam_policy_document" "enclave" {
     resources = [
       aws_ssm_parameter.storage_bucket_name.arn,
       aws_ssm_parameter.anchor_bucket_name.arn,
-      aws_ssm_parameter.lineage_bucket_name.arn,
-      aws_ssm_parameter.pcr0_pubkey.arn,
-      aws_ssm_parameter.pcr0_value.arn,
-      aws_ssm_parameter.pcr0_signature.arn,
     ]
   }
 
@@ -898,8 +845,6 @@ resource "aws_s3_bucket_versioning" "anchor" {
   }
 }
 
-# The anchor bucket is private: only the enclave role reads/writes it (rollback
-# detection is internal to the enclave, not a client-facing check).
 resource "aws_s3_bucket_public_access_block" "anchor" {
   bucket = aws_s3_bucket.anchor.id
 
@@ -928,66 +873,6 @@ resource "aws_s3_bucket_policy" "anchor_ssl" {
         Bool = { "aws:SecureTransport" = "false" }
       }
     }]
-  })
-}
-
-# PCR0 lineage bucket. Object Lock (compliance) makes each version-history entry
-# immutable even to account root; the migrating-in enclave writes one per version.
-# Independent of the K/V anchor so lineage works even without the K/V store.
-resource "aws_s3_bucket" "lineage" {
-  bucket_prefix       = "${local.prefix}-lineage-"
-  object_lock_enabled = true
-  force_destroy       = var.local
-}
-
-resource "aws_s3_bucket_versioning" "lineage" {
-  bucket = aws_s3_bucket.lineage.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# The lineage log is public READ-ONLY: any party (no AWS account) can audit the
-# chain with "enclave verify-lineage". Writes stay IAM-locked to the enclave role and
-# Object Lock keeps entries immutable; entries are Nitro-attested, carry no secrets.
-resource "aws_s3_bucket_public_access_block" "lineage" {
-  bucket = aws_s3_bucket.lineage.id
-
-  block_public_acls       = true  # no public ACLs — read is granted by the bucket policy
-  block_public_policy     = false # allow the public-read bucket policy below
-  ignore_public_acls      = true
-  restrict_public_buckets = false # honor the public-read policy
-}
-
-resource "aws_s3_bucket_policy" "lineage" {
-  bucket     = aws_s3_bucket.lineage.id
-  depends_on = [aws_s3_bucket_public_access_block.lineage]
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(
-      [{
-        Sid       = "PublicReadOnly"
-        Effect    = "Allow"
-        Principal = "*"
-        Action    = ["s3:GetObject", "s3:ListBucket", "s3:ListBucketVersions"]
-        Resource = [
-          aws_s3_bucket.lineage.arn,
-          "${aws_s3_bucket.lineage.arn}/*",
-        ]
-      }],
-      var.local ? [] : [{
-        Sid       = "EnforceSSL"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:*"
-        Resource = [
-          aws_s3_bucket.lineage.arn,
-          "${aws_s3_bucket.lineage.arn}/*",
-        ]
-        Condition = { Bool = { "aws:SecureTransport" = "false" } }
-      }]
-    )
   })
 }
 
@@ -1114,15 +999,6 @@ resource "aws_ssm_parameter" "anchor_bucket_name" {
   name      = "/${var.deployment}/${var.app_name}/AnchorBucketName"
   type      = "String"
   value     = aws_s3_bucket.anchor.id
-  overwrite = true
-}
-
-# The runtime discovers the PCR0 lineage bucket here (lineageBucketParam);
-# absent = lineage logging disabled.
-resource "aws_ssm_parameter" "lineage_bucket_name" {
-  name      = "/${var.deployment}/${var.app_name}/LineageBucketName"
-  type      = "String"
-  value     = aws_s3_bucket.lineage.id
   overwrite = true
 }
 

@@ -1,9 +1,6 @@
 package runtime
 
-// OTLP protobuf parsers for the telemetry signals the runtime ingests over
-// HTTP from the user's app: structured logs (POST /v1/logs) and metrics
-// (POST /v1/metrics). OTLP trace ingest lives alongside its handler in
-// tracing.go.
+// Shared runtime helpers.
 
 import (
 	"crypto/rand"
@@ -16,7 +13,7 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
-// envMu serializes os.Setenv across the secret-loading goroutines.
+// envMu serializes process env writes.
 var envMu sync.Mutex
 
 // safeSetenv wraps os.Setenv under envMu to prevent concurrent env mutations.
@@ -26,12 +23,7 @@ func safeSetenv(key, value string) error {
 	return os.Setenv(key, value)
 }
 
-// =============================================================================
-// Random source
-// =============================================================================
-
-// generateRuntimeToken returns a 32-byte hex-encoded bearer token used to
-// authenticate calls to the admin /v1/* endpoints.
+// generateRuntimeToken returns a 32-byte hex bearer token.
 func generateRuntimeToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := secureRandom(b); err != nil {
@@ -40,12 +32,7 @@ func generateRuntimeToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// secureRandom prefers the NSM hardware RNG when running inside an
-// enclave and falls back to crypto/rand otherwise. Inside an enclave
-// crypto/rand depends on a starved kernel entropy pool (no disk, no
-// network, no HID — only RDRAND), so the NSM RNG is the only fully
-// trustworthy source. If /dev/nsm opens but GetRandom fails the error
-// surfaces rather than silently falling back to the weak pool.
+// secureRandom uses NSM RNG when available, else crypto/rand.
 func secureRandom(b []byte) (int, error) {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
@@ -55,7 +42,6 @@ func secureRandom(b []byte) (int, error) {
 	return session.Read(b)
 }
 
-// anyValueToGo converts an OTLP AnyValue to a Go value.
 func anyValueToGo(v *commonpb.AnyValue) any {
 	if v == nil {
 		return nil
@@ -94,7 +80,6 @@ func anyValueToGo(v *commonpb.AnyValue) any {
 	}
 }
 
-// anyValueToString extracts a string representation from an AnyValue.
 func anyValueToString(v *commonpb.AnyValue) string {
 	if v == nil {
 		return ""
@@ -105,4 +90,9 @@ func anyValueToString(v *commonpb.AnyValue) string {
 	default:
 		return fmt.Sprintf("%v", anyValueToGo(v))
 	}
+}
+
+// prefix16 truncates a string to at most 16 characters for less noisy log fields.
+func prefix16(s string) string {
+	return s[:min(16, len(s))]
 }

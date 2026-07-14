@@ -184,9 +184,9 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 
 // UserData format embedded in NSM attestation documents (nitriding v1.4.2):
 //
-//	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
+//	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ signingKeyHash(32)
 //
-// Total 79 bytes. tlsKeyHash at bytes 7:39, appKeyHash at bytes 47:79.
+// Total 79 bytes. tlsKeyHash at bytes 7:39, signingKeyHash at bytes 47:79.
 const (
 	udHashPrefix = "sha256:"
 	udHashSep    = ";"
@@ -211,11 +211,44 @@ func extractTLSKeyHash(attestResult *nitrite.Result) (string, error) {
 	if string(userData[:udTLSStart]) != udHashPrefix {
 		return "", fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
 	}
-	return hex.EncodeToString(userData[udTLSStart:udTLSEnd]), nil
+	h := hex.EncodeToString(userData[udTLSStart:udTLSEnd])
+	if isAllZeroHex(h) {
+		return "", fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
+	}
+	return h, nil
+}
+
+// isAllZeroHex reports whether s is empty or all '0' — an uninitialized binding.
+func isAllZeroHex(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyLeafCertPin returns nil iff SHA-256 of the live leaf cert (rawCerts[0])
+// equals expectedHashHex; missing/empty/all-zero is rejected. Shared by HTTP+gRPC.
+func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
+	if isAllZeroHex(expectedHashHex) {
+		return fmt.Errorf("no attested TLS cert fingerprint to pin against")
+	}
+	if len(rawCerts) == 0 {
+		return fmt.Errorf("no peer certificate presented")
+	}
+	got := sha256.Sum256(rawCerts[0])
+	if !strings.EqualFold(hex.EncodeToString(got[:]), expectedHashHex) {
+		return fmt.Errorf("TLS cert fingerprint mismatch: expected %s, got %x", expectedHashHex, got[:])
+	}
+	return nil
 }
 
 // verifyKeyBinding verifies the enclave's ephemeral attestation key by
-// checking that the pubkey from /v1/enclave-info matches the appKeyHash
+// checking that the pubkey from /v1/enclave-info matches the signingKeyHash
 // in the attestation document's UserData.
 func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL string, attestResult *nitrite.Result) (string, error) {
 	if attestResult == nil || attestResult.Document == nil {
@@ -228,37 +261,37 @@ func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL stri
 		tlsStart   = len(hashPrefix)
 		tlsEnd     = tlsStart + 32
 		sepStart   = tlsEnd
-		appPrefix  = sepStart + len(hashSep)
-		appStart   = appPrefix + len(hashPrefix)
-		appEnd     = appStart + 32
+		sigKeyPrefix  = sepStart + len(hashSep)
+		sigKeyStart   = sigKeyPrefix + len(hashPrefix)
+		sigKeyEnd     = sigKeyStart + 32
 	)
 
 	userData := attestResult.Document.UserData
-	if len(userData) < appEnd {
+	if len(userData) < sigKeyEnd {
 		// UserData too short — enclave may not support attestation key.
 		return "", nil
 	}
 	if !bytes.Equal(userData[:tlsStart], []byte(hashPrefix)) {
 		return "", fmt.Errorf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(userData[:tlsStart]))
 	}
-	if string(userData[sepStart:appPrefix]) != hashSep {
-		return "", fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:appPrefix]))
+	if string(userData[sepStart:sigKeyPrefix]) != hashSep {
+		return "", fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:sigKeyPrefix]))
 	}
-	if !bytes.Equal(userData[appPrefix:appStart], []byte(hashPrefix)) {
-		return "", fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(userData[appPrefix:appStart]))
+	if !bytes.Equal(userData[sigKeyPrefix:sigKeyStart], []byte(hashPrefix)) {
+		return "", fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, sigKeyPrefix, string(userData[sigKeyPrefix:sigKeyStart]))
 	}
-	appKeyHash := userData[appStart:appEnd]
+	signingKeyHash := userData[sigKeyStart:sigKeyEnd]
 
-	// Check if appKeyHash is all zeros (key not yet registered).
+	// Check if signingKeyHash is all zeros (key not yet registered).
 	allZero := true
-	for _, b := range appKeyHash {
+	for _, b := range signingKeyHash {
 		if b != 0 {
 			allZero = false
 			break
 		}
 	}
 	if allZero {
-		return "", fmt.Errorf("attestation key not yet registered (appKeyHash is all zeros)")
+		return "", fmt.Errorf("attestation key not yet registered (signingKeyHash is all zeros)")
 	}
 
 	// Fetch the attestation pubkey from the enclave.
@@ -267,7 +300,7 @@ func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL stri
 		return "", fmt.Errorf("fetch enclave info: %w", err)
 	}
 	if info.AttestationPubkey == "" {
-		return "", fmt.Errorf("enclave reports no attestation pubkey but appKeyHash is set")
+		return "", fmt.Errorf("enclave reports no attestation pubkey but signingKeyHash is set")
 	}
 
 	attestPubkeyBytes, err := hex.DecodeString(info.AttestationPubkey)
@@ -275,13 +308,13 @@ func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL stri
 		return "", fmt.Errorf("decode attestation pubkey hex: %w", err)
 	}
 
-	// Verify that SHA256(pubkey) matches the appKeyHash from attestation.
+	// Verify that SHA256(pubkey) matches the signingKeyHash from attestation.
 	expectedHash := sha256.Sum256(attestPubkeyBytes)
-	if !bytes.Equal(expectedHash[:], appKeyHash) {
-		return "", fmt.Errorf("appKeyHash mismatch: expected SHA256(%s) = %s, got %s",
+	if !bytes.Equal(expectedHash[:], signingKeyHash) {
+		return "", fmt.Errorf("signingKeyHash mismatch: expected SHA256(%s) = %s, got %s",
 			info.AttestationPubkey,
 			hex.EncodeToString(expectedHash[:]),
-			hex.EncodeToString(appKeyHash))
+			hex.EncodeToString(signingKeyHash))
 	}
 
 	return info.AttestationPubkey, nil

@@ -2,10 +2,8 @@ package client
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -44,18 +42,10 @@ func (c *Client) GRPCConn(ctx context.Context, opts ...grpc.DialOption) (*grpc.C
 
 	tlsCfg := &tls.Config{
 		// Disable the default chain check: nitriding's self-signed cert has
-		// no PKI chain. Trust comes from VerifyPeerCertificate below.
+		// no PKI chain. Trust comes from the shared pin below.
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("no peer certificate presented")
-			}
-			got := sha256.Sum256(rawCerts[0])
-			if !strings.EqualFold(hex.EncodeToString(got[:]), attest.TLSKeyHash) {
-				return fmt.Errorf("TLS cert fingerprint mismatch: expected %s, got %x",
-					attest.TLSKeyHash, got[:])
-			}
-			return nil
+			return verifyLeafCertPin(rawCerts, attest.TLSKeyHash)
 		},
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2"},

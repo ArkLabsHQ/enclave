@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"time"
@@ -14,16 +15,45 @@ const (
 	clockSyncSlewThreshold = 5 * time.Millisecond
 )
 
-// runClockSync gradually slews CLOCK_REALTIME toward the PTP clock until stop is
-// closed, then releases the device. ADJ_OFFSET_SINGLESHOT never steps backward.
-func runClockSync(stop <-chan bool, file *os.File, phc int32) {
+// StartClockSync binds CLOCK_REALTIME to the hypervisor's PTP clock (/dev/ptp0),
+// which the host cannot forge or skew. It hard-steps at boot, then slews for the
+// enclave's lifetime (until ctx is cancelled). No-op if /dev/ptp0 is absent
+// (e.g. QEMU without ptp_kvm). Call once at the start of Run, before any
+// outbound TLS validates certs or listeners serve traffic.
+func StartClockSync(ctx context.Context) {
+	file, err := os.OpenFile(ptpDevicePath, os.O_RDONLY, 0)
+	if err != nil {
+		slog.Warn("clock sync disabled: /dev/ptp0 unavailable", "error", err)
+		return
+	}
+	// The clock id is derived from the live fd, so runClockSync keeps it open.
+	phc := fdToClockID(file.Fd())
+
+	var ptp unix.Timespec
+	if err := unix.ClockGettime(phc, &ptp); err != nil {
+		slog.Warn("clock sync disabled: cannot read PTP clock", "error", err)
+		_ = file.Close()
+		return
+	}
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
+		slog.Warn("clock sync: initial hard-step failed; slew loop will converge", "error", err)
+	} else {
+		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
+	}
+
+	go runClockSync(ctx, file, phc)
+}
+
+// runClockSync gradually slews CLOCK_REALTIME toward the PTP clock until ctx is
+// cancelled, then releases the device. ADJ_OFFSET_SINGLESHOT never steps backward.
+func runClockSync(ctx context.Context, file *os.File, phc int32) {
 	defer func() { _ = file.Close() }()
 	ticker := time.NewTicker(clockSyncInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			slog.Info("clock sync stopping")
 			return
 		case <-ticker.C:

@@ -2,22 +2,61 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
-// Single home for every ENCLAVE_* business-config read in the runtime
-// package. Infrastructure boilerplate (AWS SDK endpoints, nitriding,
-// viproxy, cmd-level) stays with its consumer.
+// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
+// SSM/KMS namespace and lock posture, the managed-secret set, and security
+// timing — a short anchor window would let the operator wait out the Object Lock
+// and roll back undetected.
+var nonOverridableEnv = map[string]bool{
+	"ENCLAVE_DEPLOYMENT":         true,
+	"ENCLAVE_APP_NAME":           true,
+	"ENCLAVE_ANCHOR_WINDOW":      true,
+	"ENCLAVE_KMS_KEY_LOCKED":     true,
+	"ENCLAVE_MIGRATION_COOLDOWN": true,
+	"ENCLAVE_SECRETS_CONFIG":     true,
+	"ENCLAVE_PREVIOUS_PCR0":      true,
+}
+
+func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
+	prefix := fmt.Sprintf("/%s/%s/env/", getDeployment(), getAppName())
+
+	params, err := ssm.ListParams(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list env override SSM params: %w", err)
+	}
+
+	applied := 0
+	for _, p := range params {
+		key := strings.TrimPrefix(p.Name, prefix)
+		// Defensive: skip empty or nested keys so a misconfigured SSM
+		// tree can't surface unexpected env var names.
+		if key == "" || strings.ContainsRune(key, '/') {
+			continue
+		}
+
+		// Never let SSM overlay change EIF-baked identity or security knobs.
+		if nonOverridableEnv[key] {
+			slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
+			continue
+		}
+
+		if err := os.Setenv(key, p.Value); err != nil {
+			return fmt.Errorf("setenv %s: %w", key, err)
+		}
+		applied++
+	}
+
+	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
+
+	return nil
+}
 
 func getDeployment() string {
 	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
@@ -26,22 +65,7 @@ func getDeployment() string {
 	return "dev"
 }
 
-// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM/KMS namespace and lock posture and the managed-secret set.
-var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":         true,
-	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_KMS_KEY_LOCKED":     true,
-	"ENCLAVE_MIGRATION_COOLDOWN": true,
-	"ENCLAVE_SECRETS_CONFIG":     true,
-}
-
-// skipCOSEVerification bypasses COSE verification only for the "dev" deployment,
-// whose local QEMU NSM produces unsigned mock documents. Any other deployment
-// verifies against the AWS Nitro root. The deployment is baked into the EIF at
-// build time (measured into PCR0) and cannot be set via the SSM env overlay
-// (nonOverridableEnv), so this security-critical check cannot be flipped at
-// deploy time.
+// skipCOSEVerification is dev-only; deployment is EIF-baked and not SSM-overridable.
 func skipCOSEVerification() bool {
 	return getDeployment() == "dev"
 }
@@ -51,6 +75,10 @@ func getAppName() string {
 		return name
 	}
 	return "app"
+}
+
+func getPreviousPCR0() string {
+	return os.Getenv("ENCLAVE_PREVIOUS_PCR0")
 }
 
 func getStaticSecretsConfig() string {
@@ -91,7 +119,7 @@ func getMigrationCooldown() time.Duration {
 	return d
 }
 
-// respPort is the TLS port for the RESP K/V listener; 0 disables it.
+// respPort is the TLS port for the RESP K/V listener.
 func respPort() uint16 {
 	if s := strings.TrimSpace(os.Getenv("ENCLAVE_KV_RESP_PORT")); s != "" {
 		if n, err := strconv.ParseUint(s, 10, 16); err == nil {
@@ -101,10 +129,16 @@ func respPort() uint16 {
 	return 6379
 }
 
-// anchorWindow is the Object-Lock retain-until duration set on every freshness-anchor
-// and lineage object (~10 years). A compile-time constant, never an env var: a long
-// window is the point — letting the operator shorten it would let them delete history.
-const anchorWindow = 10 * 365 * 24 * time.Hour
+// anchorWindow is the Object-Lock retain-until duration set on each anchor
+// object. Defaults to ~10 years.
+func anchorWindow() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("ENCLAVE_ANCHOR_WINDOW")); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * 365 * 24 * time.Hour
+}
 
 func logBufferSize() int {
 	if s := os.Getenv("ENCLAVE_LOG_BUFFER_SIZE"); s != "" {
@@ -149,12 +183,25 @@ func spanBufferSize() int {
 // secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
 // scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func secretCiphertextParam(secretName, keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/%s/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), secretName, keyID)
+	return fmt.Sprintf(
+		"/%s/%s/%s/%s/Ciphertext/%s",
+		getDeployment(),
+		getAppName(),
+		lockSegment(),
+		secretName,
+		keyID,
+	)
 }
 
 // storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
 func storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/%s/StorageDEK/Ciphertext/%s", getDeployment(), getAppName(), lockSegment(), keyID)
+	return fmt.Sprintf(
+		"/%s/%s/%s/StorageDEK/Ciphertext/%s",
+		getDeployment(),
+		getAppName(),
+		lockSegment(),
+		keyID,
+	)
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
@@ -167,7 +214,12 @@ func stateOriginReceiptParam(keyID string) string {
 // writes over a successor's state during a migration handoff. Scoped by the
 // successor key ID.
 func migrationStateOriginReceiptParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/MigrationStateOriginReceipt/%s", getDeployment(), getAppName(), keyID)
+	return fmt.Sprintf(
+		"/%s/%s/MigrationStateOriginReceipt/%s",
+		getDeployment(),
+		getAppName(),
+		keyID,
+	)
 }
 
 // migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0.
@@ -181,158 +233,18 @@ func migrationPreviousPCR0AttestationParam() string {
 	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
 }
 
-// genesisDescriptorParam: SSM path for the JSON deployment descriptor written at
-// genesis (genesis PCR0 + canonical bucket names), surfaced by /v1/enclave-info.
-func genesisDescriptorParam() string {
-	return fmt.Sprintf("/%s/%s/GenesisDescriptor", getDeployment(), getAppName())
+// migrationRequestedAtParam: SSM path for the scheduled migration timestamp.
+func migrationRequestedAtParam() string {
+	return fmt.Sprintf("/%s/%s/MigrationRequestedAt", getDeployment(), getAppName())
 }
 
-// getRegion returns the deployment's AWS region (for the descriptor, so a
-// credential-less verifier can reach the public buckets). Defaults to us-east-1.
-func getRegion() string {
-	for _, k := range []string{"ENCLAVE_AWS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"} {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	return "us-east-1"
+func envVarOverridePath(name string) string {
+	return fmt.Sprintf("/%s/%s/env/%s", getDeployment(), getAppName(), name)
 }
 
-// ssmGetter is a minimal subset of *ssm.Client. GetParameter is still used by
-// loadDeployTLSConfig for known one-off lookups; GetParametersByPath drives
-// the deploy-time env overlay (no need to enumerate keys at build time).
-type ssmGetter interface {
-	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
-	GetParametersByPath(ctx context.Context, params *ssm.GetParametersByPathInput, optFns ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error)
-}
-
-// Environment is the boot-time env-overlay step.
-type Environment struct {
-	aws *AWSClient
-}
-
-func NewEnvironment(aws *AWSClient) *Environment {
-	return &Environment{aws: aws}
-}
-
-// Override scans /<deployment>/<app>/env/ in SSM and overlays every key
-// found there onto the process env, on top of any defaults baked into the
-// EIF. Trust boundary is the IAM grant on that SSM prefix.
-func (e *Environment) Override(ctx context.Context) error {
-	return applyEnvOverrides(ctx, e.aws.SSM, getDeployment(), getAppName())
-}
-
-func applyEnvOverrides(ctx context.Context, ssmClient ssmGetter, deployment, appName string) error {
-	prefix := fmt.Sprintf("/%s/%s/env/", deployment, appName)
-	var nextToken *string
-	var applied int
-	for {
-		out, err := ssmClient.GetParametersByPath(ctx, &ssm.GetParametersByPathInput{
-			Path:           aws.String(prefix),
-			Recursive:      aws.Bool(false),
-			WithDecryption: aws.Bool(true),
-			NextToken:      nextToken,
-		})
-		if err != nil {
-			return fmt.Errorf("ssm get-parameters-by-path %s: %w", prefix, err)
-		}
-		for _, p := range out.Parameters {
-			if p.Name == nil || p.Value == nil {
-				continue
-			}
-			key := strings.TrimPrefix(*p.Name, prefix)
-			// Defensive: skip empty or nested keys so a misconfigured SSM
-			// tree can't surface unexpected env var names.
-			if key == "" || strings.ContainsRune(key, '/') {
-				continue
-			}
-			// Never let the overlay change the framework identity: these are
-			// baked into the EIF (measured into PCR0) and name the SSM/KMS
-			// namespace. Allowing an SSM writer to set them would redirect the
-			// namespace or flip security-critical checks (e.g. COSE skip).
-			if nonOverridableEnv[key] {
-				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
-				continue
-			}
-			if err := os.Setenv(key, *p.Value); err != nil {
-				return fmt.Errorf("setenv %s: %w", key, err)
-			}
-			applied++
-		}
-		if out.NextToken == nil {
-			break
-		}
-		nextToken = out.NextToken
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
-	return nil
-}
-
-// deployTLSConfig is the TLS configuration resolved at boot from SSM. tofu
-// publishes it (from enclave.yaml's tls: block) under /<deployment>/<app>/env/.
-type deployTLSConfig struct {
-	FQDN      string
-	UseACME   bool
-	Directory string // "letsencrypt" | "letsencrypt-staging" | "self-signed" | a literal https:// directory URL
-	Email     string
-	CA        string // optional PEM CA bundle for a custom ACME directory's HTTPS API
-}
-
-// loadDeployTLSConfig reads the ENCLAVE_NITRIDING_* TLS settings tofu wrote to
-// SSM under /<deployment>/<app>/env/. Absent params keep the defaults
-// (self-signed, localhost) — the common case when no domain is configured. A
-// non-NotFound SSM error is returned so the caller can fail the boot.
-func loadDeployTLSConfig(ctx context.Context, ssmClient ssmGetter) (deployTLSConfig, error) {
-	t := deployTLSConfig{FQDN: "localhost", Directory: "self-signed"}
-	dep, app := getDeployment(), getAppName()
-
-	get := func(key string) (string, error) {
-		name := fmt.Sprintf("/%s/%s/env/%s", dep, app, key)
-		out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
-			Name:           aws.String(name),
-			WithDecryption: aws.Bool(false),
-		})
-		if err != nil {
-			var pnf *ssmtypes.ParameterNotFound
-			if errors.As(err, &pnf) {
-				return "", nil
-			}
-			return "", fmt.Errorf("ssm get-parameter %s: %w", name, err)
-		}
-		if out.Parameter == nil || out.Parameter.Value == nil {
-			return "", nil
-		}
-		return strings.TrimSpace(*out.Parameter.Value), nil
-	}
-
-	fqdn, err := get("ENCLAVE_NITRIDING_FQDN")
-	if err != nil {
-		return t, err
-	}
-	if fqdn != "" {
-		t.FQDN = fqdn
-	}
-	useACME, err := get("ENCLAVE_NITRIDING_USE_ACME")
-	if err != nil {
-		return t, err
-	}
-	t.UseACME = strings.EqualFold(useACME, "true")
-	dir, err := get("ENCLAVE_NITRIDING_ACME_DIRECTORY")
-	if err != nil {
-		return t, err
-	}
-	if dir != "" {
-		t.Directory = dir
-	}
-	email, err := get("ENCLAVE_NITRIDING_ACME_EMAIL")
-	if err != nil {
-		return t, err
-	}
-	t.Email = email
-	ca, err := get("ENCLAVE_NITRIDING_ACME_CA")
-	if err != nil {
-		return t, err
-	}
-	t.CA = ca
-	return t, nil
+	return fallback
 }

@@ -29,8 +29,6 @@ func Execute() {
 		startCmd(),
 		stopCmd(),
 		verifyCmd(),
-		verifyLineageCmd(),
-		descriptorCmd(),
 		statusCmd(),
 		curlCmd(),
 		generateCmd(),

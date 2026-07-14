@@ -1,185 +1,151 @@
 package runtime
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
-
-	"golang.org/x/net/http2"
+	"time"
 )
 
-// tagRoundTripper is an http.RoundTripper that reports its own name in the
-// response Status, so a test can tell which transport handled a request.
-type tagRoundTripper string
-
-func (t tagRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return &http.Response{Status: string(t)}, nil
+type fakeAppProcess struct {
+	stops int
+	err   error
 }
 
-func TestProtocolSwitchTransport(t *testing.T) {
-	tr := &protocolSwitchTransport{
-		h1:  tagRoundTripper("h1"),
-		h2c: tagRoundTripper("h2c"),
-	}
-	for _, tc := range []struct {
-		protoMajor int
-		want       string
-	}{
-		{1, "h1"},
-		{2, "h2c"},
-	} {
-		resp, err := tr.RoundTrip(&http.Request{ProtoMajor: tc.protoMajor})
-		if err != nil {
-			t.Fatalf("ProtoMajor %d: RoundTrip: %v", tc.protoMajor, err)
-		}
-		if resp.Status != tc.want {
-			t.Errorf("ProtoMajor %d routed to %q, want %q", tc.protoMajor, resp.Status, tc.want)
-		}
-	}
+func (a *fakeAppProcess) Stop() error {
+	a.stops++
+	return a.err
 }
 
-func TestUpstreamTransport(t *testing.T) {
-	if _, ok := upstreamTransport("h2c").(*http2.Transport); !ok {
-		t.Errorf(`upstreamTransport("h2c"): not *http2.Transport`)
+type observableRuntimeState struct {
+	*runtimeState
+	listenCalls chan struct{}
+}
+
+func (r *observableRuntimeState) ListenError() <-chan error {
+	select {
+	case r.listenCalls <- struct{}{}:
+	default:
 	}
-	if _, ok := upstreamTransport("h1").(*http.Transport); !ok {
-		t.Errorf(`upstreamTransport("h1"): not *http.Transport`)
+	return r.runtimeState.ListenError()
+}
+
+func TestSuperviseContextDoneStopsApp(t *testing.T) {
+	rt := newRuntimeState()
+	want := errors.New("stop failed")
+	app := &fakeAppProcess{err: want}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := supervise(ctx, rt, app)
+	if !errors.Is(err, want) {
+		t.Fatalf("supervise error = %v, want %v", err, want)
 	}
-	for _, mode := range []string{"auto", "", "bogus"} {
-		if _, ok := upstreamTransport(mode).(*protocolSwitchTransport); !ok {
-			t.Errorf("upstreamTransport(%q): not *protocolSwitchTransport (want auto fallback)", mode)
-		}
+	if app.stops != 1 {
+		t.Fatalf("Stop calls = %d, want 1", app.stops)
 	}
 }
 
-func TestCorsWildcard_Preflight(t *testing.T) {
-	calls := 0
-	inner := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ })
-	h := corsWildcard(inner)
+func TestSuperviseListenerErrorStopsApp(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{}
+	want := errors.New("listener failed")
 
-	req := httptest.NewRequest(http.MethodOptions, "/v1/enclave-info", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	done := make(chan error, 1)
+	go func() { done <- supervise(context.Background(), rt, app) }()
+	rt.NotifyListenerError(want)
 
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("OPTIONS status = %d, want %d", rec.Code, http.StatusNoContent)
+	err := waitTestResult(t, done)
+	if !errors.Is(err, want) {
+		t.Fatalf("supervise error = %v, want %v", err, want)
 	}
-	if calls != 0 {
-		t.Errorf("inner handler called %d times on OPTIONS, want 0", calls)
-	}
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	if app.stops != 1 {
+		t.Fatalf("Stop calls = %d, want 1", app.stops)
 	}
 }
 
-func TestCorsWildcard_PassthroughAndHeaders(t *testing.T) {
-	called := false
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	})
-	h := corsWildcard(inner)
+func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/enclave-info", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app) }()
 
-	if !called {
-		t.Errorf("inner handler not called on GET")
+	rt.NotifyChildExit(nil)
+	cancel()
+
+	if err := waitTestResult(t, done); err != nil {
+		t.Fatalf("supervise error = %v, want nil", err)
 	}
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	if app.stops != 0 {
+		t.Fatalf("Stop calls = %d, want 0", app.stops)
 	}
-	for _, hdr := range []string{
-		"Access-Control-Allow-Origin",
-		"Access-Control-Allow-Methods",
-		"Access-Control-Allow-Headers",
-		"Access-Control-Expose-Headers",
-	} {
-		if got := rec.Header().Get(hdr); got != "*" {
-			t.Errorf("%s = %q, want %q", hdr, got, "*")
-		}
+	if !rt.UpstreamAppInfo().Exited {
+		t.Fatalf("UpstreamAppInfo().Exited = false, want true")
 	}
 }
 
-// TestUpstreamExited_DefaultsFalse verifies a fresh runtime reports the app
-// as not-exited (the only state observable until cmd/runtime/main.go calls
-// MarkUpstreamExited).
-func TestUpstreamExited_DefaultsFalse(t *testing.T) {
-	e := &Runtime{}
-	exited, msg := e.UpstreamExited()
-	if exited {
-		t.Errorf("UpstreamExited() exited=true on fresh runtime, want false")
+func TestSuperviseHaltWaitsForRuntime(t *testing.T) {
+	rt := &observableRuntimeState{
+		runtimeState: newRuntimeState(),
+		listenCalls:  make(chan struct{}, 2),
 	}
-	if msg != "" {
-		t.Errorf("UpstreamExited() msg=%q on fresh runtime, want empty", msg)
+	app := &fakeAppProcess{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rt.NotifyHalt()
+
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app) }()
+
+	waitTestSignal(t, rt.listenCalls)
+	waitTestSignal(t, rt.listenCalls)
+	cancel()
+
+	if err := waitTestResult(t, done); err != nil {
+		t.Fatalf("supervise error = %v, want nil", err)
+	}
+	if app.stops != 0 {
+		t.Fatalf("Stop calls = %d, want 0", app.stops)
+	}
+	if !rt.Halted() {
+		t.Fatalf("Halted() = false, want true")
 	}
 }
 
-// TestUpstreamExited_RecordsError flips the latch with a non-nil error and
-// confirms both the bool and the error string round-trip.
-func TestUpstreamExited_RecordsError(t *testing.T) {
-	e := &Runtime{}
-	e.MarkUpstreamExited(errors.New("exit status 1"))
-	exited, msg := e.UpstreamExited()
-	if !exited {
-		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(err), want true")
-	}
-	if msg != "exit status 1" {
-		t.Errorf("UpstreamExited() msg=%q, want %q", msg, "exit status 1")
+func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
+	rt := newRuntimeState()
+	want := errors.New("listener failed")
+
+	done := make(chan error, 1)
+	go func() { done <- waitForRuntime(context.Background(), rt) }()
+	rt.NotifyListenerError(want)
+
+	err := waitTestResult(t, done)
+	if !errors.Is(err, want) {
+		t.Fatalf("waitForRuntime error = %v, want %v", err, want)
 	}
 }
 
-// TestUpstreamExited_RecordsCleanExit: nil error means "app exited cleanly"
-// — still marks the latch, but message stays empty.
-func TestUpstreamExited_RecordsCleanExit(t *testing.T) {
-	e := &Runtime{}
-	e.MarkUpstreamExited(nil)
-	exited, msg := e.UpstreamExited()
-	if !exited {
-		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(nil), want true")
-	}
-	if msg != "" {
-		t.Errorf("UpstreamExited() msg=%q after clean exit, want empty", msg)
+func waitTestResult(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for result")
+		return nil
 	}
 }
 
-// TestUpstreamAppInfo_JSONShape locks in the JSON field names that
-// test/run.sh and external clients depend on (.upstream_app.exited,
-// .upstream_app.error).
-func TestUpstreamAppInfo_JSONShape(t *testing.T) {
-	cases := []struct {
-		name string
-		in   UpstreamAppInfo
-		want string
-	}{
-		{
-			name: "not exited — no error field",
-			in:   UpstreamAppInfo{Exited: false},
-			want: `{"exited":false}`,
-		},
-		{
-			name: "exited cleanly — no error field",
-			in:   UpstreamAppInfo{Exited: true},
-			want: `{"exited":true}`,
-		},
-		{
-			name: "exited with error — error included",
-			in:   UpstreamAppInfo{Exited: true, Error: "exit status 1"},
-			want: `{"exited":true,"error":"exit status 1"}`,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			b, err := json.Marshal(tc.in)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if string(b) != tc.want {
-				t.Errorf("json shape mismatch:\n  got:  %s\n  want: %s", b, tc.want)
-			}
-		})
+func waitTestSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for signal")
 	}
 }

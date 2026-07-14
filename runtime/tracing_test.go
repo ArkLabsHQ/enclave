@@ -1,15 +1,18 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/stretchr/testify/require"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -17,238 +20,365 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// --- SpanBuffer tests ---
+func TestSpanBuffer(t *testing.T) {
+	base := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
 
-func TestSpanBuffer_AddAndQuery(t *testing.T) {
-	buf := NewSpanBuffer(10)
-	buf.Add(SpanEntry{Name: "a"}, SpanEntry{Name: "b"})
+	t.Run("evicts oldest", func(t *testing.T) {
+		buf := newSpanBuffer(3)
+		buf.add(
+			spanEntry{Start: base.Add(time.Second).Format(time.RFC3339Nano), Name: "1"},
+			spanEntry{Start: base.Add(2 * time.Second).Format(time.RFC3339Nano), Name: "2"},
+			spanEntry{Start: base.Add(3 * time.Second).Format(time.RFC3339Nano), Name: "3"},
+			spanEntry{Start: base.Add(4 * time.Second).Format(time.RFC3339Nano), Name: "4"},
+		)
 
-	entries := buf.Query(time.Time{}, "", 0)
-	if len(entries) != 2 {
-		t.Fatalf("expected 2, got %d", len(entries))
-	}
+		entries := buf.query(time.Time{}, "", 0)
+		require.Len(t, entries, 3)
+		require.Equal(t, "2", entries[0].Name)
+		require.Equal(t, "4", entries[2].Name)
+	})
+
+	t.Run("filters", func(t *testing.T) {
+		buf := newSpanBuffer(10)
+		buf.add(
+			spanEntry{
+				Start:  base.Add(time.Second).Format(time.RFC3339Nano),
+				Name:   "old-app",
+				Source: "app",
+			},
+			spanEntry{
+				Start:  base.Add(2 * time.Second).Format(time.RFC3339Nano),
+				Name:   "supervisor",
+				Source: "supervisor",
+			},
+			spanEntry{
+				Start:  base.Add(3 * time.Second).Format(time.RFC3339Nano),
+				Name:   "app-1",
+				Source: "app",
+			},
+			spanEntry{
+				Start:  base.Add(4 * time.Second).Format(time.RFC3339Nano),
+				Name:   "app-2",
+				Source: "app",
+			},
+		)
+
+		entries := buf.query(base.Add(2500*time.Millisecond), "app", 1)
+		require.Len(t, entries, 1)
+		require.Equal(t, "app-1", entries[0].Name)
+	})
+
+	t.Run("empty returns slice", func(t *testing.T) {
+		entries := newSpanBuffer(1).query(time.Time{}, "", 0)
+		require.NotNil(t, entries)
+		require.Empty(t, entries)
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		buf := newSpanBuffer(100)
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					buf.add(spanEntry{Name: "concurrent"})
+				}
+			}()
+		}
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					_ = buf.query(time.Time{}, "", 10)
+				}
+			}()
+		}
+		wg.Wait()
+		require.Len(t, buf.query(time.Time{}, "", 0), 100)
+	})
 }
 
-func TestSpanBuffer_Eviction(t *testing.T) {
-	buf := NewSpanBuffer(3)
-	buf.Add(SpanEntry{Name: "1"}, SpanEntry{Name: "2"}, SpanEntry{Name: "3"})
-	buf.Add(SpanEntry{Name: "4"})
+func TestParseOTLPSpans(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		entries, err := parseOTLPSpans(
+			buildOTLPTraceRequest(t, "test.span", tracepb.Status_STATUS_CODE_OK),
+		)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
 
-	entries := buf.Query(time.Time{}, "", 0)
-	if len(entries) != 3 {
-		t.Fatalf("expected 3, got %d", len(entries))
-	}
-	if entries[0].Name != "2" {
-		t.Fatalf("expected oldest '2', got %q", entries[0].Name)
-	}
+		entry := entries[0]
+		require.Equal(t, "0102030405060708", entry.ID)
+		require.Equal(t, "0102030405060708090a0b0c0d0e0f10", entry.TraceID)
+		require.Equal(t, "test.span", entry.Name)
+		require.Equal(t, "ok", entry.Status)
+		require.Equal(t, "app", entry.Source)
+		require.Equal(t, "val", entry.Attributes["test.attr"])
+		require.Equal(t, "test-svc", entry.Attributes["resource.service.name"])
+	})
+
+	t.Run("status", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			code   tracepb.Status_StatusCode
+			status string
+		}{
+			{name: "ok", code: tracepb.Status_STATUS_CODE_OK, status: "ok"},
+			{name: "error", code: tracepb.Status_STATUS_CODE_ERROR, status: "error"},
+			{name: "unset", code: tracepb.Status_STATUS_CODE_UNSET, status: "unset"},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				entries, err := parseOTLPSpans(buildOTLPTraceRequest(t, "span", tc.code))
+				require.NoError(t, err)
+				require.Equal(t, tc.status, entries[0].Status)
+			})
+		}
+	})
+
+	t.Run("invalid protobuf", func(t *testing.T) {
+		_, err := parseOTLPSpans([]byte("garbage"))
+		require.Error(t, err)
+	})
 }
 
-func TestSpanBuffer_QueryService(t *testing.T) {
-	buf := NewSpanBuffer(10)
-	buf.Add(
-		SpanEntry{Name: "a", Source: "app"},
-		SpanEntry{Name: "b", Source: "supervisor"},
-		SpanEntry{Name: "c", Source: "app"},
-	)
+func TestTracingHandlers(t *testing.T) {
+	t.Run("get filters buffer", func(t *testing.T) {
+		tracing := &Tracing{buf: newSpanBuffer(10)}
+		tracing.buf.add(
+			spanEntry{
+				ID:      "1",
+				TraceID: "trace-1",
+				Name:    "a",
+				Start:   "start",
+				End:     "end",
+				Status:  "ok",
+				Source:  "app",
+			},
+			spanEntry{
+				ID:      "2",
+				TraceID: "trace-2",
+				Name:    "b",
+				Start:   "start",
+				End:     "end",
+				Status:  "ok",
+				Source:  "supervisor",
+			},
+			spanEntry{
+				ID:      "3",
+				TraceID: "trace-3",
+				Name:    "c",
+				Start:   "start",
+				End:     "end",
+				Status:  "error",
+				Source:  "app",
+			},
+		)
 
-	entries := buf.Query(time.Time{}, "app", 0)
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 app spans, got %d", len(entries))
-	}
+		w := httptest.NewRecorder()
+		HandleTracingGet(
+			tracing,
+		)(
+			w,
+			httptest.NewRequest(http.MethodGet, "/v1/enclave-traces?service=app&limit=1", nil),
+		)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.JSONEq(t, `[{
+			"id":"1",
+			"trace_id":"trace-1",
+			"name":"a",
+			"start":"start",
+			"end":"end",
+			"status":"ok",
+			"source":"app"
+		}]`, w.Body.String())
+	})
+
+	t.Run("get empty", func(t *testing.T) {
+		tracing := &Tracing{buf: newSpanBuffer(1)}
+		w := httptest.NewRecorder()
+
+		HandleTracingGet(tracing)(w, httptest.NewRequest(http.MethodGet, "/v1/enclave-traces", nil))
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.JSONEq(t, `[]`, w.Body.String())
+	})
+
+	t.Run("post accepts otlp", func(t *testing.T) {
+		tracing := &Tracing{buf: newSpanBuffer(10)}
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/v1/traces",
+			bytes.NewReader(buildOTLPTraceRequest(t, "test", tracepb.Status_STATUS_CODE_OK)),
+		)
+		w := httptest.NewRecorder()
+
+		HandleTracingPost(tracing)(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
+		require.Len(t, tracing.buf.query(time.Time{}, "", 0), 1)
+	})
 }
 
-func TestSpanBuffer_QuerySince(t *testing.T) {
-	buf := NewSpanBuffer(10)
-	old := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
-	recent := time.Now().UTC().Format(time.RFC3339Nano)
-	buf.Add(SpanEntry{Start: old, Name: "old"}, SpanEntry{Start: recent, Name: "new"})
+func TestTracingStartCloudWatchExport(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
+	t.Setenv("ENCLAVE_APP_NAME", "app")
+	t.Setenv("ENCLAVE_LOG_CLOUDWATCH", "true")
+	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
 
-	since := time.Now().Add(-5 * time.Second)
-	entries := buf.Query(since, "", 0)
-	if len(entries) != 1 {
-		t.Fatalf("expected 1, got %d", len(entries))
-	}
-	if entries[0].Name != "new" {
-		t.Fatalf("expected 'new', got %q", entries[0].Name)
-	}
-}
+	t.Run("disabled noops", func(t *testing.T) {
+		cw := newFakeCloudWatchLogs()
+		tracing := &Tracing{buf: newSpanBuffer(1), cw: cw}
 
-func TestSpanBuffer_QueryLimit(t *testing.T) {
-	buf := NewSpanBuffer(10)
-	for i := 0; i < 5; i++ {
-		buf.Add(SpanEntry{Name: "span"})
-	}
-	entries := buf.Query(time.Time{}, "", 2)
-	if len(entries) != 2 {
-		t.Fatalf("expected 2, got %d", len(entries))
-	}
-}
+		require.NoError(t, tracing.StartCloudWatchExport(context.Background()))
+		require.Empty(t, cw.groups)
+	})
 
-func TestSpanBuffer_Concurrent(t *testing.T) {
-	buf := NewSpanBuffer(100)
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				buf.Add(SpanEntry{Name: "c"})
+	t.Run("returns setup error", func(t *testing.T) {
+		sentinel := errors.New("create group failed")
+		cw := newFakeCloudWatchLogs()
+		cw.createLogGroupErr = sentinel
+		tracing := NewTracing(cw)
+
+		err := tracing.StartCloudWatchExport(context.Background())
+		require.ErrorIs(t, err, sentinel)
+	})
+
+	t.Run("returns after starting exporter", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		tracing := NewTracing(newFakeCloudWatchLogs())
+
+		startTracingCloudWatchExport(t, ctx, tracing)
+	})
+
+	t.Run("flushes full batch", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		tracing := NewTracing(cw)
+		startTracingCloudWatchExport(t, ctx, tracing)
+
+		for i := 0; i < 100; i++ {
+			start := time.Unix(int64(100-i), 0).UTC()
+			tracing.shipCh <- spanEntry{
+				ID:      fmt.Sprintf("span-%03d", i),
+				TraceID: fmt.Sprintf("trace-%03d", i),
+				Name:    fmt.Sprintf("op-%03d", i),
+				Start:   start.Format(time.RFC3339Nano),
+				End:     start.Add(time.Second).Format(time.RFC3339Nano),
+				Status:  "ok",
+				Source:  "app",
 			}
-		}()
-	}
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				buf.Query(time.Time{}, "", 10)
-			}
-		}()
-	}
-	wg.Wait()
+		}
+
+		put := requireCloudWatchPut(t, cw)
+		require.Equal(t, "/enclave/test/app/traces", aws.ToString(put.LogGroupName))
+		require.Len(t, put.LogEvents, 100)
+		require.JSONEq(t, `{
+			"id":"span-099",
+			"trace_id":"trace-099",
+			"name":"op-099",
+			"start":"1970-01-01T00:00:01Z",
+			"end":"1970-01-01T00:00:02Z",
+			"status":"ok",
+			"source":"app"
+		}`, aws.ToString(put.LogEvents[0].Message))
+	})
+
+	t.Run("flushes on close", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		tracing := NewTracing(cw)
+		startTracingCloudWatchExport(t, ctx, tracing)
+
+		tracing.shipCh <- spanEntry{
+			ID:      "one",
+			TraceID: "trace",
+			Name:    "flush me",
+			Start:   time.Unix(1, 0).UTC().Format(time.RFC3339Nano),
+			End:     time.Unix(2, 0).UTC().Format(time.RFC3339Nano),
+			Status:  "error",
+			Source:  "app",
+		}
+		close(tracing.shipCh)
+
+		put := requireCloudWatchPut(t, cw)
+		require.Len(t, put.LogEvents, 1)
+		require.JSONEq(t, `{
+			"id":"one",
+			"trace_id":"trace",
+			"name":"flush me",
+			"start":"1970-01-01T00:00:01Z",
+			"end":"1970-01-01T00:00:02Z",
+			"status":"error",
+			"source":"app"
+		}`, aws.ToString(put.LogEvents[0].Message))
+	})
 }
 
-// --- parseOTLPSpans tests ---
-
-func buildOTLPTraceRequest(name string, statusCode tracepb.Status_StatusCode) []byte {
+func buildOTLPTraceRequest(t *testing.T, name string, statusCode tracepb.Status_StatusCode) []byte {
+	t.Helper()
 	req := &coltracepb.ExportTraceServiceRequest{
 		ResourceSpans: []*tracepb.ResourceSpans{{
 			Resource: &resourcepb.Resource{
 				Attributes: []*commonpb.KeyValue{{
 					Key:   "service.name",
-					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "test-svc"}},
+					Value: stringValue("test-svc"),
 				}},
 			},
 			ScopeSpans: []*tracepb.ScopeSpans{{
 				Spans: []*tracepb.Span{{
-					TraceId:           []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+					TraceId: []byte{
+						1,
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10,
+						11,
+						12,
+						13,
+						14,
+						15,
+						16,
+					},
 					SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
 					ParentSpanId:      []byte{0, 0, 0, 0, 0, 0, 0, 0},
 					Name:              name,
-					StartTimeUnixNano: uint64(time.Now().Add(-1 * time.Second).UnixNano()),
-					EndTimeUnixNano:   uint64(time.Now().UnixNano()),
+					StartTimeUnixNano: uint64(time.Unix(1, 0).UnixNano()),
+					EndTimeUnixNano:   uint64(time.Unix(2, 0).UnixNano()),
 					Status:            &tracepb.Status{Code: statusCode},
 					Attributes: []*commonpb.KeyValue{{
 						Key:   "test.attr",
-						Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "val"}},
+						Value: stringValue("val"),
 					}},
 				}},
 			}},
 		}},
 	}
-	data, _ := proto.Marshal(req)
+	data, err := proto.Marshal(req)
+	require.NoError(t, err)
 	return data
 }
 
-func TestParseOTLPSpans_Valid(t *testing.T) {
-	data := buildOTLPTraceRequest("test.span", tracepb.Status_STATUS_CODE_OK)
-	entries, err := parseOTLPSpans(data)
-	if err != nil {
-		t.Fatal(err)
+func startTracingCloudWatchExport(t *testing.T, ctx context.Context, tracing *Tracing) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- tracing.StartCloudWatchExport(ctx) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "StartCloudWatchExport did not return")
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1, got %d", len(entries))
-	}
-	e := entries[0]
-	if e.Name != "test.span" {
-		t.Fatalf("expected 'test.span', got %q", e.Name)
-	}
-	if e.Status != "ok" {
-		t.Fatalf("expected 'ok', got %q", e.Status)
-	}
-	if e.Source != "app" {
-		t.Fatalf("expected 'app', got %q", e.Source)
-	}
-	if e.Attributes["test.attr"] != "val" {
-		t.Fatalf("expected attr test.attr=val, got %v", e.Attributes["test.attr"])
-	}
-	if e.Attributes["resource.service.name"] != "test-svc" {
-		t.Fatalf("expected resource attr, got %v", e.Attributes["resource.service.name"])
-	}
-}
-
-func TestParseOTLPSpans_StatusCodes(t *testing.T) {
-	tests := []struct {
-		code   tracepb.Status_StatusCode
-		status string
-	}{
-		{tracepb.Status_STATUS_CODE_OK, "ok"},
-		{tracepb.Status_STATUS_CODE_ERROR, "error"},
-		{tracepb.Status_STATUS_CODE_UNSET, "unset"},
-	}
-	for _, tt := range tests {
-		data := buildOTLPTraceRequest("s", tt.code)
-		entries, _ := parseOTLPSpans(data)
-		if entries[0].Status != tt.status {
-			t.Errorf("code %d: expected %q, got %q", tt.code, tt.status, entries[0].Status)
-		}
-	}
-}
-
-func TestParseOTLPSpans_InvalidProtobuf(t *testing.T) {
-	_, err := parseOTLPSpans([]byte("garbage"))
-	requireErrContains(t, err, "unmarshal OTLP traces")
-}
-
-// --- HTTP handler tests ---
-
-func TestHandleSpanGet_Empty(t *testing.T) {
-	enc := newTestEnclave(t)
-	req := httptest.NewRequest("GET", "/v1/enclave-traces", nil)
-	w := httptest.NewRecorder()
-	enc.tracing.handleGet(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-	var entries []SpanEntry
-	if err := json.Unmarshal(w.Body.Bytes(), &entries); err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected 0, got %d", len(entries))
-	}
-}
-
-func TestHandleSpanPost_NoAuth(t *testing.T) {
-	enc := newTestEnclave(t)
-	body := buildOTLPTraceRequest("test", tracepb.Status_STATUS_CODE_OK)
-	req := httptest.NewRequest("POST", "/v1/traces", strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	w := httptest.NewRecorder()
-	enc.tracing.handlePost(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestHandleSpanPost_Valid(t *testing.T) {
-	enc := newTestEnclave(t)
-	body := buildOTLPTraceRequest("test", tracepb.Status_STATUS_CODE_OK)
-	req := httptest.NewRequest("POST", "/v1/traces", strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.Header.Set("Authorization", "Bearer "+enc.RuntimeToken())
-	w := httptest.NewRecorder()
-	enc.tracing.handlePost(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	entries := enc.tracing.buf.Query(time.Time{}, "", 0)
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 span, got %d", len(entries))
-	}
-}
-
-// --- Tracing.Span noop test ---
-
-func TestTracingSpan_NoopOnNilTracing(t *testing.T) {
-	// A nil-receivered call should return a noop span without panicking.
-	var nilT *Tracing
-	ctx, span := nilT.Span(context.Background(), "test")
-	if ctx == nil {
-		t.Fatal("expected non-nil context")
-	}
-	span.End()
 }

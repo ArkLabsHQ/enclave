@@ -56,8 +56,13 @@ func runMigrationStatus(ctx context.Context, asJSON bool) error {
 		AppName:    appName,
 	}
 
-	report.KMSKeyID = readSSMParamSilent(ctx, ac.ssmClient, deployment, appName, "KMSKeyID")
-	report.MigrationPreviousPCR0 = readSSMParamSilent(ctx, ac.ssmClient, deployment, appName, "MigrationPreviousPCR0")
+	lockSegment := "unlocked"
+	if cfg.IsKMSKeyLocked {
+		lockSegment = "locked"
+	}
+
+	report.KMSKeyID = readSSMParamSilent(ctx, ac.ssmClient, fmt.Sprintf("/%s/%s/%s/KMSKeyID", deployment, appName, lockSegment))
+	report.MigrationPreviousPCR0 = readSSMParamSilent(ctx, ac.ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
 
 	if report.KMSKeyID != "" {
 		report.KMSKeyState = describeKMSKey(ctx, ac.kmsClient, report.KMSKeyID)
@@ -80,8 +85,7 @@ func runMigrationStatus(ctx context.Context, asJSON bool) error {
 
 // readSSMParamSilent returns the raw value or empty string on any error.
 // Treats "UNSET" as empty.
-func readSSMParamSilent(ctx context.Context, ssmClient *ssm.Client, deployment, appName, name string) string {
-	paramName := fmt.Sprintf("/%s/%s/%s", deployment, appName, name)
+func readSSMParamSilent(ctx context.Context, ssmClient *ssm.Client, paramName string) string {
 	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
 		Name: aws.String(paramName),
 	})

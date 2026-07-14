@@ -31,7 +31,7 @@ Nitro Enclave ---------------------------------->+
    - Decrypts secrets from KMS using a Nitro attestation document (PCR0-bound)
    - Sets decrypted secrets as environment variables
    - Generates an ephemeral secp256k1 attestation key
-   - Registers `SHA256(attestationPubkey)` with nitriding (embedded as `appKeyHash` in attestation UserData)
+   - Registers `SHA256(attestationPubkey)` with nitriding (embedded as `signingKeyHash` in attestation UserData)
    - Starts the reverse proxy on port 7073 with Schnorr response signing
 3. **your-app** is launched as a child process on port 7074, inheriting secret env vars
 
@@ -414,7 +414,7 @@ Every response includes:
 - `X-Attestation-Signature`: BIP-340 Schnorr signature over `SHA256(response_body)`
 - `X-Attestation-Pubkey`: compressed public key of the ephemeral attestation key
 
-Clients verify the signature, then confirm the pubkey hash matches `appKeyHash` in the attestation document's UserData.
+Clients verify the signature, then confirm the pubkey hash matches `signingKeyHash` in the attestation document's UserData.
 
 ### PCR Extension
 

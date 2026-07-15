@@ -15,13 +15,14 @@ import (
 // timing — a short anchor window would let the operator wait out the Object Lock
 // and roll back undetected.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":         true,
-	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_ANCHOR_WINDOW":      true,
-	"ENCLAVE_KMS_KEY_LOCKED":     true,
-	"ENCLAVE_MIGRATION_COOLDOWN": true,
-	"ENCLAVE_SECRETS_CONFIG":     true,
-	"ENCLAVE_PREVIOUS_PCR0":      true,
+	"ENCLAVE_DEPLOYMENT":                 true,
+	"ENCLAVE_APP_NAME":                   true,
+	"ENCLAVE_ANCHOR_WINDOW":              true,
+	"ENCLAVE_KMS_KEY_LOCKED":             true,
+	"ENCLAVE_MIGRATION_COOLDOWN":         true,
+	"ENCLAVE_MIGRATION_INTENT_RETENTION": true,
+	"ENCLAVE_SECRETS_CONFIG":             true,
+	"ENCLAVE_PREVIOUS_PCR0":              true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
@@ -117,6 +118,15 @@ func getMigrationCooldown() time.Duration {
 		return 0
 	}
 	return d
+}
+
+func migrationIntentRetention() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION")); value != "" {
+		if retention, err := time.ParseDuration(value); err == nil && retention > 0 {
+			return retention
+		}
+	}
+	return 10 * 365 * 24 * time.Hour
 }
 
 // respPort is the TLS port for the RESP K/V listener.

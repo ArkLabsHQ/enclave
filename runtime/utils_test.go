@@ -471,9 +471,11 @@ func fakeKMSRSAPublicKey(attestationDoc []byte) (*rsa.PublicKey, error) {
 }
 
 type fakeS3Object struct {
-	id       string
-	body     []byte
-	lockMode s3types.ObjectLockMode
+	id           string
+	body         []byte
+	lockMode     s3types.ObjectLockMode
+	retainUntil  time.Time
+	lastModified time.Time
 }
 
 type fakeS3 struct {
@@ -589,7 +591,13 @@ func (f *fakeS3) PutObject(
 	key := aws.ToString(in.Key)
 	f.objects[key] = append(
 		f.objects[key],
-		fakeS3Object{id: id, body: body, lockMode: in.ObjectLockMode},
+		fakeS3Object{
+			id:           id,
+			body:         body,
+			lockMode:     in.ObjectLockMode,
+			retainUntil:  aws.ToTime(in.ObjectLockRetainUntilDate),
+			lastModified: time.Now().UTC(),
+		},
 	)
 	return &s3.PutObjectOutput{VersionId: aws.String(id)}, nil
 }
@@ -624,9 +632,14 @@ func (f *fakeS3) ListObjectVersions(
 			continue
 		}
 		for _, obj := range objects {
+			lastModified := obj.lastModified
 			out = append(
 				out,
-				s3types.ObjectVersion{Key: aws.String(key), VersionId: aws.String(obj.id)},
+				s3types.ObjectVersion{
+					Key:          aws.String(key),
+					VersionId:    aws.String(obj.id),
+					LastModified: &lastModified,
+				},
 			)
 		}
 	}
@@ -687,10 +700,18 @@ func (f *fakeS3) DeleteObject(
 
 // putRawObject injects object bytes as if written outside runtime code.
 func (f *fakeS3) putRawObject(key string, body []byte) {
+	f.putRawObjectAt(key, body, time.Now().UTC())
+}
+
+func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq++
-	f.objects[key] = append(f.objects[key], fakeS3Object{id: strconv.Itoa(f.seq), body: body})
+	f.objects[key] = append(f.objects[key], fakeS3Object{
+		id:           strconv.Itoa(f.seq),
+		body:         body,
+		lastModified: lastModified,
+	})
 }
 
 func (f *fakeS3) latestBody(key string) []byte {

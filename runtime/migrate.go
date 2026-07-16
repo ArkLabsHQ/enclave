@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 )
 
@@ -45,7 +44,6 @@ type migrator struct {
 	kms           PrimaryKMS
 	ssm           SSM
 	dek           DEK
-	stateOrigin   StateOrigin
 	staticSecrets []StaticSecret
 }
 
@@ -54,7 +52,6 @@ func NewMigrator(
 	kms PrimaryKMS,
 	ssm SSM,
 	dek DEK,
-	stateOrigin StateOrigin,
 	secrets []StaticSecret,
 ) Migrator {
 	return &migrator{
@@ -62,7 +59,6 @@ func NewMigrator(
 		kms:           kms,
 		ssm:           ssm,
 		dek:           dek,
-		stateOrigin:   stateOrigin,
 		staticSecrets: secrets,
 	}
 }
@@ -153,6 +149,7 @@ func (m *migrator) StartMigration(
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
+	transitionSecrets := make([]persistedSecret, 0, len(m.staticSecrets))
 	for _, secret := range m.staticSecrets {
 		secretBytes, err := hex.DecodeString(secret.Plaintext)
 		if err != nil {
@@ -170,17 +167,22 @@ func (m *migrator) StartMigration(
 		}
 
 		if !bytes.Equal(plaintext, secretBytes) {
-			return nil, fmt.Errorf("roundtrip decrypt mismatch %s: %w", secret.Name, err)
+			return nil, fmt.Errorf("roundtrip decrypt mismatch %s", secret.Name)
 		}
 
 		ciphertextParam := secretCiphertextParam(secret.Name, migrationKMS.KeyID())
 		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
 			return nil, fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
 		}
+		transitionSecrets = append(transitionSecrets, persistedSecret{
+			metadata:   secret.StaticSecretMetadata,
+			ciphertext: ciphertextB64,
+		})
 		exportedNames = append(exportedNames, secret.Name)
 	}
 
-	if err := m.dek.ExportKey(ctx, migrationKMS, m.ssm); err != nil {
+	dekCiphertext, err := m.dek.ExportKey(ctx, migrationKMS, m.ssm)
+	if err != nil {
 		return nil, fmt.Errorf("DEK export failed: %w", err)
 	}
 
@@ -207,7 +209,16 @@ func (m *migrator) StartMigration(
 	}
 
 	// Write handoff receipt before flipping KMSKeyID.
-	if err := m.stateOrigin.WriteTransitionReceipt(ctx, migrationKMS.KeyID()); err != nil {
+	if err := WriteTransitionReceipt(
+		ctx,
+		m.nsm,
+		m.ssm,
+		persistedStateSnapshot{
+			kmsKeyID:      migrationKMS.KeyID(),
+			staticSecrets: transitionSecrets,
+			storageDEK:    dekCiphertext,
+		},
+	); err != nil {
 		return nil, fmt.Errorf(
 			"failed to write migration-transition receipt: %w", err,
 		)
@@ -231,52 +242,6 @@ func (m *migrator) StartMigration(
 func (r StartMigrationRequest) Validate() error {
 	_, err := validateNewPCR0(r.NewPCR0)
 	return err
-}
-
-func VerifyPredecessorCommitment(ctx context.Context, nsm NSM, ssm SSM) error {
-	eifPreviousPCR0 := getPreviousPCR0()
-
-	ssmPreviousPRCO, err := ssm.MayGet(ctx, migrationPreviousPCR0Param())
-	if err != nil {
-		return fmt.Errorf("failed to read previous PCR0 SSM param: %w", err)
-	}
-
-	if eifPreviousPCR0 == "genesis" {
-		if ssmPreviousPRCO != "" {
-			return fmt.Errorf("previous PCR0 SSM param set for genesis enclave")
-		}
-
-		return nil
-	}
-
-	currentPCR0, err := nsm.PCR0()
-	if err != nil {
-		return fmt.Errorf("failed to read current PCR0: %w", err)
-	}
-
-	if !strings.EqualFold(eifPreviousPCR0, ssmPreviousPRCO) &&
-		// allow rollback-to-self
-		!strings.EqualFold(ssmPreviousPRCO, hex.EncodeToString(currentPCR0)) {
-		return fmt.Errorf(
-			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
-		)
-	}
-
-	previousPRCOAttest, err := ssm.MustGet(ctx, migrationPreviousPCR0AttestationParam())
-	if err != nil {
-		return fmt.Errorf("failed to read previous PCR0 attestation SSM param: %w", err)
-	}
-
-	expectedPCRs := map[uint]string{
-		0: ssmPreviousPRCO,
-	}
-
-	// Verify PCR31 if this is not a rollback (curPCR0 != prevPCR0)
-	if !strings.EqualFold(ssmPreviousPRCO, hex.EncodeToString(currentPCR0)) {
-		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(currentPCR0))
-	}
-
-	return nsm.VerifyAttestation(previousPRCOAttest, expectedPCRs, nil)
 }
 
 func validateNewPCR0(pcr0 string) ([]byte, error) {

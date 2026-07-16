@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
@@ -22,17 +21,16 @@ func TestVerifyPredecessorCommitment_Genesis(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
 
-	ctx := context.Background()
-
 	t.Run("no predecessor", func(t *testing.T) {
-		err := VerifyPredecessorCommitment(ctx, nil, NewSSM(&fakeSSM{}))
+		err := verifyPredecessorCommitment(nil, unverifiedState{})
 		require.NoError(t, err)
 	})
 
-	t.Run("rejects SSM predecessor", func(t *testing.T) {
-		errs := VerifyPredecessorCommitment(ctx, nil, NewSSM(&fakeSSM{params: map[string]string{
-			migrationPreviousPCR0Param(): "abc123",
-		}}))
+	t.Run("rejects predecessor", func(t *testing.T) {
+		errs := verifyPredecessorCommitment(nil, unverifiedState{
+			predecessorPCR0:        "abc123",
+			predecessorAttestation: "attestation",
+		})
 		require.Error(t, errs)
 	})
 }
@@ -47,49 +45,31 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", prevPCR0)
 
-	ctx := context.Background()
-	previousParam := migrationPreviousPCR0Param()
-	attestationParam := migrationPreviousPCR0AttestationParam()
-
 	t.Run("missing previous PCR0", func(t *testing.T) {
-		err := VerifyPredecessorCommitment(
-			ctx,
+		err := verifyPredecessorCommitment(
 			predecessorNSM(t, currentPCR0Bytes, nil),
-			NewSSM(&fakeSSM{}),
+			unverifiedState{},
 		)
 		require.Error(t, err)
 	})
 
 	t.Run("mismatched previous PCR0", func(t *testing.T) {
-		err := VerifyPredecessorCommitment(
-			ctx,
+		err := verifyPredecessorCommitment(
 			predecessorNSM(t, currentPCR0Bytes, nil),
-			NewSSM(&fakeSSM{params: map[string]string{
-				previousParam: strings.Repeat("0", 96),
-			}}),
+			unverifiedState{
+				predecessorPCR0:        strings.Repeat("0", 96),
+				predecessorAttestation: attestation,
+			},
 		)
 		require.Error(t, err)
 	})
 
 	t.Run("requires attestation", func(t *testing.T) {
-		cases := []struct {
-			name   string
-			params map[string]string
-		}{
-			{"missing", map[string]string{previousParam: prevPCR0}},
-			{"unset", map[string]string{previousParam: prevPCR0, attestationParam: "UNSET"}},
-		}
-
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				err := VerifyPredecessorCommitment(
-					ctx,
-					predecessorNSM(t, currentPCR0Bytes, nil),
-					NewSSM(&fakeSSM{params: tc.params}),
-				)
-				require.Error(t, err)
-			})
-		}
+		err := verifyPredecessorCommitment(
+			predecessorNSM(t, currentPCR0Bytes, nil),
+			unverifiedState{predecessorPCR0: prevPCR0},
+		)
+		require.Error(t, err)
 	})
 
 	t.Run("wrong PCR31", func(t *testing.T) {
@@ -98,10 +78,10 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
 		}, nil))
 
-		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
-			previousParam:    prevPCR0,
-			attestationParam: attestation,
-		}}))
+		err := verifyPredecessorCommitment(nsm, unverifiedState{
+			predecessorPCR0:        prevPCR0,
+			predecessorAttestation: attestation,
+		})
 
 		require.Error(t, err)
 	})
@@ -112,10 +92,10 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
-		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
-			previousParam:    strings.ToUpper(prevPCR0),
-			attestationParam: attestation,
-		}}))
+		err := verifyPredecessorCommitment(nsm, unverifiedState{
+			predecessorPCR0:        strings.ToUpper(prevPCR0),
+			predecessorAttestation: attestation,
+		})
 
 		require.NoError(t, err)
 	})
@@ -130,10 +110,10 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0Bytes),
 		}, nil))
 
-		err := VerifyPredecessorCommitment(ctx, nsm, NewSSM(&fakeSSM{params: map[string]string{
-			previousParam:    hex.EncodeToString(currentPCR0Bytes),
-			attestationParam: attestation,
-		}}))
+		err := verifyPredecessorCommitment(nsm, unverifiedState{
+			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
+			predecessorAttestation: attestation,
+		})
 
 		require.NoError(t, err)
 	})
@@ -146,7 +126,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("genesis", func(t *testing.T) {
-		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, nil).PreviousPCR0Info(ctx)
+		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil).PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "genesis"}, info)
@@ -156,7 +136,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationPreviousPCR0Param():            "abc123",
 			migrationPreviousPCR0AttestationParam(): "attestation",
-		}}), nil, nil, nil).PreviousPCR0Info(ctx)
+		}}), nil, nil).PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "abc123", Attestation: "attestation"}, info)
@@ -171,7 +151,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("none", func(t *testing.T) {
-		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, nil).CooldownStatus(ctx)
+		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil).CooldownStatus(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &CooldownStatus{ConfiguredSeconds: 120}, status)
@@ -180,7 +160,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	t.Run("pending", func(t *testing.T) {
 		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationRequestedAtParam(): time.Now().UTC().Format(time.RFC3339),
-		}}), nil, nil, nil).CooldownStatus(ctx)
+		}}), nil, nil).CooldownStatus(ctx)
 
 		require.NoError(t, err)
 		require.True(t, status.Pending)
@@ -192,7 +172,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	t.Run("bad timestamp", func(t *testing.T) {
 		_, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationRequestedAtParam(): "not-time",
-		}}), nil, nil, nil).CooldownStatus(ctx)
+		}}), nil, nil).CooldownStatus(ctx)
 
 		require.Error(t, err)
 	})
@@ -235,12 +215,12 @@ func TestStartMigration(t *testing.T) {
 		StaticSecretMetadata: StaticSecretMetadata{Name: "signing_key"},
 		Plaintext:            hex.EncodeToString(secretPlaintext),
 	}
-	secretMeta := []StaticSecretMetadata{secret.StaticSecretMetadata}
 
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", oldPCR0Hex)
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing_key"}]`)
 
 	ctx := context.Background()
 	setup := func(t *testing.T, opts ...func(*startMigrationFixture)) *startMigrationFixture {
@@ -264,15 +244,11 @@ func TestStartMigration(t *testing.T) {
 		for _, opt := range opts {
 			opt(fx)
 		}
-		enc, err := cbor.CoreDetEncOptions().EncMode()
-		require.NoError(t, err)
-
 		fx.m = NewMigrator(
 			nsm,
 			&kmsW{nsm: nsm, kms: kmsf, sts: sts, keyID: "old-key"},
 			fx.ssm,
 			&dek{key: dekKey},
-			&stateOrigin{nsm: nsm, ssm: ssm, secrets: secretMeta, enc: enc},
 			[]StaticSecret{secret},
 		).(*migrator)
 		return fx
@@ -284,6 +260,7 @@ func TestStartMigration(t *testing.T) {
 		got, err := fx.m.StartMigration(ctx, newPCR0)
 
 		require.NoError(t, err)
+		require.Empty(t, fx.ssmf.calls, "migration must not read successor ciphertexts back")
 		require.Equal(t, oldPCR0Hex, got.PCR0)
 		require.Equal(t, []string{"signing_key"}, got.Exported)
 
@@ -308,7 +285,17 @@ func TestStartMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		require.NoError(t, VerifyPredecessorCommitment(ctx, newNSM, fx.ssm))
+		established, err := EstablishState(
+			ctx,
+			newNSM,
+			fx.kmsf,
+			&fakeSTS{},
+			fx.ssm,
+		)
+		require.NoError(t, err)
+		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID)])
 	})
 
 	t.Run("rejects invalid new PCR0", func(t *testing.T) {

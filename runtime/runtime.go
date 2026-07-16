@@ -102,58 +102,28 @@ func Run(ctx context.Context, cfg Config) error {
 	servers.Start(ctx, cfg)
 
 	ssm := NewSSM(aws.SSM)
-	ssmWithCache := NewSSMTTLCache(ssm, time.Second*5)
-
-	if err := VerifyPredecessorCommitment(ctx, nsm, ssm); err != nil {
-		return fmt.Errorf("failed to verifier predecessor commitment: %w", err)
-	}
-
-	kms, err := FetchOrCreatePrimaryKMS(ctx, nsm, aws.KMS, aws.STS, ssmWithCache)
-	if err != nil {
-		return fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
-	}
-
-	startState, err := ClassifyStartState(ctx, kms, ssmWithCache)
-	if err != nil {
-		return fmt.Errorf("failed to classify start state: %w", err)
-	}
-
-	dek, err := FetchOrInitDEK(ctx, kms, ssmWithCache)
-	if err != nil {
-		return fmt.Errorf("failed to fetch or init DEK: %w", err)
-	}
-
-	staticSecretMeta, err := LoadStaticSecretMetadata()
-	if err != nil {
-		return fmt.Errorf("failed to load static secret metadata: %w", err)
-	}
-
-	secrets, err := FetchOrInitStaticSecrets(ctx, kms, ssmWithCache, staticSecretMeta)
-	if err != nil {
-		return fmt.Errorf("failed to fetch or init static secrets: %w", err)
-	}
-
-	stateOrigin, err := EstablishStateOrigin(
+	verified, err := EstablishState(
 		ctx,
 		nsm,
-		kms,
-		ssmWithCache,
-		staticSecretMeta,
-		startState,
+		aws.KMS,
+		aws.STS,
+		ssm,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to estabilish state origin: %w", err)
+		return fmt.Errorf("failed to establish state: %w", err)
 	}
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, secrets); err != nil {
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, verified.secrets); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
-	if err := SetStaticSecretEnvVars(secrets); err != nil {
-		return fmt.Errorf("failed to set static secrets env vars: %w", err)
-	}
-
-	migrator := NewMigrator(nsm, kms, ssmWithCache, dek, stateOrigin, secrets)
+	migrator := NewMigrator(
+		nsm,
+		verified.kms,
+		NewSSMTTLCache(ssm, time.Second*5),
+		verified.dek,
+		verified.secrets,
+	)
 
 	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
@@ -163,18 +133,18 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to configure migration handler: %w", err)
 	}
 
-	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, dek, ssm, hashes)
+	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
 	}
 	rt.SetTLSCertCallback(tlsCertCb)
 
-	freshnessAnchor, err := NewFreshnessAnchor(ctx, rt, aws.S3, dek, ssm)
+	freshnessAnchor, err := NewFreshnessAnchor(ctx, rt, aws.S3, verified.dek, ssm)
 	if err != nil {
 		return fmt.Errorf("failed to create freshness anchor: %w", err)
 	}
 
-	kvStore, err := NewKVStore(ctx, aws.DDB, ssm, dek, freshnessAnchor)
+	kvStore, err := NewKVStore(ctx, aws.DDB, ssm, verified.dek, freshnessAnchor)
 	if err != nil {
 		return fmt.Errorf("failed to create kv store: %w", err)
 	}
@@ -185,6 +155,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
+	}
+	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
+	// overriding verified secret state
+	if err := SetStaticSecretEnvVars(verified.secrets); err != nil {
+		return fmt.Errorf("failed to set static secrets env vars: %w", err)
 	}
 
 	app, err := startApp(rt, cfg, authToken)

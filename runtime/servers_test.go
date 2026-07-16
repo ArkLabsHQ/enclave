@@ -285,7 +285,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	metrics := NewMetrics()
 	s := &servers{em: http.NewServeMux(), rt: rt, signer: signer, metrics: metrics}
 
-	err = s.ConfigureEnclaveInfoHandler(ctx, NewMigrator(nil, nil, ssm, nil, nil, nil), ssm)
+	err = s.ConfigureEnclaveInfoHandler(ctx, NewMigrator(nil, nil, ssm, nil, nil), ssm)
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()

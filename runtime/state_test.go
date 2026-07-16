@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"maps"
 	"testing"
 	"time"
@@ -17,6 +18,38 @@ import (
 var stateOriginTestSecrets = []StaticSecretMetadata{
 	{Name: "alpha", EnvVar: "ALPHA"},
 	{Name: "beta", EnvVar: "BETA"},
+}
+
+func setStateOriginTestEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
+		{"name":"alpha","env_var":"ALPHA"},
+		{"name":"beta","env_var":"BETA"}
+	]`)
+}
+
+type stateOriginTestKMS struct {
+	PrimaryKMS
+	keyID        string
+	generateCall byte
+	decryptCalls []string
+}
+
+func (k *stateOriginTestKMS) KeyID() string { return k.keyID }
+
+func (k *stateOriginTestKMS) GenerateDataKey(context.Context) (*DataKey, error) {
+	k.generateCall++
+	return &DataKey{
+		Ciphertext: bytes.Repeat([]byte{k.generateCall}, 32),
+		Plaintext:  bytes.Repeat([]byte{k.generateCall + 0x40}, 32),
+	}, nil
+}
+
+func (k *stateOriginTestKMS) Decrypt(_ context.Context, ciphertext string) ([]byte, error) {
+	k.decryptCalls = append(k.decryptCalls, ciphertext)
+	return base64.StdEncoding.DecodeString(ciphertext)
 }
 
 func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
@@ -40,14 +73,30 @@ func stateOriginParams(keyID string) map[string]string {
 	return params
 }
 
-func mustStateRoot(t *testing.T, ctx context.Context, ssm SSM, keyID string) []byte {
+func mustStateRoot(
+	t *testing.T,
+	ctx context.Context,
+	ssm SSM,
+	keyID string,
+) []byte {
 	t.Helper()
-	enc, err := cbor.CoreDetEncOptions().EncMode()
+	secrets := make([]persistedSecret, 0, len(stateOriginTestSecrets))
+	for _, secret := range stateOriginTestSecrets {
+		param := secretCiphertextParam(secret.Name, keyID)
+		ciphertext, err := ssm.MustGet(ctx, param)
+		require.NoError(t, err)
+		secrets = append(secrets, persistedSecret{
+			metadata:   secret,
+			ciphertext: ciphertext,
+		})
+	}
+	dekCiphertext, err := ssm.MustGet(ctx, storageDEKCiphertextParam(keyID))
 	require.NoError(t, err)
-	root, err := (&stateOrigin{ssm: ssm, secrets: stateOriginTestSecrets, enc: enc}).stateRoot(
-		ctx,
-		keyID,
-	)
+	root, err := stateRoot(persistedStateSnapshot{
+		kmsKeyID:      keyID,
+		staticSecrets: secrets,
+		storageDEK:    dekCiphertext,
+	})
 	require.NoError(t, err)
 	return root
 }
@@ -77,13 +126,16 @@ func signedReceipt(
 	)
 }
 
-func TestClassifyStartState(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+func TestLoadUnverifiedState(t *testing.T) {
+	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-classify"
 	prevPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
+	withKey := func(params map[string]string) map[string]string {
+		maps.Copy(params, stateOriginParams(keyID))
+		return params
+	}
 
 	withReceipt := func(params map[string]string) map[string]string {
 		params[stateOriginReceiptParam(keyID)] = "receipt"
@@ -98,26 +150,22 @@ func TestClassifyStartState(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		genesis bool
 		params  map[string]string
-		want    StartState
+		want    startState
 		wantErr bool
 	}{
 		{
-			name:    "genesis clean",
-			genesis: true,
-			params:  map[string]string{},
-			want:    StartStateGenesis,
+			name:   "genesis clean",
+			params: map[string]string{},
+			want:   startStateGenesis,
 		},
 		{
 			name:    "genesis blocked by migration artifacts",
-			genesis: true,
 			params:  withMigration(map[string]string{}),
 			wantErr: true,
 		},
 		{
-			name:    "genesis blocked by partial migration artifacts",
-			genesis: true,
+			name: "genesis blocked by partial migration artifacts",
 			params: map[string]string{
 				migrationPreviousPCR0Param(): prevPCR0,
 			},
@@ -125,23 +173,25 @@ func TestClassifyStartState(t *testing.T) {
 		},
 		{
 			name:   "resume with receipt",
-			params: withReceipt(map[string]string{}),
-			want:   StartStateResume,
+			params: withReceipt(withKey(map[string]string{})),
+			want:   startStateResume,
 		},
-		{name: "without receipt fails", params: map[string]string{}, wantErr: true},
+		{
+			name: "without receipt fails", params: withKey(map[string]string{}), wantErr: true,
+		},
 		{
 			name:   "migration with transition receipt",
-			params: withMigration(map[string]string{}),
-			want:   StartStateMigration,
+			params: withMigration(withKey(map[string]string{})),
+			want:   startStateMigration,
 		},
 		{
 			name: "migration artifacts without transition receipt fail",
-			params: func() map[string]string {
+			params: withKey(func() map[string]string {
 				params := map[string]string{}
 				params[migrationPreviousPCR0Param()] = prevPCR0
 				params[migrationPreviousPCR0AttestationParam()] = "attestation"
 				return params
-			}(),
+			}()),
 			wantErr: true,
 		},
 	}
@@ -149,25 +199,28 @@ func TestClassifyStartState(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, ssm := stateOriginTestSSM(tc.params)
-			got, err := ClassifyStartState(
-				ctx,
-				&kmsW{keyID: keyID, genesis: tc.genesis},
-				ssm,
-			)
+			got, err := loadUnverifiedState(ctx, ssm)
 
 			if tc.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, tc.want, got)
+			require.Equal(t, tc.want, got.startState)
+			switch tc.want {
+			case startStateResume:
+				require.Equal(t, "receipt", got.receipt)
+			case startStateMigration:
+				require.Equal(t, "transition", got.receipt)
+				require.Equal(t, prevPCR0, got.predecessorPCR0)
+				require.Equal(t, "attestation", got.predecessorAttestation)
+			}
 		})
 	}
 }
 
 func TestVerifyStateOriginReceipt(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	setStateOriginTestEnv(t)
 
 	stateRoot := []byte("state-root-commitment")
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
@@ -231,8 +284,7 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 }
 
 func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	setStateOriginTestEnv(t)
 
 	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
 	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
@@ -271,43 +323,131 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestEstablishStateOriginGenesisWritesReceipt(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+func TestValidateStaticSecretArtifacts(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	require.NoError(t, validateStaticSecretArtifacts(stateOriginTestSecrets))
+	require.Error(t, validateStaticSecretArtifacts([]StaticSecretMetadata{
+		{Name: "duplicate", EnvVar: "ONE"},
+		{Name: "duplicate", EnvVar: "TWO"},
+	}))
+	require.Error(t, validateStaticSecretArtifacts([]StaticSecretMetadata{
+		{Name: "StorageDEK", EnvVar: "COLLISION"},
+	}))
+}
+
+func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	ctx := context.Background()
+	keyID := "key-single-snapshot"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	original := stateOriginParams(keyID)
+	fake, ssm := stateOriginTestSSM(original)
+	root := mustStateRoot(t, ctx, ssm, keyID)
+	receipt := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
+	fake.params[stateOriginReceiptParam(keyID)] = receipt.docB64
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	kms := &stateOriginTestKMS{keyID: keyID}
+	unverified, err := loadUnverifiedState(ctx, ssm)
+	require.NoError(t, err)
+	readCount := len(fake.calls)
+	fake.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
+		bytes.Repeat([]byte{0xdd}, 32),
+	)
+
+	established, err := establishLoadedState(
+		ctx,
+		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
+		kms,
+		ssm,
+		unverified,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, established.dek.(*dek).key)
+	require.Len(t, fake.calls, readCount, "establishment must not read SSM")
+}
+
+func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	ctx := context.Background()
+	keyID := "key-missing-state"
+	params := stateOriginParams(keyID)
+	delete(params, secretCiphertextParam("alpha", keyID))
+	params[stateOriginReceiptParam(keyID)] = "receipt"
+	fake, ssm := stateOriginTestSSM(params)
+
+	_, err := loadUnverifiedState(ctx, ssm)
+
+	require.Error(t, err)
+	_, exists := fake.params[secretCiphertextParam("alpha", keyID)]
+	require.False(t, exists)
+}
+
+func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
+	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-genesis"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
-	fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
-	root := mustStateRoot(t, ctx, ssm, keyID)
-	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
-	session := &fakeNSMSession{}
-	session.responses = append(session.responses, attestationDocumentResponse(att.doc))
+	fake, ssm := stateOriginTestSSM(nil)
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session}}
+	unverified, err := loadUnverifiedState(ctx, ssm)
+	require.NoError(t, err)
 
-	_, err := EstablishStateOrigin(
+	established, err := establishLoadedState(
 		ctx,
 		nsm,
-		&kmsW{keyID: keyID, genesis: true},
+		&stateOriginTestKMS{keyID: keyID},
 		ssm,
-		stateOriginTestSecrets,
-		StartStateGenesis,
+		unverified,
 	)
 
 	require.NoError(t, err)
+	require.NotNil(t, established.dek)
+	require.Len(t, established.secrets, len(stateOriginTestSecrets))
+	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[stateOriginReceiptParam(keyID)]
 	require.NoError(t, verifyStateOriginReceipt(
-		NewNSM(WithAttestationRoots(att.roots)),
+		NewNSM(WithAttestationRoots(session.attestationRoots)),
 		written,
 		purposeStateOrigin,
 		root,
 		map[uint]string{0: hex.EncodeToString(pcr0)},
 	))
+	require.Equal(t, keyID, fake.params[kmsKeyIDParam()])
 }
 
-func TestEstablishStateOriginResumeDetectsCiphertextSwap(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	keyID := "key-genesis-failure"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fake, ssm := stateOriginTestSSM(map[string]string{kmsKeyIDParam(): "UNSET"})
+	fake.putErrs = map[string]error{
+		stateOriginReceiptParam(keyID): errors.New("receipt write failed"),
+	}
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	unverified, err := loadUnverifiedState(context.Background(), ssm)
+	require.NoError(t, err)
+
+	_, err = establishLoadedState(
+		context.Background(),
+		&nsmW{nsm: &fakeNSM{session: session}},
+		&stateOriginTestKMS{keyID: keyID},
+		ssm,
+		unverified,
+	)
+
+	require.Error(t, err)
+	require.Equal(t, "UNSET", fake.params[kmsKeyIDParam()])
+}
+
+func TestEstablishLoadedStateRejectsCiphertextSwapBeforeDecrypt(t *testing.T) {
+	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-resume"
@@ -316,53 +456,28 @@ func TestEstablishStateOriginResumeDetectsCiphertextSwap(t *testing.T) {
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
 	fake.params[stateOriginReceiptParam(keyID)] = att.docB64
-	payload := receiptPayload(t, purposeStateOrigin, root)
-
-	session := &fakeNSMSession{}
-	session.responses = append(
-		session.responses,
-		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
-	)
-	nsm := &nsmW{nsm: &fakeNSM{
-		session:      session,
-		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
-	}}
-	_, err := EstablishStateOrigin(
-		ctx,
-		nsm,
-		&kmsW{keyID: keyID},
-		ssm,
-		stateOriginTestSecrets,
-		StartStateResume,
-	)
-	require.NoError(t, err)
-
 	fake.params[secretCiphertextParam("alpha", keyID)] = base64.StdEncoding.EncodeToString(
 		[]byte{0xff, 0xff, 0xff},
 	)
-	session = &fakeNSMSession{}
-	session.responses = append(
-		session.responses,
-		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
-	)
-	nsm = &nsmW{nsm: &fakeNSM{
-		session:      session,
-		verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, payload),
-	}}
-	_, err = EstablishStateOrigin(
+	unverified, err := loadUnverifiedState(ctx, ssm)
+	require.NoError(t, err)
+	kms := &stateOriginTestKMS{keyID: keyID}
+	_, err = establishLoadedState(
 		ctx,
-		nsm,
-		&kmsW{keyID: keyID},
+		&nsmW{nsm: &fakeNSM{
+			session:     newStatefulNSMSession(t, map[uint][]byte{0: pcr0}),
+			verifyRoots: att.roots,
+		}},
+		kms,
 		ssm,
-		stateOriginTestSecrets,
-		StartStateResume,
+		unverified,
 	)
 	require.Error(t, err)
+	require.Empty(t, kms.decryptCalls)
 }
 
-func TestEstablishStateOriginMigration(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+func TestEstablishLoadedStateMigration(t *testing.T) {
+	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-migration"
@@ -394,14 +509,15 @@ func TestEstablishStateOriginMigration(t *testing.T) {
 				receiptPayload(t, purposeMigrationTransition, root),
 			),
 		}}
+		unverified, err := loadUnverifiedState(ctx, ssm)
+		require.NoError(t, err)
 
-		_, err := EstablishStateOrigin(
+		_, err = establishLoadedState(
 			ctx,
 			nsm,
-			&kmsW{keyID: keyID},
+			&stateOriginTestKMS{keyID: keyID},
 			ssm,
-			stateOriginTestSecrets,
-			StartStateMigration,
+			unverified,
 		)
 		return fake, root, stateReceipt.roots, err
 	}

@@ -27,22 +27,20 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 	t.Run("existing key accepted", func(t *testing.T) {
 		kmsf := newFakeKMS()
 		kmsf.putKey("key-existing", policy)
-		ssmf := &fakeSSM{params: map[string]string{kmsKeyIDParam(): "key-existing"}}
 
 		got, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-existing",
+			"",
+			"",
 		)
 
 		require.NoError(t, err)
 		if got.KeyID() != "key-existing" {
 			t.Fatalf("key ID = %q", got.KeyID())
-		}
-		if got.Genesis() {
-			t.Fatalf("existing key reported genesis")
 		}
 	})
 
@@ -50,14 +48,15 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 		kmsf := newFakeKMS()
 		stalePCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
 		kmsf.putKey("key-stale", mustBuildKMSPolicy(t, testRoleARN, []string{stalePCR0}, ""))
-		ssmf := &fakeSSM{params: map[string]string{kmsKeyIDParam(): "key-stale"}}
 
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-stale",
+			"",
+			"",
 		)
 
 		require.Error(t, err)
@@ -73,12 +72,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			[]string{pcr0Hex, targetPCR0Hex},
 			"",
 		))
-		ssmf := &fakeSSM{params: map[string]string{
-			kmsKeyIDParam():                         "key-rollback",
-			migrationPreviousPCR0Param():            pcr0Hex,
-			migrationPreviousPCR0AttestationParam(): attestation,
-		}}
-
 		got, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
@@ -87,7 +80,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			}, nil)),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-rollback",
+			pcr0Hex,
+			attestation,
 		)
 
 		require.NoError(t, err)
@@ -105,12 +100,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			[]string{pcr0Hex, targetPCR0Hex},
 			"",
 		))
-		ssmf := &fakeSSM{params: map[string]string{
-			kmsKeyIDParam():                         "key-rollback",
-			migrationPreviousPCR0Param():            pcr0Hex,
-			migrationPreviousPCR0AttestationParam(): attestation,
-		}}
-
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
@@ -119,7 +108,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			}, nil)),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-rollback",
+			pcr0Hex,
+			attestation,
 		)
 
 		require.Error(t, err)
@@ -129,12 +120,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
 		kmsf := newFakeKMS()
 		kmsf.putKey("key-rollback", mustBuildKMSPolicy(t, testRoleARN, []string{pcr0Hex}, ""))
-		ssmf := &fakeSSM{params: map[string]string{
-			kmsKeyIDParam():                         "key-rollback",
-			migrationPreviousPCR0Param():            pcr0Hex,
-			migrationPreviousPCR0AttestationParam(): attestation,
-		}}
-
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
@@ -143,7 +128,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			}, nil)),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-rollback",
+			pcr0Hex,
+			attestation,
 		)
 
 		require.Error(t, err)
@@ -160,12 +147,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			[]string{pcr0Hex, targetPCR0Hex, evilPCR0Hex},
 			"",
 		))
-		ssmf := &fakeSSM{params: map[string]string{
-			kmsKeyIDParam():                         "key-rollback",
-			migrationPreviousPCR0Param():            pcr0Hex,
-			migrationPreviousPCR0AttestationParam(): attestation,
-		}}
-
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
@@ -174,7 +155,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			}, nil)),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-rollback",
+			pcr0Hex,
+			attestation,
 		)
 
 		require.Error(t, err)
@@ -191,12 +174,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			[]string{targetPCR0Hex, evilPCR0Hex},
 			"",
 		))
-		ssmf := &fakeSSM{params: map[string]string{
-			kmsKeyIDParam():                         "key-rollback",
-			migrationPreviousPCR0Param():            pcr0Hex,
-			migrationPreviousPCR0AttestationParam(): attestation,
-		}}
-
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
@@ -205,7 +182,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			}, nil)),
 			kmsf,
 			&fakeSTS{},
-			NewSSM(ssmf),
+			"key-rollback",
+			pcr0Hex,
+			attestation,
 		)
 
 		require.Error(t, err)
@@ -213,25 +192,20 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 
 	t.Run("missing key creates genesis key", func(t *testing.T) {
 		kmsf := newFakeKMS()
-		ssmf := &fakeSSM{params: map[string]string{}}
 
 		got, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{arn: testRoleARN},
-			NewSSM(ssmf),
+			"",
+			"",
+			"",
 		)
 
 		require.NoError(t, err)
-		if !got.Genesis() {
-			t.Fatalf("created key did not report genesis")
-		}
 		if got.KeyID() == "" {
 			t.Fatalf("created key ID is empty")
-		}
-		if ssmf.params[kmsKeyIDParam()] != got.KeyID() {
-			t.Fatalf("created key ID was not stored")
 		}
 		require.NoError(
 			t,

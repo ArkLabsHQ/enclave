@@ -126,7 +126,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("genesis", func(t *testing.T) {
-		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil).PreviousPCR0Info(ctx)
+		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, "").PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "genesis"}, info)
@@ -136,7 +136,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationPreviousPCR0Param():            "abc123",
 			migrationPreviousPCR0AttestationParam(): "attestation",
-		}}), nil, nil).PreviousPCR0Info(ctx)
+		}}), nil, nil, "").PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "abc123", Attestation: "attestation"}, info)
@@ -151,7 +151,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("none", func(t *testing.T) {
-		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil).CooldownStatus(ctx)
+		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, "").CooldownStatus(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &CooldownStatus{ConfiguredSeconds: 120}, status)
@@ -160,7 +160,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	t.Run("pending", func(t *testing.T) {
 		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationRequestedAtParam(): time.Now().UTC().Format(time.RFC3339),
-		}}), nil, nil).CooldownStatus(ctx)
+		}}), nil, nil, "").CooldownStatus(ctx)
 
 		require.NoError(t, err)
 		require.True(t, status.Pending)
@@ -172,7 +172,7 @@ func TestMigratorCooldownStatus(t *testing.T) {
 	t.Run("bad timestamp", func(t *testing.T) {
 		_, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationRequestedAtParam(): "not-time",
-		}}), nil, nil).CooldownStatus(ctx)
+		}}), nil, nil, "").CooldownStatus(ctx)
 
 		require.Error(t, err)
 	})
@@ -204,6 +204,7 @@ func TestStartMigrationRequestValidate(t *testing.T) {
 
 func TestStartMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
+	const migrationIntentBucketName = "migration-intent-bucket"
 
 	oldPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
@@ -230,7 +231,9 @@ func TestStartMigration(t *testing.T) {
 			migrationPCRIndex: make([]byte, 48),
 		})
 		nsm := &nsmW{nsm: &fakeNSM{session: session}}
-		ssmf := &fakeSSM{params: map[string]string{}}
+		ssmf := &fakeSSM{params: map[string]string{
+			migrationIntentBucketParam(): migrationIntentBucketName,
+		}}
 		ssm := NewSSM(ssmf)
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
@@ -250,12 +253,14 @@ func TestStartMigration(t *testing.T) {
 			fx.ssm,
 			&dek{key: dekKey},
 			[]StaticSecret{secret},
+			migrationIntentBucketName,
 		).(*migrator)
 		return fx
 	}
 
 	t.Run("happy path commits raw PCR0 and predecessor validates", func(t *testing.T) {
 		fx := setup(t)
+		fx.ssmf.params[migrationIntentBucketParam()] = "repointed-after-startup"
 
 		got, err := fx.m.StartMigration(ctx, newPCR0)
 
@@ -281,6 +286,7 @@ func TestStartMigration(t *testing.T) {
 		))
 		require.NotNil(t, fx.session.attestationRoots)
 
+		fx.ssmf.params[migrationIntentBucketParam()] = migrationIntentBucketName
 		newNSM := &nsmW{nsm: &fakeNSM{
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
@@ -295,6 +301,7 @@ func TestStartMigration(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, migrationIntentBucketName, established.migrationIntentBucketName)
 		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID)])
 	})
 

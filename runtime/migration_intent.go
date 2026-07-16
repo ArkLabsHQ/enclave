@@ -73,6 +73,10 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
+func migrationIntentBucketParam() string {
+	return fmt.Sprintf("/%s/%s/MigrationIntentBucketName", getDeployment(), getAppName())
+}
+
 func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("migration intent bucket is required")

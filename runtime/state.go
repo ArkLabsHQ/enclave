@@ -41,18 +41,20 @@ type unverifiedState struct {
 }
 
 type verifiedState struct {
-	kms     PrimaryKMS
-	dek     DEK
-	secrets []StaticSecret
+	kms                       PrimaryKMS
+	dek                       DEK
+	secrets                   []StaticSecret
+	migrationIntentBucketName string
 }
 
 // persistedStateSnapshot is the exact SSM-backed state covered by a
 // state-origin receipt. Its values are loaded or generated once and never
 // reconstructed from SSM.
 type persistedStateSnapshot struct {
-	kmsKeyID      string
-	staticSecrets []persistedSecret
-	storageDEK    string
+	kmsKeyID                  string
+	staticSecrets             []persistedSecret
+	storageDEK                string
+	migrationIntentBucketName string
 }
 
 type persistedSecret struct {
@@ -122,6 +124,10 @@ func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) 
 	if err := validateStaticSecretArtifacts(metadata); err != nil {
 		return unverifiedState{}, fmt.Errorf("invalid static secret metadata: %w", err)
 	}
+	migrationIntentBucketName, err := ssm.MustGet(ctx, migrationIntentBucketParam())
+	if err != nil {
+		return unverifiedState{}, fmt.Errorf("failed to get migration intent bucket name: %w", err)
+	}
 
 	keyID, err := ssm.MayGet(ctx, kmsKeyIDParam())
 	if err != nil {
@@ -155,6 +161,9 @@ func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) 
 		secretMetadata:         metadata,
 		predecessorPCR0:        predecessorPCR0,
 		predecessorAttestation: predecessorAttestation,
+		snapshot: persistedStateSnapshot{
+			migrationIntentBucketName: migrationIntentBucketName,
+		},
 	}
 
 	if keyID == "" {
@@ -204,11 +213,9 @@ func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) 
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("required DEK SSM param missing: %w", err)
 	}
-	state.snapshot = persistedStateSnapshot{
-		kmsKeyID:      keyID,
-		staticSecrets: secrets,
-		storageDEK:    dekCiphertext,
-	}
+	state.snapshot.kmsKeyID = keyID
+	state.snapshot.staticSecrets = secrets
+	state.snapshot.storageDEK = dekCiphertext
 	return state, nil
 }
 
@@ -262,7 +269,7 @@ func establishLoadedState(
 	var err error
 	if state.startState == startStateGenesis {
 		snapshot, verified, err = initializePersistedState(
-			ctx, kms, ssm, state.secretMetadata,
+			ctx, kms, ssm, state.secretMetadata, state.snapshot.migrationIntentBucketName,
 		)
 		if err != nil {
 			return verifiedState{}, fmt.Errorf("failed to initialize persisted state: %w", err)
@@ -327,6 +334,7 @@ func establishLoadedState(
 			return verifiedState{}, fmt.Errorf("failed to materialize persisted state: %w", err)
 		}
 	}
+	verified.migrationIntentBucketName = snapshot.migrationIntentBucketName
 
 	switch state.startState {
 	case startStateMigration, startStateGenesis:
@@ -357,6 +365,7 @@ func initializePersistedState(
 	kms PrimaryKMS,
 	ssm SSM,
 	metadata []StaticSecretMetadata,
+	migrationIntentBucketName string,
 ) (persistedStateSnapshot, verifiedState, error) {
 	dekData, err := kms.GenerateDataKey(ctx)
 	if err != nil {
@@ -394,9 +403,10 @@ func initializePersistedState(
 	}
 
 	return persistedStateSnapshot{
-			kmsKeyID:      kms.KeyID(),
-			staticSecrets: persistedSecrets,
-			storageDEK:    dekCiphertext,
+			kmsKeyID:                  kms.KeyID(),
+			staticSecrets:             persistedSecrets,
+			storageDEK:                dekCiphertext,
+			migrationIntentBucketName: migrationIntentBucketName,
 		}, verifiedState{
 			kms:     kms,
 			dek:     &dek{key: append([]byte(nil), dekData.Plaintext...)},
@@ -465,9 +475,12 @@ func stateRoot(snapshot persistedStateSnapshot) ([]byte, error) {
 		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
 	}
 
-	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+2)
+	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+3)
 	arts = append(arts, ssmArtifactV1{
 		Name: kmsKeyIDParam(), Value: snapshot.kmsKeyID,
+	})
+	arts = append(arts, ssmArtifactV1{
+		Name: migrationIntentBucketParam(), Value: snapshot.migrationIntentBucketName,
 	})
 
 	for _, secret := range snapshot.staticSecrets {

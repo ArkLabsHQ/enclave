@@ -40,11 +40,12 @@ type Migrator interface {
 }
 
 type migrator struct {
-	nsm           NSM
-	kms           PrimaryKMS
-	ssm           SSM
-	dek           DEK
-	staticSecrets []StaticSecret
+	nsm                       NSM
+	kms                       PrimaryKMS
+	ssm                       SSM
+	dek                       DEK
+	staticSecrets             []StaticSecret
+	migrationIntentBucketName string
 }
 
 func NewMigrator(
@@ -53,13 +54,15 @@ func NewMigrator(
 	ssm SSM,
 	dek DEK,
 	secrets []StaticSecret,
+	migrationIntentBucketName string,
 ) Migrator {
 	return &migrator{
-		nsm:           nsm,
-		kms:           kms,
-		ssm:           ssm,
-		dek:           dek,
-		staticSecrets: secrets,
+		nsm:                       nsm,
+		kms:                       kms,
+		ssm:                       ssm,
+		dek:                       dek,
+		staticSecrets:             secrets,
+		migrationIntentBucketName: migrationIntentBucketName,
 	}
 }
 
@@ -214,9 +217,10 @@ func (m *migrator) StartMigration(
 		m.nsm,
 		m.ssm,
 		persistedStateSnapshot{
-			kmsKeyID:      migrationKMS.KeyID(),
-			staticSecrets: transitionSecrets,
-			storageDEK:    dekCiphertext,
+			kmsKeyID:                  migrationKMS.KeyID(),
+			staticSecrets:             transitionSecrets,
+			storageDEK:                dekCiphertext,
+			migrationIntentBucketName: m.migrationIntentBucketName,
 		},
 	); err != nil {
 		return nil, fmt.Errorf(

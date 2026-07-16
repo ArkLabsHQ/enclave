@@ -20,6 +20,8 @@ var stateOriginTestSecrets = []StaticSecretMetadata{
 	{Name: "beta", EnvVar: "BETA"},
 }
 
+const stateOriginTestMigrationIntentBucket = "state-origin-migration-intent"
+
 func setStateOriginTestEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
@@ -53,7 +55,9 @@ func (k *stateOriginTestKMS) Decrypt(_ context.Context, ciphertext string) ([]by
 }
 
 func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
-	fake := &fakeSSM{params: map[string]string{}}
+	fake := &fakeSSM{params: map[string]string{
+		migrationIntentBucketParam(): stateOriginTestMigrationIntentBucket,
+	}}
 	maps.Copy(fake.params, params)
 	return fake, NewSSM(fake)
 }
@@ -92,10 +96,13 @@ func mustStateRoot(
 	}
 	dekCiphertext, err := ssm.MustGet(ctx, storageDEKCiphertextParam(keyID))
 	require.NoError(t, err)
+	migrationIntentBucketName, err := ssm.MustGet(ctx, migrationIntentBucketParam())
+	require.NoError(t, err)
 	root, err := stateRoot(persistedStateSnapshot{
-		kmsKeyID:      keyID,
-		staticSecrets: secrets,
-		storageDEK:    dekCiphertext,
+		kmsKeyID:                  keyID,
+		staticSecrets:             secrets,
+		storageDEK:                dekCiphertext,
+		migrationIntentBucketName: migrationIntentBucketName,
 	})
 	require.NoError(t, err)
 	return root
@@ -158,6 +165,13 @@ func TestLoadUnverifiedState(t *testing.T) {
 			name:   "genesis clean",
 			params: map[string]string{},
 			want:   startStateGenesis,
+		},
+		{
+			name: "missing migration intent bucket",
+			params: map[string]string{
+				migrationIntentBucketParam(): "UNSET",
+			},
+			wantErr: true,
 		},
 		{
 			name:    "genesis blocked by migration artifacts",
@@ -409,6 +423,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, established.dek)
 	require.Len(t, established.secrets, len(stateOriginTestSecrets))
+	require.Equal(t, stateOriginTestMigrationIntentBucket, established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[stateOriginReceiptParam(keyID)]
 	require.NoError(t, verifyStateOriginReceipt(
@@ -446,34 +461,53 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	require.Equal(t, "UNSET", fake.params[kmsKeyIDParam()])
 }
 
-func TestEstablishLoadedStateRejectsCiphertextSwapBeforeDecrypt(t *testing.T) {
+func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-resume"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
-	fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
-	root := mustStateRoot(t, ctx, ssm, keyID)
-	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
-	fake.params[stateOriginReceiptParam(keyID)] = att.docB64
-	fake.params[secretCiphertextParam("alpha", keyID)] = base64.StdEncoding.EncodeToString(
-		[]byte{0xff, 0xff, 0xff},
-	)
-	unverified, err := loadUnverifiedState(ctx, ssm)
-	require.NoError(t, err)
-	kms := &stateOriginTestKMS{keyID: keyID}
-	_, err = establishLoadedState(
-		ctx,
-		&nsmW{nsm: &fakeNSM{
-			session:     newStatefulNSMSession(t, map[uint][]byte{0: pcr0}),
-			verifyRoots: att.roots,
-		}},
-		kms,
-		ssm,
-		unverified,
-	)
-	require.Error(t, err)
-	require.Empty(t, kms.decryptCalls)
+	for _, tc := range []struct {
+		name  string
+		param string
+		value string
+	}{
+		{
+			name:  "ciphertext swap",
+			param: secretCiphertextParam("alpha", keyID),
+			value: base64.StdEncoding.EncodeToString([]byte{0xff, 0xff, 0xff}),
+		},
+		{
+			name:  "migration intent bucket change",
+			param: migrationIntentBucketParam(),
+			value: "repointed-migration-intent",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
+			root := mustStateRoot(t, ctx, ssm, keyID)
+			att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
+			fake.params[stateOriginReceiptParam(keyID)] = att.docB64
+			fake.params[tc.param] = tc.value
+			unverified, err := loadUnverifiedState(ctx, ssm)
+			require.NoError(t, err)
+			kms := &stateOriginTestKMS{keyID: keyID}
+
+			_, err = establishLoadedState(
+				ctx,
+				&nsmW{nsm: &fakeNSM{
+					session:     newStatefulNSMSession(t, map[uint][]byte{0: pcr0}),
+					verifyRoots: att.roots,
+				}},
+				kms,
+				ssm,
+				unverified,
+			)
+
+			require.ErrorContains(t, err, "invalid state-origin receipt")
+			require.Empty(t, kms.decryptCalls)
+		})
+	}
 }
 
 func TestEstablishLoadedStateMigration(t *testing.T) {

@@ -123,6 +123,7 @@ func Run(ctx context.Context, cfg Config) error {
 		NewSSMTTLCache(ssm, time.Second*5),
 		verified.dek,
 		verified.secrets,
+		verified.migrationIntentBucketName,
 	)
 
 	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {

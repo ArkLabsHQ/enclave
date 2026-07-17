@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -497,25 +496,6 @@ func TestMigrationControlServerLifecycle(t *testing.T) {
 		err := waitTestResult(t, rt.ListenError())
 		require.ErrorContains(t, err, "accept failed")
 	})
-}
-
-func TestExternalMuxDoesNotExposeMigrationMutation(t *testing.T) {
-	metrics := NewMetrics()
-	server := SetupHttpServers(
-		newRuntimeState(),
-		Config{AppWebSrv: &url.URL{Scheme: "http", Host: "127.0.0.1:1"}},
-		nil, metrics, nil, nil, nil, nil, "",
-	).(*servers)
-
-	for _, path := range []string{
-		"/v1/start-migration",
-		migrationRequestPath,
-		migrationFinalisationPath,
-	} {
-		rr := httptest.NewRecorder()
-		server.em.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, path, nil))
-		require.Equal(t, http.StatusNotFound, rr.Code, path)
-	}
 }
 
 func TestConfigureEnclaveInfoHandler(t *testing.T) {

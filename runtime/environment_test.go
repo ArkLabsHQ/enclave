@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -83,4 +84,46 @@ func TestApplyEnvOverrides(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, NewSSM(&fakeSSM{err: errors.New("access denied")}))
 		require.Error(t, err)
 	})
+}
+
+func TestIsDev(t *testing.T) {
+	cases := []struct {
+		name            string
+		dev, deployment string
+		want            bool
+	}{
+		{"ENCLAVE_DEV=true forces dev", "true", "prod", true},
+		{"ENCLAVE_DEV=false forces non-dev", "false", "dev", false},
+		{"unset falls back to deployment=dev", "", "dev", true},
+		{"unset falls back to deployment=prod", "", "prod", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_DEV", c.dev)
+			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			require.Equal(t, c.want, IsDev())
+		})
+	}
+}
+
+func TestClockPollInterval(t *testing.T) {
+	cases := []struct {
+		name                      string
+		override, dev, deployment string
+		want                      time.Duration
+	}{
+		{"explicit override wins even in prod", "2s", "", "prod", 2 * time.Second},
+		{"invalid override ignored, prod default", "garbage", "", "prod", time.Hour},
+		{"non-positive override ignored, prod default", "0s", "", "prod", time.Hour},
+		{"dev polls fast", "", "true", "prod", 5 * time.Second},
+		{"prod polls hourly", "", "", "prod", time.Hour},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_CLOCK_POLL_INTERVAL", c.override)
+			t.Setenv("ENCLAVE_DEV", c.dev)
+			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			require.Equal(t, c.want, clockPollInterval())
+		})
+	}
 }

@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM/KMS namespace and lock posture, the managed-secret set, and security
-// timing — a short anchor window would let the operator wait out the Object Lock
-// and roll back undetected.
+// nonOverridableEnv lists vars the SSM env overlay must never set. Most name the
+// SSM/KMS namespace and lock posture, the managed-secret set, or security timing
+// (a short anchor window would let the operator wait out the Object Lock and roll
+// back undetected). ENCLAVE_DEV would skip COSE verification when set.
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":         true,
 	"ENCLAVE_APP_NAME":           true,
@@ -22,6 +22,7 @@ var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_MIGRATION_COOLDOWN": true,
 	"ENCLAVE_SECRETS_CONFIG":     true,
 	"ENCLAVE_PREVIOUS_PCR0":      true,
+	"ENCLAVE_DEV":                true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
@@ -62,12 +63,19 @@ func getDeployment() string {
 	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
 		return d
 	}
-	return "dev"
+	return "test"
 }
 
-// skipCOSEVerification is dev-only; deployment is EIF-baked and not SSM-overridable.
+func IsDev() bool {
+	if v := strings.TrimSpace(os.Getenv("ENCLAVE_DEV")); v != "" {
+		return strings.EqualFold(v, "true")
+	}
+	return false
+}
+
+// skipCOSEVerification is dev-only; the dev signal is EIF-baked and not SSM-overridable.
 func skipCOSEVerification() bool {
-	return getDeployment() == "dev"
+	return IsDev()
 }
 
 func getAppName() string {
@@ -117,6 +125,21 @@ func getMigrationCooldown() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// clockPollInterval is the PTP servo poll cadence. It is read at boot, before the SSM
+// overlay runs, so only a baked/process ENCLAVE_CLOCK_POLL_INTERVAL takes effect; otherwise
+// dev polls fast (so the servo is observable in tests) and prod polls hourly.
+func clockPollInterval() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ENCLAVE_CLOCK_POLL_INTERVAL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	if IsDev() {
+		return 5 * time.Second
+	}
+	return 1 * time.Hour
 }
 
 // respPort is the TLS port for the RESP K/V listener.

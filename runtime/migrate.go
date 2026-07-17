@@ -7,17 +7,23 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
 // migrationPCRIndex stores the successor-PCR0 handoff commitment.
 const migrationPCRIndex = 31
 
-type StartMigrationRequest struct {
+type CompleteMigrationRequest struct {
 	NewPCR0 string `json:"new_pcr0"`
 }
 
-type StartMigrationResult struct {
+type MigrationRequest struct {
+	Action     string `json:"action"`
+	TargetPCR0 string `json:"target_pcr0,omitempty"`
+}
+
+type CompleteMigrationResult struct {
 	PCR0     string   `json:"pcr0"`
 	Exported []string `json:"exported"`
 }
@@ -27,43 +33,65 @@ type PreviousPCR0Info struct {
 	Attestation string
 }
 
-type CooldownStatus struct {
-	ConfiguredSeconds int
-	RemainingSeconds  int
-	Pending           bool
+type MigrationStatus struct {
+	State            string     `json:"state"`
+	SourcePCR0       string     `json:"source_pcr0,omitempty"`
+	TargetPCR0       string     `json:"target_pcr0,omitempty"`
+	Sequence         uint64     `json:"sequence,omitempty"`
+	Action           string     `json:"action,omitempty"`
+	PublishedAt      *time.Time `json:"published_at,omitempty"`
+	EligibleAt       *time.Time `json:"eligible_at,omitempty"`
+	RemainingSeconds int        `json:"remaining_seconds,omitempty"`
 }
 
+const (
+	migrationStateNone        = "none"
+	migrationStateCoolingDown = "cooling_down"
+	migrationStateEligible    = "eligible"
+	migrationStateAborted     = "aborted"
+)
+
 type Migrator interface {
-	StartMigration(ctx context.Context, newPCR0 string) (*StartMigrationResult, error)
+	HandleMigrationRequest(
+		ctx context.Context,
+		action, targetPCR0 string,
+	) (*MigrationStatus, error)
+	CompleteMigration(ctx context.Context, targetPCR0 string) (*CompleteMigrationResult, error)
 	PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error)
-	CooldownStatus(ctx context.Context) (*CooldownStatus, error)
+	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
 }
 
 type migrator struct {
-	nsm                       NSM
-	kms                       PrimaryKMS
-	ssm                       SSM
-	dek                       DEK
-	staticSecrets             []StaticSecret
-	migrationIntentBucketName string
+	mu            sync.Mutex
+	nsm           NSM
+	kms           PrimaryKMS
+	ssm           SSM
+	dek           DEK
+	staticSecrets []StaticSecret
+	intent        *migrationIntentLog
 }
 
 func NewMigrator(
 	nsm NSM,
 	kms PrimaryKMS,
 	ssm SSM,
+	s3 S3API,
 	dek DEK,
 	secrets []StaticSecret,
 	migrationIntentBucketName string,
-) Migrator {
-	return &migrator{
-		nsm:                       nsm,
-		kms:                       kms,
-		ssm:                       ssm,
-		dek:                       dek,
-		staticSecrets:             secrets,
-		migrationIntentBucketName: migrationIntentBucketName,
+) (Migrator, error) {
+	intent, err := newMigrationIntentLog(s3, nsm, migrationIntentBucketName)
+	if err != nil {
+		return nil, err
 	}
+	return &migrator{
+		nsm:           nsm,
+		kms:           kms,
+		ssm:           ssm,
+		dek:           dek,
+		staticSecrets: secrets,
+		intent:        intent,
+	}, nil
 }
 
 func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
@@ -83,50 +111,130 @@ func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, err
 	return &PreviousPCR0Info{PCR0: pcr0, Attestation: attest}, nil
 }
 
-func (m *migrator) CooldownStatus(ctx context.Context) (*CooldownStatus, error) {
-	cooldown := getMigrationCooldown()
-	configuredSeconds := int(cooldown.Seconds())
-
-	requestedAtStr, err := m.ssm.MayGet(ctx, migrationRequestedAtParam())
-	if err != nil {
-		return nil, fmt.Errorf("failed to read migration requested at SSM param: %w", err)
-	}
-
-	if requestedAtStr == "" {
-		return &CooldownStatus{
-			ConfiguredSeconds: configuredSeconds,
-			RemainingSeconds:  0,
-			Pending:           false,
-		}, nil
-	}
-
-	requestedAt, err := time.Parse(time.RFC3339, requestedAtStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse %s at as RFC3339 timestamp: %w",
-			migrationPreviousPCR0Param(), err)
-	}
-
-	deadline := requestedAt.Add(cooldown)
-	rem := time.Until(deadline)
-	if rem < 0 {
-		rem = 0
-	}
-
-	return &CooldownStatus{
-		ConfiguredSeconds: configuredSeconds,
-		RemainingSeconds:  int(rem.Seconds()),
-		Pending:           true,
-	}, nil
-}
-
-// StartMigration exports state under a PCR0-locked migration key, then flips KMSKeyID.
-func (m *migrator) StartMigration(
+func (m *migrator) HandleMigrationRequest(
 	ctx context.Context,
-	newPCR0 string,
-) (*StartMigrationResult, error) {
-	newPCR0Bytes, err := validateNewPCR0(newPCR0)
+	action, targetPCR0 string,
+) (*MigrationStatus, error) {
+	cooldown, err := getMigrationCooldown()
 	if err != nil {
 		return nil, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var head *migrationIntentHead
+	switch action {
+	case migrationIntentRequested:
+		head, err = m.intent.Request(ctx, targetPCR0)
+	case migrationIntentAborted:
+		head, err = m.intent.Abort(ctx)
+	default:
+		return nil, fmt.Errorf("unknown migration action %q", action)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return migrationStatusAt(head, cooldown, time.Now()), nil
+}
+
+func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
+	cooldown, err := getMigrationCooldown()
+	if err != nil {
+		return nil, err
+	}
+	head, err := m.intent.Head(ctx)
+	if err != nil {
+		return nil, err
+	}
+	status := migrationStatusAt(head, cooldown, time.Now())
+	if head == nil {
+		status.SourcePCR0, err = m.intent.sourcePCR0()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return status, nil
+}
+
+func migrationStatusAt(
+	head *migrationIntentHead,
+	cooldown time.Duration,
+	now time.Time,
+) *MigrationStatus {
+	if head == nil {
+		return &MigrationStatus{State: migrationStateNone}
+	}
+	publishedAt := head.PublishedAt
+	status := &MigrationStatus{
+		SourcePCR0:  head.SourcePCR0,
+		TargetPCR0:  head.TargetPCR0,
+		Sequence:    head.Sequence,
+		Action:      head.Action,
+		PublishedAt: &publishedAt,
+	}
+	if head.Action == migrationIntentAborted {
+		status.State = migrationStateAborted
+		return status
+	}
+
+	eligibleAt := head.PublishedAt.Add(cooldown)
+	status.EligibleAt = &eligibleAt
+	remaining := eligibleAt.Sub(now)
+	if remaining <= 0 {
+		status.State = migrationStateEligible
+		return status
+	}
+	status.State = migrationStateCoolingDown
+	seconds := remaining / time.Second
+	if remaining%time.Second != 0 {
+		seconds++
+	}
+	status.RemainingSeconds = int(seconds)
+	return status
+}
+
+// CompleteMigration exports state under a PCR0-locked migration key, then flips KMSKeyID.
+func (m *migrator) CompleteMigration(
+	ctx context.Context,
+	targetPCR0 string,
+) (*CompleteMigrationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	targetPCR0Bytes, err := validateNewPCR0(targetPCR0)
+	if err != nil {
+		return nil, err
+	}
+	targetPCR0 = hex.EncodeToString(targetPCR0Bytes)
+
+	status, err := m.MigrationStatus(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve migration intent: %w", err)
+	}
+	switch status.State {
+	case migrationStateNone:
+		return nil, errMigrationIntentAbsent
+	case migrationStateAborted:
+		return nil, errMigrationIntentAborted
+	}
+	if status.TargetPCR0 != targetPCR0 {
+		return nil, fmt.Errorf(
+			"%w: requested %s, got %s",
+			errMigrationIntentTargetMismatch,
+			status.TargetPCR0,
+			targetPCR0,
+		)
+	}
+	if status.State == migrationStateCoolingDown {
+		return nil, fmt.Errorf(
+			"%w: %d seconds remaining",
+			errMigrationCooldownActive,
+			status.RemainingSeconds,
+		)
+	}
+	if status.State != migrationStateEligible {
+		return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
 	}
 
 	pcr0, err := m.nsm.PCR0()
@@ -135,11 +243,11 @@ func (m *migrator) StartMigration(
 	}
 	ownPCR0 := hex.EncodeToString(pcr0)
 
-	if err := m.nsm.CommitPCR(migrationPCRIndex, newPCR0Bytes); err != nil {
+	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
 		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
 
-	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, newPCR0)
+	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create migration key: %w", err)
 	}
@@ -148,7 +256,7 @@ func (m *migrator) StartMigration(
 		"created migration KMS key",
 		"key_id", migrationKMS.KeyID(),
 		"own_pcr0", prefix16(ownPCR0),
-		"new_pcr0", prefix16(newPCR0),
+		"new_pcr0", prefix16(targetPCR0),
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
@@ -220,7 +328,7 @@ func (m *migrator) StartMigration(
 			kmsKeyID:                  migrationKMS.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
-			migrationIntentBucketName: m.migrationIntentBucketName,
+			migrationIntentBucketName: m.intent.bucket,
 		},
 	); err != nil {
 		return nil, fmt.Errorf(
@@ -237,15 +345,29 @@ func (m *migrator) StartMigration(
 
 	slog.Info("KMSKeyID updated to migration key", "key_id", migrationKMS.KeyID())
 
-	return &StartMigrationResult{
+	return &CompleteMigrationResult{
 		PCR0:     ownPCR0,
 		Exported: exportedNames,
 	}, nil
 }
 
-func (r StartMigrationRequest) Validate() error {
+func (r CompleteMigrationRequest) Validate() error {
 	_, err := validateNewPCR0(r.NewPCR0)
 	return err
+}
+
+func (r MigrationRequest) Validate() error {
+	switch r.Action {
+	case migrationIntentRequested:
+		if _, err := normalizePCR0(r.TargetPCR0); err != nil {
+			return fmt.Errorf("target_pcr0 %w", err)
+		}
+	case migrationIntentAborted:
+		return nil
+	default:
+		return fmt.Errorf("unknown migration action %q", r.Action)
+	}
+	return nil
 }
 
 func validateNewPCR0(pcr0 string) ([]byte, error) {

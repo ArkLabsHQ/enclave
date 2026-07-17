@@ -3,11 +3,48 @@ package runtime
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetMigrationCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "unset"},
+		{name: "zero", value: "0s"},
+		{name: "positive", value: "2m", want: 2 * time.Minute},
+		{name: "malformed", value: "later", wantErr: true},
+		{name: "negative", value: "-1s", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
+			got, err := getMigrationCooldown()
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
+	err := (&Config{
+		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,
+		AppWebSrv: &url.URL{Scheme: "http", Host: "127.0.0.1:7074"},
+	}).Validate()
+	require.ErrorContains(t, err, "ENCLAVE_MIGRATION_COOLDOWN")
+}
 
 func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")

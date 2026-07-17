@@ -385,6 +385,7 @@ type migrationIntentS3Failure struct {
 	listErr          error
 	getErr           error
 	readErr          error
+	putErr           error
 	missingVersionID bool
 }
 
@@ -419,6 +420,9 @@ func (f *migrationIntentS3Failure) PutObject(
 	in *s3.PutObjectInput,
 	opts ...func(*s3.Options),
 ) (*s3.PutObjectOutput, error) {
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
 	out, err := f.fakeS3.PutObject(ctx, in, opts...)
 	if out != nil && f.missingVersionID {
 		out.VersionId = nil
@@ -451,15 +455,23 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 			configure(failing)
 			fx.log.s3 = failing
 			_, err := fx.log.Head(ctx)
-			require.Error(t, err)
+			require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 		})
 	}
+
+	t.Run("put", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		fx.log.s3 = &migrationIntentS3Failure{fakeS3: fx.s3, putErr: errors.New("put failed")}
+		_, err := fx.log.Request(ctx, target)
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
 
 	t.Run("missing put version ID", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		fx.log.s3 = &migrationIntentS3Failure{fakeS3: fx.s3, missingVersionID: true}
 		_, err := fx.log.Request(ctx, target)
 		require.ErrorContains(t, err, "no version ID")
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 	})
 }
 

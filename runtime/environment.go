@@ -108,16 +108,19 @@ func kmsKeyIDParam() string {
 	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
 }
 
-func getMigrationCooldown() time.Duration {
+func getMigrationCooldown() (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
 	if v == "" {
-		return 0
+		return 0, nil
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", v, err)
 	}
-	return d
+	if d < 0 {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+	}
+	return d, nil
 }
 
 func migrationIntentRetention() time.Duration {
@@ -241,11 +244,6 @@ func migrationPreviousPCR0Param() string {
 // attestation document.
 func migrationPreviousPCR0AttestationParam() string {
 	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
-}
-
-// migrationRequestedAtParam: SSM path for the scheduled migration timestamp.
-func migrationRequestedAtParam() string {
-	return fmt.Sprintf("/%s/%s/MigrationRequestedAt", getDeployment(), getAppName())
 }
 
 func envVarOverridePath(name string) string {

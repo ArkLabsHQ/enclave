@@ -29,9 +29,12 @@ const (
 )
 
 var (
-	errMigrationIntentAmbiguous = errors.New("migration intent: ambiguous head")
-	errMigrationIntentAbsent    = errors.New("migration intent: no request to abort")
-	errMigrationIntentAborted   = errors.New("migration intent: already aborted")
+	errMigrationIntentAmbiguous        = errors.New("migration intent: ambiguous head")
+	errMigrationIntentAbsent           = errors.New("migration intent: absent")
+	errMigrationIntentAborted          = errors.New("migration intent: aborted")
+	errMigrationIntentTargetMismatch   = errors.New("migration intent: target mismatch")
+	errMigrationCooldownActive         = errors.New("migration cooldown: active")
+	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 )
 
 type migrationIntentV1 struct {
@@ -187,10 +190,10 @@ func (l *migrationIntentLog) append(
 		ObjectLockRetainUntilDate: aws.Time(time.Now().Add(l.retention)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("put migration intent sequence %d: %w", sequence, err)
+		return nil, fmt.Errorf("%w: put migration intent sequence %d: %w", errMigrationIntentStoreUnavailable, sequence, err)
 	}
 	if out == nil || aws.ToString(out.VersionId) == "" {
-		return nil, fmt.Errorf("put migration intent sequence %d: S3 returned no version ID", sequence)
+		return nil, fmt.Errorf("%w: put migration intent sequence %d: S3 returned no version ID", errMigrationIntentStoreUnavailable, sequence)
 	}
 
 	scan, err := l.scan(ctx, sourcePCR0)
@@ -198,7 +201,7 @@ func (l *migrationIntentLog) append(
 		return nil, err
 	}
 	if scan.maxSequence < sequence {
-		return nil, fmt.Errorf("migration intent sequence %d missing after write", sequence)
+		return nil, fmt.Errorf("%w: migration intent sequence %d missing after write", errMigrationIntentStoreUnavailable, sequence)
 	}
 	return scan.resolvedHead()
 }
@@ -228,7 +231,7 @@ func (l *migrationIntentLog) scan(
 			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			return scan, fmt.Errorf("list migration intents: %w", err)
+			return scan, fmt.Errorf("%w: list migration intents: %w", errMigrationIntentStoreUnavailable, err)
 		}
 		for _, version := range out.Versions {
 			key := aws.ToString(version.Key)
@@ -251,7 +254,7 @@ func (l *migrationIntentLog) scan(
 			return scan, nil
 		}
 		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return scan, fmt.Errorf("list migration intents: truncated response missing markers")
+			return scan, fmt.Errorf("%w: list migration intents: truncated response missing markers", errMigrationIntentStoreUnavailable)
 		}
 		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
 	}
@@ -269,12 +272,12 @@ func (l *migrationIntentLog) readVersion(
 		VersionId: aws.String(versionID),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("get migration intent %q version %q: %w", key, versionID, err)
+		return nil, false, fmt.Errorf("%w: get migration intent %q version %q: %w", errMigrationIntentStoreUnavailable, key, versionID, err)
 	}
 	defer func() { _ = out.Body.Close() }()
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf("read migration intent %q version %q: %w", key, versionID, err)
+		return nil, false, fmt.Errorf("%w: read migration intent %q version %q: %w", errMigrationIntentStoreUnavailable, key, versionID, err)
 	}
 	entry, err := decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||

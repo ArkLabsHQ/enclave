@@ -117,21 +117,25 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
-	migrator := NewMigrator(
+	migrator, err := NewMigrator(
 		nsm,
 		verified.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
+		aws.S3,
 		verified.dek,
 		verified.secrets,
 		verified.migrationIntentBucketName,
 	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize migrator: %w", err)
+	}
 
 	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
-	if err := servers.ConfigureMigrationHandler(ctx, migrator); err != nil {
-		return fmt.Errorf("failed to configure migration handler: %w", err)
+	if err := servers.StartMigrationControlServer(ctx, migrator); err != nil {
+		return fmt.Errorf("failed to start migration control server: %w", err)
 	}
 
 	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
@@ -356,7 +360,7 @@ func newRuntimeState() *runtimeState {
 	return &runtimeState{
 		haltCh:      make(chan struct{}),
 		tlsReadyCh:  make(chan struct{}),
-		listenErrCh: make(chan error, 3),
+		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),
 	}
 }

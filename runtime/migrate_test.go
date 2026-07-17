@@ -126,70 +126,119 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("genesis", func(t *testing.T) {
-		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, "").PreviousPCR0Info(ctx)
+		m, err := NewMigrator(
+			nil, nil, NewSSM(&fakeSSM{}), newFakeS3(), nil, nil, migrationIntentTestBucket,
+		)
+		require.NoError(t, err)
+		info, err := m.PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "genesis"}, info)
 	})
 
 	t.Run("recorded predecessor", func(t *testing.T) {
-		info, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
+		m, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationPreviousPCR0Param():            "abc123",
 			migrationPreviousPCR0AttestationParam(): "attestation",
-		}}), nil, nil, "").PreviousPCR0Info(ctx)
+		}}), newFakeS3(), nil, nil, migrationIntentTestBucket)
+		require.NoError(t, err)
+		info, err := m.PreviousPCR0Info(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, &PreviousPCR0Info{PCR0: "abc123", Attestation: "attestation"}, info)
 	})
 }
 
-func TestMigratorCooldownStatus(t *testing.T) {
+func TestMigratorMigrationStatus(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "2m")
 
 	ctx := context.Background()
+	targetPCR0 := strings.Repeat("cd", 48)
+	setup := func(t *testing.T) (*migrator, *migrationIntentFixture) {
+		t.Helper()
+		fx := newMigrationIntentFixture(t)
+		return &migrator{nsm: fx.nsm, intent: fx.log}, fx
+	}
 
 	t.Run("none", func(t *testing.T) {
-		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{}), nil, nil, "").CooldownStatus(ctx)
+		m, fx := setup(t)
+		status, err := m.MigrationStatus(ctx)
 
 		require.NoError(t, err)
-		require.Equal(t, &CooldownStatus{ConfiguredSeconds: 120}, status)
+		require.Equal(t, &MigrationStatus{State: migrationStateNone, SourcePCR0: fx.source}, status)
 	})
 
 	t.Run("pending", func(t *testing.T) {
-		status, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
-			migrationRequestedAtParam(): time.Now().UTC().Format(time.RFC3339),
-		}}), nil, nil, "").CooldownStatus(ctx)
+		m, _ := setup(t)
+		_, err := m.HandleMigrationRequest(ctx, migrationIntentRequested, targetPCR0)
+		require.NoError(t, err)
+		status, err := m.MigrationStatus(ctx)
 
 		require.NoError(t, err)
-		require.True(t, status.Pending)
-		require.Equal(t, 120, status.ConfiguredSeconds)
+		require.Equal(t, migrationStateCoolingDown, status.State)
 		require.Greater(t, status.RemainingSeconds, 0)
 		require.LessOrEqual(t, status.RemainingSeconds, 120)
 	})
 
-	t.Run("bad timestamp", func(t *testing.T) {
-		_, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
-			migrationRequestedAtParam(): "not-time",
-		}}), nil, nil, "").CooldownStatus(ctx)
+	t.Run("aborted", func(t *testing.T) {
+		m, _ := setup(t)
+		_, err := m.HandleMigrationRequest(ctx, migrationIntentRequested, targetPCR0)
+		require.NoError(t, err)
+		_, err = m.HandleMigrationRequest(ctx, migrationIntentAborted, "")
+		require.NoError(t, err)
+		status, err := m.MigrationStatus(ctx)
 
-		require.Error(t, err)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAborted, status.State)
+		require.Zero(t, status.RemainingSeconds)
+	})
+
+	t.Run("invalid cooldown fails before publication", func(t *testing.T) {
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
+		m, fx := setup(t)
+
+		_, err := m.HandleMigrationRequest(ctx, migrationIntentRequested, targetPCR0)
+
+		require.ErrorContains(t, err, "ENCLAVE_MIGRATION_COOLDOWN")
+		require.Empty(t, fx.s3.objects)
 	})
 }
 
-func TestStartMigrationRequestValidate(t *testing.T) {
+func TestMigrationStatusAt(t *testing.T) {
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	cooldown := 2 * time.Minute
+	head := &migrationIntentHead{
+		SourcePCR0:  strings.Repeat("ab", 48),
+		TargetPCR0:  strings.Repeat("cd", 48),
+		Action:      migrationIntentRequested,
+		Sequence:    1,
+		PublishedAt: now.Add(-cooldown),
+	}
+
+	status := migrationStatusAt(head, cooldown, now)
+	require.Equal(t, migrationStateEligible, status.State)
+	require.Zero(t, status.RemainingSeconds)
+	require.Equal(t, now, *status.EligibleAt)
+
+	status = migrationStatusAt(head, cooldown, now.Add(-time.Nanosecond))
+	require.Equal(t, migrationStateCoolingDown, status.State)
+	require.Equal(t, 1, status.RemainingSeconds)
+}
+
+func TestCompleteMigrationRequestValidate(t *testing.T) {
 	validPCR0 := strings.Repeat("a", 96)
 
 	for _, tc := range []struct {
 		name    string
-		request StartMigrationRequest
+		request CompleteMigrationRequest
 		wantErr bool
 	}{
-		{name: "missing", request: StartMigrationRequest{}, wantErr: true},
-		{name: "short", request: StartMigrationRequest{NewPCR0: "abc"}, wantErr: true},
-		{name: "bad hex", request: StartMigrationRequest{NewPCR0: strings.Repeat("z", 96)}, wantErr: true},
-		{name: "valid", request: StartMigrationRequest{NewPCR0: validPCR0}},
+		{name: "missing", request: CompleteMigrationRequest{}, wantErr: true},
+		{name: "short", request: CompleteMigrationRequest{NewPCR0: "abc"}, wantErr: true},
+		{name: "bad hex", request: CompleteMigrationRequest{NewPCR0: strings.Repeat("z", 96)}, wantErr: true},
+		{name: "valid", request: CompleteMigrationRequest{NewPCR0: validPCR0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.request.Validate()
@@ -202,7 +251,33 @@ func TestStartMigrationRequestValidate(t *testing.T) {
 	}
 }
 
-func TestStartMigration(t *testing.T) {
+func TestMigrationRequestValidate(t *testing.T) {
+	validPCR0 := strings.Repeat("a", 96)
+
+	for _, tc := range []struct {
+		name    string
+		request MigrationRequest
+		wantErr bool
+	}{
+		{name: "missing action", request: MigrationRequest{}, wantErr: true},
+		{name: "unknown action", request: MigrationRequest{Action: "replace"}, wantErr: true},
+		{name: "requested without target", request: MigrationRequest{Action: migrationIntentRequested}, wantErr: true},
+		{name: "requested with invalid target", request: MigrationRequest{Action: migrationIntentRequested, TargetPCR0: "abc"}, wantErr: true},
+		{name: "requested", request: MigrationRequest{Action: migrationIntentRequested, TargetPCR0: validPCR0}},
+		{name: "aborted", request: MigrationRequest{Action: migrationIntentAborted}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.request.Validate()
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCompleteMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
 	const migrationIntentBucketName = "migration-intent-bucket"
 
@@ -221,6 +296,7 @@ func TestStartMigration(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", oldPCR0Hex)
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "0s")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing_key"}]`)
 
 	ctx := context.Background()
@@ -230,39 +306,56 @@ func TestStartMigration(t *testing.T) {
 			0:                 oldPCR0,
 			migrationPCRIndex: make([]byte, 48),
 		})
-		nsm := &nsmW{nsm: &fakeNSM{session: session}}
+		nsm := &nsmW{nsm: &fakeNSM{
+			session:     session,
+			verifyRoots: session.attestationSign.roots,
+		}}
 		ssmf := &fakeSSM{params: map[string]string{
 			migrationIntentBucketParam(): migrationIntentBucketName,
 		}}
 		ssm := NewSSM(ssmf)
+		s3f := newFakeS3()
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
 		fx := &startMigrationFixture{
 			session: session,
 			ssmf:    ssmf,
 			ssm:     ssm,
+			s3f:     s3f,
 			kmsf:    kmsf,
 		}
 
 		for _, opt := range opts {
 			opt(fx)
 		}
-		fx.m = NewMigrator(
+		m, err := NewMigrator(
 			nsm,
 			&kmsW{nsm: nsm, kms: kmsf, sts: sts, keyID: "old-key"},
 			fx.ssm,
+			s3f,
 			&dek{key: dekKey},
 			[]StaticSecret{secret},
 			migrationIntentBucketName,
-		).(*migrator)
+		)
+		require.NoError(t, err)
+		fx.m = m.(*migrator)
 		return fx
+	}
+	request := func(t *testing.T, fx *startMigrationFixture, targetPCR0 string) {
+		t.Helper()
+		status, err := fx.m.HandleMigrationRequest(
+			ctx, migrationIntentRequested, targetPCR0,
+		)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateEligible, status.State)
 	}
 
 	t.Run("happy path commits raw PCR0 and predecessor validates", func(t *testing.T) {
 		fx := setup(t)
 		fx.ssmf.params[migrationIntentBucketParam()] = "repointed-after-startup"
+		request(t, fx, newPCR0)
 
-		got, err := fx.m.StartMigration(ctx, newPCR0)
+		got, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.NoError(t, err)
 		require.Empty(t, fx.ssmf.calls, "migration must not read successor ciphertexts back")
@@ -308,17 +401,131 @@ func TestStartMigration(t *testing.T) {
 	t.Run("rejects invalid new PCR0", func(t *testing.T) {
 		fx := setup(t)
 
-		_, err := fx.m.StartMigration(ctx, "not-hex")
+		_, err := fx.m.CompleteMigration(ctx, "not-hex")
 
 		require.Error(t, err)
 		require.Empty(t, fx.session.requests)
 	})
 
+	t.Run("requires a published intent with zero cooldown", func(t *testing.T) {
+		fx := setup(t)
+
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+
+		require.ErrorIs(t, err, errMigrationIntentAbsent)
+		requireNoMigrationSideEffects(t, fx)
+	})
+
+	t.Run("rejects active cooldown", func(t *testing.T) {
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "2m")
+		fx := setup(t)
+		status, err := fx.m.HandleMigrationRequest(ctx, migrationIntentRequested, newPCR0)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateCoolingDown, status.State)
+
+		_, err = fx.m.CompleteMigration(ctx, newPCR0)
+
+		require.ErrorIs(t, err, errMigrationCooldownActive)
+		requireNoMigrationSideEffects(t, fx)
+	})
+
+	t.Run("rejects aborted intent", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		_, err := fx.m.HandleMigrationRequest(ctx, migrationIntentAborted, "")
+		require.NoError(t, err)
+
+		_, err = fx.m.CompleteMigration(ctx, newPCR0)
+
+		require.ErrorIs(t, err, errMigrationIntentAborted)
+		requireNoMigrationSideEffects(t, fx)
+	})
+
+	t.Run("rejects mismatched target", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, strings.Repeat("ef", 48))
+
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+
+		require.ErrorIs(t, err, errMigrationIntentTargetMismatch)
+		requireNoMigrationSideEffects(t, fx)
+	})
+
+	t.Run("fails closed on intent store error", func(t *testing.T) {
+		fx := setup(t)
+		fx.m.intent.s3 = &migrationIntentS3Failure{
+			fakeS3:  fx.s3f,
+			listErr: errors.New("list failed"),
+		}
+
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+
+		require.ErrorContains(t, err, "list failed")
+		requireNoMigrationSideEffects(t, fx)
+	})
+
+	t.Run("recovers intent after migrator restart", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		restarted, err := NewMigrator(
+			fx.m.nsm,
+			fx.m.kms,
+			fx.ssm,
+			fx.s3f,
+			fx.m.dek,
+			fx.m.staticSecrets,
+			migrationIntentBucketName,
+		)
+		require.NoError(t, err)
+
+		_, err = restarted.CompleteMigration(ctx, newPCR0)
+
+		require.NoError(t, err)
+		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam()])
+	})
+
+	t.Run("serializes request and completion", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		blocking := &blockingPrimaryKMS{
+			PrimaryKMS: fx.m.kms,
+			entered:    make(chan struct{}),
+			release:    make(chan struct{}),
+		}
+		fx.m.kms = blocking
+
+		completeDone := make(chan error, 1)
+		go func() {
+			_, err := fx.m.CompleteMigration(ctx, newPCR0)
+			completeDone <- err
+		}()
+		<-blocking.entered
+
+		requestDone := make(chan error, 1)
+		go func() {
+			_, err := fx.m.HandleMigrationRequest(
+				ctx, migrationIntentRequested, strings.Repeat("ef", 48),
+			)
+			requestDone <- err
+		}()
+
+		select {
+		case err := <-requestDone:
+			t.Fatalf("request completed during finalisation: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(blocking.release)
+		require.ErrorContains(t, <-completeDone, "blocked migration KMS creation")
+		require.NoError(t, <-requestDone)
+	})
+
 	t.Run("fails when PCR31 already committed to another target", func(t *testing.T) {
 		fx := setup(t)
 		fx.session.pcrs[migrationPCRIndex] = pcrExtendFromZero(bytes.Repeat([]byte{0xee}, 48))
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit new PCR0")
@@ -328,8 +535,9 @@ func TestStartMigration(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.kmsf.createKeyErr = errors.New("create failed")
 		})
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to create migration key")
@@ -339,8 +547,9 @@ func TestStartMigration(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.kmsf.encryptErr = errors.New("encrypt failed")
 		})
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to re-encrypt secret signing_key")
@@ -352,8 +561,9 @@ func TestStartMigration(t *testing.T) {
 				storageDEKCiphertextParam(migrationKeyID): errors.New("set failed"),
 			}
 		})
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "DEK export failed")
@@ -365,8 +575,9 @@ func TestStartMigration(t *testing.T) {
 				migrationStateOriginReceiptParam(migrationKeyID): errors.New("set failed"),
 			}
 		})
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to write migration-transition receipt")
@@ -378,8 +589,9 @@ func TestStartMigration(t *testing.T) {
 				kmsKeyIDParam(): errors.New("set failed"),
 			}
 		})
+		request(t, fx, newPCR0)
 
-		_, err := fx.m.StartMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx, newPCR0)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to update current KMS key ID")
@@ -402,7 +614,42 @@ type startMigrationFixture struct {
 	session *fakeNSMSession
 	ssmf    *fakeSSM
 	ssm     SSM
+	s3f     *fakeS3
 	kmsf    *fakeKMS
+}
+
+type blockingPrimaryKMS struct {
+	PrimaryKMS
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (k *blockingPrimaryKMS) CreateMigrationKMS(
+	context.Context,
+	string,
+) (KMS, error) {
+	close(k.entered)
+	<-k.release
+	return nil, errors.New("blocked migration KMS creation")
+}
+
+func requireNoMigrationSideEffects(t *testing.T, fx *startMigrationFixture) {
+	t.Helper()
+	require.Equal(t, make([]byte, 48), fx.session.pcrs[migrationPCRIndex])
+	require.False(t, fx.session.locks[migrationPCRIndex])
+
+	fx.kmsf.mu.Lock()
+	require.Empty(t, fx.kmsf.keys)
+	require.Empty(t, fx.kmsf.blobs)
+	fx.kmsf.mu.Unlock()
+
+	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
+	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0Param()])
+	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam()])
+	for name := range fx.ssmf.params {
+		require.NotContains(t, name, "/Ciphertext/")
+		require.NotContains(t, name, "StateOriginReceipt/")
+	}
 }
 
 func requireKMSCiphertextPlaintext(

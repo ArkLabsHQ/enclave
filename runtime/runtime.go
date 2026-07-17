@@ -24,7 +24,6 @@ type RuntimeState interface {
 	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
-	// GetTLSCertCallback blocks until TLS is ready.
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
 	NotifyListenerError(err error)
 	ListenError() <-chan error
@@ -37,9 +36,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	// Sync the clock to the hypervisor PTP source before anything dials AWS
-	// (TLS cert validation) or serves traffic. No-op without /dev/ptp0.
-	StartClockSync(ctx)
+	if err := StartClockSyncer(ctx); err != nil {
+		return fmt.Errorf("clock sync failed: %w", err)
+	}
 
 	if err := StartNetorking(ctx, cfg); err != nil {
 		return fmt.Errorf("starting networking failed: %w", err)

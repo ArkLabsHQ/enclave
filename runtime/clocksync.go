@@ -2,53 +2,140 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// ClockSyncer disciplines CLOCK_REALTIME against the parent instance's PTP
+// hardware clock (/dev/ptp0), compensating for oscillator frequency drift to
+// maintain an accurate enclave clock.
+//
+// On each synchronization interval it measures:
+//
+//	offset = PHC - CLOCK_REALTIME
+//
+// The measured offset is fed into a PI (proportional-integral) controller that
+// computes a frequency adjustment applied via ADJ_FREQUENCY. Large offsets are
+// treated as gross errors and corrected with ClockSettime.
+//
+// The proportional term provides a fast response to the current offset, while
+// the integral term continuously estimates the oscillator's frequency error,
+// allowing the clock to converge to zero steady-state offset.
+//
+// This follows the same control strategy as linuxptp's PI clock servo, with
+// gains tuned for the enclave's longer synchronization interval. Unlike a
+// conventional Linux system, a Nitro Enclave cannot run its own network-based
+// time synchronization service, so CLOCK_REALTIME would otherwise accumulate
+// drift over time.
+//
+// Sign convention: offset = PHC - CLOCK_REALTIME. A positive offset means
+// CLOCK_REALTIME is behind the PHC, so a positive frequency correction speeds
+// it up.
+//
+// References:
+//   - PI controller: https://en.wikipedia.org/wiki/PID_controller
+//   - linuxptp PI servo: https://github.com/richardcochran/linuxptp/blob/master/pi.c
+
 const (
-	ptpDevicePath          = "/dev/ptp0"
-	clockSyncInterval      = 5 * time.Second
-	clockSyncSlewThreshold = 5 * time.Millisecond
+	ptpDevicePath            = "/dev/ptp0"
+	defaultClockPollInterval = 1 * time.Hour
+	extendedProbes           = 9
+
+	freqScale          = 1 << 16 // ppm << 16
+	kernelMaxFreqPpm   = 500.0
+	nsPerPpmPerSec     = 1000.0 // 1 ppm == 1 us/s == 1000 ns/s
+	nsPerSecond        = 1_000_000_000
+	defaultMaxStepNs   = 100 * 1_000_000 // 100 ms
+	defaultMaxUncertNs = 100 * 1_000     // 100 us
 )
 
-// StartClockSync binds CLOCK_REALTIME to the hypervisor's PTP clock (/dev/ptp0),
-// which the host cannot forge or skew. It hard-steps at boot, then slews for the
-// enclave's lifetime (until ctx is cancelled). No-op if /dev/ptp0 is absent
-// (e.g. QEMU without ptp_kvm). Call once at the start of Run, before any
-// outbound TLS validates certs or listeners serve traffic.
-func StartClockSync(ctx context.Context) {
+// offsetMeasurement is one PHC/REALTIME comparison.
+type offsetMeasurement struct {
+	xMonoNs  int64
+	phcNs    int64
+	offsetNs int64
+	uncertNs int64
+}
+
+type servoConfig struct {
+	kp           float64 // proportional gain (fraction of the offset nulled per interval)
+	ki           float64 // integral gain
+	freqClampPpm float64
+	maxStepNs    int64
+	maxUncertNs  int64
+}
+
+func defaultServoConfig() servoConfig {
+	return servoConfig{
+		kp:           0.5,
+		ki:           0.05,
+		freqClampPpm: 100.0,
+		maxStepNs:    defaultMaxStepNs,
+		maxUncertNs:  defaultMaxUncertNs,
+	}
+}
+
+// clockSyncer owns the open PHC device and carries the PI servo state inline
+// (integralPpm is the standing frequency correction; lastXMonoNs/hasPreviousMeasurement
+// bound the per-poll interval).
+type clockSyncer struct {
+	file     *os.File
+	fd       int
+	interval time.Duration
+
+	cfg                    servoConfig
+	integralPpm            float64 // integral term: the standing frequency correction
+	lastXMonoNs            int64
+	hasPreviousMeasurement bool
+}
+
+func StartClockSyncer(ctx context.Context) error {
+	cs, err := newClockSyncer()
+	if err != nil {
+		return err
+	}
+	go cs.run(ctx)
+	return nil
+}
+
+func newClockSyncer() (*clockSyncer, error) {
 	file, err := os.OpenFile(ptpDevicePath, os.O_RDONLY, 0)
 	if err != nil {
-		slog.Warn("clock sync disabled: /dev/ptp0 unavailable", "error", err)
-		return
+		return nil, fmt.Errorf("open %s: %w", ptpDevicePath, err)
 	}
-	// The clock id is derived from the live fd, so runClockSync keeps it open.
+	// The dynamic clock id is derived from the live fd, so the syncer keeps it open.
 	phc := fdToClockID(file.Fd())
 
-	var ptp unix.Timespec
+	var ptp, sys unix.Timespec
 	if err := unix.ClockGettime(phc, &ptp); err != nil {
-		slog.Warn("clock sync disabled: cannot read PTP clock", "error", err)
 		_ = file.Close()
-		return
+		return nil, fmt.Errorf("read PTP clock %s: %w", ptpDevicePath, err)
+	}
+	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &sys); err == nil {
+		slog.Info("clock sync: initial offset before hard-step", "offset_ms", clockOffsetNsec(ptp, sys)/1_000_000)
 	}
 	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
-		slog.Warn("clock sync: initial hard-step failed; slew loop will converge", "error", err)
+		slog.Warn("clock sync: initial hard-step failed; servo will converge", "error", err)
 	} else {
 		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
 	}
 
-	go runClockSync(ctx, file, phc)
+	return &clockSyncer{
+		file:     file,
+		fd:       int(file.Fd()),
+		interval: defaultClockPollInterval,
+		cfg:      defaultServoConfig(),
+	}, nil
 }
 
-// runClockSync gradually slews CLOCK_REALTIME toward the PTP clock until ctx is
-// cancelled, then releases the device. ADJ_OFFSET_SINGLESHOT never steps backward.
-func runClockSync(ctx context.Context, file *os.File, phc int32) {
-	defer func() { _ = file.Close() }()
-	ticker := time.NewTicker(clockSyncInterval)
+func (cs *clockSyncer) run(ctx context.Context) {
+	defer func() { _ = cs.file.Close() }()
+	ticker := time.NewTicker(cs.interval)
 	defer ticker.Stop()
 
 	for {
@@ -58,38 +145,110 @@ func runClockSync(ctx context.Context, file *os.File, phc int32) {
 			return
 		case <-ticker.C:
 		}
-
-		var ptp, sys unix.Timespec
-		if err := unix.ClockGettime(phc, &ptp); err != nil {
-			slog.Warn("clock sync: read PTP clock", "error", err)
-			continue
-		}
-		if err := unix.ClockGettime(unix.CLOCK_REALTIME, &sys); err != nil {
-			slog.Warn("clock sync: read system clock", "error", err)
-			continue
+		if err := cs.step(); err != nil {
+			slog.Error("clock sync: step failed", "error", err)
 		}
 
-		offsetNsec := clockOffsetNsec(ptp, sys)
-
-		magnitudeNsec := offsetNsec
-		if magnitudeNsec < 0 {
-			magnitudeNsec = -magnitudeNsec
-		}
-		if magnitudeNsec <= clockSyncSlewThreshold.Nanoseconds() {
-			continue
-		}
-
-		// ADJ_OFFSET_SINGLESHOT offset is in microseconds; sign sets the direction.
-		tx := unix.Timex{
-			Modes:  unix.ADJ_OFFSET_SINGLESHOT,
-			Offset: offsetNsec / 1000,
-		}
-		if _, err := unix.ClockAdjtime(unix.CLOCK_REALTIME, &tx); err != nil {
-			slog.Warn("clock sync: slew failed", "error", err, "offset_us", offsetNsec/1000)
-			continue
-		}
-		slog.Debug("clock sync: slewed CLOCK_REALTIME toward PTP", "offset_ms", offsetNsec/1_000_000)
 	}
+}
+
+// step is one poll cycle: measure the offset, run the PI loop, apply the correction.
+func (cs *clockSyncer) step() error {
+	offsetMeasurement, err := cs.measureOffset()
+	if err != nil {
+		return fmt.Errorf("measure offset: %w", err)
+	}
+	if err := cs.adjust(offsetMeasurement); err != nil {
+		return fmt.Errorf("apply adjustment: %w", err)
+	}
+	return nil
+}
+
+var (
+	clockAdjtime = unix.ClockAdjtime
+	clockSettime = unix.ClockSettime
+)
+
+// adjust folds one measurement into the PI loop and applies the resulting correction.
+func (cs *clockSyncer) adjust(m offsetMeasurement) error {
+	raw := m.offsetNs
+	// Gross offset: jump the clock and restart the loop (the standing frequency persists).
+	if raw > cs.cfg.maxStepNs || raw < -cs.cfg.maxStepNs {
+		cs.hasPreviousMeasurement = false
+		ts := unix.NsecToTimespec(m.phcNs)
+		err := clockSettime(unix.CLOCK_REALTIME, &ts)
+		if err == nil {
+			slog.Info("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)
+		}
+		return err
+	}
+
+	if cs.cfg.maxUncertNs > 0 && m.uncertNs > cs.cfg.maxUncertNs {
+		slog.Warn("clock sync: skipped noisy measurement", "uncert_us", float64(m.uncertNs)/1e3)
+		return nil
+	}
+
+	applied := cs.integralPpm // warm-up holds the standing integral until there is an interval
+	proportionalPpm := 0.0
+	if correctingFreqPpm, ok := cs.frequencyErrorPpm(m); ok {
+		cs.integralPpm = clampFloat(cs.integralPpm+cs.cfg.ki*correctingFreqPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+		proportionalPpm = cs.cfg.kp * correctingFreqPpm
+		applied = clampFloat(proportionalPpm+cs.integralPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+	}
+	cs.lastXMonoNs = m.xMonoNs
+	cs.hasPreviousMeasurement = true
+
+	tx := unix.Timex{
+		Modes:  unix.ADJ_FREQUENCY | unix.ADJ_STATUS,
+		Status: unix.STA_FREQHOLD,
+		Freq:   ppmToKernelFreq(applied),
+	}
+	if _, err := clockAdjtime(unix.CLOCK_REALTIME, &tx); err != nil {
+		return err
+	}
+
+	slog.Info("clock sync: disciplined",
+		"freq_ppm", applied, // what is applied: proportional + integral
+		"integral_ppm", cs.integralPpm,
+		"proportional_ppm", proportionalPpm,
+		"offset_us", float64(raw)/1e3,
+	)
+	return nil
+}
+
+func (cs *clockSyncer) frequencyErrorPpm(m offsetMeasurement) (ppm float64, ok bool) {
+	elapsedSeconds := float64(m.xMonoNs-cs.lastXMonoNs) / nsPerSecond
+	if !cs.hasPreviousMeasurement || elapsedSeconds <= 0 {
+		return 0, false
+	}
+	return float64(m.offsetNs) / (elapsedSeconds * nsPerPpmPerSec), true
+}
+
+func (cs *clockSyncer) measureOffset() (offsetMeasurement, error) {
+	if p, err := unix.IoctlPtpSysOffsetPrecise(cs.fd); err == nil {
+		return measurementFromPrecisePtp(p), nil
+	}
+	// Fallback: EXTENDED reports system time on CLOCK_REALTIME
+	e, err := unix.IoctlPtpSysOffsetExtended(cs.fd, extendedProbes)
+	if err != nil {
+		return offsetMeasurement{}, fmt.Errorf("PTP_SYS_OFFSET_EXTENDED: %w", err)
+	}
+	sample := measurementFromExtendedPtp(e)
+	var raw unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &raw); err != nil {
+		return offsetMeasurement{}, fmt.Errorf("read monotonic-raw: %w", err)
+	}
+	sample.xMonoNs = unix.TimespecToNsec(raw)
+	return sample, nil
+}
+
+func ppmToKernelFreq(ppm float64) int64 {
+	ppm = clampFloat(ppm, -kernelMaxFreqPpm, kernelMaxFreqPpm)
+	return int64(math.Round(ppm * freqScale))
+}
+
+func clampFloat(v, lo, hi float64) float64 {
+	return math.Max(lo, math.Min(hi, v))
 }
 
 // fdToClockID is the kernel's FD_TO_CLOCKID macro: ((~fd) << 3) | 3.
@@ -99,5 +258,52 @@ func fdToClockID(fd uintptr) int32 {
 
 // clockOffsetNsec returns ptp - sys in ns; positive means CLOCK_REALTIME is behind.
 func clockOffsetNsec(ptp, sys unix.Timespec) int64 {
-	return (ptp.Sec*1_000_000_000 + ptp.Nsec) - (sys.Sec*1_000_000_000 + sys.Nsec)
+	return (ptp.Sec*nsPerSecond + ptp.Nsec) - (sys.Sec*nsPerSecond + sys.Nsec)
+}
+
+// ptpTimeToNs flattens a PtpClockTime to absolute nanoseconds.
+func ptpTimeToNs(t unix.PtpClockTime) int64 {
+	return t.Sec*nsPerSecond + int64(t.Nsec)
+}
+
+// measurementFromPrecisePtp builds a measurement from a PTP_SYS_OFFSET_PRECISE result.
+func measurementFromPrecisePtp(p *unix.PtpSysOffsetPrecise) offsetMeasurement {
+	phc := ptpTimeToNs(p.Device)
+	sys := ptpTimeToNs(p.Realtime)
+	return offsetMeasurement{
+		xMonoNs:  ptpTimeToNs(p.Monoraw),
+		phcNs:    phc,
+		offsetNs: phc - sys,
+	}
+}
+
+// measurementFromExtendedPtp builds a measurement from a PTP_SYS_OFFSET_EXTENDED result,
+// picking the triplet with the tightest read interval as the estimate.
+func measurementFromExtendedPtp(e *unix.PtpSysOffsetExtended) offsetMeasurement {
+	n := int(e.Samples)
+	if n <= 0 || n > len(e.Ts) {
+		n = len(e.Ts)
+	}
+	bestIdx := 0
+	bestInterval := int64(math.MaxInt64)
+	for i := 0; i < n; i++ {
+		before := ptpTimeToNs(e.Ts[i][0])
+		after := ptpTimeToNs(e.Ts[i][2])
+		interval := after - before
+		if interval < 0 {
+			interval = -interval
+		}
+		if interval < bestInterval {
+			bestInterval = interval
+			bestIdx = i
+		}
+	}
+	before := ptpTimeToNs(e.Ts[bestIdx][0])
+	phc := ptpTimeToNs(e.Ts[bestIdx][1])
+	after := ptpTimeToNs(e.Ts[bestIdx][2])
+	return offsetMeasurement{
+		phcNs:    phc,
+		offsetNs: phc - (before+after)/2,
+		uncertNs: bestInterval,
+	}
 }

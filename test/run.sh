@@ -90,7 +90,7 @@ boot_qemu() {
   echo "  Socket:     $vsock_socket"
   echo "  Forward:    CID 1 (loopback)"
   vhost-device-vsock \
-    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=2,forward-listen=9001+9002" &
+    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=1,forward-listen=9001+9002" &
   vsock_pid=$!
   sleep 1
   if ! kill -0 "$vsock_pid" 2>/dev/null; then
@@ -161,7 +161,7 @@ while True:
     -m "$memory" \
     $accel \
     $cpu_opt \
-    ${qapp[@]+"${qapp[@]}"} \
+    "${qapp[@]}" \
     -chardev "socket,id=c,path=${vsock_socket}" &
   qemu_pid=$!
   echo "  PID:    $qemu_pid"

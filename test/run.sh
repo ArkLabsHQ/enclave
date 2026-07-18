@@ -90,7 +90,7 @@ boot_qemu() {
   echo "  Socket:     $vsock_socket"
   echo "  Forward:    CID 1 (loopback)"
   vhost-device-vsock \
-    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=1,forward-listen=9001+9002" &
+    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=2,forward-listen=9001+9002" &
   vsock_pid=$!
   sleep 1
   if ! kill -0 "$vsock_pid" 2>/dev/null; then
@@ -671,15 +671,15 @@ else
   exit 1
 fi
 
-# offset_us is emitted on every disciplined cycle (JSON). Against ptp_kvm the guest tracks
-# the host closely, so the residual must stay well under a millisecond.
-CLOCK_MAX_OFF_US=$(grep "clock sync: disciplined" "$CLOCK_LOG" 2>/dev/null \
-  | grep -oE '"offset_us":-?[0-9.]+' | sed 's/.*://' \
+# offset_micro_secs is logged on every disciplined cycle: text before slog.SetDefault,
+# JSON after. Against ptp_kvm, the residual stays well below 1 ms.
+CLOCK_MAX_OFFSET_MICRO_SECS=$(grep "clock sync: disciplined" "$CLOCK_LOG" 2>/dev/null \
+  | grep -oE 'offset_us"?[:=]-?[0-9.]+' | sed 's/.*[:=]//' \
   | awk 'function abs(x){return x<0?-x:x}{v=abs($1); if(v>m)m=v} END{printf "%.1f", m+0}' || true)
-if awk "BEGIN{exit !(${CLOCK_MAX_OFF_US:-0} < 1000)}"; then
-  echo "  PASS: clock offset stayed bounded to the PHC (max ${CLOCK_MAX_OFF_US} us < 1000)"
+if awk "BEGIN{exit !(${CLOCK_MAX_OFFSET_MICRO_SECS:-0} < 1000)}"; then
+  echo "  PASS: clock offset stayed bounded to the PHC (max ${CLOCK_MAX_OFFSET_MICRO_SECS} us < 1000)"
 else
-  echo "  FAIL: clock offset exceeded 1ms (max ${CLOCK_MAX_OFF_US} us) — not tracking the PHC" >&2
+  echo "  FAIL: clock offset exceeded 1ms (max ${CLOCK_MAX_OFFSET_MICRO_SECS} us) — not tracking the PHC" >&2
   exit 1
 fi
 echo ""

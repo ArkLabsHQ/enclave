@@ -136,7 +136,10 @@ func clockPollInterval() time.Duration {
 	if IsDev() {
 		return 5 * time.Second
 	}
-	return 1 * time.Hour
+	// 5 min matches Evervault's /dev/ptp0 sync cadence:
+	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
+	// It also speeds PI convergence and limits pre-convergence drift.
+	return 5 * time.Minute
 }
 
 // clockStepNs is a DEV-ONLY synthetic offset (ns) applied to CLOCK_REALTIME at boot so an

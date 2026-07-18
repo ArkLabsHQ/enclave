@@ -167,7 +167,8 @@ func TestObserveHardStep(t *testing.T) {
 	require.NotZero(t, applied, "PI engages once there is an interval")
 	require.False(t, isHardStep, "small offset does not trigger hard-step")
 	// Third sample is a gross offset: triggers a hard-step and resets the interval baseline.
-	applied, isHardStep, stepToNs := captureAdjust(cs, offsetMeasurement{xMonoNs: 2 * nsPerSecond, phcNs: 42_000_000_000, offsetNs: 200 * 1_000_000})
+k
+	_, isHardStep, stepToNs := captureAdjust(cs, offsetMeasurement{xMonoNs: 2 * nsPerSecond, phcNs: 42_000_000_000, offsetNs: 200 * 1_000_000})
 	require.True(t, isHardStep, "gross offset triggers hard-step")
 	require.Equal(t, int64(42_000_000_000), stepToNs)
 	require.False(t, cs.hasPreviousMeasurement, "hard-step resets the interval baseline")

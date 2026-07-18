@@ -113,10 +113,10 @@ func TestClockPollInterval(t *testing.T) {
 		want                      time.Duration
 	}{
 		{"explicit override wins even in prod", "2s", "", "prod", 2 * time.Second},
-		{"invalid override ignored, prod default", "garbage", "", "prod", time.Hour},
-		{"non-positive override ignored, prod default", "0s", "", "prod", time.Hour},
+		{"invalid override ignored, prod default", "garbage", "", "prod", 5 * time.Minute},
+		{"non-positive override ignored, prod default", "0s", "", "prod", 5 * time.Minute},
 		{"dev polls fast", "", "true", "prod", 5 * time.Second},
-		{"prod polls hourly", "", "", "prod", time.Hour},
+		{"prod polls every 5min", "", "", "prod", 5 * time.Minute},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

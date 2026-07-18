@@ -1,0 +1,65 @@
+name: Clock-Drift Integration Test
+
+# End-to-end test of the enclave's PTP clock servo: boots the test enclave with a
+# synthetic clock skew injected via the kernel command line and verifies the servo
+# detects and corrects it against the hypervisor PHC (hard-steps back, then holds a
+# bounded offset). Mirrors `make test-clockdrift` (see test/clockdrift.sh).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  clockdrift-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up KVM
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Load vsock kernel modules
+        run: |
+          sudo modprobe vsock
+          sudo modprobe vsock_loopback
+          test -e /dev/vsock
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-25.11
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build test EIF
+        run: |
+          go build -o /tmp/enclave-cli ./cli/cmd/enclave
+          # Build the runtime + app from this checkout's tree (mirrors
+          # `make test-build`) so the clock test exercises the working tree,
+          # not a pinned release. The clock test needs only the v1 EIF.
+          export RUNTIME_LOCAL_PATH=$GITHUB_WORKSPACE
+          export SUPERVISOR_LOCAL_PATH=$GITHUB_WORKSPACE
+          export APP_LOCAL_PATH=$GITHUB_WORKSPACE/test/app
+          # vendor/ is gitignored; Nix needs it when building from local source.
+          (cd runtime && go mod vendor)
+          (cd test/app && go mod vendor && /tmp/enclave-cli build)
+
+      - name: Run clock-drift integration test
+        run: cd test && docker compose --profile clockdrift run --build clockdrift-runner
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clockdrift-test-logs
+          path: test/*.log
+          if-no-files-found: ignore

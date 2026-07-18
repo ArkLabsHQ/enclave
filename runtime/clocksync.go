@@ -42,16 +42,13 @@ import (
 //   - linuxptp PI servo: https://github.com/richardcochran/linuxptp/blob/master/pi.c
 
 const (
-	ptpDevicePath            = "/dev/ptp0"
-	defaultClockPollInterval = 1 * time.Hour
-	extendedProbes           = 9
+	ptpDevicePath = "/dev/ptp0"
 
-	freqScale          = 1 << 16 // ppm << 16
-	kernelMaxFreqPpm   = 500.0
-	nsPerPpmPerSec     = 1000.0 // 1 ppm == 1 us/s == 1000 ns/s
-	nsPerSecond        = 1_000_000_000
-	defaultMaxStepNs   = 100 * 1_000_000 // 100 ms
-	defaultMaxUncertNs = 100 * 1_000     // 100 us
+	freqScale        = 1 << 16 // ppm << 16
+	kernelMaxFreqPpm = 500.0
+	nsPerPpmPerSec   = 1000.0 // 1 ppm == 1 us/s == 1000 ns/s
+	nsPerSecond      = 1_000_000_000
+	defaultMaxStepNs = 100 * 1_000_000 // 100 ms
 )
 
 // offsetMeasurement is one PHC/REALTIME comparison.
@@ -59,7 +56,6 @@ type offsetMeasurement struct {
 	xMonoNs  int64
 	phcNs    int64
 	offsetNs int64
-	uncertNs int64
 }
 
 type servoConfig struct {
@@ -67,7 +63,6 @@ type servoConfig struct {
 	ki           float64 // integral gain
 	freqClampPpm float64
 	maxStepNs    int64
-	maxUncertNs  int64
 }
 
 func defaultServoConfig() servoConfig {
@@ -76,7 +71,6 @@ func defaultServoConfig() servoConfig {
 		ki:           0.05,
 		freqClampPpm: 100.0,
 		maxStepNs:    defaultMaxStepNs,
-		maxUncertNs:  defaultMaxUncertNs,
 	}
 }
 
@@ -125,12 +119,34 @@ func newClockSyncer() (*clockSyncer, error) {
 		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
 	}
 
+	if IsDev() {
+		maybeInjectCustomTime()
+	}
+
 	return &clockSyncer{
 		file:     file,
 		fd:       int(file.Fd()),
-		interval: defaultClockPollInterval,
+		interval: clockPollInterval(),
 		cfg:      defaultServoConfig(),
 	}, nil
+}
+
+// maybeInjectCustomTime offsets CLOCK_REALTIME
+func maybeInjectCustomTime() {
+	step := clockStepNs()
+	if step == 0 {
+		return
+	}
+	var now unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &now); err != nil {
+		return
+	}
+	skewed := unix.NsecToTimespec(unix.TimespecToNsec(now) + step)
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &skewed); err != nil {
+		slog.Warn("clock sync: DEV test skew failed", "error", err)
+		return
+	}
+	slog.Warn("clock sync: DEV test skew injected", "step_ns", step)
 }
 
 func (cs *clockSyncer) run(ctx context.Context) {
@@ -183,11 +199,6 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 		return err
 	}
 
-	if cs.cfg.maxUncertNs > 0 && m.uncertNs > cs.cfg.maxUncertNs {
-		slog.Warn("clock sync: skipped noisy measurement", "uncert_us", float64(m.uncertNs)/1e3)
-		return nil
-	}
-
 	applied := cs.integralPpm // warm-up holds the standing integral until there is an interval
 	proportionalPpm := 0.0
 	if correctingFreqPpm, ok := cs.frequencyErrorPpm(m); ok {
@@ -225,21 +236,23 @@ func (cs *clockSyncer) frequencyErrorPpm(m offsetMeasurement) (ppm float64, ok b
 }
 
 func (cs *clockSyncer) measureOffset() (offsetMeasurement, error) {
-	if p, err := unix.IoctlPtpSysOffsetPrecise(cs.fd); err == nil {
-		return measurementFromPrecisePtp(p), nil
+	phc := fdToClockID(uintptr(cs.fd))
+	var sys, phcTs, mono unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &sys); err != nil {
+		return offsetMeasurement{}, fmt.Errorf("read realtime: %w", err)
 	}
-	// Fallback: EXTENDED reports system time on CLOCK_REALTIME
-	e, err := unix.IoctlPtpSysOffsetExtended(cs.fd, extendedProbes)
-	if err != nil {
-		return offsetMeasurement{}, fmt.Errorf("PTP_SYS_OFFSET_EXTENDED: %w", err)
+	if err := unix.ClockGettime(phc, &phcTs); err != nil {
+		return offsetMeasurement{}, fmt.Errorf("read PHC: %w", err)
 	}
-	sample := measurementFromExtendedPtp(e)
-	var raw unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &raw); err != nil {
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &mono); err != nil {
 		return offsetMeasurement{}, fmt.Errorf("read monotonic-raw: %w", err)
 	}
-	sample.xMonoNs = unix.TimespecToNsec(raw)
-	return sample, nil
+	phcNs := unix.TimespecToNsec(phcTs)
+	return offsetMeasurement{
+		xMonoNs:  unix.TimespecToNsec(mono),
+		phcNs:    phcNs,
+		offsetNs: phcNs - unix.TimespecToNsec(sys),
+	}, nil
 }
 
 func ppmToKernelFreq(ppm float64) int64 {
@@ -259,51 +272,4 @@ func fdToClockID(fd uintptr) int32 {
 // clockOffsetNsec returns ptp - sys in ns; positive means CLOCK_REALTIME is behind.
 func clockOffsetNsec(ptp, sys unix.Timespec) int64 {
 	return (ptp.Sec*nsPerSecond + ptp.Nsec) - (sys.Sec*nsPerSecond + sys.Nsec)
-}
-
-// ptpTimeToNs flattens a PtpClockTime to absolute nanoseconds.
-func ptpTimeToNs(t unix.PtpClockTime) int64 {
-	return t.Sec*nsPerSecond + int64(t.Nsec)
-}
-
-// measurementFromPrecisePtp builds a measurement from a PTP_SYS_OFFSET_PRECISE result.
-func measurementFromPrecisePtp(p *unix.PtpSysOffsetPrecise) offsetMeasurement {
-	phc := ptpTimeToNs(p.Device)
-	sys := ptpTimeToNs(p.Realtime)
-	return offsetMeasurement{
-		xMonoNs:  ptpTimeToNs(p.Monoraw),
-		phcNs:    phc,
-		offsetNs: phc - sys,
-	}
-}
-
-// measurementFromExtendedPtp builds a measurement from a PTP_SYS_OFFSET_EXTENDED result,
-// picking the triplet with the tightest read interval as the estimate.
-func measurementFromExtendedPtp(e *unix.PtpSysOffsetExtended) offsetMeasurement {
-	n := int(e.Samples)
-	if n <= 0 || n > len(e.Ts) {
-		n = len(e.Ts)
-	}
-	bestIdx := 0
-	bestInterval := int64(math.MaxInt64)
-	for i := 0; i < n; i++ {
-		before := ptpTimeToNs(e.Ts[i][0])
-		after := ptpTimeToNs(e.Ts[i][2])
-		interval := after - before
-		if interval < 0 {
-			interval = -interval
-		}
-		if interval < bestInterval {
-			bestInterval = interval
-			bestIdx = i
-		}
-	}
-	before := ptpTimeToNs(e.Ts[bestIdx][0])
-	phc := ptpTimeToNs(e.Ts[bestIdx][1])
-	after := ptpTimeToNs(e.Ts[bestIdx][2])
-	return offsetMeasurement{
-		phcNs:    phc,
-		offsetNs: phc - (before+after)/2,
-		uncertNs: bestInterval,
-	}
 }

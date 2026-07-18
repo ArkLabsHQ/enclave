@@ -233,33 +233,6 @@ func TestSyncHandlesMeasurementGap(t *testing.T) {
 	require.False(t, cs.hasPreviousMeasurement, "hard-step resets the interval baseline")
 }
 
-func TestSampleFromPrecise(t *testing.T) {
-	p := &unix.PtpSysOffsetPrecise{
-		Device:   unix.PtpClockTime{Sec: 100, Nsec: 500}, // PHC
-		Realtime: unix.PtpClockTime{Sec: 100, Nsec: 200}, // CLOCK_REALTIME
-		Monoraw:  unix.PtpClockTime{Sec: 5, Nsec: 0},     // CLOCK_MONOTONIC_RAW
-	}
-	got := measurementFromPrecisePtp(p)
-	require.Equal(t, int64(300), got.offsetNs, "offsetNs = PHC-REALTIME")
-	require.Equal(t, int64(100*nsPerSecond+500), got.phcNs)
-	require.Equal(t, int64(5*nsPerSecond), got.xMonoNs)
-	require.Zero(t, got.uncertNs, "atomic capture has zero uncertainty")
-}
-
-func TestSampleFromExtended(t *testing.T) {
-	e := &unix.PtpSysOffsetExtended{Samples: 3}
-	// [sys_before, phc, sys_after]; the middle triple has the tightest window.
-	e.Ts[0] = [3]unix.PtpClockTime{{Sec: 10, Nsec: 0}, {Sec: 20, Nsec: 0}, {Sec: 10, Nsec: 900}} // 900 ns window
-	e.Ts[1] = [3]unix.PtpClockTime{{Sec: 10, Nsec: 0}, {Sec: 20, Nsec: 0}, {Sec: 10, Nsec: 100}} // 100 ns window (best)
-	e.Ts[2] = [3]unix.PtpClockTime{{Sec: 10, Nsec: 0}, {Sec: 20, Nsec: 0}, {Sec: 10, Nsec: 500}} // 500 ns window
-	got := measurementFromExtendedPtp(e)
-	// best triple: before=10e9, after=10e9+100, mid=10e9+50, phc=20e9 → offset=20e9-(10e9+50)=1e10-50.
-	wantOffset := int64(20*nsPerSecond) - (int64(10*nsPerSecond) + 50)
-	require.Equal(t, wantOffset, got.offsetNs)
-	require.Equal(t, int64(100), got.uncertNs, "tightest window")
-	require.Equal(t, int64(20*nsPerSecond), got.phcNs)
-}
-
 // TestServoConvergence closes the loop through adjust() and asserts the integral term
 // converges to cancel the native drift with the residual offset bounded — across
 // multiple noise seeds (so a pass isn't luck), interval jitter, and the ±clamp invariant.

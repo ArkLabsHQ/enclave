@@ -127,9 +127,6 @@ func getMigrationCooldown() time.Duration {
 	return d
 }
 
-// clockPollInterval is the PTP servo poll cadence. It is read at boot, before the SSM
-// overlay runs, so only a baked/process ENCLAVE_CLOCK_POLL_INTERVAL takes effect; otherwise
-// dev polls fast (so the servo is observable in tests) and prod polls hourly.
 func clockPollInterval() time.Duration {
 	if v := strings.TrimSpace(os.Getenv("ENCLAVE_CLOCK_POLL_INTERVAL")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -140,6 +137,23 @@ func clockPollInterval() time.Duration {
 		return 5 * time.Second
 	}
 	return 1 * time.Hour
+}
+
+// clockStepNs is a DEV-ONLY synthetic offset (ns) applied to CLOCK_REALTIME at boot so an
+// integration test can prove the servo detects and corrects a real error. 0 outside dev.
+func clockStepNs() int64 {
+	if !IsDev() {
+		return 0
+	}
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_CLOCK_TEST_STEP_NS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // respPort is the TLS port for the RESP K/V listener.

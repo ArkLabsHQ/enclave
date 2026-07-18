@@ -14,6 +14,10 @@ import (
 )
 
 func main() {
+	if runtime.IsDev() {
+		runtime.ApplyDevCmdlineOverrides()
+	}
+
 	cfg, err := runtime.LoadConfig()
 	if err != nil {
 		slog.Error("load runtime config", "error", err)

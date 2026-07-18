@@ -92,10 +92,10 @@ func TestIsDev(t *testing.T) {
 		dev, deployment string
 		want            bool
 	}{
-		{"ENCLAVE_DEV=true forces dev", "true", "prod", true},
-		{"ENCLAVE_DEV=false forces non-dev", "false", "dev", false},
-		{"unset falls back to deployment=dev", "", "dev", true},
-		{"unset falls back to deployment=prod", "", "prod", false},
+		{"ENCLAVE_DEV=true is dev", "true", "prod", true},
+		{"ENCLAVE_DEV case-insensitive", "TRUE", "prod", true},
+		{"ENCLAVE_DEV=false is not dev", "false", "dev", false},
+		{"unset is not dev regardless of deployment", "", "dev", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

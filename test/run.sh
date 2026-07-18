@@ -149,6 +149,11 @@ while True:
     cpu_opt="-cpu max"
     echo "  KVM:    not available, using TCG (slow)"
   fi
+  # Dev-only kernel cmdline overrides (enclavecfg.*) — e.g. clock cadence + a synthetic
+  # skew so the clock check can prove the servo corrects a real error. Honoured only by a
+  # dev EIF (ApplyDevCmdlineOverrides is gated on IsDev).
+  local qapp=()
+  [ -n "${QEMU_APPEND:-}" ] && qapp=(-append "$QEMU_APPEND")
   qemu-system-x86_64 \
     -M "nitro-enclave,vsock=c,id=test-enclave" \
     -kernel "$eif_path" \
@@ -156,6 +161,7 @@ while True:
     -m "$memory" \
     $accel \
     $cpu_opt \
+    ${qapp[@]+"${qapp[@]}"} \
     -chardev "socket,id=c,path=${vsock_socket}" &
   qemu_pid=$!
   echo "  PID:    $qemu_pid"
@@ -643,9 +649,39 @@ else
 fi
 echo ""
 
-# Clock sync engages only when /dev/ptp0 is present (KVM runner); informational, never fails.
-CLOCK_SYNC_LINE=$(grep -iE "clock sync" /tmp/boot-qemu.log 2>/dev/null | head -1)
-echo "  INFO: clock sync — ${CLOCK_SYNC_LINE:-<no clock-sync log line in boot-qemu.log>}"
+# Clock discipline. Clock sync is fatal at boot, so reaching here already proves /dev/ptp0
+# was present, the PTP ioctls worked, and the boot hard-step landed. Assert the servo then
+# holds CLOCK_REALTIME to the hypervisor PHC — a dev EIF polls every 5s (IsDev default), so
+# several "disciplined" cycles have logged to boot-qemu.log by now.
+echo "=== [3.5/9] Verifying clock discipline against the hypervisor PHC ==="
+CLOCK_LOG=/tmp/boot-qemu.log
+if grep -qiE "clock sync: initial hard-step to hypervisor PTP completed" "$CLOCK_LOG"; then
+  echo "  PASS: clock sync hard-stepped CLOCK_REALTIME onto the PHC at boot"
+else
+  echo "  FAIL: no PHC hard-step in boot log — clock sync did not engage" >&2
+  grep -iE "clock sync" "$CLOCK_LOG" >&2 || true
+  exit 1
+fi
+
+CLOCK_DISC=$(grep -c "clock sync: disciplined" "$CLOCK_LOG" 2>/dev/null || true)
+if [ "${CLOCK_DISC:-0}" -ge 1 ]; then
+  echo "  PASS: PI servo disciplined the clock ${CLOCK_DISC}x against the real PHC"
+else
+  echo "  FAIL: servo logged no 'disciplined' cycle (expected ~5s cadence in a dev EIF)" >&2
+  exit 1
+fi
+
+# offset_us is emitted on every disciplined cycle (JSON). Against ptp_kvm the guest tracks
+# the host closely, so the residual must stay well under a millisecond.
+CLOCK_MAX_OFF_US=$(grep "clock sync: disciplined" "$CLOCK_LOG" 2>/dev/null \
+  | grep -oE '"offset_us":-?[0-9.]+' | sed 's/.*://' \
+  | awk 'function abs(x){return x<0?-x:x}{v=abs($1); if(v>m)m=v} END{printf "%.1f", m+0}' || true)
+if awk "BEGIN{exit !(${CLOCK_MAX_OFF_US:-0} < 1000)}"; then
+  echo "  PASS: clock offset stayed bounded to the PHC (max ${CLOCK_MAX_OFF_US} us < 1000)"
+else
+  echo "  FAIL: clock offset exceeded 1ms (max ${CLOCK_MAX_OFF_US} us) — not tracking the PHC" >&2
+  exit 1
+fi
 echo ""
 
 # Step 4: Run integration tests.

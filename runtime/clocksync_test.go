@@ -27,10 +27,8 @@ type driftResult struct {
 	integralSpread float64 // max-min of integralPpm over the final quarter (post-convergence)
 }
 
-// simulateDrift closes the servo loop against a clock with a hidden native ppm error
-// and optional Gaussian measurement noise / interval jitter. It stubs the kernel write
-// seams to capture what adjust would apply, feeds that back into the model, then advances
-// one (possibly jittered) interval so drift accrues at -(native+applied).
+// simulateDrift closes the servo loop against a modeled clock: each cycle stubs the kernel
+// write seams to capture what adjust applies, then accrues drift at -(native+applied).
 func simulateDrift(cs *clockSyncer, d drift) driftResult {
 	origAdj, origSet := clockAdjtime, clockSettime
 	defer func() { clockAdjtime, clockSettime = origAdj, origSet }()

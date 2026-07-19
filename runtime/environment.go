@@ -138,7 +138,6 @@ func clockPollInterval() time.Duration {
 	}
 	// 5 min matches Evervault's /dev/ptp0 sync cadence:
 	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
-	// It also speeds PI convergence and limits pre-convergence drift.
 	return 5 * time.Minute
 }
 

@@ -10,12 +10,8 @@ import (
 // they don't collide with real kernel args.
 const devCmdlinePrefix = "enclavecfg."
 
-// devCmdlineKeys whitelists which config the dev cmdline channel may set: the token
-// (after the prefix) → the env var it maps to. Deliberately excludes security gates
-// (ENCLAVE_DEV, ENCLAVE_KMS_KEY_LOCKED, ENCLAVE_SECRETS_CONFIG) — only the deployment
-// namespace and the clock cadence / test-step knobs.
+// devCmdlineKeys whitelists cmdline token → env var; never security gates or namespace vars.
 var devCmdlineKeys = map[string]string{
-	"deployment":          "ENCLAVE_DEPLOYMENT",
 	"clock_poll_interval": "ENCLAVE_CLOCK_POLL_INTERVAL",
 	"clock_test_step_ns":  "ENCLAVE_CLOCK_TEST_STEP_NS",
 }

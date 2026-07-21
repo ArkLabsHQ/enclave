@@ -136,6 +136,8 @@ launch_node() {
   echo "=== launch $name (cid=$cid tls=$tls gvproxy=$gvport imds=$imds dep=$dep role=$role) ==="
 
   local append="enclavecfg.deployment=${dep} enclavecfg.role=${role} enclavecfg.gvproxy_port=${gvport} enclavecfg.imds_out=3:${imds}"
+  # Short liveness cadence so the eviction phase doesn't wait a minute (dev cmdline channel).
+  append="${append} enclavecfg.scaling_liveness_timeout=${SCALING_LIVENESS_TIMEOUT:-12s} enclavecfg.scaling_heartbeat=${SCALING_HEARTBEAT:-3s} enclavecfg.scaling_monitor_tick=${SCALING_MONITOR_TICK:-4s}"
   [ "$role" = follower ] && append="${append} enclavecfg.leader_addr=${LEADER_ADDR}"
 
   local fwd="${tls}:443"
@@ -181,6 +183,38 @@ set -- ${NODES[2]}; launch_node "$@"; wait_health "https://localhost:8643" follo
 echo "=== [5/6] Wait for reshare to re-randomize follower-1's share ==="
 for _ in $(seq 1 60); do r="$(share_pubkey https://localhost:8543)"; [ -n "$r" ] && [ "$r" != "$F1_V1" ] && break; sleep 2; done
 
-echo "=== [6/6] Assertions ==="
+echo "=== [6/7] Assertions (healthy 3-node group) ==="
 LEADER_URL="https://localhost:8443" FOLLOWER1_URL="https://localhost:8543" \
   FOLLOWER2_URL="https://localhost:8643" F1_SHARE_V1="$F1_V1" ./scaling-test.sh
+
+echo "=== [7/7] Liveness eviction: down follower-2 → leader bans it → survivors reshare ==="
+# Snapshot follower-1's current share, then permanently down follower-2: kill its supervisor
+# first so the watchdog can't restart the guest, then the guest (its CID-6 vhost + qemu).
+F1_BEFORE="$(share_pubkey https://localhost:8543)"
+echo "  follower-1 share before eviction: ${F1_BEFORE:0:16}..."
+kill "$(cat /tmp/sup-follower-2.pid 2>/dev/null)" 2>/dev/null || true
+pkill -f "/tmp/vhost6.socket" 2>/dev/null || true
+echo "  follower-2 downed; waiting for the leader's liveness timeout + reshare..."
+
+# The leader stops seeing follower-2's heartbeats, evicts it after the (short) liveness
+# timeout, and reshares among {leader, follower-1} — re-randomizing follower-1's share.
+F1_AFTER=""
+for _ in $(seq 1 40); do
+  r="$(share_pubkey https://localhost:8543)"
+  [ -n "$r" ] && [ "$r" != "$F1_BEFORE" ] && { F1_AFTER="$r"; break; }
+  sleep 2
+done
+
+if grep -q "threshold leader banned follower" /tmp/boot-leader.log 2>/dev/null; then
+  echo "  PASS: leader evicted (banned) the unresponsive follower"
+else
+  echo "  FAIL: leader did not log a follower eviction (see /tmp/boot-leader.log)" >&2
+  exit 1
+fi
+if [ -n "$F1_AFTER" ] && [ "$F1_AFTER" != "$F1_BEFORE" ]; then
+  echo "  PASS: survivors reshared — follower-1 share changed after eviction (${F1_AFTER:0:16}...)"
+else
+  echo "  FAIL: follower-1 share did not change after eviction — no reshare" >&2
+  exit 1
+fi
+echo "=== scaling + liveness-eviction ceremony passed ==="

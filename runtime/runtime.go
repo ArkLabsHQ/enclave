@@ -648,6 +648,7 @@ func (e *Runtime) configureExternalHttpServer(admin http.Handler) {
 
 	pm.Get(handshakePathNonce, e.scalingHandshakeNonce)
 	pm.Post(handshakePathAdmit, e.scalingHandshakeAdmit)
+	pm.Post(heartbeatPath, e.scalingHeartbeat)
 
 	pm.Handle("/v1/*", corsWildcard(admin))
 	pm.Handle("/health", admin)
@@ -1121,6 +1122,12 @@ func (e *Runtime) scalingHandshakeNonce(w http.ResponseWriter, r *http.Request) 
 func (e *Runtime) scalingHandshakeAdmit(w http.ResponseWriter, r *http.Request) {
 	if a := e.readyLeader(w); a != nil {
 		a.handleAdmitFollower(w, r)
+	}
+}
+
+func (e *Runtime) scalingHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if a := e.readyLeader(w); a != nil {
+		a.handleHeartbeat(w, r)
 	}
 }
 

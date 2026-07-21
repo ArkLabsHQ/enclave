@@ -23,6 +23,7 @@ require (
 	github.com/mdlayher/vsock v1.2.1
 	github.com/milosgajdos/tenus v0.0.3
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
+	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.3.1
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
@@ -34,6 +35,8 @@ require (
 	golang.org/x/sys v0.45.0
 	google.golang.org/protobuf v1.36.11
 )
+
+require gopkg.in/yaml.v3 v3.0.1 // indirect
 
 require (
 	github.com/ArkLabsHQ/threshold-magic/threshold_core v0.1.0 // indirect
@@ -52,7 +55,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.13 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.17 // indirect
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect

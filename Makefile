@@ -87,7 +87,7 @@ test-acme: test-build ## Build the test EIF and run the end-to-end ACME (Pebble)
 test-scaling: test-build ## Build the test EIF and run the 1-leader + 2-follower threshold-scaling ceremony in the QEMU runner container
 	cd test && docker compose --profile scaling down -v 
 	cd test && docker compose --profile scaling build scaling-runner
-	cd test && docker compose --profile scaling run --rm scaling-runner
+	cd test && docker compose --profile scaling run -T --rm scaling-runner
 
 .PHONY: test-build-docker test-docker
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)

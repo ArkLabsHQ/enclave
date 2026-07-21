@@ -111,6 +111,30 @@ func getMigrationCooldown() time.Duration {
 	return d
 }
 
+// scalingHeartbeatInterval is how often a follower pings the leader to prove liveness.
+func scalingHeartbeatInterval() time.Duration {
+	return scalingDuration("ENCLAVE_SCALING_HEARTBEAT_INTERVAL", 10*time.Second)
+}
+
+// scalingLivenessTimeout is how long the leader tolerates silence from a follower before evicting
+func scalingLivenessTimeout() time.Duration {
+	return scalingDuration("ENCLAVE_SCALING_LIVENESS_TIMEOUT", 60*time.Second)
+}
+
+// scalingMonitorTick is how often the leader's failure detector scans follower last-seen times.
+func scalingMonitorTick() time.Duration {
+	return scalingDuration("ENCLAVE_SCALING_MONITOR_TICK", 15*time.Second)
+}
+
+func scalingDuration(env string, def time.Duration) time.Duration {
+	if s := strings.TrimSpace(os.Getenv(env)); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
 func logBufferSize() int {
 	if s := os.Getenv("ENCLAVE_LOG_BUFFER_SIZE"); s != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {

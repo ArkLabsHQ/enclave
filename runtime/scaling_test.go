@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/stretchr/testify/require"
 )
 
 // TestScalingHandshakeGating verifies the handshake route (mounted unconditionally
@@ -215,4 +221,121 @@ func TestAdmitDataRoundTrip(t *testing.T) {
 	if gotResp.RelayPort != "9000" || hex.EncodeToString(gotResp.LeaderPub) != "03bb" {
 		t.Errorf("resp round-trip mismatch: %+v", gotResp)
 	}
+}
+
+func newLeaderEntity(t *testing.T) *ScalingEntity {
+	t.Helper()
+	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
+	a, err := newScalingEntity()
+	require.NoError(t, err)
+	return a
+}
+
+// TestHeartbeatAuth exercises the leader's liveness endpoint
+func TestHeartbeatAuth(t *testing.T) {
+	a := newLeaderEntity(t)
+
+	sk, err := secp.GeneratePrivateKey()
+	require.NoError(t, err)
+	hostpub := sk.PubKey().SerializeCompressed()
+	a.authorize(hostpub)
+
+	// beat builds a heartbeat carrying a freshly-issued leader nonce signed by `signer`.
+	beat := func(signer *secp.PrivateKey, pub []byte) heartbeatRequest {
+		b64, err := a.issueNonce()
+		require.NoError(t, err)
+		nonce, _ := base64.StdEncoding.DecodeString(b64)
+		sig, err := signHeartbeat(signer, nonce)
+		require.NoError(t, err)
+		return heartbeatRequest{HostPub: pub, Nonce: nonce, Sig: sig}
+	}
+	post := func(hb heartbeatRequest) int {
+		body, _ := json.Marshal(hb)
+		w := httptest.NewRecorder()
+		a.handleHeartbeat(w, httptest.NewRequest("POST", heartbeatPath, bytes.NewReader(body)))
+		return w.Code
+	}
+
+	// Valid → 204 and lastSeen recorded.
+	require.Equal(t, http.StatusNoContent, post(beat(sk, hostpub)), "valid heartbeat")
+	a.mu.Lock()
+	_, seen := a.lastSeen[hex.EncodeToString(hostpub)]
+	a.mu.Unlock()
+	require.True(t, seen, "valid heartbeat records lastSeen")
+
+	// Replay of the same nonce → 401 (one-shot).
+	hb := beat(sk, hostpub)
+	require.Equal(t, http.StatusNoContent, post(hb), "first use of nonce")
+	require.Equal(t, http.StatusUnauthorized, post(hb), "nonce replay")
+
+	// Signature by a different key → 401.
+	other, _ := secp.GeneratePrivateKey()
+	require.Equal(t, http.StatusUnauthorized, post(beat(other, hostpub)), "bad signature")
+
+	// Valid signature by an unadmitted key → 403.
+	stranger, _ := secp.GeneratePrivateKey()
+	require.Equal(t, http.StatusForbidden, post(beat(stranger, stranger.PubKey().SerializeCompressed())), "unadmitted host")
+
+	// Banned key → 403 even with a valid nonce+signature.
+	a.mu.Lock()
+	a.banned[hex.EncodeToString(hostpub)] = true
+	a.mu.Unlock()
+	require.Equal(t, http.StatusForbidden, post(beat(sk, hostpub)), "banned host")
+}
+
+// TestBanEvicts verifies Ban revokes local admission, blocklists the key,
+func TestBanEvicts(t *testing.T) {
+	a := newLeaderEntity(t)
+	hostpub := []byte{0x02, 0xde, 0xad, 0xbe, 0xef}
+
+	a.authorize(hostpub)
+	require.True(t, a.IsAuthorized(hostpub), "precondition: host should be authorized")
+
+	calls := 0
+	a.sdkBan = func(context.Context, []byte) error {
+		calls++
+		return nil
+	}
+
+	require.NoError(t, a.Ban(context.Background(), hostpub))
+	require.False(t, a.IsAuthorized(hostpub), "banned key must no longer be authorized")
+	require.True(t, a.isBanned(hostpub), "key must be on the blocklist")
+	require.Equal(t, 1, calls, "SDK eviction seam fired once")
+
+	a.mu.Lock()
+	_, seen := a.lastSeen[hex.EncodeToString(hostpub)]
+	_, auth := a.authorized[hex.EncodeToString(hostpub)]
+	a.mu.Unlock()
+	require.False(t, seen, "Ban clears lastSeen")
+	require.False(t, auth, "Ban revokes authorized")
+
+	// Idempotent: a second ban is a no-op.
+	require.NoError(t, a.Ban(context.Background(), hostpub), "second Ban")
+	require.Equal(t, 1, calls, "sdk ban invoked once (idempotent)")
+}
+
+// TestStaleFollowers ensures only stale followers are selected, never the leader.
+func TestStaleFollowers(t *testing.T) {
+	a := newLeaderEntity(t)
+	a.leaderPub = []byte{0x02, 0x11}
+
+	fresh := []byte{0x02, 0xaa}
+	stale := []byte{0x02, 0xbb}
+	a.authorize(fresh)
+	a.authorize(stale)
+
+	a.mu.Lock()
+	a.lastSeen[hex.EncodeToString(stale)] = time.Now().Add(-2 * time.Minute)
+	a.mu.Unlock()
+
+	require.Equal(t, [][]byte{stale}, a.staleFollowers(time.Minute), "only the silent follower is stale")
+}
+
+func TestScalingDurationConfig(t *testing.T) {
+	t.Setenv("ENCLAVE_SCALING_HEARTBEAT_INTERVAL", "")
+	require.Equal(t, 10*time.Second, scalingHeartbeatInterval(), "default heartbeat interval")
+	t.Setenv("ENCLAVE_SCALING_HEARTBEAT_INTERVAL", "3s")
+	require.Equal(t, 3*time.Second, scalingHeartbeatInterval(), "override heartbeat interval")
+	t.Setenv("ENCLAVE_SCALING_LIVENESS_TIMEOUT", "garbage")
+	require.Equal(t, 60*time.Second, scalingLivenessTimeout(), "invalid timeout falls back to default")
 }

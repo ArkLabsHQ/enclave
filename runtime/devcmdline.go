@@ -15,11 +15,14 @@ const devCmdlinePrefix = "enclavecfg."
 // to networking / namespace / scaling config — never security gates like
 // ENCLAVE_DEV, ENCLAVE_KMS_KEY_LOCKED, or ENCLAVE_SECRETS_CONFIG.
 var devCmdlineKeys = map[string]string{
-	"deployment":   "ENCLAVE_DEPLOYMENT",                // SSM/KMS namespace (per node)
-	"role":         "ENCLAVE_SCALING_ROLE",              // leader | follower
-	"leader_addr":  "ENCLAVE_SCALING_LEADER_ADDR",       // follower → leader handshake URL
-	"gvproxy_port": "ENCLAVE_NITRIDING_HOST_PROXY_PORT", // host vsock port for gvproxy
-	"imds_out":     "ENCLAVE_VIPROXY_OUT_ADDRS",         // host vsock CID:PORT for IMDS
+	"deployment":               "ENCLAVE_DEPLOYMENT",                 // SSM/KMS namespace (per node)
+	"role":                     "ENCLAVE_SCALING_ROLE",               // leader | follower
+	"leader_addr":              "ENCLAVE_SCALING_LEADER_ADDR",        // follower → leader handshake URL
+	"gvproxy_port":             "ENCLAVE_NITRIDING_HOST_PROXY_PORT",  // host vsock port for gvproxy
+	"imds_out":                 "ENCLAVE_VIPROXY_OUT_ADDRS",          // host vsock CID:PORT for IMDS
+	"scaling_liveness_timeout": "ENCLAVE_SCALING_LIVENESS_TIMEOUT",   // dev test: follower eviction cadence
+	"scaling_heartbeat":        "ENCLAVE_SCALING_HEARTBEAT_INTERVAL", // dev test: follower liveness ping cadence
+	"scaling_monitor_tick":     "ENCLAVE_SCALING_MONITOR_TICK",       // dev test: failure-detector scan cadence
 }
 
 // ApplyDevCmdlineOverrides reads whitelisted per-instance config from the kernel

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,12 +42,17 @@ const (
 // can hand off to the new binary.
 type Migration struct {
 	aws       *AWSClient
-	lifecycle *Lifecycle
+	lifecycle migrationLifecycle
 
 	migrateMu sync.Mutex // serialises migration intent changes and execution
 
 	controlClient   *http.Client
 	requestShutdown func() // signals Supervisor to shut down after a self-update
+}
+
+type migrationLifecycle interface {
+	Start(context.Context, string) error
+	Stop(context.Context, string) error
 }
 
 func NewMigration(aws *AWSClient, lifecycle *Lifecycle, requestShutdown func()) *Migration {
@@ -150,7 +156,11 @@ const (
 	migrationControlTimeout = 2 * time.Minute
 	defaultCommitTimeout    = 5 * time.Minute
 	keyDeletionPendingDays  = 7
+	candidateResponseLimit  = 1 << 20
+	candidatePollInterval   = 5 * time.Second
 )
+
+var errCandidateInitializing = errors.New("candidate is still initializing")
 
 // migrateEmitter streams NDJSON migrateStatus events to the /migrate caller.
 type migrateEmitter struct {
@@ -249,11 +259,13 @@ func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	if err := m.swapAndStart(ctx, p, eifDest, eifBackup, stopCmd, startCmd); err != nil {
 		return // rollback already performed
 	}
-	if !m.awaitMigrationOutcome(ctx, p, eifDest, eifBackup, stopCmd, startCmd) {
+	if !m.awaitMigrationOutcome(ctx, p, req.PCR0, eifDest, eifBackup, stopCmd, startCmd) {
 		return // rollback already performed
 	}
 
-	m.cleanupHostArtifacts(p, eifBackup)
+	if err := m.cleanupHostArtifacts(p, tmpNewEIFPath, eifBackup); err != nil {
+		return
+	}
 	exitAfter := m.maybeUpdateSupervisor(ctx, p, req)
 
 	newKeyID, _ := m.getParamAt(ctx, kmsSubtreeParamPath("KMSKeyID"))
@@ -281,6 +293,12 @@ func decodeMigrateRequest(w http.ResponseWriter, r *http.Request) (migrateReques
 		http.Error(w, `{"error":"eif_bucket, eif_key, and pcr0 are required"}`, http.StatusBadRequest)
 		return req, false
 	}
+	pcr0, err := normalizePCR0(req.PCR0)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"invalid pcr0: %v"}`, err), http.StatusBadRequest)
+		return req, false
+	}
+	req.PCR0 = pcr0
 	if len(req.SecretNames) == 0 {
 		http.Error(w, `{"error":"secret_names is required"}`, http.StatusBadRequest)
 		return req, false
@@ -342,11 +360,8 @@ func (m *Migration) swapAndStart(
 	p.progressf(stepSwapAndStart, "Replacing EIF at %s...", eifDest)
 	if err := os.Rename(tmpNewEIFPath, eifDest); err != nil {
 		if cpErr := copyFile(tmpNewEIFPath, eifDest); cpErr != nil {
-			// Old enclave is already stopped — restore backup and restart so
-			// the system always has a healthy enclave running.
-			_ = os.Rename(eifBackup, eifDest)
-			_ = m.lifecycle.Start(ctx, startCmd)
 			p.errorf(stepSwapAndStart, "replace EIF: %v", cpErr)
+			m.rollbackMigration(ctx, eifDest, eifBackup, stopCmd, startCmd, p.emit)
 			return cpErr
 		}
 	}
@@ -361,23 +376,23 @@ func (m *Migration) swapAndStart(
 	return nil
 }
 
-// awaitMigrationOutcome polls /v1/enclave-info for the new enclave's
-// migration verdict. Returns false if the verdict was abort or the timeout
-// elapsed, after triggering a full rollback.
+// awaitMigrationOutcome verifies the candidate and rolls the EIF back on any
+// health, identity, transport, or timeout failure.
 func (m *Migration) awaitMigrationOutcome(
 	ctx context.Context,
 	p *migrateEmitter,
+	expectedPCR0 string,
 	eifDest, eifBackup, stopCmd, startCmd string,
 ) bool {
 	timeout := migrationCommitTimeout()
-	p.progressf(stepWaitOutcome, "Polling new enclave until healthy (timeout: %s)...", timeout)
+	p.progressf(stepWaitOutcome, "Verifying new enclave health and PCR0 (timeout: %s)...", timeout)
 
-	if err := m.awaitEnclaveReady(ctx, timeout); err != nil {
-		p.errorf(stepWaitOutcome, "new enclave not healthy within timeout: %v", err)
+	if err := m.awaitEnclaveReady(ctx, newCandidateVerificationClient(), expectedPCR0, timeout); err != nil {
+		p.errorf(stepWaitOutcome, "new enclave verification failed: %v", err)
 		m.rollbackMigration(ctx, eifDest, eifBackup, stopCmd, startCmd, p.emit)
 		return false
 	}
-	p.progress(stepWaitOutcome, "New enclave is healthy")
+	p.progress(stepWaitOutcome, "New enclave is ready and reports the requested PCR0")
 	return true
 }
 
@@ -394,10 +409,17 @@ func migrationWriteTimeout() time.Duration {
 	return migrationControlTimeout + migrationCommitTimeout() + 2*time.Minute
 }
 
-func (m *Migration) cleanupHostArtifacts(p *migrateEmitter, eifBackup string) {
-	p.progress(stepHostCleanup, "Removing EIF backup...")
-	_ = os.Remove(eifBackup)
+func (m *Migration) cleanupHostArtifacts(p *migrateEmitter, tmpEIF, eifBackup string) error {
+	p.progress(stepHostCleanup, "Removing temporary EIF artifacts...")
+	for _, path := range []string{tmpEIF + ".tmp", tmpEIF, eifBackup} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			err = fmt.Errorf("remove %s: %w", path, err)
+			p.errorf(stepHostCleanup, "host-side cleanup failed: %v", err)
+			return err
+		}
+	}
 	p.progress(stepHostCleanup, "Host-side cleanup done")
+	return nil
 }
 
 // maybeUpdateSupervisor downloads, validates, and stages a new supervisor
@@ -416,36 +438,122 @@ func (m *Migration) maybeUpdateSupervisor(ctx context.Context, p *migrateEmitter
 	return true
 }
 
-// awaitEnclaveReady polls /v1/enclave-info until the new enclave returns
-// HTTP 200 (initOK=true) or the timeout elapses.
-func (m *Migration) awaitEnclaveReady(ctx context.Context, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	pollInterval := 5 * time.Second
-	enclaveURL := envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443")
-	client := &http.Client{
+func newCandidateVerificationClient() *http.Client {
+	return &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	for time.Now().Before(deadline) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, enclaveURL+"/v1/enclave-info", nil)
-		if err != nil {
+}
+
+// awaitEnclaveReady retries only startup transport failures and HTTP 503.
+// Any HTTP 200 response with invalid content is a terminal verification error.
+func (m *Migration) awaitEnclaveReady(ctx context.Context, client *http.Client, expectedPCR0 string, timeout time.Duration) error {
+	verificationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	defer client.CloseIdleConnections()
+
+	enclaveURL := strings.TrimRight(envOrDefault("ENCLAVE_URL", "https://127.0.0.1:443"), "/")
+	var lastStartupError error
+	for {
+		err := verifyCandidate(verificationCtx, client, enclaveURL, expectedPCR0)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errCandidateInitializing) {
 			return err
 		}
-		if resp, err := client.Do(req); err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
-		}
+		lastStartupError = err
+
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
+		case <-verificationCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("candidate verification timed out after %s: %v", timeout, lastStartupError)
+		case <-time.After(candidatePollInterval):
 		}
 	}
-	return fmt.Errorf("new enclave did not become healthy within %s", timeout)
+}
+
+func verifyCandidate(ctx context.Context, client *http.Client, enclaveURL, expectedPCR0 string) error {
+	status, body, err := candidateGET(ctx, client, enclaveURL+"/health")
+	if err != nil {
+		return err
+	}
+	if status == http.StatusServiceUnavailable {
+		return fmt.Errorf("%w: GET /health returned 503", errCandidateInitializing)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("GET /health returned HTTP %d", status)
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil {
+		return fmt.Errorf("decode GET /health response: %w", err)
+	}
+	if health.Status != "ready" {
+		return fmt.Errorf("GET /health status is %q, want %q", health.Status, "ready")
+	}
+
+	status, body, err = candidateGET(ctx, client, enclaveURL+"/v1/enclave-info")
+	if err != nil {
+		return err
+	}
+	if status == http.StatusServiceUnavailable {
+		return fmt.Errorf("%w: GET /v1/enclave-info returned 503", errCandidateInitializing)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("GET /v1/enclave-info returned HTTP %d", status)
+	}
+	var info struct {
+		Migration struct {
+			SourcePCR0 string `json:"source_pcr0"`
+		} `json:"migration"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return fmt.Errorf("decode GET /v1/enclave-info response: %w", err)
+	}
+	if info.Migration.SourcePCR0 != expectedPCR0 {
+		return fmt.Errorf("GET /v1/enclave-info migration.source_pcr0 is %q, want %q", info.Migration.SourcePCR0, expectedPCR0)
+	}
+	return nil
+}
+
+func candidateGET(ctx context.Context, client *http.Client, url string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: GET %s: %v", errCandidateInitializing, req.URL.Path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, candidateResponseLimit+1))
+	if err != nil {
+		return 0, nil, fmt.Errorf("read GET %s response: %w", req.URL.Path, err)
+	}
+	if len(body) > candidateResponseLimit {
+		return 0, nil, fmt.Errorf("read GET %s response: response exceeds %d bytes", req.URL.Path, candidateResponseLimit)
+	}
+	return resp.StatusCode, body, nil
+}
+
+func normalizePCR0(pcr0 string) (string, error) {
+	decoded, err := hex.DecodeString(pcr0)
+	if err != nil {
+		return "", fmt.Errorf("must be 96 hexadecimal characters: %w", err)
+	}
+	if len(decoded) != 48 {
+		return "", errors.New("must be 96 hexadecimal characters")
+	}
+	return hex.EncodeToString(decoded), nil
 }
 
 // rollbackMigration restores the old EIF and restarts the old enclave after
@@ -453,10 +561,13 @@ func (m *Migration) awaitEnclaveReady(ctx context.Context, timeout time.Duration
 // to the migration key (set by the old enclave before we swapped EIFs), so
 // the restored old enclave will decrypt from it — its PCR0 is in the policy.
 func (m *Migration) rollbackMigration(ctx context.Context, eifDest, eifBackup, stopCmd, startCmd string, emit func(step int, status, msg string)) {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationControlTimeout)
+	defer cancel()
+
 	emit(stepWaitOutcome, "rollback", "Initiating rollback...")
 
 	emit(stepWaitOutcome, "rollback", "Stopping failed new enclave...")
-	if err := m.lifecycle.Stop(ctx, stopCmd); err != nil {
+	if err := m.lifecycle.Stop(rollbackCtx, stopCmd); err != nil {
 		slog.Warn("rollback stop failed", "error", err)
 	}
 
@@ -470,7 +581,7 @@ func (m *Migration) rollbackMigration(ctx context.Context, eifDest, eifBackup, s
 	}
 
 	emit(stepWaitOutcome, "rollback", "Starting old enclave...")
-	if err := m.lifecycle.Start(ctx, startCmd); err != nil {
+	if err := m.lifecycle.Start(rollbackCtx, startCmd); err != nil {
 		emit(stepWaitOutcome, "rollback", fmt.Sprintf("CRITICAL: failed to start old enclave: %v", err))
 		return
 	}

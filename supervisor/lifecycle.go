@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const lifecycleCommandTimeout = 2 * time.Minute
+
 // Lifecycle runs `nitro-cli run-enclave` at supervisor startup, polls
 // `describe-enclaves` to detect unexpected exits, and restarts with bounded
 // backoff. Replaces the former enclave-watchdog.service + enclave_init.sh.
@@ -97,7 +99,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			if err := l.terminateEnclave(); err != nil {
+			if err := l.terminateEnclave(context.Background()); err != nil {
 				slog.Warn("enclave termination on shutdown failed", "error", err)
 			}
 			return nil
@@ -112,7 +114,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 			continue
 		}
 
-		running, err := l.isRunning()
+		running, err := l.isRunning(ctx)
 		if err != nil {
 			slog.Debug("isRunning probe failed", "error", err)
 			continue
@@ -142,7 +144,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		// unreachable (e.g. wedged networking), in which case start paths
 		// guarded by liveness checks (nitro-cli, test harness PID guard)
 		// would no-op forever.
-		if err := l.terminateEnclave(); err != nil {
+		if err := l.terminateEnclave(ctx); err != nil {
 			slog.Warn("enclave termination before restart failed", "error", err)
 		}
 		if err := l.startEnclave(ctx); err != nil {
@@ -194,7 +196,7 @@ func (l *Lifecycle) StartOnce(ctx context.Context) error {
 	l.stopped = false
 	l.mu.Unlock()
 
-	running, err := l.isRunning()
+	running, err := l.isRunning(ctx)
 	if err == nil && running {
 		return nil
 	}
@@ -205,7 +207,7 @@ func (l *Lifecycle) StopOnce(ctx context.Context) error {
 	l.mu.Lock()
 	l.stopped = true
 	l.mu.Unlock()
-	return l.terminateEnclave()
+	return l.terminateEnclave(ctx)
 }
 
 // SetStopped flips the auto-restart latch without touching the enclave.
@@ -255,10 +257,13 @@ func (l *Lifecycle) startEnclave(ctx context.Context) error {
 }
 
 // terminateEnclave stops the enclave. Same override precedence as startEnclave.
-func (l *Lifecycle) terminateEnclave() error {
+func (l *Lifecycle) terminateEnclave(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, lifecycleCommandTimeout)
+	defer cancel()
+
 	l.setRunning(false)
 	if cmd := os.Getenv("ENCLAVE_STOP_CMD"); cmd != "" {
-		out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+		out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("ENCLAVE_STOP_CMD: %w: %s", err, out)
 		}
@@ -267,7 +272,7 @@ func (l *Lifecycle) terminateEnclave() error {
 	if _, err := exec.LookPath("nitro-cli"); err != nil {
 		return nil
 	}
-	out, err := exec.Command("nitro-cli", "terminate-enclave", "--enclave-name", l.enclaveName).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "nitro-cli", "terminate-enclave", "--enclave-name", l.enclaveName).CombinedOutput()
 	if err != nil {
 		// nitro-cli exits non-zero on no-running-enclave — treat as success.
 		if strings.Contains(string(out), "There is no enclave") {
@@ -280,9 +285,9 @@ func (l *Lifecycle) terminateEnclave() error {
 
 // isRunning queries nitro-cli describe-enclaves; falls back to polling
 // ENCLAVE_URL/health in test/dev where nitro-cli isn't installed.
-func (l *Lifecycle) isRunning() (bool, error) {
+func (l *Lifecycle) isRunning(ctx context.Context) (bool, error) {
 	if _, err := exec.LookPath("nitro-cli"); err == nil {
-		enclaves, err := describeEnclaves()
+		enclaves, err := describeEnclavesContext(ctx)
 		if err != nil {
 			return false, err
 		}

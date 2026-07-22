@@ -32,6 +32,7 @@ const (
 
 type unverifiedState struct {
 	startState             startState
+	currentPCR0            []byte
 	kmsKeyID               string
 	secretMetadata         []StaticSecretMetadata
 	snapshot               persistedStateSnapshot
@@ -69,7 +70,17 @@ func EstablishState(
 	sts STSAPI,
 	ssm SSM,
 ) (verifiedState, error) {
-	state, err := loadUnverifiedState(ctx, ssm)
+	currentPCR0, err := nsm.PCR0()
+	if err != nil {
+		return verifiedState{}, fmt.Errorf("failed to read current PCR0: %w", err)
+	}
+	if len(currentPCR0) != 48 {
+		return verifiedState{}, fmt.Errorf(
+			"current PCR0 must be exactly 48 bytes, got %d", len(currentPCR0),
+		)
+	}
+
+	state, err := loadUnverifiedState(ctx, ssm, currentPCR0)
 	if err != nil {
 		return verifiedState{}, fmt.Errorf("failed to load unverified state: %w", err)
 	}
@@ -116,7 +127,11 @@ func WriteTransitionReceipt(
 	)
 }
 
-func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) {
+func loadUnverifiedState(
+	ctx context.Context,
+	ssm SSM,
+	currentPCR0 []byte,
+) (unverifiedState, error) {
 	metadata, err := LoadStaticSecretMetadata()
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("failed to load static secret metadata: %w", err)
@@ -157,6 +172,7 @@ func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) 
 	hasPredecessor := hasPredecessorPCR0 && hasPredecessorAttestation
 
 	state := unverifiedState{
+		currentPCR0:            append([]byte(nil), currentPCR0...),
 		kmsKeyID:               keyID,
 		secretMetadata:         metadata,
 		predecessorPCR0:        predecessorPCR0,
@@ -174,7 +190,10 @@ func loadUnverifiedState(ctx context.Context, ssm SSM) (unverifiedState, error) 
 		return state, nil
 	}
 
-	receipt, err := ssm.MayGet(ctx, stateOriginReceiptParam(keyID))
+	receipt, err := ssm.MayGet(
+		ctx,
+		stateOriginReceiptParam(keyID, hex.EncodeToString(currentPCR0)),
+	)
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("failed to get state-origin receipt SSM param: %w", err)
 	}
@@ -235,14 +254,9 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 		return fmt.Errorf("previous PCR0 attestation is required")
 	}
 
-	currentPCR0, err := nsm.PCR0()
-	if err != nil {
-		return fmt.Errorf("failed to read current PCR0: %w", err)
-	}
-
 	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) &&
 		// allow rollback-to-self
-		!strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(currentPCR0)) {
+		!strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
 		return fmt.Errorf(
 			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
 		)
@@ -250,8 +264,8 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 
 	expectedPCRs := map[uint]string{0: state.predecessorPCR0}
 	// Verify PCR31 if this is not a rollback (curPCR0 != prevPCR0).
-	if !strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(currentPCR0)) {
-		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(currentPCR0))
+	if !strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
+		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(state.currentPCR0))
 	}
 
 	return nsm.VerifyAttestation(state.predecessorAttestation, expectedPCRs, nil)
@@ -285,26 +299,17 @@ func establishLoadedState(
 
 	switch state.startState {
 	case startStateResume:
-		pcr0, err := nsm.PCR0()
-		if err != nil {
-			return verifiedState{}, fmt.Errorf("could not read PCR0 from NSM")
-		}
 		if err := verifyStateOriginReceipt(
 			nsm,
 			state.receipt,
 			purposeStateOrigin,
 			root,
-			map[uint]string{0: hex.EncodeToString(pcr0)},
+			map[uint]string{0: hex.EncodeToString(state.currentPCR0)},
 		); err != nil {
 			return verifiedState{}, fmt.Errorf("invalid state-origin receipt: %w", err)
 		}
 	case startStateMigration:
-		pcr0, err := nsm.PCR0()
-		if err != nil {
-			return verifiedState{}, fmt.Errorf("could not read PCR0 from NSM")
-		}
-
-		curPCR0 := hex.EncodeToString(pcr0)
+		curPCR0 := hex.EncodeToString(state.currentPCR0)
 
 		expectedPCRs := map[uint]string{
 			0: state.predecessorPCR0,
@@ -312,7 +317,9 @@ func establishLoadedState(
 
 		// Verify PCR31 if this migration is not a rollback (curPCR0 != prevPCR0)
 		if !strings.EqualFold(state.predecessorPCR0, curPCR0) {
-			expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(pcr0))
+			expectedPCRs[migrationPCRIndex] = hex.EncodeToString(
+				pcrExtendFromZero(state.currentPCR0),
+			)
 		}
 
 		if err := verifyStateOriginReceipt(
@@ -344,7 +351,7 @@ func establishLoadedState(
 			ssm,
 			root,
 			purposeStateOrigin,
-			stateOriginReceiptParam(kms.KeyID()),
+			stateOriginReceiptParam(kms.KeyID(), hex.EncodeToString(state.currentPCR0)),
 		); err != nil {
 			return verifiedState{}, fmt.Errorf("failed to write state-origin receipt: %w", err)
 		}

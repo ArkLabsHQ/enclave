@@ -218,9 +218,15 @@ func storageDEKCiphertextParam(keyID string) string {
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
-// own state at genesis (and after adopting a migration). Scoped by key ID.
-func stateOriginReceiptParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/StateOriginReceipt/%s", getDeployment(), getAppName(), keyID)
+// own state at genesis (and after adopting a migration). Scoped by key ID and PCR0.
+func stateOriginReceiptParam(keyID, pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/StateOriginReceipt/%s/%s",
+		getDeployment(),
+		getAppName(),
+		keyID,
+		strings.ToLower(pcr0),
+	)
 }
 
 // migrationStateOriginReceiptParam: SSM path for the receipt a predecessor

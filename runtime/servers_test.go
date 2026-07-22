@@ -97,6 +97,37 @@ func (l failingListener) Accept() (net.Conn, error) { return nil, l.err }
 func (failingListener) Close() error                { return nil }
 func (failingListener) Addr() net.Addr              { return &net.TCPAddr{} }
 
+func TestServersStartReturnsBindErrors(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer occupied.Close()
+
+	t.Run("private", func(t *testing.T) {
+		s := &servers{
+			int: &http.Server{Addr: occupied.Addr().String()},
+			ext: &http.Server{},
+			rt:  newRuntimeState(),
+		}
+		err := s.Start(context.Background(), Config{})
+		require.ErrorContains(t, err, "private listener")
+	})
+
+	t.Run("public", func(t *testing.T) {
+		port := occupied.Addr().(*net.TCPAddr).Port
+		ipv6, _ := net.Listen("tcp6", fmt.Sprintf("[::]:%d", port))
+		if ipv6 != nil {
+			defer ipv6.Close()
+		}
+		s := &servers{
+			int: &http.Server{Addr: "127.0.0.1:0"},
+			ext: &http.Server{},
+			rt:  newRuntimeState(),
+		}
+		err := s.Start(context.Background(), Config{ExtPort: uint16(port)})
+		require.ErrorContains(t, err, "public listener")
+	})
+}
+
 func TestIsGRPCRequest(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -366,7 +397,7 @@ func TestMigrationControlHandler(t *testing.T) {
 		))
 
 		require.Equal(t, http.StatusOK, rr.Code)
-		require.JSONEq(t, `{"state":"cooling_down","target_pcr0":"`+targetPCR0+`"}`, rr.Body.String())
+		require.JSONEq(t, `{"state":"cooling_down","target_pcr0":"`+targetPCR0+`","remaining_seconds":0}`, rr.Body.String())
 		require.Equal(t, []migrationControlCall{{
 			action: migrationIntentRequested, targetPCR0: targetPCR0,
 		}}, migrator.requestCalls)

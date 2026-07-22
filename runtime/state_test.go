@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"maps"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,11 +134,24 @@ func signedReceipt(
 	)
 }
 
+func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	pcr0 := strings.Repeat("AB", 48)
+	require.Equal(
+		t,
+		"/prod/state-origin/StateOriginReceipt/key-1/"+strings.ToLower(pcr0),
+		stateOriginReceiptParam("key-1", pcr0),
+	)
+}
+
 func TestLoadUnverifiedState(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	keyID := "key-classify"
+	currentPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	currentPCR0Hex := hex.EncodeToString(currentPCR0)
 	prevPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
 	withKey := func(params map[string]string) map[string]string {
 		maps.Copy(params, stateOriginParams(keyID))
@@ -145,7 +159,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 	}
 
 	withReceipt := func(params map[string]string) map[string]string {
-		params[stateOriginReceiptParam(keyID)] = "receipt"
+		params[stateOriginReceiptParam(keyID, currentPCR0Hex)] = "receipt"
 		return params
 	}
 	withMigration := func(params map[string]string) map[string]string {
@@ -199,6 +213,20 @@ func TestLoadUnverifiedState(t *testing.T) {
 			want:   startStateMigration,
 		},
 		{
+			name: "foreign receipt selects migration",
+			params: func() map[string]string {
+				params := withMigration(withKey(map[string]string{}))
+				params[stateOriginReceiptParam(keyID, strings.Repeat("cd", 48))] = "foreign"
+				return params
+			}(),
+			want: startStateMigration,
+		},
+		{
+			name:   "exact receipt takes precedence over transition",
+			params: withReceipt(withMigration(withKey(map[string]string{}))),
+			want:   startStateResume,
+		},
+		{
 			name: "migration artifacts without transition receipt fail",
 			params: withKey(func() map[string]string {
 				params := map[string]string{}
@@ -213,7 +241,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, ssm := stateOriginTestSSM(tc.params)
-			got, err := loadUnverifiedState(ctx, ssm)
+			got, err := loadUnverifiedState(ctx, ssm, currentPCR0)
 
 			if tc.wantErr {
 				require.Error(t, err)
@@ -231,6 +259,24 @@ func TestLoadUnverifiedState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEstablishStateRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	fake, ssm := stateOriginTestSSM(nil)
+	session := newStatefulNSMSession(t, map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, 47)})
+
+	_, err := EstablishState(
+		context.Background(),
+		&nsmW{nsm: &fakeNSM{session: session}},
+		nil,
+		nil,
+		ssm,
+	)
+
+	require.ErrorContains(t, err, "exactly 48 bytes")
+	require.Empty(t, fake.calls)
 }
 
 func TestVerifyStateOriginReceipt(t *testing.T) {
@@ -360,10 +406,10 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	fake, ssm := stateOriginTestSSM(original)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	receipt := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
-	fake.params[stateOriginReceiptParam(keyID)] = receipt.docB64
+	fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = receipt.docB64
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	kms := &stateOriginTestKMS{keyID: keyID}
-	unverified, err := loadUnverifiedState(ctx, ssm)
+	unverified, err := loadUnverifiedState(ctx, ssm, pcr0)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
 	fake.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
@@ -390,10 +436,11 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	keyID := "key-missing-state"
 	params := stateOriginParams(keyID)
 	delete(params, secretCiphertextParam("alpha", keyID))
-	params[stateOriginReceiptParam(keyID)] = "receipt"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = "receipt"
 	fake, ssm := stateOriginTestSSM(params)
 
-	_, err := loadUnverifiedState(ctx, ssm)
+	_, err := loadUnverifiedState(ctx, ssm, pcr0)
 
 	require.Error(t, err)
 	_, exists := fake.params[secretCiphertextParam("alpha", keyID)]
@@ -409,7 +456,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	fake, ssm := stateOriginTestSSM(nil)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session}}
-	unverified, err := loadUnverifiedState(ctx, ssm)
+	unverified, err := loadUnverifiedState(ctx, ssm, pcr0)
 	require.NoError(t, err)
 
 	established, err := establishLoadedState(
@@ -425,7 +472,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	require.Len(t, established.secrets, len(stateOriginTestSecrets))
 	require.Equal(t, stateOriginTestMigrationIntentBucket, established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
-	written := fake.params[stateOriginReceiptParam(keyID)]
+	written := fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))]
 	require.NoError(t, verifyStateOriginReceipt(
 		NewNSM(WithAttestationRoots(session.attestationRoots)),
 		written,
@@ -434,6 +481,8 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 		map[uint]string{0: hex.EncodeToString(pcr0)},
 	))
 	require.Equal(t, keyID, fake.params[kmsKeyIDParam()])
+	_, hasLegacyReceipt := fake.params["/prod/state-origin/StateOriginReceipt/"+keyID]
+	require.False(t, hasLegacyReceipt)
 }
 
 func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
@@ -443,10 +492,10 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fake, ssm := stateOriginTestSSM(map[string]string{kmsKeyIDParam(): "UNSET"})
 	fake.putErrs = map[string]error{
-		stateOriginReceiptParam(keyID): errors.New("receipt write failed"),
+		stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0)): errors.New("receipt write failed"),
 	}
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
-	unverified, err := loadUnverifiedState(context.Background(), ssm)
+	unverified, err := loadUnverifiedState(context.Background(), ssm, pcr0)
 	require.NoError(t, err)
 
 	_, err = establishLoadedState(
@@ -487,9 +536,9 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
 			root := mustStateRoot(t, ctx, ssm, keyID)
 			att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, root)
-			fake.params[stateOriginReceiptParam(keyID)] = att.docB64
+			fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = att.docB64
 			fake.params[tc.param] = tc.value
-			unverified, err := loadUnverifiedState(ctx, ssm)
+			unverified, err := loadUnverifiedState(ctx, ssm, pcr0)
 			require.NoError(t, err)
 			kms := &stateOriginTestKMS{keyID: keyID}
 
@@ -531,11 +580,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		fake.params[migrationPreviousPCR0AttestationParam()] = "previous-attestation"
 
 		session := &fakeNSMSession{}
-		session.responses = append(
-			session.responses,
-			attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: ownPCR0})),
-			attestationDocumentResponse(stateReceipt.doc),
-		)
+		session.responses = append(session.responses, attestationDocumentResponse(stateReceipt.doc))
 		nsm := &nsmW{nsm: &fakeNSM{
 			session: session,
 			verifyResult: verifyDocResult(
@@ -543,7 +588,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 				receiptPayload(t, purposeMigrationTransition, root),
 			),
 		}}
-		unverified, err := loadUnverifiedState(ctx, ssm)
+		unverified, err := loadUnverifiedState(ctx, ssm, ownPCR0)
 		require.NoError(t, err)
 
 		_, err = establishLoadedState(
@@ -564,7 +609,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, verifyStateOriginReceipt(
 			NewNSM(WithAttestationRoots(roots)),
-			fake.params[stateOriginReceiptParam(keyID)],
+			fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(ownPCR0))],
 			purposeStateOrigin,
 			root,
 			map[uint]string{0: hex.EncodeToString(ownPCR0)},

@@ -99,7 +99,9 @@ func Run(ctx context.Context, cfg Config) error {
 		authToken,
 	)
 
-	servers.Start(ctx, cfg)
+	if err := servers.Start(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to start HTTP servers: %w", err)
+	}
 
 	ssm := NewSSM(aws.SSM)
 	verified, err := EstablishState(

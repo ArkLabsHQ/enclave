@@ -44,7 +44,7 @@ var (
 )
 
 type Servers interface {
-	Start(ctx context.Context, cfg Config)
+	Start(ctx context.Context, cfg Config) error
 	StartRESPServer(ctx context.Context, resp RESPServer) error
 	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
 	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
@@ -142,21 +142,26 @@ func SetupHttpServers(
 	}
 }
 
-func (s *servers) Start(ctx context.Context, cfg Config) {
+func (s *servers) Start(ctx context.Context, cfg Config) error {
+	private, err := net.Listen("tcp", s.int.Addr)
+	if err != nil {
+		return fmt.Errorf("private listener: %w", err)
+	}
+
+	public, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
+	if err != nil {
+		_ = private.Close()
+		return fmt.Errorf("public listener: %w", err)
+	}
+
 	go func() {
-		if err := s.int.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.int.Serve(private); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("private listener: %w", err))
 		}
 	}()
 
 	go func() {
-		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
-		if err != nil {
-			s.rt.NotifyListenerError(fmt.Errorf("listen on external port: %w", err))
-			return
-		}
-
-		if err := s.ext.ServeTLS(lis, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.ext.ServeTLS(public, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("public listener: %w", err))
 		}
 	}()
@@ -166,6 +171,8 @@ func (s *servers) Start(ctx context.Context, cfg Config) {
 		_ = s.int.Close()
 		_ = s.ext.Close()
 	}()
+
+	return nil
 }
 
 func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {

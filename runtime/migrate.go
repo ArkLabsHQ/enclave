@@ -41,7 +41,7 @@ type MigrationStatus struct {
 	Action           string     `json:"action,omitempty"`
 	PublishedAt      *time.Time `json:"published_at,omitempty"`
 	EligibleAt       *time.Time `json:"eligible_at,omitempty"`
-	RemainingSeconds int        `json:"remaining_seconds,omitempty"`
+	RemainingSeconds int        `json:"remaining_seconds"`
 }
 
 const (
@@ -181,7 +181,7 @@ func migrationStatusAt(
 	eligibleAt := head.PublishedAt.Add(cooldown)
 	status.EligibleAt = &eligibleAt
 	remaining := eligibleAt.Sub(now)
-	if remaining <= 0 {
+	if cooldown == 0 || remaining <= 0 {
 		status.State = migrationStateEligible
 		return status
 	}

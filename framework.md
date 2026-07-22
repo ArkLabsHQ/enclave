@@ -250,15 +250,22 @@ migration-log verifier CLI is shipped.
 
 The supervisor is the main process inside the enclave. It:
 
-1. **Boots non-blocking** — HTTP server starts immediately (health checks available)
+1. **Binds HTTP synchronously** — public and private initial binds must both
+   succeed before their serving goroutines start
 2. **Loads secrets** — Retries KMS decryption until all secrets are available
 3. **Generates attestation key** — Ephemeral secp256k1, registered with nitriding
 4. **Extends PCRs** — Commits secret public keys to user PCR registers
 5. **Spawns user app** — Runs the user's binary as a child process with secrets as env vars
 6. **Reverse proxies** — Routes all non-management traffic to the user app
 7. **Signs responses** — Schnorr BIP-340 signature on every response
-8. **Handles migration control** — parent-only vsock port `8003` routes
+8. **Signals readiness** — Only after exact state/KMS posture and access,
+   provenance/freshness, required listeners, environment and secrets, and
+   `child.Start()` have succeeded
+9. **Handles migration control** — parent-only vsock port `8003` routes
    `/request-migration` and `/finalise-migration`
+
+Readiness is a one-way startup signal. Later child exit does not clear it, so it
+does not represent ongoing application health.
 
 ### Management Endpoints
 
@@ -267,7 +274,7 @@ The supervisor is the main process inside the enclave. It:
 | `/v1/enclave-info` | GET | Version, PCR0 history, attestation pubkey, init status |
 | `/v1/extend-pcr` | POST | Extend user PCR (16-31) with custom data |
 | `/v1/lock-pcr` | POST | Lock a user PCR against further extension |
-| `/health` | GET | Readiness probe (200 ready, 503 initializing) |
+| `/health` | GET | One-way startup readiness (200 ready, 503 initializing) |
 
 Migration mutation is not public HTTP. The EC2 parent reaches
 `POST /request-migration` and `POST /finalise-migration` over AF_VSOCK port
@@ -339,10 +346,30 @@ Public history makes hidden migration forks detectable, not prevented. A
 retained clone with the same source PCR0 and valid state can append competing
 valid entries; the protocol does not prove enclave uniqueness.
 
-> **Current activation limitation:** steps 10/11 are not implemented. The host
-> currently accepts `GET /v1/enclave-info` HTTP 200 after the EIF swap; it does
-> not perform fresh exact-target attestation, require runtime `/health`
-> readiness, or implement the intended verified cleanup ordering.
+Regular state-origin receipts are selected at
+`/<deployment>/<app>/StateOriginReceipt/<kms-key-id>/<lowercase-current-pcr0>`;
+transition receipts remain at
+`/<deployment>/<app>/MigrationStateOriginReceipt/<kms-key-id>`. An exact regular
+receipt is verified or fails closed. Only exact absence selects transition
+verification for a successor or rollback-to-self; no legacy unscoped fallback
+or sibling-PCR0 inspection occurs. Receipts for A and B can coexist under K-AB,
+and each proves state adoption rather than runtime readiness.
+
+After candidate start, the host constructs a fresh raw `http.Client`, not a
+verified enclave client, and requires runtime `/health` HTTP 200 `ready` plus an
+exact target match in
+`migration.source_pcr0`. Wrong or malformed PCR0, non-readiness, transport
+failure, or timeout triggers EIF rollback. The check is operational: it has no
+nonce-bound Nitro-chain verification, TLS pinning, or local EIF PCR derivation;
+`enclave verify` remains independent cryptographic verification.
+
+Cleanup removes only temporary local artifacts. PCR-scoped and transition
+receipts, dual-PCR authorization, and PCR0-addressed source candidates are
+retained for deliberate rollback, and candidate publication remains append-only
+until bucket teardown. A restored A needs a fresh A-to-C intent and cooldown;
+stale K-AB evidence is ignored under active K-AC. This rollback-to-self flow is
+limited to non-genesis sources because the separately tracked genesis defect
+remains out of scope.
 
 ---
 

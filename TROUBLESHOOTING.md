@@ -61,21 +61,81 @@ Use the anonymous `list-object-versions` and exact-version `get-object` commands
 in [OPERATIONS.md](OPERATIONS.md#authoritative-s3-log). Preserve all versions;
 do not inspect only `IsLatest`.
 
-### Candidate identity or readiness is uncertain after finalise
+### Candidate identity or readiness verification rolled the EIF back
 
-Current activation steps 10/11 are not implemented. Host orchestration does not
-perform fresh exact-target attestation, require runtime `/health` readiness, or
-implement the intended verified cleanup ordering. Check both endpoints and run
-independent live verification:
+After candidate start, the supervisor uses a fresh raw `http.Client`, not a
+verified enclave client, to require `/health` HTTP 200 with status `ready` and
+an exact lowercase target in `/v1/enclave-info` at
+`migration.source_pcr0`. Wrong or malformed identity, non-ready or malformed
+responses, transport failure, and timeout all prevent cleanup and roll the EIF
+back.
+
+Inspect the migration output and host journal for `new enclave verification
+failed` followed by rollback events. Before rollback completes, or while
+diagnosing a candidate manually, compare both operational responses with the
+intended PCR0:
 
 ```bash
-curl -sk https://127.0.0.1:443/v1/enclave-info
-curl -sk https://127.0.0.1:443/health
+EXPECTED_PCR0="$(tofu -chdir=tofu output -raw candidate_pcr0)"
+curl -sk https://127.0.0.1:443/health | jq .
+curl -sk https://127.0.0.1:443/v1/enclave-info \
+  | jq --arg expected "$EXPECTED_PCR0" \
+    '{reported: .migration.source_pcr0, expected: $expected}'
 enclave verify --base-url https://<enclave-address> --expected-pcr0 <candidate-pcr0>
 ```
 
-No migration-log verifier CLI is shipped; `enclave verify` checks the live
-enclave and is a different operation.
+After automatic rollback, these endpoints normally report the restored source,
+so use the journal to diagnose the failed candidate. HTTP 503 and startup
+transport failures are retried until the readiness timeout; invalid HTTP 200
+content, a non-200/non-503 response, or a wrong PCR0 fails immediately.
+
+The supervisor probes are operational only. They do not verify a nonce-bound
+Nitro attestation, Nitro certificate chain, TLS identity, or locally derived EIF
+PCR. `enclave verify` is the separate cryptographic operation. No migration-log
+verifier CLI is shipped.
+
+### State-origin receipt startup failure
+
+The active KMS key and current lowercase PCR0 select one exact regular receipt.
+Inspect the active key, exact receipt, transition receipt, and receipt siblings:
+
+```bash
+DEPLOYMENT=dev
+APP_NAME=myapp
+LOCK_SEGMENT=unlocked  # use locked when is_kms_key_locked=true
+CURRENT_PCR0=<96-lowercase-current-pcr0>
+
+KEY_ID="$(aws ssm get-parameter \
+  --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/KMSKeyID" \
+  --query 'Parameter.Value' --output text)"
+REGULAR="/$DEPLOYMENT/$APP_NAME/StateOriginReceipt/$KEY_ID/$CURRENT_PCR0"
+TRANSITION="/$DEPLOYMENT/$APP_NAME/MigrationStateOriginReceipt/$KEY_ID"
+
+aws ssm get-parameter --name "$REGULAR" --query 'Parameter.Name' --output text
+aws ssm get-parameter --name "$TRANSITION" --query 'Parameter.Name' --output text
+aws ssm get-parameters-by-path \
+  --path "/$DEPLOYMENT/$APP_NAME/StateOriginReceipt/$KEY_ID/" \
+  --recursive --query 'Parameters[].Name' --output text
+```
+
+- If the exact regular receipt exists, any signature, purpose, state-root, or
+  PCR0 verification failure is fatal. The runtime does not try the transition
+  receipt.
+- If the exact regular receipt is absent, the transition receipt,
+  `MigrationPreviousPCR0`, and `MigrationPreviousPCR0Attestation` must exist and
+  verify against an exact two-PCR KMS policy. A receipt for the other admitted
+  PCR0 is neither used nor treated as a blocker.
+- The legacy `StateOriginReceipt/<kms-key-id>` path is never read. Do not create
+  it as a workaround.
+- A regular receipt may exist even when later freshness, listener, environment,
+  secret, or child startup failed. It proves state adoption, not readiness.
+- Receipts under an old key such as K-AB remain deliberate rollback evidence,
+  but are ignored after active `KMSKeyID` moves to K-AC.
+
+For a non-genesis source, rollback-to-self can use its own exact receipt or the
+transition evidence when that receipt is absent. The separately tracked genesis
+rollback-to-self defect remains out of scope, so a failed first-generation
+activation may not restore a genesis source correctly.
 
 ### `secret value too large (N bytes, max 65536)`
 

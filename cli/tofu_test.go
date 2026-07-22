@@ -106,12 +106,50 @@ func TestWriteTofuVars_Route53ZoneID(t *testing.T) {
 	}
 }
 
-func TestTofuCandidateArtifacts(t *testing.T) {
-	for _, want := range []string{
-		`key        = "candidates/${local.effective_pcr0}/enclave.eif"`,
-		`key        = "candidates/${local.effective_pcr0}/supervisor"`,
+func TestTofuReceiptIAMPolicy(t *testing.T) {
+	requireContains(t, tofuModuleEnclaveMain, `  statement {
+    sid     = "SSMReadWriteParams"
+    actions = ["ssm:GetParameter", "ssm:PutParameter"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StateOriginReceipt/*/*",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/MigrationStateOriginReceipt/*",
+    ]
+  }`)
+
+	for _, notWant := range []string{
+		`"arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StateOriginReceipt/*"`,
+		`"ssm:Delete`,
 	} {
-		requireContains(t, tofuModuleEnclaveMain, want)
+		if strings.Contains(tofuModuleEnclaveMain, notWant) {
+			t.Errorf("generated instance policy unexpectedly contains %q", notWant)
+		}
+	}
+}
+
+func TestTofuCandidateArtifactsAreAppendOnly(t *testing.T) {
+	markers := []struct {
+		name  string
+		value string
+	}{
+		{"PCR-addressed EIF key", `candidate_eif_key        = "candidates/${local.effective_pcr0}/enclave.eif"`},
+		{"PCR-addressed supervisor key", `candidate_supervisor_key = "candidates/${local.effective_pcr0}/supervisor"`},
+		{"removed EIF object", `from = aws_s3_object.enclave_eif`},
+		{"removed supervisor object", `from = aws_s3_object.supervisor_binary`},
+		{"unified upload resource", `resource "terraform_data" "candidate_upload"`},
+		{"artifact iteration", `for_each = local.candidate_artifacts`},
+		{"content comparison", `cmp -s "$SOURCE" "$WORK/existing"`},
+		{"overwrite refusal", `refusing to overwrite retained candidate s3://$BUCKET/$KEY`},
+		{"instance upload dependency", `terraform_data.candidate_upload,`},
+	}
+	for _, marker := range markers {
+		t.Run(marker.name, func(t *testing.T) {
+			requireContains(t, tofuModuleEnclaveMain, marker.value)
+		})
+	}
+
+	if strings.Contains(tofuModuleEnclaveMain, `resource "aws_s3_object"`) {
+		t.Error("candidate publication uses lifecycle-managed aws_s3_object resources")
 	}
 
 	for _, name := range []string{

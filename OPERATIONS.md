@@ -52,8 +52,12 @@ The management server proxies nitriding's Prometheus metrics at `GET /metrics`.
 
 ### Health checks
 
-- **Supervisor**: `GET /health` returns `{"status":"ready"}` when initialized, `503` during init or on error
-- **Management**: `GET /health` runs `nitro-cli describe-enclaves` and returns enclave state
+- **Runtime through enclave HTTPS**: `GET /health` returns HTTP 200 with
+  `{"status":"ready"}` only after required initialization and successful child
+  spawn; it returns 503 while initializing. Ready is a one-way startup signal,
+  not ongoing application health.
+- **Host management**: `GET /health` runs `nitro-cli describe-enclaves` and
+  returns enclave state.
 
 ## Scaling
 
@@ -198,10 +202,10 @@ States are exactly `none`, `cooling_down`, `eligible`, and `aborted`.
 | `action` | A valid head exists; `requested` or `aborted` |
 | `published_at` | A valid head exists; exact version's S3 `LastModified` |
 | `eligible_at` | Requested head only |
-| `remaining_seconds` | `cooling_down` only, rounded up |
+| `remaining_seconds` | Always; rounded up while `cooling_down`, otherwise `0` |
 
-The CLI prints every label, rendering omitted strings as `<unset>` and omitted
-numbers as `0`. Public status is derived; the S3 log is authoritative.
+The CLI prints every label, rendering omitted strings as `<unset>`. Public
+status is derived; the S3 log is authoritative.
 
 A zero cooldown still requires a matching published request. That request is
 immediately `eligible`.
@@ -232,18 +236,61 @@ updates active `KMSKeyID`. The host then backs up the current EIF, downloads the
 PCR0-addressed candidate, stops the source, swaps the EIF, and starts the
 candidate.
 
-If candidate start or the current post-start probe fails, the host restores the
-EIF backup and restarts the source. The migration key admits both PCR0s and the
-transition receipt supports that rollback path.
+The candidate remains unready while it establishes state, verifies exact KMS
+posture and actual access, checks state provenance and freshness, initializes
+required listeners, applies environment and verified secret values, and starts
+the application child. Initial public and private HTTP binds are synchronous;
+either bind failure aborts startup. A regular state-origin receipt written
+during this process proves state adoption, not readiness.
 
-> **Current activation limitation: steps 10/11 are not implemented.** After the
-> EIF swap, the supervisor treats `GET /v1/enclave-info` HTTP 200 as sufficient
-> readiness. It does not obtain fresh attestation and prove that PCR0 equals the
-> requested target, it does not require runtime `GET /health` readiness, and it
-> does not implement the intended verified cleanup ordering. Current code then
-> removes the EIF backup and may update the supervisor, but that sequence is not
-> a verified activation/cleanup protocol. Migration completion must not be read
-> as evidence that those checks occurred.
+After candidate start, the host creates a fresh raw `http.Client`, not a
+verified enclave client, and requires both:
+
+1. `GET /health` returns HTTP 200 with status `ready`.
+2. `GET /v1/enclave-info` reports `migration.source_pcr0` exactly equal to the
+   lowercase requested target.
+
+A wrong or malformed PCR0, malformed or non-ready response, transport failure,
+or timeout restores the EIF backup and restarts the source. Later child exit
+does not clear the runtime's one-way ready signal; this activation check has no
+ongoing application-health semantics.
+
+The supervisor check is operational, not cryptographic. It does not obtain a
+nonce-bound Nitro attestation, verify the Nitro certificate chain, pin TLS, or
+locally derive and verify the downloaded EIF's PCR0. Only after both operational
+checks succeed may it remove temporary local EIF files and the backup, attempt
+an optional supervisor update, and report completion.
+
+Host cleanup retains the PCR-scoped regular receipts, transition receipt,
+dual-PCR KMS authorization, and PCR0-addressed source artifacts needed for a
+later deliberate rollback. Candidate publication is append-only across applies;
+all PCR0-addressed candidates remain until deployment bucket teardown.
+
+### State receipts and deliberate rollback
+
+The runtime selects these exact SSM paths using the active KMS key ID and its
+lowercase current PCR0:
+
+```text
+/<deployment>/<app>/StateOriginReceipt/<kms-key-id>/<lowercase-current-pcr0>
+/<deployment>/<app>/MigrationStateOriginReceipt/<kms-key-id>
+```
+
+If the exact regular receipt exists, it must verify or startup fails closed. If
+it is absent, the runtime uses the transition receipt and predecessor evidence
+for successor adoption or rollback-to-self. It never reads the legacy unscoped
+regular path and never treats a sibling PCR0 receipt as the current enclave's
+receipt.
+
+Under K-AB, A and B receipts can coexist and each PCR0 can restart from its own
+receipt. If B activation fails, a non-genesis A can be restored through its own
+receipt or the A-to-B transition. A later A-to-C migration requires a new
+A-scoped public intent and full cooldown; after K-AC becomes active, stale K-AB
+evidence is retained but ignored, and B is not admitted by the active key.
+
+The separately tracked genesis rollback-to-self defect remains out of scope. A
+failed first-generation activation may not restore a genesis source correctly;
+the deliberate rollback behavior above applies to a non-genesis source.
 
 Independently verify the live candidate after the operation:
 
@@ -253,8 +300,9 @@ enclave verify \
   --expected-pcr0 <candidate-pcr0>
 ```
 
-This live-enclave check is not automatically part of migration activation and
-does not verify migration-log history.
+This is an independent cryptographic operation. The supervisor does not invoke
+it as part of its operational activation probes, and it does not verify
+migration-log history.
 
 ### Narrow resume
 

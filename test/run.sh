@@ -461,7 +461,7 @@ elif [ "$IN_DOCKER" = true ]; then
   if [ -f "app/.enclave/artifacts/image.eif" ]; then
     EIF_PATH="app/.enclave/artifacts/image.eif"
     echo "  Using pre-built EIF: $EIF_PATH"
-    echo "  Migration EIFs: v2/v3 healthy, v4 wrong-app rollback fixture"
+    echo "  Migration EIFs: v1=G, v2=A, v3=B, v4=C (B/C both follow A)"
   else
     echo "  Error: EIF must be pre-built when running inside Docker" >&2
     echo "  Build it on the host first: cd test/app && enclave build" >&2
@@ -475,7 +475,8 @@ else
   cp "$ENCLAVE_YAML" "$FIXTURE_YAML_BACKUP"
 
   echo "  Building v1 EIF with baked nonzero cooldown..."
-  (cd app && "$ENCLAVE_CLI" build)
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
   cp "${ARTIFACTS}/image.eif" /tmp/image-v1.eif
   cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v1.json
   V1_PCR0=$(jq -r '.PCR0' /tmp/pcr-v1.json)
@@ -490,7 +491,8 @@ else
     echo "" >> "$ENCLAVE_YAML"
     echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
   fi
-  (cd app && "$ENCLAVE_CLI" build)
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
   cp "${ARTIFACTS}/image.eif" /tmp/image-v2.eif
   cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v2.json
   V2_PCR0=$(jq -r '.PCR0' /tmp/pcr-v2.json)
@@ -498,16 +500,17 @@ else
   echo "  Building healthy v3 EIF with zero cooldown..."
   sed -i 's/^version: .*/version: 0.0.3/' "$ENCLAVE_YAML"
   sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" "$ENCLAVE_YAML"
-  (cd app && "$ENCLAVE_CLI" build)
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
   cp "${ARTIFACTS}/image.eif" /tmp/image-v3.eif
   cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v3.json
   V3_PCR0=$(jq -r '.PCR0' /tmp/pcr-v3.json)
 
-  echo "  Building wrong-app v4 EIF for readiness rollback..."
+  echo "  Building healthy v4 EIF as a sibling of v3 (predecessor v2)..."
   sed -i 's/^version: .*/version: 0.0.4/' "$ENCLAVE_YAML"
-  sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V3_PCR0}\"|" "$ENCLAVE_YAML"
-  sed -i 's|^name: my-app\b|name: my-app-wrong|' "$ENCLAVE_YAML"
-  (cd app && "$ENCLAVE_CLI" build)
+  sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" "$ENCLAVE_YAML"
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
   cp "${ARTIFACTS}/image.eif" /tmp/image-v4.eif
   cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v4.json
 
@@ -714,7 +717,7 @@ migration_abort() {
 
 migration_finalise() {
   (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" migration \
-    --supervisor-url "$SUPERVISOR_URL" "$@" finalise)
+    --supervisor-url "$SUPERVISOR_URL" finalise "$@")
 }
 
 migration_json() {
@@ -738,6 +741,12 @@ publish_candidate() {
   cp "${ARTIFACTS}/pcr-v${version}.json" "${ARTIFACTS}/pcr.json"
   tofu_apply
 
+  capture_candidate "$version" "$expected_pcr0"
+}
+
+capture_candidate() {
+  local version="$1" expected_pcr0="$2"
+
   CANDIDATE_PCR0=$(tofu -chdir="$TOFU_DIR" output -raw candidate_pcr0)
   CANDIDATE_BUCKET=$(tofu -chdir="$TOFU_DIR" output -raw candidate_artifact_bucket)
   CANDIDATE_EIF_KEY=$(tofu -chdir="$TOFU_DIR" output -raw candidate_eif_key)
@@ -748,11 +757,129 @@ publish_candidate() {
     echo "  FAIL: Tofu candidate outputs are not PCR0-addressed for v${version}" >&2
     exit 1
   fi
+  printf -v "V${version}_CANDIDATE_BUCKET" '%s' "$CANDIDATE_BUCKET"
+  printf -v "V${version}_CANDIDATE_EIF_KEY" '%s' "$CANDIDATE_EIF_KEY"
+  printf -v "V${version}_CANDIDATE_SUPERVISOR_KEY" '%s' "$CANDIDATE_SUPERVISOR_KEY"
   aws s3api head-object $LOCALSTACK --bucket "$CANDIDATE_BUCKET" \
     --key "$CANDIDATE_EIF_KEY" >/dev/null
   aws s3api head-object $LOCALSTACK --bucket "$CANDIDATE_BUCKET" \
     --key "$CANDIDATE_SUPERVISOR_KEY" >/dev/null
   echo "  PASS: Tofu published v${version} at candidates/${expected_pcr0}/"
+}
+
+assert_candidate_retained() {
+  local version="$1" label="$2"
+  local bucket_var="V${version}_CANDIDATE_BUCKET"
+  local eif_var="V${version}_CANDIDATE_EIF_KEY"
+  local supervisor_var="V${version}_CANDIDATE_SUPERVISOR_KEY"
+  local bucket="${!bucket_var}" eif_key="${!eif_var}" supervisor_key="${!supervisor_var}"
+  if ! aws s3api head-object $LOCALSTACK --bucket "$bucket" --key "$eif_key" >/dev/null 2>&1 || \
+     ! aws s3api head-object $LOCALSTACK --bucket "$bucket" --key "$supervisor_key" >/dev/null 2>&1; then
+    echo "  FAIL: retained ${label} EIF or supervisor object is missing" >&2
+    exit 1
+  fi
+  echo "  PASS: retained ${label} EIF and supervisor objects"
+}
+
+ssm_may_get() {
+  aws ssm get-parameter $LOCALSTACK --name "$1" \
+    --query 'Parameter.Value' --output text 2>/dev/null || true
+}
+
+read_required_ssm() {
+  local path="$1" value
+  value=$(ssm_may_get "$path")
+  if [ -z "$value" ] || [ "$value" = "UNSET" ]; then
+    echo "  FAIL: required SSM parameter is absent: ${path}" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+assert_ssm_value() {
+  local path="$1" expected="$2" label="$3" actual
+  actual=$(ssm_may_get "$path")
+  if [ "$actual" != "$expected" ]; then
+    echo "  FAIL: ${label} changed or is absent (${path})" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} is retained unchanged"
+}
+
+assert_ssm_absent() {
+  local path="$1" label="$2" output rc
+  set +e
+  output=$(aws ssm get-parameter $LOCALSTACK --name "$path" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "  FAIL: ${label} unexpectedly exists at ${path}" >&2
+    exit 1
+  fi
+  if ! echo "$output" | grep -q 'ParameterNotFound'; then
+    echo "  FAIL: could not determine whether ${label} exists at ${path}: ${output}" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} is absent"
+}
+
+assert_no_legacy_receipt() {
+  assert_ssm_absent "/dev/my-app/StateOriginReceipt/$1" "legacy unscoped receipt for key $1"
+}
+
+assert_kms_policy_pcr0s() {
+  local key_id="$1" first="$2" second="$3" label="$4" policy
+  policy=$(aws kms get-key-policy --key-id "$key_id" --policy-name default \
+    --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+    --query 'Policy' --output text 2>/dev/null || true)
+  if ! echo "$policy" | jq -e --arg first "$first" --arg second "$second" '
+      [.Statement[] |
+        select(.Effect == "Allow") |
+        select(.Action | if type == "array" then index("kms:Decrypt") != null else . == "kms:Decrypt" end) |
+        .Condition.StringEqualsIgnoreCase["kms:RecipientAttestation:PCR0"] |
+        if type == "array" then .[] else . end |
+        ascii_downcase] | sort == ([$first, $second] | sort)
+    ' >/dev/null 2>&1; then
+    echo "  FAIL: ${label} KMS policy does not admit exactly the expected PCR0 pair" >&2
+    echo "  policy: ${policy}" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} KMS policy admits exactly the expected PCR0 pair"
+}
+
+assert_successful_migration_log() {
+  local log="$1" label="$2"
+  if ! grep -Fq "progress: New enclave is ready and reports the requested PCR0" "$log" || \
+     ! grep -Fq "complete: Migration complete" "$log"; then
+    echo "  FAIL: ${label} lacked verified-ready or completion events" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} reported verified PCR readiness and completion"
+}
+
+assert_verification_rollback_log() {
+  local log="$1" label="$2"
+  if ! grep -Fq "error: new enclave verification failed" "$log" || \
+     ! grep -Fq "rollback:" "$log" || \
+     ! grep -Fq "rollback-complete: Rollback complete" "$log" || \
+     grep -Fq "] complete: Migration complete" "$log"; then
+    echo "  FAIL: ${label} lacked the expected verification rollback events" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} emitted error, rollback, and rollback-complete without completion"
+}
+
+assert_host_migration_cleanup() {
+  local path
+  for path in "$ACTIVE_EIF_PATH.backup" /tmp/new-enclave.eif /tmp/new-enclave.eif.tmp "$ENCLAVE_SUPERVISOR.new"; do
+    if [ -e "$path" ]; then
+      echo "  FAIL: temporary migration artifact remains: ${path}" >&2
+      exit 1
+    fi
+  done
+  echo "  PASS: temporary EIF, backup, download, and supervisor staging files are absent"
 }
 
 expect_finalise_http() {
@@ -832,6 +959,7 @@ if ! echo "$ENV_OVERRIDE_RESP" | jq -e \
 fi
 echo "  PASS: Tofu app.env overrides are visible before migration"
 
+capture_candidate 1 "$V1_PCR0"
 SOURCE_KEY=$(current_kms_key)
 publish_candidate 2 "$V2_PCR0"
 POST_APPLY_STATUS=$(migration_json)
@@ -995,86 +1123,295 @@ fi
 migration_status | tee /tmp/migration-status-v2-eligible.log
 
 PRE_MIGRATION_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
-migration_finalise | tee /tmp/migration-finalise-v2.log
-if ! grep -q "complete: Migration complete" /tmp/migration-finalise-v2.log || \
-   ! grep -q "supervisor update ready" /tmp/migration-finalise-v2.log; then
-  echo "  FAIL: v1 -> v2 finalise did not complete its supervisor update" >&2
+migration_finalise \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-finalise-v2.log
+assert_successful_migration_log /tmp/migration-finalise-v2.log "G -> A finalise"
+if ! grep -Fq "supervisor update ready" /tmp/migration-finalise-v2.log; then
+  echo "  FAIL: G -> A did not stage the retained candidate supervisor" >&2
   exit 1
 fi
 wait_for_supervisor_restart "$PRE_MIGRATION_SUP_PID"
-V2_KEY=$(current_kms_key)
-if [ "$V2_KEY" = "$SOURCE_KEY" ]; then
-  echo "  FAIL: v1 -> v2 did not activate a new KMS key" >&2
+K_GA=$(current_kms_key)
+if [ "$K_GA" = "$SOURCE_KEY" ]; then
+  echo "  FAIL: G -> A did not activate a new KMS key" >&2
   exit 1
 fi
-verify_migrated_state "v2 after successful migration" "$V1_PCR0" "$V2_PCR0"
+verify_migrated_state "A after verified G -> A migration" "$V1_PCR0" "$V2_PCR0"
+K_GA_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_GA}"
+K_GA_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_GA}/${V2_PCR0}"
+K_GA_TRANSITION=$(read_required_ssm "$K_GA_TRANSITION_PATH")
+K_GA_A_RECEIPT=$(read_required_ssm "$K_GA_A_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_GA" "$V1_PCR0" "$V2_PCR0" "K-GA"
+assert_no_legacy_receipt "$K_GA"
+assert_host_migration_cleanup
+assert_candidate_retained 1 "G source candidate"
+echo "  PASS: K-GA is active with exact A and transition receipts"
 
-# Step 6: v2 has zero cooldown baked in. Tofu still only publishes v3, and
-# finalisation remains intent-gated even with no wait.
+# Step 6: A has zero cooldown. Publish B append-only, migrate A -> B, then
+# prove B and A can independently resume under the same K-AB state.
 echo ""
-echo "=== [6/11] Zero-cooldown migration: v2 -> v3 ==="
+echo "=== [6/11] Zero-cooldown A -> B and independent A/B resumes ==="
 publish_candidate 3 "$V3_PCR0"
+assert_candidate_retained 2 "A candidate after B publication"
 if [ "$(migration_json | jq -r '.source_pcr0')" != "$V2_PCR0" ] || \
+   [ "$(current_kms_key)" != "$K_GA" ] || \
    ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
-  echo "  FAIL: v3 candidate apply automatically activated" >&2
+  echo "  FAIL: publishing B mutated active A or K-GA" >&2
   exit 1
 fi
 expect_finalise_http 409 /tmp/finalise-v3-no-intent.log
-if [ "$(current_kms_key)" != "$V2_KEY" ]; then
-  echo "  FAIL: no-intent finalise changed the v2 KMS key" >&2
+if [ "$(current_kms_key)" != "$K_GA" ]; then
+  echo "  FAIL: no-intent B finalise changed K-GA" >&2
   exit 1
 fi
 migration_request | tee /tmp/migration-request-v3-zero.log
 migration_status | tee /tmp/migration-status-v3-zero.log
-V3_REQUEST=$(migration_json)
-if ! echo "$V3_REQUEST" | jq -e --arg source "$V2_PCR0" --arg target "$V3_PCR0" \
-    '.state == "eligible" and .source_pcr0 == $source and .target_pcr0 == $target and .action == "requested" and .remaining_seconds == 0' \
-    >/dev/null; then
-  echo "  FAIL: v2 zero-cooldown request was not immediately eligible" >&2
+A_B_REQUEST=$(migration_json)
+A_B_REQUEST_SEQUENCE=$(echo "$A_B_REQUEST" | jq -r '.sequence')
+if ! echo "$A_B_REQUEST" | jq -e --arg source "$V2_PCR0" --arg target "$V3_PCR0" '
+    .state == "eligible" and .source_pcr0 == $source and .target_pcr0 == $target and
+    .action == "requested" and .remaining_seconds == 0
+  ' >/dev/null; then
+  echo "  FAIL: A zero-cooldown request for B was not immediately eligible" >&2
   exit 1
 fi
-PRE_V3_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
-migration_finalise | tee /tmp/migration-finalise-v3.log
-wait_for_supervisor_restart "$PRE_V3_SUP_PID"
-V3_KEY=$(current_kms_key)
-if [ "$V3_KEY" = "$V2_KEY" ]; then
-  echo "  FAIL: v2 -> v3 did not activate a new KMS key" >&2
+PRE_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-finalise-v3.log
+assert_successful_migration_log /tmp/migration-finalise-v3.log "A -> B finalise"
+wait_for_supervisor_restart "$PRE_B_SUP_PID"
+K_AB=$(current_kms_key)
+if [ "$K_AB" = "$K_GA" ]; then
+  echo "  FAIL: A -> B did not activate K-AB" >&2
   exit 1
 fi
-verify_migrated_state "v3 after zero-cooldown migration" "$V2_PCR0" "$V3_PCR0"
+verify_migrated_state "B after zero-cooldown A -> B migration" "$V2_PCR0" "$V3_PCR0"
+K_AB_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_AB}"
+K_AB_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AB}/${V2_PCR0}"
+K_AB_B_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AB}/${V3_PCR0}"
+K_AB_TRANSITION=$(read_required_ssm "$K_AB_TRANSITION_PATH")
+K_AB_B_RECEIPT=$(read_required_ssm "$K_AB_B_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_AB" "$V2_PCR0" "$V3_PCR0" "K-AB"
+assert_no_legacy_receipt "$K_AB"
+assert_host_migration_cleanup
+echo "  PASS: B adopted K-AB and wrote its exact PCR-scoped receipt"
 
-# Step 7: v4 is a Tofu-published candidate whose baked app name is wrong.
-# The source v3 finalises, v4 fails readiness, and the supervisor restores v3.
+restart_enclave
+verify_migrated_state "B exact-receipt normal resume" "$V2_PCR0" "$V3_PCR0"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B receipt after normal restart"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: B normal restart changed K-AB" >&2
+  exit 1
+fi
+
+PRE_ROLLBACK_A_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-a.log
+assert_successful_migration_log /tmp/migration-resume-a.log "rollback-to-A resume"
+wait_for_supervisor_restart "$PRE_ROLLBACK_A_SUP_PID"
+verify_migrated_state "A rollback under K-AB" "$V2_PCR0" "$V2_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: rollback-to-A changed K-AB or did not activate retained A" >&2
+  exit 1
+fi
+K_AB_A_RECEIPT=$(read_required_ssm "$K_AB_A_RECEIPT_PATH")
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "K-AB transition after rollback-to-A"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B receipt after rollback-to-A"
+assert_host_migration_cleanup
+echo "  PASS: A wrote K-AB/A after B adoption; A/B receipts coexist without re-finalisation"
+
+restart_enclave
+verify_migrated_state "A exact-receipt normal resume" "$V2_PCR0" "$V2_PCR0"
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "K-AB/A receipt after normal restart"
+
+PRE_RESUME_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-b.log
+assert_successful_migration_log /tmp/migration-resume-b.log "independent B resume"
+wait_for_supervisor_restart "$PRE_RESUME_B_SUP_PID"
+verify_migrated_state "B independent receipt resume" "$V2_PCR0" "$V3_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: independent B resume created or selected another key" >&2
+  exit 1
+fi
+
+PRE_RESUME_A_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-a-again.log
+assert_successful_migration_log /tmp/migration-resume-a-again.log "independent A resume"
+wait_for_supervisor_restart "$PRE_RESUME_A_SUP_PID"
+verify_migrated_state "A independent receipt resume" "$V2_PCR0" "$V2_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: independent A resume created or selected another key" >&2
+  exit 1
+fi
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "K-AB/A independent receipt"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B independent receipt"
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "K-AB independent transition"
+assert_host_migration_cleanup
+
+# Step 7: C is B's sibling. Finalise A -> C once, deliberately launch A under
+# the C expectation to exercise exact-PCR rollback, then resume real C. Finally
+# prove B is excluded by K-AC and rolls back to C.
 echo ""
-echo "=== [7/11] Wrong-app rollback: v3 -> v4 -> v3 ==="
+echo "=== [7/11] Forked A -> C, wrong-PCR rollback, and K-AC exclusion ==="
 publish_candidate 4 "$V4_PCR0"
-if [ "$(migration_json | jq -r '.source_pcr0')" != "$V3_PCR0" ] || \
-   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v3.eif"; then
-  echo "  FAIL: v4 candidate apply automatically activated" >&2
+assert_candidate_retained 2 "A candidate after C publication"
+assert_candidate_retained 3 "B candidate after C publication"
+if [ "$(migration_json | jq -r '.source_pcr0')" != "$V2_PCR0" ] || \
+   [ "$(current_kms_key)" != "$K_AB" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: publishing C mutated active A or K-AB" >&2
   exit 1
 fi
 migration_request | tee /tmp/migration-request-v4.log
-if [ "$(migration_json | jq -r '.state')" != "eligible" ]; then
-  echo "  FAIL: v3 zero-cooldown request for v4 was not immediately eligible" >&2
+A_C_REQUEST=$(migration_json)
+A_C_REQUEST_SEQUENCE=$(echo "$A_C_REQUEST" | jq -r '.sequence')
+if ! echo "$A_C_REQUEST" | jq -e \
+    --arg source "$V2_PCR0" --arg target "$V4_PCR0" --argjson prior "$A_B_REQUEST_SEQUENCE" '
+      .state == "eligible" and .source_pcr0 == $source and .target_pcr0 == $target and
+      .action == "requested" and .remaining_seconds == 0 and .sequence > $prior
+    ' >/dev/null; then
+  echo "  FAIL: fresh A -> C intent was not eligible and newer than A -> B" >&2
   exit 1
 fi
+
+PRE_WRONG_C_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
 set +e
-migration_finalise >/tmp/migration-finalise-v4.log 2>&1
-V4_FINALISE_RC=$?
+migration_finalise \
+  --target-pcr0 "$V4_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  >/tmp/migration-finalise-c-with-a.log 2>&1
+WRONG_C_RC=$?
 set -e
-if [ "$V4_FINALISE_RC" -eq 0 ] || \
-   ! grep -q "rollback:" /tmp/migration-finalise-v4.log || \
-   ! grep -q "rollback-complete:" /tmp/migration-finalise-v4.log; then
-  echo "  FAIL: wrong-app v4 did not produce the expected readiness rollback" >&2
-  cat /tmp/migration-finalise-v4.log >&2
+if [ "$WRONG_C_RC" -eq 0 ]; then
+  echo "  FAIL: retained A artifact was accepted as C" >&2
+  cat /tmp/migration-finalise-c-with-a.log >&2
   exit 1
 fi
-echo "  PASS: wrong-app v4 emitted rollback and rollback-complete"
-verify_migrated_state "v3 restored and ready after v4 rollback" "$V3_PCR0" "$V3_PCR0"
-if ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v3.eif"; then
-  echo "  FAIL: rollback did not restore the v3 EIF" >&2
+assert_verification_rollback_log /tmp/migration-finalise-c-with-a.log "A-as-C PCR mismatch"
+if [ "$(cat "$SUPERVISOR_PIDFILE")" != "$PRE_WRONG_C_SUP_PID" ]; then
+  echo "  FAIL: failed A-as-C activation promoted/restarted the supervisor" >&2
   exit 1
 fi
+K_AC=$(current_kms_key)
+if [ "$K_AC" = "$K_AB" ]; then
+  echo "  FAIL: A -> C enclave finalisation did not commit K-AC before host rollback" >&2
+  exit 1
+fi
+verify_migrated_state "A restored after C PCR mismatch" "$V2_PCR0" "$V2_PCR0"
+if ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: C PCR mismatch did not restore retained A" >&2
+  exit 1
+fi
+K_AC_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_AC}"
+K_AC_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V2_PCR0}"
+K_AC_B_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V3_PCR0}"
+K_AC_C_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V4_PCR0}"
+K_AC_TRANSITION=$(read_required_ssm "$K_AC_TRANSITION_PATH")
+K_AC_A_RECEIPT=$(read_required_ssm "$K_AC_A_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "K-AC after A rollback"
+assert_no_legacy_receipt "$K_AC"
+assert_host_migration_cleanup
+echo "  PASS: A-as-C failed closed, retained K-AC/A, and did not promote the supervisor"
+
+PRE_REAL_C_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V4_PCR0" \
+  --artifact-bucket "$V4_CANDIDATE_BUCKET" \
+  --eif-key "$V4_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V4_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-c.log
+assert_successful_migration_log /tmp/migration-resume-c.log "real C resume"
+if ! grep -Fq "Skipping enclave finalisation as requested" /tmp/migration-resume-c.log; then
+  echo "  FAIL: real C activation repeated enclave finalisation" >&2
+  exit 1
+fi
+wait_for_supervisor_restart "$PRE_REAL_C_SUP_PID"
+verify_migrated_state "C adoption without repeat finalisation" "$V2_PCR0" "$V4_PCR0"
+if [ "$(current_kms_key)" != "$K_AC" ]; then
+  echo "  FAIL: real C resume changed K-AC" >&2
+  exit 1
+fi
+K_AC_C_RECEIPT=$(read_required_ssm "$K_AC_C_RECEIPT_PATH")
+assert_ssm_value "$K_AC_A_RECEIPT_PATH" "$K_AC_A_RECEIPT" "K-AC/A receipt after C adoption"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "K-AC transition after C adoption"
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "K-AC after C adoption"
+assert_host_migration_cleanup
+
+PRE_EXCLUDED_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+set +e
+migration_finalise --resume \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  >/tmp/migration-resume-b-under-kac.log 2>&1
+EXCLUDED_B_RC=$?
+set -e
+if [ "$EXCLUDED_B_RC" -eq 0 ]; then
+  echo "  FAIL: B became ready under K-AC" >&2
+  cat /tmp/migration-resume-b-under-kac.log >&2
+  exit 1
+fi
+assert_verification_rollback_log /tmp/migration-resume-b-under-kac.log "B exclusion under K-AC"
+if [ "$(cat "$SUPERVISOR_PIDFILE")" != "$PRE_EXCLUDED_B_SUP_PID" ]; then
+  echo "  FAIL: failed B-under-K-AC activation promoted/restarted the supervisor" >&2
+  exit 1
+fi
+verify_migrated_state "C restored after excluded B" "$V2_PCR0" "$V4_PCR0"
+if [ "$(current_kms_key)" != "$K_AC" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v4.eif"; then
+  echo "  FAIL: excluded B changed K-AC or did not restore C" >&2
+  exit 1
+fi
+assert_ssm_absent "$K_AC_B_RECEIPT_PATH" "K-AC/B receipt"
+assert_ssm_value "$K_AC_C_RECEIPT_PATH" "$K_AC_C_RECEIPT" "K-AC/C receipt after B rollback"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "K-AC transition after B rollback"
+assert_host_migration_cleanup
+
+# Final durable retention across both migration keys and all published PCR paths.
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "final K-AB/A receipt"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "final K-AB/B receipt"
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "final K-AB transition"
+assert_kms_policy_pcr0s "$K_AB" "$V2_PCR0" "$V3_PCR0" "stale K-AB"
+assert_ssm_value "$K_AC_A_RECEIPT_PATH" "$K_AC_A_RECEIPT" "final K-AC/A receipt"
+assert_ssm_value "$K_AC_C_RECEIPT_PATH" "$K_AC_C_RECEIPT" "final K-AC/C receipt"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "final K-AC transition"
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "active K-AC"
+assert_no_legacy_receipt "$K_GA"
+assert_no_legacy_receipt "$K_AB"
+assert_no_legacy_receipt "$K_AC"
+assert_candidate_retained 1 "G candidate at final retention"
+assert_candidate_retained 2 "A candidate at final retention"
+assert_candidate_retained 3 "B candidate at final retention"
+assert_candidate_retained 4 "C candidate at final retention"
+assert_host_migration_cleanup
+MIGRATION_FINAL_KEY="$K_AC"
+echo "  PASS: K-AB remains A+B but stale; active K-AC retains A/C state and C is running"
 
 # Step 8: Crash the app only after cooldown and migration coverage so the
 # source application remains usable throughout operator decision windows.
@@ -1225,11 +1562,16 @@ wait_for_enclave "after supervisor relaunch"
 echo ""
 echo "=== [10/11] Final enclave info ==="
 FINAL_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-if [ -n "$FINAL_INFO" ] && echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1; then
+FINAL_ACTIVE_PCR0=$(echo "$FINAL_INFO" | jq -r '.migration.source_pcr0 // empty' 2>/dev/null || true)
+if [ -n "$FINAL_INFO" ] && \
+   echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1 && \
+   [ "$FINAL_ACTIVE_PCR0" = "$V4_PCR0" ] && \
+   [ "$(current_kms_key)" = "$MIGRATION_FINAL_KEY" ] && \
+   cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v4.eif"; then
   echo "  PASS: Enclave info valid"
-  echo "$FINAL_INFO" | jq -r '"  version: \(.version // "?"), pcr0: \(.previous_pcr0 // "?")"' 2>/dev/null || true
+  echo "$FINAL_INFO" | jq -r '"  version: \(.version // "?"), active pcr0: \(.migration.source_pcr0 // "?")"' 2>/dev/null || true
 else
-  echo "  FAIL: Could not read enclave info: ${FINAL_INFO:0:120}" >&2
+  echo "  FAIL: final C PCR0, K-AC key, EIF, or enclave info check failed: ${FINAL_INFO:0:120}" >&2
   exit 1
 fi
 

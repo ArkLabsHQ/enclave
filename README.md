@@ -39,6 +39,11 @@ Nitro Enclave ---------------------------------->+
    - Starts the reverse proxy on port 7073 with Schnorr response signing
 3. **your-app** is launched as a child process on port 7074, inheriting secret env vars
 
+Runtime `/health` stays at 503 `initializing` through state and KMS verification,
+freshness and listener initialization, environment and secret setup, and
+successful child spawn. It then changes once to 200 `ready`; later child exit
+does not clear it, so this is startup readiness rather than ongoing app health.
+
 ### Networking
 
 The enclave uses [gvproxy](https://github.com/containers/gvisor-tap-vsock) for outbound connectivity:
@@ -419,7 +424,7 @@ The supervisor exposes management endpoints alongside proxied requests to your a
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/health` | — | Supervisor health check (ready/degraded) |
+| GET | `/health` | — | One-way runtime startup readiness (`ready`/`initializing`) |
 | GET | `/v1/enclave-info` | — | Build + runtime metadata (version, attestation key, previous PCR0) |
 | GET | `/enclave/attestation` | — | Nitro attestation document (served by nitriding) |
 | `*` | `/*` | — | All other requests proxied to your app on port 7074 |
@@ -555,11 +560,32 @@ Account-root resistance therefore applies only in strict mode. Updating an
 existing deployment is the explicit `enclave migration
 request|status|abort|finalise` flow. OpenTofu only publishes the candidate.
 
-> **Current activation limitation:** steps 10/11 are not implemented. Host
-> orchestration currently accepts `GET /v1/enclave-info` HTTP 200 after the EIF
-> swap; it does not perform fresh exact-target attestation, require runtime
-> `/health` readiness, or implement the intended verified cleanup ordering. See
-> [ARCHITECTURE.md](ARCHITECTURE.md#finalisation-activation-and-rollback).
+Regular state-origin receipts use
+`/<deployment>/<app>/StateOriginReceipt/<kms-key-id>/<lowercase-current-pcr0>`;
+transition receipts remain at
+`/<deployment>/<app>/MigrationStateOriginReceipt/<kms-key-id>`. An exact regular
+receipt must verify or startup fails closed. Only when it is absent does the
+runtime use transition evidence for successor adoption or rollback-to-self; it
+does not read the legacy unscoped path or inspect sibling PCR0 receipts. Regular
+receipts are written during state establishment and prove adoption, not
+readiness, so A and B receipts can coexist under K-AB.
+
+After starting a candidate, the supervisor creates a fresh raw `http.Client`,
+not a verified enclave client, and requires `/health` HTTP 200 `ready` plus an
+exact lowercase target match in
+`/v1/enclave-info` at `migration.source_pcr0`. Wrong or malformed identity,
+non-readiness, transport failure, or timeout rolls the EIF back. This is an
+operational check: the supervisor performs no nonce-bound Nitro-chain
+verification, TLS pinning, or local EIF PCR derivation. `enclave verify` remains
+the independent cryptographic operation.
+
+Successful activation cleanup removes only temporary local EIF artifacts. It
+retains PCR-scoped and transition receipts, dual-PCR KMS authorization, and
+PCR0-addressed source candidates for deliberate rollback; candidate publication
+is append-only until deployment bucket teardown. A restored A must publish a
+fresh A-to-C intent and observe a new cooldown, while stale K-AB evidence is
+ignored once K-AC is active. Rollback-to-self is supported for non-genesis
+sources; the separately tracked genesis rollback defect remains out of scope.
 
 ### PCR0 Attestation Chain
 

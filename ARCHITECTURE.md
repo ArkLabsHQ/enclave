@@ -303,7 +303,8 @@ Resource prefix: ${deployment}-${app_name}
 │   ├─ /{deployment}/{appName}/MigrationPreviousPCR0Attestation
 │   ├─ /{deployment}/{appName}/MigrationIntentBucketName
 │   ├─ /{deployment}/{appName}/StorageBucketName
-│   └─ State-origin and migration-transition receipts
+│   ├─ /{deployment}/{appName}/StateOriginReceipt/{kmsKeyID}/{pcr0}
+│   └─ /{deployment}/{appName}/MigrationStateOriginReceipt/{kmsKeyID}
 │
 ├─ VPC (not in local mode)
 │   ├─ Public + private subnets (NAT gateway enabled)
@@ -503,13 +504,18 @@ mux.Handle("/", proxy)
 enc.RegisterRoutes(mux)
 ```
 
-### Step 3: Start Server Immediately
+### Step 3: Bind and Start HTTP Servers
 
 ```go
-server := &http.Server{Addr: ":7073", Handler: enc.Middleware(mux)}
-go server.ListenAndServe()
+private, err := net.Listen("tcp", ":7073")
+public, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
+go internalServer.Serve(private)
+go externalServer.ServeTLS(public, "", "")
 ```
-- Management endpoints are available **before** Init completes
+- The private and public listeners bind synchronously. Either initial bind
+  failure aborts startup, and serving goroutines start only after both binds
+  succeed.
+- Management endpoints are available **before** initialization completes.
 - `/health` returns `{"status": "initializing"}` with 503
 - `/v1/enclave-info` returns partial info with error field
 
@@ -749,16 +755,21 @@ initStorage()
     │      ├─ Register externally readable GET /v1/enclave-info status
     │      └─ Start parent-only vsock:8003 mutation server
     │
-    ├─ 4j. Load dynamic secrets from storage
-    │      Read all keys under "secrets/" prefix in S3
-    │      Parse each as DynamicSecret JSON
-    │      Set dynamicSecretsCount
+    ├─ 4j. Complete required runtime initialization
+    │      ├─ Configure TLS and the freshness anchor
+    │      ├─ Initialize the K/V store and its RESP listener
+    │      ├─ Apply permitted environment overrides
+    │      └─ Set verified static-secret environment variables last
     │
-    └─ 4k. Mark initialization complete
-           atomic.StoreInt32(&e.initDone, 1)
-           // /health now returns {"status": "ready"} with 200
-           // Schnorr signing middleware now active
+    └─ 4k. Keep runtime readiness false
+           // /health remains {"status": "initializing"} with 503
 ```
+
+State establishment in these steps includes the exact current KMS policy
+posture, actual KMS access, state provenance, migrated-state materialization,
+and state-root verification. Readiness also remains false until freshness,
+required listeners, environment setup, and secret initialization have
+succeeded.
 
 ### Step 5: Spawn User App
 
@@ -772,7 +783,12 @@ cmd.Env = append(os.Environ(),
 cmd.Stdout = os.Stdout
 cmd.Stderr = os.Stderr
 cmd.Start()
+rt.NotifyReady()
 ```
+
+`NotifyReady` runs only after `child.Start()` succeeds. `/health` then returns
+HTTP 200 with `{"status":"ready"}`. This is a one-way startup signal: later
+child exit does not clear it, and it does not claim ongoing application health.
 
 ### Step 6: Supervise
 
@@ -1215,9 +1231,12 @@ states and field applicability are defined in [Section 15](#15-migration-flow).
 ### GET /health
 
 ```json
-{"status": "ready"}        // 200 — init complete, serving traffic
+{"status": "ready"}        // 200 — required startup completed and child spawned
 {"status": "initializing"} // 503 — Init() still running
 ```
+
+Readiness is one-way for the lifetime of the runtime. It is not an ongoing
+health check for the child application.
 
 ### GET /v1/metrics
 
@@ -1462,11 +1481,91 @@ States are exactly `none`, `cooling_down`, `eligible`, and `aborted`.
 | `action` | A valid head exists; `requested` or `aborted` |
 | `published_at` | A valid head exists; selected version's `LastModified` |
 | `eligible_at` | Requested head only; `published_at + migration_cooldown` |
-| `remaining_seconds` | `cooling_down` only, positive seconds rounded up |
+| `remaining_seconds` | Always; positive seconds rounded up while `cooling_down`, otherwise `0` |
 
 Inapplicable fields are omitted from public JSON. Cooldown is derived from S3
 publication time, not a host timer. A zero cooldown still requires a matching
 published request; that request is immediately eligible.
+
+### State-Origin Receipts and Boot Selection
+
+Regular state-origin receipts are scoped by the active KMS key ID and the
+lowercase current PCR0:
+
+```text
+/<deployment>/<app>/StateOriginReceipt/<kms-key-id>/<lowercase-current-pcr0>
+```
+
+Migration transition receipts remain scoped only by successor KMS key ID:
+
+```text
+/<deployment>/<app>/MigrationStateOriginReceipt/<kms-key-id>
+```
+
+Both values are base64-encoded NSM attestation documents whose `UserData`
+binds the receipt purpose and canonical state root. There is no fallback to the
+legacy unscoped `StateOriginReceipt/<kms-key-id>` path and no inspection of
+sibling PCR0 receipt paths.
+
+At boot the runtime reads its current PCR0 and active lock-scoped `KMSKeyID`,
+then applies this fail-closed selection:
+
+1. Load only the exact regular receipt for the active key and current PCR0.
+2. If it exists, verify its Nitro signature, purpose, state root, and PCR0. Any
+   verification failure is fatal; a transition receipt is not a fallback.
+3. If it is absent, load the key-scoped transition receipt and require the
+   predecessor PCR0 and predecessor attestation artifacts.
+4. A successor verifies the predecessor PCR0, its PCR31 commitment to the
+   current PCR0, the exact two-PCR KMS policy, and the transition receipt over
+   the state root.
+5. A rollback-to-self verifies that the current PCR0 is the predecessor,
+   derives the one other PCR0 from the exact two-PCR KMS policy, verifies the
+   predecessor's PCR31 commitment to that PCR0, and verifies the same transition
+   receipt and state root.
+
+Only after the selected receipt and state root verify does the runtime
+materialize the DEK and static secrets. During genesis or transition adoption,
+it writes the current PCR0-specific regular receipt as part of state
+establishment. That regular receipt proves state adoption, not runtime
+readiness; freshness, listeners, environment and secret setup, and successful
+`child.Start()` still have to complete.
+
+Receipts for both PCR0s under one migration key therefore coexist and are
+selected independently:
+
+```text
+StateOriginReceipt/K-AB/A
+StateOriginReceipt/K-AB/B
+MigrationStateOriginReceipt/K-AB
+```
+
+For a non-genesis A, B can adopt A's state and write its B receipt; a failed B
+activation can then restore A, which uses its own A receipt if present or the
+A-to-B transition for rollback-to-self if absent. A and B can subsequently
+restart from their own receipts while K-AB remains active. If restored A later
+migrates to C, it must publish a fresh A-scoped intent and observe the full new
+cooldown. K-AC then admits only A and C; stale K-AB receipts and transition
+evidence remain retained but are ignored for active state, and B cannot boot
+against K-AC.
+
+The separately tracked genesis rollback-to-self defect is not fixed by this
+flow. Rollback after a failed first-generation activation may not restore a
+genesis A correctly; the rollback behavior above is the supported non-genesis
+case.
+
+### Runtime Readiness
+
+The runtime remains not ready while it establishes and materializes state,
+checks exact KMS policy posture and actual access, verifies provenance and
+freshness, starts all required listeners, applies environment overrides and
+verified secrets, and spawns the application child. The public and private HTTP
+listeners perform their initial binds synchronously and fail startup if either
+bind fails. HTTP serving begins only after both binds succeed.
+
+Successful `child.Start()` sets the one-way ready signal. A later child or
+listener exit continues through the runtime's existing lifecycle handling but
+does not clear readiness. `/health` therefore reports completion of required
+startup, not ongoing application health.
 
 ### Finalisation, Activation, and Rollback
 
@@ -1476,24 +1575,40 @@ admitting source and target PCR0, re-encrypts static secrets and the storage DEK
 writes predecessor attestation and a transition receipt, and changes the active
 lock-scoped `KMSKeyID` to the migration key.
 
-The host backs up the current EIF, downloads the PCR0-addressed candidate, stops
-the source enclave, swaps the EIF, and starts the candidate. If start or the
-current post-start probe fails, it restores the backup and restarts the source.
-The dual-PCR key and transition receipt support this rollback path.
+The host backs up the current EIF and downloads the PCR0-addressed candidate
+without claiming to derive or verify the EIF's PCR0 locally. It stops the source
+enclave, swaps the EIF, starts the candidate, and only then constructs a fresh
+raw `http.Client`, rather than a verified enclave client, for candidate
+verification. That client requires both:
+
+1. `GET /health` returns HTTP 200 with runtime status `ready`.
+2. `GET /v1/enclave-info` returns a canonical lowercase 96-hex
+   `migration.source_pcr0` exactly equal to the requested target.
+
+Transport failures and HTTP 503 during startup are retried within the bounded
+readiness window. A wrong or malformed PCR0, malformed or non-ready response,
+other HTTP failure, or readiness timeout prevents cleanup and invokes the
+existing EIF rollback, which restores the backup and restarts the source. The
+dual-PCR key and transition receipt support this rollback path, subject to the
+non-genesis limitation above.
+
+These are operational activation signals, not cryptographic candidate
+authentication. The supervisor does not obtain or verify a nonce-bound Nitro
+attestation, validate the Nitro certificate chain, pin TLS, or locally derive
+and compare the downloaded EIF's PCR measurements.
+
+Only after both operational checks succeed does the supervisor remove temporary
+local download and EIF-backup files, optionally promote the candidate
+supervisor, and report completion. Host cleanup does not remove PCR-scoped
+regular receipts, transition receipts, dual-PCR KMS authorization, or
+PCR0-addressed source artifacts needed for deliberate rollback. Candidate
+publication is append-only across applies; PCR0-addressed candidates remain in
+the deployment asset bucket until that bucket is torn down.
 
 `finalise --resume` sends `finalize=false`: it skips enclave finalisation and
 retries host activation. It is valid only after enclave finalisation definitely
 succeeded and a later host orchestration step failed. It is not a cooldown or
 intent bypass and is unsafe when finalisation success is uncertain.
-
-> **Current activation limitation: steps 10/11 are not implemented.** After the
-> EIF swap, the supervisor treats `GET /v1/enclave-info` HTTP 200 as sufficient
-> readiness. It does not obtain fresh attestation and prove that PCR0 equals the
-> requested target, it does not require runtime `GET /health` readiness, and it
-> does not implement the intended verified cleanup ordering. Current code then
-> removes the EIF backup and may update the supervisor, but that sequence is not
-> a verified activation/cleanup protocol. Migration completion must not be read
-> as evidence that those checks occurred.
 
 ### Independent Verification and Forks
 
@@ -1504,7 +1619,9 @@ identity, and apply `LastModified` canonical selection.
 
 No migration-log verifier CLI is shipped. Existing `enclave verify` verifies a
 live enclave's attestation and response-signing bindings; it is different and
-does not verify migration-log history.
+does not verify migration-log history. It is also independent of the
+supervisor's operational activation checks: the supervisor does not invoke or
+reimplement its nonce, Nitro-chain, or expected-PCR verification.
 
 Public versions make hidden forks detectable, not prevented. A retained clone
 with the same source PCR0 and valid state can append competing valid entries.
@@ -1755,5 +1872,4 @@ Admin CLI → SSM Session Manager port forwarding → host 127.0.0.1:8443
 8. SERVE       User app starts with secrets as env vars, all traffic signed
 9. VERIFY      Clients: fetch attestation → verify PCR0 → verify signatures
 10. UPDATE     Publish candidate → request → status → finalise
-               (subject to the current activation limitation in Section 15)
 ```

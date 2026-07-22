@@ -59,7 +59,7 @@ jobs:
           cp .enclave/artifacts/pcr.json /tmp/pcr-v1.json
           V1_PCR0=$(jq -r '.PCR0' /tmp/pcr-v1.json)
 
-          # v2 is healthy and bakes zero cooldown for the v2 -> v3 flow.
+          # v2 is A, the healthy non-genesis successor to G, with zero cooldown.
           sed -i 's/^version: .*/version: 0.0.2/' enclave/enclave.yaml
           sed -i 's/^migration_cooldown: .*/migration_cooldown: "0s"/' enclave/enclave.yaml
           if grep -q '^previous_pcr0:' enclave/enclave.yaml; then
@@ -72,7 +72,7 @@ jobs:
           cp .enclave/artifacts/image.eif /tmp/image-v2.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v2.json
 
-          # v3 is another healthy zero-cooldown successor.
+          # v3 is B, a healthy zero-cooldown successor to A.
           V2_PCR0=$(jq -r '.PCR0' /tmp/pcr-v2.json)
           sed -i 's/^version: .*/version: 0.0.3/' enclave/enclave.yaml
           sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" enclave/enclave.yaml
@@ -80,11 +80,9 @@ jobs:
           cp .enclave/artifacts/image.eif /tmp/image-v3.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v3.json
 
-          # v4 has the wrong app name, so readiness fails and restores v3.
-          V3_PCR0=$(jq -r '.PCR0' /tmp/pcr-v3.json)
+          # v4 is C, a sibling of B with A (not B) as its predecessor.
           sed -i 's/^version: .*/version: 0.0.4/' enclave/enclave.yaml
-          sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V3_PCR0}\"|" enclave/enclave.yaml
-          sed -i 's|^name: my-app\b|name: my-app-wrong|' enclave/enclave.yaml
+          sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" enclave/enclave.yaml
           /tmp/enclave-cli build
           cp .enclave/artifacts/image.eif /tmp/image-v4.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v4.json

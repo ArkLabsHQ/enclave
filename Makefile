@@ -32,16 +32,17 @@ lint: ## Run golangci-lint on all modules (matches CI)
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
-test-build:  ## Build v1/v2/v3/v4 migration fixtures (v4 has the wrong app name for rollback)
+test-build:  ## Build v1/v2/v3/v4 migration fixtures (G, A, and forked B/C successors)
 	cd runtime && go mod vendor
 	cd test/app && go mod vendor
-	cp test/app/enclave/enclave.yaml /tmp/enclave.yaml.original
-	# Build v1 once and stash; re-using the same artifact for the final v1 copy
-	# keeps v2's baked predecessor PCR0 consistent with the running v1.
-	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
-	cp test/app/.enclave/artifacts/image.eif /tmp/image-v1.eif
-	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v1.json
-	V1_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v1.json) && \
+	@set -eu; \
+	cp test/app/enclave/enclave.yaml /tmp/enclave.yaml.original; \
+	trap 'cp /tmp/enclave.yaml.original "$(CURDIR)/test/app/enclave/enclave.yaml"' EXIT; \
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build; \
+	cd $(CURDIR); \
+	cp test/app/.enclave/artifacts/image.eif /tmp/image-v1.eif; \
+	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v1.json; \
+	V1_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v1.json); \
 	sed -i 's/^version: .*/version: 0.0.2/' test/app/enclave/enclave.yaml && \
 	sed -i 's/^migration_cooldown: .*/migration_cooldown: "0s"/' test/app/enclave/enclave.yaml && \
 	if grep -q '^previous_pcr0:' test/app/enclave/enclave.yaml; then \
@@ -49,36 +50,32 @@ test-build:  ## Build v1/v2/v3/v4 migration fixtures (v4 has the wrong app name 
 	else \
 		echo "" >> test/app/enclave/enclave.yaml; \
 		echo "previous_pcr0: \"$$V1_PCR0\"" >> test/app/enclave/enclave.yaml; \
-	fi
-	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
-	cp test/app/.enclave/artifacts/image.eif /tmp/image-v2.eif
-	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v2.json
-	# v3: healthy successor with zero cooldown.
-	V2_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v2.json) && \
+	fi; \
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build; \
+	cd $(CURDIR); \
+	cp test/app/.enclave/artifacts/image.eif /tmp/image-v2.eif; \
+	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v2.json; \
+	V2_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v2.json); \
 	sed -i 's/^version: .*/version: 0.0.3/' test/app/enclave/enclave.yaml && \
-	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$V2_PCR0\"|" test/app/enclave/enclave.yaml
-	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
-	cp test/app/.enclave/artifacts/image.eif /tmp/image-v3.eif
-	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v3.json
-	# v4: wrong app name -> Init/readiness failure -> supervisor rollback to v3.
-	V3_PCR0=$$(jq -r '.PCR0' /tmp/pcr-v3.json) && \
+	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$V2_PCR0\"|" test/app/enclave/enclave.yaml; \
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build; \
+	cd $(CURDIR); \
+	cp test/app/.enclave/artifacts/image.eif /tmp/image-v3.eif; \
+	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v3.json; \
 	sed -i 's/^version: .*/version: 0.0.4/' test/app/enclave/enclave.yaml && \
-	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$V3_PCR0\"|" test/app/enclave/enclave.yaml && \
-	sed -i 's|^name: my-app\b|name: my-app-wrong|' test/app/enclave/enclave.yaml
-	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build
-	cp test/app/.enclave/artifacts/image.eif /tmp/image-v4.eif
-	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v4.json
-	cp /tmp/enclave.yaml.original test/app/enclave/enclave.yaml
-	cp /tmp/image-v1.eif test/app/.enclave/artifacts/image.eif
-	cp /tmp/pcr-v1.json test/app/.enclave/artifacts/pcr.json
-	cp /tmp/image-v1.eif test/app/.enclave/artifacts/image-v1.eif
-	cp /tmp/pcr-v1.json test/app/.enclave/artifacts/pcr-v1.json
-	cp /tmp/image-v2.eif test/app/.enclave/artifacts/image-v2.eif
-	cp /tmp/pcr-v2.json test/app/.enclave/artifacts/pcr-v2.json
-	cp /tmp/image-v3.eif test/app/.enclave/artifacts/image-v3.eif
-	cp /tmp/pcr-v3.json test/app/.enclave/artifacts/pcr-v3.json
-	cp /tmp/image-v4.eif test/app/.enclave/artifacts/image-v4.eif
-	cp /tmp/pcr-v4.json test/app/.enclave/artifacts/pcr-v4.json
+	sed -i "s|^previous_pcr0: .*|previous_pcr0: \"$$V2_PCR0\"|" test/app/enclave/enclave.yaml; \
+	cd test/app && RUNTIME_LOCAL_PATH=$(CURDIR) SUPERVISOR_LOCAL_PATH=$(CURDIR) APP_LOCAL_PATH=$(CURDIR)/test/app /tmp/enclave build; \
+	cd $(CURDIR); \
+	cp test/app/.enclave/artifacts/image.eif /tmp/image-v4.eif; \
+	cp test/app/.enclave/artifacts/pcr.json /tmp/pcr-v4.json; \
+	cp /tmp/enclave.yaml.original test/app/enclave/enclave.yaml; \
+	trap - EXIT; \
+	cp /tmp/image-v1.eif test/app/.enclave/artifacts/image.eif; \
+	cp /tmp/pcr-v1.json test/app/.enclave/artifacts/pcr.json; \
+	for version in 1 2 3 4; do \
+		cp "/tmp/image-v$$version.eif" "test/app/.enclave/artifacts/image-v$$version.eif"; \
+		cp "/tmp/pcr-v$$version.json" "test/app/.enclave/artifacts/pcr-v$$version.json"; \
+	done
 
 test-run: ## Run integration tests (uses last-built test-runner image)
 	cd test && docker compose --profile test down -v

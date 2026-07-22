@@ -20,16 +20,17 @@ type PCRValues struct {
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
 type buildConfigJSON struct {
-	Name              string                  `json:"name"`
-	Version           string                  `json:"version"`
-	Region            string                  `json:"region"`
-	Deployment        string                  `json:"deployment"`
-	App               buildConfigAppJSON      `json:"app"`
-	Secrets           []buildConfigSecretJSON `json:"secrets"`
-	Runtime           buildConfigRuntimeJSON  `json:"runtime"`
-	MigrationCooldown string                  `json:"migration_cooldown"`
-	PreviousPCR0      string                  `json:"previous_pcr0"`
-	IsKMSKeyLocked    bool                    `json:"is_kms_key_locked"`
+	Name                     string                  `json:"name"`
+	Version                  string                  `json:"version"`
+	Region                   string                  `json:"region"`
+	Deployment               string                  `json:"deployment"`
+	App                      buildConfigAppJSON      `json:"app"`
+	Secrets                  []buildConfigSecretJSON `json:"secrets"`
+	Runtime                  buildConfigRuntimeJSON  `json:"runtime"`
+	MigrationCooldown        string                  `json:"migration_cooldown"`
+	MigrationIntentRetention string                  `json:"migration_intent_retention"`
+	PreviousPCR0             string                  `json:"previous_pcr0"`
+	IsKMSKeyLocked           bool                    `json:"is_kms_key_locked"`
 }
 
 type buildConfigAppJSON struct {
@@ -196,9 +197,10 @@ func generateBuildConfig(cfg *Config, root string) error {
 			Hash:       cfg.Runtime.Hash,
 			VendorHash: cfg.Runtime.VendorHash,
 		},
-		MigrationCooldown: cfg.MigrationCooldown,
-		PreviousPCR0:      cfg.PreviousPCR0,
-		IsKMSKeyLocked:    cfg.IsKMSKeyLocked,
+		MigrationCooldown:        cfg.MigrationCooldown,
+		MigrationIntentRetention: cfg.MigrationIntentRetention,
+		PreviousPCR0:             cfg.PreviousPCR0,
+		IsKMSKeyLocked:           cfg.IsKMSKeyLocked,
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")

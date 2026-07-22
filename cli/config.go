@@ -13,15 +13,15 @@ import (
 )
 
 var (
-	accountIDRegex   = regexp.MustCompile(`^\d{12}$`)
-	secretNameRegex  = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
-	envVarRegex      = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-	fqdnRegex        = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
-	commitSHARegex   = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	cachixHostRegex  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
-	publicKeyRegex   = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
+	accountIDRegex  = regexp.MustCompile(`^\d{12}$`)
+	secretNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+	envVarRegex     = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	fqdnRegex       = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+	commitSHARegex  = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	cachixHostRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.cachix\.org$`)
+	publicKeyRegex  = regexp.MustCompile(`^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$`)
 	// SRI sha256: "sha256-" + 43 base64 chars + "=" (32 raw bytes → 44 base64).
-	sriSha256Regex   = regexp.MustCompile(`^sha256-[A-Za-z0-9+/]{43}=$`)
+	sriSha256Regex = regexp.MustCompile(`^sha256-[A-Za-z0-9+/]{43}=$`)
 )
 
 // reservedEnvPrefixes lists env var prefixes that must not be used for secrets.
@@ -33,18 +33,19 @@ const (
 )
 
 type Config struct {
-	Name              string         `yaml:"name"`
-	Version           string         `yaml:"version"`
-	Region            string         `yaml:"region"`
-	Account           string         `yaml:"account"`
-	Deployment        string         `yaml:"deployment"`
-	Profile           string         `yaml:"profile"`
-	App               AppConfig      `yaml:"app"`
-	Secrets           []SecretConfig `yaml:"secrets"`
-	Runtime           RuntimeConfig  `yaml:"runtime"`
-	InstanceType      string         `yaml:"instance_type"`
-	MigrationCooldown string         `yaml:"migration_cooldown"`
-	PreviousPCR0      string         `yaml:"previous_pcr0"`
+	Name                     string         `yaml:"name"`
+	Version                  string         `yaml:"version"`
+	Region                   string         `yaml:"region"`
+	Account                  string         `yaml:"account"`
+	Deployment               string         `yaml:"deployment"`
+	Profile                  string         `yaml:"profile"`
+	App                      AppConfig      `yaml:"app"`
+	Secrets                  []SecretConfig `yaml:"secrets"`
+	Runtime                  RuntimeConfig  `yaml:"runtime"`
+	InstanceType             string         `yaml:"instance_type"`
+	MigrationCooldown        string         `yaml:"migration_cooldown"`
+	MigrationIntentRetention string         `yaml:"migration_intent_retention"`
+	PreviousPCR0             string         `yaml:"previous_pcr0"`
 	// IsKMSKeyLocked controls the strictness of the locked KMS key policy:
 	//
 	//   false (default — absent in yaml gives this) — the policy adds a
@@ -189,6 +190,13 @@ func loadConfigAt(configPath string) (*Config, error) {
 	}
 	if _, err := time.ParseDuration(cfg.MigrationCooldown); err != nil {
 		return nil, fmt.Errorf("%s: invalid migration_cooldown %q: %w", configFile, cfg.MigrationCooldown, err)
+	}
+	if cfg.MigrationIntentRetention == "" {
+		cfg.MigrationIntentRetention = "87600h"
+	}
+	retention, err := time.ParseDuration(cfg.MigrationIntentRetention)
+	if err != nil || retention <= 0 {
+		return nil, fmt.Errorf("%s: invalid migration_intent_retention %q", configFile, cfg.MigrationIntentRetention)
 	}
 	if cfg.PreviousPCR0 == "" {
 		cfg.PreviousPCR0 = "genesis"

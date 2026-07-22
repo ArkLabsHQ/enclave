@@ -10,8 +10,7 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "dev"
 
-// Execute builds the root cobra command and runs it. Called from cli/cmd/main.go.
-func Execute() {
+func rootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:     "enclave",
 		Short:   "Nitro Enclave deployment CLI",
@@ -35,13 +34,17 @@ func Execute() {
 		logCmd(),
 		traceCmd(),
 		metricsCmd(),
-		migrationStatusCmd(),
+		migrationCmd(),
 		nixpkgsCmd(),
 		vendorCmd(),
 		testCmd(),
 	)
+	return rootCmd
+}
 
-	if err := rootCmd.Execute(); err != nil {
+// Execute builds the root cobra command and runs it. Called from cli/cmd/main.go.
+func Execute() {
+	if err := rootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

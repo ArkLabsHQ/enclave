@@ -1,5 +1,8 @@
 # Introspector Enclave — Complete Architecture & Flow
 
+This is the authoritative technical reference. See
+[OPERATIONS.md](OPERATIONS.md) for the authoritative operator runbook.
+
 ## Table of Contents
 
 1. [High-Level Architecture](#1-high-level-architecture)
@@ -9,7 +12,7 @@
 5. [Host Systemd Services](#5-host-systemd-services)
 6. [Enclave Boot](#6-enclave-boot-startsh)
 7. [Supervisor Initialization](#7-supervisor-initialization-detailed)
-8. [KMS Policy Self-Apply](#8-kms-policy-self-apply)
+8. [KMS Policy and Trust Modes](#8-kms-policy-and-trust-modes)
 9. [Secret Lifecycle](#9-secret-lifecycle)
 10. [Storage System](#10-storage-system-s3--aes-256-gcm)
 11. [Dynamic Secrets](#11-dynamic-secrets)
@@ -81,7 +84,7 @@
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| **CLI** | Root Go module (`cmd/enclave/`) | `init`, `build`, `tofu`, `verify`, `start`, `stop`, `status` |
+| **CLI** | Root Go module (`cli/`) | Build, deployment, verification, lifecycle, and `migration request|status|abort|finalise` commands |
 | **Nix Flake** | `flake.nix` | Deterministic EIF build (supervisor + app + nitriding + viproxy) |
 | **OpenTofu module** | `cli/tofu_files.go` (scaffolded into `tofu/`) | AWS infrastructure (KMS, SSM, EC2, VPC, S3, IAM) |
 | **supervisor** | `supervisor/` | Host-side all-in-one: management API, in-process gvproxy, in-process IMDS AF_VSOCK forwarder, and enclave lifecycle watchdog. Replaces the former `enclave-watchdog`, `enclave-imds-proxy`, and standalone `gvproxy.service`. |
@@ -160,6 +163,8 @@ sdk:
 
 instance_type: m6i.xlarge
 migration_cooldown: 30m
+migration_intent_retention: 87600h
+is_kms_key_locked: false
 ```
 
 ### 2.3 Build (`enclave build`)
@@ -219,6 +224,8 @@ enclave build
     │   │       ├─ ENCLAVE_SECRETS_CONFIG=<JSON of secrets list>
     │   │       ├─ AWS_REGION, ENCLAVE_APP_NAME, ENCLAVE_DEPLOYMENT
     │   │       ├─ ENCLAVE_MIGRATION_COOLDOWN
+    │   │       ├─ ENCLAVE_MIGRATION_INTENT_RETENTION
+    │   │       ├─ ENCLAVE_KMS_KEY_LOCKED
     │   │       └─ User-provided env vars from config
     │   │
     │   └─ Build EIF via monzo/aws-nitro-util
@@ -258,10 +265,23 @@ enclave tofu
 
 tofu init && tofu apply
     │
-    ├─ Create/resolve KMS key
-    ├─ Pre-create SSM parameters for secrets
-    ├─ Provision VPC, EC2, EIP, S3, IAM, ECR (resources prefixed ${deployment}-${app_name})
-    └─ Apply KMS policy using enclave's PCR0
+    ├─ Upload PCR0-addressed candidate EIF and supervisor
+    ├─ Provision VPC, EC2, EIP, S3, SSM, DynamoDB, and IAM
+    ├─ Export candidate and migration-intent outputs
+    └─ On an existing deployment: publish only; migration activation is manual
+```
+
+Candidate artifacts and root outputs are:
+
+```text
+candidates/<pcr0>/enclave.eif
+candidates/<pcr0>/supervisor
+
+candidate_pcr0
+candidate_artifact_bucket
+candidate_eif_key
+candidate_supervisor_key
+migration_intent_bucket
 ```
 
 ### 3.2 AWS Resources Created
@@ -275,17 +295,15 @@ Resource prefix: ${deployment}-${app_name}
 │       ├─ Retention: retain on deletion (managed separately)
 │       └─ Used for: secret encryption/decryption, storage DEK wrapping
 │
-├─ SSM Parameters (per secret)
-│   ├─ /{deployment}/{appName}/{secretName}/Ciphertext     ← primary encrypted secret
-│   ├─ /{deployment}/{appName}/Migration/{secretName}/Ciphertext  ← migration transit
-│   ├─ /{deployment}/{appName}/MigrationKMSKeyID           ← new key during migration
-│   ├─ /{deployment}/{appName}/MigrationOldKMSKeyID        ← old key for cleanup
-│   ├─ /{deployment}/{appName}/MigrationRequestedAt        ← RFC3339 timestamp
-│   ├─ /{deployment}/{appName}/MigrationPreviousPCR0       ← chain of trust
-│   ├─ /{deployment}/{appName}/MigrationPreviousPCR0Attestation ← COSE Sign1 proof
-│   ├─ /{deployment}/{appName}/KMSKeyID                    ← current active key ID
-│   ├─ /{deployment}/{appName}/StorageBucketName           ← S3 bucket for storage
-│   └─ /{deployment}/{appName}/StorageDEK/Ciphertext       ← encrypted data encryption key
+├─ SSM Parameters
+│   ├─ /{deployment}/{appName}/{locked|unlocked}/KMSKeyID
+│   ├─ /{deployment}/{appName}/{locked|unlocked}/{secretName}/Ciphertext/{kmsKeyID}
+│   ├─ /{deployment}/{appName}/{locked|unlocked}/StorageDEK/Ciphertext/{kmsKeyID}
+│   ├─ /{deployment}/{appName}/MigrationPreviousPCR0
+│   ├─ /{deployment}/{appName}/MigrationPreviousPCR0Attestation
+│   ├─ /{deployment}/{appName}/MigrationIntentBucketName
+│   ├─ /{deployment}/{appName}/StorageBucketName
+│   └─ State-origin and migration-transition receipts
 │
 ├─ VPC (not in local mode)
 │   ├─ Public + private subnets (NAT gateway enabled)
@@ -310,9 +328,13 @@ Resource prefix: ${deployment}-${app_name}
 │   └─ Used for: encrypted key-value storage (/v1/storage API)
 │
 ├─ S3 Assets (uploaded during deploy)
-│   ├─ .enclave/artifacts/image.eif                        ← the enclave image
-│   ├─ enclave/systemd/enclave-supervisor.service         ← sole systemd unit
-│   └─ .enclave/artifacts/supervisor                       ← host supervisor binary
+│   ├─ candidates/<pcr0>/enclave.eif
+│   └─ candidates/<pcr0>/supervisor
+│
+├─ S3 Migration-Intent Log
+│   ├─ Versioning + Object Lock
+│   ├─ Public version listing and exact-version reads
+│   └─ COMPLIANCE retention set by the enclave on each write
 │
 ├─ EC2 Instance
 │   ├─ Amazon Linux 2023
@@ -324,8 +346,9 @@ Resource prefix: ${deployment}-${app_name}
 └─ IAM Role (EC2 instance profile)
     ├─ AmazonSSMManagedInstanceCore (SSM Session Manager access)
     ├─ S3: Read for all uploaded assets
-    ├─ KMS: GrantEncryptDecrypt + GrantPutKeyPolicy + GrantGetKeyPolicy
-    ├─ SSM: Read/Write all secret and migration parameters
+    ├─ KMS: attestation-gated key operations
+    ├─ SSM: scoped state, ciphertext, and discovery parameters
+    ├─ S3: append/read exact migration-intent versions, without delete/bypass
     └─ STS: GetCallerIdentity (for KMS policy construction)
 ```
 
@@ -404,8 +427,9 @@ Subsystems (one errgroup, shared context):
      • On unexpected exit: backoff 1s → 30s, relaunch
      • On ctx.Done: nitro-cli terminate-enclave
 
-  4. Management HTTP server (unchanged)
-     • 127.0.0.1:8443 — /health, /metrics, /migrate, /start, /stop, …
+  4. Management HTTP server
+     • 127.0.0.1:8443 — /health, /metrics, /migrate,
+       /migrate/request, /migrate/abort, /start, /stop, …
      • /start and /stop now drive the in-process watchdog directly
 ```
 
@@ -466,7 +490,7 @@ enc := sdk.New()
 ```
 - Generates random 32-byte management token (hex-encoded, 64 chars)
 - Initializes atomic flags: `initDone = false`, `initError = ""`
-- Creates empty migration state holders
+- Initializes runtime state and public/private HTTP muxes
 
 ### Step 2: Set Up HTTP Server
 
@@ -559,7 +583,7 @@ enclave-supervisor → 127.0.0.1:80 (viproxy)
 
 #### Step 4d: Self-Apply KMS Policy
 
-See [Section 8](#8-kms-policy-self-apply) for full detail.
+See [Section 8](#8-kms-policy-and-trust-modes) for full detail.
 
 #### Step 4e: Wait for Secrets from KMS
 
@@ -569,11 +593,11 @@ waitForSecretsFromKMS()  ← 5-minute timeout, 5-second polling interval
     └─ For EACH secret in ENCLAVE_SECRETS_CONFIG:
         │
         ├─ getKMSKeyID()
-        │   ├─ Check SSM: /{deployment}/{appName}/KMSKeyID
-        │   │   (This is updated during migration to point to the new key)
-        │   └─ Fallback: env var ENCLAVE_KMS_KEY_ID (baked in at deploy time)
+        │   └─ Check SSM:
+        │      /{deployment}/{appName}/{locked|unlocked}/KMSKeyID
         │
-        ├─ Check SSM: /{deployment}/{appName}/{secretName}/Ciphertext
+        ├─ Check key-scoped SSM ciphertext:
+        │   /{deployment}/{appName}/{locked|unlocked}/{secretName}/Ciphertext/{kmsKeyID}
         │
         ├─ [NOT FOUND — First Boot] generateAndStoreSecret()
         │   │
@@ -691,18 +715,12 @@ initStorage()
     ├─ 2. Initialize S3 client
     │      Respects AWS_ENDPOINT_URL_S3 for localstack testing
     │
-    ├─ 3. Check for migrated DEK
-    │      SSM: /{deployment}/{appName}/Migration/StorageDEK/Ciphertext
-    │      │
-    │      └─ If FOUND (post-migration):
-    │          ├─ Decrypt with migration KMS key (3 retries, exponential backoff)
-    │          │   Uses same NSM attestation + RSA flow as secret decryption
-    │          ├─ Re-encrypt under primary KMS key
-    │          ├─ Store as primary: /{deployment}/{appName}/StorageDEK/Ciphertext
-    │          └─ Clear migration param
+    ├─ 3. Verify state-origin or migration-transition receipt
+    │      The receipt binds the persisted state root and expected PCRs.
     │
     ├─ 4. Load or generate primary DEK
-    │      SSM: /{deployment}/{appName}/StorageDEK/Ciphertext
+    │      SSM key-scoped ciphertext:
+    │      /{deployment}/{appName}/{locked|unlocked}/StorageDEK/Ciphertext/{kmsKeyID}
     │      │
     │      ├─ [NOT FOUND — First Boot]:
     │      │   kms.GenerateDataKey({ KeySpec: "AES_256" })  → 32 bytes
@@ -721,15 +739,15 @@ initStorage()
 #### Step 4h–4k: Final Init Steps
 
 ```
-    ├─ 4h. Load migration state from SSM
+    ├─ 4h. Load predecessor state from SSM
     │      ├─ /{deployment}/{appName}/MigrationPreviousPCR0 → e.previousPCR0
     │      └─ /{deployment}/{appName}/MigrationPreviousPCR0Attestation → e.previousPCR0Attestation
     │      (If no migration history, previousPCR0 = "genesis")
     │
-    ├─ 4i. Cleanup old KMS key (if post-migration)
-    │      Read: /{deployment}/{appName}/MigrationOldKMSKeyID
-    │      If found: kms.ScheduleKeyDeletion({ PendingWindowInDays: 7 })
-    │      Clear the SSM parameter
+    ├─ 4i. Initialize migration intent
+    │      ├─ Use the established MigrationIntentBucketName state value
+    │      ├─ Register externally readable GET /v1/enclave-info status
+    │      └─ Start parent-only vsock:8003 mutation server
     │
     ├─ 4j. Load dynamic secrets from storage
     │      Read all keys under "secrets/" prefix in S3
@@ -865,7 +883,7 @@ checkRuntimeToken(request)
 | `GET /v1/enclave-info` | No | Public enclave metadata |
 | `GET /health` | No | Public health check |
 | `GET /v1/metrics` | No | Public Prometheus metrics |
-| `POST /v1/start-migration` | No | Migration (verified via SSM) |
+| Migration mutations | N/A | Not on public HTTP; parent-only vsock port 8003 |
 
 #### Security Properties
 
@@ -883,104 +901,38 @@ checkRuntimeToken(request)
 
 ---
 
-## 8. KMS Policy Self-Apply
+## 8. KMS Policy and Trust Modes
 
-This is the mechanism that **immutably locks** the KMS key to a specific enclave's code identity (PCR0).
+The runtime reads its own PCR0 from the NSM. At genesis, if the lock-scoped
+`KMSKeyID` is unset, the runtime creates the primary KMS key and writes its ID to
+SSM. On later boots it fetches the existing policy and verifies that every
+Decrypt grant is recipient-attestation gated and that the admitted PCR0 set and
+policy-mutation posture match the expected state.
 
-### Flow
+The enclave role receives:
 
-```
-selfApplyKMSPolicy()
-    │
-    ├─ 1. Get KMS Key ID
-    │      getKMSKeyID() → "arn:aws:kms:us-east-1:123456789012:key/abc-123"
-    │
-    ├─ 2. Extract own PCR0 from NSM attestation
-    │      Open NSM session → request attestation → CBOR decode → PCR0
-    │      PCR0 = "abc123def456..."  (96 hex chars, SHA-384)
-    │
-    ├─ 3. Get current key policy
-    │      kms.GetKeyPolicy({ KeyId: keyId, PolicyName: "default" })
-    │
-    ├─ 4. Idempotent check
-    │      If policy already contains this PCR0 → return (no-op, already locked)
-    │
-    ├─ 5. Lock check
-    │      If policy exists but does NOT grant kms:PutKeyPolicy to anyone:
-    │      → ERROR: key is locked to a DIFFERENT PCR0
-    │      (A different enclave version owns this key)
-    │
-    ├─ 6. Resolve identity
-    │      sts.GetCallerIdentity() → "arn:aws:sts::123456789012:assumed-role/EnclaveRole/i-abc"
-    │      Convert to IAM role ARN: "arn:aws:iam::123456789012:role/EnclaveRole"
-    │
-    ├─ 7. Build restricted policy
-    │      (see JSON below)
-    │
-    └─ 8. Apply policy
-           kms.PutKeyPolicy({
-               KeyId:     keyId,
-               PolicyName: "default",
-               Policy:     policyJSON,
-               BypassPolicyLockoutSafetyCheck: true,
-           })
-           Retry: 5 attempts, backoff 0s/2s/4s/6s/8s (IAM propagation delay)
-```
+- `kms:Decrypt` and `kms:GenerateDataKey` only with
+  `kms:RecipientAttestation:PCR0` matching the admitted PCR0 set.
+- `kms:Encrypt` and `kms:GetKeyPolicy` without a recipient condition.
+- `kms:ScheduleKeyDeletion` for lifecycle operations.
 
-### KMS Key Policy (after self-apply)
+KMS returns plaintext wrapped to an ephemeral RSA key whose private half remains
+inside the enclave. The EC2 host therefore has no direct decrypt path in either
+mode.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "EnclaveAttestedOperations",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::123456789012:role/EnclaveRole"
-      },
-      "Action": [
-        "kms:Decrypt",
-        "kms:GenerateDataKey"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEqualsIgnoreCase": {
-          "kms:RecipientAttestation:PCR0": "abc123def456..."
-        }
-      }
-    },
-    {
-      "Sid": "EnclaveOperations",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::123456789012:role/EnclaveRole"
-      },
-      "Action": [
-        "kms:Encrypt",
-        "kms:GetKeyPolicy"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "AllowKeyDeletion",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::123456789012:role/EnclaveRole"
-      },
-      "Action": "kms:ScheduleKeyDeletion",
-      "Resource": "*"
-    }
-  ]
-}
-```
+| `is_kms_key_locked` | Policy posture |
+|---|---|
+| `false` (default) | Account root receives `kms:PutKeyPolicy`, `kms:GetKeyPolicy`, and `kms:DescribeKey`. Root can rewrite the policy to admit another attested PCR0, but root never has direct `kms:Decrypt`. |
+| `true` | No principal receives `kms:PutKeyPolicy`; the policy is frozen after creation, including against account root. |
 
-**Critical**: Notice `kms:PutKeyPolicy` is **NOT** granted to anyone. Combined with `BypassPolicyLockoutSafetyCheck: true`, this means:
+Host resistance applies in all modes. Account-root resistance applies only when
+`is_kms_key_locked=true`. The mode also selects the `locked` or `unlocked` SSM
+namespace and is intended to be permanent from first key creation.
 
-- **Only** enclaves with the exact PCR0 can decrypt
-- **Nobody** (not even AWS root) can change the policy
-- The key is **immutably locked** to this enclave's code identity
-- To use a new code version, you must **migrate** to a new KMS key
+During migration, the source enclave creates a migration KMS key admitting both
+the source and requested target PCR0. This dual-PCR policy permits the target to
+materialize transferred state and permits a transition-receipt-verified rollback
+to the source if host activation fails.
 
 ---
 
@@ -1239,30 +1191,32 @@ Returns comprehensive enclave state:
 ```json
 {
     "version": "0.0.53",
-    "previous_pcr0": "abc123...",              // from migration chain (or "genesis")
-    "previous_pcr0_attestation": "base64...",  // COSE Sign1 proof from old enclave
-    "attestation_pubkey": "02abc123...",        // compressed secp256k1 (33 bytes hex)
-    "dynamic_secrets": 3,                       // count of stored dynamic secrets
-    "metrics": {                                // operational counters snapshot
-        "http_requests_total": 142,
-        "kms_operations_total": 8,
-        "storage_reads_total": 50
+    "previous_pcr0": "abc123...",
+    "previous_pcr0_attestation": "base64...",
+    "attestation_pubkey": "02abc123...",
+    "metrics": {
+        "http_requests_total": 142
     },
-    "migration_cooldown_seconds": 1800,         // configured cooldown (30m)
-    "migration_cooldown_remaining": 0,          // seconds until migration allowed
-    "migration_pending": false,                 // whether migration was requested
-    "error": ""                                 // empty if healthy
+    "migration_cooldown_seconds": 1800,
+    "migration": {
+        "state": "none",
+        "source_pcr0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "upstream_app": {
+        "exited": false
+    },
+    "kms_key_locked": false
 }
 ```
 
-Before init completes: returns 503 with `{"status": "initializing", "error": "..."}`
+The `migration` object is derived from the authoritative S3 log. Its exact
+states and field applicability are defined in [Section 15](#15-migration-flow).
 
 ### GET /health
 
 ```json
 {"status": "ready"}        // 200 — init complete, serving traffic
 {"status": "initializing"} // 503 — Init() still running
-{"status": "degraded"}     // 503 — Init() failed (error in initError)
 ```
 
 ### GET /v1/metrics
@@ -1286,9 +1240,9 @@ enclave_secret_writes_total 5
 enclave_secret_deletes_total 1
 ```
 
-### POST /v1/start-migration
-
-Migration export endpoint. See [Section 15](#15-migration-flow) for full detail.
+Migration mutation is deliberately absent from public HTTP. The parent reaches
+`POST /request-migration` and `POST /finalise-migration` on parent-only AF_VSOCK
+port `8003`.
 
 ### PUT/GET/DELETE /v1/storage/{key}
 
@@ -1345,14 +1299,12 @@ Proxies Prometheus metrics from nitriding (port 9090 via gvproxy).
 #### POST /migrate
 Full migration orchestration. See [Section 15](#15-migration-flow). Returns streaming NDJSON status updates.
 
+#### POST /migrate/request
+Proxies a `requested` intent to the source enclave's parent-only control port.
+
 #### POST /migrate/abort
-Aborts an in-progress migration:
-```
-1. Clear MigrationRequestedAt from SSM
-2. Clear MigrationKMSKeyID from SSM
-3. Clear all Migration/* ciphertext params
-4. Delete the migration KMS key (if created)
-```
+Proxies an `aborted` intent. The enclave appends a new public log sequence; it
+does not delete the prior request or clear SSM transit parameters.
 
 ---
 
@@ -1375,250 +1327,189 @@ Aborts an in-progress migration:
 │    aws ssm start-session --target i-abc123  │
 │    $ curl http://127.0.0.1:8443/health      │
 │                                             │
-│  Option B: Port forwarding                  │
-│    aws ssm start-session --target i-abc123  │
-│      --document-name AWS-StartPortForward   │
-│      --parameters portNumber=8443           │
-│    Then: curl http://localhost:8443/migrate  │
+│  Option B: CLI-managed port forwarding      │
+│    AWS-StartPortForwardingSession           │
+│    host port 8443 or enclave port 443       │
+│    enclave migration request|status|...     │
 │                                             │
 │  supervisor (127.0.0.1:8443)             │
 │       │                                     │
 │       ├─ systemctl start/stop enclave       │
 │       ├─ nitro-cli describe-enclaves        │
 │       ├─ KMS API calls (key management)     │
-│       └─ HTTP to enclave via gvproxy        │
-│           (vsock forwarded ports)            │
+│       └─ Migration mutation via vsock:8003  │
 └─────────────────────────────────────────────┘
 ```
 
-**Security model**: No SSH, no public management ports. Only IAM-authenticated SSM sessions can reach the management API.
+**Security model**: No SSH and no public management port. Remote CLI transport
+uses Session Manager port forwarding, not Run Command. `GET /v1/enclave-info`
+remains externally readable through enclave HTTPS.
 
 ---
 
 ## 15. Migration Flow
 
-Migration is required when the enclave code changes (producing a new PCR0), because the KMS key is immutably locked to the old PCR0. The old enclave must export its secrets so the new enclave can import them under a new KMS key.
+Migration is an explicit operator protocol. OpenTofu publishes candidates but
+does not automatically request, finalise, or activate one on an existing host.
 
-### Overview
-
-```
-┌──────────────────┐         ┌──────────────────┐
-│   OLD ENCLAVE    │         │   NEW ENCLAVE    │
-│   (PCR0 = A)     │         │   (PCR0 = B)     │
-│                  │         │                  │
-│  KMS Key #1      │         │  KMS Key #2      │
-│  (locked to A)   │         │  (locked to B)   │
-└──────────────────┘         └──────────────────┘
-         │                            ▲
-         │  export secrets            │  import secrets
-         │  re-encrypt with           │  re-encrypt with
-         │  migration key             │  new primary key
-         ▼                            │
-    ┌─────────────────────────────────┐
-    │        SSM (Migration/)         │
-    │  Transit storage for secrets    │
-    │  encrypted with migration key   │
-    └─────────────────────────────────┘
+```text
+enclave build -> enclave tofu -> tofu apply
+                                      |
+                                      v
+                         enclave migration request
+                                      |
+                         enclave migration status
+                             |                 |
+                           abort            finalise
 ```
 
-### Detailed Phase-by-Phase Flow
+The supported commands are `enclave migration request|status|abort|finalise`.
+`enclave migration finalise --resume` has the narrow retry role described below.
+All persistent flags and the complete procedure are in
+[OPERATIONS.md](OPERATIONS.md#migration).
 
-#### Phase 1: Preparation (supervisor on host)
+### Control Surfaces and Transport
 
-```
-Admin → POST /migrate → supervisor
-    │
-    ├─ 1. Create NEW KMS key
-    │      kms.CreateKey({ Description: "Migration key for {appName}" })
-    │      Returns: new_key_arn
-    │
-    ├─ 2. Store migration metadata in SSM
-    │      ├─ /{deploy}/{app}/MigrationKMSKeyID      = new_key_arn
-    │      ├─ /{deploy}/{app}/MigrationOldKMSKeyID    = current_key_arn
-    │      └─ /{deploy}/{app}/MigrationRequestedAt    = "2024-01-15T10:30:00Z"
-    │
-    └─ 3. Stream status: {"phase": "preparation", "status": "complete"}
-```
+| Surface | Route | Access |
+|---|---|---|
+| Enclave public HTTPS | `GET /v1/enclave-info` | Externally readable derived status |
+| Host management HTTP | `POST /migrate/request` | Localhost `8443`, normally through Session Manager |
+| Host management HTTP | `POST /migrate/abort` | Localhost `8443`, normally through Session Manager |
+| Host management HTTP | `POST /migrate` | Localhost `8443`, finalisation and activation |
+| Enclave mutation control | `POST /request-migration` | Parent-only AF_VSOCK port `8003` |
+| Enclave mutation control | `POST /finalise-migration` | Parent-only AF_VSOCK port `8003` |
 
-#### Phase 2: Export (old enclave)
+Remote CLI transport is Session Manager port forwarding through
+`AWS-StartPortForwardingSession`, not Run Command. Mutations forward to host port
+`8443`; status forwards to enclave HTTPS port `443`.
 
-```
-supervisor → POST /v1/start-migration → old enclave (via gvproxy)
-    │
-    │  Request body:
-    │  { "migration_key_id": "arn:aws:kms:...:key/new-key-id" }
-    │
-    └─ Inside old enclave:
-        │
-        ├─ 1. VERIFY migration key ID
-        │      Read SSM: /{deploy}/{app}/MigrationKMSKeyID
-        │      Assert: request.migration_key_id == SSM value
-        │      (Prevents unauthorized export to arbitrary keys)
-        │
-        ├─ 2. For EACH secret (signing_key, api_secret, ...):
-        │   │
-        │   ├─ Read plaintext from env var
-        │   │   plaintext := hex.DecodeString(os.Getenv("APP_SIGNING_KEY"))
-        │   │
-        │   ├─ Re-encrypt with migration KMS key
-        │   │   kms.Encrypt({
-        │   │       KeyId:     migration_key_id,
-        │   │       Plaintext: plaintext,
-        │   │   })
-        │   │   // No attestation needed for Encrypt (policy allows it)
-        │   │
-        │   └─ Store in SSM migration namespace
-        │       ssm.PutParameter({
-        │           Name:  "/{deploy}/{app}/Migration/{secretName}/Ciphertext",
-        │           Value: base64(ciphertext),
-        │       })
-        │
-        ├─ 3. Export storage DEK (if storage initialized)
-        │      Read e.dek (plaintext, in memory)
-        │      Re-encrypt with migration KMS key
-        │      Store: /{deploy}/{app}/Migration/StorageDEK/Ciphertext
-        │
-        ├─ 4. Record PCR0 chain of trust
-        │      ├─ Extract own PCR0 from NSM attestation
-        │      ├─ Get full attestation document (COSE Sign1)
-        │      ├─ Store in SSM:
-        │      │   ├─ /{deploy}/{app}/MigrationPreviousPCR0 = "abc123..."
-        │      │   └─ /{deploy}/{app}/MigrationPreviousPCR0Attestation = base64(doc)
-        │      └─ This creates a verifiable chain: new PCR0 → old PCR0 → older PCR0...
-        │
-        └─ 5. Return response
-               {
-                   "pcr0": "abc123...",
-                   "exported": ["signing_key", "api_secret"]
-               }
+### Public Migration-Intent Log
+
+The public, versioned S3 log is authoritative. `GET /v1/enclave-info` rescans it
+to derive status. The runtime writes each entry with COMPLIANCE Object Lock; the
+retention comes from `migration_intent_retention`, default `87600h`.
+
+Every valid object key has this exact form:
+
+```text
+migration-intent/<96 lowercase source PCR0>/<20 digit sequence>
 ```
 
-#### Phase 3: Build & Deploy (supervisor on host)
+The sequence is greater than zero and encoded as exactly 20 decimal digits. The
+source PCR0 comes from the Nitro attestation and must match the object key; it is
+not a JSON field.
 
-```
-supervisor orchestrates:
-    │
-    ├─ 1. Build new EIF (with updated code)
-    │      New code → different binary → different PCR0
-    │
-    ├─ 2. Upload new EIF to S3
-    │
-    ├─ 3. tofu apply (updates EC2 instance)
-    │      New EIF path, same infrastructure
-    │
-    ├─ 4. Stop old enclave
-    │      systemctl stop enclave-watchdog
-    │      nitro-cli terminate-enclave
-    │
-    ├─ 5. Update KMS key ID in SSM
-    │      /{deploy}/{app}/KMSKeyID = new_key_arn
-    │      (New enclave will read this instead of the env var)
-    │
-    └─ 6. Start new enclave
-           systemctl start enclave-watchdog
-           nitro-cli run-enclave (with new EIF)
+The public object is strict JSON with exactly five fields:
+
+```json
+{
+  "schema": "enclave.migration_intent.v1",
+  "sequence": 1,
+  "action": "requested",
+  "target_pcr0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "attestation": "<base64 Nitro COSE_Sign1 document>"
+}
 ```
 
-#### Phase 4: Import (new enclave boot)
+`action` is exactly `requested` or `aborted`; abort retains the request's target.
+`target_pcr0` is exactly 96 lowercase hexadecimal characters. Missing,
+duplicate, unknown, incorrectly typed, or trailing JSON values invalidate the
+version.
 
-The new enclave goes through the normal init flow (Section 7), but with migration-aware behavior:
+The attestation `UserData` is Core Deterministic Encoding canonical CBOR with
+these exact logical fields and types:
 
-```
-New enclave Init()
-    │
-    ├─ 4b. Generate NEW attestation key (secp256k1)
-    │      (Completely new key, not migrated)
-    │
-    ├─ 4d. selfApplyKMSPolicy()
-    │      ├─ getKMSKeyID() → reads /{deploy}/{app}/KMSKeyID → new_key_arn
-    │      ├─ Extract NEW PCR0 (PCR0 = B)
-    │      └─ Lock new KMS key to new PCR0
-    │         Now: only PCR0=B can decrypt with new key
-    │
-    ├─ 4e. waitForSecretsFromKMS()
-    │      For each secret:
-    │      │
-    │      ├─ Check primary SSM: /{deploy}/{app}/{secret}/Ciphertext
-    │      │   This was encrypted with OLD KMS key (locked to PCR0=A)
-    │      │   New enclave (PCR0=B) CANNOT decrypt this!
-    │      │
-    │      ├─ Check migration SSM: /{deploy}/{app}/Migration/{secret}/Ciphertext
-    │      │   This was encrypted with MIGRATION KMS key (no PCR0 restriction)
-    │      │   New enclave CAN decrypt this!
-    │      │
-    │      ├─ Decrypt migration ciphertext
-    │      │   kms.Decrypt({ KeyId: new_key_arn, CiphertextBlob: migration_ciphertext })
-    │      │   (Migration key allows decryption by the EC2 role)
-    │      │
-    │      ├─ Re-encrypt under new primary key
-    │      │   kms.Encrypt({ KeyId: new_key_arn, Plaintext: decrypted_secret })
-    │      │   Store in primary SSM: /{deploy}/{app}/{secret}/Ciphertext
-    │      │   (Now encrypted with new key, decryptable only by PCR0=B)
-    │      │
-    │      ├─ Clear migration param
-    │      │   Delete: /{deploy}/{app}/Migration/{secret}/Ciphertext
-    │      │
-    │      └─ Set env var: os.Setenv(secret.EnvVar, hex(plaintext))
-    │
-    ├─ 4f. Extend PCRs 16+ with secret pubkeys (same as normal boot)
-    │
-    ├─ 4g. initStorage()
-    │      ├─ Find migration DEK: /{deploy}/{app}/Migration/StorageDEK/Ciphertext
-    │      ├─ Decrypt with migration key
-    │      ├─ Re-encrypt with new primary key → store as primary DEK
-    │      ├─ Clear migration DEK param
-    │      └─ All existing S3 data remains accessible (same DEK, just re-wrapped)
-    │
-    ├─ 4h. Load migration state
-    │      ├─ previousPCR0 = "abc123..." (old enclave's PCR0)
-    │      └─ previousPCR0Attestation = base64(COSE Sign1 from old enclave)
-    │      This forms a verifiable chain of custody
-    │
-    ├─ 4i. Cleanup old KMS key
-    │      Read: /{deploy}/{app}/MigrationOldKMSKeyID → old_key_arn
-    │      kms.ScheduleKeyDeletion({ KeyId: old_key_arn, PendingWindowInDays: 7 })
-    │      Delete SSM param: MigrationOldKMSKeyID
-    │      // Old key enters "pending deletion" — recoverable for 7 days
-    │
-    └─ 4k. initDone = true
-           New enclave is now fully operational with all migrated secrets
+```text
+schema:      text "enclave.migration_intent.v1"
+bucket_name: text, exact S3 bucket name
+sequence:    unsigned integer
+action:      text "requested" or "aborted"
+target_pcr0: text, 96 lowercase hexadecimal characters
 ```
 
-### Migration Cooldown
+The Nitro certificate chain and COSE signature bind this payload to the source
+PCR0. A verifier must rebuild the canonical CBOR and require byte equality,
+including the exact bucket identity. Publication time is the exact S3 object
+version's `LastModified`, not a host clock, body field, or attestation timestamp.
 
-```
-ENCLAVE_MIGRATION_COOLDOWN = "30m" (from enclave.yaml)
+### Canonical Head Selection
 
-After a migration completes:
-  - MigrationRequestedAt timestamp is preserved in SSM
-  - On GET /v1/enclave-info:
-    - migration_cooldown_remaining = max(0, cooldown - elapsed)
-    - Cached for 5 seconds (avoid SSM hammering)
-  - If migration_cooldown_remaining > 0:
-    - POST /v1/start-migration returns 429 Too Many Requests
-    - Prevents rapid successive migrations
+For the current source PCR0, the runtime:
 
-Purpose: Safety valve against accidental rapid migrations
-         that could cause secret loss or key confusion
-```
+1. Lists all versions under the exact source prefix, following pagination.
+2. Fetches each candidate by exact key and exact version ID.
+3. Strictly validates the key, JSON, schema, sequence, action, target, Nitro
+   chain and COSE signature, source PCR0, canonical CBOR, and bucket identity.
+4. Ignores invalid versions.
+5. Selects the highest valid sequence.
+6. At that sequence, selects the earliest exact-version `LastModified`.
+7. Fails closed if valid versions tie at the exact earliest timestamp.
 
-### Migration Chain of Trust
+An ambiguous scan retains its maximum sequence internally, allowing a later
+request to append past the ambiguity. S3 listing or read failure is store
+unavailability, not an empty log.
 
-```
-Genesis (first deploy):
-  PCR0 = A, previous_pcr0 = "genesis"
+### Derived Status
 
-After first migration:
-  PCR0 = B, previous_pcr0 = A, attestation = <signed proof from A>
+States are exactly `none`, `cooling_down`, `eligible`, and `aborted`.
 
-After second migration:
-  PCR0 = C, previous_pcr0 = B, attestation = <signed proof from B>
+| Field | Applicability |
+|---|---|
+| `state` | Always |
+| `source_pcr0` | Always after NSM PCR0 can be read, including `none` |
+| `target_pcr0` | A valid head exists |
+| `sequence` | A valid head exists |
+| `action` | A valid head exists; `requested` or `aborted` |
+| `published_at` | A valid head exists; selected version's `LastModified` |
+| `eligible_at` | Requested head only; `published_at + migration_cooldown` |
+| `remaining_seconds` | `cooling_down` only, positive seconds rounded up |
 
-Verification:
-  Client can walk the chain: C → B → A → genesis
-  Each link includes a hardware-signed attestation document
-  proving the migration was from a legitimate enclave instance
-```
+Inapplicable fields are omitted from public JSON. Cooldown is derived from S3
+publication time, not a host timer. A zero cooldown still requires a matching
+published request; that request is immediately eligible.
+
+### Finalisation, Activation, and Rollback
+
+The source runtime finalises only an `eligible` request with an exact target
+match. It commits the target PCR0 into PCR31, creates a migration KMS key
+admitting source and target PCR0, re-encrypts static secrets and the storage DEK,
+writes predecessor attestation and a transition receipt, and changes the active
+lock-scoped `KMSKeyID` to the migration key.
+
+The host backs up the current EIF, downloads the PCR0-addressed candidate, stops
+the source enclave, swaps the EIF, and starts the candidate. If start or the
+current post-start probe fails, it restores the backup and restarts the source.
+The dual-PCR key and transition receipt support this rollback path.
+
+`finalise --resume` sends `finalize=false`: it skips enclave finalisation and
+retries host activation. It is valid only after enclave finalisation definitely
+succeeded and a later host orchestration step failed. It is not a cooldown or
+intent bypass and is unsafe when finalisation success is uncertain.
+
+> **Current activation limitation: steps 10/11 are not implemented.** After the
+> EIF swap, the supervisor treats `GET /v1/enclave-info` HTTP 200 as sufficient
+> readiness. It does not obtain fresh attestation and prove that PCR0 equals the
+> requested target, it does not require runtime `GET /health` readiness, and it
+> does not implement the intended verified cleanup ordering. Current code then
+> removes the EIF backup and may update the supervisor, but that sequence is not
+> a verified activation/cleanup protocol. Migration completion must not be read
+> as evidence that those checks occurred.
+
+### Independent Verification and Forks
+
+A conceptual migration-log verifier must enumerate and fetch all exact versions,
+enforce strict JSON, verify the AWS Nitro chain and COSE signature, match source
+PCR0 plus sequence/action/target, reconstruct canonical CBOR including bucket
+identity, and apply `LastModified` canonical selection.
+
+No migration-log verifier CLI is shipped. Existing `enclave verify` verifies a
+live enclave's attestation and response-signing bindings; it is different and
+does not verify migration-log history.
+
+Public versions make hidden forks detectable, not prevented. A retained clone
+with the same source PCR0 and valid state can append competing valid entries.
+The history and ambiguity remain public, but the protocol does not prove enclave
+uniqueness or prevent a retained clone from acting.
 
 ---
 
@@ -1845,8 +1736,8 @@ SDK AWS client → DNS (192.168.127.1 gvproxy) → gvproxy TAP
 
 **Admin → Management**:
 ```
-Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
-    → supervisor → (for enclave calls) gvproxy:7073 → supervisor:7073
+Admin CLI → SSM Session Manager port forwarding → host 127.0.0.1:8443
+    → supervisor → parent-only migration control on vsock:8003
 ```
 
 ---
@@ -1863,6 +1754,6 @@ Admin → SSM Session Manager → EC2 shell → curl 127.0.0.1:8443
 7. INIT        Supervisor: generate keys → load credentials → lock KMS → decrypt secrets
 8. SERVE       User app starts with secrets as env vars, all traffic signed
 9. VERIFY      Clients: fetch attestation → verify PCR0 → verify signatures
-10. MIGRATE    Admin: POST /migrate → export secrets → build new EIF → import → cleanup
-11. REPEAT     New enclave boots with migrated secrets, chain of trust preserved
+10. UPDATE     Publish candidate → request → status → finalise
+               (subject to the current activation limitation in Section 15)
 ```

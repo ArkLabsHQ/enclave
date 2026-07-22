@@ -9,12 +9,21 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type migrationRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f migrationRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestMigrationWriteTimeoutExceedsControlAndReadiness(t *testing.T) {
+	t.Setenv("ENCLAVE_MIGRATION_COMMIT_TIMEOUT", "8m")
+	minimum := migrationControlTimeout + 8*time.Minute
+	if got := migrationWriteTimeout(); got <= minimum {
+		t.Fatalf("migration write timeout = %s, must exceed control + readiness = %s", got, minimum)
+	}
 }
 
 func TestCallFinaliseMigrationUsesControlChannel(t *testing.T) {

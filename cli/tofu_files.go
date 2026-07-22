@@ -42,14 +42,11 @@ module "enclave" {
   instance_type     = var.instance_type
   local             = var.local
   secrets           = var.secrets
-  migration_cooldown = var.migration_cooldown
-  expected_pcr0     = var.expected_pcr0
   is_kms_key_locked = var.is_kms_key_locked
-  supervisor_url          = var.supervisor_url
-  github_owner  = var.github_owner
-  github_repo   = var.github_repo
-  release_tag   = var.release_tag
-  github_token  = var.github_token
+  github_owner      = var.github_owner
+  github_repo       = var.github_repo
+  release_tag       = var.release_tag
+  github_token      = var.github_token
 
   eif_path               = var.eif_path
   supervisor_binary_path = var.supervisor_binary_path
@@ -108,28 +105,10 @@ variable "secrets" {
   default = []
 }
 
-variable "migration_cooldown" {
-  description = "Migration cooldown duration string."
-  type        = string
-  default     = "0s"
-}
-
-variable "expected_pcr0" {
-  description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
-  type        = string
-  default     = ""
-}
-
 variable "is_kms_key_locked" {
   description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
   type        = bool
   default     = false
-}
-
-variable "supervisor_url" {
-  description = "Supervisor server URL for local mode migrations."
-  type        = string
-  default     = "http://localhost:8444"
 }
 
 # --- GitHub Release artifacts ---
@@ -229,6 +208,31 @@ output "pcr0_signing_key_arn" {
   value       = module.enclave.pcr0_signing_key_arn
 }
 
+output "candidate_pcr0" {
+  description = "Lowercase PCR0 identifying the uploaded candidate."
+  value       = module.enclave.candidate_pcr0
+}
+
+output "candidate_artifact_bucket" {
+  description = "S3 bucket containing the candidate artifacts."
+  value       = module.enclave.candidate_artifact_bucket
+}
+
+output "candidate_eif_key" {
+  description = "PCR0-addressed S3 key of the candidate EIF."
+  value       = module.enclave.candidate_eif_key
+}
+
+output "candidate_supervisor_key" {
+  description = "PCR0-addressed S3 key of the candidate supervisor."
+  value       = module.enclave.candidate_supervisor_key
+}
+
+output "migration_intent_bucket" {
+  description = "Public, versioned migration-intent bucket."
+  value       = module.enclave.migration_intent_bucket
+}
+
 `
 
 const tofuModuleEnclaveMain = `terraform {
@@ -308,28 +312,10 @@ variable "secrets" {
   default = []
 }
 
-variable "migration_cooldown" {
-  description = "Migration cooldown duration string."
-  type        = string
-  default     = "0s"
-}
-
-variable "expected_pcr0" {
-  description = "Expected PCR0 of the current EIF (from pcr.json). Used to trigger migrations."
-  type        = string
-  default     = ""
-}
-
 variable "is_kms_key_locked" {
   description = "KMS lock posture from enclave.yaml. Selects the SSM lock namespace (locked|unlocked) for the KMS key id + ciphertexts."
   type        = bool
   default     = false
-}
-
-variable "supervisor_url" {
-  description = "Supervisor server URL for local mode migrations (e.g. http://localhost:8444)."
-  type        = string
-  default     = "http://localhost:8444"
 }
 
 # --- GitHub Release artifacts ---
@@ -507,7 +493,7 @@ resource "aws_iam_role_policy" "enclave" {
 }
 
 data "aws_iam_policy_document" "enclave" {
-  # S3: read all uploaded assets (including new EIFs uploaded during migration).
+  # S3: read the selected candidate artifacts.
   statement {
     sid = "S3AssetRead"
     actions = [
@@ -555,6 +541,24 @@ data "aws_iam_policy_document" "enclave" {
     ]
   }
 
+  # S3: append and read explicit migration-intent versions. Deliberately omits
+  # delete actions and Object Lock bypass.
+  statement {
+    sid       = "S3MigrationIntentVersionList"
+    actions   = ["s3:ListBucketVersions"]
+    resources = [aws_s3_bucket.migration_intent.arn]
+  }
+
+  statement {
+    sid = "S3MigrationIntentObjects"
+    actions = [
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+      "s3:PutObjectRetention",
+    ]
+    resources = ["${aws_s3_bucket.migration_intent.arn}/*"]
+  }
+
   # DynamoDB: the encrypted, versioned K/V store. Shared with the EC2 role, so it
   # doesn't exclude the operator; rollback is prevented by the S3 anchor instead
   # (see runtime/anchor.go). Scan backs the boot gate's version-vector read.
@@ -590,7 +594,6 @@ data "aws_iam_policy_document" "enclave" {
         "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/StorageDEK/Ciphertext/*",
         aws_ssm_parameter.migration_previous_pcr0.arn,
         aws_ssm_parameter.migration_previous_pcr0_attestation.arn,
-        aws_ssm_parameter.migration_requested_at.arn,
       ],
     )
   }
@@ -602,6 +605,7 @@ data "aws_iam_policy_document" "enclave" {
     resources = [
       aws_ssm_parameter.storage_bucket_name.arn,
       aws_ssm_parameter.anchor_bucket_name.arn,
+      aws_ssm_parameter.migration_intent_bucket_name.arn,
     ]
   }
 
@@ -670,10 +674,10 @@ data "aws_iam_policy_document" "enclave" {
 
 locals {
   # When local paths are set, use them directly. Otherwise download from GitHub Release.
-  use_local      = var.eif_path != ""
-  artifacts_dir  = "${path.module}/.artifacts"
-  signing_dir    = "${path.module}/.signing"
-  release_base   = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
+  use_local     = var.eif_path != ""
+  artifacts_dir = "${path.module}/.artifacts"
+  signing_dir   = "${path.module}/.signing"
+  release_base  = "https://github.com/${var.github_owner}/${var.github_repo}/releases/download/${var.release_tag}"
 
   eif_source        = local.use_local ? var.eif_path : "${local.artifacts_dir}/image.eif"
   supervisor_source = local.use_local ? var.supervisor_binary_path : "${local.artifacts_dir}/supervisor"
@@ -707,11 +711,17 @@ resource "null_resource" "download_artifacts" {
 }
 
 # pcr.json is produced by the EIF builder (monzo/aws-nitro-util) alongside
-# image.eif and contains the precomputed PCR0/PCR1/PCR2. Reading it here lets
-# tofu auto-derive expected_pcr0 instead of asking operators to maintain it.
+# image.eif and contains the precomputed PCR0/PCR1/PCR2.
 data "local_file" "pcr" {
   filename   = local.pcr_source
   depends_on = [null_resource.download_artifacts]
+
+  lifecycle {
+    postcondition {
+      condition     = can(regex("^[0-9a-f]{96}$", lower(trimspace(jsondecode(self.content).PCR0))))
+      error_message = "candidate PCR0 could not be resolved from pcr.json as 96 hexadecimal characters"
+    }
+  }
 }
 
 # Also read the EIF and supervisor through data.local_file so their
@@ -729,9 +739,7 @@ data "local_file" "supervisor" {
 }
 
 locals {
-  # Auto-derived from the build's pcr.json. Falls back to var.expected_pcr0 if
-  # pcr.json is missing or malformed (e.g. partial local artifact set).
-  effective_pcr0 = try(jsondecode(data.local_file.pcr.content).PCR0, var.expected_pcr0)
+  effective_pcr0 = lower(trimspace(try(jsondecode(data.local_file.pcr.content).PCR0, "")))
 }
 
 # S3 bucket for enclave deployment assets (EIF, scripts, systemd units, binaries).
@@ -754,7 +762,7 @@ resource "aws_s3_bucket_public_access_block" "assets" {
 resource "aws_s3_object" "enclave_eif" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
-  key        = "image.eif"
+  key        = "candidates/${local.effective_pcr0}/enclave.eif"
   source     = local.eif_source
   etag       = data.local_file.eif.content_md5
 }
@@ -762,27 +770,7 @@ resource "aws_s3_object" "enclave_eif" {
 resource "aws_s3_object" "supervisor_binary" {
   depends_on = [null_resource.download_artifacts]
   bucket     = aws_s3_bucket.assets.id
-  key        = "supervisor"
-  source     = local.supervisor_source
-  etag       = data.local_file.supervisor.content_md5
-}
-
-# Staging copy used for in-place supervisor migration. Each tofu apply overwrites
-# this object with the freshly-built binary; the migration null_resource
-# points the running supervisor at this key. On migration success the
-# promote_supervisor_binary null_resource copies it onto the canonical key above,
-# so instance reboots come up on the new version. If migration fails the
-# canonical key stays on the last-known-good binary.
-#
-# Recovery: if a newly deployed supervisor binary crash-loops under systemd,
-# SSM into the host and run
-#   aws s3 cp s3://<assets>/supervisor /home/ec2-user/app/supervisor
-#   systemctl restart supervisor
-# to roll back to the canonical (last-known-good) binary.
-resource "aws_s3_object" "supervisor_binary_staging" {
-  depends_on = [null_resource.download_artifacts]
-  bucket     = aws_s3_bucket.assets.id
-  key        = "supervisor-staging"
+  key        = "candidates/${local.effective_pcr0}/supervisor"
   source     = local.supervisor_source
   etag       = data.local_file.supervisor.content_md5
 }
@@ -876,6 +864,77 @@ resource "aws_s3_bucket_policy" "anchor_ssl" {
   })
 }
 
+# Public migration-intent log. Object Lock is enabled when the bucket is
+# created; the runtime sets COMPLIANCE mode and the EIF-baked retain-until date
+# on every write.
+resource "aws_s3_bucket" "migration_intent" {
+  bucket_prefix       = "${local.prefix}-migration-intent-"
+  object_lock_enabled = true
+  force_destroy       = var.local
+}
+
+resource "aws_s3_bucket_versioning" "migration_intent" {
+  bucket = aws_s3_bucket.migration_intent.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "migration_intent" {
+  bucket = aws_s3_bucket.migration_intent.id
+
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = false
+  restrict_public_buckets = false
+}
+
+resource "aws_s3_bucket_policy" "migration_intent" {
+  bucket     = aws_s3_bucket.migration_intent.id
+  depends_on = [aws_s3_bucket_public_access_block.migration_intent]
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          Sid       = "PublicListMigrationIntentVersions"
+          Effect    = "Allow"
+          Principal = "*"
+          Action    = "s3:ListBucketVersions"
+          Resource  = aws_s3_bucket.migration_intent.arn
+        },
+        {
+          Sid       = "PublicReadMigrationIntentVersions"
+          Effect    = "Allow"
+          Principal = "*"
+          Action = [
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+          ]
+          Resource = "${aws_s3_bucket.migration_intent.arn}/*"
+        },
+      ],
+      var.local ? [] : [
+        {
+          Sid       = "EnforceSSL"
+          Effect    = "Deny"
+          Principal = "*"
+          Action    = "s3:*"
+          Resource = [
+            aws_s3_bucket.migration_intent.arn,
+            "${aws_s3_bucket.migration_intent.arn}/*",
+          ]
+          Condition = {
+            Bool = { "aws:SecureTransport" = "false" }
+          }
+        },
+      ],
+    )
+  })
+}
+
 # =============================================================================
 # DynamoDB — encrypted, versioned K/V store (RESP/Redis backend, issue #134)
 # =============================================================================
@@ -942,17 +1001,6 @@ resource "aws_ssm_parameter" "migration_previous_pcr0_attestation" {
   }
 }
 
-resource "aws_ssm_parameter" "migration_requested_at" {
-  name      = "/${var.deployment}/${var.app_name}/MigrationRequestedAt"
-  type      = "String"
-  value     = "UNSET"
-  overwrite = true
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
 # Deletes the runtime-created key-scoped ciphertext params on tofu destroy
 # (tofu doesn't track them). A var.secrets change replaces only this no-op
 # resource.
@@ -1000,6 +1048,18 @@ resource "aws_ssm_parameter" "anchor_bucket_name" {
   type      = "String"
   value     = aws_s3_bucket.anchor.id
   overwrite = true
+}
+
+resource "aws_ssm_parameter" "migration_intent_bucket_name" {
+  name      = "/${var.deployment}/${var.app_name}/MigrationIntentBucketName"
+  type      = "String"
+  value     = aws_s3_bucket.migration_intent.id
+  overwrite = true
+
+  depends_on = [
+    aws_s3_bucket_versioning.migration_intent,
+    aws_s3_bucket_policy.migration_intent,
+  ]
 }
 
 # Deploy-time env overrides, published to SSM at /<deployment>/<app>/env/<key>.
@@ -1260,10 +1320,10 @@ resource "aws_instance" "nitro" {
   # Wait for IAM policy before booting — user_data downloads from S3 immediately.
   depends_on = [aws_iam_role_policy.enclave]
 
-  ami                  = data.aws_ami.al2023[0].id
-  instance_type        = var.instance_type
-  subnet_id            = aws_subnet.public[0].id
-  iam_instance_profile = aws_iam_instance_profile.instance.name
+  ami                    = data.aws_ami.al2023[0].id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public[0].id
+  iam_instance_profile   = aws_iam_instance_profile.instance.name
   vpc_security_group_ids = [aws_security_group.nitro[0].id]
 
   enclave_options {
@@ -1283,7 +1343,6 @@ resource "aws_instance" "nitro" {
     app_name                 = var.app_name
     eif_s3_url               = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.enclave_eif.key}"
     supervisor_binary_s3_url = "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}"
-    migration_cooldown       = var.migration_cooldown
     is_kms_key_locked        = var.is_kms_key_locked
   })
 
@@ -1300,8 +1359,8 @@ resource "aws_instance" "nitro" {
   # On destroy: stop enclave + schedule KMS key deletion via supervisor.
   # Must run while the instance is still alive (before EC2 termination).
   provisioner "local-exec" {
-    when    = destroy
-    command = <<-EOT
+    when       = destroy
+    command    = <<-EOT
       aws ssm send-command \
         --instance-ids ${self.id} \
         --document-name AWS-RunShellScript \
@@ -1313,11 +1372,12 @@ resource "aws_instance" "nitro" {
   }
 
   # AL2023 publishes new AMIs constantly; data.aws_ami.al2023.most_recent re-resolves
-  # on every plan and would otherwise force-replace the host (and break migration
-  # because the old supervisor is gone before /migrate can be called). Bump the host
-  # OS deliberately with: tofu apply -replace=module.enclave.aws_instance.nitro[0]
+  # on every plan and would otherwise force-replace the host. Bump the host OS
+  # deliberately with: tofu apply -replace=module.enclave.aws_instance.nitro[0].
+  # Candidate applies must also leave the running host untouched; replacements
+  # still receive the currently selected candidate through user_data.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, user_data]
   }
 }
 
@@ -1366,147 +1426,6 @@ resource "aws_route53_record" "enclave" {
   records = [aws_eip.instance[0].public_ip]
 }
 
-# Automatic migration — triggers when the EIF changes (new PCR0).
-# On first apply this is a no-op (no running enclave to migrate).
-# On subsequent applies with a new EIF, it calls the supervisor to
-# perform a live migration (export keys, swap EIF, restart enclave).
-# Automatic migration (production) — triggers when EIF changes.
-# Uses SSM to call the supervisor on the EC2 instance.
-resource "null_resource" "enclave_migration" {
-  count = var.local ? 0 : 1
-
-  triggers = {
-    eif_etag      = data.local_file.eif.content_md5
-    expected_pcr0 = local.effective_pcr0
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      INSTANCE_ID="${aws_instance.nitro[0].id}"
-      REGION="${var.region}"
-      BUCKET="${aws_s3_bucket.assets.id}"
-      EIF_KEY="${aws_s3_object.enclave_eif.key}"
-      PCR0="${local.effective_pcr0}"
-      SECRETS='${jsonencode([for s in var.secrets : s.name])}'
-
-      # Skip on first deploy (no running enclave).
-      STATUS=$(aws ssm send-command \
-        --instance-ids "$INSTANCE_ID" \
-        --document-name AWS-RunShellScript \
-        --parameters '{"commands":["curl -sf http://localhost:8443/health || echo NOT_RUNNING"]}' \
-        --region "$REGION" \
-        --query 'Command.CommandId' --output text 2>/dev/null) || exit 0
-      sleep 5
-      RESULT=$(aws ssm get-command-invocation \
-        --command-id "$STATUS" --instance-id "$INSTANCE_ID" --region "$REGION" \
-        --query 'StandardOutputContent' --output text 2>/dev/null) || exit 0
-      if echo "$RESULT" | grep -q "NOT_RUNNING"; then
-        echo "No running enclave, skipping migration."
-        exit 0
-      fi
-
-      echo "Triggering migration..."
-      SUPERVISOR_BUCKET="${aws_s3_bucket.assets.id}"
-      SUPERVISOR_KEY="${aws_s3_object.supervisor_binary_staging.key}"
-      MIGRATE_BODY=$(jq -nc \
-        --arg b "$BUCKET" --arg k "$EIF_KEY" --arg p "$PCR0" --argjson s "$SECRETS" \
-        --arg mb "$SUPERVISOR_BUCKET" --arg mk "$SUPERVISOR_KEY" \
-        '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s, supervisor_binary_bucket:$mb, supervisor_binary_key:$mk}')
-      MIGRATE_CMD="curl -sf -X POST http://localhost:8443/migrate -H Content-Type:application/json -d '$MIGRATE_BODY'"
-      TMPFILE=$(mktemp)
-      jq -nc --arg cmd "$MIGRATE_CMD" '{"commands":[$cmd]}' > "$TMPFILE"
-      aws ssm send-command \
-        --instance-ids "$INSTANCE_ID" \
-        --document-name AWS-RunShellScript \
-        --parameters "file://$TMPFILE" \
-        --region "$REGION" --output text
-      rm -f "$TMPFILE"
-    EOT
-  }
-
-  depends_on = [aws_instance.nitro, aws_s3_object.enclave_eif]
-}
-
-# Promote the staging supervisor binary onto the canonical key after a successful
-# enclave migration. Runs only when enclave_migration fires and succeeds, so
-# the canonical key (used by cloud-init on future instance launches) stays
-# pinned to the last-known-good binary until the live migration proves the
-# new one boots.
-resource "null_resource" "promote_supervisor_binary" {
-  count = var.local ? 0 : 1
-
-  triggers = {
-    eif_etag      = data.local_file.eif.content_md5
-    expected_pcr0 = local.effective_pcr0
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      aws s3 cp \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary_staging.key}" \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}" \
-        --region "${var.region}"
-    EOT
-  }
-
-  depends_on = [null_resource.enclave_migration]
-}
-
-# Automatic migration (local mode) — triggers when EIF content changes.
-# Calls the supervisor directly via HTTP (no EC2/SSM in local mode).
-# Skips at runtime if expected_pcr0 is unset or no supervisor is running.
-resource "null_resource" "enclave_migration_local" {
-  count = var.local ? 1 : 0
-
-  triggers = {
-    eif_etag      = data.local_file.eif.content_md5
-    expected_pcr0 = local.effective_pcr0
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      SUPERVISOR_URL="${var.supervisor_url}"
-      BUCKET="${aws_s3_bucket.assets.id}"
-      PCR0="${local.effective_pcr0}"
-      SECRETS='${jsonencode([for s in var.secrets : s.name])}'
-
-      # Skip if PCR0 couldn't be derived — nothing meaningful to verify against.
-      [ -z "$${PCR0}" ] && { echo "PCR0 not derivable (missing pcr.json + var.expected_pcr0), skipping migration."; exit 0; }
-
-      # Skip on first deploy (supervisor not running yet).
-      curl -sf "$${SUPERVISOR_URL}/health" >/dev/null 2>&1 || { echo "No supervisor, skipping migration."; exit 0; }
-
-      echo "Triggering local migration..."
-      SUPERVISOR_KEY="${aws_s3_object.supervisor_binary_staging.key}"
-      curl -sf -X POST "$${SUPERVISOR_URL}/migrate" \
-        -H 'Content-Type: application/json' \
-        -d "{\"eif_bucket\":\"$${BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"$${PCR0}\",\"secret_names\":$${SECRETS},\"supervisor_binary_bucket\":\"$${BUCKET}\",\"supervisor_binary_key\":\"$${SUPERVISOR_KEY}\"}"
-    EOT
-  }
-}
-
-# Promote the staging supervisor binary onto the canonical key after a successful
-# local-mode migration. Mirrors null_resource.promote_supervisor_binary for non-local.
-resource "null_resource" "promote_supervisor_binary_local" {
-  count = var.local ? 1 : 0
-
-  triggers = {
-    eif_etag      = data.local_file.eif.content_md5
-    expected_pcr0 = local.effective_pcr0
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      aws s3 cp \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary_staging.key}" \
-        "s3://${aws_s3_bucket.assets.id}/${aws_s3_object.supervisor_binary.key}" \
-        --region "${var.region}"
-    EOT
-  }
-
-  depends_on = [null_resource.enclave_migration_local]
-}
-
 # =============================================================================
 # Outputs
 # =============================================================================
@@ -1535,6 +1454,32 @@ output "pcr0_signing_key_arn" {
   description = "ARN of the KMS key used by Tofu to sign each build's PCR0."
   value       = aws_kms_key.pcr0_signing.arn
 }
+
+output "candidate_pcr0" {
+  description = "Lowercase PCR0 identifying the uploaded candidate."
+  value       = local.effective_pcr0
+}
+
+output "candidate_artifact_bucket" {
+  description = "S3 bucket containing the candidate artifacts."
+  value       = aws_s3_bucket.assets.id
+}
+
+output "candidate_eif_key" {
+  description = "PCR0-addressed S3 key of the candidate EIF."
+  value       = aws_s3_object.enclave_eif.key
+}
+
+output "candidate_supervisor_key" {
+  description = "PCR0-addressed S3 key of the candidate supervisor."
+  value       = aws_s3_object.supervisor_binary.key
+}
+
+output "migration_intent_bucket" {
+  description = "Public, versioned migration-intent bucket."
+  value       = aws_s3_bucket.migration_intent.id
+}
+
 `
 
 const tofuModuleBackendMain = `# Bootstrap module for the OpenTofu state backend.

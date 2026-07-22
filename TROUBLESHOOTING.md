@@ -6,7 +6,10 @@
 
 **Cause**: The KMS key has a PCR0-restricted policy from a previous enclave build. The current EIF has a different PCR0 (any code or dependency change produces a new PCR0).
 
-**Fix**: Run `enclave migrate` to create a new KMS key locked to the new PCR0, or use `enclave lock` to apply the new PCR0 to the existing key (only works if the key policy still allows PutKeyPolicy).
+**Fix**: Publish the candidate, then run `enclave migration request`, wait for
+`enclave migration status` to report `eligible`, and run `enclave migration
+finalise`. See [OPERATIONS.md](OPERATIONS.md#migration). OpenTofu publication
+alone does not activate the new PCR0.
 
 ### `enclave init error: load secrets from KMS: KMS secret loading timed out after 5m0s`
 
@@ -28,9 +31,51 @@
 
 ### `migration already in progress`
 
-**Cause**: A previous migration is still running or was interrupted without cleanup.
+**Cause**: The host serializes request, abort, and finalise operations; another
+operation currently holds the migration lock.
 
-**Fix**: The migration is idempotent. Wait for the current migration to complete, or re-run `enclave migrate` — it will resume from the last checkpoint.
+**Fix**: Wait for that operation and inspect `journalctl -u enclave-supervisor`.
+Do not assume a generic retry is idempotent. Use `enclave migration finalise
+--resume` only if enclave finalisation definitely succeeded and a later host
+orchestration step failed.
+
+### Migration status is `none`, `cooling_down`, or `aborted`
+
+- `none`: no valid request head exists for this source PCR0. Publish one with
+  `enclave migration request`.
+- `cooling_down`: wait until `eligible_at`. Cooldown is derived from the selected
+  S3 version's `LastModified`; there is no host timer to restart.
+- `aborted`: publish a new request if the candidate is still intended.
+
+A zero cooldown still requires a matching published request, which is then
+immediately eligible.
+
+### Migration intent head is ambiguous or unavailable
+
+An exact earliest-`LastModified` tie at the highest valid sequence fails closed.
+The sequence is retained, so a new request can append past the ambiguity. S3
+list, exact-version fetch, or read failures are reported as store unavailability,
+not `none`.
+
+Use the anonymous `list-object-versions` and exact-version `get-object` commands
+in [OPERATIONS.md](OPERATIONS.md#authoritative-s3-log). Preserve all versions;
+do not inspect only `IsLatest`.
+
+### Candidate identity or readiness is uncertain after finalise
+
+Current activation steps 10/11 are not implemented. Host orchestration does not
+perform fresh exact-target attestation, require runtime `/health` readiness, or
+implement the intended verified cleanup ordering. Check both endpoints and run
+independent live verification:
+
+```bash
+curl -sk https://127.0.0.1:443/v1/enclave-info
+curl -sk https://127.0.0.1:443/health
+enclave verify --base-url https://<enclave-address> --expected-pcr0 <candidate-pcr0>
+```
+
+No migration-log verifier CLI is shipped; `enclave verify` checks the live
+enclave and is a different operation.
 
 ### `secret value too large (N bytes, max 65536)`
 
@@ -88,9 +133,10 @@ curl -sk https://127.0.0.1:443/v1/enclave-info | jq .metrics
 ```bash
 DEPLOYMENT=dev
 APP_NAME=myapp
+LOCK_SEGMENT=unlocked  # use locked when is_kms_key_locked=true
 
 # Get key ID from SSM
-KEY_ID=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/KMSKeyID" --query 'Parameter.Value' --output text)
+KEY_ID=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/KMSKeyID" --query 'Parameter.Value' --output text)
 
 # Get key policy
 aws kms get-key-policy --key-id "$KEY_ID" --policy-name default --query Policy --output text | jq .
@@ -112,12 +158,14 @@ RESPONSE=$(curl -sk -D- https://127.0.0.1:443/v1/enclave-info)
 ```bash
 DEPLOYMENT=dev
 APP_NAME=myapp
+LOCK_SEGMENT=unlocked  # use locked when is_kms_key_locked=true
+KEY_ID=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/KMSKeyID" --query 'Parameter.Value' --output text)
 
 # List all parameters for this deployment
 aws ssm get-parameters-by-path --path "/$DEPLOYMENT/$APP_NAME/" --query 'Parameters[].Name'
 
 # Check if a specific secret has a ciphertext
-aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/MySecret/Ciphertext" --query 'Parameter.Value' --output text
+aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/MySecret/Ciphertext/$KEY_ID" --query 'Parameter.Value' --output text
 ```
 
 ### Debug networking (vsock)
@@ -140,6 +188,7 @@ lsmod | grep vsock
 ```bash
 DEPLOYMENT=dev
 APP_NAME=myapp
+LOCK_SEGMENT=unlocked
 
 # Get bucket name
 BUCKET=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/StorageBucketName" --query 'Parameter.Value' --output text)
@@ -148,5 +197,6 @@ BUCKET=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/StorageBucketName"
 aws s3 ls "s3://$BUCKET/data/"
 
 # Check DEK ciphertext exists
-aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/StorageDEK/Ciphertext" --query 'Parameter.Value' --output text | head -c 50
+KEY_ID=$(aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/KMSKeyID" --query 'Parameter.Value' --output text)
+aws ssm get-parameter --name "/$DEPLOYMENT/$APP_NAME/$LOCK_SEGMENT/StorageDEK/Ciphertext/$KEY_ID" --query 'Parameter.Value' --output text | head -c 50
 ```

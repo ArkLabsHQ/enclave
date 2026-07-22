@@ -106,6 +106,64 @@ func TestWriteTofuVars_Route53ZoneID(t *testing.T) {
 	}
 }
 
+func TestTofuCandidateArtifacts(t *testing.T) {
+	for _, want := range []string{
+		`key        = "candidates/${local.effective_pcr0}/enclave.eif"`,
+		`key        = "candidates/${local.effective_pcr0}/supervisor"`,
+	} {
+		requireContains(t, tofuModuleEnclaveMain, want)
+	}
+
+	for _, name := range []string{
+		"candidate_pcr0",
+		"candidate_artifact_bucket",
+		"candidate_eif_key",
+		"candidate_supervisor_key",
+		"migration_intent_bucket",
+	} {
+		requireContains(t, tofuModuleEnclaveMain, `output "`+name+`"`)
+		requireContains(t, tofuRootMain, `value       = module.enclave.`+name)
+	}
+}
+
+func TestTofuMigrationIntentInfrastructure(t *testing.T) {
+	for _, want := range []string{
+		`object_lock_enabled = true`,
+		`resource "aws_s3_bucket_versioning" "migration_intent"`,
+		`resource "aws_s3_bucket_policy" "migration_intent"`,
+		`Action    = "s3:ListBucketVersions"`,
+		`"s3:PutObjectRetention"`,
+		`name      = "/${var.deployment}/${var.app_name}/MigrationIntentBucketName"`,
+		`aws_ssm_parameter.migration_intent_bucket_name.arn`,
+	} {
+		requireContains(t, tofuModuleEnclaveMain, want)
+	}
+}
+
+func TestTofuHasNoAutomaticMigration(t *testing.T) {
+	if strings.Contains(tofuRootMain+tofuModuleEnclaveMain, "/migrate") {
+		t.Error("generated Tofu contains automatic migration")
+	}
+	requireContains(t, tofuModuleEnclaveMain, "ignore_changes = [ami, user_data]")
+}
+
+func TestMigrationCooldownIsEIFOnly(t *testing.T) {
+	if strings.Contains(frameworkUserData, "ENCLAVE_MIGRATION_COOLDOWN") {
+		t.Error("host user data exports the EIF-only migration cooldown")
+	}
+	requireContains(t, frameworkFlakeNix,
+		`ENCLAVE_MIGRATION_COOLDOWN=${buildCfg.migration_cooldown or "0s"}`)
+	requireContains(t, frameworkFlakeNix,
+		`ENCLAVE_MIGRATION_INTENT_RETENTION=${buildCfg.migration_intent_retention or "87600h"}`)
+}
+
+func requireContains(t *testing.T, value, substring string) {
+	t.Helper()
+	if !strings.Contains(value, substring) {
+		t.Errorf("missing %q", substring)
+	}
+}
+
 // TestTofuUpdate_RefreshesOnlyTfvars confirms that `enclave tofu update`
 // regenerates terraform.tfvars.json from enclave.yaml while leaving the
 // scaffolded module files (main.tf, modules/enclave/main.tf) untouched.

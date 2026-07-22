@@ -195,6 +195,7 @@ account: ""                      # AWS account ID (required)
 deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+migration_intent_retention: "87600h" # Compliance retention for public migration intents (10 years)
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
@@ -292,6 +293,7 @@ account: ""                      # AWS account ID (required)
 deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+migration_intent_retention: "87600h" # Compliance retention for public migration intents (10 years)
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
@@ -590,6 +592,7 @@ account: ""                      # AWS account ID (required)
 deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+migration_intent_retention: "87600h" # Compliance retention for public migration intents (10 years)
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 
@@ -806,6 +809,7 @@ account: ""                      # AWS account ID (required)
 deployment: dev                      # Deployment name (stack = {deployment}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
+migration_intent_retention: "87600h" # Compliance retention for public migration intents (10 years)
 is_kms_key_locked: false         # false (default): grant AWS root kms:PutKeyPolicy on the locked key — recovery from lockout works by adding a new PCR0 condition.
                                  # true:             strict mode — the locked policy is frozen; even root cannot rewrite it. Only the attested enclave can decrypt.
 

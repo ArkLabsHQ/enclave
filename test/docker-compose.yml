@@ -68,6 +68,8 @@ services:
         condition: service_healthy
     environment:
       SKIP_MOCK_SERVICES: "1"
+      BOOT_TIMEOUT: "${BOOT_TIMEOUT:-300}"
+      INIT_TIMEOUT: "${INIT_TIMEOUT:-120}"
       # Must match enclave.yaml name — the runtime reads ENCLAVE_APP_NAME for SSM paths.
       ENCLAVE_APP_NAME: "test-app"
     command: ["./run.sh", "app/.enclave/artifacts/image.eif"]

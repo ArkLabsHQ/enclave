@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -59,13 +60,19 @@ func NewMigration(aws *AWSClient, lifecycle *Lifecycle, requestShutdown func()) 
 
 func newMigrationControlClient(enclaveCID uint32) *http.Client {
 	return &http.Client{
-		Timeout: 2 * time.Minute,
+		Timeout: migrationControlTimeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				return vsock.Dial(enclaveCID, migrationControlPort, nil)
+				conn, err := vsock.Dial(enclaveCID, migrationControlPort, nil)
+				if err == nil && enclaveCID == 1 {
+					// vhost-device-vsock can reset loopback streams when data is sent
+					// before the guest finishes accepting the connection.
+					time.Sleep(250 * time.Millisecond)
+				}
+				return conn, err
 			},
 		},
 	}
@@ -139,9 +146,10 @@ const (
 )
 
 const (
-	tmpNewEIFPath          = "/tmp/new-enclave.eif"
-	defaultCommitTimeout   = 5 * time.Minute
-	keyDeletionPendingDays = 7
+	tmpNewEIFPath           = "/tmp/new-enclave.eif"
+	migrationControlTimeout = 2 * time.Minute
+	defaultCommitTimeout    = 5 * time.Minute
+	keyDeletionPendingDays  = 7
 )
 
 // migrateEmitter streams NDJSON migrateStatus events to the /migrate caller.
@@ -186,6 +194,11 @@ func (e *migrateEmitter) warnf(step int, format string, args ...any) {
 // handleMigrate optionally finalises the enclave handoff, then orchestrates the
 // EIF swap, health check, rollback, and optional supervisor update.
 func (m *Migration) handleMigrate(w http.ResponseWriter, r *http.Request) {
+	// The server's generic write timeout is shorter than migration readiness.
+	// Extend this response only, while the CLI still provides the outer bound.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(migrationWriteTimeout())); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.Warn("set migration response deadline", "error", err)
+	}
 	if !m.migrateMu.TryLock() {
 		http.Error(w, `{"error":"migration already in progress"}`, http.StatusConflict)
 		return
@@ -356,12 +369,7 @@ func (m *Migration) awaitMigrationOutcome(
 	p *migrateEmitter,
 	eifDest, eifBackup, stopCmd, startCmd string,
 ) bool {
-	timeout := defaultCommitTimeout
-	if v := envOrDefault("ENCLAVE_MIGRATION_COMMIT_TIMEOUT", ""); v != "" {
-		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
-			timeout = d
-		}
-	}
+	timeout := migrationCommitTimeout()
 	p.progressf(stepWaitOutcome, "Polling new enclave until healthy (timeout: %s)...", timeout)
 
 	if err := m.awaitEnclaveReady(ctx, timeout); err != nil {
@@ -371,6 +379,19 @@ func (m *Migration) awaitMigrationOutcome(
 	}
 	p.progress(stepWaitOutcome, "New enclave is healthy")
 	return true
+}
+
+func migrationCommitTimeout() time.Duration {
+	if v := envOrDefault("ENCLAVE_MIGRATION_COMMIT_TIMEOUT", ""); v != "" {
+		if timeout, err := time.ParseDuration(v); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultCommitTimeout
+}
+
+func migrationWriteTimeout() time.Duration {
+	return migrationControlTimeout + migrationCommitTimeout() + 2*time.Minute
 }
 
 func (m *Migration) cleanupHostArtifacts(p *migrateEmitter, eifBackup string) {

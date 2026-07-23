@@ -202,11 +202,10 @@ func (m *migrator) CompleteMigration(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	targetPCR0Bytes, err := validateNewPCR0(targetPCR0)
+	targetPCR0Bytes, err := hex.DecodeString(targetPCR0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode target PCR0")
 	}
-	targetPCR0 = hex.EncodeToString(targetPCR0Bytes)
 
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
@@ -237,12 +236,6 @@ func (m *migrator) CompleteMigration(
 		return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
 	}
 
-	pcr0, err := m.nsm.PCR0()
-	if err != nil {
-		return nil, fmt.Errorf("could not read own PCR0 from NSM")
-	}
-	ownPCR0 := hex.EncodeToString(pcr0)
-
 	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
 		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
@@ -251,6 +244,12 @@ func (m *migrator) CompleteMigration(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create migration key: %w", err)
 	}
+
+	pcr0, err := m.nsm.PCR0()
+	if err != nil {
+		return nil, fmt.Errorf("could not read own PCR0 from NSM")
+	}
+	ownPCR0 := hex.EncodeToString(pcr0)
 
 	slog.Info(
 		"created migration KMS key",
@@ -352,8 +351,10 @@ func (m *migrator) CompleteMigration(
 }
 
 func (r CompleteMigrationRequest) Validate() error {
-	_, err := validateNewPCR0(r.NewPCR0)
-	return err
+	if _, err := normalizePCR0(r.NewPCR0); err != nil {
+		return fmt.Errorf("invalid new_pcr0: %w", err)
+	}
+	return nil
 }
 
 func (r MigrationRequest) Validate() error {
@@ -368,20 +369,4 @@ func (r MigrationRequest) Validate() error {
 		return fmt.Errorf("unknown migration action %q", r.Action)
 	}
 	return nil
-}
-
-func validateNewPCR0(pcr0 string) ([]byte, error) {
-	if pcr0 == "" {
-		return nil, fmt.Errorf("new_pcr0 is required in request body")
-	}
-	if len(pcr0) != 96 {
-		return nil, fmt.Errorf("new_pcr0 must be 96 hex characters (SHA-384)")
-	}
-
-	bytes, err := hex.DecodeString(pcr0)
-	if err != nil {
-		return nil, fmt.Errorf("new_pcr0 must be valid hex")
-	}
-
-	return bytes, err
 }

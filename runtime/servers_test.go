@@ -100,7 +100,7 @@ func (failingListener) Addr() net.Addr              { return &net.TCPAddr{} }
 func TestServersStartReturnsBindErrors(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer occupied.Close()
+	defer func() { _ = occupied.Close() }()
 
 	t.Run("private", func(t *testing.T) {
 		s := &servers{
@@ -116,7 +116,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 		port := occupied.Addr().(*net.TCPAddr).Port
 		ipv6, _ := net.Listen("tcp6", fmt.Sprintf("[::]:%d", port))
 		if ipv6 != nil {
-			defer ipv6.Close()
+			defer func() { _ = ipv6.Close() }()
 		}
 		s := &servers{
 			int: &http.Server{Addr: "127.0.0.1:0"},

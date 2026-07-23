@@ -534,7 +534,7 @@ func candidateGET(ctx context.Context, client *http.Client, url string) (int, []
 	if err != nil {
 		return 0, nil, fmt.Errorf("%w: GET %s: %v", errCandidateInitializing, req.URL.Path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, candidateResponseLimit+1))
 	if err != nil {
 		return 0, nil, fmt.Errorf("read GET %s response: %w", req.URL.Path, err)

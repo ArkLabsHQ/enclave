@@ -16,124 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var stateOriginTestSecrets = []StaticSecretMetadata{
-	{Name: "alpha", EnvVar: "ALPHA"},
-	{Name: "beta", EnvVar: "BETA"},
-}
-
-const stateOriginTestMigrationIntentBucket = "state-origin-migration-intent"
-
-func setStateOriginTestEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
-		{"name":"alpha","env_var":"ALPHA"},
-		{"name":"beta","env_var":"BETA"}
-	]`)
-}
-
-type stateOriginTestKMS struct {
-	PrimaryKMS
-	keyID        string
-	generateCall byte
-	decryptCalls []string
-}
-
-func (k *stateOriginTestKMS) KeyID() string { return k.keyID }
-
-func (k *stateOriginTestKMS) GenerateDataKey(context.Context) (*DataKey, error) {
-	k.generateCall++
-	return &DataKey{
-		Ciphertext: bytes.Repeat([]byte{k.generateCall}, 32),
-		Plaintext:  bytes.Repeat([]byte{k.generateCall + 0x40}, 32),
-	}, nil
-}
-
-func (k *stateOriginTestKMS) Decrypt(_ context.Context, ciphertext string) ([]byte, error) {
-	k.decryptCalls = append(k.decryptCalls, ciphertext)
-	return base64.StdEncoding.DecodeString(ciphertext)
-}
-
-func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
-	fake := &fakeSSM{params: map[string]string{
-		migrationIntentBucketParam(): stateOriginTestMigrationIntentBucket,
-	}}
-	maps.Copy(fake.params, params)
-	return fake, NewSSM(fake)
-}
-
-func stateOriginParams(keyID string) map[string]string {
-	params := map[string]string{
-		kmsKeyIDParam(): keyID,
-		storageDEKCiphertextParam(keyID): base64.StdEncoding.EncodeToString(
-			[]byte{0xde, 0xad, 0xbe, 0xef},
-		),
-	}
-	for i, secret := range stateOriginTestSecrets {
-		params[secretCiphertextParam(secret.Name, keyID)] = base64.StdEncoding.EncodeToString(
-			[]byte{byte(i), 0x11, 0x22, 0x33},
-		)
-	}
-	return params
-}
-
-func mustStateRoot(
-	t *testing.T,
-	ctx context.Context,
-	ssm SSM,
-	keyID string,
-) []byte {
-	t.Helper()
-	secrets := make([]persistedSecret, 0, len(stateOriginTestSecrets))
-	for _, secret := range stateOriginTestSecrets {
-		param := secretCiphertextParam(secret.Name, keyID)
-		ciphertext, err := ssm.MustGet(ctx, param)
-		require.NoError(t, err)
-		secrets = append(secrets, persistedSecret{
-			metadata:   secret,
-			ciphertext: ciphertext,
-		})
-	}
-	dekCiphertext, err := ssm.MustGet(ctx, storageDEKCiphertextParam(keyID))
-	require.NoError(t, err)
-	migrationIntentBucketName, err := ssm.MustGet(ctx, migrationIntentBucketParam())
-	require.NoError(t, err)
-	root, err := stateRoot(persistedStateSnapshot{
-		kmsKeyID:                  keyID,
-		staticSecrets:             secrets,
-		storageDEK:                dekCiphertext,
-		migrationIntentBucketName: migrationIntentBucketName,
-	})
-	require.NoError(t, err)
-	return root
-}
-
-func receiptPayload(t *testing.T, purpose string, stateRoot []byte) []byte {
-	t.Helper()
-	payload, err := cbor.Marshal(stateOriginPayloadV1{Purpose: purpose, StateRoot: stateRoot})
-	require.NoError(t, err)
-	return payload
-}
-
-func signedReceipt(
-	t *testing.T,
-	pcrs map[uint][]byte,
-	purpose string,
-	stateRoot []byte,
-) signedAttestation {
-	t.Helper()
-	now := time.Now()
-	return buildSignedAttestationCustom(
-		t,
-		pcrs,
-		now.Add(-time.Hour),
-		now.Add(time.Hour),
-		now,
-		receiptPayload(t, purpose, stateRoot),
-	)
-}
-
 func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
 	setStateOriginTestEnv(t)
 
@@ -173,7 +55,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 		name    string
 		params  map[string]string
 		want    startState
-		wantErr bool
+		wantErr string
 	}{
 		{
 			name:   "genesis clean",
@@ -185,19 +67,19 @@ func TestLoadUnverifiedState(t *testing.T) {
 			params: map[string]string{
 				migrationIntentBucketParam(): "UNSET",
 			},
-			wantErr: true,
+			wantErr: "failed to get migration intent bucket name",
 		},
 		{
 			name:    "genesis blocked by migration artifacts",
 			params:  withMigration(map[string]string{}),
-			wantErr: true,
+			wantErr: "genesis state has predecessor artifacts",
 		},
 		{
 			name: "genesis blocked by partial migration artifacts",
 			params: map[string]string{
 				migrationPreviousPCR0Param(): prevPCR0,
 			},
-			wantErr: true,
+			wantErr: "inconsistent migration predecessor artifacts",
 		},
 		{
 			name:   "resume with receipt",
@@ -205,7 +87,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 			want:   startStateResume,
 		},
 		{
-			name: "without receipt fails", params: withKey(map[string]string{}), wantErr: true,
+			name: "without receipt fails", params: withKey(map[string]string{}), wantErr: "hasMigrationArtifacts = false",
 		},
 		{
 			name:   "migration with transition receipt",
@@ -234,7 +116,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 				params[migrationPreviousPCR0AttestationParam()] = "attestation"
 				return params
 			}()),
-			wantErr: true,
+			wantErr: "hasMigrationArtifacts = true",
 		},
 	}
 
@@ -243,8 +125,8 @@ func TestLoadUnverifiedState(t *testing.T) {
 			_, ssm := stateOriginTestSSM(tc.params)
 			got, err := loadUnverifiedState(ctx, ssm, currentPCR0)
 
-			if tc.wantErr {
-				require.Error(t, err)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)
@@ -639,4 +521,122 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
+}
+
+var stateOriginTestSecrets = []StaticSecretMetadata{
+	{Name: "alpha", EnvVar: "ALPHA"},
+	{Name: "beta", EnvVar: "BETA"},
+}
+
+const stateOriginTestMigrationIntentBucket = "state-origin-migration-intent"
+
+func setStateOriginTestEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
+		{"name":"alpha","env_var":"ALPHA"},
+		{"name":"beta","env_var":"BETA"}
+	]`)
+}
+
+type stateOriginTestKMS struct {
+	PrimaryKMS
+	keyID        string
+	generateCall byte
+	decryptCalls []string
+}
+
+func (k *stateOriginTestKMS) KeyID() string { return k.keyID }
+
+func (k *stateOriginTestKMS) GenerateDataKey(context.Context) (*DataKey, error) {
+	k.generateCall++
+	return &DataKey{
+		Ciphertext: bytes.Repeat([]byte{k.generateCall}, 32),
+		Plaintext:  bytes.Repeat([]byte{k.generateCall + 0x40}, 32),
+	}, nil
+}
+
+func (k *stateOriginTestKMS) Decrypt(_ context.Context, ciphertext string) ([]byte, error) {
+	k.decryptCalls = append(k.decryptCalls, ciphertext)
+	return base64.StdEncoding.DecodeString(ciphertext)
+}
+
+func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
+	fake := &fakeSSM{params: map[string]string{
+		migrationIntentBucketParam(): stateOriginTestMigrationIntentBucket,
+	}}
+	maps.Copy(fake.params, params)
+	return fake, NewSSM(fake)
+}
+
+func stateOriginParams(keyID string) map[string]string {
+	params := map[string]string{
+		kmsKeyIDParam(): keyID,
+		storageDEKCiphertextParam(keyID): base64.StdEncoding.EncodeToString(
+			[]byte{0xde, 0xad, 0xbe, 0xef},
+		),
+	}
+	for i, secret := range stateOriginTestSecrets {
+		params[secretCiphertextParam(secret.Name, keyID)] = base64.StdEncoding.EncodeToString(
+			[]byte{byte(i), 0x11, 0x22, 0x33},
+		)
+	}
+	return params
+}
+
+func mustStateRoot(
+	t *testing.T,
+	ctx context.Context,
+	ssm SSM,
+	keyID string,
+) []byte {
+	t.Helper()
+	secrets := make([]persistedSecret, 0, len(stateOriginTestSecrets))
+	for _, secret := range stateOriginTestSecrets {
+		param := secretCiphertextParam(secret.Name, keyID)
+		ciphertext, err := ssm.MustGet(ctx, param)
+		require.NoError(t, err)
+		secrets = append(secrets, persistedSecret{
+			metadata:   secret,
+			ciphertext: ciphertext,
+		})
+	}
+	dekCiphertext, err := ssm.MustGet(ctx, storageDEKCiphertextParam(keyID))
+	require.NoError(t, err)
+	migrationIntentBucketName, err := ssm.MustGet(ctx, migrationIntentBucketParam())
+	require.NoError(t, err)
+	root, err := stateRoot(persistedStateSnapshot{
+		kmsKeyID:                  keyID,
+		staticSecrets:             secrets,
+		storageDEK:                dekCiphertext,
+		migrationIntentBucketName: migrationIntentBucketName,
+	})
+	require.NoError(t, err)
+	return root
+}
+
+func receiptPayload(t *testing.T, purpose string, stateRoot []byte) []byte {
+	t.Helper()
+	payload, err := cbor.Marshal(stateOriginPayloadV1{Purpose: purpose, StateRoot: stateRoot})
+	require.NoError(t, err)
+	return payload
+}
+
+func signedReceipt(
+	t *testing.T,
+	pcrs map[uint][]byte,
+	purpose string,
+	stateRoot []byte,
+) signedAttestation {
+	t.Helper()
+	now := time.Now()
+	return buildSignedAttestationCustom(
+		t,
+		pcrs,
+		now.Add(-time.Hour),
+		now.Add(time.Hour),
+		now,
+		receiptPayload(t, purpose, stateRoot),
+	)
 }

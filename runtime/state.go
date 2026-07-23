@@ -254,9 +254,9 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 		return fmt.Errorf("previous PCR0 attestation is required")
 	}
 
-	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) &&
-		// allow rollback-to-self
-		!strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
+	isRollbackToSelf := strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0))
+
+	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) && !isRollbackToSelf {
 		return fmt.Errorf(
 			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
 		)
@@ -264,7 +264,7 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 
 	expectedPCRs := map[uint]string{0: state.predecessorPCR0}
 	// Verify PCR31 if this is not a rollback (curPCR0 != prevPCR0).
-	if !strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
+	if !isRollbackToSelf {
 		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(state.currentPCR0))
 	}
 
@@ -341,7 +341,6 @@ func establishLoadedState(
 			return verifiedState{}, fmt.Errorf("failed to materialize persisted state: %w", err)
 		}
 	}
-	verified.migrationIntentBucketName = snapshot.migrationIntentBucketName
 
 	switch state.startState {
 	case startStateMigration, startStateGenesis:
@@ -415,9 +414,10 @@ func initializePersistedState(
 			storageDEK:                dekCiphertext,
 			migrationIntentBucketName: migrationIntentBucketName,
 		}, verifiedState{
-			kms:     kms,
-			dek:     &dek{key: append([]byte(nil), dekData.Plaintext...)},
-			secrets: secrets,
+			kms:                       kms,
+			dek:                       &dek{key: append([]byte(nil), dekData.Plaintext...)},
+			secrets:                   secrets,
+			migrationIntentBucketName: migrationIntentBucketName,
 		}, nil
 }
 
@@ -454,9 +454,10 @@ func materializePersistedState(
 	}
 
 	return verifiedState{
-		kms:     kms,
-		dek:     &dek{key: dekPlaintext},
-		secrets: secrets,
+		kms:                       kms,
+		dek:                       &dek{key: dekPlaintext},
+		secrets:                   secrets,
+		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 	}, nil
 }
 

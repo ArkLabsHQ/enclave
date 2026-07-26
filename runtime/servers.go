@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )

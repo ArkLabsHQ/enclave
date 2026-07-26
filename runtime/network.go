@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/viproxy"
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
+	"github.com/ArkLabsHQ/enclave/runtime/viproxy"
 	"github.com/mdlayher/vsock"
 )
 

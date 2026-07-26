@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )

@@ -1,4 +1,4 @@
-module github.com/ArkLabsHQ/introspector-enclave/runtime
+module github.com/ArkLabsHQ/enclave/runtime
 
 go 1.25.0
 

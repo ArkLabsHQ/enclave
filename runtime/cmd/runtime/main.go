@@ -7,10 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	runtime "github.com/ArkLabsHQ/introspector-enclave/runtime"
+	runtime "github.com/ArkLabsHQ/enclave/runtime"
 	// Imported for its init() — seeds /dev/random from /dev/nsm before main()
 	// runs. See runtime/nitriding/package_init.go.
-	_ "github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	_ "github.com/ArkLabsHQ/enclave/runtime/nitriding"
 )
 
 func main() {

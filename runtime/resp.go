@@ -883,7 +883,7 @@ func (s *respServer) cmdScan(ctx context.Context, conn redcon.Conn, cmd redcon.C
 
 func (s *respServer) cmdInfo(conn redcon.Conn) {
 	conn.WriteBulkString("# Server\r\n" +
-		"redis_version:7.0.0-introspector-enclave\r\n" +
+		"redis_version:7.0.0-enclave\r\n" +
 		"redis_mode:standalone\r\n" +
 		"# Clients\r\nconnected_clients:1\r\n" +
 		"# Keyspace\r\n")

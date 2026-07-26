@@ -34,5 +34,7 @@ nitro.buildEif {
     '';
   };
   entrypoint = "/app/runtime";
-  env = pkgs.lib.generators.toKeyValue { } env;
+  # APP_BINARY_NAME tells the runtime which binary to exec under /app
+  # (runtime.go defaults to "app", but we install the app under its own name).
+  env = pkgs.lib.generators.toKeyValue { } ({ APP_BINARY_NAME = app.name; } // env);
 }

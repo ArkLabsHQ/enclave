@@ -36,16 +36,18 @@
       );
 
       checks = forAllSystems (
-        { system, ... }:
+        { pkgs, system, ... }:
         {
           unit-tests = self.packages.${system}.runtime;
         }
+        // import ./nix/tests { inherit pkgs system self; }
       );
 
       lib = {
-        buildEif = import nix/build-eif.nix { inherit self aws-nitro-util; };
-        mkEnclaveAmi = import nix/mk-enclave-ami.nix { inherit self; };
-        mkEnclaveTofu = import nix/mk-enclave-tofu.nix { inherit tofunix; };
+        buildEif = import ./nix/build-eif.nix { inherit self aws-nitro-util; };
+        mkEnclaveAmi = import ./nix/mk-enclave-ami.nix { inherit self nixpkgs; };
+        mkEnclaveQemuAmi = import ./nix/mk-enclave-qemu-ami.nix;
+        mkEnclaveTofu = import ./nix/mk-enclave-tofu.nix { inherit tofunix; };
       };
     };
 }

@@ -1,0 +1,97 @@
+--- a/ministack/services/ec2.py
++++ b/ministack/services/ec2.py
+@@ -452,1 +452,5 @@
+-def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None):
++def _launch_instances_internal(image_id, instance_type, subnet_id, count,
++                               key_name="", user_data="", sg_ids=None,
++                               requested_private_ip=None, iam_profile=None,
++                               root_volume_size=8, root_volume_type="gp3",
++                               root_volume_encrypted=False, enclave_enabled=False):
+@@ -466,13 +469,13 @@
+         vol_id = _new_volume_id()
+         _volumes[vol_id] = {
+             "VolumeId": vol_id,
+-            "Size": 8,
++            "Size": root_volume_size,
+             "AvailabilityZone": f"{get_region()}a",
+             "State": "in-use",
+-            "VolumeType": "gp3",
++            "VolumeType": root_volume_type,
+             "SnapshotId": "",
+             "Iops": 3000,
+-            "Encrypted": False,
++            "Encrypted": root_volume_encrypted,
+             "CreateTime": now,
+             "Attachments": [{
+                 "VolumeId": vol_id,
+@@ -526,6 +529,7 @@
+             "LaunchTime": now,
+             "BlockDeviceMappings": block_device_mappings,
+             "IamInstanceProfile": iam_profile,
++            "EnclaveOptions": {"Enabled": enclave_enabled},
+         }
+         _instances[instance_id] = inst
+         if iam_profile:
+@@ -568,3 +572,10 @@
++    root_volume_size = int(_p(p, "BlockDeviceMapping.1.Ebs.VolumeSize") or "8")
++    root_volume_type = _p(p, "BlockDeviceMapping.1.Ebs.VolumeType") or "gp3"
++    root_volume_encrypted = (
++        (_p(p, "BlockDeviceMapping.1.Ebs.Encrypted") or "false").lower() == "true"
++    )
++    enclave_enabled = (_p(p, "EnclaveOptions.Enabled") or "false").lower() == "true"
++
+     created = _launch_instances_internal(
+         image_id=image_id,
+         instance_type=instance_type,
+@@ -574,5 +585,9 @@
+         user_data=user_data,
+         sg_ids=sg_ids,
+         requested_private_ip=requested_private_ip,
+-        iam_profile=iam_profile
++        iam_profile=iam_profile,
++        root_volume_size=root_volume_size,
++        root_volume_type=root_volume_type,
++        root_volume_encrypted=root_volume_encrypted,
++        enclave_enabled=enclave_enabled,
+     )
+@@ -2258,6 +2273,23 @@
+         "NetworkInterfaceId": None,
+         "PrivateIpAddress": None,
+     }
++    # The AWS provider sends aws_eip tags in AllocateAddress's
++    # TagSpecification. Round-trip them through DescribeAddresses so a refresh
++    # does not report perpetual drift.
++    i = 1
++    while _p(p, f"TagSpecification.{i}.ResourceType"):
++        if _p(p, f"TagSpecification.{i}.ResourceType") == "elastic-ip":
++            spec_tags = []
++            j = 1
++            while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
++                spec_tags.append({
++                    "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
++                    "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
++                })
++                j += 1
++            if spec_tags:
++                _tags[allocation_id] = spec_tags
++        i += 1
+     return _xml(200, "AllocateAddressResponse", f"""
+         <publicIp>{public_ip}</publicIp>
+         <domain>{domain}</domain>
+@@ -2311,5 +2341,6 @@
+             <publicIp>{addr['PublicIp']}</publicIp>
+             <domain>{addr['Domain']}</domain>
+             {assoc}{inst}
++            {_tag_set_xml(addr['AllocationId'])}
+         </item>"""
+     return _xml(200, "DescribeAddressesResponse", f"<addressesSet>{items}</addressesSet>")
+@@ -2775,6 +2806,9 @@
+         {_inst_iam_xml(inst)}<virtualizationType>{inst['Virtualization']}</virtualizationType>
+         <hypervisor>{inst['Hypervisor']}</hypervisor>
+         <monitoring><state>{inst['Monitoring']['State']}</state></monitoring>
++        <enclaveOptions>
++            <enabled>{'true' if inst.get('EnclaveOptions', {}).get('Enabled') else 'false'}</enabled>
++        </enclaveOptions>
+         <groupSet>{sgs}</groupSet>
+         <tagSet>{tags}</tagSet>
+         <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>

@@ -37,18 +37,17 @@ let
       inherit (cli) module tfjson;
     };
 
-  mkCli = if local then (attrs: mkLocalWrapper lib.mkCliAio attrs) else (attrs: lib.mkCliAio attrs);
+  mkCli = if local then (attrs: mkLocalWrapper (lib.mkCliAio attrs)) else lib.mkCliAio;
 
 in
 mkCli {
   plugins = [
-    lib.mkOpentofuProvider
-    {
+    (lib.mkOpentofuProvider {
       owner = "hashicorp";
       repo = "aws";
       version = "6.56.0";
-      hash = pkgs.lib.fakeHash;
-    }
+      hash = "sha256-mIzFbP+RKcLRDmcMu1zQgYhTq/szdm92f15EJu0Ujjs=";
+    })
   ];
   moduleConfig =
     { ref, lib, ... }:
@@ -61,7 +60,7 @@ mkCli {
 
       variable.active_slot = {
         type = "string";
-        description = "Which slot's EIP Route53 points at.";
+        description = "Which slot owns the shared Elastic IP.";
         default = "blue";
       };
 
@@ -134,6 +133,7 @@ mkCli {
                 Action = [
                   "s3:PutObject"
                   "s3:GetObject"
+                  "s3:GetObjectVersion"
                   "s3:PutObjectRetention"
                   "s3:ListBucket"
                   "s3:ListBucketVersions"
@@ -149,6 +149,7 @@ mkCli {
                 Effect = "Allow";
                 Action = [
                   "ssm:GetParameter"
+                  "ssm:GetParametersByPath"
                   "ssm:PutParameter"
                 ];
                 Resource = [
@@ -160,6 +161,7 @@ mkCli {
                 Effect = "Allow";
                 Action = [
                   "kms:CreateKey"
+                  "kms:TagResource"
                 ];
                 Resource = [ "*" ];
               }

@@ -150,20 +150,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(tlsCertCb)
 
-	freshnessAnchor, err := NewFreshnessAnchor(ctx, rt, aws.S3, verified.dek, ssm)
-	if err != nil {
-		return fmt.Errorf("failed to create freshness anchor: %w", err)
-	}
-
-	kvStore, err := NewKVStore(ctx, aws.DDB, ssm, verified.dek, freshnessAnchor)
-	if err != nil {
-		return fmt.Errorf("failed to create kv store: %w", err)
-	}
-
-	if err := servers.StartRESPServer(ctx, NewRESPServer(rt, kvStore, authToken)); err != nil {
-		return fmt.Errorf("failed to start RESP server: %w", err)
-	}
-
 	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}

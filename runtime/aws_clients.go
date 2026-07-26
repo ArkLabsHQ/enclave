@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -103,55 +102,6 @@ type STSAPI interface {
 	) (*sts.GetCallerIdentityOutput, error)
 }
 
-// DynamoDBAPI is the subset of *dynamodb.Client used by the K/V store.
-type DynamoDBAPI interface {
-	GetItem(
-		ctx context.Context,
-		params *dynamodb.GetItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.GetItemOutput, error)
-	PutItem(
-		ctx context.Context,
-		params *dynamodb.PutItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.PutItemOutput, error)
-	UpdateItem(
-		ctx context.Context,
-		params *dynamodb.UpdateItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.UpdateItemOutput, error)
-	DeleteItem(
-		ctx context.Context,
-		params *dynamodb.DeleteItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.DeleteItemOutput, error)
-	Query(
-		ctx context.Context,
-		params *dynamodb.QueryInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.QueryOutput, error)
-	Scan(
-		ctx context.Context,
-		params *dynamodb.ScanInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.ScanOutput, error)
-	BatchGetItem(
-		ctx context.Context,
-		params *dynamodb.BatchGetItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.BatchGetItemOutput, error)
-	BatchWriteItem(
-		ctx context.Context,
-		params *dynamodb.BatchWriteItemInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.BatchWriteItemOutput, error)
-	TransactWriteItems(
-		ctx context.Context,
-		params *dynamodb.TransactWriteItemsInput,
-		optFns ...func(*dynamodb.Options),
-	) (*dynamodb.TransactWriteItemsOutput, error)
-}
-
 // CloudWatchLogsAPI is the subset of *cloudwatchlogs.Client used by the runtime.
 type CloudWatchLogsAPI interface {
 	PutLogEvents(
@@ -183,7 +133,6 @@ type AWSClient struct {
 	S3  S3API
 	STS STSAPI
 	CWL CloudWatchLogsAPI
-	DDB DynamoDBAPI
 }
 
 // NewAWSClient constructs all SDK clients from a single shared aws.Config.
@@ -199,18 +148,7 @@ func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 		S3:  newS3Client(cfg),
 		STS: newSTSClient(cfg),
 		CWL: newCloudWatchLogsClient(cfg),
-		DDB: newDynamoDBClient(cfg),
 	}, nil
-}
-
-// newDynamoDBClient creates a DynamoDB client, respecting
-// AWS_ENDPOINT_URL_DYNAMODB for localstack.
-func newDynamoDBClient(cfg aws.Config) *dynamodb.Client {
-	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		if ep := os.Getenv("AWS_ENDPOINT_URL_DYNAMODB"); ep != "" {
-			o.BaseEndpoint = aws.String(ep)
-		}
-	})
 }
 
 // newKMSClient creates a KMS client, respecting AWS_ENDPOINT_URL_KMS for localstack.

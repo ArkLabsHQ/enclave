@@ -38,21 +38,24 @@
         );
     in
     {
-      packages = nixpkgs.lib.recursiveUpdate
-        (forSystems enclaveSystems (
-          { pkgs, system, ... }:
-          {
-            runtime = import ./nix/runtime.nix { inherit pkgs; };
-            aws-nitro-enclaves-cli = import ./nix/aws-nitro-enclaves-cli.nix { inherit pkgs; };
-          }
-        ))
-        (forSystems allSystems (
-          { pkgs, system, ... }:
-          {
-            cli = import ./nix/cli.nix { inherit pkgs; };
-            default = self.packages.${system}.cli;
-          }
-        ));
+      packages =
+        nixpkgs.lib.recursiveUpdate
+          (forSystems enclaveSystems (
+            { pkgs, system, ... }:
+            {
+              runtime = import ./nix/runtime.nix { inherit pkgs; };
+              aws-nitro-enclaves-cli = import ./nix/aws-nitro-enclaves-cli.nix { inherit pkgs; };
+            }
+          ))
+          (
+            forSystems allSystems (
+              { pkgs, system, ... }:
+              {
+                cli = import ./nix/cli.nix { inherit pkgs; };
+                default = self.packages.${system}.cli;
+              }
+            )
+          );
 
       devShells = forSystems allSystems (
         { pkgs, system, ... }:
@@ -64,6 +67,11 @@
       checks = forSystems enclaveSystems (
         { pkgs, system, ... }: import ./nix/tests { inherit pkgs system self; }
       );
+
+      templates.default = {
+        path = ./nix/template;
+        description = "Downstream App Template";
+      };
 
       lib = {
         buildEif = import ./nix/build-eif.nix { inherit self aws-nitro-util; };

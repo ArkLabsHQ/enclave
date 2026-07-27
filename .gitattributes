@@ -1,4 +1,0 @@
-# Exclude from git archive / GitHub release tarballs.
-# This breaks the circular dependency: runtime-hashes.json stores the
-# source hash of the archive, so it cannot be inside that archive.
-cli/runtime-hashes.json export-ignore

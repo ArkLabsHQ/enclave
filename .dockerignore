@@ -1,7 +1,0 @@
-.git
-target
-bin
-**/enclave/artifacts
-**/flake_result
-**/result
-enclave-cli

@@ -11,3 +11,13 @@ linters:
     paths:
       - nitriding
       - viproxy
+
+formatters:
+  enable:
+    - gofumpt
+    - golines
+  settings:
+    gofumpt:
+      module-path: github.com/ArkLabsHQ/enclave/runtime
+    golines:
+      max-len: 100

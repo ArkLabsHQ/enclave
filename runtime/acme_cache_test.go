@@ -14,7 +14,7 @@ func TestACMEStorageCache(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "acme_cache")
 
 	const bucketName = "cert-bucket"
-	bucketParam := "/unittest/acme_cache/StorageBucketName"
+	bucketParam := "/unittest/acme_cache/TLSCacheBucketName"
 	ctx := context.Background()
 
 	newCache := func(t *testing.T) (*acmeStorageCache, *fakeS3) {

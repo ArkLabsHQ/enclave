@@ -4,7 +4,7 @@ pkgs.buildGoModule (finalAttrs: {
   version = "0.1.0";
   src = ../runtime;
   subPackages = [ "cmd/runtime" ];
-  vendorHash = "sha256-1FMauSDK+XXpECNadsyOU3af8gZ+P2Fciw0ALfEelH4=";
+  vendorHash = "sha256-8bNEo1h22hmnzttU49QzHQslt/WnrDqTf1LRgwd1eN4=";
   env.CGO_ENABLED = "0";
   buildFlags = [
     "-trimpath"

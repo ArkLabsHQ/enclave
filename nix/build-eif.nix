@@ -6,6 +6,7 @@
   pkgs,
   app,
   env,
+  extraPackages ? [ ],
 }:
 let
   system = pkgs.stdenv.hostPlatform.system;
@@ -23,9 +24,8 @@ nitro.buildEif {
   copyToRoot = pkgs.buildEnv {
     name = "${app.name}-enclave-rootfs";
     paths = [
-      pkgs.busybox
       pkgs.cacert
-    ];
+    ] ++ extraPackages;
     pathsToLink = [ "/" ];
     postBuild = ''
       mkdir -p $out/app

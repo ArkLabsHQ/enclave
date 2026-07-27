@@ -1,40 +1,26 @@
-# Test application baked into test EIFs: a tiny REST server that executes
-# shell scripts, built from busybox httpd + CGI (busybox is already part of
-# the EIF rootfs — see nix/build-eif.nix).
+# Test application baked into test EIFs: a tiny stdlib-only Go HTTP server
+# exposing the seams the NixOS test driver needs to observe and perturb the
+# enclave. Built with buildGoModule; stdlib only, so no go.sum and an empty
+# vendor hash.
 #
-# Endpoints (reached through the runtime's reverse proxy on :443):
-#   GET  /cgi-bin/health  -> {"status":"ok"}
-#   POST /cgi-bin/run     -> body is executed with /bin/sh; combined output returned
+# Routes (reached through the runtime's reverse proxy on :443):
+#   GET  /test/health     -> {"status":"ok"}
+#   GET  /test/env/{name} -> {"name":"...","value":"..."}  (os.Getenv)
+#   GET  /test/clock      -> {"unix":<sec>,"nsec":<ns>}
+#   POST /test/clock      -> {"offset_seconds":N}  (bounded +/-10)
+#                            sets CLOCK_REALTIME and returns before/after
 #
 # The derivation carries `.name`/`.version` as required by buildEif's `app`
 # contract (${app}/bin/${app.name} is copied to /app/${app.name}).
+# buildGoModule sets name = "${pname}-${version}"; override to just the binary
+# name so buildEif's `cp ${app}/bin/${app.name}` resolves correctly.
 { pkgs }:
-(pkgs.writeShellScriptBin "testapp" ''
-  set -eu
-  # The EIF init mounts /tmp noexec; CGI scripts must live on the executable
-  # rootfs alongside the app.
-  WWW=/app/test-www
-  /bin/busybox mkdir -p "$WWW/cgi-bin"
-
-  /bin/busybox cat > "$WWW/cgi-bin/health" <<'EOF'
-  #!/bin/busybox sh
-  printf 'Content-Type: application/json\r\n\r\n'
-  printf '{"status":"ok"}'
-  EOF
-
-  /bin/busybox cat > "$WWW/cgi-bin/run" <<'EOF'
-  #!/bin/busybox sh
-  # Execute the POSTed shell script, return combined output.
-  printf 'Content-Type: text/plain\r\n\r\n'
-  script=$(/bin/busybox cat)
-  /bin/busybox sh -c "$script" 2>&1 || true
-  EOF
-
-  /bin/busybox chmod +x "$WWW/cgi-bin/health" "$WWW/cgi-bin/run"
-
-  echo "testapp: serving on 127.0.0.1:''${PORT:-7074}"
-  exec /bin/busybox httpd -f -v -p "127.0.0.1:''${PORT:-7074}" -h "$WWW"
-'')
-// {
+pkgs.buildGoModule {
+  pname = "testapp";
   version = "0.1.0";
+  src = ./test-app;
+  vendorHash = null;
+  env.CGO_ENABLED = "0";
+} // {
+  name = "testapp";
 }

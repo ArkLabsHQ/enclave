@@ -14,7 +14,6 @@ let
   # these addresses through gvproxy; using the AWS node's stable VLAN address
   # avoids depending on gvproxy forwarding the host's /etc/hosts entries.
   commonEifEnv = {
-    PATH = "/bin";
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -23,6 +22,10 @@ let
     ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
     ENCLAVE_NITRIDING_UPSTREAM = "h1";
     ENCLAVE_LOG_CLOUDWATCH = "false";
+    # Test-only: shorten the clock-sync poll cadence from 5m to 2s so the
+    # clock-skew recovery assertion completes in seconds, not minutes. The
+    # servo logic (measure, hard-step >100ms) is unchanged; only the cadence.
+    ENCLAVE_CLOCK_POLL_INTERVAL = "2s";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";

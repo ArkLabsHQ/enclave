@@ -70,7 +70,7 @@ def wait_healthy(node):
             timeout=300,
         )
         node.wait_until_succeeds(
-            "curl -skf --http1.1 https://127.0.0.1/cgi-bin/health "
+            "curl -skf --http1.1 https://127.0.0.1/test/health "
             "| jq -e '.status == \"ok\"'",
             timeout=30,
         )
@@ -90,16 +90,14 @@ def wait_healthy(node):
         raise
 
 
-def secret_fingerprint(node):
-    command = (
-        "curl -skf --http1.1 --data-binary "
-        "'printf \"%s\" \"$E2E_SIGNING_KEY\" | sha256sum | cut -d \" \" -f 1' "
-        "https://127.0.0.1/cgi-bin/run"
-    )
-    fingerprint = node.succeed(command).strip()
-    assert len(fingerprint) == 64, fingerprint
-    assert all(c in "0123456789abcdef" for c in fingerprint), fingerprint
-    return fingerprint
+def secret_value(node):
+    value = node.succeed(
+        "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY "
+        "| jq -r .value"
+    ).strip()
+    assert len(value) == 64, value
+    assert all(c in "0123456789abcdef" for c in value), value
+    return value
 
 
 # MiniStack is the control plane: it records AWS resources but cannot boot an
@@ -206,11 +204,11 @@ blue.wait_for_unit("enclave-start.service")
 blue.wait_for_unit("enclave-watchdog.service")
 wait_healthy(blue)
 blue.succeed(
-    "test \"$(curl -skf --http1.1 --data-binary "
-    "'printf \"%s\" \"$E2E_OVERRIDE\"' "
-    "https://127.0.0.1/cgi-bin/run)\" = override-from-ssm"
+    "test \"$(curl -skf --http1.1 "
+    "https://127.0.0.1/test/env/E2E_OVERRIDE "
+    "| jq -r .value)\" = override-from-ssm"
 )
-blue_secret = secret_fingerprint(blue)
+blue_secret = secret_value(blue)
 blue.succeed(
     "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
     f"| jq -e --arg p '{BLUE_PCR0}' "
@@ -223,6 +221,60 @@ genesis_key = cloud(
     f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
 )
 assert genesis_key not in ("", "UNSET", "None")
+
+# Clock-skew recovery: prove the production clock synchronizer detects and
+# corrects a real CLOCK_REALTIME discontinuity against /dev/ptp0. Run this on
+# blue after health/genesis succeeds and before migration so cooldown and
+# receipt timestamps are unaffected. The EIF sets ENCLAVE_CLOCK_POLL_INTERVAL=2s
+# (test-only) so recovery completes in seconds rather than 5-minute intervals.
+host_ts = int(blue.succeed("date +%s").strip())
+enclave_ts = int(
+    blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix").strip()
+)
+assert abs(enclave_ts - host_ts) <= 2, (enclave_ts, host_ts)
+
+# Count recovery hard-steps so far (excludes the initial boot hard-step, which
+# has a distinct "clock sync: initial hard-step" message).
+initial_hardsteps = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+
+# Skew the enclave clock +5s. The syncer's 100ms threshold guarantees a
+# hard-step on the next 2s poll.
+clock_resp = json.loads(
+    blue.succeed(
+        "curl -skf --http1.1 -X POST -H 'Content-Type: application/json' "
+        "--data '{\"offset_seconds\":5}' https://127.0.0.1/test/clock"
+    )
+)
+skewed_ts = clock_resp["after"]["unix"]
+host_ts_after = int(blue.succeed("date +%s").strip())
+assert skewed_ts - host_ts_after >= 3, (skewed_ts, host_ts_after)
+
+# Wait for the syncer to hard-step the clock back onto the PHC.
+blue.wait_until_succeeds(
+    f"test \"$(grep -c 'clock sync: hard-step' /var/log/enclave-console.log)\" "
+    f"-ge {initial_hardsteps + 1}",
+    timeout=30,
+)
+
+# Poll until the enclave clock is back within 2s of the outer host.
+blue.wait_until_succeeds(
+    "test $(( $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) "
+    "- $(date +%s) )) -le 2 "
+    "&& test $(( $(date +%s) "
+    "- $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) )) -le 2",
+    timeout=30,
+)
+final_hardsteps = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
+wait_healthy(blue)
 
 # Prove the next infrastructure change creates only green, but do not apply
 # the saved plan yet: a real EC2 create would immediately boot the AMI, and
@@ -363,7 +415,7 @@ green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green.wait_for_unit("enclave-start.service")
 green.wait_for_unit("enclave-watchdog.service")
 wait_healthy(green)
-assert secret_fingerprint(green) == blue_secret
+assert secret_value(green) == blue_secret
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "

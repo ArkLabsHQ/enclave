@@ -38,21 +38,21 @@
         );
     in
     {
-      packages =
-        forSystems enclaveSystems (
+      packages = nixpkgs.lib.recursiveUpdate
+        (forSystems enclaveSystems (
           { pkgs, system, ... }:
           {
             runtime = import ./nix/runtime.nix { inherit pkgs; };
             aws-nitro-enclaves-cli = import ./nix/aws-nitro-enclaves-cli.nix { inherit pkgs; };
           }
-        )
-        // forSystems allSystems (
+        ))
+        (forSystems allSystems (
           { pkgs, system, ... }:
           {
             cli = import ./nix/cli.nix { inherit pkgs; };
             default = self.packages.${system}.cli;
           }
-        );
+        ));
 
       devShells = forSystems allSystems (
         { pkgs, system, ... }:

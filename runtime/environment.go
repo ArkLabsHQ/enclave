@@ -17,7 +17,6 @@ import (
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":                 true,
 	"ENCLAVE_APP_NAME":                   true,
-	"ENCLAVE_ANCHOR_WINDOW":              true,
 	"ENCLAVE_KMS_KEY_LOCKED":             true,
 	"ENCLAVE_MIGRATION_COOLDOWN":         true,
 	"ENCLAVE_MIGRATION_INTENT_RETENTION": true,

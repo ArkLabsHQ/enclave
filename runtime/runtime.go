@@ -36,7 +36,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	if err := StartClockSyncer(ctx); err != nil {
+	ctx, err := StartClockSyncer(ctx)
+	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
 
@@ -278,6 +279,10 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		return waitForRuntime(ctx, rt)
 
 	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			_ = child.Stop()
+			return fmt.Errorf("runtime halted: %w", cause)
+		}
 		slog.Info("shutting down")
 		return child.Stop()
 	}
@@ -288,6 +293,9 @@ func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 	case err := <-rt.ListenError():
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			return fmt.Errorf("runtime halted: %w", cause)
+		}
 		slog.Info("shutting down")
 		return nil
 	}

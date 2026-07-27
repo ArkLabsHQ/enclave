@@ -49,6 +49,9 @@ const (
 	nsPerPpmPerSec   = 1000.0 // 1 ppm == 1 us/s == 1000 ns/s
 	nsPerSecond      = 1_000_000_000
 	defaultMaxStepNs = 100 * 1_000_000 // 100 ms
+
+	clockSyncRetryInterval  = 10 * time.Second
+	clockSyncFailureTimeout = time.Minute
 )
 
 // offsetMeasurement is one PHC/REALTIME comparison.
@@ -88,13 +91,19 @@ type clockSyncer struct {
 	hasPreviousMeasurement bool
 }
 
-func StartClockSyncer(ctx context.Context) error {
+func StartClockSyncer(ctx context.Context) (context.Context, error) {
 	cs, err := newClockSyncer()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	go cs.run(ctx)
-	return nil
+
+	runCtx, cancel := context.WithCancelCause(ctx)
+	go func() {
+		if err := cs.run(runCtx); err != nil {
+			cancel(err)
+		}
+	}()
+	return runCtx, nil
 }
 
 func newClockSyncer() (*clockSyncer, error) {
@@ -149,35 +158,72 @@ func maybeInjectCustomTime() {
 	slog.Warn("clock sync: DEV test skew injected", "step_ns", step)
 }
 
-func (cs *clockSyncer) run(ctx context.Context) {
+func (cs *clockSyncer) run(ctx context.Context) error {
 	defer func() { _ = cs.file.Close() }()
-	ticker := time.NewTicker(cs.interval)
-	defer ticker.Stop()
+
+	timer := time.NewTimer(cs.interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("clock sync stopping")
-			return
-		case <-ticker.C:
-		}
-		if err := cs.step(); err != nil {
-			slog.Error("clock sync: step failed", "error", err)
+			return nil
+
+		case <-timer.C:
 		}
 
+		if err := cs.step(ctx); err != nil {
+			return err
+		}
+
+		timer.Reset(cs.interval)
 	}
 }
 
-// step is one poll cycle: measure the offset, run the PI loop, apply the correction.
-func (cs *clockSyncer) step() error {
-	offsetMeasurement, err := cs.measureOffset()
-	if err != nil {
-		return fmt.Errorf("measure offset: %w", err)
+// step performs a single synchronization cycle.
+func (cs *clockSyncer) step(ctx context.Context) error {
+	deadline := time.Now().Add(clockSyncFailureTimeout)
+
+	stepOnce := func() error {
+		offsetMeasurement, err := cs.measureOffset()
+		if err != nil {
+			return fmt.Errorf("measure offset: %w", err)
+		}
+		if err := cs.adjust(offsetMeasurement); err != nil {
+			return fmt.Errorf("apply adjustment: %w", err)
+		}
+		return nil
 	}
-	if err := cs.adjust(offsetMeasurement); err != nil {
-		return fmt.Errorf("apply adjustment: %w", err)
+
+	for {
+		err := stepOnce()
+		if err == nil {
+			return nil
+		}
+
+		// PHC read failures are usually transient rather than indicating a
+		// dead clock. During ENA resets the AWS driver returns EOPNOTSUPP
+		// while the PTP device is reinitializing (/dev/ptp0 remains valid),
+		// and EBUSY during the subsequent ~1 ms back-off.
+		if time.Now().After(deadline) {
+			return fmt.Errorf(
+				"clock sync failed for %s: %w",
+				clockSyncFailureTimeout,
+				err,
+			)
+		}
+
+		slog.Warn("clock sync: read failed, retrying", "error", err)
+
+		timer := time.NewTimer(clockSyncRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
-	return nil
 }
 
 var (

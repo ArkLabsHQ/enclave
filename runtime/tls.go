@@ -73,7 +73,10 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 		return nil
 	}
 
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_FQDN", func(val string) { cfg.FQDN = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_FQDN",
+		func(val string) { cfg.FQDN = val },
+	); err != nil {
 		return err
 	}
 	if err := loadSSMOverride("ENCLAVE_NITRIDING_USE_ACME", func(val string) {
@@ -86,10 +89,16 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	}); err != nil {
 		return err
 	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_EMAIL", func(val string) { cfg.ACMEEmail = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_ACME_EMAIL",
+		func(val string) { cfg.ACMEEmail = val },
+	); err != nil {
 		return err
 	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_CA", func(val string) { cfg.ACMECA = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_ACME_CA",
+		func(val string) { cfg.ACMECA = val },
+	); err != nil {
 		return err
 	}
 

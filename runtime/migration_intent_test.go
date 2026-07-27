@@ -204,8 +204,22 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		base := time.Now().Add(-time.Hour)
 		key1 := migrationIntentObjectKey(fx.source, 1)
-		late := fx.object(t, 1, migrationIntentRequested, targetA, migrationIntentTestBucket, fx.pcr0)
-		early := fx.object(t, 1, migrationIntentAborted, targetA, migrationIntentTestBucket, fx.pcr0)
+		late := fx.object(
+			t,
+			1,
+			migrationIntentRequested,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
+		early := fx.object(
+			t,
+			1,
+			migrationIntentAborted,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
 		fx.s3.putRawObjectAt(key1, late, base.Add(time.Minute))
 		fx.s3.putRawObjectAt(key1, early, base)
 		fx.s3.putRawObjectAt(
@@ -231,7 +245,14 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 	t.Run("newer replay does not replace original", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		key := migrationIntentObjectKey(fx.source, 1)
-		body := fx.object(t, 1, migrationIntentRequested, targetA, migrationIntentTestBucket, fx.pcr0)
+		body := fx.object(
+			t,
+			1,
+			migrationIntentRequested,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
 		base := time.Now().Add(-time.Hour).UTC()
 		fx.s3.putRawObjectAt(key, body, base)
 		fx.s3.putRawObjectAt(key, body, base.Add(time.Minute))
@@ -280,7 +301,14 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			return fx.object(t, 2, migrationIntentRequested, target, "other-bucket", fx.pcr0)
 		},
 		"wrong schema": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			body := fx.object(t, 2, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0)
+			body := fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
 			var entry migrationIntentObjectV1
 			require.NoError(t, json.Unmarshal(body, &entry))
 			entry.Schema = "enclave.migration_intent.v2"
@@ -289,7 +317,14 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			return body
 		},
 		"foreign PCR0": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			return fx.object(t, 2, migrationIntentRequested, target, migrationIntentTestBucket, foreignPCR0)
+			return fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				foreignPCR0,
+			)
 		},
 		"untrusted root": func(t *testing.T, fx *migrationIntentFixture) []byte {
 			payload, err := fx.log.enc.Marshal(migrationIntentV1{
@@ -314,14 +349,26 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			return body
 		},
 		"sequence mismatch": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			return fx.object(t, 3, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0)
+			return fx.object(
+				t,
+				3,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
 		},
 		"unknown action": func(t *testing.T, fx *migrationIntentFixture) []byte {
 			return fx.object(t, 2, "unknown", target, migrationIntentTestBucket, fx.pcr0)
 		},
 		"noncanonical target": func(t *testing.T, fx *migrationIntentFixture) []byte {
 			return fx.object(
-				t, 2, migrationIntentRequested, strings.ToUpper(target), migrationIntentTestBucket, fx.pcr0,
+				t,
+				2,
+				migrationIntentRequested,
+				strings.ToUpper(target),
+				migrationIntentTestBucket,
+				fx.pcr0,
 			)
 		},
 		"noncanonical CBOR": func(t *testing.T, fx *migrationIntentFixture) []byte {
@@ -354,7 +401,14 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			return body
 		},
 		"forged signature": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			body := fx.object(t, 2, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0)
+			body := fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
 			var entry migrationIntentObjectV1
 			require.NoError(t, json.Unmarshal(body, &entry))
 			doc, err := base64.StdEncoding.DecodeString(entry.Attestation)
@@ -373,7 +427,14 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			base := time.Now().Add(-time.Hour)
 			fx.s3.putRawObjectAt(
 				migrationIntentObjectKey(fx.source, 1),
-				fx.object(t, 1, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+				fx.object(
+					t,
+					1,
+					migrationIntentRequested,
+					target,
+					migrationIntentTestBucket,
+					fx.pcr0,
+				),
 				base,
 			)
 			fx.s3.putRawObjectAt(
@@ -400,7 +461,14 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 			fx := newMigrationIntentFixture(t)
 			fx.s3.putRawObjectAt(
 				migrationIntentObjectKey(fx.source, 1),
-				fx.object(t, 1, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+				fx.object(
+					t,
+					1,
+					migrationIntentRequested,
+					target,
+					migrationIntentTestBucket,
+					fx.pcr0,
+				),
 				time.Now(),
 			)
 			configure(fx.s3)
@@ -430,7 +498,14 @@ func TestMigrationIntentSequenceOverflow(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	fx.s3.putRawObjectAt(
 		migrationIntentObjectKey(fx.source, math.MaxUint64),
-		fx.object(t, math.MaxUint64, migrationIntentAborted, target, migrationIntentTestBucket, fx.pcr0),
+		fx.object(
+			t,
+			math.MaxUint64,
+			migrationIntentAborted,
+			target,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		),
 		time.Now(),
 	)
 
@@ -480,7 +555,14 @@ func TestMigrationIntentPagination(t *testing.T) {
 	for sequence := uint64(1); sequence <= 2; sequence++ {
 		fx.s3.putRawObjectAt(
 			migrationIntentObjectKey(fx.source, sequence),
-			fx.object(t, sequence, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+			fx.object(
+				t,
+				sequence,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			),
 			time.Now().Add(time.Duration(sequence)*time.Minute),
 		)
 	}

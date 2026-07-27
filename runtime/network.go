@@ -23,7 +23,11 @@ const (
 
 func StartNetorking(ctx context.Context, cfg Config) error {
 	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0o644); err != nil {
+	if err := os.WriteFile(
+		"/etc/resolv.conf",
+		[]byte("nameserver 192.168.127.1\n"),
+		0o644,
+	); err != nil {
 		slog.Debug("write /etc/resolv.conf", "error", err)
 	}
 

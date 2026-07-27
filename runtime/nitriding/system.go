@@ -67,7 +67,7 @@ func SetFdLimit(cur, max uint64) error { return setFdLimit(cur, max) }
 // and hard (max) cap.  If either of the two given values is 0, we use our
 // default value instead.
 func setFdLimit(cur, max uint64) error {
-	var rLimit = new(syscall.Rlimit)
+	rLimit := new(syscall.Rlimit)
 
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, rLimit); err != nil {
 		return err

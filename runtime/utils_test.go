@@ -394,7 +394,8 @@ func fakeKMSEnvelopeForRecipient(plaintext, attestationDoc []byte) ([]byte, erro
 	padLen := aes.BlockSize - len(plaintext)%aes.BlockSize
 	padded := append(
 		append([]byte(nil), plaintext...),
-		bytes.Repeat([]byte{byte(padLen)}, padLen)...)
+		bytes.Repeat([]byte{byte(padLen)}, padLen)...,
+	)
 	block, err := aes.NewCipher(cek)
 	if err != nil {
 		return nil, err

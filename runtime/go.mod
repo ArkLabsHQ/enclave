@@ -14,7 +14,7 @@ require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.3
 	github.com/containers/gvisor-tap-vsock v0.8.8
 	github.com/edgebitio/nitro-enclaves-sdk-go v1.0.0
-	github.com/fxamacker/cbor/v2 v2.9.0
+	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/hf/nitrite v0.0.0-20241225144000-c2d5d3c4f303
 	github.com/hf/nsm v0.0.0-20220930140112-cd181bd646b9
 	github.com/mdlayher/vsock v1.2.1

@@ -160,7 +160,12 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	}()
 
 	go func() {
-		if err := s.ext.ServeTLS(public, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.ext.ServeTLS(
+			public,
+			"",
+			"",
+		); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("public listener: %w", err))
 		}
 	}()
@@ -234,7 +239,11 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 func (s *servers) StartMigrationControlServer(ctx context.Context, migrator Migrator) error {
 	lis, err := vsock.Listen(migrationControlPort, nil)
 	if err != nil {
-		return fmt.Errorf("listen on migration control vsock port %d: %w", migrationControlPort, err)
+		return fmt.Errorf(
+			"listen on migration control vsock port %d: %w",
+			migrationControlPort,
+			err,
+		)
 	}
 
 	slog.Info("starting migration control listener", "vsock_port", migrationControlPort)

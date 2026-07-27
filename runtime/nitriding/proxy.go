@@ -136,7 +136,10 @@ func linkUp() error {
 
 func rx(conn io.Writer, tap io.Reader, errCh chan error) {
 	elog.Println("Waiting for frames from enclave application.")
-	buf := make([]byte, frameSizeLen+frameLen) // Two bytes for the frame length plus the frame itself
+	buf := make(
+		[]byte,
+		frameSizeLen+frameLen,
+	) // Two bytes for the frame length plus the frame itself
 
 	for {
 		n, err := tap.Read([]byte(buf[frameSizeLen:]))
@@ -161,7 +164,10 @@ func rx(conn io.Writer, tap io.Reader, errCh chan error) {
 
 func tx(conn io.Reader, tap io.Writer, errCh chan error) {
 	elog.Println("Waiting for frames from host.")
-	buf := make([]byte, frameSizeLen+frameLen) // Two bytes for the frame length plus the frame itself
+	buf := make(
+		[]byte,
+		frameSizeLen+frameLen,
+	) // Two bytes for the frame length plus the frame itself
 
 	for {
 		n, err := io.ReadFull(conn, buf[:frameSizeLen])

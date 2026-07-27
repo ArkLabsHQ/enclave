@@ -41,7 +41,10 @@ func (m *migrationControlMigrator) HandleMigrationRequest(
 	_ context.Context,
 	action, targetPCR0 string,
 ) (*MigrationStatus, error) {
-	m.requestCalls = append(m.requestCalls, migrationControlCall{action: action, targetPCR0: targetPCR0})
+	m.requestCalls = append(
+		m.requestCalls,
+		migrationControlCall{action: action, targetPCR0: targetPCR0},
+	)
 	return m.requestStatus, m.requestErr
 }
 
@@ -351,7 +354,8 @@ func TestAttestationHandler(t *testing.T) {
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, hashes).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, hashes).ServeHTTP(
+			rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce="+hex.EncodeToString(rawNonce), nil),
 		)
 
@@ -394,7 +398,11 @@ func TestMigrationControlHandler(t *testing.T) {
 		))
 
 		require.Equal(t, http.StatusOK, rr.Code)
-		require.JSONEq(t, `{"state":"cooling_down","target_pcr0":"`+targetPCR0+`","remaining_seconds":0}`, rr.Body.String())
+		require.JSONEq(
+			t,
+			`{"state":"cooling_down","target_pcr0":"`+targetPCR0+`","remaining_seconds":0}`,
+			rr.Body.String(),
+		)
 		require.Equal(t, []migrationControlCall{{
 			action: migrationIntentRequested, targetPCR0: targetPCR0,
 		}}, migrator.requestCalls)

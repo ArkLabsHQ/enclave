@@ -158,7 +158,10 @@ func loadUnverifiedState(
 		ctx, migrationPreviousPCR0AttestationParam(),
 	)
 	if err != nil {
-		return unverifiedState{}, fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
+		return unverifiedState{}, fmt.Errorf(
+			"failed to get predecessor attestation SSM param: %w",
+			err,
+		)
 	}
 	hasPredecessorPCR0 := predecessorPCR0 != ""
 	hasPredecessorAttestation := predecessorAttestation != ""
@@ -197,7 +200,10 @@ func loadUnverifiedState(
 		stateOriginReceiptParam(keyID, hex.EncodeToString(currentPCR0)),
 	)
 	if err != nil {
-		return unverifiedState{}, fmt.Errorf("failed to get state-origin receipt SSM param: %w", err)
+		return unverifiedState{}, fmt.Errorf(
+			"failed to get state-origin receipt SSM param: %w",
+			err,
+		)
 	}
 	if receipt != "" {
 		state.startState = startStateResume
@@ -205,7 +211,10 @@ func loadUnverifiedState(
 	} else {
 		receipt, err = ssm.MayGet(ctx, migrationStateOriginReceiptParam(keyID))
 		if err != nil {
-			return unverifiedState{}, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
+			return unverifiedState{}, fmt.Errorf(
+				"failed to get migration receipt SSM param: %w",
+				err,
+			)
 		}
 		if receipt == "" || !hasPredecessor {
 			return unverifiedState{}, fmt.Errorf(
@@ -223,7 +232,10 @@ func loadUnverifiedState(
 		param := secretCiphertextParam(secret.Name, keyID)
 		ciphertext, err := ssm.MustGet(ctx, param)
 		if err != nil {
-			return unverifiedState{}, fmt.Errorf("required static secret SSM param missing: %w", err)
+			return unverifiedState{}, fmt.Errorf(
+				"required static secret SSM param missing: %w",
+				err,
+			)
 		}
 		secrets = append(secrets, persistedSecret{
 			metadata:   secret,
@@ -256,7 +268,10 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 		return fmt.Errorf("previous PCR0 attestation is required")
 	}
 
-	isRollbackToSelf := strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0))
+	isRollbackToSelf := strings.EqualFold(
+		state.predecessorPCR0,
+		hex.EncodeToString(state.currentPCR0),
+	)
 
 	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) && !isRollbackToSelf {
 		return fmt.Errorf(

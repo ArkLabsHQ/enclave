@@ -15,9 +15,21 @@
       self,
     }:
     let
-      forAllSystems =
-        f:
-        nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
+      enclaveSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+
+      allSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+        "x86_64-darwin"
+      ];
+
+      forSystems =
+        systems: f:
+        nixpkgs.lib.genAttrs systems (
           system:
           f {
             inherit system;
@@ -26,21 +38,31 @@
         );
     in
     {
-      packages = forAllSystems (
+      packages =
+        forSystems enclaveSystems (
+          { pkgs, system, ... }:
+          {
+            runtime = import ./nix/runtime.nix { inherit pkgs; };
+            aws-nitro-enclaves-cli = import ./nix/aws-nitro-enclaves-cli.nix { inherit pkgs; };
+          }
+        )
+        // forSystems allSystems (
+          { pkgs, system, ... }:
+          {
+            cli = import ./nix/cli.nix { inherit pkgs; };
+            default = self.packages.${system}.cli;
+          }
+        );
+
+      devShells = forSystems allSystems (
         { pkgs, system, ... }:
         {
-          runtime = import ./nix/runtime.nix { inherit pkgs; };
-          aws-nitro-enclaves-cli = import ./nix/aws-nitro-enclaves-cli.nix { inherit pkgs; };
-          default = self.packages.${system}.runtime;
+          default = import ./nix/shell.nix { inherit pkgs; };
         }
       );
 
-      checks = forAllSystems (
-        { pkgs, system, ... }:
-        {
-          unit-tests = self.packages.${system}.runtime;
-        }
-        // import ./nix/tests { inherit pkgs system self; }
+      checks = forSystems enclaveSystems (
+        { pkgs, system, ... }: import ./nix/tests { inherit pkgs system self; }
       );
 
       lib = {

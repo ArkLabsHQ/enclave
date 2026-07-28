@@ -30,6 +30,7 @@ const (
 	startStateMigration
 )
 
+// unverifiedState holds state loaded from SSM, untrusted until the receipt verifies.
 type unverifiedState struct {
 	startState             startState
 	currentPCR0            []byte
@@ -41,6 +42,7 @@ type unverifiedState struct {
 	predecessorAttestation string
 }
 
+// verifiedState holds live key material and exists only after the receipt verifies.
 type verifiedState struct {
 	kms                       PrimaryKMS
 	dek                       DEK

@@ -178,6 +178,12 @@ func migrationStatusAt(
 		return status
 	}
 
+	if cooldown == 0 {
+		status.State = migrationStateEligible
+		status.EligibleAt = &head.PublishedAt
+		return status
+	}
+
 	eligibleAt := head.PublishedAt.Add(cooldown)
 	status.EligibleAt = &eligibleAt
 	remaining := eligibleAt.Sub(now)

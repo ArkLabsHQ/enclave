@@ -114,7 +114,7 @@ func SetupHttpServers(
 	ext := &http.Server{
 		Handler: metricsMW(attestationMW(em)),
 		TLSConfig: &tls.Config{
-			GetCertificate: certCallback(rt, cfg),
+			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
 			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
 		},
@@ -410,18 +410,14 @@ func withTokenAuth(token string, handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// certCallback fills missing SNI with cfg.FQDN so ACME works for IP/loopback probes.
-func certCallback(rt RuntimeState, cfg Config) TLSCertCallback {
+// certCallback blocks each handshake until the runtime's TLS cert source is
+// configured. SNI defaulting lives in withDefaultSNI, applied where the
+// post-SSM-override FQDN is final.
+func certCallback(rt RuntimeState) TLSCertCallback {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		getCert, err := rt.GetTLSCertCallback(hello.Context())
 		if err != nil {
 			return nil, nil
-		}
-
-		if hello.ServerName == "" && cfg.FQDN != "" {
-			h := *hello
-			h.ServerName = cfg.FQDN
-			return getCert(&h)
 		}
 		return getCert(hello)
 	}

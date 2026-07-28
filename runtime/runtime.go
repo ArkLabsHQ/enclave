@@ -148,7 +148,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
 	}
-	rt.SetTLSCertCallback(tlsCertCb)
+	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
 	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)

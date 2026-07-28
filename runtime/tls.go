@@ -35,6 +35,22 @@ const (
 
 type TLSCertCallback func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
+// withDefaultSNI fills a missing server name so IP/loopback probes reach the
+// same cert source as named clients. autocert rejects an empty ServerName.
+func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
+	if fqdn == "" {
+		return next
+	}
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if hello.ServerName != "" {
+			return next(hello)
+		}
+		h := *hello
+		h.ServerName = fqdn
+		return next(&h)
+	}
+}
+
 func ConfigureTLS(
 	ctx context.Context,
 	cfg *Config,

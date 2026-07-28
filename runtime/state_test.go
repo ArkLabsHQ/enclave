@@ -268,12 +268,12 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 func TestValidateStaticSecretArtifacts(t *testing.T) {
 	setStateOriginTestEnv(t)
 
-	require.NoError(t, validateStaticSecretArtifacts(stateOriginTestSecrets))
-	require.Error(t, validateStaticSecretArtifacts([]StaticSecretMetadata{
+	require.NoError(t, validateStaticSecretNames(stateOriginTestSecrets))
+	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
 		{Name: "duplicate", EnvVar: "ONE"},
 		{Name: "duplicate", EnvVar: "TWO"},
 	}))
-	require.Error(t, validateStaticSecretArtifacts([]StaticSecretMetadata{
+	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
 		{Name: "StorageDEK", EnvVar: "COLLISION"},
 	}))
 }

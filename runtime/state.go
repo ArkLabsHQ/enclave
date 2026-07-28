@@ -136,7 +136,7 @@ func loadUnverifiedState(
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("failed to load static secret metadata: %w", err)
 	}
-	if err := validateStaticSecretArtifacts(metadata); err != nil {
+	if err := validateStaticSecretNames(metadata); err != nil {
 		return unverifiedState{}, fmt.Errorf("invalid static secret metadata: %w", err)
 	}
 	migrationIntentBucketName, err := ssm.MustGet(ctx, migrationIntentBucketParam())
@@ -461,7 +461,7 @@ func materializePersistedState(
 	}, nil
 }
 
-func validateStaticSecretArtifacts(metadata []StaticSecretMetadata) error {
+func validateStaticSecretNames(metadata []StaticSecretMetadata) error {
 	seen := make(map[string]bool, len(metadata))
 	for _, secret := range metadata {
 		if secret.Name == "StorageDEK" {

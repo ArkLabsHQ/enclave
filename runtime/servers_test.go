@@ -533,6 +533,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "2m")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 
 	ctx := context.Background()

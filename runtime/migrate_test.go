@@ -126,6 +126,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 func TestMigratorPreviousPCR0Info(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
 
 	ctx := context.Background()
 
@@ -307,6 +308,7 @@ func TestCompleteMigration(t *testing.T) {
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", oldPCR0Hex)
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "0s")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing_key"}]`)
 
 	ctx := context.Background()

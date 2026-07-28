@@ -84,7 +84,10 @@ func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIn
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("migration intent bucket is required")
 	}
-	retention := migrationIntentRetention()
+	retention, err := migrationIntentRetention()
+	if err != nil {
+		return nil, err
+	}
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build migration intent CBOR encoder: %w", err)

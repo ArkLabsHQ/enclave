@@ -123,13 +123,22 @@ func getMigrationCooldown() (time.Duration, error) {
 	return d, nil
 }
 
-func migrationIntentRetention() time.Duration {
-	if value := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION")); value != "" {
-		if retention, err := time.ParseDuration(value); err == nil && retention > 0 {
-			return retention
-		}
+func migrationIntentRetention() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION"))
+
+	if value == "" {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_INTENT_RETENTION must not be empty")
 	}
-	return 10 * 365 * 24 * time.Hour
+
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid ENCLAVE_MIGRATION_INTENT_RETENTION %q: %w", value, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_INTENT_RETENTION must be positive")
+	}
+
+	return d, nil
 }
 
 // respPort is the TLS port for the RESP K/V listener.

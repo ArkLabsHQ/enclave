@@ -180,18 +180,20 @@ func TestMigrationIntentAppend(t *testing.T) {
 }
 
 func TestMigrationIntentRetentionConfig(t *testing.T) {
-	defaultRetention := 10 * 365 * 24 * time.Hour
-	for name, value := range map[string]string{
-		"missing":  "",
-		"invalid":  "later",
-		"zero":     "0s",
-		"negative": "-1h",
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{name: "missing", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must not be empty"},
+		{name: "invalid", value: "later", wantErr: `invalid ENCLAVE_MIGRATION_INTENT_RETENTION "later"`},
+		{name: "zero", value: "0s", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
+		{name: "negative", value: "-1h", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", value)
-			log, err := newMigrationIntentLog(newFakeS3(), nil, migrationIntentTestBucket)
-			require.NoError(t, err)
-			require.Equal(t, defaultRetention, log.retention)
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", tc.value)
+			_, err := newMigrationIntentLog(newFakeS3(), nil, migrationIntentTestBucket)
+			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
 }

@@ -112,7 +112,7 @@ func (l *migrationIntentLog) Request(
 	ctx context.Context,
 	targetPCR0 string,
 ) (*migrationIntentHead, error) {
-	targetPCR0, err := normalizePCR0(targetPCR0)
+	targetPCR0, _, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
 	}
@@ -364,19 +364,19 @@ func parseMigrationIntentObjectKey(key string) (string, uint64, bool) {
 	return sourcePCR0, sequence, true
 }
 
-func normalizePCR0(value string) (string, error) {
+func normalizePCR0(value string) (string, []byte, error) {
 	if len(value) != 96 {
-		return "", fmt.Errorf("must be 96 hex characters")
+		return "", nil, fmt.Errorf("must be 96 hex characters")
 	}
 	decoded, err := hex.DecodeString(value)
 	if err != nil {
-		return "", fmt.Errorf("must be valid hex")
+		return "", nil, fmt.Errorf("must be valid hex")
 	}
-	return hex.EncodeToString(decoded), nil
+	return hex.EncodeToString(decoded), decoded, nil
 }
 
 func isCanonicalPCR0(value string) bool {
-	normalized, err := normalizePCR0(value)
+	normalized, _, err := normalizePCR0(value)
 	return err == nil && normalized == value
 }
 

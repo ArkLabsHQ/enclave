@@ -208,7 +208,7 @@ func (m *migrator) CompleteMigration(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	targetPCR0Bytes, err := hex.DecodeString(targetPCR0)
+	targetPCR0, targetPCR0Bytes, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode target PCR0")
 	}
@@ -357,7 +357,7 @@ func (m *migrator) CompleteMigration(
 }
 
 func (r CompleteMigrationRequest) Validate() error {
-	if _, err := normalizePCR0(r.NewPCR0); err != nil {
+	if _, _, err := normalizePCR0(r.NewPCR0); err != nil {
 		return fmt.Errorf("invalid new_pcr0: %w", err)
 	}
 	return nil
@@ -366,7 +366,7 @@ func (r CompleteMigrationRequest) Validate() error {
 func (r MigrationRequest) Validate() error {
 	switch r.Action {
 	case migrationIntentRequested:
-		if _, err := normalizePCR0(r.TargetPCR0); err != nil {
+		if _, _, err := normalizePCR0(r.TargetPCR0); err != nil {
 			return fmt.Errorf("target_pcr0 %w", err)
 		}
 	case migrationIntentAborted:

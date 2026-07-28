@@ -243,7 +243,7 @@ func (l *migrationIntentLog) scan(
 			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || version.LastModified == nil {
 				continue
 			}
-			head, valid, err := l.readVersion(
+			head, valid, err := l.fetchIntentHead(
 				ctx, key, versionID, keySourcePCR0, sequence, version.LastModified.UTC(),
 			)
 			if err != nil {
@@ -263,7 +263,7 @@ func (l *migrationIntentLog) scan(
 	}
 }
 
-func (l *migrationIntentLog) readVersion(
+func (l *migrationIntentLog) fetchIntentHead(
 	ctx context.Context,
 	key, versionID, sourcePCR0 string,
 	sequence uint64,

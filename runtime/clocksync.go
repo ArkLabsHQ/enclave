@@ -128,34 +128,12 @@ func newClockSyncer() (*clockSyncer, error) {
 		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
 	}
 
-	if IsDev() {
-		maybeInjectCustomTime()
-	}
-
 	return &clockSyncer{
 		file:     file,
 		fd:       int(file.Fd()),
 		interval: clockPollInterval(),
 		cfg:      defaultServoConfig(),
 	}, nil
-}
-
-// maybeInjectCustomTime offsets CLOCK_REALTIME
-func maybeInjectCustomTime() {
-	step := clockStepNs()
-	if step == 0 {
-		return
-	}
-	var now unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &now); err != nil {
-		return
-	}
-	skewed := unix.NsecToTimespec(unix.TimespecToNsec(now) + step)
-	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &skewed); err != nil {
-		slog.Warn("clock sync: DEV test skew failed", "error", err)
-		return
-	}
-	slog.Warn("clock sync: DEV test skew injected", "step_ns", step)
 }
 
 func (cs *clockSyncer) run(ctx context.Context) error {

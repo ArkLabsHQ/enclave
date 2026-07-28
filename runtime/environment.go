@@ -141,23 +141,6 @@ func clockPollInterval() time.Duration {
 	return 5 * time.Minute
 }
 
-// clockStepNs is a DEV-ONLY synthetic offset (ns) applied to CLOCK_REALTIME at boot so an
-// integration test can prove the servo detects and corrects a real error. 0 outside dev.
-func clockStepNs() int64 {
-	if !IsDev() {
-		return 0
-	}
-	v := strings.TrimSpace(os.Getenv("ENCLAVE_CLOCK_TEST_STEP_NS"))
-	if v == "" {
-		return 0
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
 // respPort is the TLS port for the RESP K/V listener.
 func respPort() uint16 {
 	if s := strings.TrimSpace(os.Getenv("ENCLAVE_KV_RESP_PORT")); s != "" {

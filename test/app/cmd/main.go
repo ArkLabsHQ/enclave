@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	otelTrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -126,6 +128,8 @@ func main() {
 	mux.HandleFunc("GET /test/logs", handleTestLogs)
 	mux.HandleFunc("GET /test/env-override", handleTestEnvOverride)
 	mux.HandleFunc("POST /test/crash", handleTestCrash)
+	mux.HandleFunc("GET /test/clock", handleTestClock)
+	mux.HandleFunc("POST /test/clock-skew", handleTestClockSkew)
 
 	// Wrap mux with otelhttp — every incoming request creates a span automatically.
 	otelHandler := otelhttp.NewHandler(mux, "test-app",
@@ -179,6 +183,43 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		"status":     "ok",
 		"app":        "test-enclave-app",
 		"request_id": uuid.NewString(),
+	})
+}
+
+// handleTestClock returns the guest's CLOCK_REALTIME as unix nanoseconds so the
+// clock-drift test can bracket guest time against host time.
+func handleTestClock(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"guest_unix_ns": time.Now().UnixNano()})
+}
+
+// handleTestClockSkew advances the guest CLOCK_REALTIME by ?ms= (default 500) and returns
+// the post-skew guest time. The PTP servo corrects it on its next poll — hard-stepping a
+// gross offset (>100ms) or frequency-disciplining a sub-threshold one — so the test can
+// exercise both paths. Relies on CAP_SYS_TIME, which the enclave app process has.
+func handleTestClockSkew(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	skewMs := int64(500)
+	if v := r.URL.Query().Get("ms"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			skewMs = n
+		}
+	}
+
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &ts); err != nil {
+		http.Error(w, fmt.Sprintf("get clock: %v", err), http.StatusInternalServerError)
+		return
+	}
+	skewed := unix.NsecToTimespec(unix.TimespecToNsec(ts) + skewMs*int64(time.Millisecond))
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &skewed); err != nil {
+		http.Error(w, fmt.Sprintf("set clock: %v", err), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"skew_ms":       skewMs,
+		"guest_unix_ns": time.Now().UnixNano(),
 	})
 }
 
@@ -729,14 +770,14 @@ func handleTestAttestationBinding(w http.ResponseWriter, r *http.Request) {
 	results["user_data_length"] = len(doc.UserData)
 
 	const (
-		hashPrefix = "sha256:"
-		hashSep    = ";"
-		tlsStart   = len(hashPrefix)
-		tlsEnd     = tlsStart + 32
-		sepStart   = tlsEnd
-		sigKeyPrefix  = sepStart + len(hashSep)
-		sigKeyStart   = sigKeyPrefix + len(hashPrefix)
-		sigKeyEnd     = sigKeyStart + 32
+		hashPrefix   = "sha256:"
+		hashSep      = ";"
+		tlsStart     = len(hashPrefix)
+		tlsEnd       = tlsStart + 32
+		sepStart     = tlsEnd
+		sigKeyPrefix = sepStart + len(hashSep)
+		sigKeyStart  = sigKeyPrefix + len(hashPrefix)
+		sigKeyEnd    = sigKeyStart + 32
 	)
 
 	if len(doc.UserData) < sigKeyEnd {

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end clock-drift test: boots the test enclave with a synthetic clock skew injected
-# via the kernel command line (enclavecfg.clock_test_step_ns), and verifies the PI servo
-# detects and corrects it against the hypervisor PHC — one recovery hard-step, then a steady
-# series of frequency adjustments with no further stepping.
+# End-to-end clock-drift test: boots the test enclave, then injects a synthetic clock skew at
+# runtime via the test app's POST /test/clock-skew endpoint, and verifies the PI servo detects
+# and corrects it against the hypervisor PHC — hard-stepping a gross offset and
+# frequency-disciplining a sub-threshold one.
 #
 # Requires /dev/ptp0 in the guest (ptp_kvm on a KVM runner); the enclave's clock sync is fatal
 # at boot, so a missing PHC shows up as a boot timeout. The EIF must be a dev build
-# (ENCLAVE_DEV=true baked) — enclavecfg.* overrides and the servo's dev cadence are gated on it.
+# (ENCLAVE_DEV=true baked) — the servo's dev poll cadence (5s) is gated on it.
 #
 # Runs inside the clockdrift-runner container (test/docker-compose.yml). `make test-clockdrift`
 # is the entry point. The supervisor is run only for in-process gvproxy + the IMDS forwarder;
@@ -28,12 +28,6 @@ VSOCK_SOCKET="/tmp/vhost${GUEST_CID}.socket"
 ENCLAVE_PIDS="/tmp/clockdrift-enclave-pids"
 SUP_LOG="${SCRIPT_DIR}/clockdrift-supervisor.log"
 BOOT_LOG="${SCRIPT_DIR}/clockdrift-boot.log"
-
-# The synthetic skew (ns) + poll cadence injected via the dev cmdline channel (enclavecfg.*).
-# 500ms > maxStepNs (100ms), so the servo must hard-step — not slew — to recover.
-CLOCK_STEP_NS="${CLOCK_STEP_NS:-500000000}"
-CLOCK_STEP_MS=$((CLOCK_STEP_NS / 1000000))
-export QEMU_APPEND="enclavecfg.clock_poll_interval=2s enclavecfg.clock_test_step_ns=${CLOCK_STEP_NS}"
 
 export ENCLAVE_CONFIG="${SCRIPT_DIR}/app/enclave/enclave.yaml"
 export AWS_ACCESS_KEY_ID=test
@@ -139,8 +133,8 @@ start_supervisor() {
   echo "  supervisor up (pid $sup_pid) — gvproxy + IMDS"
 }
 
-# boot_enclave brings up the AF_VSOCK fabric and launches the EIF in QEMU with the clock skew
-# on the kernel cmdline, then returns; QEMU keeps running in the background.
+# boot_enclave brings up the AF_VSOCK fabric and launches the EIF in QEMU, then returns;
+# QEMU keeps running in the background.
 boot_enclave() {
   stop_enclave
   rm -f "$VSOCK_SOCKET"
@@ -180,7 +174,6 @@ while True:
 
   local accel cpu
   if [ -e /dev/kvm ]; then accel="--enable-kvm"; cpu="-cpu host"; else accel="-accel tcg"; cpu="-cpu max"; fi
-  echo "  QEMU_APPEND: ${QEMU_APPEND}"
   qemu-system-x86_64 \
     -M "nitro-enclave,vsock=c,id=clockdrift-enclave" \
     -kernel "$EIF_ABS" \
@@ -188,7 +181,6 @@ while True:
     -m "$MEMORY" \
     $accel \
     $cpu \
-    -append "$QEMU_APPEND" \
     -chardev "socket,id=c,path=${VSOCK_SOCKET}" \
     >>"$BOOT_LOG" 2>&1 &
   local qemu_pid=$!
@@ -260,50 +252,77 @@ echo "[1/3] tofu apply (localstack) — seeding KMS/SSM/S3..."
 tofu_destroy
 tofu_apply
 
-echo "[2/3] Booting enclave (skew=${CLOCK_STEP_MS}ms, poll=2s via enclavecfg.*)..."
+echo "[2/3] Booting enclave (dev EIF, 5s servo cadence)..."
 start_supervisor
 boot_enclave
 wait_health "(clock-drift boot)"
-# Allow >=3 servo cycles (2s cadence) after recovery.
-sleep 6
 
-echo "[3/3] Verifying clock discipline + drift recovery from the boot log..."
+echo "[3/3] Injecting gross + sub-threshold clock skews; verifying both servo paths..."
+BASE_URL="https://localhost:${HOST_TLS_PORT}"
 
-# 1. The boot hard-step aligned CLOCK_REALTIME to the PHC — proves the device + PTP ioctls
-#    + the dynamic clock-id all work against a real /dev/ptp0.
+# extract_ns pulls a "<field>":<int> value from a JSON blob on stdin.
+extract_ns() { grep -oE "\"$1\":[0-9]+" | grep -oE '[0-9]+'; }
+
+# skew_clock advances the guest CLOCK_REALTIME by $1 ms via the test app, failing the
+# test if the endpoint did not apply it (no timestamp in the response).
+skew_clock() {
+  local resp
+  resp=$(curl -sk --max-time 8 -X POST "${BASE_URL}/test/clock-skew?ms=${1}" || true)
+  if printf '%s' "$resp" | grep -q '"guest_unix_ns"'; then
+    return 0
+  fi
+  fail "POST /test/clock-skew?ms=${1} did not apply the skew (response: ${resp})"
+  return 1
+}
+
+# hard_steps counts runtime recovery hard-steps logged so far.
+hard_steps() { grep -c 'clock sync: hard-step' "$BOOT_LOG" 2>/dev/null || true; }
+
+# 1. The boot hard-step aligned CLOCK_REALTIME to the PHC — proves the device + the
+#    dynamic clock-id all work against a real /dev/ptp0.
 if grep -qiE "clock sync: initial hard-step to hypervisor PTP completed" "$BOOT_LOG"; then
   pass "clock sync hard-stepped CLOCK_REALTIME onto the PHC at boot"
 else
   fail "no PHC hard-step in boot log — clock sync did not engage (is /dev/ptp0 present?)"
 fi
 
-# 2. Frequency adjustments against the real PHC. Health (~5s) + 6s settle guarantees
-#  >=5 ticks at 2s cadence; the first is the recovery hard-step, so >=3 must remain.
-CLOCK_DISC=$(grep -c "clock sync: disciplined" "$BOOT_LOG" 2>/dev/null || true)
-if [ "${CLOCK_DISC:-0}" -ge 3 ]; then
-  pass "PI servo applied ${CLOCK_DISC} frequency adjustments against the real PHC"
-else
-  fail "expected >=3 frequency adjustments at the 2s cadence, saw ${CLOCK_DISC:-0}"
+# 2. HARD-STEP path: a gross 500ms offset (> maxStepNs 100ms) must be hard-stepped back
+#    onto the PHC. Confirm the guest reconverges to host and exactly one hard-step fires.
+if skew_clock 500; then
+  sleep 12
+  HOST_AFTER=$(date +%s%N)
+  GUEST_NOW=$(curl -sk --max-time 8 "${BASE_URL}/test/clock" | extract_ns guest_unix_ns || true)
+  DRIFT_MS=$(( (${GUEST_NOW:-0} - HOST_AFTER) / 1000000 )); DRIFT_MS=${DRIFT_MS#-}
+  if [ -n "${GUEST_NOW:-}" ] && [ "$DRIFT_MS" -le 250 ]; then
+    pass "gross skew hard-stepped back: guest within ${DRIFT_MS}ms of host"
+  else
+    fail "gross skew not recovered (guest_ns=${GUEST_NOW:-none}, |drift|=${DRIFT_MS}ms)"
+  fi
+  if [ "$(hard_steps)" -eq 1 ]; then
+    pass "gross offset triggered exactly one hard-step"
+  else
+    fail "expected 1 hard-step after the gross skew, saw $(hard_steps)"
+  fi
 fi
 
-# 3. The injected skew is a gross offset, so the servo must hard-step it back onto the PHC —
-#    proving it CORRECTS a real error, not just holds an already-synced clock.
-CLOCK_RECOV_MS=$(grep 'clock sync: hard-step' "$BOOT_LOG" 2>/dev/null \
-  | grep -oE 'offset_ms"?[:=]-?[0-9.]+' | sed 's/.*[:=]//' \
-  | awk 'function abs(x){return x<0?-x:x}{v=abs($1); if(v>m)m=v} END{printf "%.0f", m+0}' || true)
-if [ "${CLOCK_RECOV_MS:-0}" -ge $((CLOCK_STEP_MS * 4 / 5)) ]; then
-  pass "servo hard-stepped the injected ~${CLOCK_STEP_MS}ms skew back onto the PHC (|offset|=${CLOCK_RECOV_MS}ms)"
-else
-  fail "injected ${CLOCK_STEP_MS}ms skew not corrected (max hard-step |offset|=${CLOCK_RECOV_MS}ms)"
-fi
-
-## 4. Exactly one runtime hard-step (recovery). No further steps imply the servo kept
-#    the offset below maxStepNs (100ms) for the remainder of the run.
-CLOCK_STEPS=$(grep -c 'clock sync: hard-step' "$BOOT_LOG" 2>/dev/null || true)
-if [ "${CLOCK_STEPS:-0}" -eq 1 ]; then
-  pass "single recovery hard-step; frequency discipline held the clock afterwards"
-else
-  fail "expected exactly 1 runtime hard-step (the recovery), saw ${CLOCK_STEPS:-0}"
+# 3. FREQUENCY path: a sub-threshold 50ms offset (< maxStepNs) must NOT hard-step; the PI loop frequency-disciplines it.
+LINES_BEFORE=$(wc -l <"$BOOT_LOG")
+if skew_clock 50; then
+  sleep 12
+  if [ "$(hard_steps)" -eq 1 ]; then
+    pass "sub-threshold offset did not hard-step (handled by the frequency path)"
+  else
+    fail "sub-threshold skew must not hard-step; count is now $(hard_steps)"
+  fi
+  # Largest |offset_us| among disciplined ticks logged AFTER the skew (JSON or logfmt).
+  MAX_US=$(tail -n +"$((LINES_BEFORE + 1))" "$BOOT_LOG" | grep 'clock sync: disciplined' \
+    | grep -oE 'offset_us"?[:=]-?[0-9.]+' | sed 's/.*[:=]//' \
+    | awk 'function abs(x){return x<0?-x:x}{v=abs($1); if(v>m)m=v} END{printf "%.0f", m+0}' || true)
+  if [ "${MAX_US:-0}" -ge 30000 ]; then
+    pass "servo frequency-disciplined the injected offset (|offset_us|=${MAX_US} in a disciplined tick)"
+  else
+    fail "no post-skew disciplined tick reflects the ~50ms offset (max |offset_us|=${MAX_US:-0})"
+  fi
 fi
 
 echo ""

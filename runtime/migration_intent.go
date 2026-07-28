@@ -63,9 +63,8 @@ type migrationIntentHead struct {
 }
 
 type migrationIntentScan struct {
-	maxSequence uint64
-	head        *migrationIntentHead
-	ambiguous   bool
+	head      *migrationIntentHead
+	ambiguous bool
 }
 
 type migrationIntentLog struct {
@@ -125,7 +124,7 @@ func (l *migrationIntentLog) Request(
 	if err != nil {
 		return nil, err
 	}
-	return l.append(ctx, sourcePCR0, scan.maxSequence, migrationIntentRequested, targetPCR0)
+	return l.append(ctx, sourcePCR0, scan.headSequence(), migrationIntentRequested, targetPCR0)
 }
 
 func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntentHead, error) {
@@ -147,19 +146,19 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntentHead, e
 	if head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
-	return l.append(ctx, sourcePCR0, scan.maxSequence, migrationIntentAborted, head.TargetPCR0)
+	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
 }
 
 func (l *migrationIntentLog) append(
 	ctx context.Context,
 	sourcePCR0 string,
-	maxSequence uint64,
+	baseSequence uint64,
 	action, targetPCR0 string,
 ) (*migrationIntentHead, error) {
-	if maxSequence == math.MaxUint64 {
+	if baseSequence == math.MaxUint64 {
 		return nil, fmt.Errorf("migration intent sequence overflow")
 	}
-	sequence := maxSequence + 1
+	sequence := baseSequence + 1
 	payload, err := l.enc.Marshal(migrationIntentV1{
 		Schema:     migrationIntentSchemaV1,
 		BucketName: l.bucket,
@@ -203,7 +202,7 @@ func (l *migrationIntentLog) append(
 	if err != nil {
 		return nil, err
 	}
-	if scan.maxSequence < sequence {
+	if scan.headSequence() < sequence {
 		return nil, fmt.Errorf("%w: migration intent sequence %d missing after write", errMigrationIntentStoreUnavailable, sequence)
 	}
 	return scan.resolvedHead()
@@ -315,18 +314,24 @@ func (l *migrationIntentLog) fetchIntentHead(
 	}, true, nil
 }
 
-func (s *migrationIntentScan) add(head *migrationIntentHead) {
+func (s *migrationIntentScan) headSequence() uint64 {
+	if s.head == nil {
+		return 0
+	}
+	return s.head.Sequence
+}
+
+func (s *migrationIntentScan) add(candidate *migrationIntentHead) {
 	switch {
-	case s.head == nil || head.Sequence > s.maxSequence:
-		s.maxSequence = head.Sequence
-		s.head = head
+	case s.head == nil || candidate.Sequence > s.headSequence():
+		s.head = candidate
 		s.ambiguous = false
-	case head.Sequence < s.maxSequence:
+	case candidate.Sequence < s.headSequence():
 		return
-	case head.PublishedAt.Before(s.head.PublishedAt):
-		s.head = head
+	case candidate.PublishedAt.Before(s.head.PublishedAt):
+		s.head = candidate
 		s.ambiguous = false
-	case head.PublishedAt.Equal(s.head.PublishedAt):
+	case candidate.PublishedAt.Equal(s.head.PublishedAt):
 		s.ambiguous = true
 	}
 }

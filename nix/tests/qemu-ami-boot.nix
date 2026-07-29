@@ -1,8 +1,5 @@
-# Spike/smoke check: the QEMU-AMI variant (mk-enclave-qemu-ami.nix) actually
-# launches the EIF under nested KVM and the runtime gets through its
-# hardware-dependent boot stages (NSM device, /dev/ptp0 clock sync, vsock
-# fabric). No AWS mocks here — Init is *expected* to fail later at SSM; the
-# full flow lives in the e2e test.
+# Boot the hardware-dependent EIF stages (NSM, PTP, and vsock) under QEMU.
+# AWS is intentionally absent; failure later at SSM is expected.
 {
   pkgs,
   self,

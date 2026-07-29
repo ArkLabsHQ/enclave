@@ -1,5 +1,3 @@
-# Flake checks. Imported from flake.nix as:
-#   import ./nix/tests { inherit pkgs system self; }
 {
   pkgs,
   system,
@@ -22,9 +20,7 @@ let
     ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
     ENCLAVE_NITRIDING_UPSTREAM = "h1";
     ENCLAVE_LOG_CLOUDWATCH = "false";
-    # Test-only: shorten the clock-sync poll cadence from 5m to 2s so the
-    # clock-skew recovery assertion completes in seconds, not minutes. The
-    # servo logic (measure, hard-step >100ms) is unchanged; only the cadence.
+    # Test-only cadence exercises the unchanged servo without waiting five minutes.
     ENCLAVE_CLOCK_POLL_INTERVAL = "2s";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
@@ -89,8 +85,7 @@ in
     touch $out
   '';
 
-  # mkEnclaveTofu's generated config is well-formed: providers resolve from
-  # the nix store (offline) and the module passes `tofu validate`.
+  # Validate generated configuration with the offline store-pinned provider.
   tofu-validate =
     pkgs.runCommand "check-tofu-validate"
       {
@@ -103,8 +98,7 @@ in
         export HOME=$TMPDIR
         cd $TMPDIR
 
-        # sanity: the generated main.tf.json contains the blue/green machinery
-        # (resource blocks are emitted as arrays of single-key objects)
+        # Generated resource blocks are arrays of single-key objects.
         jq -e '
           ([.resource.aws_instance[] | has("nitro")] | any)
           and ([.resource.aws_eip_association[] | has("instance")] | any)
@@ -135,6 +129,7 @@ in
       greenEif
       bluePCR0
       greenPCR0
+      awsNodeIP
       ;
   };
 }

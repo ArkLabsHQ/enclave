@@ -1,12 +1,3 @@
-# Full-stack blue/green test:
-#
-#   * builds two distinct EIFs and two QEMU AMIs through mkEnclaveQemuAmi;
-#   * registers those AMIs with ministack and feeds the allocated IDs to tofu;
-#   * applies blue -> blue+green -> active green -> green-only;
-#   * boots the real runtime inside each QEMU AMI through the production host
-#     services shared with mkEnclaveAmi;
-#   * performs the predecessor/successor migration handshake over vsock:8003;
-#   * proves the static secret survives the KMS handoff.
 {
   pkgs,
   self,
@@ -15,10 +6,15 @@
   greenEif,
   bluePCR0,
   greenPCR0,
+  awsNodeIP,
 }:
 let
   ministack = import ./ministack.nix { inherit pkgs; };
   awsmocks = import ./awsmocks.nix { inherit pkgs; };
+  pebbleFixtures = import ./pebble.nix {
+    inherit pkgs;
+    apiIP = awsNodeIP;
+  };
 
   mkQemuAmiNode =
     eif:
@@ -38,6 +34,8 @@ let
       environment.systemPackages = with pkgs; [
         curl
         jq
+        openssl
+        self.packages.${pkgs.system}.cli
       ];
 
       networking.firewall.allowedTCPPorts = [ 443 ];
@@ -71,7 +69,7 @@ pkgs.testers.runNixOSTest {
 
   nodes = {
     aws =
-      { pkgs, ... }:
+      { pkgs, nodes, ... }:
       {
         virtualisation.memorySize = 2048;
         virtualisation.cores = 2;
@@ -80,6 +78,7 @@ pkgs.testers.runNixOSTest {
           pkgs.awscli2
           pkgs.curl
           pkgs.jq
+          pkgs.openssl
           enclaveTofu
         ];
         environment.variables = {
@@ -90,10 +89,16 @@ pkgs.testers.runNixOSTest {
           AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
         };
 
+        # Pebble's TLS-ALPN-01 VA and chain verification dial green by name.
+        networking.hosts."${nodes.green.networking.primaryIPAddress}" = [ "enclave.test" ];
+
+        environment.etc."pebble/ca.crt".source = "${pebbleFixtures}/ca.crt";
+
         networking.firewall.allowedTCPPorts = [
           1338
           4000
           4566
+          14000
         ];
 
         systemd.services.ministack = {
@@ -130,6 +135,22 @@ pkgs.testers.runNixOSTest {
             Restart = "on-failure";
           };
         };
+
+        # Disable Pebble sleeps and nonce rejection to stay within test timeouts.
+        # Its management API provides the per-launch root and certificate status.
+        systemd.services.pebble = {
+          description = "Pebble ACME test server";
+          wantedBy = [ "multi-user.target" ];
+          environment = {
+            PEBBLE_VA_NOSLEEP = "1";
+            PEBBLE_WFE_NONCEREJECT = "0";
+          };
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${pkgs.pebble}/bin/pebble -config ${pebbleFixtures}/pebble-config.json -strict false";
+            Restart = "on-failure";
+          };
+        };
       };
 
     blue = mkQemuAmiNode blueEif;
@@ -140,6 +161,7 @@ pkgs.testers.runNixOSTest {
     ''
       BLUE_PCR0 = ${builtins.toJSON bluePCR0}
       GREEN_PCR0 = ${builtins.toJSON greenPCR0}
+      AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
     ''
     + builtins.readFile ./e2e.py;
 }

@@ -1,21 +1,6 @@
-// Test application baked into the e2e and qemu-ami-boot EIFs. A tiny HTTP
-// server exposing the seams the NixOS test driver needs to observe and
-// perturb the enclave: health, environment inheritance from the runtime,
-// and CLOCK_REALTIME read/set for clock-skew recovery coverage.
-//
-// Routes (reached through the runtime's reverse proxy on :443):
-//
-//	GET  /test/health      -> {"status":"ok"}
-//	GET  /test/env/{name}  -> {"name":"...","value":"..."}  (os.Getenv)
-//	GET  /test/clock       -> {"unix":<sec>,"nsec":<ns>}
-//	POST /test/clock       -> {"offset_seconds":N}  (bounded +/-10)
-//	                          sets CLOCK_REALTIME and returns before/after
-//
-// The runtime execs /app/testapp directly (no shell), so this binary owns
-// every behavior the test exercises. Stdlib only: no go.sum, empty vendor
-// hash. Clock writes use syscall.Settimeofday; the runtime's clocksync
-// already proves ClockSettime succeeds in the EIF, and the test-app is a
-// root child with CAP_SYS_TIME.
+// Minimal stdlib-only app for observing runtime env and testing clock recovery.
+// It is exec'd as a root child with CAP_SYS_TIME, so /test/clock can call
+// syscall.Settimeofday without adding a shell or other packages to the EIF.
 package main
 
 import (

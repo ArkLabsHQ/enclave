@@ -1,13 +1,6 @@
-# awsmocks: the one piece of AWS behaviour no emulator provides — KMS
-# Decrypt/GenerateDataKey with a Nitro `Recipient` (attestation document in,
-# CMS EnvelopedData out) — plus an IMDSv2 credential stub.
-#
-# It is a rewriting reverse proxy: requests without a Recipient pass straight
-# through to the upstream KMS (ministack), and those with one are stripped,
-# forwarded, and the plaintext re-enveloped to the enclave's attested RSA key.
-#
-# Vendored from the previous framework repo (test/awsmocks); the source is
-# unmodified apart from the module path.
+# MiniStack lacks Nitro KMS Recipient handling. This proxy strips Recipient,
+# forwards to MiniStack, and CMS-wraps plaintext to the attested RSA key; it
+# also serves the IMDSv2 credential stub.
 { pkgs }:
 pkgs.buildGoModule {
   pname = "awsmocks";

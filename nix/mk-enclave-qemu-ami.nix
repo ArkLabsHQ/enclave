@@ -103,7 +103,8 @@ let
         serviceConfig = {
           Type = "simple";
           RuntimeDirectory = runtimeDir;
-          ExecStart = "${pkgs.vhost-device-vsock}/bin/vhost-device-vsock --vm guest-cid=${toString enclaveCID},socket=${vsockSocket},forward-cid=1,forward-listen=8003";
+          # Larger queues prevent bursty forwarded connections exhausting LocalTxBuf.
+          ExecStart = "${pkgs.vhost-device-vsock}/bin/vhost-device-vsock --vm guest-cid=${toString enclaveCID},socket=${vsockSocket},forward-cid=1,forward-listen=8003,tx-buffer-size=65536,queue-size=1024";
           Restart = "always";
           RestartSec = 2;
         };

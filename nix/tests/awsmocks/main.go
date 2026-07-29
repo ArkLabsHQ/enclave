@@ -1,6 +1,5 @@
-// awsmocks bundles a KMS Decrypt/GenerateDataKey-with-Recipient proxy (:4000,
-// wraps plaintext in CMS EnvelopedData for the attesting enclave's RSA key)
-// and an IMDSv2 stub (:1338) into one binary.
+// Attestation-aware KMS Recipient proxy that CMS-wraps plaintext to the
+// enclave's RSA key, plus an IMDSv2 stub.
 package main
 
 import (
@@ -265,10 +264,8 @@ func handleDecrypt(w http.ResponseWriter, r *http.Request, upstream *url.URL, pr
 	_ = json.NewEncoder(w).Encode(result)
 }
 
-// handleGenerateDataKey mirrors handleDecrypt for GenerateDataKey: local-kms has
-// no Recipient support, so the proxy strips the attestation, forwards, then
-// CMS-envelopes the returned Plaintext into CiphertextForRecipient — keeping the
-// wrapped CiphertextBlob and dropping Plaintext, as real Nitro KMS does.
+// Strip unsupported Recipient while preserving CiphertextBlob and CMS-wrapping
+// Plaintext as CiphertextForRecipient to match Nitro KMS.
 func handleGenerateDataKey(w http.ResponseWriter, r *http.Request, upstream *url.URL, proxy *httputil.ReverseProxy) {
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
@@ -337,10 +334,6 @@ func handleGenerateDataKey(w http.ResponseWriter, r *http.Request, upstream *url
 	_ = json.NewEncoder(w).Encode(result)
 }
 
-// forwardToUpstream sends the Recipient-stripped body to the upstream KMS,
-// copying the AWS signing headers. On a 200 it returns the response body; on a
-// transport error or non-200 it writes the error/passthrough to w and returns
-// ok=false.
 func forwardToUpstream(w http.ResponseWriter, r *http.Request, upstream *url.URL, strippedBody []byte) ([]byte, bool) {
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String()+"/", bytes.NewReader(strippedBody))
 	if err != nil {

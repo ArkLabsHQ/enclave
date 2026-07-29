@@ -57,15 +57,12 @@ deployment stack from your application derivation.
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
 
-      # buildEif copies ${app}/bin/${app.name}, so app.name must be the
-      # binary's filename. buildGoModule sets name to "<pname>-<version>",
-      # so override it.
       myapp = pkgs.buildGoModule {
         pname = "myapp";
         version = "1.0.0";
         src = ./.;
         vendorHash = null;
-      } // { name = "myapp"; };
+      };
 
       eif = enclave.lib.buildEif {
         inherit pkgs;
@@ -219,7 +216,7 @@ Arguments:
 ```nix
 {
   pkgs,                  # package set
-  app,                   # derivation; ${app}/bin/${app.name} is the binary
+  app,                   # package; executable selected with pkgs.lib.getExe
   env,                   # environment baked into the measurement
   extraPackages ? [ ],   # additional packages in the enclave rootfs
 }
@@ -227,9 +224,9 @@ Arguments:
 
 Produces a derivation containing `image.eif` and `pcr.json`.
 
-- `app.name` must equal the binary's filename under `bin/`. `buildEif` always
-  adds `APP_BINARY_NAME = app.name` to the environment so the runtime execs the
-  right path.
+- `buildEif` selects the executable with `pkgs.lib.getExe`. Set
+  `app.meta.mainProgram` when it differs from the package name. The executable
+  is copied under `/app`, and `APP_BINARY_NAME` is injected automatically.
 - `env` is part of the measurement. Changing any value changes PCR0.
 - The rootfs contains the system CA store and nothing else by default. The
   runtime never shells out. Applications that need `/bin/sh` or other utilities
@@ -336,7 +333,7 @@ measurement. A subset can be overridden at runtime from SSM.
 | `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
-| `APP_BINARY_NAME` | `app` | Injected automatically by `buildEif`. The runtime execs `/app/<value>`. |
+| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
 
 ### Migration
 

@@ -61,11 +61,6 @@ type migrationIntentHead struct {
 	VersionID   string
 }
 
-type migrationIntentScan struct {
-	head      *migrationIntentHead
-	ambiguous bool
-}
-
 type migrationIntentLog struct {
 	s3        S3API
 	nsm       NSM
@@ -100,11 +95,15 @@ func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntentHead, er
 	if err != nil {
 		return nil, err
 	}
-	scan, err := l.scan(ctx, sourcePCR0)
+	head, tie, err := l.scan(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	return scan.resolvedHead()
+	if tie {
+		return nil, errMigrationIntentAmbiguous
+	}
+
+	return head, nil
 }
 
 func (l *migrationIntentLog) Request(
@@ -119,11 +118,15 @@ func (l *migrationIntentLog) Request(
 	if err != nil {
 		return nil, err
 	}
-	scan, err := l.scan(ctx, sourcePCR0)
+	head, _, err := l.scan(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	return l.append(ctx, sourcePCR0, scan.headSequence(), migrationIntentRequested, targetPCR0)
+	headSequence := uint64(0)
+	if head != nil {
+		headSequence = head.Sequence
+	}
+	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
 }
 
 func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntentHead, error) {
@@ -131,11 +134,7 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntentHead, e
 	if err != nil {
 		return nil, err
 	}
-	scan, err := l.scan(ctx, sourcePCR0)
-	if err != nil {
-		return nil, err
-	}
-	head, err := scan.resolvedHead()
+	head, _, err := l.scan(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -197,14 +196,18 @@ func (l *migrationIntentLog) append(
 		return nil, fmt.Errorf("%w: put migration intent sequence %d: S3 returned no version ID", errMigrationIntentStoreUnavailable, sequence)
 	}
 
-	scan, err := l.scan(ctx, sourcePCR0)
+	head, tie, err := l.scan(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	if scan.headSequence() < sequence {
+	if tie {
+		return nil, errMigrationIntentAmbiguous
+	}
+	if head == nil || head.Sequence < sequence {
 		return nil, fmt.Errorf("%w: migration intent sequence %d missing after write", errMigrationIntentStoreUnavailable, sequence)
 	}
-	return scan.resolvedHead()
+
+	return head, nil
 }
 
 func (l *migrationIntentLog) sourcePCR0() (string, error) {
@@ -221,8 +224,9 @@ func (l *migrationIntentLog) sourcePCR0() (string, error) {
 func (l *migrationIntentLog) scan(
 	ctx context.Context,
 	sourcePCR0 string,
-) (migrationIntentScan, error) {
-	var scan migrationIntentScan
+) (*migrationIntentHead, bool, error) {
+	var head *migrationIntentHead
+	var tie bool
 	var keyMarker, versionMarker *string
 	for {
 		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
@@ -232,7 +236,7 @@ func (l *migrationIntentLog) scan(
 			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			return scan, fmt.Errorf("%w: list migration intents: %w", errMigrationIntentStoreUnavailable, err)
+			return nil, false, fmt.Errorf("%w: list migration intents: %w", errMigrationIntentStoreUnavailable, err)
 		}
 		for _, version := range out.Versions {
 			key := aws.ToString(version.Key)
@@ -241,21 +245,33 @@ func (l *migrationIntentLog) scan(
 			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || version.LastModified == nil {
 				continue
 			}
-			head, valid, err := l.fetchIntentHead(
+			nextHead, valid, err := l.fetchIntentHead(
 				ctx, key, versionID, keySourcePCR0, sequence, version.LastModified.UTC(),
 			)
 			if err != nil {
-				return scan, err
+				return nil, false, err
 			}
-			if valid {
-				scan.add(head)
+			if !valid {
+				continue
+			}
+			switch {
+			case head == nil || nextHead.Sequence > head.Sequence:
+				head = nextHead
+				tie = false
+			case nextHead.Sequence < head.Sequence:
+				continue
+			case nextHead.PublishedAt.Before(head.PublishedAt):
+				head = nextHead
+				tie = false
+			case nextHead.PublishedAt.Equal(head.PublishedAt):
+				tie = true
 			}
 		}
 		if !aws.ToBool(out.IsTruncated) {
-			return scan, nil
+			return head, tie, nil
 		}
 		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return scan, fmt.Errorf("%w: list migration intents: truncated response missing markers", errMigrationIntentStoreUnavailable)
+			return nil, false, fmt.Errorf("%w: list migration intents: truncated response missing markers", errMigrationIntentStoreUnavailable)
 		}
 		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
 	}
@@ -311,35 +327,6 @@ func (l *migrationIntentLog) fetchIntentHead(
 		PublishedAt: publishedAt,
 		VersionID:   versionID,
 	}, true, nil
-}
-
-func (s *migrationIntentScan) headSequence() uint64 {
-	if s.head == nil {
-		return 0
-	}
-	return s.head.Sequence
-}
-
-func (s *migrationIntentScan) add(candidate *migrationIntentHead) {
-	switch {
-	case s.head == nil || candidate.Sequence > s.headSequence():
-		s.head = candidate
-		s.ambiguous = false
-	case candidate.Sequence < s.headSequence():
-		return
-	case candidate.PublishedAt.Before(s.head.PublishedAt):
-		s.head = candidate
-		s.ambiguous = false
-	case candidate.PublishedAt.Equal(s.head.PublishedAt):
-		s.ambiguous = true
-	}
-}
-
-func (s migrationIntentScan) resolvedHead() (*migrationIntentHead, error) {
-	if s.ambiguous {
-		return nil, errMigrationIntentAmbiguous
-	}
-	return s.head, nil
 }
 
 func migrationIntentObjectKey(sourcePCR0 string, sequence uint64) string {

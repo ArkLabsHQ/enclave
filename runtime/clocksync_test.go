@@ -1,9 +1,13 @@
 package runtime
 
 import (
+	"context"
+	"errors"
 	"math"
 	"math/rand"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -170,6 +174,101 @@ func TestObserveHardStep(t *testing.T) {
 	require.Equal(t, int64(42_000_000_000), stepToNs)
 	require.False(t, cs.hasPreviousMeasurement, "hard-step resets the interval baseline")
 
+}
+
+// TestNewClockSyncer covers the OS-facing bootstrap: every failure path is fatal
+// (that decision is what gates whether the enclave boots), and success wires the
+// retry/timeout defaults.
+func TestNewClockSyncer(t *testing.T) {
+	origOpen, origGet, origSet := openPTPDevice, clockGettime, clockSettime
+	defer func() { openPTPDevice, clockGettime, clockSettime = origOpen, origGet, origSet }()
+
+	realFile := func(t *testing.T) *os.File {
+		f, err := os.CreateTemp(t.TempDir(), "ptp")
+		require.NoError(t, err)
+		return f
+	}
+	ok := func(int32, *unix.Timespec) error { return nil }
+	fail := func(msg string) func(int32, *unix.Timespec) error {
+		return func(int32, *unix.Timespec) error { return errors.New(msg) }
+	}
+
+	t.Run("open failure is fatal", func(t *testing.T) {
+		openPTPDevice = func() (*os.File, error) { return nil, errors.New("no device") }
+		clockGettime, clockSettime = ok, ok
+		cs, err := newClockSyncer()
+		require.ErrorContains(t, err, "open")
+		require.Nil(t, cs)
+	})
+
+	t.Run("PHC read failure is fatal", func(t *testing.T) {
+		f := realFile(t)
+		openPTPDevice = func() (*os.File, error) { return f, nil }
+		clockGettime, clockSettime = fail("EOPNOTSUPP"), ok
+		cs, err := newClockSyncer()
+		require.ErrorContains(t, err, "read PTP clock")
+		require.Nil(t, cs)
+	})
+
+	t.Run("initial hard-step failure is fatal", func(t *testing.T) {
+		f := realFile(t)
+		openPTPDevice = func() (*os.File, error) { return f, nil }
+		clockGettime, clockSettime = ok, fail("EPERM")
+		cs, err := newClockSyncer()
+		require.ErrorContains(t, err, "initial hard-step")
+		require.Nil(t, cs)
+	})
+
+	t.Run("success wires retry/timeout defaults", func(t *testing.T) {
+		f := realFile(t)
+		openPTPDevice = func() (*os.File, error) { return f, nil }
+		clockGettime, clockSettime = ok, ok
+		cs, err := newClockSyncer()
+		require.NoError(t, err)
+		require.NotNil(t, cs)
+		require.Equal(t, clockSyncRetryInterval, cs.retryInterval)
+		require.Equal(t, clockSyncFailureTimeout, cs.failureTimeout)
+		_ = cs.file.Close()
+	})
+}
+
+// TestStepRetry covers the retry/deadline logic that decides whether a transient
+// PHC read failure is tolerated or halts the runtime.
+func TestStepRetry(t *testing.T) {
+	origGet, origAdj := clockGettime, clockAdjtime
+	defer func() { clockGettime, clockAdjtime = origGet, origAdj }()
+	clockAdjtime = func(int32, *unix.Timex) (int, error) { return 0, nil }
+
+	newCS := func() *clockSyncer {
+		return &clockSyncer{
+			cfg:            defaultServoConfig(),
+			retryInterval:  time.Millisecond,
+			failureTimeout: 20 * time.Millisecond,
+		}
+	}
+
+	t.Run("transient failure recovers before the deadline", func(t *testing.T) {
+		var reads int
+		clockGettime = func(int32, *unix.Timespec) error {
+			if reads++; reads <= 3 {
+				return errors.New("EBUSY")
+			}
+			return nil
+		}
+		require.NoError(t, newCS().step(context.Background()))
+	})
+
+	t.Run("failure past the deadline halts", func(t *testing.T) {
+		clockGettime = func(int32, *unix.Timespec) error { return errors.New("EOPNOTSUPP") }
+		require.ErrorContains(t, newCS().step(context.Background()), "clock sync failed")
+	})
+
+	t.Run("ctx cancel during backoff is a clean stop", func(t *testing.T) {
+		clockGettime = func(int32, *unix.Timespec) error { return errors.New("EOPNOTSUPP") }
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		require.NoError(t, newCS().step(ctx))
+	})
 }
 
 func TestObserveFreqStep(t *testing.T) {

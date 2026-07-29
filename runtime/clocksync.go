@@ -85,6 +85,9 @@ type clockSyncer struct {
 	fd       int
 	interval time.Duration
 
+	retryInterval  time.Duration
+	failureTimeout time.Duration
+
 	cfg                    servoConfig
 	integralPpm            float64 // integral term: the standing frequency correction
 	lastXMonoNs            int64
@@ -99,15 +102,13 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 
 	runCtx, cancel := context.WithCancelCause(ctx)
 	go func() {
-		if err := cs.run(runCtx); err != nil {
-			cancel(err)
-		}
+		cancel(cs.run(runCtx))
 	}()
 	return runCtx, nil
 }
 
 func newClockSyncer() (*clockSyncer, error) {
-	file, err := os.OpenFile(ptpDevicePath, os.O_RDONLY, 0)
+	file, err := openPTPDevice()
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", ptpDevicePath, err)
 	}
@@ -115,24 +116,26 @@ func newClockSyncer() (*clockSyncer, error) {
 	phc := fdToClockID(file.Fd())
 
 	var ptp, sys unix.Timespec
-	if err := unix.ClockGettime(phc, &ptp); err != nil {
+	if err := clockGettime(phc, &ptp); err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("read PTP clock %s: %w", ptpDevicePath, err)
 	}
-	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &sys); err == nil {
+	if err := clockGettime(unix.CLOCK_REALTIME, &sys); err == nil {
 		slog.Info("clock sync: initial offset before hard-step", "offset_ms", clockOffsetNsec(ptp, sys)/1_000_000)
 	}
-	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
-		slog.Warn("clock sync: initial hard-step failed; servo will converge", "error", err)
-	} else {
-		slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
+	if err := clockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("initial hard-step to PHC failed: %w", err)
 	}
+	slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
 
 	return &clockSyncer{
-		file:     file,
-		fd:       int(file.Fd()),
-		interval: clockPollInterval(),
-		cfg:      defaultServoConfig(),
+		file:           file,
+		fd:             int(file.Fd()),
+		interval:       clockPollInterval(),
+		retryInterval:  clockSyncRetryInterval,
+		failureTimeout: clockSyncFailureTimeout,
+		cfg:            defaultServoConfig(),
 	}, nil
 }
 
@@ -161,7 +164,7 @@ func (cs *clockSyncer) run(ctx context.Context) error {
 
 // step performs a single synchronization cycle.
 func (cs *clockSyncer) step(ctx context.Context) error {
-	deadline := time.Now().Add(clockSyncFailureTimeout)
+	deadline := time.Now().Add(cs.failureTimeout)
 
 	stepOnce := func() error {
 		offsetMeasurement, err := cs.measureOffset()
@@ -187,14 +190,14 @@ func (cs *clockSyncer) step(ctx context.Context) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf(
 				"clock sync failed for %s: %w",
-				clockSyncFailureTimeout,
+				cs.failureTimeout,
 				err,
 			)
 		}
 
 		slog.Warn("clock sync: read failed, retrying", "error", err)
 
-		timer := time.NewTimer(clockSyncRetryInterval)
+		timer := time.NewTimer(cs.retryInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -205,8 +208,10 @@ func (cs *clockSyncer) step(ctx context.Context) error {
 }
 
 var (
-	clockAdjtime = unix.ClockAdjtime
-	clockSettime = unix.ClockSettime
+	openPTPDevice = func() (*os.File, error) { return os.OpenFile(ptpDevicePath, os.O_RDONLY, 0) }
+	clockGettime  = unix.ClockGettime
+	clockAdjtime  = unix.ClockAdjtime
+	clockSettime  = unix.ClockSettime
 )
 
 // adjust folds one measurement into the PI loop and applies the resulting correction.
@@ -218,7 +223,7 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 		ts := unix.NsecToTimespec(m.phcNs)
 		err := clockSettime(unix.CLOCK_REALTIME, &ts)
 		if err == nil {
-			slog.Info("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)
+			slog.Warn("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)
 		}
 		return err
 	}
@@ -262,13 +267,13 @@ func (cs *clockSyncer) frequencyErrorPpm(m offsetMeasurement) (ppm float64, ok b
 func (cs *clockSyncer) measureOffset() (offsetMeasurement, error) {
 	phc := fdToClockID(uintptr(cs.fd))
 	var sys, phcTs, mono unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &sys); err != nil {
+	if err := clockGettime(unix.CLOCK_REALTIME, &sys); err != nil {
 		return offsetMeasurement{}, fmt.Errorf("read realtime: %w", err)
 	}
-	if err := unix.ClockGettime(phc, &phcTs); err != nil {
+	if err := clockGettime(phc, &phcTs); err != nil {
 		return offsetMeasurement{}, fmt.Errorf("read PHC: %w", err)
 	}
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &mono); err != nil {
+	if err := clockGettime(unix.CLOCK_MONOTONIC_RAW, &mono); err != nil {
 		return offsetMeasurement{}, fmt.Errorf("read monotonic-raw: %w", err)
 	}
 	phcNs := unix.TimespecToNsec(phcTs)

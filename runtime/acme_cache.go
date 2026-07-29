@@ -96,5 +96,5 @@ func (c *acmeStorageCache) Delete(ctx context.Context, key string) error {
 }
 
 func prefixAcmeCacheKey(key string) string {
-	return getDeployment() + "/" + getAppName() + acmeStoragePrefix + key
+	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + key
 }

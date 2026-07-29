@@ -33,6 +33,12 @@ func TestACMEStorageCache(t *testing.T) {
 		require.Equal(t, bucketName, c.bucket)
 	})
 
+	t.Run("key layout", func(t *testing.T) {
+		require.Equal(t,
+			"unittest/acme_cache/data/acme/example.com",
+			prefixAcmeCacheKey("example.com"))
+	})
+
 	t.Run("get miss", func(t *testing.T) {
 		c, _ := newCache(t)
 		_, err := c.Get(ctx, "example.com")

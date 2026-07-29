@@ -19,6 +19,7 @@ func newCurlCommand() *cobra.Command {
 		data        string
 		headers     []string
 		strictTLS   bool
+		skipCOSE    bool
 		verbose     bool
 	)
 
@@ -39,6 +40,7 @@ Use /v1/enclave-info for runtime, status, and migration information.`,
 				data:        data,
 				headers:     headers,
 				strictTLS:   strictTLS,
+				skipCOSE:    skipCOSE,
 				verbose:     verbose,
 				path:        args[0],
 			})
@@ -53,6 +55,9 @@ Use /v1/enclave-info for runtime, status, and migration information.`,
 	cmd.Flags().
 		BoolVar(&strictTLS, "strict-tls", false, "also require public CA and hostname validation")
 	cmd.Flags().
+		BoolVar(&skipCOSE, "insecure-skip-cose-verify", false,
+			"skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only)")
+	cmd.Flags().
 		BoolVarP(&verbose, "verbose", "v", false, "write request and verification details to stderr")
 	_ = cmd.MarkFlagRequired("base-url")
 	_ = cmd.MarkFlagRequired("expected-pcr0")
@@ -66,6 +71,7 @@ type curlOptions struct {
 	data        string
 	headers     []string
 	strictTLS   bool
+	skipCOSE    bool
 	verbose     bool
 	path        string
 }
@@ -100,9 +106,15 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 		fmt.Fprintf(os.Stderr, "> %s %s\n", req.Method, req.URL)
 	}
 
+	if opts.skipCOSE {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: skipping attestation COSE signature and AWS Nitro root chain verification — QEMU/local test only")
+	}
+
 	c, err := client.New(baseURL, client.Options{
-		ExpectedPCR0: opts.expectedPCR,
-		StrictTLS:    opts.strictTLS,
+		ExpectedPCR0:           opts.expectedPCR,
+		StrictTLS:              opts.strictTLS,
+		InsecureSkipCOSEVerify: opts.skipCOSE,
 	})
 	if err != nil {
 		return err

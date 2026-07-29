@@ -319,18 +319,7 @@ func migrationControlHandler(migrator Migrator) http.Handler {
 	})
 
 	mux.HandleFunc("POST "+migrationFinalisationPath, func(w http.ResponseWriter, r *http.Request) {
-		var req CompleteMigrationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		if err := req.Validate(); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		res, err := migrator.CompleteMigration(r.Context(), req.NewPCR0)
+		res, err := migrator.CompleteMigration(r.Context())
 		if err != nil {
 			http.Error(
 				w,
@@ -352,8 +341,7 @@ func migrationHTTPStatus(err error) int {
 	case errors.Is(err, errMigrationCooldownActive):
 		return http.StatusTooEarly
 	case errors.Is(err, errMigrationIntentAbsent),
-		errors.Is(err, errMigrationIntentAborted),
-		errors.Is(err, errMigrationIntentTargetMismatch):
+		errors.Is(err, errMigrationIntentAborted):
 		return http.StatusConflict
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
 		return http.StatusServiceUnavailable

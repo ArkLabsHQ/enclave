@@ -14,10 +14,6 @@ import (
 // migrationPCRIndex stores the successor-PCR0 handoff commitment.
 const migrationPCRIndex = 31
 
-type CompleteMigrationRequest struct {
-	NewPCR0 string `json:"new_pcr0"`
-}
-
 type MigrationRequest struct {
 	Action     string `json:"action"`
 	TargetPCR0 string `json:"target_pcr0,omitempty"`
@@ -56,7 +52,7 @@ type Migrator interface {
 		ctx context.Context,
 		action, targetPCR0 string,
 	) (*MigrationStatus, error)
-	CompleteMigration(ctx context.Context, targetPCR0 string) (*CompleteMigrationResult, error)
+	CompleteMigration(ctx context.Context) (*CompleteMigrationResult, error)
 	PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error)
 	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
 }
@@ -203,15 +199,9 @@ func migrationStatusAt(
 // CompleteMigration exports state under a PCR0-locked migration key, then flips KMSKeyID.
 func (m *migrator) CompleteMigration(
 	ctx context.Context,
-	targetPCR0 string,
 ) (*CompleteMigrationResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	targetPCR0, targetPCR0Bytes, err := normalizePCR0(targetPCR0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode target PCR0")
-	}
 
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
@@ -222,14 +212,6 @@ func (m *migrator) CompleteMigration(
 		return nil, errMigrationIntentAbsent
 	case migrationStateAborted:
 		return nil, errMigrationIntentAborted
-	}
-	if status.TargetPCR0 != targetPCR0 {
-		return nil, fmt.Errorf(
-			"%w: requested %s, got %s",
-			errMigrationIntentTargetMismatch,
-			status.TargetPCR0,
-			targetPCR0,
-		)
 	}
 	if status.State == migrationStateCoolingDown {
 		return nil, fmt.Errorf(
@@ -242,11 +224,16 @@ func (m *migrator) CompleteMigration(
 		return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
 	}
 
+	targetPCR0Bytes, err := hex.DecodeString(status.TargetPCR0)
+	if err != nil {
+		return nil, fmt.Errorf("migration intent has invalid target PCR0: %w", err)
+	}
+
 	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
 		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
 
-	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, targetPCR0)
+	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, status.TargetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create migration key: %w", err)
 	}
@@ -261,7 +248,7 @@ func (m *migrator) CompleteMigration(
 		"created migration KMS key",
 		"key_id", migrationKMS.KeyID(),
 		"own_pcr0", prefix16(ownPCR0),
-		"new_pcr0", prefix16(targetPCR0),
+		"new_pcr0", prefix16(status.TargetPCR0),
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
@@ -354,13 +341,6 @@ func (m *migrator) CompleteMigration(
 		PCR0:     ownPCR0,
 		Exported: exportedNames,
 	}, nil
-}
-
-func (r CompleteMigrationRequest) Validate() error {
-	if _, _, err := normalizePCR0(r.NewPCR0); err != nil {
-		return fmt.Errorf("invalid new_pcr0: %w", err)
-	}
-	return nil
 }
 
 func (r MigrationRequest) Validate() error {

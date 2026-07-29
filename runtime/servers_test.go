@@ -31,7 +31,6 @@ type migrationControlMigrator struct {
 	requestCalls  []migrationControlCall
 	complete      *CompleteMigrationResult
 	completeErr   error
-	completeCalls []string
 	previous      *PreviousPCR0Info
 	previousErr   error
 	status        *MigrationStatus
@@ -48,9 +47,7 @@ func (m *migrationControlMigrator) HandleMigrationRequest(
 
 func (m *migrationControlMigrator) CompleteMigration(
 	_ context.Context,
-	targetPCR0 string,
 ) (*CompleteMigrationResult, error) {
-	m.completeCalls = append(m.completeCalls, targetPCR0)
 	return m.complete, m.completeErr
 }
 
@@ -408,27 +405,20 @@ func TestMigrationControlHandler(t *testing.T) {
 			PCR0: strings.Repeat("cd", 48), Exported: []string{"secret"},
 		}
 		migrator := &migrationControlMigrator{complete: result}
-		body, err := json.Marshal(CompleteMigrationRequest{NewPCR0: targetPCR0})
-		require.NoError(t, err)
 
 		rr := httptest.NewRecorder()
 		migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-			http.MethodPost, migrationFinalisationPath, bytes.NewReader(body),
+			http.MethodPost, migrationFinalisationPath, nil,
 		))
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		want, err := json.Marshal(result)
 		require.NoError(t, err)
 		require.JSONEq(t, string(want), rr.Body.String())
-		require.Equal(t, []string{targetPCR0}, migrator.completeCalls)
 	})
 }
 
 func TestMigrationControlHandlerMapsErrors(t *testing.T) {
-	targetPCR0 := strings.Repeat("ab", 48)
-	body, err := json.Marshal(CompleteMigrationRequest{NewPCR0: targetPCR0})
-	require.NoError(t, err)
-
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -437,7 +427,6 @@ func TestMigrationControlHandlerMapsErrors(t *testing.T) {
 		{name: "cooldown active", err: errMigrationCooldownActive, code: http.StatusTooEarly},
 		{name: "intent absent", err: errMigrationIntentAbsent, code: http.StatusConflict},
 		{name: "intent aborted", err: errMigrationIntentAborted, code: http.StatusConflict},
-		{name: "target mismatch", err: errMigrationIntentTargetMismatch, code: http.StatusConflict},
 		{name: "store unavailable", err: errMigrationIntentStoreUnavailable, code: http.StatusServiceUnavailable},
 		{name: "unexpected", err: errors.New("unexpected"), code: http.StatusInternalServerError},
 	} {
@@ -447,7 +436,7 @@ func TestMigrationControlHandlerMapsErrors(t *testing.T) {
 			}
 			rr := httptest.NewRecorder()
 			migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-				http.MethodPost, migrationFinalisationPath, bytes.NewReader(body),
+				http.MethodPost, migrationFinalisationPath, nil,
 			))
 
 			require.Equal(t, tc.code, rr.Code)
@@ -464,8 +453,6 @@ func TestMigrationControlHandlerRejectsInvalidRequests(t *testing.T) {
 	}{
 		{name: "malformed request", path: migrationRequestPath, body: "{"},
 		{name: "missing request target", path: migrationRequestPath, body: `{"action":"requested"}`},
-		{name: "malformed finalisation", path: migrationFinalisationPath, body: "{"},
-		{name: "missing finalisation target", path: migrationFinalisationPath, body: `{}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			migrator := &migrationControlMigrator{}
@@ -476,7 +463,6 @@ func TestMigrationControlHandlerRejectsInvalidRequests(t *testing.T) {
 
 			require.Equal(t, http.StatusBadRequest, rr.Code)
 			require.Empty(t, migrator.requestCalls)
-			require.Empty(t, migrator.completeCalls)
 		})
 	}
 }

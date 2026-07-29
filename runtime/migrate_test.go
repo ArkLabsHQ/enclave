@@ -238,30 +238,6 @@ func TestMigrationStatusAt(t *testing.T) {
 	require.Equal(t, head.PublishedAt, *status.EligibleAt)
 }
 
-func TestCompleteMigrationRequestValidate(t *testing.T) {
-	validPCR0 := strings.Repeat("a", 96)
-
-	for _, tc := range []struct {
-		name    string
-		request CompleteMigrationRequest
-		wantErr bool
-	}{
-		{name: "missing", request: CompleteMigrationRequest{}, wantErr: true},
-		{name: "short", request: CompleteMigrationRequest{NewPCR0: "abc"}, wantErr: true},
-		{name: "bad hex", request: CompleteMigrationRequest{NewPCR0: strings.Repeat("z", 96)}, wantErr: true},
-		{name: "valid", request: CompleteMigrationRequest{NewPCR0: validPCR0}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := tc.request.Validate()
-			if tc.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-		})
-	}
-}
-
 func TestMigrationRequestValidate(t *testing.T) {
 	validPCR0 := strings.Repeat("a", 96)
 
@@ -367,7 +343,7 @@ func TestCompleteMigration(t *testing.T) {
 		fx.ssmf.params[migrationIntentBucketParam()] = "repointed-after-startup"
 		request(t, fx, newPCR0)
 
-		got, err := fx.m.CompleteMigration(ctx, newPCR0)
+		got, err := fx.m.CompleteMigration(ctx)
 
 		require.NoError(t, err)
 		require.Empty(t, fx.ssmf.calls, "migration must not read successor ciphertexts back")
@@ -420,19 +396,10 @@ func TestCompleteMigration(t *testing.T) {
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 	})
 
-	t.Run("rejects invalid new PCR0", func(t *testing.T) {
-		fx := setup(t)
-
-		_, err := fx.m.CompleteMigration(ctx, "not-hex")
-
-		require.Error(t, err)
-		require.Empty(t, fx.session.requests)
-	})
-
 	t.Run("requires a published intent with zero cooldown", func(t *testing.T) {
 		fx := setup(t)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationIntentAbsent)
 		requireNoMigrationSideEffects(t, fx)
@@ -445,7 +412,7 @@ func TestCompleteMigration(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, migrationStateCoolingDown, status.State)
 
-		_, err = fx.m.CompleteMigration(ctx, newPCR0)
+		_, err = fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationCooldownActive)
 		requireNoMigrationSideEffects(t, fx)
@@ -457,19 +424,9 @@ func TestCompleteMigration(t *testing.T) {
 		_, err := fx.m.HandleMigrationRequest(ctx, migrationIntentAborted, "")
 		require.NoError(t, err)
 
-		_, err = fx.m.CompleteMigration(ctx, newPCR0)
+		_, err = fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
-		requireNoMigrationSideEffects(t, fx)
-	})
-
-	t.Run("rejects mismatched target", func(t *testing.T) {
-		fx := setup(t)
-		request(t, fx, strings.Repeat("ef", 48))
-
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
-
-		require.ErrorIs(t, err, errMigrationIntentTargetMismatch)
 		requireNoMigrationSideEffects(t, fx)
 	})
 
@@ -480,7 +437,7 @@ func TestCompleteMigration(t *testing.T) {
 			listErr: errors.New("list failed"),
 		}
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.ErrorContains(t, err, "list failed")
 		requireNoMigrationSideEffects(t, fx)
@@ -500,7 +457,7 @@ func TestCompleteMigration(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		_, err = restarted.CompleteMigration(ctx, newPCR0)
+		_, err = restarted.CompleteMigration(ctx)
 
 		require.NoError(t, err)
 		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam()])
@@ -518,7 +475,7 @@ func TestCompleteMigration(t *testing.T) {
 
 		completeDone := make(chan error, 1)
 		go func() {
-			_, err := fx.m.CompleteMigration(ctx, newPCR0)
+			_, err := fx.m.CompleteMigration(ctx)
 			completeDone <- err
 		}()
 		<-blocking.entered
@@ -547,7 +504,7 @@ func TestCompleteMigration(t *testing.T) {
 		fx.session.pcrs[migrationPCRIndex] = pcrExtendFromZero(bytes.Repeat([]byte{0xee}, 48))
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit new PCR0")
@@ -559,7 +516,7 @@ func TestCompleteMigration(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to create migration key")
@@ -571,7 +528,7 @@ func TestCompleteMigration(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to re-encrypt secret signing_key")
@@ -585,7 +542,7 @@ func TestCompleteMigration(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "DEK export failed")
@@ -599,7 +556,7 @@ func TestCompleteMigration(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to write migration-transition receipt")
@@ -613,7 +570,7 @@ func TestCompleteMigration(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		_, err := fx.m.CompleteMigration(ctx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to update current KMS key ID")

@@ -32,7 +32,6 @@ var (
 	errMigrationIntentAmbiguous        = errors.New("migration intent: ambiguous head")
 	errMigrationIntentAbsent           = errors.New("migration intent: absent")
 	errMigrationIntentAborted          = errors.New("migration intent: aborted")
-	errMigrationIntentTargetMismatch   = errors.New("migration intent: target mismatch")
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 )

@@ -407,9 +407,9 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Eight names are refused, because they define the enclave's identity or security
+Seven names are refused, because they define the enclave's identity or security
 posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
-`ENCLAVE_APP_NAME`, `ENCLAVE_ANCHOR_WINDOW`, `ENCLAVE_KMS_KEY_LOCKED`,
+`ENCLAVE_APP_NAME`, `ENCLAVE_KMS_KEY_LOCKED`,
 `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_MIGRATION_INTENT_RETENTION`,
 `ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_PREVIOUS_PCR0`.
 
@@ -698,6 +698,7 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, TLS pin, key binding, and response signature are still verified. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh

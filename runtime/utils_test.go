@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -482,6 +483,12 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	seq     int
 	objects map[string][]fakeS3Object
+
+	listErr          error
+	getErr           error
+	readErr          error
+	putErr           error
+	missingVersionID bool
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]fakeS3Object{}} }
@@ -583,6 +590,9 @@ func (f *fakeS3) PutObject(
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.PutObjectOutput, error) {
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	body, _ := io.ReadAll(in.Body)
@@ -599,7 +609,11 @@ func (f *fakeS3) PutObject(
 			lastModified: time.Now().UTC(),
 		},
 	)
-	return &s3.PutObjectOutput{VersionId: aws.String(id)}, nil
+	out := &s3.PutObjectOutput{VersionId: aws.String(id)}
+	if f.missingVersionID {
+		out.VersionId = nil
+	}
+	return out, nil
 }
 
 func (f *fakeS3) GetObject(
@@ -607,12 +621,19 @@ func (f *fakeS3) GetObject(
 	in *s3.GetObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.GetObjectOutput, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	objects := f.objects[aws.ToString(in.Key)]
 	for i := len(objects) - 1; i >= 0; i-- {
 		if in.VersionId == nil || objects[i].id == aws.ToString(in.VersionId) {
-			return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(objects[i].body))}, nil
+			body := io.NopCloser(bytes.NewReader(objects[i].body))
+			if f.readErr != nil {
+				body = io.NopCloser(iotest.ErrReader(f.readErr))
+			}
+			return &s3.GetObjectOutput{Body: body}, nil
 		}
 	}
 	return nil, &s3types.NoSuchKey{}
@@ -623,6 +644,9 @@ func (f *fakeS3) ListObjectVersions(
 	in *s3.ListObjectVersionsInput,
 	_ ...func(*s3.Options),
 ) (*s3.ListObjectVersionsOutput, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	prefix := aws.ToString(in.Prefix)

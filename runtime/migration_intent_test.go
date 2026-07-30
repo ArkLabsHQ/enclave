@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"math"
 	"strings"
 	"testing"
@@ -388,69 +387,14 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 	}
 }
 
-type migrationIntentS3Failure struct {
-	*fakeS3
-	listErr          error
-	getErr           error
-	readErr          error
-	putErr           error
-	missingVersionID bool
-}
-
-func (f *migrationIntentS3Failure) ListObjectVersions(
-	ctx context.Context,
-	in *s3.ListObjectVersionsInput,
-	opts ...func(*s3.Options),
-) (*s3.ListObjectVersionsOutput, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
-	return f.fakeS3.ListObjectVersions(ctx, in, opts...)
-}
-
-func (f *migrationIntentS3Failure) GetObject(
-	ctx context.Context,
-	in *s3.GetObjectInput,
-	opts ...func(*s3.Options),
-) (*s3.GetObjectOutput, error) {
-	if f.getErr != nil {
-		return nil, f.getErr
-	}
-	out, err := f.fakeS3.GetObject(ctx, in, opts...)
-	if err == nil && f.readErr != nil {
-		out.Body = readErrorCloser{err: f.readErr}
-	}
-	return out, err
-}
-
-func (f *migrationIntentS3Failure) PutObject(
-	ctx context.Context,
-	in *s3.PutObjectInput,
-	opts ...func(*s3.Options),
-) (*s3.PutObjectOutput, error) {
-	if f.putErr != nil {
-		return nil, f.putErr
-	}
-	out, err := f.fakeS3.PutObject(ctx, in, opts...)
-	if out != nil && f.missingVersionID {
-		out.VersionId = nil
-	}
-	return out, err
-}
-
-type readErrorCloser struct{ err error }
-
-func (r readErrorCloser) Read([]byte) (int, error) { return 0, r.err }
-func (readErrorCloser) Close() error               { return nil }
-
 func TestMigrationIntentS3Failures(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	ctx := context.Background()
 
-	for name, configure := range map[string]func(*migrationIntentS3Failure){
-		"list": func(s *migrationIntentS3Failure) { s.listErr = errors.New("list failed") },
-		"get":  func(s *migrationIntentS3Failure) { s.getErr = errors.New("get failed") },
-		"read": func(s *migrationIntentS3Failure) { s.readErr = errors.New("read failed") },
+	for name, configure := range map[string]func(*fakeS3){
+		"list": func(s *fakeS3) { s.listErr = errors.New("list failed") },
+		"get":  func(s *fakeS3) { s.getErr = errors.New("get failed") },
+		"read": func(s *fakeS3) { s.readErr = errors.New("read failed") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			fx := newMigrationIntentFixture(t)
@@ -459,9 +403,7 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 				fx.object(t, 1, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
 				time.Now(),
 			)
-			failing := &migrationIntentS3Failure{fakeS3: fx.s3}
-			configure(failing)
-			fx.log.s3 = failing
+			configure(fx.s3)
 			_, err := fx.log.Head(ctx)
 			require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 		})
@@ -469,14 +411,14 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 
 	t.Run("put", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
-		fx.log.s3 = &migrationIntentS3Failure{fakeS3: fx.s3, putErr: errors.New("put failed")}
+		fx.s3.putErr = errors.New("put failed")
 		_, err := fx.log.Request(ctx, target)
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 	})
 
 	t.Run("missing put version ID", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
-		fx.log.s3 = &migrationIntentS3Failure{fakeS3: fx.s3, missingVersionID: true}
+		fx.s3.missingVersionID = true
 		_, err := fx.log.Request(ctx, target)
 		require.ErrorContains(t, err, "no version ID")
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
@@ -569,6 +511,4 @@ func mustMigrationIntentPayload(
 	return payload
 }
 
-var _ io.ReadCloser = readErrorCloser{}
-var _ S3API = (*migrationIntentS3Failure)(nil)
 var _ S3API = (*migrationIntentPagedS3)(nil)

@@ -432,10 +432,7 @@ func TestCompleteMigration(t *testing.T) {
 
 	t.Run("fails closed on intent store error", func(t *testing.T) {
 		fx := setup(t)
-		fx.m.intent.s3 = &migrationIntentS3Failure{
-			fakeS3:  fx.s3f,
-			listErr: errors.New("list failed"),
-		}
+		fx.s3f.listErr = errors.New("list failed")
 
 		_, err := fx.m.CompleteMigration(ctx)
 

@@ -32,6 +32,7 @@ var (
 	errMigrationIntentAmbiguous        = errors.New("migration intent: ambiguous head")
 	errMigrationIntentAbsent           = errors.New("migration intent: absent")
 	errMigrationIntentAborted          = errors.New("migration intent: aborted")
+	errMigrationIntentAlreadyRequested = errors.New("migration intent: already requested, abort first")
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 )
@@ -52,7 +53,7 @@ type migrationIntentObjectV1 struct {
 	Attestation string `json:"attestation"`
 }
 
-type migrationIntentHead struct {
+type migrationIntent struct {
 	SourcePCR0  string
 	TargetPCR0  string
 	Action      string
@@ -90,12 +91,12 @@ func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIn
 	}, nil
 }
 
-func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntentHead, error) {
+func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error) {
 	sourcePCR0, err := l.sourcePCR0()
 	if err != nil {
 		return nil, err
 	}
-	head, tie, err := l.scan(ctx, sourcePCR0)
+	head, tie, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +110,7 @@ func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntentHead, er
 func (l *migrationIntentLog) Request(
 	ctx context.Context,
 	targetPCR0 string,
-) (*migrationIntentHead, error) {
+) (*migrationIntent, error) {
 	targetPCR0, _, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
@@ -118,23 +119,26 @@ func (l *migrationIntentLog) Request(
 	if err != nil {
 		return nil, err
 	}
-	head, _, err := l.scan(ctx, sourcePCR0)
+	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
 	headSequence := uint64(0)
 	if head != nil {
+		if head.Action == migrationIntentRequested {
+			return nil, errMigrationIntentAlreadyRequested
+		}
 		headSequence = head.Sequence
 	}
 	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
 }
 
-func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntentHead, error) {
+func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error) {
 	sourcePCR0, err := l.sourcePCR0()
 	if err != nil {
 		return nil, err
 	}
-	head, _, err := l.scan(ctx, sourcePCR0)
+	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +156,7 @@ func (l *migrationIntentLog) append(
 	sourcePCR0 string,
 	baseSequence uint64,
 	action, targetPCR0 string,
-) (*migrationIntentHead, error) {
+) (*migrationIntent, error) {
 	if baseSequence == math.MaxUint64 {
 		return nil, fmt.Errorf("migration intent sequence overflow")
 	}
@@ -196,7 +200,7 @@ func (l *migrationIntentLog) append(
 		return nil, fmt.Errorf("%w: put migration intent sequence %d: S3 returned no version ID", errMigrationIntentStoreUnavailable, sequence)
 	}
 
-	head, tie, err := l.scan(ctx, sourcePCR0)
+	head, tie, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -221,11 +225,11 @@ func (l *migrationIntentLog) sourcePCR0() (string, error) {
 	return hex.EncodeToString(pcr0), nil
 }
 
-func (l *migrationIntentLog) scan(
+func (l *migrationIntentLog) deriveHead(
 	ctx context.Context,
 	sourcePCR0 string,
-) (*migrationIntentHead, bool, error) {
-	var head *migrationIntentHead
+) (*migrationIntent, bool, error) {
+	var head *migrationIntent
 	var tie bool
 	var keyMarker, versionMarker *string
 	for {
@@ -245,7 +249,7 @@ func (l *migrationIntentLog) scan(
 			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || version.LastModified == nil {
 				continue
 			}
-			nextHead, valid, err := l.fetchIntentHead(
+			nextHead, valid, err := l.fetchIntent(
 				ctx, key, versionID, keySourcePCR0, sequence, version.LastModified.UTC(),
 			)
 			if err != nil {
@@ -277,12 +281,12 @@ func (l *migrationIntentLog) scan(
 	}
 }
 
-func (l *migrationIntentLog) fetchIntentHead(
+func (l *migrationIntentLog) fetchIntent(
 	ctx context.Context,
 	key, versionID, sourcePCR0 string,
 	sequence uint64,
 	publishedAt time.Time,
-) (*migrationIntentHead, bool, error) {
+) (*migrationIntent, bool, error) {
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:    aws.String(l.bucket),
 		Key:       aws.String(key),
@@ -319,7 +323,7 @@ func (l *migrationIntentLog) fetchIntentHead(
 	); err != nil {
 		return nil, false, nil
 	}
-	return &migrationIntentHead{
+	return &migrationIntent{
 		SourcePCR0:  sourcePCR0,
 		TargetPCR0:  entry.TargetPCR0,
 		Action:      entry.Action,

@@ -185,6 +185,10 @@ The host forwards the mutation over parent-only vsock port `8003` to
 `POST /request-migration`. The source enclave attests and appends a new
 `requested` version to the public S3 migration-intent log.
 
+A request is rejected with `409` when the current head is already `requested`.
+Abort first to retarget, so every target change is an explicit pair of log
+entries rather than a silent overwrite.
+
 Observe derived status:
 
 ```bash
@@ -218,8 +222,8 @@ enclave migration abort
 
 Abort appends `action=aborted` at the next sequence and retains the current
 target PCR0. It does not erase history. A later request can append another
-sequence. Do not use abort as rollback after enclave finalisation changes active
-KMS state.
+sequence, and an abort is required before that request may retarget. Do not use
+abort as rollback after enclave finalisation changes active KMS state.
 
 ### Finalise and activate
 

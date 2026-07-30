@@ -427,6 +427,7 @@ func TestMigrationControlHandlerMapsErrors(t *testing.T) {
 		{name: "cooldown active", err: errMigrationCooldownActive, code: http.StatusTooEarly},
 		{name: "intent absent", err: errMigrationIntentAbsent, code: http.StatusConflict},
 		{name: "intent aborted", err: errMigrationIntentAborted, code: http.StatusConflict},
+		{name: "intent already requested", err: errMigrationIntentAlreadyRequested, code: http.StatusConflict},
 		{name: "store unavailable", err: errMigrationIntentStoreUnavailable, code: http.StatusServiceUnavailable},
 		{name: "unexpected", err: errors.New("unexpected"), code: http.StatusInternalServerError},
 	} {

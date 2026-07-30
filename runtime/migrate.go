@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 )
@@ -119,19 +120,19 @@ func (m *migrator) HandleMigrationRequest(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var head *migrationIntentHead
+	var intentHead *migrationIntent
 	switch action {
 	case migrationIntentRequested:
-		head, err = m.intent.Request(ctx, targetPCR0)
+		intentHead, err = m.intent.Request(ctx, targetPCR0)
 	case migrationIntentAborted:
-		head, err = m.intent.Abort(ctx)
+		intentHead, err = m.intent.Abort(ctx)
 	default:
 		return nil, fmt.Errorf("unknown migration action %q", action)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return migrationStatusAt(head, cooldown, time.Now()), nil
+	return migrationStatusAt(intentHead, cooldown, time.Now()), nil
 }
 
 func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
@@ -154,7 +155,7 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 }
 
 func migrationStatusAt(
-	head *migrationIntentHead,
+	head *migrationIntent,
 	cooldown time.Duration,
 	now time.Time,
 ) *MigrationStatus {
@@ -183,16 +184,12 @@ func migrationStatusAt(
 	eligibleAt := head.PublishedAt.Add(cooldown)
 	status.EligibleAt = &eligibleAt
 	remaining := eligibleAt.Sub(now)
-	if cooldown == 0 || remaining <= 0 {
+	if remaining <= 0 {
 		status.State = migrationStateEligible
 		return status
 	}
 	status.State = migrationStateCoolingDown
-	seconds := remaining / time.Second
-	if remaining%time.Second != 0 {
-		seconds++
-	}
-	status.RemainingSeconds = int(seconds)
+	status.RemainingSeconds = int(math.Ceil(remaining.Seconds()))
 	return status
 }
 

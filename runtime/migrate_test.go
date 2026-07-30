@@ -214,7 +214,7 @@ func TestMigratorMigrationStatus(t *testing.T) {
 func TestMigrationStatusAt(t *testing.T) {
 	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	cooldown := 2 * time.Minute
-	head := &migrationIntentHead{
+	head := &migrationIntent{
 		SourcePCR0:  strings.Repeat("ab", 48),
 		TargetPCR0:  strings.Repeat("cd", 48),
 		Action:      migrationIntentRequested,
@@ -482,9 +482,7 @@ func TestCompleteMigration(t *testing.T) {
 
 		requestDone := make(chan error, 1)
 		go func() {
-			_, err := fx.m.HandleMigrationRequest(
-				ctx, migrationIntentRequested, strings.Repeat("ef", 48),
-			)
+			_, err := fx.m.HandleMigrationRequest(ctx, migrationIntentAborted, "")
 			requestDone <- err
 		}()
 

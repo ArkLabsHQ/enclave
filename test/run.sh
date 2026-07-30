@@ -1285,6 +1285,7 @@ if [ "$(migration_json | jq -r '.source_pcr0')" != "$V2_PCR0" ] || \
   echo "  FAIL: publishing C mutated active A or K-AB" >&2
   exit 1
 fi
+migration_abort | tee /tmp/migration-abort-v3-before-v4.log
 migration_request | tee /tmp/migration-request-v4.log
 A_C_REQUEST=$(migration_json)
 A_C_REQUEST_SEQUENCE=$(echo "$A_C_REQUEST" | jq -r '.sequence')

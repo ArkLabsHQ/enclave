@@ -160,13 +160,12 @@ func TestMigrationIntentAppend(t *testing.T) {
 	require.NoError(t, fx.nsm.VerifyAttestation(entry.Attestation, map[uint]string{0: fx.source},
 		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket)))
 
-	head, err = fx.log.Request(context.Background(), targetA)
-	require.NoError(t, err)
-	require.Equal(t, uint64(2), head.Sequence)
+	_, err = fx.log.Request(context.Background(), targetB)
+	require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
 
 	head, err = fx.log.Abort(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), head.Sequence)
+	require.Equal(t, uint64(2), head.Sequence)
 	require.Equal(t, migrationIntentAborted, head.Action)
 	require.Equal(t, targetA, head.TargetPCR0)
 
@@ -175,7 +174,7 @@ func TestMigrationIntentAppend(t *testing.T) {
 
 	head, err = fx.log.Request(context.Background(), targetB)
 	require.NoError(t, err)
-	require.Equal(t, uint64(4), head.Sequence)
+	require.Equal(t, uint64(3), head.Sequence)
 	require.Equal(t, targetB, head.TargetPCR0)
 }
 
@@ -243,7 +242,7 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		require.Equal(t, base, head.PublishedAt)
 	})
 
-	t.Run("timestamp tie fails closed but request advances", func(t *testing.T) {
+	t.Run("timestamp tie fails closed but abort advances", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		key := migrationIntentObjectKey(fx.source, 1)
 		publishedAt := time.Now().Add(-time.Hour).UTC()
@@ -257,9 +256,16 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		_, err := fx.log.Head(context.Background())
 		require.ErrorIs(t, err, errMigrationIntentAmbiguous)
 
-		head, err := fx.log.Request(context.Background(), targetB)
+		_, err = fx.log.Request(context.Background(), targetB)
+		require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+
+		head, err := fx.log.Abort(context.Background())
 		require.NoError(t, err)
 		require.Equal(t, uint64(2), head.Sequence)
+
+		head, err = fx.log.Request(context.Background(), targetB)
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), head.Sequence)
 	})
 }
 
@@ -482,7 +488,7 @@ func TestMigrationIntentSequenceOverflow(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	fx.s3.putRawObjectAt(
 		migrationIntentObjectKey(fx.source, math.MaxUint64),
-		fx.object(t, math.MaxUint64, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+		fx.object(t, math.MaxUint64, migrationIntentAborted, target, migrationIntentTestBucket, fx.pcr0),
 		time.Now(),
 	)
 

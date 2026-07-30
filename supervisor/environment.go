@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 )
 
 // Single home for the supervisor's business-config env reads.
@@ -32,27 +31,11 @@ func getRegion() string {
 	return "us-east-1"
 }
 
-// getMigrationCooldown returns 0 on unset; surfaces parse errors so the
-// caller can fail boot on a malformed value.
-func getMigrationCooldown() (time.Duration, error) {
-	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
-	if v == "" {
-		return 0, nil
-	}
-	return time.ParseDuration(v)
-}
-
 func getSupervisorAddr() string {
 	if a := strings.TrimSpace(os.Getenv("ENCLAVE_SUPERVISOR_ADDR")); a != "" {
 		return a
 	}
 	return "127.0.0.1:8443"
-}
-
-// ssmParamPath returns /<deployment>/<app>/<name>. Used for migration-state
-// params, which are NOT lock-namespaced — see kmsSubtreeParamPath for KMS state.
-func ssmParamPath(name string) string {
-	return fmt.Sprintf("/%s/%s/%s", getDeployment(), getAppName(), name)
 }
 
 // kmsKeyLocked mirrors the runtime: the EIF's lock posture, plumbed to the host
@@ -68,8 +51,7 @@ func lockSegment() string {
 	return "unlocked"
 }
 
-// kmsSubtreeParamPath returns /<deployment>/<app>/<lock>/<name>. Use ONLY for
-// KMS-subtree params (KMSKeyID); migration-state params stay on ssmParamPath.
+// kmsSubtreeParamPath returns /<deployment>/<app>/<lock>/<name> for KMS state.
 func kmsSubtreeParamPath(name string) string {
 	return fmt.Sprintf("/%s/%s/%s/%s", getDeployment(), getAppName(), lockSegment(), name)
 }

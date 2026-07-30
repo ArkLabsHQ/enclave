@@ -14,10 +14,10 @@ func TestGenerateBuildConfig(t *testing.T) {
 	// generateBuildConfig creates .enclave/ itself; no MkdirAll needed.
 
 	cfg := &Config{
-		Name:    "testapp",
-		Version: "1.2.3",
-		Region:  "us-west-2",
-		Deployment:  "staging",
+		Name:       "testapp",
+		Version:    "1.2.3",
+		Region:     "us-west-2",
+		Deployment: "staging",
 		App: AppConfig{
 			Language:       "go",
 			NixOwner:       "myorg",
@@ -38,8 +38,9 @@ func TestGenerateBuildConfig(t *testing.T) {
 		Runtime: RuntimeConfig{
 			Rev: "sdkrev", Hash: "sha256-sdk", VendorHash: "sha256-sdkv",
 		},
-		MigrationCooldown: "5m",
-		PreviousPCR0:      "genesis",
+		MigrationCooldown:        "5m",
+		MigrationIntentRetention: "24h",
+		PreviousPCR0:             "genesis",
 	}
 
 	if err := generateBuildConfig(cfg, root); err != nil {
@@ -82,6 +83,9 @@ func TestGenerateBuildConfig(t *testing.T) {
 	if bc.Runtime.Rev != "sdkrev" {
 		t.Errorf("SDK.Rev = %q, want %q", bc.Runtime.Rev, "sdkrev")
 	}
+	if bc.MigrationIntentRetention != "24h" {
+		t.Errorf("MigrationIntentRetention = %q, want %q", bc.MigrationIntentRetention, "24h")
+	}
 }
 
 func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
@@ -91,10 +95,10 @@ func TestGenerateBuildConfig_EnvTemplateSubstitution(t *testing.T) {
 	}
 
 	cfg := &Config{
-		Name:    "app",
-		Version: "2.0.0",
-		Region:  "eu-west-1",
-		Deployment:  "prod",
+		Name:       "app",
+		Version:    "2.0.0",
+		Region:     "eu-west-1",
+		Deployment: "prod",
 		App: AppConfig{
 			BinaryName: "app",
 			Env: map[string]string{

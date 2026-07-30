@@ -4,7 +4,13 @@
 
 Introspector Enclave is a **CLI framework and runtime SDK** for deploying applications inside **AWS Nitro Enclaves** with hardware-backed secret management, cryptographic attestation, and reproducible builds. It enables any Go HTTP server to run inside a Nitro Enclave with zero enclave-specific application code — the framework handles all infrastructure concerns (secret lifecycle, attestation, TLS, networking, upgrades).
 
-The framework provides an **irreversible security guarantee**: once a KMS key is locked, only an enclave with the exact same binary measurements (PCR0) can decrypt its secrets — not even the AWS root account can override this.
+KMS plaintext is recipient-attestation wrapped to the enclave, so the EC2 host
+has no direct decrypt path in either policy mode. Account-root policy-rewrite
+resistance applies only with `is_kms_key_locked: true`; in the default mode root
+can rewrite policy but never has direct `kms:Decrypt`.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) is the authoritative technical reference and
+[OPERATIONS.md](OPERATIONS.md) is the authoritative operator runbook.
 
 ---
 
@@ -57,15 +63,16 @@ The framework provides an **irreversible security guarantee**: once a KMS key is
 
 ---
 
-## CLI Commands (8 total)
+## CLI Commands
 
 ### Lifecycle Workflow
 
 ```
 enclave init  →  enclave setup  →  enclave tofu  →  enclave build  →  tofu apply
-                                                                   →  enclave verify
-                                                                   →  enclave status
-                                                                   →  tofu destroy
+                                                                    →  enclave verify
+                                                                    →  enclave status
+                                                                    →  enclave migration ...
+                                                                    →  tofu destroy
 ```
 
 ### 1. `enclave init` — Project Scaffolding
@@ -134,23 +141,19 @@ Anyone can rebuild the same EIF and get identical PCR values, proving the binary
 
 ### 4. `enclave tofu` + `tofu apply` — AWS Deployment
 
-Handles both fresh deployments and upgrades:
+Publishes infrastructure and candidates:
 
 **Fresh deploy:**
 - `enclave tofu` scaffolds the OpenTofu module, then `tofu apply` provisions the infrastructure (VPC, EC2, KMS, SSM, IAM, EIP)
-- Applies KMS key policy with PCR0 attestation condition
+- The first enclave boot creates the primary key with a PCR0 attestation condition
 - Waits for instance readiness
 
-**Upgrade (unlocked KMS):**
-- Calls old enclave's `/v1/prepare-upgrade` to record PCR0 attestation
-- Updates KMS policy with new PCR0
-- Hot-swaps the EIF on the running instance
-
-**Upgrade (locked KMS — irreversible key):**
-- Creates temporary KMS key bound to new PCR0
-- Old enclave re-encrypts all secrets with temporary key via `/v1/start-migration`
-- New enclave boots with migrated secrets
-- Old KMS key scheduled for deletion
+**Candidate update:**
+- Uploads `candidates/<pcr0>/enclave.eif` and
+  `candidates/<pcr0>/supervisor`
+- Exports `candidate_pcr0`, `candidate_artifact_bucket`, `candidate_eif_key`,
+  `candidate_supervisor_key`, and `migration_intent_bucket`
+- Does not automatically migrate or activate an existing deployment
 
 ### 5. `enclave verify` — Attestation Verification
 
@@ -164,9 +167,14 @@ Three independent verification checks:
 
 Shows instance state, KMS key state, lock status, and enclave version.
 
-### 7. `enclave lock` — Irreversible KMS Lock
+### 7. `enclave migration request|status|abort|finalise`
 
-Removes `kms:PutKeyPolicy` and `kms:ScheduleKeyDeletion` from the admin, making the KMS policy **permanent and irrevocable**. After locking, only an enclave with the correct PCR0 can decrypt secrets — even the AWS root account cannot override this.
+Runs the explicit candidate migration protocol. `request` and `abort` publish
+attested S3 intent versions, `status` derives the canonical public state, and
+`finalise` transfers state and asks the host to activate the candidate.
+`finalise --resume` is only for retrying host orchestration after enclave
+finalisation definitely succeeded. Persistent flags and the complete procedure
+are in [OPERATIONS.md](OPERATIONS.md#commands-and-flags).
 
 ### 8. `tofu destroy` — Teardown
 
@@ -202,7 +210,8 @@ Destroys all AWS infrastructure via `tofu destroy`.
 - **Secrets never leave the enclave in plaintext** — KMS wraps the response to a one-time RSA key generated inside the enclave's NSM hardware
 - **PCR0-gated decryption** — KMS policy condition `kms:RecipientAttestation:PCR0` ensures only the correct enclave binary can decrypt
 - **Configurable secret list** — Defined in `enclave.yaml`, each with a `name` and `env_var`
-- **SSM path convention**: `/{deployment}/{appName}/{secretName}/Ciphertext`
+- **SSM path convention**: lock- and key-scoped under
+  `/{deployment}/{appName}/{locked|unlocked}/.../Ciphertext/{kmsKeyID}`
 
 ---
 
@@ -230,7 +239,10 @@ Destroys all AWS infrastructure via `tofu destroy`.
 
 ### PCR0 Upgrade Chain
 
-Each enclave records its predecessor's PCR0 and the hardware-signed attestation proving it. This creates an immutable chain from genesis to the current version, verifiable by any external party via `enclave verify`.
+Each enclave records its predecessor's PCR0 and hardware-signed attestation. The
+public versioned migration-intent log separately exposes request history and
+competing forks. `enclave verify` checks the live enclave chain; no
+migration-log verifier CLI is shipped.
 
 ---
 
@@ -238,14 +250,22 @@ Each enclave records its predecessor's PCR0 and the hardware-signed attestation 
 
 The supervisor is the main process inside the enclave. It:
 
-1. **Boots non-blocking** — HTTP server starts immediately (health checks available)
+1. **Binds HTTP synchronously** — public and private initial binds must both
+   succeed before their serving goroutines start
 2. **Loads secrets** — Retries KMS decryption until all secrets are available
 3. **Generates attestation key** — Ephemeral secp256k1, registered with nitriding
 4. **Extends PCRs** — Commits secret public keys to user PCR registers
 5. **Spawns user app** — Runs the user's binary as a child process with secrets as env vars
 6. **Reverse proxies** — Routes all non-management traffic to the user app
 7. **Signs responses** — Schnorr BIP-340 signature on every response
-8. **Handles upgrades** — `/v1/start-migration` and `/v1/prepare-upgrade` endpoints
+8. **Signals readiness** — Only after exact state/KMS posture and access,
+   provenance/freshness, required listeners, environment and secrets, and
+   `child.Start()` have succeeded
+9. **Handles migration control** — parent-only vsock port `8003` routes
+   `/request-migration` and `/finalise-migration`
+
+Readiness is a one-way startup signal. Later child exit does not clear it, so it
+does not represent ongoing application health.
 
 ### Management Endpoints
 
@@ -254,9 +274,12 @@ The supervisor is the main process inside the enclave. It:
 | `/v1/enclave-info` | GET | Version, PCR0 history, attestation pubkey, init status |
 | `/v1/extend-pcr` | POST | Extend user PCR (16-31) with custom data |
 | `/v1/lock-pcr` | POST | Lock a user PCR against further extension |
-| `/v1/start-migration` | POST | Re-encrypt secrets for migration (upgrade) |
-| `/v1/prepare-upgrade` | POST | Store PCR0 + attestation for upgrade chain |
-| `/health` | GET | Readiness probe (200 ready, 503 initializing) |
+| `/health` | GET | One-way startup readiness (200 ready, 503 initializing) |
+
+Migration mutation is not public HTTP. The EC2 parent reaches
+`POST /request-migration` and `POST /finalise-migration` over AF_VSOCK port
+`8003`. `GET /v1/enclave-info` remains externally readable and includes status
+derived from the authoritative S3 log.
 
 ---
 
@@ -269,12 +292,13 @@ Deployed via the OpenTofu module scaffolded by `enclave tofu`:
 | **VPC** | Public + private subnets, NAT gateway |
 | **EC2 Instance** | Nitro Enclave-enabled, configurable instance type |
 | **Elastic IP** | Static public address surviving reboots |
-| **KMS Key** | Attestation-gated encryption, auto-rotation |
-| **SSM Parameters** | Secret ciphertext storage + migration state |
+| **KMS Key** | Runtime-created, attestation-gated encryption |
+| **SSM Parameters** | Lock/key-scoped ciphertexts, state receipts, predecessor state, and bucket discovery |
+| **S3 Candidate Assets** | PCR0-addressed EIF and supervisor objects |
+| **S3 Migration Intent** | Public version history with Object Lock and exact-version reads |
 | **IAM Role** | Instance profile with SSM, KMS, ECR, S3 access |
 | **VPC Endpoints** | KMS, SSM, ECR (private connectivity) |
 | **Security Group** | HTTPS ingress, all egress |
-| **ECR Image** | gvproxy Docker image for outbound networking |
 
 ---
 
@@ -312,10 +336,40 @@ SDK coordinates (rev, source hash, vendor hash) are:
 | **Secret confidentiality** | KMS decryption gated by hardware-attested PCR0 |
 | **Binary integrity** | Reproducible Nix builds → verifiable PCR0 |
 | **Response authenticity** | BIP-340 Schnorr signature on every HTTP response |
-| **Upgrade auditability** | PCR0 chain with hardware-signed attestation documents |
-| **Irreversible lockdown** | KMS policy removes admin's own PutKeyPolicy permission |
+| **Migration auditability** | Public versioned intent objects with Nitro-attested canonical CBOR |
+| **Host resistance** | Recipient-attestation KMS wrapping in both policy modes |
+| **Account-root resistance** | Only strict `is_kms_key_locked=true` removes all `PutKeyPolicy` grants |
 | **No operator access** | Enclave memory is inaccessible from host, even to root |
 | **Network isolation** | Enclave has no direct network — vsock only |
+
+Public history makes hidden migration forks detectable, not prevented. A
+retained clone with the same source PCR0 and valid state can append competing
+valid entries; the protocol does not prove enclave uniqueness.
+
+Regular state-origin receipts are selected at
+`/<deployment>/<app>/StateOriginReceipt/<kms-key-id>/<lowercase-current-pcr0>`;
+transition receipts remain at
+`/<deployment>/<app>/MigrationStateOriginReceipt/<kms-key-id>`. An exact regular
+receipt is verified or fails closed. Only exact absence selects transition
+verification for a successor or rollback-to-self; no legacy unscoped fallback
+or sibling-PCR0 inspection occurs. Receipts for A and B can coexist under K-AB,
+and each proves state adoption rather than runtime readiness.
+
+After candidate start, the host constructs a fresh raw `http.Client`, not a
+verified enclave client, and requires runtime `/health` HTTP 200 `ready` plus an
+exact target match in
+`migration.source_pcr0`. Wrong or malformed PCR0, non-readiness, transport
+failure, or timeout triggers EIF rollback. The check is operational: it has no
+nonce-bound Nitro-chain verification, TLS pinning, or local EIF PCR derivation;
+`enclave verify` remains independent cryptographic verification.
+
+Cleanup removes only temporary local artifacts. PCR-scoped and transition
+receipts, dual-PCR authorization, and PCR0-addressed source candidates are
+retained for deliberate rollback, and candidate publication remains append-only
+until bucket teardown. A restored A needs a fresh A-to-C intent and cooldown;
+stale K-AB evidence is ignored under active K-AC. This rollback-to-self flow is
+limited to non-genesis sources because the separately tracked genesis defect
+remains out of scope.
 
 ---
 
@@ -327,6 +381,9 @@ A developer using this framework:
 2. Runs `enclave init` to scaffold the project
 3. Configures secrets and app source in `enclave.yaml`
 4. Runs `enclave build` → `enclave tofu` → `tofu apply` → `enclave verify`
-5. Their app runs inside a Nitro Enclave with hardware-attested secrets, signed responses, and an immutable upgrade chain
+5. For a later PCR0, runs `enclave migration request` → `status` → `finalise`
+6. Their app runs inside a Nitro Enclave with hardware-attested secrets and signed responses
 
-The framework abstracts away all Nitro Enclave complexity — NSM sessions, vsock networking, attestation documents, KMS recipient attestation, PCR management, and upgrade key migration.
+The framework abstracts away NSM sessions, vsock networking, attestation
+documents, KMS recipient attestation, PCR management, and migration state
+transfer while keeping candidate activation an explicit operator action.

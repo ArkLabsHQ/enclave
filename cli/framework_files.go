@@ -14,9 +14,9 @@ type frameworkFile struct {
 
 // Placeholders replaced in flake templates at scaffold time.
 const (
-	nixpkgsRefPlaceholder       = "{{NixpkgsRef}}"
-	flakeUtilsRefPlaceholder    = "{{FlakeUtilsRef}}"
-	awsNitroUtilRefPlaceholder  = "{{AwsNitroUtilRef}}"
+	nixpkgsRefPlaceholder      = "{{NixpkgsRef}}"
+	flakeUtilsRefPlaceholder   = "{{FlakeUtilsRef}}"
+	awsNitroUtilRefPlaceholder = "{{AwsNitroUtilRef}}"
 )
 
 // DefaultNixpkgsRef is the nixpkgs commit baked into scaffolded flakes when
@@ -240,7 +240,6 @@ EIF_PATH=/home/ec2-user/app/server/enclave.eif
 ENCLAVE_NITRIDING_ENABLED=true
 ENCLAVE_DEPLOYMENT=${dev_mode}
 ENCLAVE_AWS_REGION=${region}
-ENCLAVE_MIGRATION_COOLDOWN=${migration_cooldown}
 ENCLAVE_KMS_KEY_LOCKED=${is_kms_key_locked}
 MEMORY_MIB=4320
 CPU_COUNT=2
@@ -394,6 +393,7 @@ const frameworkFlakeNix = `{
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_MIGRATION_INTENT_RETENTION=` + "${buildCfg.migration_intent_retention or \"87600h\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
@@ -594,6 +594,7 @@ LAUNCHER
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_MIGRATION_INTENT_RETENTION=` + "${buildCfg.migration_intent_retention or \"87600h\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
@@ -1120,6 +1121,7 @@ const frameworkFlakeNixDotnet = `{
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_MIGRATION_INTENT_RETENTION=` + "${buildCfg.migration_intent_retention or \"87600h\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `
@@ -1285,6 +1287,7 @@ const frameworkFlakeNixRust = `{
           ENCLAVE_APP_NAME=` + "${buildCfg.name}" + `
           ENCLAVE_SECRETS_CONFIG=` + "${secretsCfgJson}" + `
           ENCLAVE_MIGRATION_COOLDOWN=` + "${buildCfg.migration_cooldown or \"0s\"}" + `
+          ENCLAVE_MIGRATION_INTENT_RETENTION=` + "${buildCfg.migration_intent_retention or \"87600h\"}" + `
           ENCLAVE_PREVIOUS_PCR0=` + "${buildCfg.previous_pcr0 or \"genesis\"}" + `
           ENCLAVE_KMS_KEY_LOCKED=` + "${if buildCfg.is_kms_key_locked or false then \"true\" else \"false\"}" + `
           ENCLAVE_DEPLOYMENT=` + "${deployment}" + `

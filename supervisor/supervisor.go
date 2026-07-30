@@ -11,8 +11,9 @@
 //   - POST /start                    — start the enclave (Lifecycle)
 //   - POST /stop                     — stop the enclave (Lifecycle)
 //   - POST /schedule-key-deletion    — schedule the primary KMS key for deletion
-//   - POST /migrate                  — full locked-key migration
-//   - POST /migrate/abort            — abort a migration during cooldown
+//   - POST /migrate                  — finalise and/or orchestrate migration
+//   - POST /migrate/request          — publish a migration intent via the enclave
+//   - POST /migrate/abort            — publish a migration abort via the enclave
 //
 // Listens on 127.0.0.1:8443 (plain HTTP, localhost only). External access
 // goes through SSM Run Command, gated by IAM.
@@ -56,11 +57,6 @@ func New(ctx context.Context) (*Supervisor, error) {
 	}
 	awsClient := NewAWSClient(cfg)
 
-	cooldown, err := getMigrationCooldown()
-	if err != nil {
-		return nil, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN: %w", err)
-	}
-
 	lifecycle, err := NewLifecycle()
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle init: %w", err)
@@ -73,7 +69,7 @@ func New(ctx context.Context) (*Supervisor, error) {
 		shutdown:   make(chan struct{}, 1),
 		addr:       getSupervisorAddr(),
 	}
-	s.migration = NewMigration(awsClient, lifecycle, cooldown, s.RequestShutdown)
+	s.migration = NewMigration(awsClient, lifecycle, s.RequestShutdown)
 	s.observability = NewObservability(awsClient)
 	s.health = NewHealth(awsClient, s.migration.InProgress)
 

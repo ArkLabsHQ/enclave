@@ -71,6 +71,9 @@ func (c *Config) Validate() error {
 	if c.FQDN == "" {
 		return fmt.Errorf("config is missing FQDN")
 	}
+	if _, err := getMigrationCooldown(); err != nil {
+		return err
+	}
 	return nil
 }
 

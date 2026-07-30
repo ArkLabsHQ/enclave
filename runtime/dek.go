@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
 	"fmt"
 )
 
@@ -34,64 +33,32 @@ type dek struct {
 type DEK interface {
 	Seal(plaintext, aad []byte) ([]byte, error)
 	Open(blob, aad []byte) ([]byte, error)
-	ExportKey(ctx context.Context, kms KMS, ssm SSM) error
-}
-
-func FetchOrInitDEK(ctx context.Context, kms KMS, ssm SSM) (DEK, error) {
-	dekParam := storageDEKCiphertextParam(kms.KeyID())
-
-	ciphertextB64, err := ssm.MayGet(ctx, dekParam)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch DEK SSM param: %w", err)
-	}
-
-	if ciphertextB64 == "" {
-		// First boot for this KMS key: mint an attested DEK.
-		dk, err := kms.GenerateDataKey(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("generate DEK: %w", err)
-		}
-
-		encoded := base64.StdEncoding.EncodeToString(dk.Ciphertext)
-
-		if err := ssm.Set(ctx, dekParam, encoded); err != nil {
-			return nil, fmt.Errorf("failed to store DEK: %w", err)
-		}
-
-		return &dek{key: dk.Plaintext}, nil
-	}
-
-	plaintext, err := kms.Decrypt(ctx, ciphertextB64)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt DEK: %w", err)
-	}
-
-	return &dek{key: plaintext}, nil
+	ExportKey(ctx context.Context, kms KMS, ssm SSM) (string, error)
 }
 
 // ExportKey stores this DEK encrypted under kms, then verifies round-trip.
-func (d *dek) ExportKey(ctx context.Context, kms KMS, ssm SSM) error {
+func (d *dek) ExportKey(ctx context.Context, kms KMS, ssm SSM) (string, error) {
 	ciphertextB64, err := kms.Encrypt(ctx, d.key)
 	if err != nil {
-		return fmt.Errorf("failed to encrypt DEK under provided KMS: %w", err)
+		return "", fmt.Errorf("failed to encrypt DEK under provided KMS: %w", err)
 	}
 
 	dekParam := storageDEKCiphertextParam(kms.KeyID())
 
 	if err := ssm.Set(ctx, dekParam, ciphertextB64); err != nil {
-		return fmt.Errorf("encrypt DEK with migration key: %w", err)
+		return "", fmt.Errorf("encrypt DEK with migration key: %w", err)
 	}
 
 	decrypted, err := kms.Decrypt(ctx, ciphertextB64)
 	if err != nil {
-		return fmt.Errorf("verify DEK re-encryption: %w", err)
+		return "", fmt.Errorf("verify DEK re-encryption: %w", err)
 	}
 
 	if !bytes.Equal(decrypted, d.key) {
-		return fmt.Errorf("verify DEK re-encryption: plaintext mismatch")
+		return "", fmt.Errorf("verify DEK re-encryption: plaintext mismatch")
 	}
 
-	return nil
+	return ciphertextB64, nil
 }
 
 // Seal encrypts plaintext with aad as v1: version || nonce || ct+tag.

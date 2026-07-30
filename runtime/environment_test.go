@@ -3,11 +3,48 @@ package runtime
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetMigrationCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "unset"},
+		{name: "zero", value: "0s"},
+		{name: "positive", value: "2m", want: 2 * time.Minute},
+		{name: "malformed", value: "later", wantErr: true},
+		{name: "negative", value: "-1s", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
+			got, err := getMigrationCooldown()
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
+	err := (&Config{
+		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,
+		AppWebSrv: &url.URL{Scheme: "http", Host: "127.0.0.1:7074"},
+	}).Validate()
+	require.ErrorContains(t, err, "ENCLAVE_MIGRATION_COOLDOWN")
+}
 
 func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
@@ -15,6 +52,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("ENCLAVE_ANCHOR_WINDOW", "10h")
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "10h")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "pcr0")
 	t.Setenv("APPLY_FOO", "")
@@ -59,14 +97,15 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, ssmFor(map[string]string{
-			path("ENCLAVE_DEPLOYMENT"):         "dev",
-			path("ENCLAVE_APP_NAME"):           "evil",
-			path("ENCLAVE_ANCHOR_WINDOW"):      "1s",
-			path("ENCLAVE_KMS_KEY_LOCKED"):     "false",
-			path("ENCLAVE_MIGRATION_COOLDOWN"): "0s",
-			path("ENCLAVE_SECRETS_CONFIG"):     `[{"name":"evil"}]`,
-			path("ENCLAVE_PREVIOUS_PCR0"):      "evil-pcr0",
-			path("SAFE_KEY"):                   "ok",
+			path("ENCLAVE_DEPLOYMENT"):                 "dev",
+			path("ENCLAVE_APP_NAME"):                   "evil",
+			path("ENCLAVE_ANCHOR_WINDOW"):              "1s",
+			path("ENCLAVE_KMS_KEY_LOCKED"):             "false",
+			path("ENCLAVE_MIGRATION_COOLDOWN"):         "0s",
+			path("ENCLAVE_MIGRATION_INTENT_RETENTION"): "1s",
+			path("ENCLAVE_SECRETS_CONFIG"):             `[{"name":"evil"}]`,
+			path("ENCLAVE_PREVIOUS_PCR0"):              "evil-pcr0",
+			path("SAFE_KEY"):                           "ok",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "prod", os.Getenv("ENCLAVE_DEPLOYMENT"))
@@ -74,6 +113,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Equal(t, "10h", os.Getenv("ENCLAVE_ANCHOR_WINDOW"))
 		require.Equal(t, "true", os.Getenv("ENCLAVE_KMS_KEY_LOCKED"))
 		require.Equal(t, "1m", os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
+		require.Equal(t, "10h", os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION"))
 		require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
 		require.Equal(t, "pcr0", os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))

@@ -15,13 +15,14 @@ import (
 // timing — a short anchor window would let the operator wait out the Object Lock
 // and roll back undetected.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":         true,
-	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_ANCHOR_WINDOW":      true,
-	"ENCLAVE_KMS_KEY_LOCKED":     true,
-	"ENCLAVE_MIGRATION_COOLDOWN": true,
-	"ENCLAVE_SECRETS_CONFIG":     true,
-	"ENCLAVE_PREVIOUS_PCR0":      true,
+	"ENCLAVE_DEPLOYMENT":                 true,
+	"ENCLAVE_APP_NAME":                   true,
+	"ENCLAVE_ANCHOR_WINDOW":              true,
+	"ENCLAVE_KMS_KEY_LOCKED":             true,
+	"ENCLAVE_MIGRATION_COOLDOWN":         true,
+	"ENCLAVE_MIGRATION_INTENT_RETENTION": true,
+	"ENCLAVE_SECRETS_CONFIG":             true,
+	"ENCLAVE_PREVIOUS_PCR0":              true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
@@ -107,16 +108,37 @@ func kmsKeyIDParam() string {
 	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
 }
 
-func getMigrationCooldown() time.Duration {
+func getMigrationCooldown() (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
 	if v == "" {
-		return 0
+		return 0, nil
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", v, err)
 	}
-	return d
+	if d < 0 {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+	}
+	return d, nil
+}
+
+func migrationIntentRetention() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION"))
+
+	if value == "" {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_INTENT_RETENTION must not be empty")
+	}
+
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid ENCLAVE_MIGRATION_INTENT_RETENTION %q: %w", value, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("ENCLAVE_MIGRATION_INTENT_RETENTION must be positive")
+	}
+
+	return d, nil
 }
 
 // respPort is the TLS port for the RESP K/V listener.
@@ -205,9 +227,15 @@ func storageDEKCiphertextParam(keyID string) string {
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
-// own state at genesis (and after adopting a migration). Scoped by key ID.
-func stateOriginReceiptParam(keyID string) string {
-	return fmt.Sprintf("/%s/%s/StateOriginReceipt/%s", getDeployment(), getAppName(), keyID)
+// own state at genesis (and after adopting a migration). Scoped by key ID and PCR0.
+func stateOriginReceiptParam(keyID, pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/StateOriginReceipt/%s/%s",
+		getDeployment(),
+		getAppName(),
+		keyID,
+		strings.ToLower(pcr0),
+	)
 }
 
 // migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
@@ -231,11 +259,6 @@ func migrationPreviousPCR0Param() string {
 // attestation document.
 func migrationPreviousPCR0AttestationParam() string {
 	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
-}
-
-// migrationRequestedAtParam: SSM path for the scheduled migration timestamp.
-func migrationRequestedAtParam() string {
-	return fmt.Sprintf("/%s/%s/MigrationRequestedAt", getDeployment(), getAppName())
 }
 
 func envVarOverridePath(name string) string {

@@ -21,12 +21,16 @@ import (
 	"time"
 
 	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )
 
 const (
-	indexPage      = "This host runs inside an AWS Nitro Enclave.\n"
-	nonceNumDigits = 40 // 20-byte nonce, hex-encoded
+	indexPage                 = "This host runs inside an AWS Nitro Enclave.\n"
+	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
+	migrationControlPort      = 8003
+	migrationRequestPath      = "/request-migration"
+	migrationFinalisationPath = "/finalise-migration"
 )
 
 var (
@@ -40,10 +44,10 @@ var (
 )
 
 type Servers interface {
-	Start(ctx context.Context, cfg Config)
+	Start(ctx context.Context, cfg Config) error
 	StartRESPServer(ctx context.Context, resp RESPServer) error
 	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
-	ConfigureMigrationHandler(ctx context.Context, migrator Migrator) error
+	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
 }
 
 type servers struct {
@@ -138,21 +142,26 @@ func SetupHttpServers(
 	}
 }
 
-func (s *servers) Start(ctx context.Context, cfg Config) {
+func (s *servers) Start(ctx context.Context, cfg Config) error {
+	private, err := net.Listen("tcp", s.int.Addr)
+	if err != nil {
+		return fmt.Errorf("private listener: %w", err)
+	}
+
+	public, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
+	if err != nil {
+		_ = private.Close()
+		return fmt.Errorf("public listener: %w", err)
+	}
+
 	go func() {
-		if err := s.int.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.int.Serve(private); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("private listener: %w", err))
 		}
 	}()
 
 	go func() {
-		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExtPort))
-		if err != nil {
-			s.rt.NotifyListenerError(fmt.Errorf("listen on external port: %w", err))
-			return
-		}
-
-		if err := s.ext.ServeTLS(lis, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.ext.ServeTLS(public, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("public listener: %w", err))
 		}
 	}()
@@ -162,6 +171,8 @@ func (s *servers) Start(ctx context.Context, cfg Config) {
 		_ = s.int.Close()
 		_ = s.ext.Close()
 	}()
+
+	return nil
 }
 
 func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {
@@ -194,16 +205,15 @@ func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {
 
 // RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
 type RuntimeInfo struct {
-	Version                    string          `json:"version"`
-	PreviousPCR0               string          `json:"previous_pcr0"`
-	PreviousPCR0Attestation    string          `json:"previous_pcr0_attestation,omitempty"`
-	AttestationPubkey          string          `json:"attestation_pubkey,omitempty"`
-	Metrics                    map[string]any  `json:"metrics"`
-	MigrationCooldownSeconds   int             `json:"migration_cooldown_seconds"`
-	MigrationCooldownRemaining int             `json:"migration_cooldown_remaining,omitempty"`
-	MigrationPending           bool            `json:"migration_pending"`
-	UpstreamApp                UpstreamAppInfo `json:"upstream_app"`
-	KMSKeyLocked               bool            `json:"kms_key_locked"`
+	Version                  string           `json:"version"`
+	PreviousPCR0             string           `json:"previous_pcr0"`
+	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey        string           `json:"attestation_pubkey,omitempty"`
+	Metrics                  map[string]any   `json:"metrics"`
+	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
+	Migration                *MigrationStatus `json:"migration"`
+	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
+	KMSKeyLocked             bool             `json:"kms_key_locked"`
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(
@@ -214,40 +224,76 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		cooldownStatus, err := migrator.CooldownStatus(r.Context())
+		migrationStatus, err := migrator.MigrationStatus(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprint("failed to get cooldown status: %w", err),
-				http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("failed to get migration status: %v", err),
+				migrationHTTPStatus(err))
 			return
 		}
 
 		prevInfo, err := migrator.PreviousPCR0Info(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprint("failed to get previous PCR0 info: %w", err),
+			http.Error(w, fmt.Sprintf("failed to get previous PCR0 info: %v", err),
+				http.StatusInternalServerError)
+			return
+		}
+		cooldown, err := getMigrationCooldown()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to get migration cooldown: %v", err),
 				http.StatusInternalServerError)
 			return
 		}
 
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
-			Version:                    Version,
-			PreviousPCR0:               prevInfo.PCR0,
-			PreviousPCR0Attestation:    prevInfo.Attestation,
-			AttestationPubkey:          s.signer.Pubkey(),
-			Metrics:                    s.metrics.MetricsSnapshot(),
-			MigrationCooldownSeconds:   cooldownStatus.ConfiguredSeconds,
-			MigrationCooldownRemaining: cooldownStatus.RemainingSeconds,
-			MigrationPending:           cooldownStatus.Pending,
-			UpstreamApp:                s.rt.UpstreamAppInfo(),
-			KMSKeyLocked:               kmsKeyLocked(),
+			Version:                  Version,
+			PreviousPCR0:             prevInfo.PCR0,
+			PreviousPCR0Attestation:  prevInfo.Attestation,
+			AttestationPubkey:        s.signer.Pubkey(),
+			Metrics:                  s.metrics.MetricsSnapshot(),
+			MigrationCooldownSeconds: int(cooldown.Seconds()),
+			Migration:                migrationStatus,
+			UpstreamApp:              s.rt.UpstreamAppInfo(),
+			KMSKeyLocked:             kmsKeyLocked(),
 		})
 	})
 
 	return nil
 }
 
-func (s *servers) ConfigureMigrationHandler(ctx context.Context, migrator Migrator) error {
-	s.em.HandleFunc("POST /v1/start-migration", func(w http.ResponseWriter, r *http.Request) {
-		var req StartMigrationRequest
+func (s *servers) StartMigrationControlServer(ctx context.Context, migrator Migrator) error {
+	lis, err := vsock.Listen(migrationControlPort, nil)
+	if err != nil {
+		return fmt.Errorf("listen on migration control vsock port %d: %w", migrationControlPort, err)
+	}
+
+	slog.Info("starting migration control listener", "vsock_port", migrationControlPort)
+	s.serveMigrationControl(ctx, migrator, lis)
+	return nil
+}
+
+func (s *servers) serveMigrationControl(
+	ctx context.Context,
+	migrator Migrator,
+	lis net.Listener,
+) {
+	server := &http.Server{Handler: migrationControlHandler(migrator)}
+
+	go func() {
+		<-ctx.Done()
+		_ = server.Close()
+	}()
+
+	go func() {
+		if err := server.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.rt.NotifyListenerError(fmt.Errorf("migration control listener: %w", err))
+		}
+	}()
+}
+
+func migrationControlHandler(migrator Migrator) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST "+migrationRequestPath, func(w http.ResponseWriter, r *http.Request) {
+		var req MigrationRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
 			return
@@ -258,12 +304,27 @@ func (s *servers) ConfigureMigrationHandler(ctx context.Context, migrator Migrat
 			return
 		}
 
-		res, err := migrator.StartMigration(r.Context(), req.NewPCR0)
+		status, err := migrator.HandleMigrationRequest(r.Context(), req.Action, req.TargetPCR0)
 		if err != nil {
 			http.Error(
 				w,
-				fmt.Sprintf("failed to start migration: %v", err),
-				http.StatusInternalServerError,
+				fmt.Sprintf("failed to handle migration request: %v", err),
+				migrationHTTPStatus(err),
+			)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+	})
+
+	mux.HandleFunc("POST "+migrationFinalisationPath, func(w http.ResponseWriter, r *http.Request) {
+		res, err := migrator.CompleteMigration(r.Context())
+		if err != nil {
+			http.Error(
+				w,
+				fmt.Sprintf("failed to finalise migration: %v", err),
+				migrationHTTPStatus(err),
 			)
 			return
 		}
@@ -272,7 +333,22 @@ func (s *servers) ConfigureMigrationHandler(ctx context.Context, migrator Migrat
 		_ = json.NewEncoder(w).Encode(res)
 	})
 
-	return nil
+	return mux
+}
+
+func migrationHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, errMigrationCooldownActive):
+		return http.StatusTooEarly
+	case errors.Is(err, errMigrationIntentAbsent),
+		errors.Is(err, errMigrationIntentAborted),
+		errors.Is(err, errMigrationIntentAlreadyRequested):
+		return http.StatusConflict
+	case errors.Is(err, errMigrationIntentStoreUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func responseSignerMiddleware(signer AttestedSigner) func(http.Handler) http.Handler {

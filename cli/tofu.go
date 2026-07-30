@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,16 +11,14 @@ import (
 
 // tofuVars represents the variables passed to OpenTofu via terraform.tfvars.json.
 type tofuVars struct {
-	Region            string         `json:"region"`
-	Account           string         `json:"account"`
-	Deployment        string         `json:"deployment"`
-	AppName           string         `json:"app_name"`
-	InstanceType      string         `json:"instance_type"`
-	Local             bool           `json:"local"`
-	Secrets           []SecretConfig `json:"secrets"`
-	MigrationCooldown string         `json:"migration_cooldown"`
-	ExpectedPCR0      string         `json:"expected_pcr0,omitempty"`
-	IsKMSKeyLocked    bool           `json:"is_kms_key_locked"`
+	Region         string         `json:"region"`
+	Account        string         `json:"account"`
+	Deployment     string         `json:"deployment"`
+	AppName        string         `json:"app_name"`
+	InstanceType   string         `json:"instance_type"`
+	Local          bool           `json:"local"`
+	Secrets        []SecretConfig `json:"secrets"`
+	IsKMSKeyLocked bool           `json:"is_kms_key_locked"`
 
 	// GitHub Release coordinates for build artifacts (EIF, supervisor).
 	GithubOwner string `json:"github_owner"`
@@ -63,16 +62,14 @@ func writeTofuVars(cfg *Config, root string, remote bool) error {
 	}
 
 	vars := tofuVars{
-		Region:            cfg.Region,
-		Account:           cfg.Account,
-		Deployment:        cfg.Deployment,
-		AppName:           cfg.Name,
-		InstanceType:      cfg.InstanceType,
-		Local:             os.Getenv("LOCAL_DEPLOYMENT") == "true",
-		Secrets:           cfg.Secrets,
-		MigrationCooldown: cfg.MigrationCooldown,
-		ExpectedPCR0:      readPCR0FromArtifacts(absRoot),
-		IsKMSKeyLocked:    cfg.IsKMSKeyLocked,
+		Region:         cfg.Region,
+		Account:        cfg.Account,
+		Deployment:     cfg.Deployment,
+		AppName:        cfg.Name,
+		InstanceType:   cfg.InstanceType,
+		Local:          os.Getenv("LOCAL_DEPLOYMENT") == "true",
+		Secrets:        cfg.Secrets,
+		IsKMSKeyLocked: cfg.IsKMSKeyLocked,
 
 		GithubOwner: cfg.App.NixOwner,
 		GithubRepo:  cfg.App.NixRepo,
@@ -177,12 +174,19 @@ type tofuOutputJSON map[string]struct {
 // loadTofuOutputs runs tofu output -json and parses the result.
 // It also caches the result to tofu/tofu-outputs.json for offline reads.
 func loadTofuOutputs(root string) (TofuOutputs, error) {
+	return loadTofuOutputsContext(context.Background(), root)
+}
+
+func loadTofuOutputsContext(ctx context.Context, root string) (TofuOutputs, error) {
 	dir := tofuDir(root)
 
-	cmd := exec.Command("tofu", "-chdir="+dir, "output", "-json")
+	cmd := exec.CommandContext(ctx, "tofu", "-chdir="+dir, "output", "-json")
 	cmd.Stderr = os.Stderr
 	data, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("read tofu outputs: %w", ctx.Err())
+		}
 		// Fall back to cached outputs.
 		return loadCachedTofuOutputs(root)
 	}
@@ -221,20 +225,4 @@ func loadCachedTofuOutputs(root string) (TofuOutputs, error) {
 // getOutput reads a value from OpenTofu outputs.
 func (o TofuOutputs) getOutput(key string) string {
 	return o[key]
-}
-
-// readPCR0FromArtifacts reads PCR0 from .enclave/artifacts/pcr.json if it exists.
-// Returns empty string if the file is missing (e.g. before first build).
-func readPCR0FromArtifacts(root string) string {
-	data, err := os.ReadFile(filepath.Join(root, ".enclave", "artifacts", "pcr.json"))
-	if err != nil {
-		return ""
-	}
-	var pcrs struct {
-		PCR0 string `json:"PCR0"`
-	}
-	if json.Unmarshal(data, &pcrs) != nil {
-		return ""
-	}
-	return pcrs.PCR0
 }

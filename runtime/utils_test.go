@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -471,15 +472,23 @@ func fakeKMSRSAPublicKey(attestationDoc []byte) (*rsa.PublicKey, error) {
 }
 
 type fakeS3Object struct {
-	id       string
-	body     []byte
-	lockMode s3types.ObjectLockMode
+	id           string
+	body         []byte
+	lockMode     s3types.ObjectLockMode
+	retainUntil  time.Time
+	lastModified time.Time
 }
 
 type fakeS3 struct {
 	mu      sync.Mutex
 	seq     int
 	objects map[string][]fakeS3Object
+
+	listErr          error
+	getErr           error
+	readErr          error
+	putErr           error
+	missingVersionID bool
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]fakeS3Object{}} }
@@ -581,6 +590,9 @@ func (f *fakeS3) PutObject(
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.PutObjectOutput, error) {
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	body, _ := io.ReadAll(in.Body)
@@ -589,9 +601,19 @@ func (f *fakeS3) PutObject(
 	key := aws.ToString(in.Key)
 	f.objects[key] = append(
 		f.objects[key],
-		fakeS3Object{id: id, body: body, lockMode: in.ObjectLockMode},
+		fakeS3Object{
+			id:           id,
+			body:         body,
+			lockMode:     in.ObjectLockMode,
+			retainUntil:  aws.ToTime(in.ObjectLockRetainUntilDate),
+			lastModified: time.Now().UTC(),
+		},
 	)
-	return &s3.PutObjectOutput{VersionId: aws.String(id)}, nil
+	out := &s3.PutObjectOutput{VersionId: aws.String(id)}
+	if f.missingVersionID {
+		out.VersionId = nil
+	}
+	return out, nil
 }
 
 func (f *fakeS3) GetObject(
@@ -599,12 +621,19 @@ func (f *fakeS3) GetObject(
 	in *s3.GetObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.GetObjectOutput, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	objects := f.objects[aws.ToString(in.Key)]
 	for i := len(objects) - 1; i >= 0; i-- {
 		if in.VersionId == nil || objects[i].id == aws.ToString(in.VersionId) {
-			return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(objects[i].body))}, nil
+			body := io.NopCloser(bytes.NewReader(objects[i].body))
+			if f.readErr != nil {
+				body = io.NopCloser(iotest.ErrReader(f.readErr))
+			}
+			return &s3.GetObjectOutput{Body: body}, nil
 		}
 	}
 	return nil, &s3types.NoSuchKey{}
@@ -615,6 +644,9 @@ func (f *fakeS3) ListObjectVersions(
 	in *s3.ListObjectVersionsInput,
 	_ ...func(*s3.Options),
 ) (*s3.ListObjectVersionsOutput, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	prefix := aws.ToString(in.Prefix)
@@ -624,9 +656,14 @@ func (f *fakeS3) ListObjectVersions(
 			continue
 		}
 		for _, obj := range objects {
+			lastModified := obj.lastModified
 			out = append(
 				out,
-				s3types.ObjectVersion{Key: aws.String(key), VersionId: aws.String(obj.id)},
+				s3types.ObjectVersion{
+					Key:          aws.String(key),
+					VersionId:    aws.String(obj.id),
+					LastModified: &lastModified,
+				},
 			)
 		}
 	}
@@ -687,10 +724,18 @@ func (f *fakeS3) DeleteObject(
 
 // putRawObject injects object bytes as if written outside runtime code.
 func (f *fakeS3) putRawObject(key string, body []byte) {
+	f.putRawObjectAt(key, body, time.Now().UTC())
+}
+
+func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq++
-	f.objects[key] = append(f.objects[key], fakeS3Object{id: strconv.Itoa(f.seq), body: body})
+	f.objects[key] = append(f.objects[key], fakeS3Object{
+		id:           strconv.Itoa(f.seq),
+		body:         body,
+		lastModified: lastModified,
+	})
 }
 
 func (f *fakeS3) latestBody(key string) []byte {

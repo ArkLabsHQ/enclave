@@ -8,25 +8,26 @@ Vendored from https://github.com/brave/nitriding-daemon.
 
 ## What's vendored vs dropped
 
-**Kept (25 files):** `attestation.go`, `bufferpool.go`, `cache.go`, `certcache.go`,
-`enclave.go`, `handlers.go`, `keysync_{initiator,responder,shared}.go`,
-`metrics.go`, `proxy.go`, `system.go`, `system_linux.go`, plus matching `_test.go`
-files, plus `package_init.go` (locally added).
+**Currently retained:** five upstream-derived implementation files —
+`bufferpool.go`, `proxy.go`, `system.go`, `system_linux.go`, and
+`system_darwin.go` — plus `bufferpool_test.go`, `proxy_test.go`, and
+`system_test.go`. `package_init.go` is locally added.
 
-**Dropped:** `main.go` and `main_test.go` (upstream CLI entrypoint — we construct
-the `Enclave` programmatically from [runtime/cmd/runtime/main.go](../cmd/runtime/main.go));
-`system_darwin.go` and `system_darwin_test.go` (EIF targets Linux only).
+**Dropped:** the upstream CLI entrypoint and `Enclave` API; HTTP handlers;
+TLS/cert caching; metrics; attestation/hash helpers; the expiring cache; the
+bounded reader; and key synchronization. `runtime` now owns TLS, attestation
+endpoints, state and migration, metrics, and application proxying.
 
 ## Local modifications
 
-The vendored files are byte-identical to upstream except for one line per file:
+The retained files are not byte-identical to upstream. In addition to changing
+`package main` to `package nitriding`, local changes include:
 
-    -package main
-    +package nitriding
-
-The `elog` logger, `inEnclave` package variable, and `func init()` that upstream
-defined in `main.go` are reproduced verbatim in `package_init.go` so other files
-in the package keep compiling.
+- `package_init.go` reproduces the `elog` logger, `inEnclave` state, and `init()`
+  bootstrap that upstream kept in `main.go`.
+- `proxy.go` owns only the TAP/vsock tunnel used by `runtime`; attestation,
+  HTTP, metrics, and key-sync integration were removed.
+- `system_darwin.go` remains as a compilation stub even though EIFs target Linux.
 
 **`proxy.go` — stale TAP link cleanup in `setupNetworking`.** Upstream's
 teardown only closes the vsock connection and the tap fd; the interface's IP
@@ -40,10 +41,13 @@ Re-apply this block when syncing to a newer upstream.
 
 ## Syncing to a newer upstream
 
-1. `git diff --stat v1.4.2..<new-tag> -- '*.go' ':!main*' ':!system_darwin*'` against
-   brave/nitriding-daemon.
-2. Apply the diff here, preserving the `package nitriding` first line.
-3. If upstream adds package-level state or logic to `main.go`, port it into
-   `package_init.go`.
+This tree is intentionally pruned. Sync only fixes relevant to the retained
+buffer-pool, TAP/vsock, Linux system, and entropy-bootstrap code; do not restore
+dropped subsystems unless production callers are added.
+
+1. Compare `v1.4.2..<new-tag>` for the retained paths in brave/nitriding-daemon.
+2. Apply fixes selectively, preserving `package nitriding`, the platform stubs,
+   and the stale-TAP cleanup above.
+3. If upstream adds package-level bootstrap logic to `main.go`, port the relevant
+   parts into `package_init.go`.
 4. Update this file's Tag / Rev / Vendored date.
-5. Bump `vendorHash` in [flake.nix](../../flake.nix).

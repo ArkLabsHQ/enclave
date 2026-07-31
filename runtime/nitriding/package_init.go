@@ -8,8 +8,6 @@ import (
 
 var (
 	elog = log.New(os.Stderr, "nitriding: ", log.Ldate|log.Ltime|log.LUTC|log.Lshortfile)
-	// Elog is the exported logger.
-	Elog = elog
 	// inEnclave is true when /dev/nsm is present.
 	inEnclave = false
 )

@@ -17,6 +17,13 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const (
+	// parentCID is the vsock CID of the parent EC2 instance. Per AWS docs
+	// it's always 3:
+	// https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave-concepts.html
+	parentCID = 3
+)
+
 var (
 	frameLen     = 0xffff
 	frameSizeLen = 2

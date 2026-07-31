@@ -172,8 +172,94 @@ func TestObserveHardStep(t *testing.T) {
 	_, isHardStep, stepToNs := captureAdjust(cs, offsetMeasurement{xMonoNs: 2 * nsPerSecond, phcNs: 42_000_000_000, offsetNs: 200 * 1_000_000})
 	require.True(t, isHardStep, "gross offset triggers hard-step")
 	require.Equal(t, int64(42_000_000_000), stepToNs)
-	require.False(t, cs.hasPreviousMeasurement, "hard-step resets the interval baseline")
+	require.Equal(t, int64(2*nsPerSecond), cs.lastXMonoNs, "hard-step restarts the interval baseline")
+}
 
+func TestAdjustCommitsStateOnlyOnSuccess(t *testing.T) {
+	origAdj := clockAdjtime
+	defer func() { clockAdjtime = origAdj }()
+
+	cs := &clockSyncer{cfg: defaultServoConfig()}
+	captureAdjust(cs, offsetMeasurement{xMonoNs: 0, offsetNs: 6_000_000})
+	captureAdjust(cs, offsetMeasurement{xMonoNs: 300 * nsPerSecond, offsetNs: 6_000_000})
+
+	integral, baseline := cs.integralPpm, cs.lastXMonoNs
+	require.NotZero(t, integral, "warm-up leaves a standing integral")
+
+	clockAdjtime = func(int32, *unix.Timex) (int, error) { return 0, errors.New("EPERM") }
+	err := cs.adjust(offsetMeasurement{xMonoNs: 310 * nsPerSecond, offsetNs: 6_200_000})
+
+	require.Error(t, err)
+	require.Equal(t, integral, cs.integralPpm, "integral must not advance past a failed adjustment")
+	require.Equal(t, baseline, cs.lastXMonoNs, "baseline must not advance past a failed adjustment")
+}
+
+func TestClockPollInterval(t *testing.T) {
+	cases := []struct {
+		name            string
+		dev, deployment string
+		want            time.Duration
+	}{
+		{"dev polls fast", "true", "prod", 5 * time.Second},
+		{"prod polls every 5min", "", "prod", 5 * time.Minute},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_DEV", c.dev)
+			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			require.Equal(t, c.want, clockPollInterval())
+		})
+	}
+}
+
+func TestMeasureOffset(t *testing.T) {
+	original := clockGettime
+	t.Cleanup(func() { clockGettime = original })
+	const fd = 3
+	phcID := fdToClockID(fd)
+	var calls []int32
+	clockGettime = func(clockID int32, ts *unix.Timespec) error {
+		calls = append(calls, clockID)
+		switch clockID {
+		case unix.CLOCK_REALTIME:
+			*ts = unix.Timespec{Sec: 100, Nsec: 200}
+		case phcID:
+			*ts = unix.Timespec{Sec: 100, Nsec: 500}
+		case unix.CLOCK_MONOTONIC_RAW:
+			*ts = unix.Timespec{Sec: 5, Nsec: 7}
+		default:
+			t.Fatalf("unexpected clock ID: %d", clockID)
+		}
+		return nil
+	}
+
+	got, err := (&clockSyncer{fd: fd}).measureOffset()
+
+	require.NoError(t, err)
+	require.Equal(t, offsetMeasurement{
+		xMonoNs:  5*nsPerSecond + 7,
+		phcNs:    100*nsPerSecond + 500,
+		offsetNs: 300,
+	}, got)
+	require.Equal(t, []int32{
+		unix.CLOCK_REALTIME,
+		phcID,
+		unix.CLOCK_MONOTONIC_RAW,
+	}, calls)
+}
+
+func TestAdjustSetsFrequencyOnly(t *testing.T) {
+	origAdj := clockAdjtime
+	defer func() { clockAdjtime = origAdj }()
+
+	var modes uint32
+	clockAdjtime = func(_ int32, tx *unix.Timex) (int, error) { modes = tx.Modes; return 0, nil }
+
+	cs := &clockSyncer{cfg: defaultServoConfig()}
+	require.NoError(t, cs.adjust(offsetMeasurement{xMonoNs: 0, offsetNs: 1000}))
+
+	require.Equal(t, uint32(unix.ADJ_FREQUENCY), modes,
+		"ADJ_STATUS would replace every writable status flag, clearing STA_UNSYNC and pending STA_INS/STA_DEL")
 }
 
 // TestNewClockSyncer covers the OS-facing bootstrap: every failure path is fatal
@@ -327,7 +413,7 @@ func TestSyncHandlesMeasurementGap(t *testing.T) {
 	})
 	require.True(t, hardStep, "144ms offset exceeds the 100ms step threshold")
 	require.Equal(t, int64(123_456_789), stepToNs, "hard-step targets the PHC")
-	require.False(t, cs.hasPreviousMeasurement, "hard-step resets the interval baseline")
+	require.Equal(t, int64((gapS+7200)*nsPerSecond), cs.lastXMonoNs, "hard-step restarts the interval baseline")
 }
 
 // TestServoConvergence closes the loop through adjust() and asserts the integral term

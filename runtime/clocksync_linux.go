@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -44,6 +45,9 @@ import (
 const (
 	ptpDevicePath = "/dev/ptp0"
 
+	clockSourcePath = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+	wantClockSource = "kvm-clock"
+
 	freqScale        = 1 << 16 // ppm << 16
 	kernelMaxFreqPpm = 500.0
 	nsPerPpmPerSec   = 1000.0 // 1 ppm == 1 us/s == 1000 ns/s
@@ -52,7 +56,18 @@ const (
 
 	clockSyncRetryInterval  = 10 * time.Second
 	clockSyncFailureTimeout = time.Minute
+
+	// 5 min matches Evervault's /dev/ptp0 sync cadence:
+	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
+	clockSyncPollInterval = 5 * time.Minute
 )
+
+func clockPollInterval() time.Duration {
+	if IsDev() {
+		return 5 * time.Second
+	}
+	return clockSyncPollInterval
+}
 
 // offsetMeasurement is one PHC/REALTIME comparison.
 type offsetMeasurement struct {
@@ -78,8 +93,8 @@ func defaultServoConfig() servoConfig {
 }
 
 // clockSyncer owns the open PHC device and carries the PI servo state inline
-// (integralPpm is the standing frequency correction; lastXMonoNs/hasPreviousMeasurement
-// bound the per-poll interval).
+// (integralPpm is the standing frequency correction; lastXMonoNs bounds the
+// per-poll interval).
 type clockSyncer struct {
 	file     *os.File
 	fd       int
@@ -88,13 +103,22 @@ type clockSyncer struct {
 	retryInterval  time.Duration
 	failureTimeout time.Duration
 
-	cfg                    servoConfig
-	integralPpm            float64 // integral term: the standing frequency correction
-	lastXMonoNs            int64
-	hasPreviousMeasurement bool
+	cfg         servoConfig
+	integralPpm float64 // integral term: the standing frequency correction
+	lastXMonoNs int64
 }
 
 func StartClockSyncer(ctx context.Context) (context.Context, error) {
+	if verifyClockSourceEnabled() {
+		data, err := os.ReadFile(clockSourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("read current clocksource: %w", err)
+		}
+		if clocksource := strings.TrimSpace(string(data)); clocksource != wantClockSource {
+			return nil, fmt.Errorf("current clocksource is %q, want %q", clocksource, wantClockSource)
+		}
+	}
+
 	cs, err := newClockSyncer()
 	if err != nil {
 		return nil, err
@@ -129,9 +153,16 @@ func newClockSyncer() (*clockSyncer, error) {
 	}
 	slog.Info("clock sync: initial hard-step to hypervisor PTP completed")
 
+	var mono unix.Timespec
+	if err := clockGettime(unix.CLOCK_MONOTONIC_RAW, &mono); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("establish initial clock baseline: %w", err)
+	}
+
 	return &clockSyncer{
 		file:           file,
 		fd:             int(file.Fd()),
+		lastXMonoNs:    unix.TimespecToNsec(mono),
 		interval:       clockPollInterval(),
 		retryInterval:  clockSyncRetryInterval,
 		failureTimeout: clockSyncFailureTimeout,
@@ -195,7 +226,7 @@ func (cs *clockSyncer) step(ctx context.Context) error {
 			)
 		}
 
-		slog.Warn("clock sync: read failed, retrying", "error", err)
+		slog.Warn("clock sync: synchronization attempt failed, retrying", "error", err)
 
 		timer := time.NewTimer(cs.retryInterval)
 		select {
@@ -219,10 +250,10 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 	raw := m.offsetNs
 	// Gross offset: jump the clock and restart the loop (the standing frequency persists).
 	if raw > cs.cfg.maxStepNs || raw < -cs.cfg.maxStepNs {
-		cs.hasPreviousMeasurement = false
 		ts := unix.NsecToTimespec(m.phcNs)
 		err := clockSettime(unix.CLOCK_REALTIME, &ts)
 		if err == nil {
+			cs.lastXMonoNs = m.xMonoNs
 			slog.Warn("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)
 		}
 		return err
@@ -230,22 +261,23 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 
 	applied := cs.integralPpm // warm-up holds the standing integral until there is an interval
 	proportionalPpm := 0.0
+	nextIntegralPpm := cs.integralPpm
 	if correctingFreqPpm, ok := cs.frequencyErrorPpm(m); ok {
-		cs.integralPpm = clampFloat(cs.integralPpm+cs.cfg.ki*correctingFreqPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+		nextIntegralPpm = clampFloat(cs.integralPpm+cs.cfg.ki*correctingFreqPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
 		proportionalPpm = cs.cfg.kp * correctingFreqPpm
-		applied = clampFloat(proportionalPpm+cs.integralPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+		applied = clampFloat(proportionalPpm+nextIntegralPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
 	}
-	cs.lastXMonoNs = m.xMonoNs
-	cs.hasPreviousMeasurement = true
 
 	tx := unix.Timex{
-		Modes:  unix.ADJ_FREQUENCY | unix.ADJ_STATUS,
-		Status: unix.STA_FREQHOLD,
-		Freq:   ppmToKernelFreq(applied),
+		Modes: unix.ADJ_FREQUENCY,
+		Freq:  ppmToKernelFreq(applied),
 	}
 	if _, err := clockAdjtime(unix.CLOCK_REALTIME, &tx); err != nil {
 		return err
 	}
+
+	cs.integralPpm = nextIntegralPpm
+	cs.lastXMonoNs = m.xMonoNs
 
 	slog.Info("clock sync: disciplined",
 		"freq_ppm", applied, // what is applied: proportional + integral
@@ -258,7 +290,7 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 
 func (cs *clockSyncer) frequencyErrorPpm(m offsetMeasurement) (ppm float64, ok bool) {
 	elapsedSeconds := float64(m.xMonoNs-cs.lastXMonoNs) / nsPerSecond
-	if !cs.hasPreviousMeasurement || elapsedSeconds <= 0 {
+	if elapsedSeconds <= 0 {
 		return 0, false
 	}
 	return float64(m.offsetNs) / (elapsedSeconds * nsPerPpmPerSec), true

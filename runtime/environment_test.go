@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -102,28 +101,6 @@ func TestIsDev(t *testing.T) {
 			t.Setenv("ENCLAVE_DEV", c.dev)
 			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
 			require.Equal(t, c.want, IsDev())
-		})
-	}
-}
-
-func TestClockPollInterval(t *testing.T) {
-	cases := []struct {
-		name                      string
-		override, dev, deployment string
-		want                      time.Duration
-	}{
-		{"explicit override wins even in prod", "2s", "", "prod", 2 * time.Second},
-		{"invalid override ignored, prod default", "garbage", "", "prod", 5 * time.Minute},
-		{"non-positive override ignored, prod default", "0s", "", "prod", 5 * time.Minute},
-		{"dev polls fast", "", "true", "prod", 5 * time.Second},
-		{"prod polls every 5min", "", "", "prod", 5 * time.Minute},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_CLOCK_POLL_INTERVAL", c.override)
-			t.Setenv("ENCLAVE_DEV", c.dev)
-			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
-			require.Equal(t, c.want, clockPollInterval())
 		})
 	}
 }

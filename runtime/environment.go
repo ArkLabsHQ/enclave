@@ -15,14 +15,15 @@ import (
 // (a short anchor window would let the operator wait out the Object Lock and roll
 // back undetected). ENCLAVE_DEV would skip COSE verification when set.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":         true,
-	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_ANCHOR_WINDOW":      true,
-	"ENCLAVE_KMS_KEY_LOCKED":     true,
-	"ENCLAVE_MIGRATION_COOLDOWN": true,
-	"ENCLAVE_SECRETS_CONFIG":     true,
-	"ENCLAVE_PREVIOUS_PCR0":      true,
-	"ENCLAVE_DEV":                true,
+	"ENCLAVE_DEPLOYMENT":          true,
+	"ENCLAVE_APP_NAME":            true,
+	"ENCLAVE_ANCHOR_WINDOW":       true,
+	"ENCLAVE_KMS_KEY_LOCKED":      true,
+	"ENCLAVE_MIGRATION_COOLDOWN":  true,
+	"ENCLAVE_SECRETS_CONFIG":      true,
+	"ENCLAVE_PREVIOUS_PCR0":       true,
+	"ENCLAVE_DEV":                 true,
+	"ENCLAVE_VERIFY_CLOCK_SOURCE": true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
@@ -127,18 +128,13 @@ func getMigrationCooldown() time.Duration {
 	return d
 }
 
-func clockPollInterval() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("ENCLAVE_CLOCK_POLL_INTERVAL")); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-	if IsDev() {
-		return 5 * time.Second
-	}
-	// 5 min matches Evervault's /dev/ptp0 sync cadence:
-	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
-	return 5 * time.Minute
+// verifyClockSourceEnabled gates the kvm-clock assertion. Only trustworthy when
+// baked into the measured EIF; harnesses that boot without the paravirtualized
+// clock leave it unset.
+func verifyClockSourceEnabled() bool {
+	return strings.EqualFold(
+		strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE")), "true",
+	)
 }
 
 // respPort is the TLS port for the RESP K/V listener.

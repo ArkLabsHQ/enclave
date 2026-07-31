@@ -107,8 +107,10 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 	}
 
 	if opts.skipCOSE {
-		fmt.Fprintln(os.Stderr,
-			"WARNING: skipping attestation COSE signature and AWS Nitro root chain verification — QEMU/local test only")
+		fmt.Fprintln(
+			os.Stderr,
+			"WARNING: skipping attestation COSE signature and AWS Nitro root chain verification — QEMU/local test only",
+		)
 	}
 
 	c, err := client.New(baseURL, client.Options{

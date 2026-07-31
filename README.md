@@ -789,7 +789,6 @@ nix flake check
 | `eif-build` | Builds two EIFs, validates PCR0 shape, and proves the measurements differ. |
 | `ami-build` | Builds the production host system closure. |
 | `tofu-validate` | Resolves the pinned AWS provider offline and runs `tofu validate` against the generated stack. |
-| `qemu-ami-boot` | Boots an EIF under the QEMU host and proves NSM and PTP clock sync work. |
 | `e2e` | The complete lifecycle: AMI registration, OpenTofu blue/green, runtime genesis, clock-skew recovery, migration handshake, EIP cutover, and retirement. |
 
 Unit tests are not flake checks. Run them with `make test`, or
@@ -798,11 +797,10 @@ available.
 
 ### Requirements
 
-`qemu-ami-boot` and `e2e` are `x86_64-linux` only, because QEMU's
-`nitro-enclave` machine type is x86_64 only. The remaining checks run on
-`aarch64-linux` as well.
+`e2e` is `x86_64-linux` only because QEMU's `nitro-enclave` machine type is
+x86_64 only. The remaining checks run on `aarch64-linux` as well.
 
-Both QEMU checks need a builder with:
+The e2e check needs a builder with:
 
 - `/dev/kvm`
 - nested virtualisation enabled

@@ -114,12 +114,6 @@ in
 }
 # QEMU's nitro-enclave machine type is x86_64-only.
 // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-  # The QEMU-AMI variant boots the EIF through its hardware-dependent stages.
-  qemu-ami-boot = import ./qemu-ami-boot.nix {
-    inherit pkgs self;
-    eif = blueEif;
-  };
-
   e2e = import ./e2e.nix {
     inherit
       pkgs

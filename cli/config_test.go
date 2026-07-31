@@ -27,6 +27,7 @@ account: "123456789012"
 deployment: prod
 instance_type: c6i.xlarge
 migration_cooldown: "5m"
+migration_intent_retention: "24h"
 previous_pcr0: abc123
 app:
   language: rust
@@ -70,6 +71,9 @@ sdk:
 	}
 	if cfg.MigrationCooldown != "5m" {
 		t.Errorf("MigrationCooldown = %q, want %q", cfg.MigrationCooldown, "5m")
+	}
+	if cfg.MigrationIntentRetention != "24h" {
+		t.Errorf("MigrationIntentRetention = %q, want %q", cfg.MigrationIntentRetention, "24h")
 	}
 	if cfg.PreviousPCR0 != "abc123" {
 		t.Errorf("PreviousPCR0 = %q, want %q", cfg.PreviousPCR0, "abc123")
@@ -165,6 +169,9 @@ region: eu-west-1
 	if cfg.MigrationCooldown != "0s" {
 		t.Errorf("MigrationCooldown = %q, want %q", cfg.MigrationCooldown, "0s")
 	}
+	if cfg.MigrationIntentRetention != "87600h" {
+		t.Errorf("MigrationIntentRetention = %q, want %q", cfg.MigrationIntentRetention, "87600h")
+	}
 	if cfg.PreviousPCR0 != "genesis" {
 		t.Errorf("PreviousPCR0 = %q, want %q", cfg.PreviousPCR0, "genesis")
 	}
@@ -194,6 +201,20 @@ migration_cooldown: "not-a-duration"
 `)
 	_, err := loadConfig()
 	requireErrContains(t, err, "invalid migration_cooldown")
+}
+
+func TestLoadConfig_InvalidMigrationIntentRetention(t *testing.T) {
+	for _, value := range []string{"not-a-duration", "0s", "-1h"} {
+		t.Run(value, func(t *testing.T) {
+			writeConfig(t, `
+name: myapp
+region: us-east-1
+migration_intent_retention: "`+value+`"
+`)
+			_, err := loadConfig()
+			requireErrContains(t, err, "invalid migration_intent_retention")
+		})
+	}
 }
 
 func TestLoadConfig_SecretValidation(t *testing.T) {

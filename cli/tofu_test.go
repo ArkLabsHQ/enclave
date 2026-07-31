@@ -106,6 +106,102 @@ func TestWriteTofuVars_Route53ZoneID(t *testing.T) {
 	}
 }
 
+func TestTofuReceiptIAMPolicy(t *testing.T) {
+	requireContains(t, tofuModuleEnclaveMain, `  statement {
+    sid     = "SSMReadWriteParams"
+    actions = ["ssm:GetParameter", "ssm:PutParameter"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/${local.lock_segment}/KMSKeyID",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StateOriginReceipt/*/*",
+      "arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/MigrationStateOriginReceipt/*",
+    ]
+  }`)
+
+	for _, notWant := range []string{
+		`"arn:aws:ssm:${var.region}:${var.account}:parameter/${var.deployment}/${var.app_name}/StateOriginReceipt/*"`,
+		`"ssm:Delete`,
+	} {
+		if strings.Contains(tofuModuleEnclaveMain, notWant) {
+			t.Errorf("generated instance policy unexpectedly contains %q", notWant)
+		}
+	}
+}
+
+func TestTofuCandidateArtifactsAreAppendOnly(t *testing.T) {
+	markers := []struct {
+		name  string
+		value string
+	}{
+		{"PCR-addressed EIF key", `candidate_eif_key        = "candidates/${local.effective_pcr0}/enclave.eif"`},
+		{"PCR-addressed supervisor key", `candidate_supervisor_key = "candidates/${local.effective_pcr0}/supervisor"`},
+		{"removed EIF object", `from = aws_s3_object.enclave_eif`},
+		{"removed supervisor object", `from = aws_s3_object.supervisor_binary`},
+		{"unified upload resource", `resource "terraform_data" "candidate_upload"`},
+		{"artifact iteration", `for_each = local.candidate_artifacts`},
+		{"content comparison", `cmp -s "$SOURCE" "$WORK/existing"`},
+		{"overwrite refusal", `refusing to overwrite retained candidate s3://$BUCKET/$KEY`},
+		{"instance upload dependency", `terraform_data.candidate_upload,`},
+	}
+	for _, marker := range markers {
+		t.Run(marker.name, func(t *testing.T) {
+			requireContains(t, tofuModuleEnclaveMain, marker.value)
+		})
+	}
+
+	if strings.Contains(tofuModuleEnclaveMain, `resource "aws_s3_object"`) {
+		t.Error("candidate publication uses lifecycle-managed aws_s3_object resources")
+	}
+
+	for _, name := range []string{
+		"candidate_pcr0",
+		"candidate_artifact_bucket",
+		"candidate_eif_key",
+		"candidate_supervisor_key",
+		"migration_intent_bucket",
+	} {
+		requireContains(t, tofuModuleEnclaveMain, `output "`+name+`"`)
+		requireContains(t, tofuRootMain, `value       = module.enclave.`+name)
+	}
+}
+
+func TestTofuMigrationIntentInfrastructure(t *testing.T) {
+	for _, want := range []string{
+		`object_lock_enabled = true`,
+		`resource "aws_s3_bucket_versioning" "migration_intent"`,
+		`resource "aws_s3_bucket_policy" "migration_intent"`,
+		`Action    = "s3:ListBucketVersions"`,
+		`"s3:PutObjectRetention"`,
+		`name      = "/${var.deployment}/${var.app_name}/MigrationIntentBucketName"`,
+		`aws_ssm_parameter.migration_intent_bucket_name.arn`,
+	} {
+		requireContains(t, tofuModuleEnclaveMain, want)
+	}
+}
+
+func TestTofuHasNoAutomaticMigration(t *testing.T) {
+	if strings.Contains(tofuRootMain+tofuModuleEnclaveMain, "/migrate") {
+		t.Error("generated Tofu contains automatic migration")
+	}
+	requireContains(t, tofuModuleEnclaveMain, "ignore_changes = [ami, user_data]")
+}
+
+func TestMigrationCooldownIsEIFOnly(t *testing.T) {
+	if strings.Contains(frameworkUserData, "ENCLAVE_MIGRATION_COOLDOWN") {
+		t.Error("host user data exports the EIF-only migration cooldown")
+	}
+	requireContains(t, frameworkFlakeNix,
+		`ENCLAVE_MIGRATION_COOLDOWN=${buildCfg.migration_cooldown or "0s"}`)
+	requireContains(t, frameworkFlakeNix,
+		`ENCLAVE_MIGRATION_INTENT_RETENTION=${buildCfg.migration_intent_retention or "87600h"}`)
+}
+
+func requireContains(t *testing.T, value, substring string) {
+	t.Helper()
+	if !strings.Contains(value, substring) {
+		t.Errorf("missing %q", substring)
+	}
+}
+
 // TestTofuUpdate_RefreshesOnlyTfvars confirms that `enclave tofu update`
 // regenerates terraform.tfvars.json from enclave.yaml while leaving the
 // scaffolded module files (main.tf, modules/enclave/main.tf) untouched.

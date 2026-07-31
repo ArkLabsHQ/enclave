@@ -10,7 +10,7 @@ on:
 jobs:
   enclave-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -49,15 +49,19 @@ jobs:
           cd $RUNTIME_LOCAL_PATH/runtime && go mod vendor && cd $GITHUB_WORKSPACE/test/app
           go mod vendor
 
-          # Build v1 once; stash to /tmp so v2's baked predecessor PCR0 is
-          # guaranteed to match the final installed v1.
+          # Preserve the checked fixture exactly; variants are temporary build inputs.
+          cp enclave/enclave.yaml /tmp/enclave.yaml.original
+          trap 'cp /tmp/enclave.yaml.original enclave/enclave.yaml' EXIT
+
+          # v1 is the source and keeps the fixture's short nonzero cooldown.
           /tmp/enclave-cli build
           cp .enclave/artifacts/image.eif /tmp/image-v1.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v1.json
           V1_PCR0=$(jq -r '.PCR0' /tmp/pcr-v1.json)
 
-          # Build v2 EIF with previous_pcr0 set to v1's PCR0.
+          # v2 is A, the healthy non-genesis successor to G, with zero cooldown.
           sed -i 's/^version: .*/version: 0.0.2/' enclave/enclave.yaml
+          sed -i 's/^migration_cooldown: .*/migration_cooldown: "0s"/' enclave/enclave.yaml
           if grep -q '^previous_pcr0:' enclave/enclave.yaml; then
             sed -i "s/^previous_pcr0: .*/previous_pcr0: \"${V1_PCR0}\"/" enclave/enclave.yaml
           else
@@ -68,19 +72,23 @@ jobs:
           cp .enclave/artifacts/image.eif /tmp/image-v2.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v2.json
 
-          # v3: wrong app name → /dev/my-app-wrong/KMSKeyID 404 → Init fails → rollback.
+          # v3 is B, a healthy zero-cooldown successor to A.
           V2_PCR0=$(jq -r '.PCR0' /tmp/pcr-v2.json)
           sed -i 's/^version: .*/version: 0.0.3/' enclave/enclave.yaml
           sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" enclave/enclave.yaml
-          sed -i 's|^name: my-app\b|name: my-app-wrong|' enclave/enclave.yaml
           /tmp/enclave-cli build
           cp .enclave/artifacts/image.eif /tmp/image-v3.eif
           cp .enclave/artifacts/pcr.json /tmp/pcr-v3.json
 
-          # Restore yaml to v1 state (no rebuild — would produce a divergent PCR0).
-          sed -i 's/^version: .*/version: 0.0.1/' enclave/enclave.yaml
-          sed -i '/^previous_pcr0:/d' enclave/enclave.yaml
-          sed -i 's|^name: my-app-wrong\b|name: my-app|' enclave/enclave.yaml
+          # v4 is C, a sibling of B with A (not B) as its predecessor.
+          sed -i 's/^version: .*/version: 0.0.4/' enclave/enclave.yaml
+          sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" enclave/enclave.yaml
+          /tmp/enclave-cli build
+          cp .enclave/artifacts/image.eif /tmp/image-v4.eif
+          cp .enclave/artifacts/pcr.json /tmp/pcr-v4.json
+
+          cp /tmp/enclave.yaml.original enclave/enclave.yaml
+          trap - EXIT
 
           # Install all artifacts from /tmp.
           cp /tmp/image-v1.eif .enclave/artifacts/image.eif
@@ -91,6 +99,8 @@ jobs:
           cp /tmp/pcr-v2.json .enclave/artifacts/pcr-v2.json
           cp /tmp/image-v3.eif .enclave/artifacts/image-v3.eif
           cp /tmp/pcr-v3.json .enclave/artifacts/pcr-v3.json
+          cp /tmp/image-v4.eif .enclave/artifacts/image-v4.eif
+          cp /tmp/pcr-v4.json .enclave/artifacts/pcr-v4.json
 
       - name: Run integration test
         run: cd test && docker compose --profile test run --build test-runner

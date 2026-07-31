@@ -56,6 +56,7 @@ boot_qemu() {
   eif_path="$(realpath "$eif_path")"
 
   local guest_cid="${GUEST_CID:-4}"
+  local forward_cid="${VSOCK_FORWARD_CID:-1}"
   local memory="${MEMORY:-4G}"
   local vsock_socket="/tmp/vhost${guest_cid}.socket"
   local boot_timeout="${BOOT_TIMEOUT:-300}"
@@ -88,9 +89,9 @@ boot_qemu() {
   echo "=== Starting vhost-device-vsock ==="
   echo "  CID:        $guest_cid"
   echo "  Socket:     $vsock_socket"
-  echo "  Forward:    CID 1 (loopback)"
+  echo "  Forward:    CID ${forward_cid} (loopback), host-to-guest port 8003"
   vhost-device-vsock \
-    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=1,forward-listen=9001+9002" &
+    --vm "guest-cid=${guest_cid},socket=${vsock_socket},forward-cid=${forward_cid},forward-listen=8003+9001+9002" &
   vsock_pid=$!
   sleep 1
   if ! kill -0 "$vsock_pid" 2>/dev/null; then
@@ -226,17 +227,15 @@ elif command -v go &>/dev/null; then
   echo "Building enclave CLI and supervisor..."
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_CLI" ./cli/cmd/enclave)
   (cd "$REPO_ROOT" && go build -o "$ENCLAVE_SUPERVISOR" ./supervisor/cmd/supervisor)
-  # Seed the artifacts dir with the real v1 supervisor binary so the first
-  # tofu_apply uploads it (not an empty placeholder) to the staging S3
-  # key. Step 7 later overwrites this file with a v2 variant to force
-  # Step 10 down the swap path.
-  mkdir -p "${SCRIPT_DIR}/app/.enclave/artifacts"
-  cp "$ENCLAVE_SUPERVISOR" "${SCRIPT_DIR}/app/.enclave/artifacts/supervisor"
 else
   echo "Error: neither pre-built binaries (enclave-cli, supervisor) nor Go compiler found" >&2
   exit 1
 fi
 
+# Seed the artifacts dir with the binary under test so Tofu publishes the same
+# supervisor for every candidate and self-update does not install a stale build.
+mkdir -p "${SCRIPT_DIR}/app/.enclave/artifacts"
+cp "$ENCLAVE_SUPERVISOR" "${SCRIPT_DIR}/app/.enclave/artifacts/supervisor"
 
 echo "  CLI:  $ENCLAVE_CLI"
 echo "  Supervisor: $ENCLAVE_SUPERVISOR"
@@ -278,10 +277,8 @@ tofu_apply() {
 
   echo "  Generating terraform.tfvars.json..."
 
-  # Ensure artifact placeholders exist for tofu's filemd5() (local mode
-  # doesn't actually use these S3 objects — the enclave boots from QEMU).
-  # Only image.eif and supervisor are uploaded now; gvproxy is vendored
-  # into the supervisor binary itself.
+  # Ensure inputs exist for tofu's filemd5(). The enclave initially boots in
+  # QEMU, while migrations download these generated candidate objects from S3.
   mkdir -p "${SCRIPT_DIR}/app/.enclave/artifacts"
   for f in image.eif supervisor; do
     [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/$f" ] || touch "${SCRIPT_DIR}/app/.enclave/artifacts/$f"
@@ -347,10 +344,16 @@ tofu_destroy() {
 
 EIF_PATH="${1:-}"
 SUP_PID=""
+FIXTURE_YAML_BACKUP=""
+ACTIVE_EIF_PATH="/tmp/enclave-active.eif"
 
 cleanup() {
   echo ""
   echo "=== Tearing down ==="
+  if [ -n "$FIXTURE_YAML_BACKUP" ] && [ -f "$FIXTURE_YAML_BACKUP" ]; then
+    cp -f "$FIXTURE_YAML_BACKUP" "${SCRIPT_DIR}/app/enclave/enclave.yaml"
+    rm -f "$FIXTURE_YAML_BACKUP"
+  fi
   tofu_destroy
   # Kill supervisor relauncher (which TERM-traps and kills its child supervisor).
   [ -n "${SUP_PID:-}" ] && kill -TERM "$SUP_PID" 2>/dev/null && wait "$SUP_PID" 2>/dev/null || true
@@ -360,6 +363,7 @@ cleanup() {
     rm -f /tmp/supervisor.pid
   fi
   rm -f /tmp/supervisor-relauncher.sh
+  rm -f "$ACTIVE_EIF_PATH"
   # Kill enclave (boot_qemu) via PID file.
   if [ -f /tmp/enclave-boot.pid ]; then
     kill "$(cat /tmp/enclave-boot.pid)" 2>/dev/null || true
@@ -454,7 +458,7 @@ if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
 fi
 
 # Step 0: Build test EIF from skeleton app.
-echo "=== [0/9] Building test EIF from skeleton app ==="
+echo "=== [0/11] Building test EIF from skeleton app ==="
 if [ -n "$EIF_PATH" ] && [ -f "$EIF_PATH" ]; then
   echo "  Using provided EIF: $EIF_PATH"
 elif [ "$IN_DOCKER" = true ]; then
@@ -462,56 +466,82 @@ elif [ "$IN_DOCKER" = true ]; then
   if [ -f "app/.enclave/artifacts/image.eif" ]; then
     EIF_PATH="app/.enclave/artifacts/image.eif"
     echo "  Using pre-built EIF: $EIF_PATH"
-    if [ -f "app/.enclave/artifacts/image-v2.eif" ]; then
-      echo "  Migration EIF: app/.enclave/artifacts/image-v2.eif"
-    else
-      echo "  WARN: No migration EIF (image-v2.eif) — Step 7 will reuse same EIF"
-    fi
+    echo "  Migration EIFs: v1=G, v2=A, v3=B, v4=C (B/C both follow A)"
   else
     echo "  Error: EIF must be pre-built when running inside Docker" >&2
     echo "  Build it on the host first: cd test/app && enclave build" >&2
     exit 1
   fi
 else
-  # On host: build v1 EIF, then v2 with different version for migration testing.
+  # On host: build the same four fixtures as CI.
   ENCLAVE_YAML="${SCRIPT_DIR}/app/enclave/enclave.yaml"
   ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
-  ORIG_VERSION=$(grep '^version:' "$ENCLAVE_YAML" | awk '{print $2}')
+  FIXTURE_YAML_BACKUP="$(mktemp /tmp/enclave-yaml.XXXXXX)"
+  cp "$ENCLAVE_YAML" "$FIXTURE_YAML_BACKUP"
 
-  echo "  Building v1 EIF (version ${ORIG_VERSION})..."
-  (cd app && "$ENCLAVE_CLI" build)
-  EIF_PATH="app/.enclave/artifacts/image.eif"
-  V1_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
-  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v1.json"
+  echo "  Building v1 EIF with baked nonzero cooldown..."
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
+  cp "${ARTIFACTS}/image.eif" /tmp/image-v1.eif
+  cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v1.json
+  V1_PCR0=$(jq -r '.PCR0' /tmp/pcr-v1.json)
   echo "  v1 PCR0: ${V1_PCR0:0:16}..."
 
-  # Build v2 with previous_pcr0 set to v1's PCR0.
-  # This exercises the runtime's previousPCR0 validation during v2 Init:
-  # the enclave checks that ENCLAVE_PREVIOUS_PCR0 (baked from enclave.yaml)
-  # matches MigrationPreviousPCR0 in SSM (stored by v1's start-migration).
-  echo "  Building v2 EIF (version 0.0.2, previous_pcr0=${V1_PCR0:0:16}...)..."
+  echo "  Building healthy v2 EIF with zero cooldown..."
   sed -i 's/^version: .*/version: 0.0.2/' "$ENCLAVE_YAML"
+  sed -i 's/^migration_cooldown: .*/migration_cooldown: "0s"/' "$ENCLAVE_YAML"
   if grep -q '^previous_pcr0:' "$ENCLAVE_YAML"; then
     sed -i "s/^previous_pcr0: .*/previous_pcr0: \"${V1_PCR0}\"/" "$ENCLAVE_YAML"
   else
     echo "" >> "$ENCLAVE_YAML"
     echo "previous_pcr0: \"${V1_PCR0}\"" >> "$ENCLAVE_YAML"
   fi
-  (cd app && "$ENCLAVE_CLI" build)
-  cp "${ARTIFACTS}/image.eif" "${ARTIFACTS}/image-v2.eif"
-  cp "${ARTIFACTS}/pcr.json" "${ARTIFACTS}/pcr-v2.json"
-  echo "  v2 PCR0: $(jq -r '.PCR0' "${ARTIFACTS}/pcr-v2.json" | cut -c1-16)..."
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
+  cp "${ARTIFACTS}/image.eif" /tmp/image-v2.eif
+  cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v2.json
+  V2_PCR0=$(jq -r '.PCR0' /tmp/pcr-v2.json)
 
-  # Restore v1 as the active EIF (genesis for first boot).
-  sed -i "s/^version: .*/version: ${ORIG_VERSION}/" "$ENCLAVE_YAML"
-  sed -i '/^previous_pcr0:/d' "$ENCLAVE_YAML"
-  (cd app && "$ENCLAVE_CLI" build)
-  echo "  Restored v1"
+  echo "  Building healthy v3 EIF with zero cooldown..."
+  sed -i 's/^version: .*/version: 0.0.3/' "$ENCLAVE_YAML"
+  sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" "$ENCLAVE_YAML"
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
+  cp "${ARTIFACTS}/image.eif" /tmp/image-v3.eif
+  cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v3.json
+  V3_PCR0=$(jq -r '.PCR0' /tmp/pcr-v3.json)
+
+  echo "  Building healthy v4 EIF as a sibling of v3 (predecessor v2)..."
+  sed -i 's/^version: .*/version: 0.0.4/' "$ENCLAVE_YAML"
+  sed -i "s|^previous_pcr0: .*|previous_pcr0: \"${V2_PCR0}\"|" "$ENCLAVE_YAML"
+  (cd app && RUNTIME_LOCAL_PATH="$REPO_ROOT" SUPERVISOR_LOCAL_PATH="$REPO_ROOT" \
+    APP_LOCAL_PATH="${SCRIPT_DIR}/app" "$ENCLAVE_CLI" build)
+  cp "${ARTIFACTS}/image.eif" /tmp/image-v4.eif
+  cp "${ARTIFACTS}/pcr.json" /tmp/pcr-v4.json
+
+  cp -f "$FIXTURE_YAML_BACKUP" "$ENCLAVE_YAML"
+  rm -f "$FIXTURE_YAML_BACKUP"
+  FIXTURE_YAML_BACKUP=""
+  for version in 1 2 3 4; do
+    cp "/tmp/image-v${version}.eif" "${ARTIFACTS}/image-v${version}.eif"
+    cp "/tmp/pcr-v${version}.json" "${ARTIFACTS}/pcr-v${version}.json"
+  done
+  cp /tmp/image-v1.eif "${ARTIFACTS}/image.eif"
+  cp /tmp/pcr-v1.json "${ARTIFACTS}/pcr.json"
+  EIF_PATH="app/.enclave/artifacts/image.eif"
+  echo "  Restored exact YAML and selected v1"
 fi
+for version in 1 2 3 4; do
+  if [ ! -f "${SCRIPT_DIR}/app/.enclave/artifacts/image-v${version}.eif" ] || \
+     [ ! -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v${version}.json" ]; then
+    echo "  Error: missing v${version} migration fixture artifacts" >&2
+    exit 1
+  fi
+done
 echo ""
 
 # Step 1: Start mock services (skipped inside Docker — compose handles it).
-echo "=== [1/9] Starting mock services ==="
+echo "=== [1/11] Starting mock services ==="
 if [ "$IN_DOCKER" = true ]; then
   echo "  Skipped (services managed by docker compose)"
 else
@@ -521,7 +551,7 @@ fi
 echo ""
 
 # Step 2: Deploy to localstack via OpenTofu and start supervisor.
-echo "=== [2/9] Deploying to localstack via tofu ==="
+echo "=== [2/11] Deploying to localstack via tofu ==="
 
 # Clean up any stale state from previous runs.
 tofu_destroy
@@ -539,7 +569,10 @@ tofu_apply
 # This lets ENCLAVE_SUPERVISOR_RESTART_CMD just kill the current supervisor process; the
 # supervisor resurrects it with the updated on-disk binary.
 echo "  Starting supervisor..."
-EIF_ABS_PATH="$(realpath "$EIF_PATH")"
+# Keep the running EIF separate from the mutable Tofu candidate input. Applying
+# a candidate must never change what a watchdog restart boots.
+cp -f "$EIF_PATH" "$ACTIVE_EIF_PATH"
+EIF_ABS_PATH="$ACTIVE_EIF_PATH"
 
 SUPERVISOR_PIDFILE=/tmp/supervisor.pid
 SUP_RELAUNCHER=/tmp/supervisor-relauncher.sh
@@ -563,6 +596,10 @@ chmod +x "$SUP_RELAUNCHER"
 export ENCLAVE_AWS_REGION=us-east-1
 export ENCLAVE_DEPLOYMENT=dev
 export ENCLAVE_APP_NAME=my-app
+# vhost-device-vsock owns QEMU's actual guest CID and exposes selected guest
+# ports on its host loopback forward CID. The supervisor must dial that bridge,
+# not the unrelated production default CID or the unregistered QEMU guest CID.
+export ENCLAVE_CID="${VSOCK_FORWARD_CID:-1}"
 export ENCLAVE_SUPERVISOR_ADDR="127.0.0.1:8444"
 # The supervisor runs in-process gvproxy (vsock:1024) and IMDS forwarder
 # (vsock:8002) just as it does in prod. Only the enclave launcher differs:
@@ -574,7 +611,6 @@ export GVPROXY_FORWARD_PORTS="8443:443"
 # Point the in-process IMDS forwarder at mock-imds instead of the real
 # 169.254.169.254 (which isn't reachable from the test container).
 export IMDS_PROXY_TARGET="127.0.0.1:1338"
-export ENCLAVE_MIGRATION_COOLDOWN="1m"
 # Shorten commit-poll timeout so rollback tests don't wait 5min for the default.
 export ENCLAVE_MIGRATION_COMMIT_TIMEOUT="45s"
 export ENCLAVE_URL="https://127.0.0.1:8443"
@@ -594,7 +630,7 @@ export AWS_SECRET_ACCESS_KEY=test
 # independent KMS mocks: LocalStack at :4566 holds the pcr0_signing key
 # that tofu created; kms-proxy → local-kms at :4000 holds the runtime's
 # encryption key. Exporting AWS_ENDPOINT_URL_KMS=4000 globally would
-# leak into the migration's second tofu_apply, whose local-exec would
+# leak into later candidate applies, whose local-exec would
 # then ask local-kms for a key UUID that only exists in LocalStack.
 AWS_ENDPOINT_URL_KMS="http://127.0.0.1:4000" \
   "$SUP_RELAUNCHER" "$ENCLAVE_SUPERVISOR" "$SUPERVISOR_PIDFILE" &
@@ -615,7 +651,7 @@ echo ""
 # Step 3: The supervisor's watchdog launches the enclave via
 # ENCLAVE_START_CMD (→ boot_qemu) on its own. We just wait for it to
 # come up.
-echo "=== [3/9] Booting enclave in QEMU ==="
+echo "=== [3/11] Booting enclave in QEMU ==="
 wait_for_enclave "initial boot"
 echo ""
 
@@ -649,533 +685,819 @@ fi
 echo ""
 
 # Step 4: Run integration tests.
-echo "=== [4/9] Running integration tests ==="
+echo "=== [4/11] Running integration tests ==="
 ./integration-test.sh
 echo ""
 
-# Step 5: Verify migration cooldown fields in enclave-info (pre-migration).
-echo "=== [5/9] Migration cooldown: pre-migration check ==="
-COOLDOWN_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-COOLDOWN_SEC=$(echo "$COOLDOWN_INFO" | jq -r '.migration_cooldown_seconds // -1' 2>/dev/null || echo "-1")
-MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "missing" end' 2>/dev/null || echo "missing")
-if echo "$COOLDOWN_INFO" | jq -e 'has("migration_cooldown_seconds")' >/dev/null 2>&1; then
-  echo "  PASS: migration_cooldown_seconds=${COOLDOWN_SEC}, migration_pending=${MIG_PENDING}"
-else
-  echo "  FAIL: migration_cooldown_seconds missing from enclave-info" >&2
-  exit 1
-fi
-if [ "$MIG_PENDING" = "false" ]; then
-  echo "  PASS: No migration pending before deploy"
-else
-  echo "  FAIL: migration_pending should be false before deploy (got: ${MIG_PENDING})" >&2
-  exit 1
-fi
+# Step 5: candidate publication and explicit migration control.
+echo "=== [5/11] Explicit migration: v1 -> v2 ==="
+SUPERVISOR_URL="http://127.0.0.1:${SUPERVISOR_PORT:-8444}"
+ENCLAVE_LOCAL_URL="https://127.0.0.1:${HOST_TLS_PORT:-8443}"
+ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
+V1_PCR0=$(jq -r '.PCR0 | ascii_downcase' "${ARTIFACTS}/pcr-v1.json")
+V2_PCR0=$(jq -r '.PCR0 | ascii_downcase' "${ARTIFACTS}/pcr-v2.json")
+V3_PCR0=$(jq -r '.PCR0 | ascii_downcase' "${ARTIFACTS}/pcr-v3.json")
+V4_PCR0=$(jq -r '.PCR0 | ascii_downcase' "${ARTIFACTS}/pcr-v4.json")
 
-# Verify tofu's app.env overrides (supplied via env_values.auto.tfvars.json)
-# flowed through SSM into the running app. Both keys default to "default-from-yaml"
-# in enclave.yaml; the env file overrides them with distinct values.
-ENV_OVERRIDE_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/env-override" 2>/dev/null || echo "")
-ENV_OVERRIDE_VAL=$(echo "$ENV_OVERRIDE_RESP" | jq -r '.test_runtime_override // empty' 2>/dev/null || echo "")
-ENV_OVERRIDE_ENVFILE_VAL=$(echo "$ENV_OVERRIDE_RESP" | jq -r '.test_runtime_override_envfile // empty' 2>/dev/null || echo "")
-if [ "$ENV_OVERRIDE_VAL" = "override-from-tofu" ]; then
-  echo "  PASS: app.env override applied (TEST_RUNTIME_OVERRIDE=${ENV_OVERRIDE_VAL})"
-else
-  printf "  FAIL: app.env override not applied — got %q, want \"override-from-tofu\" (response: %s)\n" "$ENV_OVERRIDE_VAL" "${ENV_OVERRIDE_RESP:0:120}" >&2
-  exit 1
-fi
-if [ "$ENV_OVERRIDE_ENVFILE_VAL" = "override-from-envfile" ]; then
-  echo "  PASS: env-file override applied (TEST_RUNTIME_OVERRIDE_ENVFILE=${ENV_OVERRIDE_ENVFILE_VAL})"
-else
-  printf "  FAIL: env-file override not applied — got %q, want \"override-from-envfile\" (response: %s)\n" "$ENV_OVERRIDE_ENVFILE_VAL" "${ENV_OVERRIDE_RESP:0:120}" >&2
-  exit 1
-fi
-echo ""
-
-# Step 5.5: Runtime resilience — issue #122. The upstream app crashing must
-# NOT take the runtime down (which would void any in-flight migration). We
-# trigger /test/crash on the app, then assert the runtime keeps serving
-# /health and /v1/enclave-info while app routes surface as 502.
-echo "=== [5.5/9] Runtime resilience: upstream app crash ==="
-HOST_TLS_PORT_VAL="${HOST_TLS_PORT:-8443}"
-RESILIENCE_BASE="https://localhost:${HOST_TLS_PORT_VAL}"
-RESILIENCE_LOG="${SCRIPT_DIR}/crash-resilience.log"
-: > "$RESILIENCE_LOG"
-
-# Trigger crash. Connection will reset partway — that's expected; we only
-# need the request to hit the app.
-curl -sk -X POST --max-time 5 "${RESILIENCE_BASE}/test/crash" \
-  >>"$RESILIENCE_LOG" 2>&1 || true
-
-# Give the runtime a moment to observe child exit + flip the latch.
-sleep 3
-
-# 1) /health must still return 200 — proves the runtime is alive.
-HEALTH=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${RESILIENCE_BASE}/health" 2>>"$RESILIENCE_LOG" || echo "000")
-if [ "$HEALTH" != "200" ]; then
-  echo "  FAIL: runtime died after app crash (/health=${HEALTH}); see ${RESILIENCE_LOG}" >&2
-  exit 1
-fi
-echo "  PASS: /health=200 after app crash (runtime alive)"
-
-# 2) /v1/enclave-info.upstream_app.exited must be true.
-RUNTIME_INFO=$(curl -sk --max-time 5 "${RESILIENCE_BASE}/v1/enclave-info" 2>>"$RESILIENCE_LOG" || echo "")
-APP_EXITED=$(echo "$RUNTIME_INFO" | jq -r '.upstream_app.exited // false' 2>/dev/null || echo "false")
-APP_ERROR=$(echo "$RUNTIME_INFO" | jq -r '.upstream_app.error // ""' 2>/dev/null || echo "")
-if [ "$APP_EXITED" != "true" ]; then
-  printf "  FAIL: enclave-info.upstream_app.exited=%q, want true (response: %s)\n" "$APP_EXITED" "${RUNTIME_INFO:0:200}" >&2
-  exit 1
-fi
-echo "  PASS: enclave-info.upstream_app.exited=true (error: ${APP_ERROR:-<empty>})"
-
-# 3) Any non-/v1 path proxied to the dead app must surface as 502 (reverse
-#    proxy's ErrorHandler).
-APP_PROXY=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${RESILIENCE_BASE}/test/storage-persistence" 2>>"$RESILIENCE_LOG" || echo "000")
-if [ "$APP_PROXY" != "502" ]; then
-  echo "  FAIL: dead-app route returned ${APP_PROXY}, want 502" >&2
-  exit 1
-fi
-echo "  PASS: dead-app route returns 502 via reverse proxy"
-echo "  Note: app stays dead until step [7/9] migration replaces the EIF —"
-echo "        intermediate steps [6/9] cooldown only use /v1/* runtime endpoints."
-echo ""
-
-# Step 6: Migration cooldown abort test.
-# Start a migration in the background (enters cooldown), verify pending=true,
-# abort, verify pending=false.
-echo "=== [6/9] Migration cooldown: abort test ==="
-SUPERVISOR_URL="http://localhost:${SUPERVISOR_PORT:-8444}"
-
-# KMS endpoint deliberately omitted — the aws kms calls below use
-# explicit --endpoint-url; exporting AWS_ENDPOINT_URL_KMS=4000 here would
-# leak into step 7's tofu_apply local-exec (see line 583 for context).
+# KMS endpoint deliberately remains explicit on KMS calls. Exporting the local
+# KMS proxy globally would divert Tofu's PCR0-signing calls away from LocalStack.
 export AWS_ENDPOINT_URL_SSM="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_STS="http://127.0.0.1:4566"
 export AWS_ENDPOINT_URL_S3="http://127.0.0.1:4566"
 
-# Trigger migration directly via supervisor in the background.
-# (Not via tofu — we need to abort mid-migration, which tofu can't do.)
-ABORT_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
-aws s3 mb "s3://${ABORT_EIF_BUCKET}" $LOCALSTACK 2>/dev/null || true
-aws s3 cp "$EIF_PATH" "s3://${ABORT_EIF_BUCKET}/image.eif" $LOCALSTACK 2>/dev/null
-ABORT_PCR0=$(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json")
-curl -sf -X POST "${SUPERVISOR_URL}/migrate" \
-  -H 'Content-Type: application/json' \
-  -d "{\"eif_bucket\":\"${ABORT_EIF_BUCKET}\",\"eif_key\":\"image.eif\",\"pcr0\":\"${ABORT_PCR0}\",\"secret_names\":[\"signing_key\"]}" \
-  > /tmp/deploy-abort-test.log 2>&1 &
-DEPLOY_PID=$!
-
-# Poll for migration_pending=true (timeout 30s).
-echo "  Waiting for migration_pending=true..."
-MIG_PENDING="false"
-for i in $(seq 1 30); do
-  COOLDOWN_INFO=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-  MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "false" end' 2>/dev/null || echo "false")
-  if [ "$MIG_PENDING" = "true" ]; then
-    COOLDOWN_REM=$(echo "$COOLDOWN_INFO" | jq -r '.migration_cooldown_remaining // 0' 2>/dev/null || echo "0")
-    echo "  PASS: migration_pending=true after ${i}s (remaining=${COOLDOWN_REM}s)"
-    break
-  fi
-  sleep 1
-done
-if [ "$MIG_PENDING" != "true" ]; then
-  echo "  FAIL: migration_pending never became true (timed out after 30s)" >&2
-  echo "  Last enclave-info response:"
-  echo "$COOLDOWN_INFO" | jq . 2>/dev/null | sed 's/^/    /' || echo "    (not valid JSON)"
-  echo "  Deploy log (full):"
-  cat /tmp/deploy-abort-test.log 2>/dev/null | sed 's/^/    /'
-  exit 1
-fi
-
-# Abort the migration.
-ABORT_CODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "${SUPERVISOR_URL}/migrate/abort" 2>/dev/null || echo "000")
-if [ "$ABORT_CODE" = "200" ]; then
-  echo "  PASS: Migration aborted (HTTP 200)"
-else
-  echo "  FAIL: Abort returned HTTP ${ABORT_CODE}" >&2
-  exit 1
-fi
-
-# Wait for the aborted deploy to exit.
-wait "$DEPLOY_PID" 2>/dev/null || true
-
-# Poll for migration_pending=false (timeout 15s, accounts for 5s SSM cache).
-echo "  Waiting for migration_pending=false..."
-MIG_PENDING="true"
-for i in $(seq 1 15); do
-  COOLDOWN_INFO=$(curl -sk --max-time 5 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-  MIG_PENDING=$(echo "$COOLDOWN_INFO" | jq -r 'if has("migration_pending") then .migration_pending | tostring else "false" end' 2>/dev/null || echo "false")
-  if [ "$MIG_PENDING" = "false" ]; then
-    echo "  PASS: migration_pending=false after abort (${i}s)"
-    break
-  fi
-  sleep 1
-done
-if [ "$MIG_PENDING" != "false" ]; then
-  echo "  FAIL: migration_pending still true after abort (timed out after 15s)" >&2
-  exit 1
-fi
-echo ""
-
-# Step 7: Deploy migration with a different EIF (different PCR0).
-# A real migration deploys new code with a different PCR0. The second EIF
-# must be pre-built on the host (see build-migration-eif.sh) and placed at
-# app/.enclave/artifacts/image-v2.eif. If not available, fall back to same EIF.
-echo "=== [7/9] Running migration (tofu apply upgrade) ==="
-MIGRATION_EIF="${SCRIPT_DIR}/app/.enclave/artifacts/image-v2.eif"
-if [ -f "$MIGRATION_EIF" ]; then
-  echo "  Using migration EIF: $MIGRATION_EIF"
-  cp "$MIGRATION_EIF" "${SCRIPT_DIR}/app/.enclave/artifacts/image.eif"
-  # Update pcr.json with the v2 PCR0.
-  if [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" ]; then
-    cp "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v2.json" "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json"
-  fi
-else
-  echo "  WARN: No migration EIF found (image-v2.eif), reusing same EIF"
-fi
-
-# Re-apply with the new EIF — tofu detects expected_pcr0 changed and triggers
-# enclave_migration_local, which calls the supervisor to perform live migration.
-echo "  v2 PCR0: $(jq -r '.PCR0' "${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json" | cut -c1-16)..."
-
-# Snapshot the current supervisor child PID so we can verify Step 10 actually
-# restarted it (supervisor writes new child's PID back to the pidfile).
-PRE_MIGRATION_SUP_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
-echo "  Pre-migration supervisor PID: $PRE_MIGRATION_SUP_PID"
-tofu_apply
-echo "  tofu apply log (migration lines):"
-grep -i 'migrat\|trigger\|null_resource\|local-exec\|curl\|skip' ${SCRIPT_DIR}/tofu-apply.log 2>/dev/null | sed 's/^/    /' || echo "    (no migration lines found)"
-
-# Report migration rollback directly — supervisor-update won't have run, so the
-# "supervisor update ready" check below would only surface the symptom.
-if grep -q '"status":"rollback-complete"' "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
-  echo "  FAIL: migration rolled back — happy-path migration was expected to commit" >&2
-  echo "  Rollback reason (from tofu-apply.log):" >&2
-  grep -E '"status":"(error|rollback)"' "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
-  echo "  v2 init errors (from /tmp/boot-qemu.log):" >&2
-  grep -E 'enclave init failed|ERROR|previous_pcr0|migration|promote|KMS|decrypt' /tmp/boot-qemu.log 2>/dev/null | tail -20 | sed 's/^/    /' >&2 \
-    || echo "    (boot-qemu.log empty or unavailable)" >&2
-  echo "  Full tofu-apply.log tail:" >&2
-  tail -30 "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
-  exit 1
-fi
-
-# Supervisor binary update: handler emits "supervisor update ready" after validate passes.
-if ! grep -q "supervisor update ready" "${SCRIPT_DIR}/tofu-apply.log" 2>/dev/null; then
-  echo "  FAIL: supervisor update did not complete — no 'supervisor update ready' NDJSON line" >&2
-  echo "  Last 30 lines of tofu-apply.log:" >&2
-  tail -30 "${SCRIPT_DIR}/tofu-apply.log" | sed 's/^/    /' >&2
-  exit 1
-fi
-echo "  PASS: supervisor update ready — validate passed and binary was swapped"
-
-# Wait for scheduleSupervisorAtomicRestart (2s detached sleep + systemctl restart)
-# to run the restart cmd, for supervisor to exit, and for the supervisor to relaunch
-# it with the new binary. The helper also polls /supervisor/health and rolls back
-# on failure, but since validate passed and the binary is healthy, no rollback.
-POST_MIGRATION_SUP_PID=""
-for i in $(seq 1 15); do
-  sleep 1
-  CURRENT_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
-  if [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$PRE_MIGRATION_SUP_PID" ] && kill -0 "$CURRENT_PID" 2>/dev/null; then
-    POST_MIGRATION_SUP_PID="$CURRENT_PID"
-    break
-  fi
-done
-if [ -z "$POST_MIGRATION_SUP_PID" ]; then
-  echo "  FAIL: relauncher did not relaunch supervisor within 15s (pidfile=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null), pre=$PRE_MIGRATION_SUP_PID)" >&2
-  exit 1
-fi
-echo "  PASS: supervisor restarted ($PRE_MIGRATION_SUP_PID → $POST_MIGRATION_SUP_PID)"
-
-# Sanity-check the new supervisor process serves requests.
-if curl -sf --max-time 5 "http://127.0.0.1:8444/health" >/dev/null 2>&1; then
-  echo "  PASS: restarted supervisor answering /health"
-else
-  echo "  FAIL: restarted supervisor not responding on /health" >&2
-  exit 1
-fi
-
-# Verify the CLI promoted the staging object onto the canonical supervisor
-# key after the migration succeeded (null_resource.promote_supervisor_binary_local).
-ASSETS_BUCKET=$(aws s3api list-buckets $LOCALSTACK --query "Buckets[?starts_with(Name, 'dev-my-app-assets-')].Name | [0]" --output text 2>/dev/null || echo "")
-if [ -n "$ASSETS_BUCKET" ] && [ "$ASSETS_BUCKET" != "None" ]; then
-  if aws s3api head-object $LOCALSTACK --bucket "$ASSETS_BUCKET" --key "supervisor" >/dev/null 2>&1; then
-    echo "  PASS: Canonical supervisor S3 key promoted"
-  else
-    echo "  FAIL: Canonical supervisor S3 key not found in $ASSETS_BUCKET" >&2
-    exit 1
-  fi
-else
-  echo "  WARN: assets bucket not found — skipping canonical-promotion check"
-fi
-
-# Step 8: Wait for restarted enclave and verify migration survival.
-# supervisor already stopped and restarted the enclave in step 7 (via boot_qemu).
-# The new enclave must decrypt secrets from the NEW KMS key and re-import
-# the storage DEK from migrated ciphertexts.
-echo "=== [8/9] Post-migration verification ==="
-wait_for_enclave "post-migration restart"
-HTTP_CODE=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
-  "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" = "200" ]; then
-  echo "  PASS: Enclave healthy after restart"
-else
-  echo "  FAIL: Enclave unhealthy after restart (HTTP $HTTP_CODE)" >&2
-  exit 1
-fi
-
-# Verify previous_pcr0 was updated (no longer "genesis" after start-migration).
-POST_MIG_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-PREV_PCR0=$(echo "$POST_MIG_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
-if [ -n "$PREV_PCR0" ] && [ "$PREV_PCR0" != "genesis" ]; then
-  echo "  PASS: previous_pcr0 updated after migration (${PREV_PCR0:0:16}...)"
-else
-  echo "  FAIL: previous_pcr0 should not be genesis after migration (got: ${PREV_PCR0:-empty})" >&2
-  exit 1
-fi
-
-# Verify previous_pcr0 matches v1 PCR0 from build artifacts.
-V1_PCR0_FILE="${SCRIPT_DIR}/app/.enclave/artifacts/pcr.json"
-if [ -f "${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v1.json" ]; then
-  V1_PCR0_FILE="${SCRIPT_DIR}/app/.enclave/artifacts/pcr-v1.json"
-fi
-if [ -f "$V1_PCR0_FILE" ]; then
-  EXPECTED_PCR0=$(jq -r '.PCR0' "$V1_PCR0_FILE" 2>/dev/null || echo "")
-  if [ -n "$EXPECTED_PCR0" ]; then
-    # PCR0 from enclave-info is lowercase, normalize for comparison.
-    PREV_PCR0_LOWER=$(echo "$PREV_PCR0" | tr '[:upper:]' '[:lower:]')
-    EXPECTED_PCR0_LOWER=$(echo "$EXPECTED_PCR0" | tr '[:upper:]' '[:lower:]')
-    if [ "$PREV_PCR0_LOWER" = "$EXPECTED_PCR0_LOWER" ]; then
-      echo "  PASS: previous_pcr0 matches v1 build PCR0"
-    else
-      echo "  WARN: previous_pcr0 mismatch with v1 build (enclave=${PREV_PCR0:0:32}... build=${EXPECTED_PCR0:0:32}...)"
-    fi
-  fi
-fi
-
-
-# Verify static secrets decrypted from new KMS key.
-SECRETS_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/secrets" 2>/dev/null || echo "")
-if echo "$SECRETS_RESP" | jq -e '.status == "ok"' >/dev/null 2>&1; then
-  echo "  PASS: Static secrets decrypted from new KMS key"
-else
-  echo "  FAIL: Static secrets not available after restart: ${SECRETS_RESP:0:120}" >&2
-  exit 1
-fi
-
-# Verify storage round-trip (DEK re-imported from migrated ciphertext).
-STORAGE_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage" 2>/dev/null || echo "")
-if echo "$STORAGE_RESP" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  echo "  PASS: Storage round-trip works (DEK re-imported)"
-else
-  echo "  FAIL: Storage broken after restart: ${STORAGE_RESP:0:120}" >&2
-  exit 1
-fi
-
-# Verify persistent storage key survived migration+restart (written in integration test 13).
-# GET /test/storage-persistence reads the known key and compares byte-for-byte.
-# 200+ok=true → data intact. 404 → data lost. 500 → value corrupted. All non-200 are FAIL.
-PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage-persistence" 2>/dev/null || echo "")
-if echo "$PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  echo "  PASS: Persistent storage survived migration+restart"
-else
-  echo "  FAIL: Persistent storage lost or corrupted during migration: ${PERSIST_RESP:0:200}" >&2
-  exit 1
-fi
-
-# Verify attestation pubkey + PCR16 survived migration (written in integration test 15).
-# GET /test/attestation-persistence re-derives current values and compares to stored.
-# 200+ok=true → SIGNING_KEY intact and derivation matches. 404 → storage lost. 500 → mismatch.
-ATTEST_PERSIST_RESP=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/attestation-persistence" 2>/dev/null || echo "")
-if echo "$ATTEST_PERSIST_RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
-  echo "  PASS: Attestation pubkey + PCR16 identical after migration (SIGNING_KEY survived)"
-else
-  echo "  FAIL: Attestation data lost or changed during migration!" >&2
-  echo "$ATTEST_PERSIST_RESP" | jq . >&2
-  exit 1
-fi
-
-# Step 8.5: Verify new atomic-migration observability endpoints and CLI commands.
-echo ""
-echo "=== [8.5/9] Atomic migration observability checks ==="
-
-# /supervisor/health — AWS auth + SSM + enclave reachability + migration lock state.
-SUP_HEALTH_CODE=$(curl -s --max-time 5 -o /tmp/supervisor-health.json -w '%{http_code}' \
-  "http://127.0.0.1:8444/supervisor/health" 2>/dev/null || echo "000")
-if [ "$SUP_HEALTH_CODE" = "200" ]; then
-  SUP_HEALTH_STATUS=$(jq -r '.status // empty' /tmp/supervisor-health.json 2>/dev/null || echo "")
-  if [ "$SUP_HEALTH_STATUS" = "ok" ]; then
-    echo "  PASS: /supervisor/health reports ok"
-  else
-    echo "  FAIL: /supervisor/health returned status=$SUP_HEALTH_STATUS" >&2
-    cat /tmp/supervisor-health.json >&2
-    exit 1
-  fi
-else
-  echo "  FAIL: /supervisor/health HTTP $SUP_HEALTH_CODE" >&2
-  cat /tmp/supervisor-health.json 2>/dev/null >&2
-  exit 1
-fi
-
-# After a migration, KMSKeyID names the new key and the secret's ciphertext
-# lives at the key-scoped path under it (flipping KMSKeyID is the atomic commit).
-NEW_KEY=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/unlocked/KMSKeyID" \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$NEW_KEY" ] || [ "$NEW_KEY" = "UNSET" ]; then
-  echo "  FAIL: KMSKeyID empty after migration" >&2
-  exit 1
-fi
-NEW_CT=$(aws ssm get-parameter $LOCALSTACK \
-  --name "/dev/my-app/unlocked/signing_key/Ciphertext/$NEW_KEY" \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -n "$NEW_CT" ] && [ "$NEW_CT" != "UNSET" ]; then
-  echo "  PASS: signing_key ciphertext present under new key (key-scoped commit)"
-else
-  echo "  FAIL: /dev/my-app/unlocked/signing_key/Ciphertext/$NEW_KEY missing after migration" >&2
-  exit 1
-fi
-
-# `enclave migration-status` CLI command — should show the migrated KMS key.
-if [ -x "$ENCLAVE_CLI" ]; then
-  (cd app && "$ENCLAVE_CLI" migration-status > /tmp/migration-status.out 2>&1) || true
-  if grep -q "$NEW_KEY" /tmp/migration-status.out 2>/dev/null; then
-    echo "  PASS: 'enclave migration-status' reports the migrated KMS key"
-  else
-    echo "  WARN: 'enclave migration-status' did not show the new key"
-    sed 's/^/    /' /tmp/migration-status.out 2>/dev/null | head -10
-  fi
-fi
-
-
-# Step 8.7: State-origin tamper (issue #131). The boot-time state_root commits to
-# every ciphertext the runtime owns, so overwriting one in SSM — as a host with
-# un-gated KMS Encrypt could — must make resume fail closed, not decrypt
-# attacker-known bytes. Drive the bounce via the supervisor's /stop (sets the
-# stopped latch, so the watchdog won't relaunch underneath us) and /start.
-echo ""
-echo "=== [8.7/11] State-origin: tampered ciphertext → fail closed ==="
-DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${NEW_KEY}"
-ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$ORIG_DEK" ]; then
-  echo "  FAIL: could not read KMSKeyID / StorageDEK ciphertext from SSM" >&2
-  exit 1
-fi
-
-restart_enclave() {
-  curl -sf -X POST "${SUPERVISOR_URL}/stop"  >/dev/null 2>&1 || true
-  curl -sf -X POST "${SUPERVISOR_URL}/start" >/dev/null 2>&1 || true
+migration_status() {
+  (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" migration \
+    --enclave-url "$ENCLAVE_LOCAL_URL" status)
 }
 
-# Swap the storage-DEK ciphertext for a different (valid base64) value, then
-# bounce the enclave so it takes the resume path against the tampered state.
-aws ssm put-parameter --name "$DEK_PARAM" --value "dGFtcGVyZWQtY2lwaGVydGV4dA==" \
-  --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
-restart_enclave
+migration_request() {
+  (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" migration \
+    --supervisor-url "$SUPERVISOR_URL" "$@" request)
+}
 
-# Resume must reject it: /health must NOT reach 200. The 30s window stays under
-# the watchdog's 60s boot-grace.
-echo "  Asserting enclave stays unhealthy on tampered state (30s)..."
-TAMPER_HEALTHY="false"
-for _ in $(seq 1 30); do
-  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
-    "https://localhost:${HOST_TLS_PORT:-8443}/health" 2>/dev/null || echo "000")
-  if [ "$CODE" = "200" ]; then TAMPER_HEALTHY="true"; break; fi
+migration_abort() {
+  (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" migration \
+    --supervisor-url "$SUPERVISOR_URL" abort)
+}
+
+migration_finalise() {
+  (cd "${SCRIPT_DIR}/app" && "$ENCLAVE_CLI" migration \
+    --supervisor-url "$SUPERVISOR_URL" finalise "$@")
+}
+
+migration_json() {
+  curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/v1/enclave-info" | jq -c '.migration'
+}
+
+current_kms_key() {
+  aws ssm get-parameter $LOCALSTACK \
+    --name "/dev/my-app/unlocked/KMSKeyID" \
+    --query 'Parameter.Value' --output text
+}
+
+restart_enclave() {
+  curl -sf --max-time 10 -X POST "${SUPERVISOR_URL}/stop" >/dev/null
+  curl -sf --max-time 10 -X POST "${SUPERVISOR_URL}/start" >/dev/null
+}
+
+publish_candidate() {
+  local version="$1" expected_pcr0="$2"
+  cp "${ARTIFACTS}/image-v${version}.eif" "${ARTIFACTS}/image.eif"
+  cp "${ARTIFACTS}/pcr-v${version}.json" "${ARTIFACTS}/pcr.json"
+  tofu_apply
+
+  capture_candidate "$version" "$expected_pcr0"
+}
+
+capture_candidate() {
+  local version="$1" expected_pcr0="$2"
+
+  CANDIDATE_PCR0=$(tofu -chdir="$TOFU_DIR" output -raw candidate_pcr0)
+  CANDIDATE_BUCKET=$(tofu -chdir="$TOFU_DIR" output -raw candidate_artifact_bucket)
+  CANDIDATE_EIF_KEY=$(tofu -chdir="$TOFU_DIR" output -raw candidate_eif_key)
+  CANDIDATE_SUPERVISOR_KEY=$(tofu -chdir="$TOFU_DIR" output -raw candidate_supervisor_key)
+  if [ "$CANDIDATE_PCR0" != "$expected_pcr0" ] || \
+     [ "$CANDIDATE_EIF_KEY" != "candidates/${expected_pcr0}/enclave.eif" ] || \
+     [ "$CANDIDATE_SUPERVISOR_KEY" != "candidates/${expected_pcr0}/supervisor" ]; then
+    echo "  FAIL: Tofu candidate outputs are not PCR0-addressed for v${version}" >&2
+    exit 1
+  fi
+  printf -v "V${version}_CANDIDATE_BUCKET" '%s' "$CANDIDATE_BUCKET"
+  printf -v "V${version}_CANDIDATE_EIF_KEY" '%s' "$CANDIDATE_EIF_KEY"
+  printf -v "V${version}_CANDIDATE_SUPERVISOR_KEY" '%s' "$CANDIDATE_SUPERVISOR_KEY"
+  aws s3api head-object $LOCALSTACK --bucket "$CANDIDATE_BUCKET" \
+    --key "$CANDIDATE_EIF_KEY" >/dev/null
+  aws s3api head-object $LOCALSTACK --bucket "$CANDIDATE_BUCKET" \
+    --key "$CANDIDATE_SUPERVISOR_KEY" >/dev/null
+  echo "  PASS: Tofu published v${version} at candidates/${expected_pcr0}/"
+}
+
+assert_candidate_retained() {
+  local version="$1" label="$2"
+  local bucket_var="V${version}_CANDIDATE_BUCKET"
+  local eif_var="V${version}_CANDIDATE_EIF_KEY"
+  local supervisor_var="V${version}_CANDIDATE_SUPERVISOR_KEY"
+  local bucket="${!bucket_var}" eif_key="${!eif_var}" supervisor_key="${!supervisor_var}"
+  if ! aws s3api head-object $LOCALSTACK --bucket "$bucket" --key "$eif_key" >/dev/null 2>&1 || \
+     ! aws s3api head-object $LOCALSTACK --bucket "$bucket" --key "$supervisor_key" >/dev/null 2>&1; then
+    echo "  FAIL: retained ${label} EIF or supervisor object is missing" >&2
+    exit 1
+  fi
+  echo "  PASS: retained ${label} EIF and supervisor objects"
+}
+
+ssm_may_get() {
+  aws ssm get-parameter $LOCALSTACK --name "$1" \
+    --query 'Parameter.Value' --output text 2>/dev/null || true
+}
+
+read_required_ssm() {
+  local path="$1" value
+  value=$(ssm_may_get "$path")
+  if [ -z "$value" ] || [ "$value" = "UNSET" ]; then
+    echo "  FAIL: required SSM parameter is absent: ${path}" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+assert_ssm_value() {
+  local path="$1" expected="$2" label="$3" actual
+  actual=$(ssm_may_get "$path")
+  if [ "$actual" != "$expected" ]; then
+    echo "  FAIL: ${label} changed or is absent (${path})" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} is retained unchanged"
+}
+
+assert_ssm_absent() {
+  local path="$1" label="$2" output rc
+  set +e
+  output=$(aws ssm get-parameter $LOCALSTACK --name "$path" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "  FAIL: ${label} unexpectedly exists at ${path}" >&2
+    exit 1
+  fi
+  if ! echo "$output" | grep -q 'ParameterNotFound'; then
+    echo "  FAIL: could not determine whether ${label} exists at ${path}: ${output}" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} is absent"
+}
+
+assert_no_legacy_receipt() {
+  assert_ssm_absent "/dev/my-app/StateOriginReceipt/$1" "legacy unscoped receipt for key $1"
+}
+
+assert_kms_policy_pcr0s() {
+  local key_id="$1" first="$2" second="$3" label="$4" policy
+  policy=$(aws kms get-key-policy --key-id "$key_id" --policy-name default \
+    --endpoint-url "http://127.0.0.1:4000" --region us-east-1 \
+    --query 'Policy' --output text 2>/dev/null || true)
+  if ! echo "$policy" | jq -e --arg first "$first" --arg second "$second" '
+      [.Statement[] |
+        select(.Effect == "Allow") |
+        select(.Action | if type == "array" then index("kms:Decrypt") != null else . == "kms:Decrypt" end) |
+        .Condition.StringEqualsIgnoreCase["kms:RecipientAttestation:PCR0"] |
+        if type == "array" then .[] else . end |
+        ascii_downcase] | sort == ([$first, $second] | sort)
+    ' >/dev/null 2>&1; then
+    echo "  FAIL: ${label} KMS policy does not admit exactly the expected PCR0 pair" >&2
+    echo "  policy: ${policy}" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} KMS policy admits exactly the expected PCR0 pair"
+}
+
+assert_successful_migration_log() {
+  local log="$1" label="$2"
+  if ! grep -Fq "progress: New enclave is ready and reports the requested PCR0" "$log" || \
+     ! grep -Fq "complete: Migration complete" "$log"; then
+    echo "  FAIL: ${label} lacked verified-ready or completion events" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} reported verified PCR readiness and completion"
+}
+
+assert_verification_rollback_log() {
+  local log="$1" label="$2"
+  if ! grep -Fq "error: new enclave verification failed" "$log" || \
+     ! grep -Fq "rollback:" "$log" || \
+     ! grep -Fq "rollback-complete: Rollback complete" "$log" || \
+     grep -Fq "] complete: Migration complete" "$log"; then
+    echo "  FAIL: ${label} lacked the expected verification rollback events" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} emitted error, rollback, and rollback-complete without completion"
+}
+
+assert_host_migration_cleanup() {
+  local path
+  for path in "$ACTIVE_EIF_PATH.backup" /tmp/new-enclave.eif /tmp/new-enclave.eif.tmp "$ENCLAVE_SUPERVISOR.new"; do
+    if [ -e "$path" ]; then
+      echo "  FAIL: temporary migration artifact remains: ${path}" >&2
+      exit 1
+    fi
+  done
+  echo "  PASS: temporary EIF, backup, download, and supervisor staging files are absent"
+}
+
+expect_finalise_http() {
+  local expected="$1" log="$2" rc
+  shift 2
+  set +e
+  migration_finalise "$@" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] || ! grep -q "HTTP ${expected}" "$log"; then
+    echo "  FAIL: migration finalise did not fail with HTTP ${expected}" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  echo "  PASS: migration finalise rejected with HTTP ${expected}"
+}
+
+wait_for_supervisor_restart() {
+  local old_pid="$1" current_pid=""
+  for _ in $(seq 1 15); do
+    sleep 1
+    current_pid=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || true)
+    if [ -n "$current_pid" ] && [ "$current_pid" != "$old_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
+      echo "  PASS: supervisor restarted (${old_pid} -> ${current_pid})"
+      curl -sf --max-time 5 "${SUPERVISOR_URL}/health" >/dev/null
+      return
+    fi
+  done
+  echo "  FAIL: supervisor did not restart within 15s (pre=${old_pid}, current=${current_pid})" >&2
+  exit 1
+}
+
+verify_migrated_state() {
+  local label="$1" expected_predecessor="$2" expected_current="$3"
+  wait_for_enclave "$label"
+  local info predecessor current secrets storage persistent attestation
+  info=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/v1/enclave-info")
+  predecessor=$(echo "$info" | jq -r '.previous_pcr0 | ascii_downcase')
+  current=$(echo "$info" | jq -r '.migration.source_pcr0 | ascii_downcase')
+  if [ "$predecessor" != "$expected_predecessor" ] || [ "$current" != "$expected_current" ]; then
+    echo "  FAIL: ${label} PCR chain mismatch (predecessor=${predecessor}, current=${current})" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} PCR chain ${expected_predecessor:0:16}... -> ${expected_current:0:16}..."
+
+  secrets=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/secrets")
+  storage=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/storage")
+  persistent=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/storage-persistence")
+  attestation=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/attestation-persistence")
+  if ! echo "$secrets" | jq -e '.status == "ok"' >/dev/null || \
+     ! echo "$storage" | jq -e '.roundtrip == true' >/dev/null || \
+     ! echo "$persistent" | jq -e '.ok == true' >/dev/null || \
+     ! echo "$attestation" | jq -e '.ok == true' >/dev/null; then
+    echo "  FAIL: ${label} did not preserve secrets, storage, or attestation state" >&2
+    exit 1
+  fi
+  echo "  PASS: ${label} preserved static secrets, DEK storage, persistent state, and signing identity"
+}
+
+SOURCE_INFO=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/v1/enclave-info")
+SOURCE_COOLDOWN=$(echo "$SOURCE_INFO" | jq -r '.migration_cooldown_seconds')
+SOURCE_STATE=$(echo "$SOURCE_INFO" | jq -r '.migration.state')
+SOURCE_PCR0=$(echo "$SOURCE_INFO" | jq -r '.migration.source_pcr0 | ascii_downcase')
+if [ "$SOURCE_COOLDOWN" -le 0 ] || [ "$SOURCE_STATE" != "none" ] || [ "$SOURCE_PCR0" != "$V1_PCR0" ]; then
+  echo "  FAIL: v1 must start with a baked nonzero cooldown and migration state none" >&2
+  exit 1
+fi
+echo "  PASS: v1 reports source PCR0 and baked ${SOURCE_COOLDOWN}s cooldown"
+
+# Verify Tofu app.env overrides before migration while the source app is usable.
+ENV_OVERRIDE_RESP=$(curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/env-override")
+if ! echo "$ENV_OVERRIDE_RESP" | jq -e \
+    '.test_runtime_override == "override-from-tofu" and .test_runtime_override_envfile == "override-from-envfile"' \
+    >/dev/null; then
+  echo "  FAIL: Tofu app.env overrides are not visible in the source app" >&2
+  exit 1
+fi
+echo "  PASS: Tofu app.env overrides are visible before migration"
+
+capture_candidate 1 "$V1_PCR0"
+SOURCE_KEY=$(current_kms_key)
+publish_candidate 2 "$V2_PCR0"
+POST_APPLY_STATUS=$(migration_json)
+if [ "$(echo "$POST_APPLY_STATUS" | jq -r '.state')" != "none" ] || \
+   [ "$(echo "$POST_APPLY_STATUS" | jq -r '.source_pcr0')" != "$V1_PCR0" ] || \
+   [ "$(current_kms_key)" != "$SOURCE_KEY" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v1.eif"; then
+  echo "  FAIL: applying v2 activated or mutated the running v1 enclave" >&2
+  exit 1
+fi
+echo "  PASS: v2 apply only published a candidate; v1 PCR, KMS key, and active EIF are unchanged"
+
+# Request a different checked target first, then prove the public intent
+# survives a source restart with identical timing metadata.
+migration_request --target-pcr0 "$V3_PCR0" | tee /tmp/migration-request-v3.log
+migration_status | tee /tmp/migration-status-v3.log
+REQUEST_ONE=$(migration_json)
+if ! echo "$REQUEST_ONE" | jq -e --arg source "$V1_PCR0" --arg target "$V3_PCR0" \
+    '.state == "cooling_down" and .source_pcr0 == $source and .target_pcr0 == $target and .action == "requested" and .sequence == 1 and .remaining_seconds > 0' \
+    >/dev/null; then
+  echo "  FAIL: first request did not enter cooling_down for the alternate v3 target" >&2
+  exit 1
+fi
+REQUEST_ONE_SEQUENCE=$(echo "$REQUEST_ONE" | jq -r '.sequence')
+REQUEST_ONE_PUBLISHED=$(echo "$REQUEST_ONE" | jq -r '.published_at')
+REQUEST_ONE_ELIGIBLE=$(echo "$REQUEST_ONE" | jq -r '.eligible_at')
+if ! curl -skf --max-time 10 "${ENCLAVE_LOCAL_URL}/test/storage" | \
+    jq -e '.roundtrip == true' >/dev/null; then
+  echo "  FAIL: source application became unusable during cooldown" >&2
+  exit 1
+fi
+echo "  PASS: source application remains usable during cooldown"
+restart_enclave
+wait_for_enclave "v1 restart during migration cooldown"
+migration_status | tee /tmp/migration-status-restarted.log
+REQUEST_RECOVERED=$(migration_json)
+if ! echo "$REQUEST_RECOVERED" | jq -e \
+    --argjson sequence "$REQUEST_ONE_SEQUENCE" \
+    --arg published "$REQUEST_ONE_PUBLISHED" --arg eligible "$REQUEST_ONE_ELIGIBLE" \
+    '(.state == "cooling_down" or .state == "eligible") and .sequence == $sequence and .published_at == $published and .eligible_at == $eligible' \
+    >/dev/null; then
+  echo "  FAIL: restarted v1 did not recover the same intent and eligibility deadline" >&2
+  exit 1
+fi
+echo "  PASS: v1 restart recovered sequence, published_at, and eligible_at"
+
+migration_abort | tee /tmp/migration-abort.log
+migration_status | tee /tmp/migration-status-aborted.log
+ABORTED_STATUS=$(migration_json)
+ABORT_SEQUENCE=$(echo "$ABORTED_STATUS" | jq -r '.sequence')
+if ! echo "$ABORTED_STATUS" | jq -e --arg target "$V3_PCR0" \
+    '.state == "aborted" and .action == "aborted" and .target_pcr0 == $target and .sequence == 2' \
+    >/dev/null; then
+  echo "  FAIL: abort was not durably published" >&2
+  exit 1
+fi
+expect_finalise_http 409 /tmp/finalise-aborted.log
+
+PRE_EARLY_KEY=$(current_kms_key)
+migration_request | tee /tmp/migration-request-v2.log
+expect_finalise_http 425 /tmp/finalise-too-early.log \
+  --target-pcr0 "$CANDIDATE_PCR0" \
+  --artifact-bucket "$CANDIDATE_BUCKET" \
+  --eif-key "$CANDIDATE_EIF_KEY" \
+  --supervisor-key "$CANDIDATE_SUPERVISOR_KEY"
+REQUEST_TWO=$(migration_json)
+REQUEST_TWO_SEQUENCE=$(echo "$REQUEST_TWO" | jq -r '.sequence')
+if ! echo "$REQUEST_TWO" | jq -e \
+    --arg source "$V1_PCR0" --arg target "$V2_PCR0" --argjson previous "$ABORT_SEQUENCE" \
+    '.state == "cooling_down" and .source_pcr0 == $source and .target_pcr0 == $target and .action == "requested" and .sequence == ($previous + 1)' \
+    >/dev/null; then
+  echo "  FAIL: replacement request did not advance the sequence to the v2 target" >&2
+  exit 1
+fi
+echo "  PASS: replacement request advanced sequence ${ABORT_SEQUENCE} -> ${REQUEST_TWO_SEQUENCE} and selected v2"
+
+if [ "$(current_kms_key)" != "$PRE_EARLY_KEY" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v1.eif" || \
+   [ "$(migration_json | jq -r '.source_pcr0')" != "$V1_PCR0" ]; then
+  echo "  FAIL: too-early finalise changed KMS, EIF, or running source PCR0" >&2
+  exit 1
+fi
+echo "  PASS: HTTP 425 finalise had no KMS or EIF activation side effects"
+
+# Validate the generated public log anonymously, including the selected v2
+# replacement request and the generated SSM bucket-name wiring.
+INTENT_BUCKET=$(tofu -chdir="$TOFU_DIR" output -raw migration_intent_bucket)
+SSM_INTENT_BUCKET=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/MigrationIntentBucketName" \
+  --query 'Parameter.Value' --output text)
+if [ -z "$INTENT_BUCKET" ] || [ "$INTENT_BUCKET" != "$SSM_INTENT_BUCKET" ]; then
+  echo "  FAIL: migration_intent_bucket output does not match generated MigrationIntentBucketName" >&2
+  exit 1
+fi
+VERSIONING=$(aws s3api get-bucket-versioning $LOCALSTACK --bucket "$INTENT_BUCKET" --output json)
+if [ "$(echo "$VERSIONING" | jq -r '.Status')" != "Enabled" ]; then
+  echo "  FAIL: migration intent bucket versioning is not enabled" >&2
+  exit 1
+fi
+PUBLIC_VERSIONS=$(aws s3api list-object-versions $LOCALSTACK --no-sign-request \
+  --bucket "$INTENT_BUCKET" --prefix "migration-intent/${V1_PCR0}/" --output json)
+if [ "$(echo "$PUBLIC_VERSIONS" | jq '[.Versions[]] | length')" -ne 3 ]; then
+  echo "  FAIL: anonymous version listing did not expose exactly three v1 intent entries" >&2
+  exit 1
+fi
+REQUEST_TWO_KEY=$(printf 'migration-intent/%s/%020d' "$V1_PCR0" "$REQUEST_TWO_SEQUENCE")
+REQUEST_TWO_VERSION=$(echo "$PUBLIC_VERSIONS" | jq -r --arg key "$REQUEST_TWO_KEY" \
+  '.Versions[] | select(.Key == $key) | .VersionId')
+if [ -z "$REQUEST_TWO_VERSION" ] || [ "$REQUEST_TWO_VERSION" = "null" ]; then
+  echo "  FAIL: selected replacement request version is not publicly listed" >&2
+  exit 1
+fi
+aws s3api get-object $LOCALSTACK --no-sign-request --bucket "$INTENT_BUCKET" \
+  --key "$REQUEST_TWO_KEY" --version-id "$REQUEST_TWO_VERSION" \
+  /tmp/public-migration-intent.json >/dev/null
+if ! jq -e --arg target "$V2_PCR0" --argjson sequence "$REQUEST_TWO_SEQUENCE" '
+    (keys | sort) == ["action", "attestation", "schema", "sequence", "target_pcr0"] and
+    .schema == "enclave.migration_intent.v1" and .action == "requested" and
+    .target_pcr0 == $target and .sequence == $sequence and
+    (.attestation | type == "string" and length > 0)
+  ' /tmp/public-migration-intent.json >/dev/null; then
+  echo "  FAIL: public migration intent JSON schema or selected values differ" >&2
+  exit 1
+fi
+RETENTION=$(aws s3api get-object-retention $LOCALSTACK --bucket "$INTENT_BUCKET" \
+  --key "$REQUEST_TWO_KEY" --version-id "$REQUEST_TWO_VERSION" --output json)
+if [ "$(echo "$RETENTION" | jq -r '.Retention.Mode')" != "COMPLIANCE" ] || \
+   [ -z "$(echo "$RETENTION" | jq -r '.Retention.RetainUntilDate // empty')" ]; then
+  echo "  FAIL: selected migration intent lacks COMPLIANCE retention" >&2
+  exit 1
+fi
+PUBLIC_POLICY=$(aws s3api get-bucket-policy $LOCALSTACK --bucket "$INTENT_BUCKET" \
+  --query Policy --output text)
+if ! echo "$PUBLIC_POLICY" | jq -e '
+    [.Statement[] | select(.Effect == "Allow" and .Principal == "*") | .Action] |
+    flatten | sort == ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucketVersions"]
+  ' >/dev/null; then
+  echo "  FAIL: public migration intent policy grants actions beyond list/read" >&2
+  exit 1
+fi
+echo "  PASS: public log is anonymously listable/readable, versioned, COMPLIANCE-retained, exact-schema, and grants no public writes"
+
+# The wait is bounded by the short cooldown baked into v1, plus a small margin.
+WAIT_LIMIT=$(echo "$REQUEST_TWO" | jq -r '.remaining_seconds + 15')
+if [ "$WAIT_LIMIT" -gt 90 ]; then
+  echo "  FAIL: baked migration cooldown is too long for this integration path (${WAIT_LIMIT}s bound)" >&2
+  exit 1
+fi
+ELIGIBLE=false
+for _ in $(seq 1 "$WAIT_LIMIT"); do
+  if [ "$(migration_json | jq -r '.state')" = "eligible" ]; then
+    ELIGIBLE=true
+    break
+  fi
   sleep 1
 done
-if [ "$TAMPER_HEALTHY" = "true" ]; then
-  echo "  FAIL: enclave became healthy on a tampered ciphertext (state-origin check bypassed)" >&2
-  aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+if [ "$ELIGIBLE" != true ]; then
+  echo "  FAIL: v2 request did not become eligible within ${WAIT_LIMIT}s" >&2
+  exit 1
+fi
+migration_status | tee /tmp/migration-status-v2-eligible.log
+
+PRE_MIGRATION_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-finalise-v2.log
+assert_successful_migration_log /tmp/migration-finalise-v2.log "G -> A finalise"
+if ! grep -Fq "supervisor update ready" /tmp/migration-finalise-v2.log; then
+  echo "  FAIL: G -> A did not stage the retained candidate supervisor" >&2
+  exit 1
+fi
+wait_for_supervisor_restart "$PRE_MIGRATION_SUP_PID"
+K_GA=$(current_kms_key)
+if [ "$K_GA" = "$SOURCE_KEY" ]; then
+  echo "  FAIL: G -> A did not activate a new KMS key" >&2
+  exit 1
+fi
+verify_migrated_state "A after verified G -> A migration" "$V1_PCR0" "$V2_PCR0"
+K_GA_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_GA}"
+K_GA_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_GA}/${V2_PCR0}"
+K_GA_TRANSITION=$(read_required_ssm "$K_GA_TRANSITION_PATH")
+K_GA_A_RECEIPT=$(read_required_ssm "$K_GA_A_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_GA" "$V1_PCR0" "$V2_PCR0" "K-GA"
+assert_no_legacy_receipt "$K_GA"
+assert_host_migration_cleanup
+assert_candidate_retained 1 "G source candidate"
+echo "  PASS: K-GA is active with exact A and transition receipts"
+
+# Step 6: A has zero cooldown. Publish B append-only, migrate A -> B, then
+# prove B and A can independently resume under the same K-AB state.
+echo ""
+echo "=== [6/11] Zero-cooldown A -> B and independent A/B resumes ==="
+publish_candidate 3 "$V3_PCR0"
+assert_candidate_retained 2 "A candidate after B publication"
+if [ "$(migration_json | jq -r '.source_pcr0')" != "$V2_PCR0" ] || \
+   [ "$(current_kms_key)" != "$K_GA" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: publishing B mutated active A or K-GA" >&2
+  exit 1
+fi
+expect_finalise_http 409 /tmp/finalise-v3-no-intent.log
+if [ "$(current_kms_key)" != "$K_GA" ]; then
+  echo "  FAIL: no-intent B finalise changed K-GA" >&2
+  exit 1
+fi
+migration_request | tee /tmp/migration-request-v3-zero.log
+migration_status | tee /tmp/migration-status-v3-zero.log
+A_B_REQUEST=$(migration_json)
+A_B_REQUEST_SEQUENCE=$(echo "$A_B_REQUEST" | jq -r '.sequence')
+if ! echo "$A_B_REQUEST" | jq -e --arg source "$V2_PCR0" --arg target "$V3_PCR0" '
+    .state == "eligible" and .source_pcr0 == $source and .target_pcr0 == $target and
+    .action == "requested" and .remaining_seconds == 0
+  ' >/dev/null; then
+  echo "  FAIL: A zero-cooldown request for B was not immediately eligible" >&2
+  exit 1
+fi
+PRE_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-finalise-v3.log
+assert_successful_migration_log /tmp/migration-finalise-v3.log "A -> B finalise"
+wait_for_supervisor_restart "$PRE_B_SUP_PID"
+K_AB=$(current_kms_key)
+if [ "$K_AB" = "$K_GA" ]; then
+  echo "  FAIL: A -> B did not activate K-AB" >&2
+  exit 1
+fi
+verify_migrated_state "B after zero-cooldown A -> B migration" "$V2_PCR0" "$V3_PCR0"
+K_AB_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_AB}"
+K_AB_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AB}/${V2_PCR0}"
+K_AB_B_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AB}/${V3_PCR0}"
+K_AB_TRANSITION=$(read_required_ssm "$K_AB_TRANSITION_PATH")
+K_AB_B_RECEIPT=$(read_required_ssm "$K_AB_B_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_AB" "$V2_PCR0" "$V3_PCR0" "K-AB"
+assert_no_legacy_receipt "$K_AB"
+assert_host_migration_cleanup
+echo "  PASS: B adopted K-AB and wrote its exact PCR-scoped receipt"
+
+restart_enclave
+verify_migrated_state "B exact-receipt normal resume" "$V2_PCR0" "$V3_PCR0"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B receipt after normal restart"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: B normal restart changed K-AB" >&2
+  exit 1
+fi
+
+PRE_ROLLBACK_A_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-a.log
+assert_successful_migration_log /tmp/migration-resume-a.log "rollback-to-A resume"
+wait_for_supervisor_restart "$PRE_ROLLBACK_A_SUP_PID"
+verify_migrated_state "A rollback under K-AB" "$V2_PCR0" "$V2_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: rollback-to-A changed K-AB or did not activate retained A" >&2
+  exit 1
+fi
+K_AB_A_RECEIPT=$(read_required_ssm "$K_AB_A_RECEIPT_PATH")
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "K-AB transition after rollback-to-A"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B receipt after rollback-to-A"
+assert_host_migration_cleanup
+echo "  PASS: A wrote K-AB/A after B adoption; A/B receipts coexist without re-finalisation"
+
+restart_enclave
+verify_migrated_state "A exact-receipt normal resume" "$V2_PCR0" "$V2_PCR0"
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "K-AB/A receipt after normal restart"
+
+PRE_RESUME_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-b.log
+assert_successful_migration_log /tmp/migration-resume-b.log "independent B resume"
+wait_for_supervisor_restart "$PRE_RESUME_B_SUP_PID"
+verify_migrated_state "B independent receipt resume" "$V2_PCR0" "$V3_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: independent B resume created or selected another key" >&2
+  exit 1
+fi
+
+PRE_RESUME_A_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V2_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-a-again.log
+assert_successful_migration_log /tmp/migration-resume-a-again.log "independent A resume"
+wait_for_supervisor_restart "$PRE_RESUME_A_SUP_PID"
+verify_migrated_state "A independent receipt resume" "$V2_PCR0" "$V2_PCR0"
+if [ "$(current_kms_key)" != "$K_AB" ]; then
+  echo "  FAIL: independent A resume created or selected another key" >&2
+  exit 1
+fi
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "K-AB/A independent receipt"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "K-AB/B independent receipt"
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "K-AB independent transition"
+assert_host_migration_cleanup
+
+# Step 7: C is B's sibling. Finalise A -> C once, deliberately launch A under
+# the C expectation to exercise exact-PCR rollback, then resume real C. Finally
+# prove B is excluded by K-AC and rolls back to C.
+echo ""
+echo "=== [7/11] Forked A -> C, wrong-PCR rollback, and K-AC exclusion ==="
+publish_candidate 4 "$V4_PCR0"
+assert_candidate_retained 2 "A candidate after C publication"
+assert_candidate_retained 3 "B candidate after C publication"
+if [ "$(migration_json | jq -r '.source_pcr0')" != "$V2_PCR0" ] || \
+   [ "$(current_kms_key)" != "$K_AB" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: publishing C mutated active A or K-AB" >&2
+  exit 1
+fi
+migration_abort | tee /tmp/migration-abort-v3-before-v4.log
+migration_request | tee /tmp/migration-request-v4.log
+A_C_REQUEST=$(migration_json)
+A_C_REQUEST_SEQUENCE=$(echo "$A_C_REQUEST" | jq -r '.sequence')
+if ! echo "$A_C_REQUEST" | jq -e \
+    --arg source "$V2_PCR0" --arg target "$V4_PCR0" --argjson prior "$A_B_REQUEST_SEQUENCE" '
+      .state == "eligible" and .source_pcr0 == $source and .target_pcr0 == $target and
+      .action == "requested" and .remaining_seconds == 0 and .sequence > $prior
+    ' >/dev/null; then
+  echo "  FAIL: fresh A -> C intent was not eligible and newer than A -> B" >&2
+  exit 1
+fi
+
+PRE_WRONG_C_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+set +e
+migration_finalise \
+  --target-pcr0 "$V4_PCR0" \
+  --artifact-bucket "$V2_CANDIDATE_BUCKET" \
+  --eif-key "$V2_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V2_CANDIDATE_SUPERVISOR_KEY" \
+  >/tmp/migration-finalise-c-with-a.log 2>&1
+WRONG_C_RC=$?
+set -e
+if [ "$WRONG_C_RC" -eq 0 ]; then
+  echo "  FAIL: retained A artifact was accepted as C" >&2
+  cat /tmp/migration-finalise-c-with-a.log >&2
+  exit 1
+fi
+assert_verification_rollback_log /tmp/migration-finalise-c-with-a.log "A-as-C PCR mismatch"
+if [ "$(cat "$SUPERVISOR_PIDFILE")" != "$PRE_WRONG_C_SUP_PID" ]; then
+  echo "  FAIL: failed A-as-C activation promoted/restarted the supervisor" >&2
+  exit 1
+fi
+K_AC=$(current_kms_key)
+if [ "$K_AC" = "$K_AB" ]; then
+  echo "  FAIL: A -> C enclave finalisation did not commit K-AC before host rollback" >&2
+  exit 1
+fi
+verify_migrated_state "A restored after C PCR mismatch" "$V2_PCR0" "$V2_PCR0"
+if ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v2.eif"; then
+  echo "  FAIL: C PCR mismatch did not restore retained A" >&2
+  exit 1
+fi
+K_AC_TRANSITION_PATH="/dev/my-app/MigrationStateOriginReceipt/${K_AC}"
+K_AC_A_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V2_PCR0}"
+K_AC_B_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V3_PCR0}"
+K_AC_C_RECEIPT_PATH="/dev/my-app/StateOriginReceipt/${K_AC}/${V4_PCR0}"
+K_AC_TRANSITION=$(read_required_ssm "$K_AC_TRANSITION_PATH")
+K_AC_A_RECEIPT=$(read_required_ssm "$K_AC_A_RECEIPT_PATH")
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "K-AC after A rollback"
+assert_no_legacy_receipt "$K_AC"
+assert_host_migration_cleanup
+echo "  PASS: A-as-C failed closed, retained K-AC/A, and did not promote the supervisor"
+
+PRE_REAL_C_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+migration_finalise --resume \
+  --target-pcr0 "$V4_PCR0" \
+  --artifact-bucket "$V4_CANDIDATE_BUCKET" \
+  --eif-key "$V4_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V4_CANDIDATE_SUPERVISOR_KEY" \
+  | tee /tmp/migration-resume-c.log
+assert_successful_migration_log /tmp/migration-resume-c.log "real C resume"
+if ! grep -Fq "Skipping enclave finalisation as requested" /tmp/migration-resume-c.log; then
+  echo "  FAIL: real C activation repeated enclave finalisation" >&2
+  exit 1
+fi
+wait_for_supervisor_restart "$PRE_REAL_C_SUP_PID"
+verify_migrated_state "C adoption without repeat finalisation" "$V2_PCR0" "$V4_PCR0"
+if [ "$(current_kms_key)" != "$K_AC" ]; then
+  echo "  FAIL: real C resume changed K-AC" >&2
+  exit 1
+fi
+K_AC_C_RECEIPT=$(read_required_ssm "$K_AC_C_RECEIPT_PATH")
+assert_ssm_value "$K_AC_A_RECEIPT_PATH" "$K_AC_A_RECEIPT" "K-AC/A receipt after C adoption"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "K-AC transition after C adoption"
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "K-AC after C adoption"
+assert_host_migration_cleanup
+
+PRE_EXCLUDED_B_SUP_PID=$(cat "$SUPERVISOR_PIDFILE")
+set +e
+migration_finalise --resume \
+  --target-pcr0 "$V3_PCR0" \
+  --artifact-bucket "$V3_CANDIDATE_BUCKET" \
+  --eif-key "$V3_CANDIDATE_EIF_KEY" \
+  --supervisor-key "$V3_CANDIDATE_SUPERVISOR_KEY" \
+  >/tmp/migration-resume-b-under-kac.log 2>&1
+EXCLUDED_B_RC=$?
+set -e
+if [ "$EXCLUDED_B_RC" -eq 0 ]; then
+  echo "  FAIL: B became ready under K-AC" >&2
+  cat /tmp/migration-resume-b-under-kac.log >&2
+  exit 1
+fi
+assert_verification_rollback_log /tmp/migration-resume-b-under-kac.log "B exclusion under K-AC"
+if [ "$(cat "$SUPERVISOR_PIDFILE")" != "$PRE_EXCLUDED_B_SUP_PID" ]; then
+  echo "  FAIL: failed B-under-K-AC activation promoted/restarted the supervisor" >&2
+  exit 1
+fi
+verify_migrated_state "C restored after excluded B" "$V2_PCR0" "$V4_PCR0"
+if [ "$(current_kms_key)" != "$K_AC" ] || \
+   ! cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v4.eif"; then
+  echo "  FAIL: excluded B changed K-AC or did not restore C" >&2
+  exit 1
+fi
+assert_ssm_absent "$K_AC_B_RECEIPT_PATH" "K-AC/B receipt"
+assert_ssm_value "$K_AC_C_RECEIPT_PATH" "$K_AC_C_RECEIPT" "K-AC/C receipt after B rollback"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "K-AC transition after B rollback"
+assert_host_migration_cleanup
+
+# Final durable retention across both migration keys and all published PCR paths.
+assert_ssm_value "$K_AB_A_RECEIPT_PATH" "$K_AB_A_RECEIPT" "final K-AB/A receipt"
+assert_ssm_value "$K_AB_B_RECEIPT_PATH" "$K_AB_B_RECEIPT" "final K-AB/B receipt"
+assert_ssm_value "$K_AB_TRANSITION_PATH" "$K_AB_TRANSITION" "final K-AB transition"
+assert_kms_policy_pcr0s "$K_AB" "$V2_PCR0" "$V3_PCR0" "stale K-AB"
+assert_ssm_value "$K_AC_A_RECEIPT_PATH" "$K_AC_A_RECEIPT" "final K-AC/A receipt"
+assert_ssm_value "$K_AC_C_RECEIPT_PATH" "$K_AC_C_RECEIPT" "final K-AC/C receipt"
+assert_ssm_value "$K_AC_TRANSITION_PATH" "$K_AC_TRANSITION" "final K-AC transition"
+assert_kms_policy_pcr0s "$K_AC" "$V2_PCR0" "$V4_PCR0" "active K-AC"
+assert_no_legacy_receipt "$K_GA"
+assert_no_legacy_receipt "$K_AB"
+assert_no_legacy_receipt "$K_AC"
+assert_candidate_retained 1 "G candidate at final retention"
+assert_candidate_retained 2 "A candidate at final retention"
+assert_candidate_retained 3 "B candidate at final retention"
+assert_candidate_retained 4 "C candidate at final retention"
+assert_host_migration_cleanup
+MIGRATION_FINAL_KEY="$K_AC"
+echo "  PASS: K-AB remains A+B but stale; active K-AC retains A/C state and C is running"
+
+# Step 8: Crash the app only after cooldown and migration coverage so the
+# source application remains usable throughout operator decision windows.
+echo ""
+echo "=== [8/11] Runtime resilience: upstream app crash ==="
+RESILIENCE_LOG="${SCRIPT_DIR}/crash-resilience.log"
+: > "$RESILIENCE_LOG"
+curl -sk -X POST --max-time 5 "${ENCLAVE_LOCAL_URL}/test/crash" \
+  >>"$RESILIENCE_LOG" 2>&1 || true
+sleep 3
+HEALTH=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+  "${ENCLAVE_LOCAL_URL}/health" 2>>"$RESILIENCE_LOG" || echo "000")
+RUNTIME_INFO=$(curl -sk --max-time 5 "${ENCLAVE_LOCAL_URL}/v1/enclave-info" \
+  2>>"$RESILIENCE_LOG" || true)
+APP_PROXY=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+  "${ENCLAVE_LOCAL_URL}/test/storage-persistence" 2>>"$RESILIENCE_LOG" || echo "000")
+if [ "$HEALTH" != "200" ] || \
+   [ "$(echo "$RUNTIME_INFO" | jq -r '.upstream_app.exited // false')" != "true" ] || \
+   [ "$APP_PROXY" != "502" ]; then
+  echo "  FAIL: runtime/app crash isolation assertions failed; see ${RESILIENCE_LOG}" >&2
+  exit 1
+fi
+echo "  PASS: runtime stays healthy, reports app exit, and dead app routes return 502"
+
+# Preserve the supervisor health and atomic key-scoped ciphertext assertions.
+echo ""
+echo "=== [8.5/11] Atomic migration observability checks ==="
+SUP_HEALTH_CODE=$(curl -s --max-time 5 -o /tmp/supervisor-health.json -w '%{http_code}' \
+  "${SUPERVISOR_URL}/supervisor/health" 2>/dev/null || echo "000")
+if [ "$SUP_HEALTH_CODE" != "200" ] || \
+   [ "$(jq -r '.status // empty' /tmp/supervisor-health.json 2>/dev/null || true)" != "ok" ]; then
+  echo "  FAIL: /supervisor/health is not ok after migration" >&2
+  exit 1
+fi
+NEW_KEY=$(current_kms_key)
+NEW_CT=$(aws ssm get-parameter $LOCALSTACK \
+  --name "/dev/my-app/unlocked/signing_key/Ciphertext/$NEW_KEY" \
+  --query 'Parameter.Value' --output text 2>/dev/null || true)
+if [ -z "$NEW_KEY" ] || [ "$NEW_KEY" = "UNSET" ] || \
+   [ -z "$NEW_CT" ] || [ "$NEW_CT" = "UNSET" ]; then
+  echo "  FAIL: key-scoped signing_key ciphertext is absent after migration" >&2
+  exit 1
+fi
+echo "  PASS: supervisor health is ok and key-scoped migration ciphertext exists"
+
+# Step 8.7: State-origin tamper (issue #131). The boot-time state root commits
+# to every runtime ciphertext, so replacing one must make resume fail closed.
+echo ""
+echo "=== [8.7/11] State-origin: tampered ciphertext -> fail closed ==="
+DEK_PARAM="/dev/my-app/unlocked/StorageDEK/Ciphertext/${NEW_KEY}"
+ORIG_DEK=$(aws ssm get-parameter --name "$DEK_PARAM" $LOCALSTACK \
+  --query 'Parameter.Value' --output text 2>/dev/null || true)
+if [ -z "$ORIG_DEK" ]; then
+  echo "  FAIL: could not read StorageDEK ciphertext from SSM" >&2
+  exit 1
+fi
+aws ssm put-parameter --name "$DEK_PARAM" --value "dGFtcGVyZWQtY2lwaGVydGV4dA==" \
+  --type String --overwrite $LOCALSTACK >/dev/null
+restart_enclave
+echo "  Asserting enclave stays unhealthy on tampered state (30s)..."
+TAMPER_HEALTHY=false
+for _ in $(seq 1 30); do
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+    "${ENCLAVE_LOCAL_URL}/health" 2>/dev/null || echo "000")
+  if [ "$CODE" = "200" ]; then TAMPER_HEALTHY=true; break; fi
+  sleep 1
+done
+if [ "$TAMPER_HEALTHY" = true ]; then
+  echo "  FAIL: enclave became healthy with a tampered ciphertext" >&2
+  aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" \
+    --type String --overwrite $LOCALSTACK >/dev/null
   restart_enclave
   exit 1
 fi
-echo "  PASS: tampered StorageDEK ciphertext → enclave fails closed (no 200 in 30s)"
-
-# Restore the original ciphertext and confirm a clean resume recovers — also
-# proves the bounce mechanism itself works (so the fail-closed wasn't a no-boot).
-aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" --type String --overwrite $LOCALSTACK >/dev/null 2>&1 || true
+echo "  PASS: tampered StorageDEK ciphertext kept the enclave unhealthy for 30s"
+aws ssm put-parameter --name "$DEK_PARAM" --value "$ORIG_DEK" \
+  --type String --overwrite $LOCALSTACK >/dev/null
 restart_enclave
 wait_for_enclave "resume after state-origin restore"
-echo "  PASS: restored ciphertext → enclave resumes healthy"
-echo ""
-
-
-# Step 9: rollback — v3 is baked with a wrong app name, so its Init fails
-# (GetKeyID 404 at /dev/my-app-wrong/unlocked/KMSKeyID) → /health stays 503 → the
-# supervisor's awaitEnclaveReady times out → rollbackMigration restores v2.
-echo ""
-echo "=== [9/10] Rollback test: v3 Init fails on wrong app name ==="
-
-ARTIFACTS="${SCRIPT_DIR}/app/.enclave/artifacts"
-V3_EIF="${ARTIFACTS}/image-v3.eif"
-V3_PCR_FILE="${ARTIFACTS}/pcr-v3.json"
-
-# Require pre-built v3 artifacts (produced by `make test-build`).
-if [ ! -f "$V3_EIF" ] || [ ! -f "$V3_PCR_FILE" ]; then
-  echo "  FAIL: v3 artifacts not found (run 'make test-build' to build them)" >&2
-  echo "  expected: $V3_EIF, $V3_PCR_FILE" >&2
-  exit 1
-fi
-
-V2_PCR0=$(jq -r '.PCR0' "${ARTIFACTS}/pcr.json")
-V3_PCR0=$(jq -r '.PCR0' "$V3_PCR_FILE")
-echo "  v2 PCR0: ${V2_PCR0:0:16}... (currently running)"
-echo "  v3 PCR0: ${V3_PCR0:0:16}..."
-
-ROLLBACK_EIF_BUCKET="dev-my-app-eif-000000000000-us-east-1"
-aws s3 cp "$V3_EIF" "s3://${ROLLBACK_EIF_BUCKET}/image-v3.eif" $LOCALSTACK > /dev/null 2>&1 || {
-  echo "  FAIL: could not upload v3 EIF" >&2
-  exit 1
-}
-
-MIGRATE_BODY=$(jq -nc \
-  --arg b "$ROLLBACK_EIF_BUCKET" --arg k "image-v3.eif" --arg p "$V3_PCR0" \
-  --argjson s '["signing_key"]' \
-  '{eif_bucket:$b, eif_key:$k, pcr0:$p, secret_names:$s}')
-
-echo "  Triggering migration v2 → v3 (expecting rollback)..."
-curl -s --max-time 180 -X POST "${SUPERVISOR_URL}/migrate" \
-  -H 'Content-Type: application/json' -d "$MIGRATE_BODY" \
-  > /tmp/rollback-migrate.log 2>&1 || true
-
-if grep -q '"status":"rollback"' /tmp/rollback-migrate.log 2>/dev/null; then
-  echo "  PASS: Migration emitted rollback status"
-else
-  echo "  FAIL: No rollback status in migration response" >&2
-  echo "  Last 20 NDJSON lines:" >&2
-  tail -20 /tmp/rollback-migrate.log | sed 's/^/    /' >&2
-  exit 1
-fi
-
-wait_for_enclave "post-rollback"
-
-V2_PCR0_LOWER=$(echo "$V2_PCR0" | tr '[:upper:]' '[:lower:]')
-POST_ROLLBACK_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-POST_ROLLBACK_PREV=$(echo "$POST_ROLLBACK_INFO" | jq -r '.previous_pcr0 // empty' 2>/dev/null || echo "")
-POST_LOWER=$(echo "$POST_ROLLBACK_PREV" | tr '[:upper:]' '[:lower:]')
-if [ -n "$POST_LOWER" ] && [ "$V2_PCR0_LOWER" = "$POST_LOWER" ]; then
-  echo "  PASS: v2 restored after rollback (previous_pcr0 = v2)"
-else
-  echo "  FAIL: previous_pcr0 after rollback (${POST_ROLLBACK_PREV:0:16}...) != v2 (${V2_PCR0:0:16}...)" >&2
-  exit 1
-fi
-
-ROLLBACK_STORAGE=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/storage" 2>/dev/null || echo "")
-if echo "$ROLLBACK_STORAGE" | jq -e '.roundtrip == true' >/dev/null 2>&1; then
-  echo "  PASS: v2 storage round-trip works after rollback (DEK intact)"
-else
-  echo "  FAIL: v2 storage broken after rollback: ${ROLLBACK_STORAGE:0:120}" >&2
-  exit 1
-fi
-
-ROLLBACK_SECRETS=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/test/secrets" 2>/dev/null || echo "")
-if echo "$ROLLBACK_SECRETS" | jq -e '.status == "ok"' >/dev/null 2>&1; then
-  echo "  PASS: v2 static secrets still decryptable after rollback"
-else
-  echo "  FAIL: v2 secrets broken after rollback: ${ROLLBACK_SECRETS:0:120}" >&2
-  exit 1
-fi
+echo "  PASS: restored ciphertext lets the enclave resume healthy"
 
 
 # Step 9.5: Supervisor resilience — SIGKILL supervisor and verify the
@@ -1184,7 +1506,7 @@ fi
 # if supervisor dies mid-handleMigrate, a new supervisor must come up with fresh
 # state (supervisor is stateless; all migration state lives in SSM).
 echo ""
-echo "=== [9.5/10] Supervisor resilience ==="
+echo "=== [9.5/11] Supervisor resilience ==="
 PRE_KILL_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || echo "")
 if [ -z "$PRE_KILL_PID" ]; then
   echo "  FAIL: supervisor PID file missing" >&2
@@ -1246,11 +1568,16 @@ wait_for_enclave "after supervisor relaunch"
 echo ""
 echo "=== [10/11] Final enclave info ==="
 FINAL_INFO=$(curl -sk --max-time 10 "https://localhost:${HOST_TLS_PORT:-8443}/v1/enclave-info" 2>/dev/null || echo "")
-if [ -n "$FINAL_INFO" ] && echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1; then
+FINAL_ACTIVE_PCR0=$(echo "$FINAL_INFO" | jq -r '.migration.source_pcr0 // empty' 2>/dev/null || true)
+if [ -n "$FINAL_INFO" ] && \
+   echo "$FINAL_INFO" | jq -e '.version' >/dev/null 2>&1 && \
+   [ "$FINAL_ACTIVE_PCR0" = "$V4_PCR0" ] && \
+   [ "$(current_kms_key)" = "$MIGRATION_FINAL_KEY" ] && \
+   cmp -s "$ACTIVE_EIF_PATH" "${ARTIFACTS}/image-v4.eif"; then
   echo "  PASS: Enclave info valid"
-  echo "$FINAL_INFO" | jq -r '"  version: \(.version // "?"), pcr0: \(.previous_pcr0 // "?")"' 2>/dev/null || true
+  echo "$FINAL_INFO" | jq -r '"  version: \(.version // "?"), active pcr0: \(.migration.source_pcr0 // "?")"' 2>/dev/null || true
 else
-  echo "  FAIL: Could not read enclave info: ${FINAL_INFO:0:120}" >&2
+  echo "  FAIL: final C PCR0, K-AC key, EIF, or enclave info check failed: ${FINAL_INFO:0:120}" >&2
   exit 1
 fi
 

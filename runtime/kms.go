@@ -16,11 +16,10 @@ import (
 )
 
 type kmsW struct {
-	nsm     NSM
-	kms     KMSAPI
-	sts     STSAPI
-	keyID   string
-	genesis bool
+	nsm   NSM
+	kms   KMSAPI
+	sts   STSAPI
+	keyID string
 }
 
 type DataKey struct {
@@ -37,8 +36,6 @@ type KMS interface {
 
 type PrimaryKMS interface {
 	KMS
-	// Genesis reports first-boot key creation.
-	Genesis() bool
 	CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, error)
 }
 
@@ -47,18 +44,15 @@ func FetchOrCreatePrimaryKMS(
 	nsm NSM,
 	kms KMSAPI,
 	sts STSAPI,
-	ssm SSM,
+	keyID string,
+	prevPCR0 string,
+	migrationAttest string,
 ) (PrimaryKMS, error) {
 	curPCR0, err := nsm.PCR0()
 	if err != nil {
 		return nil, fmt.Errorf("could not read PCR0 from NSM")
 	}
 	curPCR0Hex := hex.EncodeToString(curPCR0)
-
-	keyID, err := ssm.MayGet(ctx, kmsKeyIDParam())
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch key ID SSM param: %s - %w", kmsKeyIDParam(), err)
-	}
 
 	if keyID != "" {
 		out, err := kms.GetKeyPolicy(ctx, &kmscmd.GetKeyPolicyInput{
@@ -73,10 +67,6 @@ func FetchOrCreatePrimaryKMS(
 			return nil, fmt.Errorf("KMS key policy empty: %s", keyID)
 		}
 		expectedPCR0s := []string{curPCR0Hex}
-		prevPCR0, err := ssm.MayGet(ctx, migrationPreviousPCR0Param())
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch migration previous PCR0: %w", err)
-		}
 		switch {
 		case prevPCR0 == "":
 			// genesis/current key
@@ -103,12 +93,8 @@ func FetchOrCreatePrimaryKMS(
 			for k := range admitted {
 				otherPCR0 = k
 			}
-			migrationAttest, err := ssm.MustGet(ctx, migrationPreviousPCR0AttestationParam())
-			if err != nil {
-				return nil, fmt.Errorf(
-					"failed to read previous PCR0 attestation SSM param: %w",
-					err,
-				)
+			if migrationAttest == "" {
+				return nil, fmt.Errorf("previous PCR0 attestation is required for rollback")
 			}
 			otherPCR0Bytes, err := hex.DecodeString(otherPCR0)
 			if err != nil {
@@ -178,21 +164,13 @@ func FetchOrCreatePrimaryKMS(
 
 	keyID = *createOut.KeyMetadata.KeyId
 
-	if err := ssm.Set(ctx, kmsKeyIDParam(), keyID); err != nil {
-		return nil, fmt.Errorf("failed to set primary KMS Key ID SSM Param: %w", err)
-	}
-
 	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", curPCR0Hex[:16])
 
-	return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID, genesis: true}, nil
+	return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
 }
 
 func (k *kmsW) KeyID() string {
 	return k.keyID
-}
-
-func (k *kmsW) Genesis() bool {
-	return k.genesis
 }
 
 // Encrypt encrypts plaintext under keyID and returns base64 ciphertext.

@@ -1,9 +1,7 @@
 package runtime
 
 import (
-	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,61 +33,6 @@ func LoadStaticSecretMetadata() ([]StaticSecretMetadata, error) {
 	}
 
 	return secretMeta, nil
-}
-
-// FetchOrInitStaticSecrets loads each key-scoped secret, or creates one via KMS.
-func FetchOrInitStaticSecrets(
-	ctx context.Context,
-	kms KMS,
-	ssm SSM,
-	metadata []StaticSecretMetadata,
-) ([]StaticSecret, error) {
-	secrets := make([]StaticSecret, 0, len(metadata))
-
-	addSecret := func(m StaticSecretMetadata, p string) {
-		secrets = append(secrets, StaticSecret{StaticSecretMetadata: m, Plaintext: p})
-	}
-
-	for _, s := range metadata {
-		paramName := secretCiphertextParam(s.Name, kms.KeyID())
-		ciphertextB64, err := ssm.MayGet(ctx, paramName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch SSM static secret param %s: %w", paramName, err)
-		}
-
-		if ciphertextB64 == "" {
-			dk, err := kms.GenerateDataKey(ctx)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"failed to generate static secret param %s: %w",
-					paramName,
-					err,
-				)
-			}
-
-			ciphertextB64 = base64.StdEncoding.EncodeToString(dk.Ciphertext)
-
-			if err := ssm.Set(ctx, paramName, ciphertextB64); err != nil {
-				return nil, fmt.Errorf(
-					"failed to set SSM static secret param %s: %w",
-					paramName,
-					err,
-				)
-			}
-
-			addSecret(s, hex.EncodeToString(dk.Plaintext))
-			continue
-		}
-
-		plaintext, err := kms.Decrypt(ctx, ciphertextB64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt static secret param %s: %w", paramName, err)
-		}
-
-		addSecret(s, hex.EncodeToString(plaintext))
-	}
-
-	return secrets, nil
 }
 
 func SetStaticSecretEnvVars(secrets []StaticSecret) error {

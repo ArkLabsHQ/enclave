@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"net/http"
@@ -157,7 +158,13 @@ func (h *Health) handleSupervisorHealth(w http.ResponseWriter, r *http.Request) 
 // describeEnclaves runs nitro-cli describe-enclaves and parses the output.
 // Also called from Observability and Lifecycle.
 func describeEnclaves() ([]enclaveStatus, error) {
-	out, err := exec.Command("nitro-cli", "describe-enclaves").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), lifecycleCommandTimeout)
+	defer cancel()
+	return describeEnclavesContext(ctx)
+}
+
+func describeEnclavesContext(ctx context.Context) ([]enclaveStatus, error) {
+	out, err := exec.CommandContext(ctx, "nitro-cli", "describe-enclaves").Output()
 	if err != nil {
 		return nil, err
 	}

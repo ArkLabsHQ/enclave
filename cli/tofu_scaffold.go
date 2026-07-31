@@ -42,10 +42,10 @@ preserved. To regenerate a specific file, delete it first then re-run.
 
 By default, terraform.tfvars.json points at the EIF and supervisor binary
 that 'enclave build' produced under .enclave/artifacts/ — tofu uploads
-those files directly to S3. Pass --remote to leave those paths empty so
-the tofu module pulls image.eif and supervisor from the GitHub Release
-identified by app.nix_owner / app.nix_repo / app.release_tag in
-enclave.yaml at apply time, then mirrors them to S3.`,
+those files as PCR0-addressed candidates. Pass --remote to leave those paths
+empty so the tofu module pulls image.eif and supervisor from the GitHub
+Release identified by app.nix_owner / app.nix_repo / app.release_tag in
+enclave.yaml at apply time, then uploads them as candidates.`,
 		RunE: runTofuInit,
 	}
 	cmd.Flags().Bool("remote", false,

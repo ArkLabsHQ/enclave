@@ -40,4 +40,4 @@ WORKDIR /workspace
 # root because Nix needs an /etc/passwd entry that matches its uid; we chown the
 # workspace back to HOST_UID/HOST_GID at exit so the host user can edit/delete
 # the generated artifacts.
-CMD ["sh", "-c", "trap 'chown -R \"${HOST_UID:-0}:${HOST_GID:-0}\" /workspace 2>/dev/null || true' EXIT; mkdir -p /root/go/bin && go build -trimpath -o /root/go/bin/enclave ./cli/cmd/enclave && make test-build"]
+CMD ["sh", "-c", "trap 'chown -R \"${HOST_UID:-0}:${HOST_GID:-0}\" /workspace 2>/dev/null || true' EXIT; go build -trimpath -o /tmp/enclave ./cli/cmd/enclave && make test-build"]

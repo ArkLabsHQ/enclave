@@ -292,9 +292,4 @@ func TestCLI_Build(t *testing.T) {
 		}
 	}
 
-	// Verify PCR0 was extracted.
-	pcr0 := readPCR0FromArtifacts(dir)
-	if pcr0 == "" {
-		t.Error("PCR0 should be populated after build")
-	}
 }

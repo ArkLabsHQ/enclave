@@ -15,15 +15,17 @@ import (
 // fakeSessionStarter is a test sessionStarter that returns a pre-configured
 // port + cleanup recorder (or a fixed error).
 type fakeSessionStarter struct {
-	port     int
-	cleanups int
-	err      error
+	port       int
+	remotePort string
+	cleanups   int
+	err        error
 }
 
 func (f *fakeSessionStarter) StartPortForward(ctx context.Context, instanceID, region, profile, remotePort string) (int, func(), error) {
 	if f.err != nil {
 		return 0, nil, f.err
 	}
+	f.remotePort = remotePort
 	return f.port, func() { f.cleanups++ }, nil
 }
 

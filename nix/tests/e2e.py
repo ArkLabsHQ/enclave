@@ -320,6 +320,8 @@ else:
         )[1]
     )
     print(blue.execute("tail -n 100 /var/log/enclave-console.log")[1])
+    # Distinguishes an enclave crash from a dropped transport on the next run.
+    print(blue.execute("curl -sk https://127.0.0.1/health || true")[1])
     raise Exception("request-migration did not reach the enclave")
 intent_bucket = tofu("output -raw migration_intent_log_bucket")
 assert (

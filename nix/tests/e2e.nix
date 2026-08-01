@@ -24,12 +24,11 @@ let
         (self.lib.mkEnclaveQemuAmi {
           inherit eif;
           memoryMib = 2048;
-          cpuCount = 2;
         })
       ];
 
       virtualisation.memorySize = 4096;
-      virtualisation.cores = 2;
+      virtualisation.cores = 1;
 
       environment.systemPackages = with pkgs; [
         curl
@@ -72,7 +71,7 @@ pkgs.testers.runNixOSTest {
       { pkgs, nodes, ... }:
       {
         virtualisation.memorySize = 2048;
-        virtualisation.cores = 2;
+        virtualisation.cores = 1;
 
         environment.systemPackages = [
           pkgs.awscli2

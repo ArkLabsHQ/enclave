@@ -85,6 +85,26 @@ func leaseObjectKey(name string) string {
 	return fmt.Sprintf("%s/%s/lock/%s", getDeployment(), getAppName(), name)
 }
 
+func TryAcquireLease(
+	ctx context.Context,
+	s3api S3API,
+	bucket, name string,
+	ttl time.Duration,
+	opts ...leaseOption,
+) (*Lease, error) {
+	cfg := leaseConfig{steal: true}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	key := leaseObjectKey(name)
+	etag, expiresAt, err := claimLease(ctx, s3api, bucket, key, ttl, cfg)
+	if err != nil || etag == "" {
+		return nil, err
+	}
+	return startLease(s3api, bucket, key, ttl, etag, expiresAt), nil
+}
+
 // AcquireLease blocks until the lease is held or ctx ends.
 func AcquireLease(
 	ctx context.Context,
@@ -93,7 +113,7 @@ func AcquireLease(
 	ttl time.Duration,
 ) (*Lease, error) {
 	for {
-		lease, err := tryAcquireLease(ctx, s3api, bucket, name, ttl)
+		lease, err := TryAcquireLease(ctx, s3api, bucket, name, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -147,26 +167,6 @@ type leaseConfig struct{ steal bool }
 // the operation must then be idempotent-or-nothing, not idempotent-or-retry.
 func withoutSteal() leaseOption {
 	return func(c *leaseConfig) { c.steal = false }
-}
-
-func tryAcquireLease(
-	ctx context.Context,
-	s3api S3API,
-	bucket, name string,
-	ttl time.Duration,
-	opts ...leaseOption,
-) (*Lease, error) {
-	cfg := leaseConfig{steal: true}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	key := leaseObjectKey(name)
-	etag, expiresAt, err := claimLease(ctx, s3api, bucket, key, ttl, cfg)
-	if err != nil || etag == "" {
-		return nil, err
-	}
-	return startLease(s3api, bucket, key, ttl, etag, expiresAt), nil
 }
 
 func startLease(

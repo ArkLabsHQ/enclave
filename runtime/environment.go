@@ -128,6 +128,12 @@ func storageBucketParam() string {
 	return fmt.Sprintf("/%s/%s/StorageBucketName", getDeployment(), getAppName())
 }
 
+// route53ZoneIDParam: SSM path for the hosted zone DNS-01 writes into. Its
+// presence is what selects DNS-01 over tls-alpn-01.
+func route53ZoneIDParam() string {
+	return fmt.Sprintf("/%s/%s/Route53ZoneID", getDeployment(), getAppName())
+}
+
 // kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
 func kmsKeyIDParam() string {
 	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())

@@ -145,7 +145,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start migration control server: %w", err)
 	}
 
-	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
+	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, aws.Route53, hashes)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
 	}

@@ -51,12 +51,22 @@ func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
 	}
 }
 
+// ConfigureTLS selects one of three certificate sources:
+//
+//   - self-signed, when ACME is off;
+//   - DNS-01 with a fleet-shared certificate, when a Route53 zone is configured.
+//     This is the only mode that survives a load balancer, because tls-alpn-01
+//     needs the CA's connection to reach the specific enclave holding the
+//     challenge;
+//   - tls-alpn-01 via autocert otherwise - the single-instance path, retained
+//     unchanged for deployments addressed directly by IP.
 func ConfigureTLS(
 	ctx context.Context,
 	cfg *Config,
 	s3 S3API,
 	dek DEK,
 	ssm SSM,
+	r53 Route53API,
 	hashes AttestationHashes,
 ) (TLSCertCallback, error) {
 	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
@@ -70,11 +80,71 @@ func ConfigureTLS(
 	if !nitriding.InEnclave() {
 		return configureACME(cfg, autocert.DirCache(acmeCertCacheDir), hashes)
 	}
+
+	zoneID, err := ssm.MayGet(ctx, route53ZoneIDParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read Route53 zone ID: %w", err)
+	}
+	if zoneID != "" {
+		return configureSharedDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
+	}
+
+	slog.Info("no Route53 zone configured, using tls-alpn-01 (single instance only)")
 	acmeCache, err := NewAcmeStorageCache(ctx, s3, dek, ssm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ACME cache: %w", err)
 	}
 	return configureACME(cfg, acmeCache, hashes)
+}
+
+// configureSharedDNS01Cert brings up the fleet-shared certificate: load or issue
+// one now, then keep it fresh in the background.
+func configureSharedDNS01Cert(
+	ctx context.Context,
+	cfg *Config,
+	s3 S3API,
+	dek DEK,
+	ssm SSM,
+	r53 Route53API,
+	zoneID string,
+	hashes AttestationHashes,
+) (TLSCertCallback, error) {
+	bucket, err := ssm.MustGet(ctx, storageBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read storage bucket name: %w", err)
+	}
+
+	store := newCertStore(s3, dek, bucket, cfg.FQDN)
+
+	accountKey, err := loadOrCreateAccountKey(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	client, err := acmeClientForDirectory(cfg.ACMEDirectory, cfg.ACMECA)
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		client = &acme.Client{DirectoryURL: acme.LetsEncryptURL}
+	}
+	client.Key = accountKey
+
+	provider, err := newRoute53Provider(r53, zoneID)
+	if err != nil {
+		return nil, err
+	}
+
+	manager := newCertManager(
+		store, newACMEIssuer(client, provider, cfg.ACMEEmail),
+		s3, bucket, cfg.FQDN, hashes,
+	)
+	if err := manager.bootstrap(ctx); err != nil {
+		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
+	}
+	go manager.Run(ctx)
+
+	slog.Info("serving fleet-shared certificate via DNS-01", "fqdn", cfg.FQDN, "zone", zoneID)
+	return manager.GetCertificate, nil
 }
 
 func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) error {

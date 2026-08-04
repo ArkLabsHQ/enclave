@@ -65,7 +65,7 @@ func awaitGenesis(
 			return nil, state, nil
 		}
 
-		lease, err := tryAcquireLease(
+		lease, err := TryAcquireLease(
 			waitCtx, s3api, bucket, genesisLeaseName, leaseTTL, withoutSteal(),
 		)
 		if err != nil {

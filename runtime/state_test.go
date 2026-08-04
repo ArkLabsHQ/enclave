@@ -645,3 +645,132 @@ func signedReceipt(
 		receiptPayload(t, purpose, stateRoot),
 	)
 }
+
+// genesisFixture builds the shared AWS surface N enclaves of one PCR0 boot
+// against. The NSM session is shared because identical PCR0 means an identical
+// EIF, and receipts written by one enclave must verify under another's roots.
+type genesisFixture struct {
+	nsm  NSM
+	ssmf *fakeSSM
+	ssm  SSM
+	s3f  *fakeS3
+	kmsf *fakeKMS
+	sts  *fakeSTS
+}
+
+func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
+	t.Helper()
+	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	ssmf, ssm := stateOriginTestSSM(map[string]string{
+		storageBucketParam(): "genesis-storage",
+	})
+	return &genesisFixture{
+		nsm:  &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
+		ssmf: ssmf,
+		ssm:  ssm,
+		s3f:  newFakeS3(),
+		kmsf: newFakeKMS(),
+		sts:  &fakeSTS{arn: testRoleARN},
+	}
+}
+
+func (f *genesisFixture) establish(ctx context.Context) (verifiedState, error) {
+	return EstablishState(ctx, f.nsm, f.kmsf, f.sts, f.ssm, f.s3f)
+}
+
+// A live peer lease must stop genesis before any KMS key is minted
+func TestEstablishStateGenesisBlocksOnPeerLease(t *testing.T) {
+	setStateOriginTestEnv(t)
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := fx.establish(ctx)
+
+	require.ErrorContains(t, err, "genesis did not complete")
+	require.Empty(t, fx.kmsf.keys, "no KMS key may be minted while a peer holds genesis")
+	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
+}
+
+// A second enclave arriving after a peer's genesis resumes against the committed
+// key and derives the identical DEK, rather than minting its own.
+func TestEstablishStateResumesAfterPeerGenesis(t *testing.T) {
+	setStateOriginTestEnv(t)
+	ctx := context.Background()
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+
+	first, err := fx.establish(ctx)
+	require.NoError(t, err)
+	require.Len(t, fx.kmsf.keys, 1)
+	committed := fx.ssmf.params[kmsKeyIDParam()]
+	require.NotEmpty(t, committed)
+
+	second, err := fx.establish(ctx)
+	require.NoError(t, err)
+
+	require.Len(t, fx.kmsf.keys, 1, "the second boot must not mint a key")
+	require.Equal(t, committed, fx.ssmf.params[kmsKeyIDParam()])
+	require.Equal(t, first.kms.KeyID(), second.kms.KeyID())
+	require.Equal(t, first.dek.(*dek).key, second.dek.(*dek).key, "fleet must share one DEK")
+	require.Equal(t, first.secrets, second.secrets)
+}
+
+// The lease is released once genesis commits, so it never wedges later boots.
+func TestEstablishStateReleasesGenesisLease(t *testing.T) {
+	setStateOriginTestEnv(t)
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+
+	_, err := fx.establish(context.Background())
+	require.NoError(t, err)
+
+	require.Empty(t, fx.s3f.currentETag(leaseObjectKey(genesisLeaseName)))
+}
+
+// Losers must not queue on the lease. Once a peer has committed, a waiting
+// enclave resumes immediately instead of winning the lock just to find the work
+// already done — otherwise a fleet's first boot drains one poll interval at a time.
+func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
+	setStateOriginTestEnv(t)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	_, err := fx.establish(context.Background())
+	require.NoError(t, err)
+
+	// A peer still holds the genesis lease, but the work is already committed.
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
+
+	// Far shorter than leasePollInterval: passing proves we never waited on it.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	lease, state, err := awaitGenesis(ctx, fx.ssm, fx.s3f, pcr0)
+
+	require.NoError(t, err)
+	require.Nil(t, lease, "a committed genesis needs no lease")
+	require.Equal(t, startStateResume, state.startState)
+}
+
+// Genesis is never taken over. A holder that died mid-genesis leaves a lapsed
+// lock, and peers must wedge rather than resume its half-finished work: the
+// KMSKeyID commit cannot be conditional, so a stalled holder waking up later
+// would clobber whoever took over and orphan that enclave's DEK.
+func TestAwaitGenesisNeverStealsLapsedLock(t *testing.T) {
+	setStateOriginTestEnv(t)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	// A peer died mid-genesis: the lock is long expired, KMSKeyID never committed.
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(-time.Hour))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	lease, _, err := awaitGenesis(ctx, fx.ssm, fx.s3f, pcr0)
+
+	require.Nil(t, lease)
+	require.ErrorContains(t, err, "genesis did not complete")
+	require.ErrorContains(t, err, "delete that object", "the error must be actionable")
+	require.Empty(t, fx.kmsf.keys, "a lapsed genesis lock must not admit a second genesis")
+}

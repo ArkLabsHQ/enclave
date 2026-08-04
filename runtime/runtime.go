@@ -114,6 +114,7 @@ func Run(ctx context.Context, cfg Config) error {
 		aws.KMS,
 		aws.STS,
 		ssm,
+		aws.S3,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)

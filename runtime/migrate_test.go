@@ -378,6 +378,7 @@ func TestCompleteMigration(t *testing.T) {
 			fx.kmsf,
 			&fakeSTS{},
 			fx.ssm,
+			fx.s3f,
 		)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
@@ -390,7 +391,7 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: oldPCR0}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		_, err = EstablishState(ctx, oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm)
+		_, err = EstablishState(ctx, oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
 		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])

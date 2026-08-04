@@ -123,6 +123,11 @@ func lockSegment() string {
 	return "unlocked"
 }
 
+// storageBucketParam: SSM path for the shared storage bucket name.
+func storageBucketParam() string {
+	return fmt.Sprintf("/%s/%s/StorageBucketName", getDeployment(), getAppName())
+}
+
 // kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
 func kmsKeyIDParam() string {
 	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())

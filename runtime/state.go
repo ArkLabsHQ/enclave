@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -20,7 +21,78 @@ const (
 
 	purposeStateOrigin         = "enclave.state_origin"
 	purposeMigrationTransition = "enclave.state_origin.migration_transition"
+
+	genesisLeaseName = "genesis"
+
+	// genesisLeaseWait bounds how long we queue behind a peer's genesis.
+	genesisLeaseWait = 10 * time.Minute
 )
+
+// awaitGenesis returns once genesis is this enclave's to perform or a peer has
+// already committed one. A non-nil lease means we hold it and must do genesis;
+// nil means a peer finished and the returned state resumes against their key.
+//
+// Losers watch KMSKeyID rather than queueing on the lease: they have no work to
+// serialize, so making each one win the lock just to discover that would drain a
+// fleet's first boot one poll interval at a time.
+//
+// WARNING: peers unblock together, but first boot still costs however long
+// genesis takes plus a poll interval, and withoutSteal means a holder dying
+// mid-genesis wedges them until an operator deletes the lock object.
+func awaitGenesis(
+	ctx context.Context,
+	ssm SSM,
+	s3api S3API,
+	currentPCR0 []byte,
+) (*Lease, unverifiedState, error) {
+	bucket, err := ssm.MustGet(ctx, storageBucketParam())
+	if err != nil {
+		return nil, unverifiedState{}, fmt.Errorf(
+			"failed to read storage bucket name for genesis lease: %w", err,
+		)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, genesisLeaseWait)
+	defer cancel()
+
+	for {
+		state, err := loadUnverifiedState(waitCtx, ssm, currentPCR0)
+		if err != nil {
+			return nil, unverifiedState{}, fmt.Errorf("failed to reload state for genesis: %w", err)
+		}
+		if state.startState != startStateGenesis {
+			slog.Info("genesis completed by a peer, resuming", "key_id", prefix16(state.kmsKeyID))
+			return nil, state, nil
+		}
+
+		lease, err := tryAcquireLease(
+			waitCtx, s3api, bucket, genesisLeaseName, leaseTTL, withoutSteal(),
+		)
+		if err != nil {
+			return nil, unverifiedState{}, fmt.Errorf("failed to acquire genesis lease: %w", err)
+		}
+		if lease != nil {
+			state, err = loadUnverifiedState(waitCtx, ssm, currentPCR0)
+			if err != nil {
+				_ = lease.Release(context.WithoutCancel(ctx))
+				return nil, unverifiedState{}, fmt.Errorf(
+					"failed to reload state under genesis lease: %w", err,
+				)
+			}
+			return lease, state, nil
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return nil, unverifiedState{}, fmt.Errorf(
+				"genesis did not complete: lock s3://%s/%s is held and genesis is never "+
+					"taken over; delete that object once no enclave is mid-genesis: %w",
+				bucket, leaseObjectKey(genesisLeaseName), waitCtx.Err(),
+			)
+		case <-time.After(leasePollInterval):
+		}
+	}
+}
 
 type startState int
 
@@ -71,6 +143,7 @@ func EstablishState(
 	kmsAPI KMSAPI,
 	sts STSAPI,
 	ssm SSM,
+	s3api S3API,
 ) (verifiedState, error) {
 	currentPCR0, err := nsm.PCR0()
 	if err != nil {
@@ -85,6 +158,17 @@ func EstablishState(
 	state, err := loadUnverifiedState(ctx, ssm, currentPCR0)
 	if err != nil {
 		return verifiedState{}, fmt.Errorf("failed to load unverified state: %w", err)
+	}
+
+	if state.startState == startStateGenesis {
+		lease, genesisState, err := awaitGenesis(ctx, ssm, s3api, currentPCR0)
+		if err != nil {
+			return verifiedState{}, err
+		}
+		if lease != nil {
+			defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+		}
+		state = genesisState
 	}
 
 	if err := verifyPredecessorCommitment(nsm, state); err != nil {

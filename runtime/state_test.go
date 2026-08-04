@@ -157,6 +157,7 @@ func TestEstablishStateRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
 		nil,
 		nil,
 		ssm,
+		nil,
 	)
 
 	require.ErrorContains(t, err, "exactly 48 bytes")

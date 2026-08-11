@@ -307,6 +307,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 		kms,
 		ssm,
 		unverified,
+		nil,
 	)
 
 	require.NoError(t, err)
@@ -350,6 +351,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 		&stateOriginTestKMS{keyID: keyID},
 		ssm,
 		unverified,
+		nil,
 	)
 
 	require.NoError(t, err)
@@ -391,6 +393,7 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 		&stateOriginTestKMS{keyID: keyID},
 		ssm,
 		unverified,
+		nil,
 	)
 
 	require.Error(t, err)
@@ -438,6 +441,7 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 				kms,
 				ssm,
 				unverified,
+				nil,
 			)
 
 			require.ErrorContains(t, err, "invalid state-origin receipt")
@@ -484,6 +488,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			&stateOriginTestKMS{keyID: keyID},
 			ssm,
 			unverified,
+			nil,
 		)
 		return fake, root, stateReceipt.roots, err
 	}
@@ -753,17 +758,33 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	require.Equal(t, startStateResume, state.startState)
 }
 
-// Genesis is never taken over. A holder that died mid-genesis leaves a lapsed
-// lock, and peers must wedge rather than resume its half-finished work: the
-// KMSKeyID commit cannot be conditional, so a stalled holder waking up later
-// would clobber whoever took over and orphan that enclave's DEK.
-func TestAwaitGenesisNeverStealsLapsedLock(t *testing.T) {
+// A holder that died mid-genesis must not wedge the deployment forever — not
+// even against its own restart. Once the lease lapses the lock is reclaimable.
+func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
-	// A peer died mid-genesis: the lock is long expired, KMSKeyID never committed.
+	// A previous boot died mid-genesis: lock left behind, KMSKeyID never committed.
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(-time.Hour))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	lease, state, err := awaitGenesis(ctx, fx.ssm, fx.s3f, pcr0)
+
+	require.NoError(t, err)
+	require.NotNil(t, lease, "a lapsed lock must be reclaimable")
+	require.Equal(t, startStateGenesis, state.startState)
+	require.NoError(t, lease.Release(context.Background()))
+}
+
+// A live holder is still never displaced.
+func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
+	setStateOriginTestEnv(t)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -771,6 +792,39 @@ func TestAwaitGenesisNeverStealsLapsedLock(t *testing.T) {
 
 	require.Nil(t, lease)
 	require.ErrorContains(t, err, "genesis did not complete")
-	require.ErrorContains(t, err, "delete that object", "the error must be actionable")
-	require.Empty(t, fx.kmsf.keys, "a lapsed genesis lock must not admit a second genesis")
+	require.Empty(t, fx.kmsf.keys, "a live holder's genesis must not be duplicated")
+}
+
+// The KMSKeyID commit is unconditional, so losing the lock mid-genesis must
+// stop the commit rather than let it clobber whoever took over.
+func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
+	setStateOriginTestEnv(t)
+	ctx := context.Background()
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	bucket, err := fx.ssm.MustGet(ctx, storageBucketParam())
+	require.NoError(t, err)
+	lease, err := AcquireLease(ctx, fx.s3f, bucket, genesisLeaseName, leaseTTL)
+	require.NoError(t, err)
+
+	// A peer takes the lock over while this enclave is mid-genesis.
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
+
+	unverified, err := loadUnverifiedState(ctx, fx.ssm, pcr0)
+	require.NoError(t, err)
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+
+	_, err = establishLoadedState(
+		ctx,
+		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
+		&stateOriginTestKMS{keyID: "key-zombie"},
+		fx.ssm,
+		unverified,
+		lease,
+	)
+
+	require.ErrorContains(t, err, "refusing to commit genesis")
+	require.ErrorIs(t, err, ErrLeaseLost)
+	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()], "KMSKeyID must not be committed")
 }

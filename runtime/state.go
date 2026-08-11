@@ -37,8 +37,8 @@ const (
 // fleet's first boot one poll interval at a time.
 //
 // WARNING: peers unblock together, but first boot still costs however long
-// genesis takes plus a poll interval, and withoutSteal means a holder dying
-// mid-genesis wedges them until an operator deletes the lock object.
+// genesis takes plus a poll interval. A holder that dies blocks the fleet until
+// its lease lapses (leaseTTL), including its own restart.
 func awaitGenesis(
 	ctx context.Context,
 	ssm SSM,
@@ -65,9 +65,7 @@ func awaitGenesis(
 			return nil, state, nil
 		}
 
-		lease, err := TryAcquireLease(
-			waitCtx, s3api, bucket, genesisLeaseName, leaseTTL, withoutSteal(),
-		)
+		lease, err := TryAcquireLease(waitCtx, s3api, bucket, genesisLeaseName, leaseTTL)
 		if err != nil {
 			return nil, unverifiedState{}, fmt.Errorf("failed to acquire genesis lease: %w", err)
 		}
@@ -85,8 +83,7 @@ func awaitGenesis(
 		select {
 		case <-waitCtx.Done():
 			return nil, unverifiedState{}, fmt.Errorf(
-				"genesis did not complete: lock s3://%s/%s is held and genesis is never "+
-					"taken over; delete that object once no enclave is mid-genesis: %w",
+				"genesis did not complete: lock s3://%s/%s held for the whole wait: %w",
 				bucket, leaseObjectKey(genesisLeaseName), waitCtx.Err(),
 			)
 		case <-time.After(leasePollInterval):
@@ -160,12 +157,14 @@ func EstablishState(
 		return verifiedState{}, fmt.Errorf("failed to load unverified state: %w", err)
 	}
 
+	var genesisLease *Lease
 	if state.startState == startStateGenesis {
 		lease, genesisState, err := awaitGenesis(ctx, ssm, s3api, currentPCR0)
 		if err != nil {
 			return verifiedState{}, err
 		}
 		if lease != nil {
+			genesisLease = lease
 			defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 		}
 		state = genesisState
@@ -188,7 +187,7 @@ func EstablishState(
 		return verifiedState{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
 
-	return establishLoadedState(ctx, nsm, kms, ssm, state)
+	return establishLoadedState(ctx, nsm, kms, ssm, state, genesisLease)
 }
 
 // WriteTransitionReceipt is called by the predecessor during a handoff; PCR31
@@ -378,6 +377,7 @@ func establishLoadedState(
 	kms PrimaryKMS,
 	ssm SSM,
 	state unverifiedState,
+	lease *Lease,
 ) (verifiedState, error) {
 	var snapshot persistedStateSnapshot
 	var verified verifiedState
@@ -456,6 +456,11 @@ func establishLoadedState(
 			return verifiedState{}, fmt.Errorf("failed to write state-origin receipt: %w", err)
 		}
 		if state.startState == startStateGenesis {
+			if lease != nil {
+				if err := lease.Verify(ctx); err != nil {
+					return verifiedState{}, fmt.Errorf("refusing to commit genesis: %w", err)
+				}
+			}
 			if err := ssm.Set(ctx, kmsKeyIDParam(), kms.KeyID()); err != nil {
 				return verifiedState{}, fmt.Errorf("failed to commit genesis KMS key ID: %w", err)
 			}

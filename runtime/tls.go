@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
@@ -21,11 +20,9 @@ import (
 
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
 )
 
 const (
-	acmeCertCacheDir = "cert-cache"
 	// acmeStagingDirectoryURL is Let's Encrypt's staging ACME endpoint — an
 	// untrusted root with high rate limits, used for testing.
 	acmeStagingDirectoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -36,7 +33,7 @@ const (
 type TLSCertCallback func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 // withDefaultSNI fills a missing server name so IP/loopback probes reach the
-// same cert source as named clients. autocert rejects an empty ServerName.
+// same cert source as named clients.
 func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
 	if fqdn == "" {
 		return next
@@ -51,15 +48,13 @@ func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
 	}
 }
 
-// ConfigureTLS selects one of three certificate sources:
+// ConfigureTLS picks the certificate source: self-signed when ACME is off,
+// otherwise a fleet-shared certificate obtained via DNS-01.
 //
-//   - self-signed, when ACME is off;
-//   - DNS-01 with a fleet-shared certificate, when a Route53 zone is configured.
-//     This is the only mode that survives a load balancer, because tls-alpn-01
-//     needs the CA's connection to reach the specific enclave holding the
-//     challenge;
-//   - tls-alpn-01 via autocert otherwise - the single-instance path, retained
-//     unchanged for deployments addressed directly by IP.
+// DNS-01 is the only supported challenge. tls-alpn-01 cannot survive a load
+// balancer — the CA's connection is hashed to an arbitrary target while only the
+// enclave that created the order holds the challenge certificate — so ACME
+// requires a Route53 hosted zone.
 func ConfigureTLS(
 	ctx context.Context,
 	cfg *Config,
@@ -77,24 +72,26 @@ func ConfigureTLS(
 		return configureSelfSignedCert(cfg, hashes)
 	}
 
+	// Outside an enclave there is no DEK to seal the shared store with, so ACME
+	// is unavailable; local runs get a self-signed certificate.
 	if !nitriding.InEnclave() {
-		return configureACME(cfg, autocert.DirCache(acmeCertCacheDir), hashes)
+		slog.Warn("not running in an enclave, serving a self-signed certificate")
+		return configureSelfSignedCert(cfg, hashes)
 	}
 
 	zoneID, err := ssm.MayGet(ctx, route53ZoneIDParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Route53 zone ID: %w", err)
 	}
-	if zoneID != "" {
-		return configureSharedDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
+	if zoneID == "" {
+		// Fail rather than quietly serve self-signed: an operator who asked for
+		// ACME and silently got an untrusted certificate finds out from clients.
+		return nil, fmt.Errorf(
+			"ACME is enabled but %s is unset; DNS-01 is the only supported challenge "+
+				"and needs a Route53 hosted zone", route53ZoneIDParam(),
+		)
 	}
-
-	slog.Info("no Route53 zone configured, using tls-alpn-01 (single instance only)")
-	acmeCache, err := NewAcmeStorageCache(ctx, s3, dek, ssm)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ACME cache: %w", err)
-	}
-	return configureACME(cfg, acmeCache, hashes)
+	return configureSharedDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
 }
 
 // configureSharedDNS01Cert brings up the fleet-shared certificate: load or issue
@@ -189,37 +186,6 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	}
 
 	return nil
-}
-
-func configureACME(
-	cfg *Config,
-	cache autocert.Cache,
-	hashes AttestationHashes,
-) (TLSCertCallback, error) {
-	client, err := acmeClientForDirectory(cfg.ACMEDirectory, cfg.ACMECA)
-	if err != nil {
-		return nil, err
-	}
-
-	mgr := autocert.Manager{
-		Cache:      cache,
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.FQDN),
-		Email:      cfg.ACMEEmail,
-		Client:     client,
-	}
-
-	// Hash live ACME leaf; autocert may rotate it.
-	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		cert, err := mgr.GetCertificate(hello)
-		if err == nil && cert != nil && len(cert.Certificate) > 0 {
-			h := sha256.Sum256(cert.Certificate[0])
-			if hashes.SetTLSKeyHashIfChanged(h) {
-				slog.Info("TLS: bound attestation to ACME cert", "sha256", hex.EncodeToString(h[:]))
-			}
-		}
-		return cert, err
-	}, nil
 }
 
 // configureSelfSignedCert generates an ECDSA-P256 leaf cert, records its fingerprint

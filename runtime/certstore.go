@@ -55,12 +55,21 @@ func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
 	return &certStore{s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn}
 }
 
+// acmeStoragePrefix namespaces certificate material in the app storage bucket.
+// The layout predates DNS-01 and is kept so existing deployments keep their
+// certificate rather than re-issuing on upgrade.
+const acmeStoragePrefix = "data/acme/"
+
+func objectKeyFor(name string) string {
+	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
+}
+
 func (c *certStore) certObjectKey() string {
-	return prefixAcmeCacheKey(c.fqdn + "/cert")
+	return objectKeyFor(c.fqdn + "/cert")
 }
 
 func (c *certStore) accountObjectKey() string {
-	return prefixAcmeCacheKey("account.key")
+	return objectKeyFor("account.key")
 }
 
 // certETag reports the current object's ETag, or "" when absent. Used by the

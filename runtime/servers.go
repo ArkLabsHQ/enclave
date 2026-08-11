@@ -116,7 +116,7 @@ func SetupHttpServers(
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
-			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
 	}
 

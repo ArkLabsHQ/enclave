@@ -14,6 +14,9 @@ import (
 )
 
 func main() {
+	// Before anything reads config or touches the network. No-op outside dev.
+	runtime.ApplyDevCmdlineOverrides()
+
 	cfg, err := runtime.LoadConfig()
 	if err != nil {
 		slog.Error("load runtime config", "error", err)

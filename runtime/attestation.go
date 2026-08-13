@@ -25,6 +25,7 @@ type AttestedSigner interface {
 type AttestationHashes interface {
 	SetTLSKeyHash(h [sha256.Size]byte)
 	SetTLSKeyHashIfChanged(h [sha256.Size]byte) bool
+	SetTLSKeyHashSource(src func() ([sha256.Size]byte, bool))
 	SetSigningKeyHash(h [sha256.Size]byte)
 	Serialize() []byte
 }
@@ -80,6 +81,7 @@ type attestationHashes struct {
 	mu             sync.RWMutex
 	tlsKeyHash     [sha256.Size]byte
 	signingKeyHash [sha256.Size]byte
+	tlsKeyHashSrc  func() ([sha256.Size]byte, bool)
 }
 
 func NewAttestationHashes() AttestationHashes {
@@ -106,6 +108,14 @@ func (a *attestationHashes) SetTLSKeyHashIfChanged(h [sha256.Size]byte) bool {
 	return true
 }
 
+// SetTLSKeyHashSource makes the attested hash track the same atomic certificate
+// pointer used by TLS handshakes, avoiding a mismatch window during renewal.
+func (a *attestationHashes) SetTLSKeyHashSource(src func() ([sha256.Size]byte, bool)) {
+	a.mu.Lock()
+	a.tlsKeyHashSrc = src
+	a.mu.Unlock()
+}
+
 // SetSigningKeyHash records the response-signing key hash.
 func (a *attestationHashes) SetSigningKeyHash(h [sha256.Size]byte) {
 	a.mu.Lock()
@@ -116,7 +126,13 @@ func (a *attestationHashes) SetSigningKeyHash(h [sha256.Size]byte) {
 // Serialize returns user_data: sha256:<tls>;sha256:<signing>, with raw hash bytes.
 func (a *attestationHashes) Serialize() []byte {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
+	tlsHash, signing, src := a.tlsKeyHash, a.signingKeyHash, a.tlsKeyHashSrc
+	a.mu.RUnlock()
+	if src != nil {
+		if live, ok := src(); ok {
+			tlsHash = live
+		}
+	}
 	return []byte(fmt.Sprintf("%s%s%s%s%s",
-		hashPrefix, a.tlsKeyHash, hashSeparator, hashPrefix, a.signingKeyHash))
+		hashPrefix, tlsHash, hashSeparator, hashPrefix, signing))
 }

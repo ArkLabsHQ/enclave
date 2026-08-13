@@ -1,9 +1,5 @@
 package runtime
 
-// S3 conditional-write lease. Every transition is guarded by an S3 conditional
-// write, so the ETag returned by the last successful write *is* the claim: the
-// object body carries only an expiry
-
 import (
 	"bytes"
 	"context"
@@ -21,11 +17,7 @@ import (
 )
 
 const (
-	// leaseTTL bounds how long a dead holder blocks its peers. Renewing at
-	// ttl/3 leaves a live holder at least 2*ttl/3 of remaining lease at all
-	// times, which is the margin that absorbs clock skew between enclaves: a
-	// peer would need minutes of skew to rob a healthy holder, so expiry needs
-	// no extra padding.
+	// leaseTTL bounds how long a dead holder can block its peers.
 	leaseTTL = 5 * time.Minute
 
 	// leaseConflictRetries bounds retries of S3's retryable 409.
@@ -53,14 +45,7 @@ type leaseDocV1 struct {
 	ExpiresAt  int64 `json:"expires_at"`
 }
 
-// lapsed reports whether the lease is stealable.
-func (d leaseDocV1) lapsed(now time.Time) bool {
-	return now.After(time.Unix(d.ExpiresAt, 0))
-}
-
-// Lease is a held S3 lease, kept alive by a background heartbeat. Callers scope
-// their work to Context() so a stolen lease cancels it; they never write to the
-// lease object themselves.
+// Lease is a held S3 lease kept alive by a background heartbeat.
 type Lease struct {
 	s3     S3API
 	bucket string
@@ -74,32 +59,10 @@ type Lease struct {
 	stop     chan struct{}
 	done     chan struct{}
 
-	mu        sync.Mutex
-	etag      string
+	mu sync.Mutex
+
+	guard     string
 	expiresAt time.Time
-}
-
-func (l *Lease) currentETag() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.etag
-}
-
-func (l *Lease) renewedAt(etag string, expiresAt time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.etag, l.expiresAt = etag, expiresAt
-}
-
-func (l *Lease) lapsed() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return time.Now().After(l.expiresAt)
-}
-
-// leaseObjectKey namespaces locks inside the storage bucket.
-func leaseObjectKey(name string) string {
-	return fmt.Sprintf("%s/%s/lock/%s", getDeployment(), getAppName(), name)
 }
 
 func TryAcquireLease(
@@ -108,12 +71,13 @@ func TryAcquireLease(
 	bucket, name string,
 	ttl time.Duration,
 ) (*Lease, error) {
-	key := leaseObjectKey(name)
-	etag, expiresAt, err := claimLease(ctx, s3api, bucket, key, ttl)
-	if err != nil || etag == "" {
+	l := &Lease{s3: s3api, bucket: bucket, key: leaseObjectKey(name), ttl: ttl}
+	won, err := l.claim(ctx)
+	if err != nil || !won {
 		return nil, err
 	}
-	return startLease(s3api, bucket, key, ttl, etag, expiresAt), nil
+	l.start()
+	return l, nil
 }
 
 // AcquireLease blocks until the lease is held or ctx ends.
@@ -145,34 +109,33 @@ func (l *Lease) Verify(ctx context.Context) error {
 	if l.ctx.Err() != nil {
 		return fmt.Errorf("%w: %s: %w", ErrLeaseLost, l.key, context.Cause(l.ctx))
 	}
-	_, etag, err := getLease(ctx, l.s3, l.bucket, l.key)
+	_, live, err := l.get(ctx)
 	if err != nil {
 		if isNoSuchKey(err) {
 			return fmt.Errorf("%w: %s: lease object is gone", ErrLeaseLost, l.key)
 		}
 		return fmt.Errorf("verify lease %q: %w", l.key, err)
 	}
-	if etag != l.currentETag() {
+	if live != l.currentGuard() {
 		return fmt.Errorf("%w: %s: taken over by a peer", ErrLeaseLost, l.key)
 	}
 	return nil
 }
 
-// Release stops the heartbeat and drops the object. Conditional on our ETag, so
-// a lease already stolen is left alone.
+// Release relinquishes the lease.
 func (l *Lease) Release(ctx context.Context) error {
 	l.stopOnce.Do(func() { close(l.stop) })
-	<-l.done // hands etag ownership over from the heartbeat goroutine
+	<-l.done // hands guard ownership over from the heartbeat goroutine
 	l.cancel(errLeaseReleased)
 
-	etag := l.currentETag()
-	if etag == "" {
+	guard := l.currentGuard()
+	if guard == "" {
 		return nil
 	}
 	_, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket:  aws.String(l.bucket),
 		Key:     aws.String(l.key),
-		IfMatch: aws.String(etag),
+		IfMatch: aws.String(guard),
 	})
 	switch {
 	case err == nil:
@@ -185,32 +148,15 @@ func (l *Lease) Release(ctx context.Context) error {
 	}
 }
 
-func startLease(
-	s3api S3API,
-	bucket, key string,
-	ttl time.Duration,
-	etag string,
-	expiresAt time.Time,
-) *Lease {
-	ctx, cancel := context.WithCancelCause(context.Background())
-	l := &Lease{
-		s3:        s3api,
-		bucket:    bucket,
-		key:       key,
-		ttl:       ttl,
-		ctx:       ctx,
-		cancel:    cancel,
-		stop:      make(chan struct{}),
-		done:      make(chan struct{}),
-		etag:      etag,
-		expiresAt: expiresAt,
-	}
+// start begins the heartbeat that keeps the lease alive and detects its loss.
+func (l *Lease) start() {
+	l.ctx, l.cancel = context.WithCancelCause(context.Background())
+	l.stop = make(chan struct{})
+	l.done = make(chan struct{})
 	go l.heartbeat()
-	return l
 }
 
-// heartbeat renews the lease every ttl/3 and is the loss detector: a 412 means a
-// peer stole it, which cancels the lease context so leased work unwinds.
+// heartbeat renews the lease every ttl/3 and is the loss detector
 func (l *Lease) heartbeat() {
 	defer close(l.done)
 
@@ -225,12 +171,12 @@ func (l *Lease) heartbeat() {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), leaseWriteTimeout)
-		etag, expiresAt, err := putLease(ctx, l.s3, l.bucket, l.key, l.ttl, ifMatch(l.currentETag()))
+		guard, expiresAt, err := l.put(ctx)
 		cancel()
 
 		switch {
 		case err == nil:
-			l.renewedAt(etag, expiresAt)
+			l.renewedAt(guard, expiresAt)
 		case isPreconditionFailed(err):
 			l.cancel(fmt.Errorf("%w: %s", ErrLeaseLost, l.key))
 			return
@@ -243,77 +189,98 @@ func (l *Lease) heartbeat() {
 	}
 }
 
-// claimLease returns the ETag of a won lease, or "" when a live peer holds it.
-func claimLease(
-	ctx context.Context,
-	s3api S3API,
-	bucket, key string,
-	ttl time.Duration,
-) (string, time.Time, error) {
+// claim wins the lease and records its guard, or reports false when a live peer
+// holds it. Runs before the heartbeat starts, so it writes the fields directly.
+func (l *Lease) claim(ctx context.Context) (bool, error) {
 	for attempt := 0; attempt <= leaseConflictRetries; attempt++ {
 		// Uncontended: succeeds only if the object is absent.
-		etag, expiresAt, err := putLease(ctx, s3api, bucket, key, ttl, ifNoneMatchAny())
+		l.setGuard("")
+		guard, expiresAt, err := l.put(ctx)
 		switch {
 		case err == nil:
-			return etag, expiresAt, nil
+			l.guard, l.expiresAt = guard, expiresAt
+			return true, nil
 		case isConditionalConflict(err):
 			if err := backoff(ctx, attempt); err != nil {
-				return "", time.Time{}, err
+				return false, err
 			}
 			continue
 		case !isPreconditionFailed(err):
-			return "", time.Time{}, fmt.Errorf("lease claim %q: %w", key, err)
+			return false, fmt.Errorf("lease claim %q: %w", l.key, err)
 		}
 
 		// Held by an enclave. Steal only once their lease has lapsed.
-		doc, curETag, err := getLease(ctx, s3api, bucket, key)
+		doc, theirs, err := l.get(ctx)
 		if isNoSuchKey(err) {
 			continue // released between our put and our get
 		}
 		if err != nil {
-			return "", time.Time{}, err
+			return false, err
 		}
 		if !doc.lapsed(time.Now()) {
-			return "", time.Time{}, nil
+			return false, nil
 		}
 
-		etag, expiresAt, err = putLease(ctx, s3api, bucket, key, ttl, ifMatch(curETag))
+		l.setGuard(theirs)
+		guard, expiresAt, err = l.put(ctx)
 		switch {
 		case err == nil:
-			return etag, expiresAt, nil
+			l.guard, l.expiresAt = guard, expiresAt
+			return true, nil
 		case isPreconditionFailed(err):
-			return "", time.Time{}, nil // a peer stole it first
+			return false, nil // a peer stole it first
 		case isConditionalConflict(err):
 			if err := backoff(ctx, attempt); err != nil {
-				return "", time.Time{}, err
+				return false, err
 			}
 			continue
 		default:
-			return "", time.Time{}, fmt.Errorf("lease steal %q: %w", key, err)
+			return false, fmt.Errorf("lease steal %q: %w", l.key, err)
 		}
 	}
-	return "", time.Time{}, fmt.Errorf("lease claim %q: too many conditional conflicts", key)
+	return false, fmt.Errorf("lease claim %q: too many conditional conflicts", l.key)
 }
 
-type leaseCondition func(*s3.PutObjectInput)
-
-func ifMatch(etag string) leaseCondition {
-	return func(in *s3.PutObjectInput) { in.IfMatch = aws.String(etag) }
+// insertCondition applies the lease's expectation to a put, so S3, not this
+// process, decides whether the write is allowed.
+func (l *Lease) insertCondition(in *s3.PutObjectInput) {
+	if guard := l.currentGuard(); guard != "" {
+		in.IfMatch = aws.String(guard)
+		return
+	}
+	in.IfNoneMatch = aws.String("*")
 }
 
-func ifNoneMatchAny() leaseCondition {
-	return func(in *s3.PutObjectInput) { in.IfNoneMatch = aws.String("*") }
+// expect records the version the next put must find. Set before every claim
+// attempt: a failed steal would otherwise leave a peer's guard behind and turn
+// the next iteration's create-only write into a conditional overwrite.
+func (l *Lease) setGuard(guard string) {
+	l.mu.Lock()
+	l.guard = guard
+	l.mu.Unlock()
 }
 
-func putLease(
-	ctx context.Context,
-	s3api S3API,
-	bucket, key string,
-	ttl time.Duration,
-	cond leaseCondition,
-) (string, time.Time, error) {
+func (l *Lease) currentGuard() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.guard
+}
+
+func (l *Lease) renewedAt(guard string, expiresAt time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.guard, l.expiresAt = guard, expiresAt
+}
+
+func (l *Lease) lapsed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return time.Now().After(l.expiresAt)
+}
+
+func (l *Lease) put(ctx context.Context) (string, time.Time, error) {
 	now := time.Now()
-	expiresAt := now.Add(ttl)
+	expiresAt := now.Add(l.ttl)
 	body, err := json.Marshal(leaseDocV1{
 		AcquiredAt: now.Unix(),
 		ExpiresAt:  expiresAt.Unix(),
@@ -323,33 +290,29 @@ func putLease(
 	}
 
 	in := &s3.PutObjectInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(key),
+		Bucket:      aws.String(l.bucket),
+		Key:         aws.String(l.key),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
 	}
 
-	cond(in)
+	l.insertCondition(in)
 
-	out, err := s3api.PutObject(ctx, in)
+	out, err := l.s3.PutObject(ctx, in)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	etag := aws.ToString(out.ETag)
 	if etag == "" {
-		return "", time.Time{}, fmt.Errorf("lease put %q: S3 returned no ETag", key)
+		return "", time.Time{}, fmt.Errorf("lease put %q: S3 returned no ETag", l.key)
 	}
 	return etag, expiresAt, nil
 }
 
-func getLease(
-	ctx context.Context,
-	s3api S3API,
-	bucket, key string,
-) (leaseDocV1, string, error) {
-	out, err := s3api.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+func (l *Lease) get(ctx context.Context) (leaseDocV1, string, error) {
+	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(l.bucket),
+		Key:    aws.String(l.key),
 	})
 	if err != nil {
 		return leaseDocV1{}, "", err
@@ -358,14 +321,24 @@ func getLease(
 
 	raw, err := io.ReadAll(out.Body)
 	if err != nil {
-		return leaseDocV1{}, "", fmt.Errorf("read lease %q: %w", key, err)
+		return leaseDocV1{}, "", fmt.Errorf("read lease %q: %w", l.key, err)
 	}
 	var doc leaseDocV1
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		slog.Warn("lease object is unparseable, treating as lapsed", "key", key, "error", err)
+		slog.Warn("lease object is unparseable, treating as lapsed", "key", l.key, "error", err)
 		return leaseDocV1{}, aws.ToString(out.ETag), nil
 	}
 	return doc, aws.ToString(out.ETag), nil
+}
+
+// lapsed reports whether the lease is stealable.
+func (d leaseDocV1) lapsed(now time.Time) bool {
+	return now.After(time.Unix(d.ExpiresAt, 0))
+}
+
+// leaseObjectKey namespaces locks inside the storage bucket.
+func leaseObjectKey(name string) string {
+	return fmt.Sprintf("%s/%s/lock/%s", getDeployment(), getAppName(), name)
 }
 
 func backoff(ctx context.Context, attempt int) error {

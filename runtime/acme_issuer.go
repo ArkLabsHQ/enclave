@@ -1,13 +1,6 @@
 package runtime
 
-// DNS-01 issuance driven directly against golang.org/x/crypto/acme.
-//
-// autocert is not usable here: it implements only http-01 and tls-alpn-01, and
-// its Manager is process-local, so N enclaves would issue N simultaneous orders
-// for one FQDN and exhaust the CA's duplicate-certificate limit. lego and
-// certmagic would solve the protocol half but drag a large dependency tree into
-// a measured EIF, so the order flow is written out here instead.
-
+// DNS-01 issuance driven directly against golang.org/x/crypto/acme. The challenge is published over DNS
 import (
 	"context"
 	"crypto"
@@ -20,7 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/route53"
+	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"golang.org/x/crypto/acme"
 )
 
@@ -28,16 +26,34 @@ import (
 // for its duration.
 type acmeIssuer struct {
 	client *acme.Client
-	dns    dnsProvider
+	r53    Route53API
+	zoneID string
 	email  string
 }
 
-func newACMEIssuer(client *acme.Client, dns dnsProvider, email string) *acmeIssuer {
-	return &acmeIssuer{client: client, dns: dns, email: email}
+const (
+	acmeChallengePrefix = "_acme-challenge."
+
+	// dnsChallengeTTL is short so a failed cleanup expires quickly.
+	dnsChallengeTTL = 60
+
+	route53SyncPoll    = 2 * time.Second
+	route53SyncTimeout = 3 * time.Minute
+)
+
+func newACMEIssuer(
+	client *acme.Client,
+	r53 Route53API,
+	zoneID, email string,
+) (*acmeIssuer, error) {
+	if strings.TrimSpace(zoneID) == "" {
+		return nil, errors.New("ACME issuer: hosted zone ID is required for DNS-01")
+	}
+	return &acmeIssuer{client: client, r53: r53, zoneID: zoneID, email: email}, nil
 }
 
-// issue runs a complete order for domain and returns the PEM chain and key.
-func (i *acmeIssuer) issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
+// Issue runs a complete order for domain and returns the PEM chain and key.
+func (i *acmeIssuer) Issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
 	if err := i.register(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -47,8 +63,6 @@ func (i *acmeIssuer) issue(ctx context.Context, domain string) (certPEM, keyPEM 
 		return nil, nil, fmt.Errorf("authorize order for %q: %w", domain, err)
 	}
 
-	// Challenge records are withdrawn before this returns. Safe: an authorization
-	// stays valid once validated, and finalization never re-queries DNS.
 	if err := i.solveChallenges(ctx, order); err != nil {
 		return nil, nil, err
 	}
@@ -98,12 +112,7 @@ func (i *acmeIssuer) register(ctx context.Context) error {
 	return nil
 }
 
-// solveChallenges publishes every dns-01 record the order needs, accepts the
-// challenges, and waits for the authorizations to go valid. Records are withdrawn
-// before it returns, on every path.
 func (i *acmeIssuer) solveChallenges(ctx context.Context, order *acme.Order) error {
-	// One record name per identifier, but a name may carry several values, so
-	// they are published as a set rather than one at a time.
 	valuesByName := map[string][]string{}
 	var accept []*acme.Challenge
 
@@ -131,7 +140,7 @@ func (i *acmeIssuer) solveChallenges(ctx context.Context, order *acme.Order) err
 	}
 
 	if len(accept) == 0 {
-		return nil // every authorization was already valid
+		return nil
 	}
 
 	// Withdraw whatever we managed to publish, on every exit path. The context
@@ -139,14 +148,14 @@ func (i *acmeIssuer) solveChallenges(ctx context.Context, order *acme.Order) err
 	published := map[string][]string{}
 	defer func() {
 		for name, values := range published {
-			if err := i.dns.RemoveChallenge(context.WithoutCancel(ctx), name, values); err != nil {
+			if err := i.removeChallenge(context.WithoutCancel(ctx), name, values); err != nil {
 				slog.Warn("failed to withdraw dns-01 record", "name", name, "error", err)
 			}
 		}
 	}()
 
 	for name, values := range valuesByName {
-		if err := i.dns.PublishChallenge(ctx, name, values); err != nil {
+		if err := i.publishChallenge(ctx, name, values); err != nil {
 			return err
 		}
 		published[name] = values
@@ -165,39 +174,87 @@ func (i *acmeIssuer) solveChallenges(ctx context.Context, order *acme.Order) err
 	return nil
 }
 
-// loadOrCreateAccountKey returns the fleet-shared ACME account key, creating one
-// if the fleet has none. The create is conditional, so concurrent first boots
-// converge on a single account instead of registering one each.
-func loadOrCreateAccountKey(ctx context.Context, store *certStore) (crypto.Signer, error) {
-	// Two passes at most: either a key is already stored, or we create one, or a
-	// peer beat us to the create and the second pass loads theirs.
-	for range 2 {
-		pemBytes, err := store.loadAccountKey(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if pemBytes != nil {
-			return parseECKey(pemBytes)
-		}
+func (i *acmeIssuer) publishChallenge(
+	ctx context.Context,
+	name string,
+	values []string,
+) error {
+	changeID, err := i.change(ctx, r53types.ChangeActionUpsert, name, values)
+	if err != nil {
+		return fmt.Errorf("publish DNS-01 record %q: %w", name, err)
+	}
+	return i.waitInSync(ctx, changeID)
+}
 
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("generate ACME account key: %w", err)
-		}
-		encoded, err := encodeECKey(key)
-		if err != nil {
-			return nil, err
-		}
+func (i *acmeIssuer) removeChallenge(
+	ctx context.Context,
+	name string,
+	values []string,
+) error {
+	if _, err := i.change(ctx, r53types.ChangeActionDelete, name, values); err != nil {
+		return fmt.Errorf("remove DNS-01 record %q: %w", name, err)
+	}
+	return nil
+}
 
-		err = store.saveAccountKey(ctx, encoded)
-		if err == nil {
-			return key, nil
+func (i *acmeIssuer) change(
+	ctx context.Context,
+	action r53types.ChangeAction,
+	name string,
+	values []string,
+) (string, error) {
+	if len(values) == 0 {
+		return "", errors.New("no challenge values")
+	}
+	records := make([]r53types.ResourceRecord, 0, len(values))
+	for _, v := range values {
+		records = append(records, r53types.ResourceRecord{Value: aws.String(quoteTXTValue(v))})
+	}
+
+	out, err := i.r53.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(i.zoneID),
+		ChangeBatch: &r53types.ChangeBatch{
+			Changes: []r53types.Change{{
+				Action: action,
+				ResourceRecordSet: &r53types.ResourceRecordSet{
+					Name:            aws.String(name),
+					Type:            r53types.RRTypeTxt,
+					TTL:             aws.Int64(dnsChallengeTTL),
+					ResourceRecords: records,
+				},
+			}},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if out == nil || out.ChangeInfo == nil {
+		return "", errors.New("route53 returned no change info")
+	}
+	return aws.ToString(out.ChangeInfo.Id), nil
+}
+
+func (i *acmeIssuer) waitInSync(ctx context.Context, changeID string) error {
+	ctx, cancel := context.WithTimeout(ctx, route53SyncTimeout)
+	defer cancel()
+
+	for {
+		out, err := i.r53.GetChange(ctx, &route53.GetChangeInput{Id: aws.String(changeID)})
+		if err != nil {
+			return fmt.Errorf("get change %q: %w", changeID, err)
 		}
-		if !errors.Is(err, errCertChanged) {
-			return nil, fmt.Errorf("store ACME account key: %w", err)
+		if out == nil || out.ChangeInfo == nil {
+			return fmt.Errorf("get change %q: route53 returned no change info", changeID)
+		}
+		if out.ChangeInfo.Status == r53types.ChangeStatusInsync {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for change %q to sync: %w", changeID, ctx.Err())
+		case <-time.After(route53SyncPoll):
 		}
 	}
-	return nil, errors.New("ACME account key: object kept disappearing between load and create")
 }
 
 func parseECKey(pemBytes []byte) (crypto.Signer, error) {
@@ -239,4 +296,14 @@ func encodeECKey(key *ecdsa.PrivateKey) ([]byte, error) {
 		return nil, fmt.Errorf("marshal private key: %w", err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
+}
+
+// quoteTXTValue wraps a TXT value in the double quotes Route53 requires.
+func quoteTXTValue(v string) string {
+	return `"` + v + `"`
+}
+
+// acmeChallengeName is the fully-qualified TXT record name for an identifier.
+func acmeChallengeName(domain string) string {
+	return acmeChallengePrefix + strings.TrimSuffix(domain, ".") + "."
 }

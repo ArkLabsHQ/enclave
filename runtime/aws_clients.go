@@ -111,11 +111,6 @@ type Route53API interface {
 		params *route53.GetChangeInput,
 		optFns ...func(*route53.Options),
 	) (*route53.GetChangeOutput, error)
-	GetHostedZone(
-		ctx context.Context,
-		params *route53.GetHostedZoneInput,
-		optFns ...func(*route53.Options),
-	) (*route53.GetHostedZoneOutput, error)
 }
 
 // STSAPI is the subset of *sts.Client used by the runtime.

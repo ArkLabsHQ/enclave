@@ -67,7 +67,7 @@ type fakeIssuer struct {
 	onIssue func()
 }
 
-func (f *fakeIssuer) issue(context.Context, string) ([]byte, []byte, error) {
+func (f *fakeIssuer) Issue(context.Context, string) ([]byte, []byte, error) {
 	f.calls++
 	if f.onIssue != nil {
 		f.onIssue()
@@ -105,7 +105,7 @@ func TestCertManagerBootstrapIssuesWhenFleetHasNone(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	m, hashes := newCertTestManager(t, s3f, issuer)
 
-	require.NoError(t, m.bootstrap(context.Background()))
+	require.NoError(t, m.Bootstrap(context.Background()))
 
 	require.Equal(t, 1, issuer.calls)
 	cert, err := m.GetCertificate(nil)
@@ -128,11 +128,11 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 
 	// A peer already issued for the fleet.
 	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	stored, err := m.store.saveCert(context.Background(), certPEM, keyPEM, "")
+	stored, err := m.store.SaveCert(context.Background(), certPEM, keyPEM, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, stored.etag)
 
-	require.NoError(t, m.bootstrap(context.Background()))
+	require.NoError(t, m.Bootstrap(context.Background()))
 
 	require.Zero(t, issuer.calls, "a stored certificate must not trigger an order")
 	// Adopting must record the version too, or the first poll re-downloads a
@@ -163,7 +163,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	issuer.onIssue = func() {
 		// While our order runs, a peer takes over and commits its own.
 		peerCert, peerKey := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-		_, err := m.store.saveCert(ctx, peerCert, peerKey, "")
+		_, err := m.store.SaveCert(ctx, peerCert, peerKey, "")
 		require.NoError(t, err)
 
 		block, _ := pem.Decode(peerCert)
@@ -174,7 +174,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	require.NoError(t, m.renew(ctx, staleETag))
 
 	// The store must still hold the peer's certificate: ours was rejected.
-	stored, err := m.store.loadCert(ctx)
+	stored, err := m.store.LoadCert(ctx)
 	require.NoError(t, err)
 	require.Equal(t, peerLeaf, sha256.Sum256(stored.cert.Certificate[0]),
 		"a stale ETag must not overwrite the peer's certificate")
@@ -207,13 +207,13 @@ func TestCertManagerAdoptsPeerRenewalOnPoll(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	m, _ := newCertTestManager(t, s3f, issuer)
 
-	require.NoError(t, m.bootstrap(ctx))
+	require.NoError(t, m.Bootstrap(ctx))
 	first, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 
 	// A peer renews out from under us.
 	peerCert, peerKey := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	_, err = m.store.saveCert(ctx, peerCert, peerKey, m.currentETag())
+	_, err = m.store.SaveCert(ctx, peerCert, peerKey, m.currentETag())
 	require.NoError(t, err)
 
 	require.NoError(t, m.tick(ctx))
@@ -231,20 +231,20 @@ func TestCertStoreSaveIsConditional(t *testing.T) {
 	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 
 	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(24*time.Hour))
-	saved, err := store.saveCert(ctx, certPEM, keyPEM, "")
+	saved, err := store.SaveCert(ctx, certPEM, keyPEM, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, saved.etag)
 
 	// Create-only against an existing object must fail.
-	_, err = store.saveCert(ctx, certPEM, keyPEM, "")
+	_, err = store.SaveCert(ctx, certPEM, keyPEM, "")
 	require.ErrorIs(t, err, errCertChanged)
 
 	// A stale ETag must fail.
-	_, err = store.saveCert(ctx, certPEM, keyPEM, `"etag-stale"`)
+	_, err = store.SaveCert(ctx, certPEM, keyPEM, `"etag-stale"`)
 	require.ErrorIs(t, err, errCertChanged)
 
 	// The current ETag must succeed.
-	_, err = store.saveCert(ctx, certPEM, keyPEM, saved.etag)
+	_, err = store.SaveCert(ctx, certPEM, keyPEM, saved.etag)
 	require.NoError(t, err)
 }
 
@@ -256,14 +256,14 @@ func TestCertStoreRoundTripsThroughDEK(t *testing.T) {
 
 	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
 	certPEM, keyPEM := issueTestCert(t, "enclave.test", notAfter)
-	_, err := store.saveCert(ctx, certPEM, keyPEM, "")
+	_, err := store.SaveCert(ctx, certPEM, keyPEM, "")
 	require.NoError(t, err)
 
 	// The object on the wire must not contain the key in the clear.
 	raw := s3f.latestBody(store.certObjectKey())
 	require.NotContains(t, string(raw), "PRIVATE KEY")
 
-	bundle, err := store.loadCert(ctx)
+	bundle, err := store.LoadCert(ctx)
 	require.NoError(t, err)
 	require.NotEmpty(t, bundle.etag, "the bundle must carry the version it came from")
 	require.Equal(t, notAfter.UTC(), bundle.notAfter.UTC())
@@ -273,13 +273,9 @@ func TestCertStoreMissingObject(t *testing.T) {
 	setCertTestEnv(t)
 	store := newCertStore(newFakeS3(), &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 
-	bundle, err := store.loadCert(context.Background())
+	bundle, err := store.LoadCert(context.Background())
 	require.NoError(t, err)
 	require.Nil(t, bundle)
-
-	tag, err := store.certETag(context.Background())
-	require.NoError(t, err)
-	require.Empty(t, tag)
 }
 
 func TestLoadOrCreateAccountKeyConvergesOnOne(t *testing.T) {
@@ -288,11 +284,11 @@ func TestLoadOrCreateAccountKeyConvergesOnOne(t *testing.T) {
 	s3f := newFakeS3()
 	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 
-	first, err := loadOrCreateAccountKey(ctx, store)
+	first, err := store.LoadOrCreateAccountKey(ctx)
 	require.NoError(t, err)
 
 	// A second enclave must adopt the stored key, not register its own account.
-	second, err := loadOrCreateAccountKey(ctx, store)
+	second, err := store.LoadOrCreateAccountKey(ctx)
 	require.NoError(t, err)
 	require.Equal(t, first.Public(), second.Public())
 }
@@ -303,8 +299,85 @@ func TestCertManagerIssueFailurePropagates(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test", err: errors.New("CA unavailable")}
 	m, _ := newCertTestManager(t, s3f, issuer)
 
-	err := m.bootstrap(context.Background())
+	err := m.Bootstrap(context.Background())
 
 	require.ErrorContains(t, err, "CA unavailable")
 	require.Empty(t, s3f.currentETag(leaseObjectKey(certLeaseName)), "lease must be released")
+}
+
+// The attested hash and the served certificate must never disagree: a client
+// that reads user_data and then opens a connection pins one against the other.
+// They are one atomic load, so this holds at every point of a renewal.
+func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
+	m, hashes := newCertTestManager(t, s3f, issuer)
+	ctx := context.Background()
+
+	// Before any certificate exists, user_data carries the zero hash rather
+	// than a value for a leaf nobody serves.
+	requireAttestedTLSHash(t, hashes, [sha256.Size]byte{})
+
+	require.NoError(t, m.Bootstrap(ctx))
+
+	attested := func() [sha256.Size]byte {
+		var h [sha256.Size]byte
+		copy(h[:], hashes.Serialize()[len(hashPrefix):])
+		return h
+	}
+	served := func() [sha256.Size]byte {
+		cert, err := m.GetCertificate(nil)
+		require.NoError(t, err)
+		return sha256.Sum256(cert.Certificate[0])
+	}
+	require.Equal(t, served(), attested(), "after bootstrap")
+
+	// Adopting a peer's certificate moves both together too.
+	before := served()
+	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
+	bundle, err := m.store.SaveCert(ctx, certPEM, keyPEM, m.currentETag())
+	require.NoError(t, err)
+	m.currentCert.Store(bundle)
+
+	require.NotEqual(t, before, served(), "the served leaf should have changed")
+	require.Equal(t, served(), attested(), "after adopting a peer's certificate")
+}
+
+// S3 returns 409 ConditionalRequestConflict when concurrent conditional writes
+// race internally. It is not contention with a peer, but the response is the
+// same as 412: adopt what is there rather than reporting a broken issuance and
+// burning another duplicate-certificate slot on a retry.
+func TestCertStoreConditionalConflictIsCertChanged(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	dek := &dek{key: make([]byte, 32)}
+	store := newCertStore(s3f, dek, certTestBucket, "enclave.test")
+	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
+
+	s3f.putConflicts = 1
+	_, err := store.SaveCert(context.Background(), certPEM, keyPEM, "")
+	require.ErrorIs(t, err, errCertChanged,
+		"a 409 must surface as cert-changed so the caller adopts instead of failing")
+}
+
+// HeadObject can see a version GetObject then misses, if the object is deleted
+// in between. The enclave keeps serving what it has rather than dropping its
+// certificate, and must not do so silently.
+func TestCertManagerTickSurvivesVanishedCert(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
+	m, _ := newCertTestManager(t, s3f, issuer)
+	ctx := context.Background()
+	require.NoError(t, m.Bootstrap(ctx))
+
+	served := m.currentCert.Load()
+	require.NotNil(t, served)
+
+	// The object is deleted out from under the fleet.
+	s3f.getMissing = map[string]bool{m.store.certObjectKey(): true}
+
+	require.NoError(t, m.tick(ctx), "a vanished object must not fail the poll")
+	require.Same(t, served, m.currentCert.Load(), "the previous certificate stays in service")
 }

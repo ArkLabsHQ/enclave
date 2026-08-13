@@ -1,16 +1,12 @@
 package runtime
 
-// Fleet-shared certificate storage.
-//
-// The certificate and its private key live in one DEK-sealed S3 object, so a
-// write can never tear into a cert without its key. Every enclave of the same
-// PCR0 derives the same DEK, so all of them can open it — that is what makes one
-// certificate shareable across the fleet, and therefore what lets every enclave
-// attest the same tlsKeyHash.
-
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -51,45 +47,17 @@ type certStore struct {
 	fqdn   string
 }
 
-func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
-	return &certStore{s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn}
-}
-
 // acmeStoragePrefix namespaces certificate material in the app storage bucket.
 // The layout predates DNS-01 and is kept so existing deployments keep their
 // certificate rather than re-issuing on upgrade.
 const acmeStoragePrefix = "data/acme/"
 
-func objectKeyFor(name string) string {
-	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
+func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
+	return &certStore{s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn}
 }
 
-func (c *certStore) certObjectKey() string {
-	return objectKeyFor(c.fqdn + "/cert")
-}
-
-func (c *certStore) accountObjectKey() string {
-	return objectKeyFor("account.key")
-}
-
-// certETag reports the current object's ETag, or "" when absent. Used by the
-// refresher to notice a peer's renewal without downloading anything.
-func (c *certStore) certETag(ctx context.Context) (string, error) {
-	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(c.certObjectKey()),
-	})
-	if err != nil {
-		if isNoSuchKey(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("head certificate: %w", err)
-	}
-	return aws.ToString(out.ETag), nil
-}
-
-// loadCert returns the stored bundle, or nil when the fleet has no certificate.
-func (c *certStore) loadCert(ctx context.Context) (*certBundle, error) {
+// LoadCert returns the stored bundle, or nil when the fleet has no certificate.
+func (c *certStore) LoadCert(ctx context.Context) (*certBundle, error) {
 	raw, etag, err := c.get(ctx, c.certObjectKey())
 	if err != nil || raw == nil {
 		return nil, err
@@ -107,20 +75,11 @@ func (c *certStore) loadCert(ctx context.Context) (*certBundle, error) {
 	return bundle, nil
 }
 
-// saveCert writes the certificate conditionally. An empty expectedETag means
-// "must not exist"; otherwise the object must still be exactly that version.
-// Returns errCertChanged when the condition fails.
-//
-// This condition is the only thing containing a zombie issuer — an enclave whose
-// lease lapsed while it was descheduled, which resumes with no way to know it was
-// robbed. The lease cannot stop it. Never make this write unconditional.
-func (c *certStore) saveCert(
+func (c *certStore) SaveCert(
 	ctx context.Context,
 	certPEM, keyPEM []byte,
 	expectedETag string,
 ) (*certBundle, error) {
-	// Parse before writing: a malformed chain stored here would poison every
-	// enclave that later loads it.
 	bundle, err := parseCertBundle(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
@@ -135,6 +94,55 @@ func (c *certStore) saveCert(
 	}
 	bundle.etag = etag
 	return bundle, nil
+}
+
+// LoadOrCreateAccountKey returns ACME account key
+func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, error) {
+	pemBytes, err := c.loadAccountKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pemBytes != nil {
+		return parseECKey(pemBytes)
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ACME account key: %w", err)
+	}
+	encoded, err := encodeECKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.saveAccountKey(ctx, encoded); err != nil {
+		if !errors.Is(err, errCertChanged) {
+			return nil, fmt.Errorf("store ACME account key: %w", err)
+		}
+		// A peer created the account between our load and our write. Theirs is
+		// the fleet's key; discard the one we just generated.
+		pemBytes, err = c.loadAccountKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if pemBytes == nil {
+			return nil, errors.New("ACME account key: create lost the race but no key is stored")
+		}
+		return parseECKey(pemBytes)
+	}
+	return key, nil
+}
+
+func objectKeyFor(name string) string {
+	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
+}
+
+func (c *certStore) certObjectKey() string {
+	return objectKeyFor(c.fqdn + "/cert")
+}
+
+func (c *certStore) accountObjectKey() string {
+	return objectKeyFor("account.key")
 }
 
 // loadAccountKey returns the fleet-shared ACME account key, or nil if unset.
@@ -198,7 +206,11 @@ func (c *certStore) putConditional(
 
 	out, err := c.s3.PutObject(ctx, in)
 	if err != nil {
-		if isPreconditionFailed(err) {
+		// 412 means a peer moved the object. 409 is S3 losing an internal race
+		// between concurrent conditional writes — different cause, same response
+		// here: adopt whatever is there now rather than reporting a broken
+		// issuance and burning another duplicate-certificate slot on a retry.
+		if isPreconditionFailed(err) || isConditionalConflict(err) {
 			return "", fmt.Errorf("%w: %s", errCertChanged, key)
 		}
 		return "", fmt.Errorf("put %q: %w", key, err)

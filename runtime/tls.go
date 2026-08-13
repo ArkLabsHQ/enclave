@@ -91,12 +91,10 @@ func ConfigureTLS(
 				"and needs a Route53 hosted zone", route53ZoneIDParam(),
 		)
 	}
-	return configureSharedDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
+	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
 }
 
-// configureSharedDNS01Cert brings up the fleet-shared certificate: load or issue
-// one now, then keep it fresh in the background.
-func configureSharedDNS01Cert(
+func configureDNS01Cert(
 	ctx context.Context,
 	cfg *Config,
 	s3 S3API,
@@ -113,7 +111,7 @@ func configureSharedDNS01Cert(
 
 	store := newCertStore(s3, dek, bucket, cfg.FQDN)
 
-	accountKey, err := loadOrCreateAccountKey(ctx, store)
+	accountKey, err := store.LoadOrCreateAccountKey(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -126,16 +124,16 @@ func configureSharedDNS01Cert(
 	}
 	client.Key = accountKey
 
-	provider, err := newRoute53Provider(r53, zoneID)
+	issuer, err := newACMEIssuer(client, r53, zoneID, cfg.ACMEEmail)
 	if err != nil {
 		return nil, err
 	}
 
 	manager := newCertManager(
-		store, newACMEIssuer(client, provider, cfg.ACMEEmail),
+		store, issuer,
 		s3, bucket, cfg.FQDN, hashes,
 	)
-	if err := manager.bootstrap(ctx); err != nil {
+	if err := manager.Bootstrap(ctx); err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
 	}
 	go manager.Run(ctx)

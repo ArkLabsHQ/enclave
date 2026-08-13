@@ -9,8 +9,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,10 +36,8 @@ const (
 	certIssueTimeout = 10 * time.Minute
 )
 
-// certIssuer produces a certificate for a domain. An interface so tests can
-// exercise the commit ordering without an ACME server.
 type certIssuer interface {
-	issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error)
+	Issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error)
 }
 
 // certManager serves the shared certificate and keeps it fresh.
@@ -51,9 +49,7 @@ type certManager struct {
 	fqdn   string
 	hashes AttestationHashes
 
-	// current is swapped wholesale so the served certificate, the attested
-	// fingerprint and the stored version it came from can never disagree.
-	current atomic.Pointer[certBundle]
+	currentCert atomic.Pointer[certBundle]
 }
 
 func newCertManager(
@@ -63,7 +59,7 @@ func newCertManager(
 	bucket, fqdn string,
 	hashes AttestationHashes,
 ) *certManager {
-	return &certManager{
+	m := &certManager{
 		store:  store,
 		issuer: issuer,
 		s3:     s3api,
@@ -71,47 +67,28 @@ func newCertManager(
 		fqdn:   fqdn,
 		hashes: hashes,
 	}
+
+	hashes.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
+		bundle := m.currentCert.Load()
+		if bundle == nil {
+			return [sha256.Size]byte{}, false
+		}
+		return bundle.leafHash, true
+	})
+	return m
 }
 
-// GetCertificate serves the installed bundle. It never issues.
-func (m *certManager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	bundle := m.current.Load()
-	if bundle == nil {
-		return nil, errors.New("no certificate available yet")
-	}
-	return bundle.cert, nil
-}
-
-// storeBundle installs a certificate: served bundle, attested fingerprint and
-// the stored version it came from, all in one step.
-//
-// These must move as one. A window where the enclave serves leaf B while
-// attesting leaf A fails *every* pinning client, because the whole point of
-// tlsKeyHash is that the two agree.
-func (m *certManager) storeBundle(bundle *certBundle) {
-	m.hashes.SetTLSKeyHash(bundle.leafHash)
-	m.current.Store(bundle)
-	slog.Info("installed TLS certificate",
-		"sha256", hex.EncodeToString(bundle.leafHash[:]),
-		"not_after", bundle.notAfter.UTC().Format(time.RFC3339))
-}
-
-// bootstrap loads the shared certificate, issuing one if the fleet has none.
-// It blocks: the listener must not start without a certificate.
-func (m *certManager) bootstrap(ctx context.Context) error {
-	bundle, err := m.store.loadCert(ctx)
+func (m *certManager) Bootstrap(ctx context.Context) error {
+	bundle, err := m.store.LoadCert(ctx)
 	if err != nil {
 		return err
 	}
 	if bundle != nil {
-		m.storeBundle(bundle)
+		m.currentCert.Store(bundle)
 		return nil
 	}
 
-	// Reads do not need the lease; it guards issuance. The unlocked check above
-	// keeps every boot but the fleet's first off the lock, and the re-check below
-	// — under the lease — is what stops two enclaves that both saw "no
-	// certificate" from both ordering one.
+	// Prevents duplicate issuance if multiple enclaves start up at once.
 	slog.Info("no shared certificate found, issuing", "fqdn", m.fqdn)
 	lease, err := AcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
 	if err != nil {
@@ -120,11 +97,11 @@ func (m *certManager) bootstrap(ctx context.Context) error {
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
 	// A peer may have issued while we queued.
-	if bundle, err = m.store.loadCert(ctx); err != nil {
+	if bundle, err = m.store.LoadCert(ctx); err != nil {
 		return err
 	}
 	if bundle != nil {
-		m.storeBundle(bundle)
+		m.currentCert.Store(bundle)
 		return nil
 	}
 	// Still nothing stored, so the write must be create-only.
@@ -145,45 +122,43 @@ func (m *certManager) Run(ctx context.Context) {
 	}
 }
 
+// GetCertificate serves the installed bundle. It never issues.
+func (m *certManager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	bundle := m.currentCert.Load()
+	if bundle == nil {
+		return nil, errors.New("no certificate available yet")
+	}
+	return bundle.cert, nil
+}
+
+// tick adopts a peer's renewal when the stored ETag moves, and renews when the certificate is inside renewBefore.
 func (m *certManager) tick(ctx context.Context) error {
-	// Cheap poll: an ETag change means a peer renewed, so adopt theirs.
-	etag, err := m.store.certETag(ctx)
+	// A changed ETag means a peer renewed, so adopt theirs.
+	stored, err := m.store.LoadCert(ctx)
 	if err != nil {
 		return err
 	}
-	if etag != "" && etag != m.currentETag() {
-		bundle, err := m.store.loadCert(ctx)
-		if err != nil {
-			return err
-		}
-		if bundle != nil {
-			m.storeBundle(bundle)
-		}
+	if stored != nil && stored.etag != m.currentETag() {
+		m.currentCert.Store(stored)
 	}
 
-	bundle := m.current.Load()
-	if bundle == nil {
-		return m.renewUnderLease(ctx, "")
-	}
+	bundle := m.currentCert.Load()
 	if time.Until(bundle.notAfter) > renewBefore {
 		return nil
 	}
-	// bundle.etag is the version backing the certificate we serve right now —
-	// exactly the snapshot the conditional write needs.
+
 	if err := m.renewUnderLease(ctx, bundle.etag); err != nil {
 		return err
 	}
-	// Post-renewal: renewUnderLease is silent whether it renewed or deferred to a
-	// peer, so only the certificate we now serve says if we are in trouble.
-	if left := time.Until(m.current.Load().notAfter); left < certHardFloor {
+
+	if left := time.Until(m.currentCert.Load().notAfter); left < certHardFloor {
 		slog.Error("shared certificate is close to expiry and not renewing",
 			"fqdn", m.fqdn, "expires_in", left.Truncate(time.Minute).String())
 	}
 	return nil
 }
 
-// renewUnderLease renews only if this enclave wins the lease; otherwise the peer
-// holding it is already doing the work and the next poll picks up the result.
+// renewUnderLease renews only if this enclave wins the lease;
 func (m *certManager) renewUnderLease(ctx context.Context, certETag string) error {
 	lease, err := TryAcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
 	if err != nil {
@@ -198,26 +173,16 @@ func (m *certManager) renewUnderLease(ctx context.Context, certETag string) erro
 }
 
 // renew issues a new certificate and commits it against certETag.
-//
-// certETag is captured by the caller *before* the order begins and must not be
-// refreshed here. It is a snapshot of what the world looked like when the order
-// started, which is what makes the conditional write mean "nothing happened while
-// I was gone". Re-reading it immediately before the write would let a zombie
-// issuer — one whose lease lapsed while it was descheduled — overwrite the peer
-// that took over, and the code would still look correct.
 func (m *certManager) renew(ctx context.Context, certETag string) error {
 	ctx, cancel := context.WithTimeout(ctx, certIssueTimeout)
 	defer cancel()
 
-	certPEM, keyPEM, err := m.issuer.issue(ctx, m.fqdn)
+	certPEM, keyPEM, err := m.issuer.Issue(ctx, m.fqdn)
 	if err != nil {
 		return fmt.Errorf("issue certificate for %q: %w", m.fqdn, err)
 	}
 
-	// S3 first, memory second: installing a certificate whose write was rejected
-	// would leave this enclave serving a leaf no peer has, with its attestation
-	// bound to it, breaking any client that took attestation from a peer.
-	bundle, err := m.store.saveCert(ctx, certPEM, keyPEM, certETag)
+	bundle, err := m.store.SaveCert(ctx, certPEM, keyPEM, certETag)
 	if err != nil {
 		if errors.Is(err, errCertChanged) {
 			slog.Info("peer renewed the certificate first, adopting theirs")
@@ -226,24 +191,24 @@ func (m *certManager) renew(ctx context.Context, certETag string) error {
 		return err
 	}
 
-	m.storeBundle(bundle)
+	m.currentCert.Store(bundle)
 	return nil
 }
 
 func (m *certManager) adoptPeerCert(ctx context.Context) error {
-	bundle, err := m.store.loadCert(ctx)
+	bundle, err := m.store.LoadCert(ctx)
 	if err != nil {
 		return err
 	}
 	if bundle == nil {
 		return errors.New("certificate vanished after a conflicting write")
 	}
-	m.storeBundle(bundle)
+	m.currentCert.Store(bundle)
 	return nil
 }
 
 func (m *certManager) currentETag() string {
-	if bundle := m.current.Load(); bundle != nil {
+	if bundle := m.currentCert.Load(); bundle != nil {
 		return bundle.etag
 	}
 	return ""

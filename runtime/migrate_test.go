@@ -22,12 +22,12 @@ func TestVerifyPredecessorCommitment_Genesis(t *testing.T) {
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
 
 	t.Run("no predecessor", func(t *testing.T) {
-		err := verifyPredecessorCommitment(nil, unverifiedState{})
+		err := verifyPredecessorCommitment(nil, &bootState{})
 		require.NoError(t, err)
 	})
 
 	t.Run("rejects predecessor", func(t *testing.T) {
-		errs := verifyPredecessorCommitment(nil, unverifiedState{
+		errs := verifyPredecessorCommitment(nil, &bootState{
 			predecessorPCR0:        "abc123",
 			predecessorAttestation: "attestation",
 		})
@@ -48,7 +48,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Run("missing previous PCR0", func(t *testing.T) {
 		err := verifyPredecessorCommitment(
 			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{currentPCR0: currentPCR0Bytes},
+			&bootState{currentPCR0: currentPCR0Bytes},
 		)
 		require.Error(t, err)
 	})
@@ -56,7 +56,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Run("mismatched previous PCR0", func(t *testing.T) {
 		err := verifyPredecessorCommitment(
 			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{
+			&bootState{
 				currentPCR0:            currentPCR0Bytes,
 				predecessorPCR0:        strings.Repeat("0", 96),
 				predecessorAttestation: attestation,
@@ -68,7 +68,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Run("requires attestation", func(t *testing.T) {
 		err := verifyPredecessorCommitment(
 			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{currentPCR0: currentPCR0Bytes, predecessorPCR0: prevPCR0},
+			&bootState{currentPCR0: currentPCR0Bytes, predecessorPCR0: prevPCR0},
 		)
 		require.Error(t, err)
 	})
@@ -79,7 +79,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := verifyPredecessorCommitment(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        prevPCR0,
 			predecessorAttestation: attestation,
@@ -94,7 +94,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := verifyPredecessorCommitment(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        strings.ToUpper(prevPCR0),
 			predecessorAttestation: attestation,
@@ -113,7 +113,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := verifyPredecessorCommitment(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
 			predecessorAttestation: attestation,
@@ -372,14 +372,10 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		established, err := EstablishState(
-			ctx,
-			newNSM,
-			fx.kmsf,
-			&fakeSTS{},
-			fx.ssm,
-			fx.s3f,
-		)
+		newBoot, err := NewBoot(newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		require.NoError(t, err)
+		require.NoError(t, newBoot.plan(ctx))
+		established, err := newBoot.finalise(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
@@ -391,7 +387,10 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: oldPCR0}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		_, err = EstablishState(ctx, oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		oldBoot, err := NewBoot(oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		require.NoError(t, err)
+		require.NoError(t, oldBoot.plan(ctx))
+		_, err = oldBoot.finalise(ctx)
 		require.NoError(t, err)
 		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])

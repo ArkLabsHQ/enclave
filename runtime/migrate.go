@@ -249,7 +249,7 @@ func (m *migrator) CompleteMigration(
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
-	transitionSecrets := make([]persistedSecret, 0, len(m.staticSecrets))
+	transitionSecrets := make(map[StaticSecretMetadata]string, len(m.staticSecrets))
 	for _, secret := range m.staticSecrets {
 		secretBytes, err := hex.DecodeString(secret.Plaintext)
 		if err != nil {
@@ -274,10 +274,7 @@ func (m *migrator) CompleteMigration(
 		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
 			return nil, fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
 		}
-		transitionSecrets = append(transitionSecrets, persistedSecret{
-			metadata:   secret.StaticSecretMetadata,
-			ciphertext: ciphertextB64,
-		})
+		transitionSecrets[secret.StaticSecretMetadata] = ciphertextB64
 		exportedNames = append(exportedNames, secret.Name)
 	}
 
@@ -313,7 +310,7 @@ func (m *migrator) CompleteMigration(
 		ctx,
 		m.nsm,
 		m.ssm,
-		persistedStateSnapshot{
+		bootSnapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,

@@ -11,6 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func setValidEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1h")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "24h")
+}
+
 func TestGetMigrationCooldown(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -37,9 +45,54 @@ func TestGetMigrationCooldown(t *testing.T) {
 	}
 }
 
+func TestValidateEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		key     string
+		value   string
+		wantErr string
+	}{
+		{name: "all set"},
+		{
+			name: "deployment missing", key: "ENCLAVE_DEPLOYMENT",
+			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+		},
+		{
+			name: "app name missing", key: "ENCLAVE_APP_NAME",
+			wantErr: "ENCLAVE_APP_NAME must be set",
+		},
+		{
+			name: "deployment blank", key: "ENCLAVE_DEPLOYMENT", value: "   ",
+			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+		},
+		{
+			name: "cooldown invalid", key: "ENCLAVE_MIGRATION_COOLDOWN", value: "nope",
+			wantErr: "ENCLAVE_MIGRATION_COOLDOWN",
+		},
+		{
+			name: "retention missing", key: "ENCLAVE_MIGRATION_INTENT_RETENTION",
+			wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnvironment(t)
+			if tc.key != "" {
+				t.Setenv(tc.key, tc.value)
+			}
+
+			err := validateEnvironment()
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	setValidEnvironment(t)
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
 	err := (&Config{
 		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,

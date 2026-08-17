@@ -55,7 +55,7 @@ const (
 	defaultMaxStepNs = 100 * 1_000_000 // 100 ms
 
 	clockSyncRetryInterval  = 10 * time.Second
-	clockSyncFailureTimeout = time.Minute
+	clockSyncFailureTimeout = 10 * time.Minute
 
 	// 5 min matches Evervault's /dev/ptp0 sync cadence:
 	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
@@ -215,9 +215,10 @@ func (cs *clockSyncer) step(ctx context.Context) error {
 		}
 
 		// PHC read failures are usually transient rather than indicating a
-		// dead clock. During ENA resets the AWS driver returns EOPNOTSUPP
-		// while the PTP device is reinitializing (/dev/ptp0 remains valid),
-		// and EBUSY during the subsequent ~1 ms back-off.
+		// dead clock: the driver returns EOPNOTSUPP while the PTP device
+		// reinitializes (/dev/ptp0 remains valid) and EBUSY during the
+		// subsequent back-off. Retry for the whole failure timeout — halting
+		// costs a full reboot.
 		if time.Now().After(deadline) {
 			return fmt.Errorf(
 				"clock sync failed for %s: %w",

@@ -61,11 +61,26 @@ func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
 	return nil
 }
 
-func getDeployment() string {
-	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
-		return d
+// validateEnvironment rejects unusable EIF-baked settings before any state is
+// touched. Callers of the getters below rely on it having run.
+func validateEnvironment() error {
+	if getDeployment() == "" {
+		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
 	}
-	return "test"
+	if getAppName() == "" {
+		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	if _, err := getMigrationCooldown(); err != nil {
+		return err
+	}
+	if _, err := migrationIntentRetention(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getDeployment() string {
+	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT"))
 }
 
 func IsDev() bool {
@@ -81,10 +96,7 @@ func skipCOSEVerification() bool {
 }
 
 func getAppName() string {
-	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
-		return name
-	}
-	return "app"
+	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
 }
 
 func getPreviousPCR0() string {

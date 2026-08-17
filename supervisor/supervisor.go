@@ -51,6 +51,9 @@ type Supervisor struct {
 }
 
 func New(ctx context.Context) (*Supervisor, error) {
+	if err := validateEnvironment(); err != nil {
+		return nil, err
+	}
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(getRegion()))
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)

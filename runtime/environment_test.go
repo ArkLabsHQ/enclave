@@ -38,6 +38,8 @@ func TestGetMigrationCooldown(t *testing.T) {
 }
 
 func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
 	err := (&Config{
 		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,

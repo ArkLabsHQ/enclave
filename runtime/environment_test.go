@@ -11,6 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func setValidEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1h")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "24h")
+}
+
 func TestGetMigrationCooldown(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -37,7 +45,54 @@ func TestGetMigrationCooldown(t *testing.T) {
 	}
 }
 
+func TestValidateEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		key     string
+		value   string
+		wantErr string
+	}{
+		{name: "all set"},
+		{
+			name: "deployment missing", key: "ENCLAVE_DEPLOYMENT",
+			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+		},
+		{
+			name: "app name missing", key: "ENCLAVE_APP_NAME",
+			wantErr: "ENCLAVE_APP_NAME must be set",
+		},
+		{
+			name: "deployment blank", key: "ENCLAVE_DEPLOYMENT", value: "   ",
+			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+		},
+		{
+			name: "cooldown invalid", key: "ENCLAVE_MIGRATION_COOLDOWN", value: "nope",
+			wantErr: "ENCLAVE_MIGRATION_COOLDOWN",
+		},
+		{
+			name: "retention missing", key: "ENCLAVE_MIGRATION_INTENT_RETENTION",
+			wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnvironment(t)
+			if tc.key != "" {
+				t.Setenv(tc.key, tc.value)
+			}
+
+			err := validateEnvironment()
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
+	setValidEnvironment(t)
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
 	err := (&Config{
 		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,
@@ -123,4 +178,24 @@ func TestApplyEnvOverrides(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, NewSSM(&fakeSSM{err: errors.New("access denied")}))
 		require.Error(t, err)
 	})
+}
+
+func TestIsDev(t *testing.T) {
+	cases := []struct {
+		name            string
+		dev, deployment string
+		want            bool
+	}{
+		{"ENCLAVE_DEV=true is dev", "true", "prod", true},
+		{"ENCLAVE_DEV case-insensitive", "TRUE", "prod", true},
+		{"ENCLAVE_DEV=false is not dev", "false", "dev", false},
+		{"unset is not dev regardless of deployment", "", "dev", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_DEV", c.dev)
+			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			require.Equal(t, c.want, IsDev())
+		})
+	}
 }

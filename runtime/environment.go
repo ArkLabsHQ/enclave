@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM/KMS namespace and lock posture, the managed-secret set, and security
-// timing — a short anchor window would let the operator wait out the Object Lock
-// and roll back undetected.
+// nonOverridableEnv lists vars the SSM env overlay must never set. Most name the
+// SSM/KMS namespace and lock posture, the managed-secret set, or security timing
+// (a short anchor window would let the operator wait out the Object Lock and roll
+// back undetected). ENCLAVE_DEV would skip COSE verification when set.
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":                 true,
 	"ENCLAVE_APP_NAME":                   true,
@@ -23,6 +23,8 @@ var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_MIGRATION_INTENT_RETENTION": true,
 	"ENCLAVE_SECRETS_CONFIG":             true,
 	"ENCLAVE_PREVIOUS_PCR0":              true,
+	"ENCLAVE_DEV":                        true,
+	"ENCLAVE_VERIFY_CLOCK_SOURCE":        true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
@@ -59,23 +61,42 @@ func ApplyEnvOverrides(ctx context.Context, ssm SSM) error {
 	return nil
 }
 
-func getDeployment() string {
-	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
-		return d
+// validateEnvironment rejects unusable EIF-baked settings before any state is
+// touched. Callers of the getters below rely on it having run.
+func validateEnvironment() error {
+	if getDeployment() == "" {
+		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
 	}
-	return "dev"
+	if getAppName() == "" {
+		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	if _, err := getMigrationCooldown(); err != nil {
+		return err
+	}
+	if _, err := migrationIntentRetention(); err != nil {
+		return err
+	}
+	return nil
 }
 
-// skipCOSEVerification is dev-only; deployment is EIF-baked and not SSM-overridable.
+func getDeployment() string {
+	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT"))
+}
+
+func IsDev() bool {
+	if v := strings.TrimSpace(os.Getenv("ENCLAVE_DEV")); v != "" {
+		return strings.EqualFold(v, "true")
+	}
+	return false
+}
+
+// skipCOSEVerification is dev-only; the dev signal is EIF-baked and not SSM-overridable.
 func skipCOSEVerification() bool {
-	return getDeployment() == "dev"
+	return IsDev()
 }
 
 func getAppName() string {
-	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
-		return name
-	}
-	return "app"
+	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
 }
 
 func getPreviousPCR0() string {
@@ -139,6 +160,15 @@ func migrationIntentRetention() (time.Duration, error) {
 	}
 
 	return d, nil
+}
+
+// verifyClockSourceEnabled gates the kvm-clock assertion. Only trustworthy when
+// baked into the measured EIF; harnesses that boot without the paravirtualized
+// clock leave it unset.
+func verifyClockSourceEnabled() bool {
+	return strings.EqualFold(
+		strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE")), "true",
+	)
 }
 
 // respPort is the TLS port for the RESP K/V listener.

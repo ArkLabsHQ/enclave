@@ -10,18 +10,24 @@ import (
 // Infrastructure boilerplate (AWS endpoints, gvproxy/IMDS, lifecycle
 // config, cmd-level) stays with its consumer.
 
-func getDeployment() string {
-	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
-		return d
+// validateEnvironment rejects unusable settings before any caller runs; New
+// gates on it.
+func validateEnvironment() error {
+	if getDeployment() == "" {
+		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
 	}
-	return "dev"
+	if getAppName() == "" {
+		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	return nil
+}
+
+func getDeployment() string {
+	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT"))
 }
 
 func getAppName() string {
-	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
-		return name
-	}
-	return "app"
+	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
 }
 
 func getRegion() string {

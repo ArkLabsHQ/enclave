@@ -118,3 +118,24 @@ services:
       ENCLAVE_APP_NAME: "my-app"
       ENCLAVE_DEPLOYMENT: "dev"
     command: ["./acme-test.sh", "app/.enclave/artifacts/image.eif"]
+
+  clockdrift-runner:
+    profiles: ["clockdrift"]
+    build:
+      context: ../
+      dockerfile: test/Dockerfile.runner
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      aws-mocks:
+        condition: service_healthy
+    environment:
+      SKIP_MOCK_SERVICES: "1"
+      # Must match enclave.yaml `name` — the runtime + tofu derive SSM paths from it.
+      ENCLAVE_APP_NAME: "my-app"
+      ENCLAVE_DEPLOYMENT: "dev"
+    command: ["./clockdrift.sh", "app/.enclave/artifacts/image.eif"]

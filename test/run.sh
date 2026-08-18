@@ -150,6 +150,10 @@ while True:
     cpu_opt="-cpu max"
     echo "  KVM:    not available, using TCG (slow)"
   fi
+  # Dev-only kernel cmdline overrides (enclavecfg.*), honoured only by a dev EIF
+  # (ApplyDevCmdlineOverrides is gated on IsDev). Unset here; clockdrift.sh uses it.
+  local qapp=()
+  [ -n "${QEMU_APPEND:-}" ] && qapp=(-append "$QEMU_APPEND")
   qemu-system-x86_64 \
     -M "nitro-enclave,vsock=c,id=test-enclave" \
     -kernel "$eif_path" \
@@ -157,6 +161,7 @@ while True:
     -m "$memory" \
     $accel \
     $cpu_opt \
+    "${qapp[@]}" \
     -chardev "socket,id=c,path=${vsock_socket}" &
   qemu_pid=$!
   echo "  PID:    $qemu_pid"

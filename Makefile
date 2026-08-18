@@ -28,7 +28,7 @@ lint: ## Run golangci-lint on all modules (matches CI)
 	cd supervisor && golangci-lint run ./...
 	cd client && golangci-lint run ./...
 
-.PHONY: test test-build test-run test-rebuild test-acme
+.PHONY: test test-build test-run test-rebuild test-acme test-clockdrift
 
 test: test-build test-run ## Build test EIFs and run integration tests
 
@@ -79,16 +79,23 @@ test-build:  ## Build v1/v2/v3/v4 migration fixtures (G, A, and forked B/C succe
 
 test-run: ## Run integration tests (uses last-built test-runner image)
 	cd test && docker compose --profile test down -v
-	cd test && docker compose --profile test run test-runner
+	cd test && docker compose --profile test run -T test-runner
 
 test-rebuild: ## Rebuild test-runner image and run integration tests
 	cd test && docker compose --profile test down -v
-	cd test && docker compose --profile test run --build test-runner
+	cd test && docker compose --profile test build test-runner
+	cd test && docker compose --profile test run -T test-runner
 
 test-acme: test-build ## Build the test EIF and run the end-to-end ACME (Pebble) test
 	bash test/pebble/gen-certs.sh
 	cd test && docker compose --profile acme down -v
-	cd test && docker compose --profile acme run --build acme-runner
+	cd test && docker compose --profile acme build acme-runner
+	cd test && docker compose --profile acme run -T acme-runner
+
+test-clockdrift: test-build ## Build the test EIF and run the end-to-end clock-drift (PTP servo) test
+	cd test && docker compose --profile clockdrift down -v
+	cd test && docker compose --profile clockdrift build clockdrift-runner
+	cd test && docker compose --profile clockdrift run -T clockdrift-runner
 
 .PHONY: test-build-docker test-docker
 test-build-docker: ## Run test-build inside a linux/amd64 container (for macOS/ARM hosts)

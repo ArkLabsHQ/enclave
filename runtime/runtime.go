@@ -24,7 +24,6 @@ type RuntimeState interface {
 	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
-	// GetTLSCertCallback blocks until TLS is ready.
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
 	NotifyListenerError(err error)
 	ListenError() <-chan error
@@ -35,6 +34,11 @@ type RuntimeState interface {
 func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
+	}
+
+	ctx, err := StartClockSyncer(ctx)
+	if err != nil {
+		return fmt.Errorf("clock sync failed: %w", err)
 	}
 
 	if err := StartNetorking(ctx, cfg); err != nil {
@@ -246,7 +250,7 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		} else {
 			slog.Warn("upstream app exited cleanly; runtime stays alive")
 		}
-		return waitForRuntime(ctx, rt)
+		return waitForRuntime(ctx, rt, child)
 
 	case err := <-rt.ListenError():
 		_ = child.Stop()
@@ -254,20 +258,41 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 
 	case <-rt.Halt():
 		slog.Info("received halt circuit-breaker")
-		return waitForRuntime(ctx, rt)
+		return waitForRuntime(ctx, rt, child)
 
 	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			_ = child.Stop()
+			return fmt.Errorf("runtime halted: %w", cause)
+		}
 		slog.Info("shutting down")
 		return child.Stop()
 	}
 }
 
-func waitForRuntime(ctx context.Context, rt RuntimeState) error {
+// waitForRuntime keeps the runtime alive after the app is gone or halted, so
+// health and migration endpoints still answer.
+func waitForRuntime(ctx context.Context, rt RuntimeState, child appProcess) error {
+	// Only stop a child that is still running: stopApp waits on ChildDone,
+	// which is unbuffered and delivered once, so stopping an already-reaped
+	// child would block forever.
+	stopChild := func() {
+		if !rt.UpstreamAppInfo().Exited {
+			_ = child.Stop()
+		}
+	}
+
 	select {
 	case err := <-rt.ListenError():
+		stopChild()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			stopChild()
+			return fmt.Errorf("runtime halted: %w", cause)
+		}
 		slog.Info("shutting down")
+		stopChild()
 		return nil
 	}
 }

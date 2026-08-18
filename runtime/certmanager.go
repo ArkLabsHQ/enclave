@@ -53,12 +53,13 @@ type certManager struct {
 }
 
 func newCertManager(
+	ctx context.Context,
 	store *certStore,
 	issuer certIssuer,
 	s3api S3API,
 	bucket, fqdn string,
 	hashes AttestationHashes,
-) *certManager {
+) (*certManager, error) {
 	m := &certManager{
 		store:  store,
 		issuer: issuer,
@@ -68,41 +69,41 @@ func newCertManager(
 		hashes: hashes,
 	}
 
+	bundle, err := m.resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m.currentCert.Store(bundle)
+
 	hashes.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
-		bundle := m.currentCert.Load()
-		if bundle == nil {
-			return [sha256.Size]byte{}, false
-		}
-		return bundle.leafHash, true
+		return m.currentCert.Load().leafHash, true
 	})
-	return m
+	return m, nil
 }
 
-func (m *certManager) Bootstrap(ctx context.Context) error {
+func (m *certManager) resolve(ctx context.Context) (*certBundle, error) {
 	bundle, err := m.store.LoadCert(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if bundle != nil {
-		m.currentCert.Store(bundle)
-		return nil
+		return bundle, nil
 	}
 
 	// Prevents duplicate issuance if multiple enclaves start up at once.
 	slog.Info("no shared certificate found, issuing", "fqdn", m.fqdn)
 	lease, err := AcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
 	if err != nil {
-		return fmt.Errorf("acquire renewal lease for first issuance: %w", err)
+		return nil, fmt.Errorf("acquire renewal lease for first issuance: %w", err)
 	}
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
 	// A peer may have issued while we queued.
 	if bundle, err = m.store.LoadCert(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if bundle != nil {
-		m.currentCert.Store(bundle)
-		return nil
+		return bundle, nil
 	}
 	// Still nothing stored, so the write must be create-only.
 	return m.renew(ctx, "")
@@ -124,11 +125,7 @@ func (m *certManager) Run(ctx context.Context) {
 
 // GetCertificate serves the installed bundle. It never issues.
 func (m *certManager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	bundle := m.currentCert.Load()
-	if bundle == nil {
-		return nil, errors.New("no certificate available yet")
-	}
-	return bundle.cert, nil
+	return m.currentCert.Load().cert, nil
 }
 
 // tick adopts a peer's renewal when the stored ETag moves, and renews when the certificate is inside renewBefore.
@@ -147,8 +144,12 @@ func (m *certManager) tick(ctx context.Context) error {
 		return nil
 	}
 
-	if err := m.renewUnderLease(ctx, bundle.etag); err != nil {
+	renewed, err := m.renewUnderLease(ctx, bundle.etag)
+	if err != nil {
 		return err
+	}
+	if renewed != nil {
+		m.currentCert.Store(renewed)
 	}
 
 	if left := time.Until(m.currentCert.Load().notAfter); left < certHardFloor {
@@ -159,13 +160,13 @@ func (m *certManager) tick(ctx context.Context) error {
 }
 
 // renewUnderLease renews only if this enclave wins the lease;
-func (m *certManager) renewUnderLease(ctx context.Context, certETag string) error {
+func (m *certManager) renewUnderLease(ctx context.Context, certETag string) (*certBundle, error) {
 	lease, err := TryAcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
 	if err != nil {
-		return fmt.Errorf("acquire renewal lease: %w", err)
+		return nil, fmt.Errorf("acquire renewal lease: %w", err)
 	}
 	if lease == nil {
-		return nil // a peer is renewing
+		return nil, nil // a peer is renewing
 	}
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
@@ -173,13 +174,13 @@ func (m *certManager) renewUnderLease(ctx context.Context, certETag string) erro
 }
 
 // renew issues a new certificate and commits it against certETag.
-func (m *certManager) renew(ctx context.Context, certETag string) error {
+func (m *certManager) renew(ctx context.Context, certETag string) (*certBundle, error) {
 	ctx, cancel := context.WithTimeout(ctx, certIssueTimeout)
 	defer cancel()
 
 	certPEM, keyPEM, err := m.issuer.Issue(ctx, m.fqdn)
 	if err != nil {
-		return fmt.Errorf("issue certificate for %q: %w", m.fqdn, err)
+		return nil, fmt.Errorf("issue certificate for %q: %w", m.fqdn, err)
 	}
 
 	bundle, err := m.store.SaveCert(ctx, certPEM, keyPEM, certETag)
@@ -188,30 +189,24 @@ func (m *certManager) renew(ctx context.Context, certETag string) error {
 			slog.Info("peer renewed the certificate first, adopting theirs")
 			return m.adoptPeerCert(ctx)
 		}
-		return err
+		return nil, err
 	}
-
-	m.currentCert.Store(bundle)
-	return nil
+	return bundle, nil
 }
 
-func (m *certManager) adoptPeerCert(ctx context.Context) error {
+func (m *certManager) adoptPeerCert(ctx context.Context) (*certBundle, error) {
 	bundle, err := m.store.LoadCert(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if bundle == nil {
-		return errors.New("certificate vanished after a conflicting write")
+		return nil, errors.New("certificate vanished after a conflicting write")
 	}
-	m.currentCert.Store(bundle)
-	return nil
+	return bundle, nil
 }
 
 func (m *certManager) currentETag() string {
-	if bundle := m.currentCert.Load(); bundle != nil {
-		return bundle.etag
-	}
-	return ""
+	return m.currentCert.Load().etag
 }
 
 func jitteredPoll() time.Duration {

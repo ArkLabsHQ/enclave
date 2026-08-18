@@ -129,11 +129,11 @@ func configureDNS01Cert(
 		return nil, err
 	}
 
-	manager := newCertManager(
-		store, issuer,
+	manager, err := newCertManager(
+		ctx, store, issuer,
 		s3, bucket, cfg.FQDN, hashes,
 	)
-	if err := manager.Bootstrap(ctx); err != nil {
+	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
 	}
 	go manager.Run(ctx)

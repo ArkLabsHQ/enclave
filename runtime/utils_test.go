@@ -42,6 +42,12 @@ type fakeSSM struct {
 	putErrs map[string]error
 	calls   []string
 
+	// getSeq scripts successive reads of one parameter, for races that turn on
+	// a value changing between two reads. The i-th read returns the i-th entry;
+	// the last entry repeats. An empty entry reads as absent, as it would
+	// before anything committed the parameter.
+	getSeq map[string][]string
+
 	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
 	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
 	// (empty string = no more). lastDecryption captures the last call's
@@ -81,6 +87,12 @@ func (f *fakeSSM) GetParameter(
 		return nil, f.err
 	}
 	v, ok := f.params[name]
+	if seq, scripted := f.getSeq[name]; scripted && len(seq) > 0 {
+		v, ok = seq[0], seq[0] != ""
+		if len(seq) > 1 {
+			f.getSeq[name] = seq[1:]
+		}
+	}
 	if !ok {
 		return nil, &ssmtypes.ParameterNotFound{}
 	}

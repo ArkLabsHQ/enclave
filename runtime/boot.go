@@ -98,7 +98,9 @@ type Boot struct {
 	ssm    SSM
 	s3     S3API
 	pcr0   []byte
+}
 
+type plannedBoot struct {
 	state bootState
 	mode  bootMode
 }
@@ -115,22 +117,22 @@ func NewBoot(nsm NSM, kmsAPI KMSAPI, sts STSAPI, ssm SSM, s3api S3API) (*Boot, e
 }
 
 // plan decides, once, which of the three boots this is.
-func (b *Boot) plan(ctx context.Context) error {
+func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	metadata, err := LoadStaticSecretMetadata()
 	if err != nil {
-		return fmt.Errorf("failed to load static secret metadata: %w", err)
+		return nil, fmt.Errorf("failed to load static secret metadata: %w", err)
 	}
 	if err := validateStaticSecretNames(metadata); err != nil {
-		return fmt.Errorf("invalid static secret metadata: %w", err)
+		return nil, fmt.Errorf("invalid static secret metadata: %w", err)
 	}
 	migrationIntentBucketName, err := b.ssm.MustGet(ctx, migrationIntentBucketParam())
 	if err != nil {
-		return fmt.Errorf("failed to get migration intent bucket name: %w", err)
+		return nil, fmt.Errorf("failed to get migration intent bucket name: %w", err)
 	}
 
 	predecessorPCR0, predecessorAttestation, err := b.loadPredecessor(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	state := bootState{
 		currentPCR0:            append([]byte(nil), b.pcr0...),
@@ -144,21 +146,20 @@ func (b *Boot) plan(ctx context.Context) error {
 
 	mode, err := b.determineMode(ctx, &state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := mode.verify(&state); err != nil {
-		return err
+		return nil, err
 	}
-	b.state, b.mode = state, mode
-	return nil
+	return &plannedBoot{state: state, mode: mode}, nil
 }
 
 // determineMode loads what a committed key names — the params embed the key ID,
 // so with none committed there is nothing to read — and decides the mode.
 func (b *Boot) determineMode(ctx context.Context, state *bootState) (bootMode, error) {
-	keyID, err := b.ssm.MayGet(ctx, kmsKeyIDParam())
+	keyID, err := b.committedKeyID(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+		return nil, err
 	}
 	state.kmsKeyID = keyID
 
@@ -211,19 +212,27 @@ func (b *migrationBoot) verify(state *bootState) error {
 	return nil
 }
 
-func (b *Boot) finalise(ctx context.Context) (bootResult, error) {
-
-	if _, ok := b.mode.(*genesisBoot); ok {
-		lease, err := b.awaitGenesis(ctx)
+func (b *Boot) finalise(ctx context.Context, planned *plannedBoot) (bootResult, error) {
+	if _, ok := planned.mode.(*genesisBoot); ok {
+		lease, err := b.awaitGenesisLease(ctx)
 		if err != nil {
 			return bootResult{}, err
 		}
 		if lease != nil {
 			defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 		}
+		// The wait may have ended with a peer's key committed, so decide once
+		// more from what is true now rather than from what we planned before it.
+		planned, err = b.plan(ctx)
+		if err != nil {
+			return bootResult{}, fmt.Errorf("failed to replan boot after genesis wait: %w", err)
+		}
+		if genesis, stillGenesis := planned.mode.(*genesisBoot); stillGenesis {
+			genesis.lease = lease
+		}
 	}
 
-	state := &b.state
+	state := &planned.state
 	if err := verifyPredecessorCommitment(b.nsm, state); err != nil {
 		return bootResult{}, fmt.Errorf("failed to verify predecessor commitment: %w", err)
 	}
@@ -236,7 +245,7 @@ func (b *Boot) finalise(ctx context.Context) (bootResult, error) {
 		return bootResult{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
 
-	snapshot, err := b.mode.buildSnapshot(ctx, state, kms, b.ssm)
+	snapshot, err := planned.mode.buildSnapshot(ctx, state, kms, b.ssm)
 	if err != nil {
 		return bootResult{}, err
 	}
@@ -244,7 +253,7 @@ func (b *Boot) finalise(ctx context.Context) (bootResult, error) {
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to build state root: %v", err)
 	}
-	if err := b.mode.verifySnapshot(state, b.nsm, snapshotRoot); err != nil {
+	if err := planned.mode.verifySnapshot(state, b.nsm, snapshotRoot); err != nil {
 		return bootResult{}, err
 	}
 
@@ -278,7 +287,7 @@ func (b *Boot) finalise(ctx context.Context) (bootResult, error) {
 		})
 	}
 
-	if err := b.mode.commitSnapshot(ctx, state, b.nsm, b.ssm, kms, snapshotRoot); err != nil {
+	if err := planned.mode.commitSnapshot(ctx, state, b.nsm, b.ssm, kms, snapshotRoot); err != nil {
 		return bootResult{}, err
 	}
 	return bootResult{
@@ -327,8 +336,15 @@ func (b *Boot) loadPredecessor(ctx context.Context) (pcr0, attestation string, e
 	return pcr0, attestation, nil
 }
 
-// ensures only one enclave can start genesis at a time, and that the one that does is the one that commits the KMS key ID.
-func (b *Boot) awaitGenesis(ctx context.Context) (*Lease, error) {
+func (b *Boot) committedKeyID(ctx context.Context) (string, error) {
+	keyID, err := b.ssm.MayGet(ctx, kmsKeyIDParam())
+	if err != nil {
+		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+	}
+	return keyID, nil
+}
+
+func (b *Boot) awaitGenesisLease(ctx context.Context) (*Lease, error) {
 	bucket, err := b.ssm.MustGet(ctx, storageBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read storage bucket name for genesis lease: %w", err)
@@ -338,12 +354,12 @@ func (b *Boot) awaitGenesis(ctx context.Context) (*Lease, error) {
 	defer cancel()
 
 	for {
-		if err := b.plan(waitCtx); err != nil {
-			return nil, fmt.Errorf("failed to replan boot for genesis: %w", err)
+		keyID, err := b.committedKeyID(waitCtx)
+		if err != nil {
+			return nil, err
 		}
-		if _, stillGenesis := b.mode.(*genesisBoot); !stillGenesis {
-			slog.Info("genesis completed by a peer, resuming",
-				"key_id", prefix16(b.state.kmsKeyID))
+		if keyID != "" {
+			slog.Info("genesis completed by a peer, resuming", "key_id", prefix16(keyID))
 			return nil, nil
 		}
 
@@ -352,16 +368,16 @@ func (b *Boot) awaitGenesis(ctx context.Context) (*Lease, error) {
 			return nil, fmt.Errorf("failed to acquire genesis lease: %w", err)
 		}
 		if lease != nil {
-			// Re-read under the lease: a peer may have committed between our last
-			// look and winning it.
-			if err := b.plan(waitCtx); err != nil {
+			keyID, err := b.committedKeyID(waitCtx)
+			if err != nil {
 				_ = lease.Release(context.WithoutCancel(ctx))
-				return nil, fmt.Errorf("failed to replan boot under genesis lease: %w", err)
+				return nil, err
 			}
-			// The transition completes the state it produces: a genesis machine
-			// leaves here already carrying its lease.
-			if genesis, stillGenesis := b.mode.(*genesisBoot); stillGenesis {
-				genesis.lease = lease
+			if keyID != "" {
+				_ = lease.Release(context.WithoutCancel(ctx))
+				slog.Info("genesis completed by a peer while we queued, resuming",
+					"key_id", prefix16(keyID))
+				return nil, nil
 			}
 			return lease, nil
 		}

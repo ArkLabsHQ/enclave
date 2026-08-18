@@ -374,8 +374,9 @@ func TestCompleteMigration(t *testing.T) {
 		}}
 		newBoot, err := NewBoot(newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
-		require.NoError(t, newBoot.plan(ctx))
-		established, err := newBoot.finalise(ctx)
+		newBootPlan, err := newBoot.plan(ctx)
+		require.NoError(t, err)
+		established, err := newBoot.finalise(ctx, newBootPlan)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
@@ -389,8 +390,9 @@ func TestCompleteMigration(t *testing.T) {
 		}}
 		oldBoot, err := NewBoot(oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
-		require.NoError(t, oldBoot.plan(ctx))
-		_, err = oldBoot.finalise(ctx)
+		oldBootPlan, err := oldBoot.plan(ctx)
+		require.NoError(t, err)
+		_, err = oldBoot.finalise(ctx, oldBootPlan)
 		require.NoError(t, err)
 		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])

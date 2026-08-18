@@ -83,20 +83,32 @@ func (f *fakeIssuer) Issue(context.Context, string) ([]byte, []byte, error) {
 	return certPEM, keyPEM, nil
 }
 
-func newCertTestManager(t *testing.T, s3f *fakeS3, issuer certIssuer) (*certManager, AttestationHashes) {
-	t.Helper()
-	dek := &dek{key: make([]byte, 32)}
-	store := newCertStore(s3f, dek, certTestBucket, "enclave.test")
-	hashes := NewAttestationHashes()
-	return newCertManager(store, issuer, s3f, certTestBucket, "enclave.test", hashes), hashes
+// attestedHash is user_data for a leaf before a response-signing key is set.
+func attestedHash(leaf [sha256.Size]byte) []byte {
+	payload := append([]byte(hashPrefix), leaf[:]...)
+	payload = append(payload, hashSeparator...)
+	payload = append(payload, hashPrefix...)
+	return append(payload, make([]byte, sha256.Size)...)
 }
 
-func requireAttestedTLSHash(t *testing.T, hashes AttestationHashes, want [sha256.Size]byte) {
+func newCertTestStore(s3f *fakeS3) *certStore {
+	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+}
+
+func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, AttestationHashes, error) {
+	hashes := NewAttestationHashes()
+	m, err := newCertManager(
+		context.Background(), newCertTestStore(s3f), issuer,
+		s3f, certTestBucket, "enclave.test", hashes,
+	)
+	return m, hashes, err
+}
+
+func newCertTestManager(t *testing.T, s3f *fakeS3, issuer certIssuer) (*certManager, AttestationHashes) {
 	t.Helper()
-	payload := hashes.Serialize()
-	start := len(hashPrefix)
-	require.GreaterOrEqual(t, len(payload), start+sha256.Size)
-	require.Equal(t, want[:], payload[start:start+sha256.Size])
+	m, hashes, err := tryNewCertTestManager(s3f, issuer)
+	require.NoError(t, err)
+	return m, hashes
 }
 
 func TestCertManagerBootstrapIssuesWhenFleetHasNone(t *testing.T) {
@@ -105,8 +117,6 @@ func TestCertManagerBootstrapIssuesWhenFleetHasNone(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	m, hashes := newCertTestManager(t, s3f, issuer)
 
-	require.NoError(t, m.Bootstrap(context.Background()))
-
 	require.Equal(t, 1, issuer.calls)
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
@@ -114,7 +124,7 @@ func TestCertManagerBootstrapIssuesWhenFleetHasNone(t *testing.T) {
 
 	// The attested fingerprint must describe the leaf actually served.
 	served := sha256.Sum256(cert.Certificate[0])
-	requireAttestedTLSHash(t, hashes, served)
+	require.Equal(t, attestedHash(served), hashes.Serialize())
 
 	// The lease is released, so a peer is not blocked behind us.
 	require.Empty(t, s3f.currentETag(leaseObjectKey(certLeaseName)))
@@ -124,15 +134,13 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	m, hashes := newCertTestManager(t, s3f, issuer)
-
 	// A peer already issued for the fleet.
 	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	stored, err := m.store.SaveCert(context.Background(), certPEM, keyPEM, "")
+	stored, err := newCertTestStore(s3f).SaveCert(context.Background(), certPEM, keyPEM, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, stored.etag)
 
-	require.NoError(t, m.Bootstrap(context.Background()))
+	m, hashes := newCertTestManager(t, s3f, issuer)
 
 	require.Zero(t, issuer.calls, "a stored certificate must not trigger an order")
 	// Adopting must record the version too, or the first poll re-downloads a
@@ -141,7 +149,7 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	served := sha256.Sum256(cert.Certificate[0])
-	requireAttestedTLSHash(t, hashes, served)
+	require.Equal(t, attestedHash(served), hashes.Serialize())
 }
 
 // The headline case: an enclave whose lease lapsed while it was descheduled
@@ -154,16 +162,14 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	s3f := newFakeS3()
 
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	store := newCertTestStore(s3f)
 
-	// This enclave observed an empty store, so it captured "" as its snapshot.
-	staleETag := ""
-
+	// This enclave observes an empty store, so its write is create-only.
 	var peerLeaf [sha256.Size]byte
 	issuer.onIssue = func() {
 		// While our order runs, a peer takes over and commits its own.
 		peerCert, peerKey := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-		_, err := m.store.SaveCert(ctx, peerCert, peerKey, "")
+		_, err := store.SaveCert(ctx, peerCert, peerKey, "")
 		require.NoError(t, err)
 
 		block, _ := pem.Decode(peerCert)
@@ -171,10 +177,10 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 		peerLeaf = sha256.Sum256(block.Bytes)
 	}
 
-	require.NoError(t, m.renew(ctx, staleETag))
+	m, hashes := newCertTestManager(t, s3f, issuer)
 
 	// The store must still hold the peer's certificate: ours was rejected.
-	stored, err := m.store.LoadCert(ctx)
+	stored, err := store.LoadCert(ctx)
 	require.NoError(t, err)
 	require.Equal(t, peerLeaf, sha256.Sum256(stored.cert.Certificate[0]),
 		"a stale ETag must not overwrite the peer's certificate")
@@ -183,7 +189,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	require.Equal(t, peerLeaf, sha256.Sum256(cert.Certificate[0]))
-	requireAttestedTLSHash(t, hashes, peerLeaf)
+	require.Equal(t, attestedHash(peerLeaf), hashes.Serialize())
 
 	require.Equal(t, 1, issuer.calls, "a rejected write must not re-run the order")
 }
@@ -192,11 +198,19 @@ func TestCertManagerRenewSkipsWhenPeerHoldsLease(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
+
+	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
+	_, err := newCertTestStore(s3f).SaveCert(context.Background(), certPEM, keyPEM, "")
+	require.NoError(t, err)
+
 	m, _ := newCertTestManager(t, s3f, issuer)
 
 	writeLeaseDoc(t, s3f, leaseObjectKey(certLeaseName), time.Now().Add(time.Hour))
 
-	require.NoError(t, m.renewUnderLease(context.Background(), ""))
+	renewed, err := m.renewUnderLease(context.Background(), "")
+	require.NoError(t, err)
+
+	require.Nil(t, renewed, "a peer holding the lease yields no new bundle")
 	require.Zero(t, issuer.calls, "the lease holder is already renewing")
 }
 
@@ -207,7 +221,6 @@ func TestCertManagerAdoptsPeerRenewalOnPoll(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	m, _ := newCertTestManager(t, s3f, issuer)
 
-	require.NoError(t, m.Bootstrap(ctx))
 	first, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 
@@ -297,10 +310,9 @@ func TestCertManagerIssueFailurePropagates(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test", err: errors.New("CA unavailable")}
-	m, _ := newCertTestManager(t, s3f, issuer)
+	m, _, err := tryNewCertTestManager(s3f, issuer)
 
-	err := m.Bootstrap(context.Background())
-
+	require.Nil(t, m, "a manager must not exist without a certificate")
 	require.ErrorContains(t, err, "CA unavailable")
 	require.Empty(t, s3f.currentETag(leaseObjectKey(certLeaseName)), "lease must be released")
 }
@@ -312,14 +324,14 @@ func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	m, hashes := newCertTestManager(t, s3f, issuer)
 	ctx := context.Background()
 
-	// Before any certificate exists, user_data carries the zero hash rather
-	// than a value for a leaf nobody serves.
-	requireAttestedTLSHash(t, hashes, [sha256.Size]byte{})
+	require.Equal(t,
+		attestedHash([sha256.Size]byte{}),
+		NewAttestationHashes().Serialize(),
+	)
 
-	require.NoError(t, m.Bootstrap(ctx))
+	m, hashes := newCertTestManager(t, s3f, issuer)
 
 	attested := func() [sha256.Size]byte {
 		var h [sha256.Size]byte
@@ -370,8 +382,6 @@ func TestCertManagerTickSurvivesVanishedCert(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	m, _ := newCertTestManager(t, s3f, issuer)
 	ctx := context.Background()
-	require.NoError(t, m.Bootstrap(ctx))
-
 	served := m.currentCert.Load()
 	require.NotNil(t, served)
 

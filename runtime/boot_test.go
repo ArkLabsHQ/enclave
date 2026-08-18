@@ -127,22 +127,22 @@ func TestLoadUnverifiedState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, ssm := stateOriginTestSSM(tc.params)
 			boot := &Boot{ssm: ssm, pcr0: currentPCR0}
-			err := boot.plan(ctx)
+			planned, err := boot.plan(ctx)
 
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)
-			require.IsType(t, tc.want, boot.mode)
+			require.IsType(t, tc.want, planned.mode)
 
-			switch boot.mode.(type) {
+			switch planned.mode.(type) {
 			case *resumeBoot:
-				require.Equal(t, "receipt", boot.state.bootReceipt)
+				require.Equal(t, "receipt", planned.state.bootReceipt)
 			case *migrationBoot:
-				require.Equal(t, "transition", boot.state.migrationReceipt)
-				require.Equal(t, prevPCR0, boot.state.predecessorPCR0)
-				require.Equal(t, "attestation", boot.state.predecessorAttestation)
+				require.Equal(t, "transition", planned.state.migrationReceipt)
+				require.Equal(t, prevPCR0, planned.state.predecessorPCR0)
+				require.Equal(t, "attestation", planned.state.predecessorAttestation)
 			}
 		})
 	}
@@ -291,7 +291,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	kms := &stateOriginTestKMS{keyID: keyID}
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	err := boot.plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
 	fake.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
@@ -303,7 +303,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
 		kms,
 		ssm,
-		boot,
+		planned,
 	)
 
 	require.NoError(t, err)
@@ -322,7 +322,7 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = "receipt"
 	fake, ssm := stateOriginTestSSM(params)
 
-	err := (&Boot{ssm: ssm, pcr0: pcr0}).plan(ctx)
+	_, err := (&Boot{ssm: ssm, pcr0: pcr0}).plan(ctx)
 
 	require.Error(t, err)
 	_, exists := fake.params[secretCiphertextParam("alpha", keyID)]
@@ -339,7 +339,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session}}
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	err := boot.plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 
 	established, err := runBootPlan(
@@ -347,7 +347,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 		nsm,
 		&stateOriginTestKMS{keyID: keyID},
 		ssm,
-		boot,
+		planned,
 	)
 
 	require.NoError(t, err)
@@ -381,7 +381,7 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	}
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	err := boot.plan(context.Background())
+	planned, err := boot.plan(context.Background())
 	require.NoError(t, err)
 
 	_, err = runBootPlan(
@@ -389,7 +389,7 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 		&nsmW{nsm: &fakeNSM{session: session}},
 		&stateOriginTestKMS{keyID: keyID},
 		ssm,
-		boot,
+		planned,
 	)
 
 	require.Error(t, err)
@@ -425,7 +425,7 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = att.docB64
 			fake.params[tc.param] = tc.value
 			boot := &Boot{ssm: ssm, pcr0: pcr0}
-			err := boot.plan(ctx)
+			planned, err := boot.plan(ctx)
 			require.NoError(t, err)
 			kms := &stateOriginTestKMS{keyID: keyID}
 
@@ -437,7 +437,7 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 				}},
 				kms,
 				ssm,
-				boot,
+				planned,
 			)
 
 			require.ErrorContains(t, err, "invalid state-origin receipt")
@@ -476,7 +476,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			),
 		}}
 		boot := &Boot{ssm: ssm, pcr0: ownPCR0}
-		err := boot.plan(ctx)
+		planned, err := boot.plan(ctx)
 		require.NoError(t, err)
 
 		_, err = runBootPlan(
@@ -484,7 +484,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			nsm,
 			&stateOriginTestKMS{keyID: keyID},
 			ssm,
-			boot,
+			planned,
 		)
 		return fake, root, stateReceipt.roots, err
 	}
@@ -678,10 +678,11 @@ func (f *genesisFixture) establish(ctx context.Context) (bootResult, error) {
 	if err != nil {
 		return bootResult{}, err
 	}
-	if err := boot.plan(ctx); err != nil {
+	planned, err := boot.plan(ctx)
+	if err != nil {
 		return bootResult{}, err
 	}
-	return boot.finalise(ctx)
+	return boot.finalise(ctx, planned)
 }
 
 // A live peer lease must stop genesis before any KMS key is minted
@@ -752,11 +753,38 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, pcr0: pcr0}
-	lease, err := boot.awaitGenesis(ctx)
+	lease, err := boot.awaitGenesisLease(ctx)
 
 	require.NoError(t, err)
 	require.Nil(t, lease, "a committed genesis needs no lease")
-	require.IsType(t, &resumeBoot{}, boot.mode, "a peer's committed genesis leaves us resuming")
+
+	planned, err := boot.plan(ctx)
+	require.NoError(t, err)
+	require.IsType(t, &resumeBoot{}, planned.mode, "a peer's committed genesis leaves us resuming")
+}
+
+// A peer can commit between our poll and our winning the lease. Winning proves
+// nobody else is running genesis, not that genesis has not already happened, so
+// the lease must be given straight back rather than used to redo the work.
+func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
+	setStateOriginTestEnv(t)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	// The key lands between our poll and our re-read under the lease.
+	fx.ssmf.getSeq = map[string][]string{
+		kmsKeyIDParam(): {"", "key-from-peer"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, pcr0: pcr0}
+	lease, err := boot.awaitGenesisLease(ctx)
+
+	require.NoError(t, err)
+	require.Nil(t, lease, "a genesis completed under us must not leave us holding the lease")
+	require.Empty(t, fx.s3f.currentETag(leaseObjectKey(genesisLeaseName)),
+		"the lease must be released, not held through the resume path")
 }
 
 // A holder that died mid-genesis must not wedge the deployment forever — not
@@ -772,13 +800,14 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, pcr0: pcr0}
-	lease, err := boot.awaitGenesis(ctx)
+	lease, err := boot.awaitGenesisLease(ctx)
 
 	require.NoError(t, err)
 	require.NotNil(t, lease, "a lapsed lock must be reclaimable")
-	genesis, ok := boot.mode.(*genesisBoot)
-	require.True(t, ok, "holding the lease means genesis is still ours to do")
-	require.Same(t, lease, genesis.lease, "the plan leaves await carrying its lease")
+
+	planned, err := boot.plan(ctx)
+	require.NoError(t, err)
+	require.IsType(t, &genesisBoot{}, planned.mode, "holding the lease means genesis is still ours to do")
 	require.NoError(t, lease.Release(context.Background()))
 }
 
@@ -792,7 +821,7 @@ func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	lease, err := (&Boot{ssm: fx.ssm, s3: fx.s3f, pcr0: pcr0}).awaitGenesis(ctx)
+	lease, err := (&Boot{ssm: fx.ssm, s3: fx.s3f, pcr0: pcr0}).awaitGenesisLease(ctx)
 
 	require.Nil(t, lease)
 	require.ErrorContains(t, err, "genesis did not complete")
@@ -816,9 +845,9 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
 
 	boot := &Boot{ssm: fx.ssm, pcr0: pcr0}
-	err = boot.plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
-	genesis, ok := boot.mode.(*genesisBoot)
+	genesis, ok := planned.mode.(*genesisBoot)
 	require.True(t, ok, "an uncommitted deployment must plan a genesis boot")
 	genesis.lease = lease
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
@@ -828,7 +857,7 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
 		&stateOriginTestKMS{keyID: "key-zombie"},
 		fx.ssm,
-		boot,
+		planned,
 	)
 
 	require.ErrorContains(t, err, "refusing to commit genesis")
@@ -844,10 +873,10 @@ func runBootPlan(
 	nsm NSM,
 	kms PrimaryKMS,
 	ssm SSM,
-	boot *Boot,
+	planned *plannedBoot,
 ) (bootResult, error) {
-	state := &boot.state
-	snapshot, err := boot.mode.buildSnapshot(ctx, state, kms, ssm)
+	state := &planned.state
+	snapshot, err := planned.mode.buildSnapshot(ctx, state, kms, ssm)
 	if err != nil {
 		return bootResult{}, err
 	}
@@ -855,7 +884,7 @@ func runBootPlan(
 	if err != nil {
 		return bootResult{}, err
 	}
-	if err := boot.mode.verifySnapshot(state, nsm, snapshotRoot); err != nil {
+	if err := planned.mode.verifySnapshot(state, nsm, snapshotRoot); err != nil {
 		return bootResult{}, err
 	}
 	if kms.KeyID() != snapshot.kmsKeyID {
@@ -879,7 +908,7 @@ func runBootPlan(
 			Plaintext:            hex.EncodeToString(plaintext),
 		})
 	}
-	if err := boot.mode.commitSnapshot(ctx, state, nsm, ssm, kms, snapshotRoot); err != nil {
+	if err := planned.mode.commitSnapshot(ctx, state, nsm, ssm, kms, snapshotRoot); err != nil {
 		return bootResult{}, err
 	}
 	return bootResult{

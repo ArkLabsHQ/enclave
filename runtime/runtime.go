@@ -112,10 +112,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
-	if err := boot.plan(ctx); err != nil {
+	planned, err := boot.plan(ctx)
+	if err != nil {
 		return fmt.Errorf("failed to plan boot: %w", err)
 	}
-	result, err := boot.finalise(ctx)
+	result, err := boot.finalise(ctx, planned)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}

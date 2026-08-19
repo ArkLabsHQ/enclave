@@ -121,14 +121,17 @@ in
         if [ "$MISSING" -lt 12 ]; then
           continue
         fi
+        echo "enclave watchdog: enclave missing after $MISSING checks; attempting restart"
         ${launcher.terminate} || true
         sleep "$BACKOFF"
         if ${launcher.run}; then
+          echo "enclave watchdog: restart command succeeded"
           MISSING=0
           BACKOFF=1
         else
           BACKOFF=$((BACKOFF * 2))
           if [ "$BACKOFF" -gt 30 ]; then BACKOFF=30; fi
+          echo "enclave watchdog: restart command failed; retrying with ''${BACKOFF}s backoff"
         fi
       done
     '';

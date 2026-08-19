@@ -65,7 +65,15 @@
       );
 
       checks = forSystems enclaveSystems (
-        { pkgs, system, ... }: import ./nix/tests { inherit pkgs system self; }
+        { pkgs, system, ... }:
+        import ./nix/tests {
+          inherit
+            pkgs
+            system
+            self
+            aws-nitro-util
+            ;
+        }
       );
 
       templates.default = {

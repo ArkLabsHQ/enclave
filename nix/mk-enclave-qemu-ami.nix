@@ -25,6 +25,7 @@
   cpuCount ? 2,
   enclaveCID ? 16,
   enclaveName ? "enclave",
+  vhostDeviceVsock ? null,
 }:
 let
   runtimeDir = "vhost-vsock-${enclaveName}";
@@ -50,7 +51,8 @@ let
             -enable-kvm \
             -cpu host \
             -display none \
-            -serial file:${consoleLog} \
+            -chardev file,id=console,path=${consoleLog},append=on \
+            -serial chardev:console \
             -no-reboot \
             -daemonize \
             -pidfile ${pidfile} \
@@ -79,6 +81,10 @@ let
 
   qemuModule =
     { pkgs, lib, ... }:
+    let
+      vhostDeviceVsockPackage =
+        if vhostDeviceVsock == null then pkgs.vhost-device-vsock else vhostDeviceVsock;
+    in
     {
       # Host side of AF_VSOCK loopback (CID 1) used by forward-cid/forward-listen.
       boot.kernelModules = [ "vsock_loopback" ];
@@ -104,7 +110,7 @@ let
           Type = "simple";
           RuntimeDirectory = runtimeDir;
           # Larger queues prevent bursty forwarded connections exhausting LocalTxBuf.
-          ExecStart = "${pkgs.vhost-device-vsock}/bin/vhost-device-vsock --vm guest-cid=${toString enclaveCID},socket=${vsockSocket},forward-cid=1,forward-listen=8003,tx-buffer-size=65536,queue-size=1024";
+          ExecStart = "${vhostDeviceVsockPackage}/bin/vhost-device-vsock --vm guest-cid=${toString enclaveCID},socket=${vsockSocket},forward-cid=1,forward-listen=8003,tx-buffer-size=65536,queue-size=1024";
           Restart = "always";
           RestartSec = 2;
         };

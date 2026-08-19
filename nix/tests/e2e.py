@@ -91,26 +91,63 @@ def instance_ids():
     return json.loads(tofu("output -json instance_ids"))
 
 
+def print_enclave_diagnostics(node):
+    print(
+        node.execute(
+            "echo '=== qemu ==='; "
+            "if [ -s /run/enclave-qemu.pid ]; then "
+            "pid=$(cat /run/enclave-qemu.pid); "
+            "echo pid=$pid; "
+            "if kill -0 \"$pid\" 2>/dev/null; then echo alive=yes; else echo alive=no; fi; "
+            "else echo pidfile=missing; fi; "
+            "ls -l /dev/kvm; "
+            "ps -eo pid,ppid,stat,pcpu,comm,args | grep '[q]emu-system' || true"
+        )[1]
+    )
+    print(
+        node.execute(
+            "systemctl status vhost-device-vsock enclave-heartbeat gvproxy "
+            "imds-proxy migration-proxy enclave-start enclave-watchdog "
+            "--no-pager 2>&1"
+        )[1]
+    )
+    print(
+        node.execute(
+            "journalctl -u vhost-device-vsock -u enclave-heartbeat -u gvproxy "
+            "-u imds-proxy -u migration-proxy -u enclave-start "
+            "-u enclave-watchdog --no-pager -n 150 2>&1"
+        )[1]
+    )
+    print(
+        node.execute(
+            "echo '=== enclave console ==='; "
+            "if [ -e /var/log/enclave-console.log ]; then "
+            "echo bytes=$(wc -c </var/log/enclave-console.log); "
+            "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
+            "| tail -n 160; "
+            "echo '=== enclave console hex tail ==='; "
+            "tail -c 256 /var/log/enclave-console.log | od -An -tx1; "
+            "else echo missing; fi"
+        )[1]
+    )
+
+
 def wait_healthy(node):
     try:
         node.wait_until_succeeds(
-            "curl -skf --http1.1 https://127.0.0.1/health "
+            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
+            "https://127.0.0.1/health "
             "| jq -e '.status == \"ready\"'",
             timeout=300,
         )
         node.wait_until_succeeds(
-            "curl -skf --http1.1 https://127.0.0.1/test/health "
+            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
+            "https://127.0.0.1/test/health "
             "| jq -e '.status == \"ok\"'",
             timeout=30,
         )
     except Exception:
-        print(node.execute("tail -n 120 /var/log/enclave-console.log 2>&1")[1])
-        print(
-            node.execute(
-                "journalctl -u gvproxy -u imds-proxy -u migration-proxy "
-                "-u enclave-start -u enclave-watchdog --no-pager -n 100"
-            )[1]
-        )
+        print_enclave_diagnostics(node)
         print(
             aws.execute(
                 "journalctl -u ministack -u awsmocks --no-pager -n 100"
@@ -291,7 +328,7 @@ migration_request_output = ""
 for _ in range(30):
     migration_status, migration_request_output = blue.execute(
         "rm -f /tmp/request-migration.json; "
-        "curl -fsS -H 'Content-Type: application/json' "
+        "curl --fail-with-body -sS -H 'Content-Type: application/json' "
         f"--data '{{\"action\":\"requested\",\"target_pcr0\":\"{GREEN_PCR0}\"}}' "
         "--output /tmp/request-migration.json "
         "http://127.0.0.1:8003/request-migration"
@@ -309,6 +346,7 @@ for _ in range(30):
     time.sleep(1)
 else:
     print(migration_request_output)
+    print(blue.execute("cat /tmp/request-migration.json 2>/dev/null || true")[1])
     print(
         blue.execute(
             "systemctl status migration-proxy vhost-device-vsock --no-pager"
@@ -322,7 +360,7 @@ else:
     print(blue.execute("tail -n 100 /var/log/enclave-console.log")[1])
     # Distinguishes an enclave crash from a dropped transport on the next run.
     print(blue.execute("curl -sk https://127.0.0.1/health || true")[1])
-    raise Exception("request-migration did not reach the enclave")
+    raise Exception("request-migration did not succeed")
 intent_bucket = tofu("output -raw migration_intent_log_bucket")
 assert (
     int(
@@ -345,7 +383,7 @@ finalise_output = ""
 for attempt in range(30):
     finalise_status, finalise_output = blue.execute(
         "rm -f /tmp/finalise-migration.json; "
-        "curl -fsS -H 'Content-Type: application/json' "
+        "curl --fail-with-body -sS -H 'Content-Type: application/json' "
         f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
         "--output /tmp/finalise-migration.json "
         "http://127.0.0.1:8003/finalise-migration"

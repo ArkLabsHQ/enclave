@@ -2,6 +2,7 @@
   pkgs,
   system,
   self,
+  aws-nitro-util,
 }:
 let
   testApp = import ./test-app.nix { inherit pkgs; };
@@ -118,11 +119,10 @@ in
     inherit
       pkgs
       self
+      aws-nitro-util
       enclaveTofu
-      blueEif
-      greenEif
-      bluePCR0
-      greenPCR0
+      testApp
+      commonEifEnv
       awsNodeIP
       ;
   };

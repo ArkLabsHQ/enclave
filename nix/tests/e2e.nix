@@ -1,14 +1,52 @@
 {
   pkgs,
   self,
+  aws-nitro-util,
   enclaveTofu,
-  blueEif,
-  greenEif,
-  bluePCR0,
-  greenPCR0,
+  testApp,
+  commonEifEnv,
   awsNodeIP,
 }:
 let
+  lib = pkgs.lib;
+  system = pkgs.stdenv.hostPlatform.system;
+
+  eifInit = aws-nitro-util.packages.${system}.eif-init.overrideAttrs (oldAttrs: {
+    patches = (oldAttrs.patches or [ ]) ++ [ ./patches/aws-nitro-util-init-wait.patch ];
+  });
+
+  vhostDeviceVsock = pkgs.vhost-device-vsock.overrideAttrs (oldAttrs: {
+    # https://github.com/rust-vmm/vhost-device/issues/963
+    patches = (oldAttrs.patches or [ ]) ++ [ ./patches/vhost-device-vsock-forward-listen.patch ];
+    # This upstream test hard-codes host-vsock port 9000, which may be in use
+    # by another NixOS test on a shared builder.
+    checkFlags = (oldAttrs.checkFlags or [ ]) ++ [
+      "--skip"
+      "tests::test_vsock_server_vsock"
+    ];
+  });
+
+  mkEif =
+    env:
+    self.lib.buildEif {
+      inherit pkgs;
+      app = testApp;
+      init = "${eifInit}/bin/init";
+      env = commonEifEnv // { ENCLAVE_DEV = "true"; } // env;
+    };
+
+  blueEif = mkEif {
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
+    ENCLAVE_TEST_SALT = "blue";
+  };
+  bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
+
+  greenEif = mkEif {
+    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
+    ENCLAVE_TEST_SALT = "green";
+  };
+  greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
+
   ministack = import ./ministack.nix { inherit pkgs; };
   awsmocks = import ./awsmocks.nix { inherit pkgs; };
   pebbleFixtures = import ./pebble.nix {
@@ -24,11 +62,13 @@ let
         (self.lib.mkEnclaveQemuAmi {
           inherit eif;
           memoryMib = 2048;
+          cpuCount = 1;
+          inherit vhostDeviceVsock;
         })
       ];
 
       virtualisation.memorySize = 4096;
-      virtualisation.cores = 1;
+      virtualisation.cores = 2;
 
       environment.systemPackages = with pkgs; [
         curl

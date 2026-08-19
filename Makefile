@@ -9,8 +9,8 @@ test:
 	cd runtime && go test ./...
 
 lint:
-	golangci-lint run $(ROOT_PACKAGES)
-	cd runtime && golangci-lint run ./...
+	CGO_ENABLED=0 GOOS=linux golangci-lint run $(ROOT_PACKAGES)
+	cd runtime && CGO_ENABLED=0 GOOS=linux golangci-lint run ./...
 
 fmt:
 	cd client && golines -w --max-len=100 .

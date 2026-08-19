@@ -9,7 +9,10 @@ on:
 
 jobs:
   enclave-test:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Not migrated to Blacksmith: the runner kernel ships no vsock /
+    # vsock_loopback module, and this test needs host AF_VSOCK loopback
+    # (see test/run.sh and the vsock heartbeat responder).
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

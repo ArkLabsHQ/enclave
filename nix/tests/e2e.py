@@ -138,13 +138,17 @@ def wait_healthy(node):
             "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
             "https://127.0.0.1/health "
             "| jq -e '.status == \"ready\"'",
-            timeout=300,
+            # Nested enclave boot and genesis on the 4-vCPU hosted runner are
+            # very slow (~370s observed); allow ample headroom.
+            timeout=900,
         )
         node.wait_until_succeeds(
             "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
             "https://127.0.0.1/test/health "
             "| jq -e '.status == \"ok\"'",
-            timeout=30,
+            # On the 4-vCPU runner both outer VMs and their inners
+            # oversubscribe the host; health probes can be starved for minutes.
+            timeout=300,
         )
     except Exception:
         print_enclave_diagnostics(node)
@@ -473,7 +477,9 @@ assert (
 blue.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
     "| jq -e '.migration.state == \"eligible\"'",
-    timeout=30,
+    # The eligible-state read is a runtime HTTP round trip; give the slow
+    # 4-vCPU runner room.
+    timeout=120,
 )
 
 finalise_response_valid = False

@@ -1,6 +1,8 @@
 // Minimal stdlib-only app for observing runtime env and testing clock recovery.
 // It is exec'd as a root child with CAP_SYS_TIME, so /test/clock can call
 // syscall.Settimeofday without adding a shell or other packages to the EIF.
+// offset_ms exists for sub-threshold (<100ms) skews that exercise the clock
+// servo's frequency path rather than its hard-step path.
 package main
 
 import (
@@ -12,7 +14,10 @@ import (
 	"time"
 )
 
-const maxOffsetS = 10
+const (
+	maxOffsetS  = 10
+	maxOffsetMs = 10_000
+)
 
 type clockSample struct {
 	Unix int64 `json:"unix"`
@@ -73,6 +78,7 @@ func handleClockSet(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		OffsetSeconds int64 `json:"offset_seconds"`
+		OffsetMs      int64 `json:"offset_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("decode body: %v", err))
@@ -86,9 +92,19 @@ func handleClockSet(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
+	if req.OffsetMs < -maxOffsetMs || req.OffsetMs > maxOffsetMs {
+		writeError(
+			w,
+			http.StatusBadRequest,
+			fmt.Sprintf("offset_ms out of range (limit +/-%d)", maxOffsetMs),
+		)
+		return
+	}
 
 	before := nowSample()
-	target := time.Now().Add(time.Duration(req.OffsetSeconds) * time.Second)
+	offset := time.Duration(req.OffsetSeconds)*time.Second +
+		time.Duration(req.OffsetMs)*time.Millisecond
+	target := time.Now().Add(offset)
 	tv := syscall.NsecToTimeval(target.UnixNano())
 	if err := syscall.Settimeofday(&tv); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("settimeofday: %v", err))

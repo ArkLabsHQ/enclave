@@ -316,6 +316,12 @@ enclave_ts = int(
 )
 assert abs(enclave_ts - host_ts) <= 2, (enclave_ts, host_ts)
 
+# The boot hard-step against /dev/ptp0 must have engaged.
+blue.succeed(
+    "grep -q 'clock sync: initial hard-step to hypervisor PTP completed' "
+    "/var/log/enclave-console.log"
+)
+
 # This excludes the distinct "initial hard-step" boot message.
 initial_hardsteps = int(
     blue.succeed(
@@ -355,6 +361,51 @@ final_hardsteps = int(
     ).strip()
 )
 assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
+wait_healthy(blue)
+
+# A sub-threshold skew (50ms < the 100ms maxStep threshold) must NOT hard-step:
+# the PI servo frequency-disciplines it instead. Evidence: a post-skew
+# "disciplined" tick reflecting the injected offset, with no new hard-step.
+hardsteps_before_sub = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+log_lines_before = int(blue.succeed("wc -l < /var/log/enclave-console.log").strip())
+blue.succeed(
+    "curl -skf --http1.1 -X POST -H 'Content-Type: application/json' "
+    "--data '{\"offset_ms\":50}' https://127.0.0.1/test/clock"
+)
+
+# Wait for at least one post-skew servo tick on the 2s poll cadence.
+blue.wait_until_succeeds(
+    f"test \"$(tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
+    "| grep -c 'clock sync: disciplined')\" -ge 1",
+    timeout=15,
+)
+
+_, sub_lines = blue.execute(
+    f"tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
+    "| grep 'clock sync: disciplined' || true"
+)
+max_offset_us = 0.0
+for line in sub_lines.splitlines():
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        continue
+    max_offset_us = max(max_offset_us, abs(float(entry.get("offset_us", 0))))
+assert max_offset_us >= 30000, max_offset_us
+
+hardsteps_after_sub = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+assert hardsteps_after_sub == hardsteps_before_sub, (
+    hardsteps_before_sub,
+    hardsteps_after_sub,
+)
 wait_healthy(blue)
 
 # Prove the next infrastructure change creates only green, but do not apply

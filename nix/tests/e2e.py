@@ -308,6 +308,54 @@ genesis_key = cloud(
 )
 assert genesis_key not in ("", "UNSET", "None")
 
+# Skew before migration so cooldown and receipt timestamps remain valid. The
+# 2s test poll exercises the unchanged /dev/ptp0 servo without waiting five minutes.
+host_ts = int(blue.succeed("date +%s").strip())
+enclave_ts = int(
+    blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix").strip()
+)
+assert abs(enclave_ts - host_ts) <= 2, (enclave_ts, host_ts)
+
+# This excludes the distinct "initial hard-step" boot message.
+initial_hardsteps = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+
+# A +5s skew exceeds the 100ms hard-step threshold on the next 2s poll.
+clock_resp = json.loads(
+    blue.succeed(
+        "curl -skf --http1.1 -X POST -H 'Content-Type: application/json' "
+        "--data '{\"offset_seconds\":5}' https://127.0.0.1/test/clock"
+    )
+)
+skewed_ts = clock_resp["after"]["unix"]
+host_ts_after = int(blue.succeed("date +%s").strip())
+assert skewed_ts - host_ts_after >= 3, (skewed_ts, host_ts_after)
+
+# Wait for the syncer to hard-step the clock back onto the PHC.
+blue.wait_until_succeeds(
+    f"test \"$(grep -c 'clock sync: hard-step' /var/log/enclave-console.log)\" "
+    f"-ge {initial_hardsteps + 1}",
+    timeout=30,
+)
+
+# Poll until the enclave clock is back within 2s of the outer host.
+blue.wait_until_succeeds(
+    "test $(( $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) "
+    "- $(date +%s) )) -le 2 "
+    "&& test $(( $(date +%s) "
+    "- $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) )) -le 2",
+    timeout=30,
+)
+final_hardsteps = int(
+    blue.succeed(
+        "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
+    ).strip()
+)
+assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
+wait_healthy(blue)
 
 # Prove the next infrastructure change creates only green, but do not apply
 # the saved plan yet: a real EC2 create would immediately boot the AMI, and

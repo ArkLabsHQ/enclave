@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   runtime-hashes:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +132,7 @@ jobs:
 
   build-cli:
     needs: runtime-hashes
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       matrix:
         include:
@@ -183,7 +183,7 @@ jobs:
 
   create-release:
     needs: [build-cli]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8

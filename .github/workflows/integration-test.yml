@@ -9,7 +9,7 @@ on:
 
 jobs:
   enclave-test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

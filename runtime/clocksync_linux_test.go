@@ -84,7 +84,10 @@ func simulateDrift(cs *clockSyncer, d drift) driftResult {
 // captureAdjust runs cs.adjust(m) with the kernel write seams stubbed, returning the
 // frequency it would apply (ppm) and, for a hard-step, the target it would set — without
 // touching the real clock.
-func captureAdjust(cs *clockSyncer, m offsetMeasurement) (appliedPpm float64, hardStep bool, stepToNs int64) {
+func captureAdjust(
+	cs *clockSyncer,
+	m offsetMeasurement,
+) (appliedPpm float64, hardStep bool, stepToNs int64) {
 	origAdj, origSet := clockAdjtime, clockSettime
 	defer func() { clockAdjtime, clockSettime = origAdj, origSet }()
 	var freqUnits int64
@@ -154,7 +157,13 @@ func TestObserveSignDirection(t *testing.T) {
 	for _, nativePpm := range []float64{-11.6, +11.6} {
 		s := &clockSyncer{cfg: defaultServoConfig()}
 		res := simulateDrift(s, drift{nativeDriftPpm: nativePpm, intervalS: 30, steps: 20})
-		require.Less(t, nativePpm*res.applied, 0.0, "native %v: correction opposes drift", nativePpm)
+		require.Less(
+			t,
+			nativePpm*res.applied,
+			0.0,
+			"native %v: correction opposes drift",
+			nativePpm,
+		)
 	}
 }
 
@@ -165,14 +174,29 @@ func TestObserveHardStep(t *testing.T) {
 	require.Zero(t, applied, "fresh servo holds zero frequency")
 	require.False(t, isHardStep, "first sample does not trigger hard-step")
 	// Second sample gives an interval: the PI loop engages and applies a correction.
-	applied, isHardStep, _ = captureAdjust(cs, offsetMeasurement{xMonoNs: nsPerSecond, offsetNs: 1000})
+	applied, isHardStep, _ = captureAdjust(
+		cs,
+		offsetMeasurement{xMonoNs: nsPerSecond, offsetNs: 1000},
+	)
 	require.NotZero(t, applied, "PI engages once there is an interval")
 	require.False(t, isHardStep, "small offset does not trigger hard-step")
 	// Third sample is a gross offset: triggers a hard-step and resets the interval baseline.
-	_, isHardStep, stepToNs := captureAdjust(cs, offsetMeasurement{xMonoNs: 2 * nsPerSecond, phcNs: 42_000_000_000, offsetNs: 200 * 1_000_000})
+	_, isHardStep, stepToNs := captureAdjust(
+		cs,
+		offsetMeasurement{
+			xMonoNs:  2 * nsPerSecond,
+			phcNs:    42_000_000_000,
+			offsetNs: 200 * 1_000_000,
+		},
+	)
 	require.True(t, isHardStep, "gross offset triggers hard-step")
 	require.Equal(t, int64(42_000_000_000), stepToNs)
-	require.Equal(t, int64(2*nsPerSecond), cs.lastXMonoNs, "hard-step restarts the interval baseline")
+	require.Equal(
+		t,
+		int64(2*nsPerSecond),
+		cs.lastXMonoNs,
+		"hard-step restarts the interval baseline",
+	)
 }
 
 func TestAdjustCommitsStateOnlyOnSuccess(t *testing.T) {
@@ -258,8 +282,12 @@ func TestAdjustSetsFrequencyOnly(t *testing.T) {
 	cs := &clockSyncer{cfg: defaultServoConfig()}
 	require.NoError(t, cs.adjust(offsetMeasurement{xMonoNs: 0, offsetNs: 1000}))
 
-	require.Equal(t, uint32(unix.ADJ_FREQUENCY), modes,
-		"ADJ_STATUS would replace every writable status flag, clearing STA_UNSYNC and pending STA_INS/STA_DEL")
+	require.Equal(
+		t,
+		uint32(unix.ADJ_FREQUENCY),
+		modes,
+		"ADJ_STATUS would replace every writable status flag, clearing STA_UNSYNC and pending STA_INS/STA_DEL",
+	)
 }
 
 // TestNewClockSyncer covers the OS-facing bootstrap: every failure path is fatal
@@ -374,17 +402,45 @@ func TestObserveFreqStep(t *testing.T) {
 		cfg.maxStepNs = 5 * nsPerSecond // let the offset accrue without hard-stepping
 		s := &clockSyncer{cfg: cfg}
 		res := simulateDrift(s, drift{nativeDriftPpm: c.nativeDriftPpm, intervalS: 30, steps: 400})
-		require.InDelta(t, c.wantFreq, res.integral, 0.05, "native %v: integral tracks/saturates", c.nativeDriftPpm)
-		require.InDelta(t, c.wantFreq, res.applied, 0.05, "native %v: applied tracks/saturates", c.nativeDriftPpm)
-		require.LessOrEqual(t, res.maxAbs, 100.0, "native %v: applied never exceeds the clamp", c.nativeDriftPpm)
+		require.InDelta(
+			t,
+			c.wantFreq,
+			res.integral,
+			0.05,
+			"native %v: integral tracks/saturates",
+			c.nativeDriftPpm,
+		)
+		require.InDelta(
+			t,
+			c.wantFreq,
+			res.applied,
+			0.05,
+			"native %v: applied tracks/saturates",
+			c.nativeDriftPpm,
+		)
+		require.LessOrEqual(
+			t,
+			res.maxAbs,
+			100.0,
+			"native %v: applied never exceeds the clamp",
+			c.nativeDriftPpm,
+		)
 	}
 
 	// checks a distinct property from convergence: once locked, the integral (frequency estimate) must stay quiet under sustained noise.
 	rng := rand.New(rand.NewSource(1))
 	cs := &clockSyncer{cfg: defaultServoConfig()}
-	res := simulateDrift(cs, drift{nativeDriftPpm: 20, sigmaNs: 100_000, intervalS: 30, steps: 800, rng: rng})
+	res := simulateDrift(
+		cs,
+		drift{nativeDriftPpm: 20, sigmaNs: 100_000, intervalS: 30, steps: 800, rng: rng},
+	)
 	require.InDelta(t, -20.0, res.integral, 1.0, "integral converges near -native under noise")
-	require.LessOrEqual(t, res.integralSpread, 2.0, "frequency estimate must not chatter once locked")
+	require.LessOrEqual(
+		t,
+		res.integralSpread,
+		2.0,
+		"frequency estimate must not chatter once locked",
+	)
 }
 
 // TestSyncHandlesMeasurementGap verifies that after a long gap (missed polls) the servo
@@ -413,7 +469,12 @@ func TestSyncHandlesMeasurementGap(t *testing.T) {
 	})
 	require.True(t, hardStep, "144ms offset exceeds the 100ms step threshold")
 	require.Equal(t, int64(123_456_789), stepToNs, "hard-step targets the PHC")
-	require.Equal(t, int64((gapS+7200)*nsPerSecond), cs.lastXMonoNs, "hard-step restarts the interval baseline")
+	require.Equal(
+		t,
+		int64((gapS+7200)*nsPerSecond),
+		cs.lastXMonoNs,
+		"hard-step restarts the interval baseline",
+	)
 }
 
 // TestServoConvergence closes the loop through adjust() and asserts the integral term
@@ -454,9 +515,29 @@ func TestServoConvergence(t *testing.T) {
 					nativeDriftPpm: c.nativePpm, sigmaNs: c.sigmaNs, intervalS: intervalS,
 					jitterS: c.jitterS, steps: steps, rng: rng,
 				})
-				require.InDelta(t, -c.nativePpm, res.integral, c.tolerancePpm, "seed %d: integral should cancel native drift", seed)
-				require.InDelta(t, 0.0, res.offsetNs, c.tolOffsetN, "seed %d: residual offset bounded", seed)
-				require.LessOrEqual(t, res.maxAbs, 100.0, "seed %d: applied never exceeds the clamp", seed)
+				require.InDelta(
+					t,
+					-c.nativePpm,
+					res.integral,
+					c.tolerancePpm,
+					"seed %d: integral should cancel native drift",
+					seed,
+				)
+				require.InDelta(
+					t,
+					0.0,
+					res.offsetNs,
+					c.tolOffsetN,
+					"seed %d: residual offset bounded",
+					seed,
+				)
+				require.LessOrEqual(
+					t,
+					res.maxAbs,
+					100.0,
+					"seed %d: applied never exceeds the clamp",
+					seed,
+				)
 			}
 		})
 	}

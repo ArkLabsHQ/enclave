@@ -43,7 +43,8 @@ let
             [ -S ${vsockSocket} ] && break
             sleep 0.2
           done
-          exec ${pkgs'.qemu_kvm}/bin/qemu-system-x86_64 \
+          # brlttySupport drops brltty -> python3 (~135 MiB) from the node closure.
+          exec ${pkgs'.qemu_test.override { brlttySupport = false; }}/bin/qemu-system-x86_64 \
             -M nitro-enclave,vsock=c,id=${enclaveName} \
             -kernel ${eif}/image.eif \
             -m ${toString memoryMib}M \
@@ -64,7 +65,7 @@ let
     terminate = ''{ [ -s ${pidfile} ] && ${pkgs'.util-linux}/bin/kill "$(cat ${pidfile})" 2>/dev/null; rm -f ${pidfile}; } || true'';
     path = [
       pkgs'.coreutils
-      pkgs'.qemu_kvm
+      (pkgs'.qemu_test.override { brlttySupport = false; })
       pkgs'.util-linux
     ];
     requires = [
@@ -86,6 +87,12 @@ let
         if vhostDeviceVsock == null then pkgs.vhost-device-vsock else vhostDeviceVsock;
     in
     {
+      documentation.enable = false;
+      boot.enableContainers = false;
+      system.tools.nixos-rebuild.enable = false;
+      system.tools.nixos-generate-config.enable = false;
+      boot.loader.grub.enable = lib.mkForce false;
+
       # Host side of AF_VSOCK loopback (CID 1) used by forward-cid/forward-listen.
       boot.kernelModules = [ "vsock_loopback" ];
 

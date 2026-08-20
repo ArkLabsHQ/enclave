@@ -381,10 +381,13 @@ blue.succeed(
     "--data '{\"offset_ms\":50}' https://127.0.0.1/test/clock"
 )
 
-# Wait for at least one post-skew servo tick on the 2s poll cadence.
+# Wait for a post-skew tick that observed the injected ~50ms offset. A bare
+# "disciplined" line is insufficient: on a slow runner the POST round trip
+# outlasts the 2s poll, and a pre-skew steady-state tick would satisfy it.
 blue.wait_until_succeeds(
-    f"test \"$(tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
-    "| grep -c 'clock sync: disciplined')\" -ge 1",
+    f"tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
+    "| grep 'clock sync: disciplined' "
+    "| jq -e 'select(.offset_us != null and (.offset_us | fabs) >= 30000)'",
     timeout=15,
 )
 

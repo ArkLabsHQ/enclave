@@ -10,9 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAttestationHashes(t *testing.T) {
+func TestAttestationUserData(t *testing.T) {
 	t.Run("zero value serializes fixed user_data format", func(t *testing.T) {
-		h := NewAttestationHashes()
+		h := &AttestationHashes{}
 
 		var zero [sha256.Size]byte
 		want := append([]byte(hashPrefix), zero[:]...)
@@ -24,14 +24,14 @@ func TestAttestationHashes(t *testing.T) {
 	})
 
 	t.Run("set hashes serialize exact raw bytes", func(t *testing.T) {
-		h := NewAttestationHashes()
+		h := &AttestationHashes{}
 		var tlsHash, signingHash [sha256.Size]byte
 		for i := range tlsHash {
 			tlsHash[i] = byte(i)
 			signingHash[i] = byte(sha256.Size - i)
 		}
 
-		h.SetTLSKeyHash(tlsHash)
+		h.SetTLSKeyHashSource(staticKeyHash(tlsHash))
 		h.SetSigningKeyHash(signingHash)
 
 		want := append([]byte(hashPrefix), tlsHash[:]...)
@@ -42,14 +42,13 @@ func TestAttestationHashes(t *testing.T) {
 		require.Equal(t, want, h.Serialize())
 	})
 
-	t.Run("SetTLSKeyHashIfChanged returns true false true", func(t *testing.T) {
-		h := NewAttestationHashes()
-		one := sha256.Sum256([]byte("one"))
-		two := sha256.Sum256([]byte("two"))
+	// The wire format is fixed-width and clients slice it by offset, so its
+	// length is part of the contract.
+	t.Run("user_data is 79 bytes", func(t *testing.T) {
+		h := &AttestationHashes{}
+		h.SetTLSKeyHashSource(staticKeyHash(sha256.Sum256([]byte("leaf"))))
 
-		require.True(t, h.SetTLSKeyHashIfChanged(one))
-		require.False(t, h.SetTLSKeyHashIfChanged(one))
-		require.True(t, h.SetTLSKeyHashIfChanged(two))
+		require.Len(t, h.Serialize(), 79)
 	})
 }
 

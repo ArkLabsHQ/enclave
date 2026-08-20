@@ -68,7 +68,7 @@ func SetupHttpServers(
 	logging *Logging,
 	tracing *Tracing,
 	signer AttestedSigner,
-	hashes AttestationHashes,
+	hashes *AttestationHashes,
 	authToken string,
 ) Servers {
 	metricsMW := metricsMiddleware(metrics)
@@ -444,7 +444,7 @@ func configHandler(cfg Config) http.HandlerFunc {
 }
 
 // attestationHandler serves NSM attestation binding TLS and response-signing key hashes.
-func attestationHandler(nsm NSM, hashes AttestationHashes) http.HandlerFunc {
+func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, errBadForm, http.StatusBadRequest)

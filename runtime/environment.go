@@ -123,9 +123,17 @@ func lockSegment() string {
 	return "unlocked"
 }
 
-// storageBucketParam: SSM path for the shared storage bucket name.
-func storageBucketParam() string {
-	return fmt.Sprintf("/%s/%s/StorageBucketName", getDeployment(), getAppName())
+// certBucketParam: SSM path for the bucket holding the fleet certificate and
+// the ACME account key.
+func certBucketParam() string {
+	return fmt.Sprintf("/%s/%s/CertBucketName", getDeployment(), getAppName())
+}
+
+// leaseBucketParam: SSM path for the bucket holding leases. Separate from the
+// certificate bucket: leases are ephemeral coordination objects, and nothing in
+// it survives losing the bucket.
+func leaseBucketParam() string {
+	return fmt.Sprintf("/%s/%s/LeaseBucketName", getDeployment(), getAppName())
 }
 
 // route53ZoneIDParam: SSM path for the hosted zone DNS-01 writes into. Required

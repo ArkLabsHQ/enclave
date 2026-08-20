@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"sync"
+	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -22,13 +22,9 @@ type AttestedSigner interface {
 	Sign(body []byte) string
 }
 
-type AttestationHashes interface {
-	SetTLSKeyHash(h [sha256.Size]byte)
-	SetTLSKeyHashIfChanged(h [sha256.Size]byte) bool
-	SetTLSKeyHashSource(src func() ([sha256.Size]byte, bool))
-	SetSigningKeyHash(h [sha256.Size]byte)
-	Serialize() []byte
-}
+// TLSKeyHashFunc reports the fingerprint of the TLS leaf currently served; ok is
+// false before the first certificate is installed.
+type TLSKeyHashFunc func() (hash [sha256.Size]byte, ok bool)
 
 // AttestedSigner owns the ephemeral secp256k1 response-signing key.
 type attestedSigner struct {
@@ -73,66 +69,46 @@ type attestationDocument struct {
 	PCRs map[uint][]byte `cbor:"pcrs"`
 }
 
-// AttestationHashes is the user_data payload embedded in NSM attestation
-// documents, binding the document to the TLS cert and the response-signing key.
-// The fields are mutated (ACME renewal, signing-key registration) while
-// Serialize reads them per request, so all access is guarded by mu.
-type attestationHashes struct {
-	mu             sync.RWMutex
-	tlsKeyHash     [sha256.Size]byte
-	signingKeyHash [sha256.Size]byte
-	tlsKeyHashSrc  func() ([sha256.Size]byte, bool)
+// AttestationHashes is the user_data payload of NSM attestation documents,
+// binding them to the served TLS leaf and response-signing key. Its zero value
+// attests all-zero hashes.
+type AttestationHashes struct {
+	tlsKeyHash     atomic.Pointer[TLSKeyHashFunc]
+	signingKeyHash atomic.Pointer[[sha256.Size]byte]
 }
 
-func NewAttestationHashes() AttestationHashes {
-	return &attestationHashes{}
-}
-
-// SetTLSKeyHash records the fingerprint of the live TLS leaf cert.
-func (a *attestationHashes) SetTLSKeyHash(h [sha256.Size]byte) {
-	a.mu.Lock()
-	a.tlsKeyHash = h
-	a.mu.Unlock()
-}
-
-// SetTLSKeyHashIfChanged records h and reports whether it differed from the
-// current value. Lets the per-handshake ACME cert wrapper re-bind (and log)
-// only when autocert rotates the leaf.
-func (a *attestationHashes) SetTLSKeyHashIfChanged(h [sha256.Size]byte) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.tlsKeyHash == h {
-		return false
-	}
-	a.tlsKeyHash = h
-	return true
-}
-
-// SetTLSKeyHashSource makes the attested hash track the same atomic certificate
-// pointer used by TLS handshakes, avoiding a mismatch window during renewal.
-func (a *attestationHashes) SetTLSKeyHashSource(src func() ([sha256.Size]byte, bool)) {
-	a.mu.Lock()
-	a.tlsKeyHashSrc = src
-	a.mu.Unlock()
+// SetTLSKeyHashSource makes the attested hash track the certificate src reports,
+// so a certificate swap can never leave the two disagreeing.
+func (a *AttestationHashes) SetTLSKeyHashSource(src TLSKeyHashFunc) {
+	a.tlsKeyHash.Store(&src)
 }
 
 // SetSigningKeyHash records the response-signing key hash.
-func (a *attestationHashes) SetSigningKeyHash(h [sha256.Size]byte) {
-	a.mu.Lock()
-	a.signingKeyHash = h
-	a.mu.Unlock()
+func (a *AttestationHashes) SetSigningKeyHash(h [sha256.Size]byte) {
+	a.signingKeyHash.Store(&h)
 }
 
 // Serialize returns user_data: sha256:<tls>;sha256:<signing>, with raw hash bytes.
-func (a *attestationHashes) Serialize() []byte {
-	a.mu.RLock()
-	tlsHash, signing, src := a.tlsKeyHash, a.signingKeyHash, a.tlsKeyHashSrc
-	a.mu.RUnlock()
-	if src != nil {
-		if live, ok := src(); ok {
+func (a *AttestationHashes) Serialize() []byte {
+	var tlsHash, signingHash [sha256.Size]byte
+	if src := a.tlsKeyHash.Load(); src != nil {
+		if live, ok := (*src)(); ok {
 			tlsHash = live
 		}
 	}
-	return []byte(fmt.Sprintf("%s%s%s%s%s",
-		hashPrefix, tlsHash, hashSeparator, hashPrefix, signing))
+	if signing := a.signingKeyHash.Load(); signing != nil {
+		signingHash = *signing
+	}
+
+	payload := make([]byte, 0, 2*len(hashPrefix)+len(hashSeparator)+2*sha256.Size)
+	payload = append(payload, hashPrefix...)
+	payload = append(payload, tlsHash[:]...)
+	payload = append(payload, hashSeparator...)
+	payload = append(payload, hashPrefix...)
+	return append(payload, signingHash[:]...)
+}
+
+// staticKeyHash is the source for a certificate that never changes.
+func staticKeyHash(h [sha256.Size]byte) TLSKeyHashFunc {
+	return func() ([sha256.Size]byte, bool) { return h, true }
 }

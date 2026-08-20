@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"maps"
 	"strings"
 	"testing"
@@ -53,10 +52,11 @@ func TestLoadUnverifiedState(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		params  map[string]string
-		want    bootMode
-		wantErr string
+		name         string
+		params       map[string]string
+		previousPCR0 string
+		want         bootMode
+		wantErr      string
 	}{
 		{
 			name:   "genesis clean",
@@ -90,15 +90,17 @@ func TestLoadUnverifiedState(t *testing.T) {
 		{
 			name:    "without receipt fails",
 			params:  withKey(map[string]string{}),
-			wantErr: "hasMigrationArtifacts = false",
+			wantErr: "no predecessor to migrate from",
 		},
 		{
-			name:   "migration with transition receipt",
-			params: withMigration(withKey(map[string]string{})),
-			want:   &migrationBoot{},
+			name:         "migration with transition receipt",
+			params:       withMigration(withKey(map[string]string{})),
+			previousPCR0: prevPCR0,
+			want:         &migrationBoot{},
 		},
 		{
-			name: "foreign receipt selects migration",
+			name:         "foreign receipt selects migration",
+			previousPCR0: prevPCR0,
 			params: func() map[string]string {
 				params := withMigration(withKey(map[string]string{}))
 				params[stateOriginReceiptParam(keyID, strings.Repeat("cd", 48))] = "foreign"
@@ -107,27 +109,40 @@ func TestLoadUnverifiedState(t *testing.T) {
 			want: &migrationBoot{},
 		},
 		{
-			name:   "exact receipt takes precedence over transition",
-			params: withReceipt(withMigration(withKey(map[string]string{}))),
-			want:   &resumeBoot{},
+			name:         "exact receipt takes precedence over transition",
+			params:       withReceipt(withMigration(withKey(map[string]string{}))),
+			previousPCR0: prevPCR0,
+			want:         &resumeBoot{},
 		},
 		{
-			name: "migration artifacts without transition receipt fail",
+			name:         "migration artifacts without transition receipt fail",
+			previousPCR0: prevPCR0,
 			params: withKey(func() map[string]string {
 				params := map[string]string{}
 				params[migrationPreviousPCR0Param()] = prevPCR0
 				params[migrationPreviousPCR0AttestationParam()] = "attestation"
 				return params
 			}()),
-			wantErr: "hasMigrationArtifacts = true",
+			wantErr: "no migration transition receipt",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.previousPCR0 != "" {
+				t.Setenv("ENCLAVE_PREVIOUS_PCR0", tc.previousPCR0)
+			}
 			_, ssm := stateOriginTestSSM(tc.params)
-			boot := &Boot{ssm: ssm, pcr0: currentPCR0}
-			planned, err := boot.plan(ctx)
+			boot := &Boot{
+				nsm: fakePredecessorNSM{
+					NSM: &nsmW{nsm: &fakeNSM{
+						verifyErr: errors.New("unexpected attestation verification"),
+					}},
+					doc: "attestation",
+				},
+				ssm: ssm, pcr0: currentPCR0,
+			}
+			planned, err := boot.Plan(ctx)
 
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
@@ -169,7 +184,7 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 	att := signedReceipt(t, map[uint][]byte{0: pcr0}, purposeStateOrigin, stateRoot)
 	verifier := NewNSM(WithAttestationRoots(att.roots))
 
-	require.NoError(t, verifyStateOriginReceipt(
+	require.NoError(t, verifyStateReceipt(
 		verifier,
 		att.docB64,
 		purposeStateOrigin,
@@ -218,7 +233,7 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := verifyStateOriginReceipt(verifier, tc.receipt, tc.purpose, tc.root, tc.expected)
+			err := verifyStateReceipt(verifier, tc.receipt, tc.purpose, tc.root, tc.expected)
 			require.Error(t, err)
 		})
 	}
@@ -237,7 +252,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	}, purposeMigrationTransition, stateRoot)
 	verifier := NewNSM(WithAttestationRoots(att.roots))
 
-	err := verifyStateOriginReceipt(
+	err := verifyStateReceipt(
 		verifier,
 		att.docB64,
 		purposeMigrationTransition,
@@ -249,7 +264,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = verifyStateOriginReceipt(
+	err = verifyStateReceipt(
 		verifier,
 		att.docB64,
 		purposeMigrationTransition,
@@ -291,20 +306,17 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	kms := &stateOriginTestKMS{keyID: keyID}
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
 	fake.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
 		bytes.Repeat([]byte{0xdd}, 32),
 	)
 
-	established, err := runBootPlan(
-		ctx,
-		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
-		kms,
-		ssm,
-		planned,
-	)
+	established, err := (&Boot{
+		nsm: &nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
+		ssm: ssm,
+	}).establish(ctx, planned, kms)
 
 	require.NoError(t, err)
 	require.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, established.dek.(*dek).key)
@@ -322,7 +334,7 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = "receipt"
 	fake, ssm := stateOriginTestSSM(params)
 
-	_, err := (&Boot{ssm: ssm, pcr0: pcr0}).plan(ctx)
+	_, err := (&Boot{ssm: ssm, pcr0: pcr0}).Plan(ctx)
 
 	require.Error(t, err)
 	_, exists := fake.params[secretCiphertextParam("alpha", keyID)]
@@ -339,15 +351,11 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session}}
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
 
-	established, err := runBootPlan(
-		ctx,
-		nsm,
-		&stateOriginTestKMS{keyID: keyID},
-		ssm,
-		planned,
+	established, err := (&Boot{nsm: nsm, ssm: ssm}).establish(
+		ctx, planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
 	require.NoError(t, err)
@@ -356,7 +364,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	require.Equal(t, stateOriginTestMigrationIntentBucket, established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))]
-	require.NoError(t, verifyStateOriginReceipt(
+	require.NoError(t, verifyStateReceipt(
 		NewNSM(WithAttestationRoots(session.attestationRoots)),
 		written,
 		purposeStateOrigin,
@@ -381,15 +389,11 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	}
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	boot := &Boot{ssm: ssm, pcr0: pcr0}
-	planned, err := boot.plan(context.Background())
+	planned, err := boot.Plan(context.Background())
 	require.NoError(t, err)
 
-	_, err = runBootPlan(
-		context.Background(),
-		&nsmW{nsm: &fakeNSM{session: session}},
-		&stateOriginTestKMS{keyID: keyID},
-		ssm,
-		planned,
+	_, err = (&Boot{nsm: &nsmW{nsm: &fakeNSM{session: session}}, ssm: ssm}).establish(
+		context.Background(), planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
 	require.Error(t, err)
@@ -425,20 +429,17 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))] = att.docB64
 			fake.params[tc.param] = tc.value
 			boot := &Boot{ssm: ssm, pcr0: pcr0}
-			planned, err := boot.plan(ctx)
+			planned, err := boot.Plan(ctx)
 			require.NoError(t, err)
 			kms := &stateOriginTestKMS{keyID: keyID}
 
-			_, err = runBootPlan(
-				ctx,
-				&nsmW{nsm: &fakeNSM{
+			_, err = (&Boot{
+				nsm: &nsmW{nsm: &fakeNSM{
 					session:     newStatefulNSMSession(t, map[uint][]byte{0: pcr0}),
 					verifyRoots: att.roots,
 				}},
-				kms,
-				ssm,
-				planned,
-			)
+				ssm: ssm,
+			}).establish(ctx, planned, kms)
 
 			require.ErrorContains(t, err, "invalid state-origin receipt")
 			require.Empty(t, kms.decryptCalls)
@@ -455,6 +456,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
 	wrongPCR0 := bytes.Repeat([]byte{0x77}, 48)
 	failedTargetPCR0 := bytes.Repeat([]byte{0x33}, 48)
+	t.Setenv("ENCLAVE_PREVIOUS_PCR0", hex.EncodeToString(prevPCR0))
 
 	run := func(t *testing.T, prevPCR0Hex string, verifiedPCRs map[uint][]byte) (*fakeSSM, []byte, *x509.CertPool, error) {
 		t.Helper()
@@ -475,16 +477,15 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 				receiptPayload(t, purposeMigrationTransition, root),
 			),
 		}}
-		boot := &Boot{ssm: ssm, pcr0: ownPCR0}
-		planned, err := boot.plan(ctx)
+		boot := &Boot{
+			nsm: fakePredecessorNSM{NSM: nsm, doc: "previous-attestation"},
+			ssm: ssm, pcr0: ownPCR0,
+		}
+		planned, err := boot.Plan(ctx)
 		require.NoError(t, err)
 
-		_, err = runBootPlan(
-			ctx,
-			nsm,
-			&stateOriginTestKMS{keyID: keyID},
-			ssm,
-			planned,
+		_, err = (&Boot{nsm: nsm, ssm: ssm}).establish(
+			ctx, planned, &stateOriginTestKMS{keyID: keyID},
 		)
 		return fake, root, stateReceipt.roots, err
 	}
@@ -495,7 +496,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(ownPCR0),
 		})
 		require.NoError(t, err)
-		require.NoError(t, verifyStateOriginReceipt(
+		require.NoError(t, verifyStateReceipt(
 			NewNSM(WithAttestationRoots(roots)),
 			fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(ownPCR0))],
 			purposeStateOrigin,
@@ -540,6 +541,7 @@ func setStateOriginTestEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
 		{"name":"alpha","env_var":"ALPHA"},
 		{"name":"beta","env_var":"BETA"}
@@ -661,7 +663,7 @@ func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	ssmf, ssm := stateOriginTestSSM(map[string]string{
-		storageBucketParam(): "genesis-storage",
+		leaseBucketParam(): "genesis-leases",
 	})
 	return &genesisFixture{
 		nsm:  &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
@@ -678,11 +680,11 @@ func (f *genesisFixture) establish(ctx context.Context) (bootResult, error) {
 	if err != nil {
 		return bootResult{}, err
 	}
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	if err != nil {
 		return bootResult{}, err
 	}
-	return boot.finalise(ctx, planned)
+	return boot.Finalise(ctx, planned)
 }
 
 // A live peer lease must stop genesis before any KMS key is minted
@@ -758,7 +760,7 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, lease, "a committed genesis needs no lease")
 
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
 	require.IsType(t, &resumeBoot{}, planned.mode, "a peer's committed genesis leaves us resuming")
 }
@@ -805,7 +807,7 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lease, "a lapsed lock must be reclaimable")
 
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
 	require.IsType(t, &genesisBoot{}, planned.mode, "holding the lease means genesis is still ours to do")
 	require.NoError(t, lease.Release(context.Background()))
@@ -836,7 +838,7 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
-	bucket, err := fx.ssm.MustGet(ctx, storageBucketParam())
+	bucket, err := fx.ssm.MustGet(ctx, leaseBucketParam())
 	require.NoError(t, err)
 	lease, err := AcquireLease(ctx, fx.s3f, bucket, genesisLeaseName, leaseTTL)
 	require.NoError(t, err)
@@ -845,76 +847,38 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
 
 	boot := &Boot{ssm: fx.ssm, pcr0: pcr0}
-	planned, err := boot.plan(ctx)
+	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
 	genesis, ok := planned.mode.(*genesisBoot)
 	require.True(t, ok, "an uncommitted deployment must plan a genesis boot")
 	genesis.lease = lease
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 
-	_, err = runBootPlan(
-		ctx,
-		&nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
-		&stateOriginTestKMS{keyID: "key-zombie"},
-		fx.ssm,
-		planned,
-	)
+	_, err = (&Boot{
+		nsm: &nsmW{nsm: &fakeNSM{
+			session:     session,
+			verifyRoots: session.attestationSign.roots,
+		}},
+		ssm: fx.ssm,
+	}).establish(ctx, planned, &stateOriginTestKMS{keyID: "key-zombie"})
 
 	require.ErrorContains(t, err, "refusing to commit genesis")
 	require.ErrorIs(t, err, ErrLeaseLost)
 	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()], "KMSKeyID must not be committed")
 }
 
-// runBootPlan mirrors Boot.finalise from the point the fleet key is known, so
-// plan behaviour is testable without STS/KMS bootstrap fakes. Keep it in step
-// with finalise — in particular, nothing decrypts before verifySnapshot passes.
-func runBootPlan(
-	ctx context.Context,
-	nsm NSM,
-	kms PrimaryKMS,
-	ssm SSM,
-	planned *plannedBoot,
-) (bootResult, error) {
-	state := &planned.state
-	snapshot, err := planned.mode.buildSnapshot(ctx, state, kms, ssm)
-	if err != nil {
-		return bootResult{}, err
+// fakePredecessorNSM answers the predecessor attestation check, which the tests
+// using it are not about, and delegates every other document.
+type fakePredecessorNSM struct {
+	NSM
+	doc string
+}
+
+func (n fakePredecessorNSM) VerifyAttestation(
+	doc string, pcrs map[uint]string, userData []byte,
+) error {
+	if doc == n.doc {
+		return nil
 	}
-	snapshotRoot, err := stateRoot(snapshot)
-	if err != nil {
-		return bootResult{}, err
-	}
-	if err := planned.mode.verifySnapshot(state, nsm, snapshotRoot); err != nil {
-		return bootResult{}, err
-	}
-	if kms.KeyID() != snapshot.kmsKeyID {
-		return bootResult{}, fmt.Errorf(
-			"state KMS key ID %q does not match active KMS key ID %q",
-			snapshot.kmsKeyID, kms.KeyID(),
-		)
-	}
-	dekPlaintext, err := kms.Decrypt(ctx, snapshot.storageDEK)
-	if err != nil {
-		return bootResult{}, err
-	}
-	secrets := make([]StaticSecret, 0, len(state.metadata))
-	for _, meta := range state.metadata {
-		plaintext, err := kms.Decrypt(ctx, snapshot.staticSecrets[meta])
-		if err != nil {
-			return bootResult{}, err
-		}
-		secrets = append(secrets, StaticSecret{
-			StaticSecretMetadata: meta,
-			Plaintext:            hex.EncodeToString(plaintext),
-		})
-	}
-	if err := planned.mode.commitSnapshot(ctx, state, nsm, ssm, kms, snapshotRoot); err != nil {
-		return bootResult{}, err
-	}
-	return bootResult{
-		kms:                       kms,
-		dek:                       &dek{key: dekPlaintext},
-		secrets:                   secrets,
-		migrationIntentBucketName: snapshot.migrationIntentBucketName,
-	}, nil
+	return n.NSM.VerifyAttestation(doc, pcrs, userData)
 }

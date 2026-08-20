@@ -193,8 +193,7 @@ func (l *Lease) heartbeat() {
 // holds it. Runs before the heartbeat starts, so it writes the fields directly.
 func (l *Lease) claim(ctx context.Context) (bool, error) {
 	for attempt := 0; attempt <= leaseConflictRetries; attempt++ {
-		// Uncontended: succeeds only if the object is absent.
-		l.setGuard("")
+		l.setEmptyGuard()
 		guard, expiresAt, err := l.put(ctx)
 		switch {
 		case err == nil:
@@ -251,9 +250,10 @@ func (l *Lease) insertCondition(in *s3.PutObjectInput) {
 	in.IfNoneMatch = aws.String("*")
 }
 
-// expect records the version the next put must find. Set before every claim
-// attempt: a failed steal would otherwise leave a peer's guard behind and turn
-// the next iteration's create-only write into a conditional overwrite.
+// setEmptyGuard makes the next put create-only.
+func (l *Lease) setEmptyGuard() { l.setGuard("") }
+
+// setGuard records the version the next put must find.
 func (l *Lease) setGuard(guard string) {
 	l.mu.Lock()
 	l.guard = guard

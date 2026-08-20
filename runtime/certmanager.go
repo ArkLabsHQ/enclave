@@ -42,12 +42,12 @@ type certIssuer interface {
 
 // certManager serves the shared certificate and keeps it fresh.
 type certManager struct {
-	store  *certStore
-	issuer certIssuer
-	s3     S3API
-	bucket string
-	fqdn   string
-	hashes AttestationHashes
+	store       *certStore
+	issuer      certIssuer
+	s3          S3API
+	leaseBucket string
+	fqdn        string
+	hashes      *AttestationHashes
 
 	currentCert atomic.Pointer[certBundle]
 }
@@ -57,16 +57,16 @@ func newCertManager(
 	store *certStore,
 	issuer certIssuer,
 	s3api S3API,
-	bucket, fqdn string,
-	hashes AttestationHashes,
+	leaseBucket, fqdn string,
+	hashes *AttestationHashes,
 ) (*certManager, error) {
 	m := &certManager{
-		store:  store,
-		issuer: issuer,
-		s3:     s3api,
-		bucket: bucket,
-		fqdn:   fqdn,
-		hashes: hashes,
+		store:       store,
+		issuer:      issuer,
+		s3:          s3api,
+		leaseBucket: leaseBucket,
+		fqdn:        fqdn,
+		hashes:      hashes,
 	}
 
 	bundle, err := m.resolve(ctx)
@@ -92,7 +92,7 @@ func (m *certManager) resolve(ctx context.Context) (*certBundle, error) {
 
 	// Prevents duplicate issuance if multiple enclaves start up at once.
 	slog.Info("no shared certificate found, issuing", "fqdn", m.fqdn)
-	lease, err := AcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
+	lease, err := AcquireLease(ctx, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
 	if err != nil {
 		return nil, fmt.Errorf("acquire renewal lease for first issuance: %w", err)
 	}
@@ -123,7 +123,6 @@ func (m *certManager) Run(ctx context.Context) {
 	}
 }
 
-// GetCertificate serves the installed bundle. It never issues.
 func (m *certManager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return m.currentCert.Load().cert, nil
 }
@@ -161,7 +160,7 @@ func (m *certManager) tick(ctx context.Context) error {
 
 // renewUnderLease renews only if this enclave wins the lease;
 func (m *certManager) renewUnderLease(ctx context.Context, certETag string) (*certBundle, error) {
-	lease, err := TryAcquireLease(ctx, m.s3, m.bucket, certLeaseName, leaseTTL)
+	lease, err := TryAcquireLease(ctx, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
 	if err != nil {
 		return nil, fmt.Errorf("acquire renewal lease: %w", err)
 	}
@@ -187,20 +186,16 @@ func (m *certManager) renew(ctx context.Context, certETag string) (*certBundle, 
 	if err != nil {
 		if errors.Is(err, errCertChanged) {
 			slog.Info("peer renewed the certificate first, adopting theirs")
-			return m.adoptPeerCert(ctx)
+			bundle, err := m.store.LoadCert(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if bundle == nil {
+				return nil, errors.New("certificate vanished after a conflicting write")
+			}
+			return bundle, nil
 		}
 		return nil, err
-	}
-	return bundle, nil
-}
-
-func (m *certManager) adoptPeerCert(ctx context.Context) (*certBundle, error) {
-	bundle, err := m.store.LoadCert(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if bundle == nil {
-		return nil, errors.New("certificate vanished after a conflicting write")
 	}
 	return bundle, nil
 }

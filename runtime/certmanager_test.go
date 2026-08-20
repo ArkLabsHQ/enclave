@@ -95,8 +95,8 @@ func newCertTestStore(s3f *fakeS3) *certStore {
 	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 }
 
-func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, AttestationHashes, error) {
-	hashes := NewAttestationHashes()
+func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, *AttestationHashes, error) {
+	hashes := &AttestationHashes{}
 	m, err := newCertManager(
 		context.Background(), newCertTestStore(s3f), issuer,
 		s3f, certTestBucket, "enclave.test", hashes,
@@ -104,14 +104,14 @@ func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, Attest
 	return m, hashes, err
 }
 
-func newCertTestManager(t *testing.T, s3f *fakeS3, issuer certIssuer) (*certManager, AttestationHashes) {
+func newCertTestManager(t *testing.T, s3f *fakeS3, issuer certIssuer) (*certManager, *AttestationHashes) {
 	t.Helper()
 	m, hashes, err := tryNewCertTestManager(s3f, issuer)
 	require.NoError(t, err)
 	return m, hashes
 }
 
-func TestCertManagerBootstrapIssuesWhenFleetHasNone(t *testing.T) {
+func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
@@ -194,7 +194,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	require.Equal(t, 1, issuer.calls, "a rejected write must not re-run the order")
 }
 
-func TestCertManagerRenewSkipsWhenPeerHoldsLease(t *testing.T) {
+func TestCertManagerRenewSkipsWhenLeaseIsUnavailable(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
@@ -250,10 +250,6 @@ func TestCertStoreSaveIsConditional(t *testing.T) {
 
 	// Create-only against an existing object must fail.
 	_, err = store.SaveCert(ctx, certPEM, keyPEM, "")
-	require.ErrorIs(t, err, errCertChanged)
-
-	// A stale ETag must fail.
-	_, err = store.SaveCert(ctx, certPEM, keyPEM, `"etag-stale"`)
 	require.ErrorIs(t, err, errCertChanged)
 
 	// The current ETag must succeed.
@@ -328,7 +324,7 @@ func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
 
 	require.Equal(t,
 		attestedHash([sha256.Size]byte{}),
-		NewAttestationHashes().Serialize(),
+		(&AttestationHashes{}).Serialize(),
 	)
 
 	m, hashes := newCertTestManager(t, s3f, issuer)

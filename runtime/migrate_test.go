@@ -16,26 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestVerifyPredecessorCommitment_Genesis(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
-
-	t.Run("no predecessor", func(t *testing.T) {
-		err := verifyPredecessorCommitment(nil, &bootState{})
-		require.NoError(t, err)
-	})
-
-	t.Run("rejects predecessor", func(t *testing.T) {
-		errs := verifyPredecessorCommitment(nil, &bootState{
-			predecessorPCR0:        "abc123",
-			predecessorAttestation: "attestation",
-		})
-		require.Error(t, errs)
-	})
-}
-
-func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
+func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 	prevPCR0Bytes := bytes.Repeat([]byte{0xab}, 48)
 	currentPCR0Bytes := bytes.Repeat([]byte{0xcd}, 48)
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
@@ -45,31 +26,38 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", prevPCR0)
 
-	t.Run("missing previous PCR0", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			&bootState{currentPCR0: currentPCR0Bytes},
-		)
+	t.Run("SSM predecessor must match the PCR0 baked into the EIF", func(t *testing.T) {
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, nil))
+
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			currentPCR0:            currentPCR0Bytes,
+			predecessorPCR0:        strings.Repeat("0", 96),
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
 		require.Error(t, err)
 	})
 
-	t.Run("mismatched previous PCR0", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			&bootState{
-				currentPCR0:            currentPCR0Bytes,
-				predecessorPCR0:        strings.Repeat("0", 96),
-				predecessorAttestation: attestation,
-			},
-		)
-		require.Error(t, err)
-	})
+	t.Run("attested PCR0 must match the claimed predecessor", func(t *testing.T) {
+		claimedPCR0Bytes := bytes.Repeat([]byte{0xef}, 48)
+		claimedPCR0 := hex.EncodeToString(claimedPCR0Bytes)
+		t.Setenv("ENCLAVE_PREVIOUS_PCR0", claimedPCR0)
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, nil))
 
-	t.Run("requires attestation", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			&bootState{currentPCR0: currentPCR0Bytes, predecessorPCR0: prevPCR0},
-		)
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			currentPCR0:            currentPCR0Bytes,
+			predecessorPCR0:        claimedPCR0,
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
 		require.Error(t, err)
 	})
 
@@ -79,10 +67,11 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, &bootState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        prevPCR0,
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.Error(t, err)
@@ -94,10 +83,11 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, &bootState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        strings.ToUpper(prevPCR0),
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.NoError(t, err)
@@ -113,10 +103,11 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, &bootState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
 			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.NoError(t, err)
@@ -374,9 +365,9 @@ func TestCompleteMigration(t *testing.T) {
 		}}
 		newBoot, err := NewBoot(newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
-		newBootPlan, err := newBoot.plan(ctx)
+		newBootPlan, err := newBoot.Plan(ctx)
 		require.NoError(t, err)
-		established, err := newBoot.finalise(ctx, newBootPlan)
+		established, err := newBoot.Finalise(ctx, newBootPlan)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
@@ -390,9 +381,9 @@ func TestCompleteMigration(t *testing.T) {
 		}}
 		oldBoot, err := NewBoot(oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
-		oldBootPlan, err := oldBoot.plan(ctx)
+		oldBootPlan, err := oldBoot.Plan(ctx)
 		require.NoError(t, err)
-		_, err = oldBoot.finalise(ctx, oldBootPlan)
+		_, err = oldBoot.Finalise(ctx, oldBootPlan)
 		require.NoError(t, err)
 		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])

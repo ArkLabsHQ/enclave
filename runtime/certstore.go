@@ -47,9 +47,6 @@ type certStore struct {
 	fqdn   string
 }
 
-// acmeStoragePrefix namespaces certificate material in the app storage bucket.
-// The layout predates DNS-01 and is kept so existing deployments keep their
-// certificate rather than re-issuing on upgrade.
 const acmeStoragePrefix = "data/acme/"
 
 func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
@@ -131,10 +128,6 @@ func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, 
 		return parseECKey(pemBytes)
 	}
 	return key, nil
-}
-
-func objectKeyFor(name string) string {
-	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
 }
 
 func (c *certStore) certObjectKey() string {
@@ -239,4 +232,8 @@ func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 		notAfter: leaf.NotAfter,
 		leafHash: sha256.Sum256(cert.Certificate[0]),
 	}, nil
+}
+
+func objectKeyFor(name string) string {
+	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
 }

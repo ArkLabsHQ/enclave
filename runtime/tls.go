@@ -62,7 +62,7 @@ func ConfigureTLS(
 	dek DEK,
 	ssm SSM,
 	r53 Route53API,
-	hashes AttestationHashes,
+	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load TLS SSM overrides: %w", err)
@@ -102,14 +102,18 @@ func configureDNS01Cert(
 	ssm SSM,
 	r53 Route53API,
 	zoneID string,
-	hashes AttestationHashes,
+	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	bucket, err := ssm.MustGet(ctx, storageBucketParam())
+	certBucket, err := ssm.MustGet(ctx, certBucketParam())
 	if err != nil {
-		return nil, fmt.Errorf("failed to read storage bucket name: %w", err)
+		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
+	}
+	leaseBucket, err := ssm.MustGet(ctx, leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}
 
-	store := newCertStore(s3, dek, bucket, cfg.FQDN)
+	store := newCertStore(s3, dek, certBucket, cfg.FQDN)
 
 	accountKey, err := store.LoadOrCreateAccountKey(ctx)
 	if err != nil {
@@ -131,7 +135,7 @@ func configureDNS01Cert(
 
 	manager, err := newCertManager(
 		ctx, store, issuer,
-		s3, bucket, cfg.FQDN, hashes,
+		s3, leaseBucket, cfg.FQDN, hashes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
@@ -188,7 +192,7 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 
 // configureSelfSignedCert generates an ECDSA-P256 leaf cert, records its fingerprint
 // in the attestation hashes so clients can pin it against the NSM document
-func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCallback, error) {
+func configureSelfSignedCert(cfg *Config, hashes *AttestationHashes) (TLSCertCallback, error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate cert key: %w", err)
@@ -248,7 +252,7 @@ func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCall
 	if err != nil {
 		return nil, err
 	}
-	hashes.SetTLSKeyHash(h)
+	hashes.SetTLSKeyHashSource(staticKeyHash(h))
 
 	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {

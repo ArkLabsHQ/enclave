@@ -325,7 +325,7 @@ func TestAttestationMiddleware(t *testing.T) {
 func TestAttestationHandler(t *testing.T) {
 	t.Run("missing nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -335,7 +335,7 @@ func TestAttestationHandler(t *testing.T) {
 
 	t.Run("bad nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce=not-hex", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -346,10 +346,10 @@ func TestAttestationHandler(t *testing.T) {
 	t.Run("returns document bound to nonce and user data", func(t *testing.T) {
 		doc := []byte("attestation document")
 		session := &fakeNSMSession{responses: []response.Response{attestationDocumentResponse(doc)}}
-		hashes := NewAttestationHashes()
+		hashes := &AttestationHashes{}
 		tlsHash := sha256.Sum256([]byte("tls"))
 		signingHash := sha256.Sum256([]byte("signing"))
-		hashes.SetTLSKeyHash(tlsHash)
+		hashes.SetTLSKeyHashSource(staticKeyHash(tlsHash))
 		hashes.SetSigningKeyHash(signingHash)
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 

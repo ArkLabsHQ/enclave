@@ -71,7 +71,6 @@
             pkgs
             system
             self
-            aws-nitro-util
             ;
         }
       );

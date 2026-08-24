@@ -7,7 +7,6 @@
   app,
   env,
   extraPackages ? [ ],
-  init ? null,
 }:
 let
   lib = pkgs.lib;
@@ -20,27 +19,24 @@ let
   version = "${app.version}-${runtime.version}";
   nitro = aws-nitro-util.lib.${system};
 in
-nitro.buildEif (
-  {
-    name = "${appName}-enclave-${version}";
-    inherit version arch;
-    kernel = nitro.blobs.${arch}.kernel;
-    kernelConfig = nitro.blobs.${arch}.kernelConfig;
-    nsmKo = nitro.blobs.${arch}.nsmKo;
-    copyToRoot = pkgs.buildEnv {
-      name = "${appName}-enclave-rootfs";
-      paths = [
-        pkgs.cacert
-      ] ++ extraPackages;
-      pathsToLink = [ "/" ];
-      postBuild = ''
-        mkdir -p $out/app
-        cp ${appExe} $out/app/${appBinaryName}
-        cp ${runtime}/bin/runtime $out/app/runtime
-      '';
-    };
-    entrypoint = "/app/runtime";
-    env = lib.generators.toKeyValue { } (env // { APP_BINARY_NAME = appBinaryName; });
-  }
-  // lib.optionalAttrs (init != null) { inherit init; }
-)
+nitro.buildEif ({
+  name = "${appName}-enclave-${version}";
+  inherit version arch;
+  kernel = nitro.blobs.${arch}.kernel;
+  kernelConfig = nitro.blobs.${arch}.kernelConfig;
+  nsmKo = nitro.blobs.${arch}.nsmKo;
+  copyToRoot = pkgs.buildEnv {
+    name = "${appName}-enclave-rootfs";
+    paths = [
+      pkgs.cacert
+    ] ++ extraPackages;
+    pathsToLink = [ "/" ];
+    postBuild = ''
+      mkdir -p $out/app
+      cp ${appExe} $out/app/${appBinaryName}
+      cp ${runtime}/bin/runtime $out/app/runtime
+    '';
+  };
+  entrypoint = "/app/runtime";
+  env = lib.generators.toKeyValue { } (env // { APP_BINARY_NAME = appBinaryName; });
+})

@@ -2,7 +2,6 @@
   pkgs,
   system,
   self,
-  aws-nitro-util,
 }:
 let
   testApp = import ./test-app.nix { inherit pkgs; };
@@ -119,7 +118,6 @@ in
     inherit
       pkgs
       self
-      aws-nitro-util
       enclaveTofu
       testApp
       commonEifEnv

@@ -1,7 +1,6 @@
 {
   pkgs,
   self,
-  aws-nitro-util,
   enclaveTofu,
   testApp,
   commonEifEnv,
@@ -9,29 +8,12 @@
 }:
 let
   lib = pkgs.lib;
-  system = pkgs.stdenv.hostPlatform.system;
-
-  eifInit = aws-nitro-util.packages.${system}.eif-init.overrideAttrs (oldAttrs: {
-    patches = (oldAttrs.patches or [ ]) ++ [ ./patches/aws-nitro-util-init-wait.patch ];
-  });
-
-  vhostDeviceVsock = pkgs.vhost-device-vsock.overrideAttrs (oldAttrs: {
-    # https://github.com/rust-vmm/vhost-device/issues/963
-    patches = (oldAttrs.patches or [ ]) ++ [ ./patches/vhost-device-vsock-forward-listen.patch ];
-    # This upstream test hard-codes host-vsock port 9000, which may be in use
-    # by another NixOS test on a shared builder.
-    checkFlags = (oldAttrs.checkFlags or [ ]) ++ [
-      "--skip"
-      "tests::test_vsock_server_vsock"
-    ];
-  });
 
   mkEif =
     env:
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
-      init = "${eifInit}/bin/init";
       env = commonEifEnv // { ENCLAVE_DEV = "true"; } // env;
     };
 
@@ -62,8 +44,7 @@ let
         (self.lib.mkEnclaveQemuAmi {
           inherit eif;
           memoryMib = 2048;
-          cpuCount = 1;
-          inherit vhostDeviceVsock;
+          cpuCount = 2;
         })
       ];
 
@@ -111,7 +92,7 @@ pkgs.testers.runNixOSTest {
       { pkgs, nodes, ... }:
       {
         virtualisation.memorySize = 2048;
-        virtualisation.cores = 1;
+        virtualisation.cores = 2;
 
         environment.systemPackages = [
           pkgs.awscli2

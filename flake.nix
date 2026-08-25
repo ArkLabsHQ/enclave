@@ -44,7 +44,7 @@
               runtime = pkgs.buildGoModule (finalAttrs: {
                 pname = "runtime";
                 version = "0.1.0";
-                src = ../runtime;
+                src = ./runtime;
                 subPackages = [ "cmd/runtime" ];
                 vendorHash = "sha256-8bNEo1h22hmnzttU49QzHQslt/WnrDqTf1LRgwd1eN4=";
                 env.CGO_ENABLED = "0";
@@ -65,7 +65,7 @@
                 cli = pkgs.buildGoModule (finalAttrs: {
                   pname = "enclave-cli";
                   version = "0.1.0";
-                  src = ../.;
+                  src = ./.;
                   subPackages = [ "cmd/enclave" ];
                   vendorHash = "sha256-/LPCpvpa1869AaFWPQAZNOmdIFPe8ZoQqLHwPXcifcA=";
                   env.GOWORK = "off";

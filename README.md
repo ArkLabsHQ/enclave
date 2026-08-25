@@ -11,8 +11,7 @@ the runtime and client CLI, provides a  development shell, and includes NixOS te
 that exercise the runtime against an AWS emulator under nested KVM.
 
 The runtime, enclave images, and checks support `x86_64-linux`. The CLI and
-development shell additionally support `aarch64-linux`, `aarch64-darwin`, and
-`x86_64-darwin`.
+development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 
 ## Contents
 

@@ -108,11 +108,6 @@
         }
       );
 
-      templates.default = {
-        path = ./nix/template;
-        description = "Downstream App Template";
-      };
-
       lib = {
         buildEif = import ./nix/build-eif.nix { inherit self aws-nitro-util; };
       };

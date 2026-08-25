@@ -7,9 +7,8 @@ endpoint, and implements a blue/green migration protocol that transfers that
 state to a successor enclave with a different measurement.
 
 The repository exports `lib.buildEif` for constructing enclave images, packages
-the runtime and client CLI, provides a downstream application template and
-development shell, and includes NixOS tests that exercise the runtime against an
-AWS emulator under nested KVM.
+the runtime and client CLI, provides a  development shell, and includes NixOS tests
+that exercise the runtime against an AWS emulator under nested KVM.
 
 Supported systems for the runtime, enclave images, and checks are `x86_64-linux`
 and `aarch64-linux`. The CLI and client library additionally build on
@@ -36,7 +35,7 @@ and `aarch64-linux`. The CLI and client library additionally build on
 | `runtime/` | The Go runtime that runs as PID 1 inside the enclave. Separate Go module, `github.com/ArkLabsHQ/enclave/runtime`. |
 | `client/` | Go client library for attestation-verified requests. Part of the root module. |
 | `cmd/enclave/` | The `enclave` CLI. |
-| `nix/` | `buildEif`, runtime and CLI packaging, the downstream template, and the development shell. |
+| `nix/` | `buildEif` function |
 | `nix/tests/` | EIF construction and full blue/green runtime checks. |
 
 ## Quickstart
@@ -212,18 +211,6 @@ The flake also exposes these packages:
 
 For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
 `nix build github:ArkLabsHQ/enclave#runtime` builds the standalone runtime.
-
-### Application template
-
-Initialize a downstream Go application flake with:
-
-```sh
-nix flake init -t github:ArkLabsHQ/enclave
-```
-
-The template packages the application and defines development and production
-EIF outputs using `buildEif`. Replace its placeholders, pin the enclave input,
-and set the application's vendor hash before building.
 
 ### Development shell
 

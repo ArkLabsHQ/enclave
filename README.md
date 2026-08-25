@@ -228,8 +228,9 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_DEPLOYMENT` | `dev` | First SSM path segment. The value `dev` disables COSE signature verification of attestation documents. See [Security notes](#security-notes). |
-| `ENCLAVE_APP_NAME` | `app` | Second SSM path segment. |
+| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
+| `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
+| `ENCLAVE_DEV` | `false` | When `true`, disables COSE signature and certificate chain verification of attestation documents and shortens the clock-sync poll interval from five minutes to five seconds. For local testing against emulated NSM only. See [Security notes](#security-notes). |
 | `ENCLAVE_PREVIOUS_PCR0` | none | Required. Either the literal `genesis`, or the predecessor's PCR0 when adopting migrated state. Unset fails the boot. |
 | `ENCLAVE_KMS_KEY_LOCKED` | `false` | When `true`, the KMS key policy omits the root recovery principal and the SSM namespace segment becomes `locked` instead of `unlocked`. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
@@ -262,6 +263,7 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `ENCLAVE_VERIFY_CLOCK_SOURCE` | `false` | When `true`, fails the boot unless the system clock source is `kvm-clock`. |
 
 The runtime hard-steps the clock onto the PTP hardware clock at startup, then
 runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
@@ -319,11 +321,12 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Seven names are refused, because they define the enclave's identity or security
+Nine names are refused, because they define the enclave's identity or security
 posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
 `ENCLAVE_APP_NAME`, `ENCLAVE_KMS_KEY_LOCKED`,
 `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_MIGRATION_INTENT_RETENTION`,
-`ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_PREVIOUS_PCR0`.
+`ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_PREVIOUS_PCR0`, `ENCLAVE_DEV`,
+`ENCLAVE_VERIFY_CLOCK_SOURCE`.
 
 Five TLS and ACME settings are read **only** from this overlay, never from the
 baked environment, because TLS is configured before the overlay is applied to
@@ -686,10 +689,11 @@ AWS APIs, then controls node startup according to the runtime migration order.
 It does not simulate a deployment system, host image lifecycle, or traffic
 cutover.
 
-The test EIF sets `ENCLAVE_DEPLOYMENT=dev`, because QEMU's emulated NSM produces
-no AWS certificate chain, and `ENCLAVE_DEV=true`, which shortens the clock-sync
-poll interval from five minutes to five seconds. Neither changes the logic being
-tested.
+The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace. It separately
+sets `ENCLAVE_DEV=true` because QEMU's emulated NSM produces no AWS certificate
+chain. This skips COSE signature and certificate chain verification and shortens
+the clock-sync poll interval from five minutes to five seconds; it is only for
+local testing against the emulator.
 
 ### Troubleshooting
 
@@ -719,14 +723,15 @@ should not be retried.
 
 ## Security notes
 
-**`ENCLAVE_DEPLOYMENT` defaults to `dev`, and `dev` disables COSE signature
-verification.** In that mode the runtime decodes attestation documents but does
-not verify their signature or validate the certificate chain against the AWS
-Nitro root. It logs `INSECURE: skipping COSE signature verification of
-attestation document` at startup. PCR comparison and `user_data` checks still
-apply. Always set `ENCLAVE_DEPLOYMENT` explicitly for anything other than local
-testing. The value is baked into the measurement and cannot be overridden from
-SSM.
+**`ENCLAVE_DEV=true` disables COSE signature verification.** In that mode the
+runtime decodes attestation documents but does not verify their signature or
+validate the certificate chain against the AWS Nitro root. It logs `INSECURE:
+skipping COSE signature verification of attestation document` at startup. PCR
+comparison and `user_data` checks still apply. Only set `ENCLAVE_DEV=true` for
+local testing against emulated NSM. `ENCLAVE_DEPLOYMENT` is required but only
+selects the SSM namespace; values such as `dev` and `prod` do not control
+verification. Both settings are baked into the measurement and cannot be
+overridden from SSM.
 
 **Clients must pin PCR0.** `client.New` refuses to construct a client without
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is

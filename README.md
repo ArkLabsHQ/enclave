@@ -70,6 +70,7 @@ derivation.
           ENCLAVE_APP_NAME = "myapp";
           ENCLAVE_AWS_REGION = "eu-west-1";
           ENCLAVE_PREVIOUS_PCR0 = "genesis";
+          ENCLAVE_MIGRATION_INTENT_RETENTION = "87600h";
         };
       };
     in
@@ -195,6 +196,8 @@ Produces a derivation containing `image.eif` and `pcr.json`.
   `app.meta.mainProgram` when it differs from the package name. The executable
   is copied under `/app`, and `APP_BINARY_NAME` is injected automatically.
 - `env` is part of the measurement. Changing any value changes PCR0.
+  `buildEif` does not currently validate runtime configuration; missing or invalid
+  required values fail when the EIF boots.
 - The rootfs contains the system CA store and nothing else by default. The
   runtime never shells out. Applications that need `/bin/sh` or other utilities
   must request them: `extraPackages = [ pkgs.busybox ]`.
@@ -253,7 +256,7 @@ measurement. A subset can be overridden at runtime from SSM.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ENCLAVE_MIGRATION_COOLDOWN` | `0` | Minimum interval between `/request-migration` and `/finalise-migration`. A negative or unparseable value fails the boot. |
-| `ENCLAVE_MIGRATION_INTENT_RETENTION` | `87600h` (10 years) | S3 Object Lock retention applied to each migration intent record. |
+| `ENCLAVE_MIGRATION_INTENT_RETENTION` | none | Required. Positive Go duration for the S3 Object Lock retention applied to each migration intent record. |
 
 ### Clock
 

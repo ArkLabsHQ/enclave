@@ -587,7 +587,7 @@ if resp.StatusCode >= 400 {
 
 Methods: `Get`, `Post`, `Do`, `VerifyAttestation`, `GRPCConn`. Package
 functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
-`FetchManifest`, `VerifyManifestProvenance`.
+`FetchManifest`.
 
 | Option | Default | Effect |
 |---|---|---|
@@ -598,7 +598,6 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | `SkipKeyBinding` | `false` | Skips signing-key binding, and therefore response signature verification. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
 | `InsecureTLS` | unset | Removes the certificate pin entirely. |
-| `VerifyProvenance` | `false` | For `NewFromManifest`, checks that a GitHub attestation is registered for the manifest digest. |
 
 What is verified on the first request, and cached for `CacheTTL`:
 

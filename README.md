@@ -10,9 +10,9 @@ The repository exports `lib.buildEif` for constructing enclave images, packages
 the runtime and client CLI, provides a  development shell, and includes NixOS tests
 that exercise the runtime against an AWS emulator under nested KVM.
 
-Supported systems for the runtime, enclave images, and checks are `x86_64-linux`
-and `aarch64-linux`. The CLI and client library additionally build on
-`aarch64-darwin` and `x86_64-darwin`.
+The runtime, enclave images, and checks support `x86_64-linux`. The CLI and
+development shell additionally support `aarch64-linux`, `aarch64-darwin`, and
+`x86_64-darwin`.
 
 ## Contents
 
@@ -183,7 +183,7 @@ Arguments:
 
 ```nix
 {
-  pkgs,                  # package set
+  pkgs,                  # x86_64-linux package set
   app,                   # package; executable selected with pkgs.lib.getExe
   env,                   # environment baked into the measurement
   extraPackages ? [ ],   # additional packages in the enclave rootfs
@@ -206,7 +206,7 @@ The flake also exposes these packages:
 
 | Package | Systems | Purpose |
 |---|---|---|
-| `runtime` | Linux | The runtime executable embedded by `buildEif`. |
+| `runtime` | `x86_64-linux` | The runtime executable embedded by `buildEif`. |
 | `cli`, `default` | Linux and Darwin | The `enclave` client CLI. |
 
 For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
@@ -629,7 +629,7 @@ nix flake check
 
 | Check | Purpose |
 |---|---|
-| `eif-build` | Portable check that builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
+| `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
 | `e2e` | x86-only runtime lifecycle across ordinary `aws`, `blue`, and `green` NixOS nodes: direct AWS setup, genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
 
 Unit tests are not flake checks. Run them with `make test`, or
@@ -638,8 +638,8 @@ available.
 
 ### Requirements
 
-`eif-build` runs on `x86_64-linux` and `aarch64-linux`. `e2e` is
-`x86_64-linux` only because QEMU's `nitro-enclave` machine type is x86_64 only.
+Both checks run on `x86_64-linux` only. The `e2e` check uses QEMU's
+x86_64-only `nitro-enclave` machine type.
 
 The e2e check needs a builder with:
 

@@ -1,14 +1,14 @@
-# e2e.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
-# The NixOS test driver injects nodes, aws, blue, and green.
+# default.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
+# The NixOS test driver injects aws, blue, and green.
 
 import json
 import shlex
 import time
 
 CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
-WORK = "/var/lib/enclave-e2e"
-TFVARS = f"{WORK}/deploy.tfvars.json"
 FQDN = "enclave.test"
+TLS_BUCKET = "enclave-e2e-tls-cache"
+INTENT_BUCKET = "enclave-e2e-migration-intent"
 
 
 def cloud(command):
@@ -46,51 +46,6 @@ def enclave_curl(node, pcr0):
     )
 
 
-def tofu(command):
-    return aws.succeed(f"cd {WORK} && tofunix {command}").strip()
-
-
-def write_tfvars(instances, active_slot):
-    payload = json.dumps(
-        {
-            "account": "000000000000",
-            "instances": instances,
-            "active_slot": active_slot,
-        }
-    )
-    aws.succeed(f"printf %s {shlex.quote(payload)} > {TFVARS}")
-
-
-def clear_released_lock():
-    # MiniStack occasionally retains OpenTofu's conditionally-deleted lock
-    # after the command has exited. Commands in this test are strictly
-    # serial, so remove only this stack's exact lock key between commands.
-    cloud(
-        "dynamodb delete-item --table-name enclave-e2e-tofu-lock "
-        "--key '{\"LockID\":{\"S\":\"enclave-e2e-tofu-state/enclave.tfstate\"}}'"
-    )
-
-
-def plan(name):
-    path = f"{WORK}/{name}.plan"
-    tofu(f"plan -input=false -out={path} -var-file={TFVARS}")
-    clear_released_lock()
-    return path
-
-
-def changed_resources(plan_path):
-    doc = json.loads(tofu(f"show -json {plan_path}"))
-    return [
-        (change["address"], change["change"]["actions"])
-        for change in doc.get("resource_changes", [])
-        if change["change"]["actions"] != ["no-op"]
-    ]
-
-
-def instance_ids():
-    return json.loads(tofu("output -json instance_ids"))
-
-
 def print_enclave_diagnostics(node):
     print(
         node.execute(
@@ -98,7 +53,7 @@ def print_enclave_diagnostics(node):
             "if [ -s /run/enclave-qemu.pid ]; then "
             "pid=$(cat /run/enclave-qemu.pid); "
             "echo pid=$pid; "
-            "if kill -0 \"$pid\" 2>/dev/null; then echo alive=yes; else echo alive=no; fi; "
+            'if kill -0 "$pid" 2>/dev/null; then echo alive=yes; else echo alive=no; fi; '
             "else echo pidfile=missing; fi; "
             "ls -l /dev/kvm; "
             "ps -eo pid,ppid,stat,pcpu,comm,args | grep '[q]emu-system' || true"
@@ -107,15 +62,15 @@ def print_enclave_diagnostics(node):
     print(
         node.execute(
             "systemctl status vhost-device-vsock enclave-heartbeat gvproxy "
-            "imds-proxy migration-proxy enclave-start enclave-watchdog "
+            "imds-proxy migration-proxy mock-imds-forward enclave-start "
             "--no-pager 2>&1"
         )[1]
     )
     print(
         node.execute(
             "journalctl -u vhost-device-vsock -u enclave-heartbeat -u gvproxy "
-            "-u imds-proxy -u migration-proxy -u enclave-start "
-            "-u enclave-watchdog --no-pager -n 150 2>&1"
+            "-u imds-proxy -u migration-proxy -u mock-imds-forward "
+            "-u enclave-start --no-pager -n 150 2>&1"
         )[1]
     )
     print(
@@ -136,18 +91,12 @@ def wait_healthy(node):
     try:
         node.wait_until_succeeds(
             "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            "https://127.0.0.1/health "
-            "| jq -e '.status == \"ready\"'",
-            # Nested enclave boot and genesis on the 4-vCPU hosted runner are
-            # very slow (~370s observed); allow ample headroom.
+            'https://127.0.0.1/health | jq -e ".status == \\"ready\\""',
             timeout=900,
         )
         node.wait_until_succeeds(
             "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            "https://127.0.0.1/test/health "
-            "| jq -e '.status == \"ok\"'",
-            # On the 4-vCPU runner both outer VMs and their inners
-            # oversubscribe the host; health probes can be starved for minutes.
+            'https://127.0.0.1/test/health | jq -e ".status == \\"ok\\""',
             timeout=300,
         )
     except Exception:
@@ -170,113 +119,44 @@ def secret_value(node):
     return value
 
 
-# MiniStack is the control plane: it records AWS resources but cannot boot an
-# AMI. Start only that node until OpenTofu creates the first mock EC2 instance.
 aws.start()
 aws.wait_for_unit("multi-user.target")
 aws.wait_for_open_port(4566)
 aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
 aws.wait_for_open_port(4000)
 aws.wait_for_open_port(1338)
-
 aws.wait_for_open_port(14000)
 aws.wait_until_succeeds(
     "curl -fsS --cacert /etc/pebble/ca.crt https://127.0.0.1:14000/dir "
     "| grep -q newOrder"
 )
 
-aws.succeed(f"mkdir -p {WORK}")
-
-cloud("s3api create-bucket --bucket enclave-e2e-tofu-state")
+# Create only the AWS resources consumed by the runtime.
+cloud(f"s3api create-bucket --bucket {TLS_BUCKET}")
 cloud(
-    "dynamodb create-table --table-name enclave-e2e-tofu-lock "
-    "--attribute-definitions AttributeName=LockID,AttributeType=S "
-    "--key-schema AttributeName=LockID,KeyType=HASH "
-    "--billing-mode PAY_PER_REQUEST"
+    f"s3api create-bucket --bucket {INTENT_BUCKET} "
+    "--object-lock-enabled-for-bucket"
 )
-tofu(
-    "init -input=false "
-    "-backend-config=bucket=enclave-e2e-tofu-state "
-    "-backend-config=region=us-east-1 "
-    "-backend-config=dynamodb_table=enclave-e2e-tofu-lock"
-)
-
-# Release/register both AMIs. MiniStack allocates the IDs consumed by the
-# instances tfvars; the PCR0 in each image's metadata identifies the EIF
-# actually embedded in the corresponding QEMU AMI node.
-blue_ami = cloud(
-    "ec2 register-image "
-    f"--name enclave-blue-{BLUE_PCR0} "
-    f"--description PCR0={BLUE_PCR0} "
-    "--root-device-name /dev/xvda "
-    "--query ImageId --output text"
-)
-green_ami = cloud(
-    "ec2 register-image "
-    f"--name enclave-green-{GREEN_PCR0} "
-    f"--description PCR0={GREEN_PCR0} "
-    "--root-device-name /dev/xvda "
-    "--query ImageId --output text"
-)
-assert blue_ami.startswith("ami-")
-assert green_ami.startswith("ami-")
-assert blue_ami != green_ami
-assert (
-    cloud(
-        f"ec2 describe-images --image-ids {blue_ami} "
-        "--query 'Images[0].Name' --output text"
-    )
-    == f"enclave-blue-{BLUE_PCR0}"
-)
-assert (
-    cloud(
-        f"ec2 describe-images --image-ids {green_ami} "
-        "--query 'Images[0].Name' --output text"
-    )
-    == f"enclave-green-{GREEN_PCR0}"
-)
-
-blue_instance = {"ami_id": blue_ami, "instance_type": "m5.xlarge"}
-green_instance = {"ami_id": green_ami, "instance_type": "m5.xlarge"}
-
-# First deployment: only blue exists and owns the stable EIP.
-write_tfvars({"blue": blue_instance}, "blue")
-initial_plan = plan("initial-blue")
-tofu(f"apply -auto-approve -input=false {initial_plan}")
-clear_released_lock()
-ids = instance_ids()
-blue_instance_id = ids["blue"]
-assert (
-    cloud(
-        f"ec2 describe-instances --instance-ids {blue_instance_id} "
-        "--query 'Reservations[0].Instances[0].ImageId' --output text"
-    )
-    == blue_ami
-)
-elastic_ip = tofu("output -raw elastic_ip")
-tls_bucket = tofu("output -raw tls_cache_bucket")
-assert (
-    cloud("ec2 describe-addresses --query 'Addresses[0].InstanceId' --output text")
-    == blue_instance_id
-)
-
 cloud(
-    "ssm put-parameter --name /dev/testapp/env/E2E_OVERRIDE "
-    "--type String --value override-from-ssm"
+    f"s3api put-bucket-versioning --bucket {INTENT_BUCKET} "
+    "--versioning-configuration Status=Enabled"
 )
-
-# FQDN must come from the runtime's SSM overlay, not the baked EIF env.
+cloud(
+    "ssm put-parameter --name /dev/testapp/TLSCacheBucketName "
+    f"--type String --value {TLS_BUCKET}"
+)
+cloud(
+    "ssm put-parameter --name /dev/testapp/MigrationIntentBucketName "
+    f"--type String --value {INTENT_BUCKET}"
+)
+put_env("E2E_OVERRIDE", "override-from-ssm")
 put_env("ENCLAVE_NITRIDING_FQDN", FQDN)
 
-# MiniStack cannot execute the selected AMI, so pair the successful EC2 apply
-# with its outer NixOS host VM. Normal multi-user activation starts the same
-# enclave services as the production AMI, which then launches the inner EIF.
 blue.start()
 blue.wait_for_unit("multi-user.target")
 blue.wait_for_unit("mock-imds-forward.service")
 blue.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 blue.wait_for_unit("enclave-start.service")
-blue.wait_for_unit("enclave-watchdog.service")
 wait_healthy(blue)
 blue.succeed(
     "test \"$(curl -skf --http1.1 "
@@ -298,7 +178,7 @@ assert "AWS Nitro enclave application" in leaf_subject, leaf_subject
 leaf_san = served_leaf(blue, "-noout -ext subjectAltName")
 assert f"DNS:{FQDN}" in leaf_san, leaf_san
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {tls_bucket} "
+    f"s3api list-objects-v2 --bucket {TLS_BUCKET} "
     "--query 'Contents[].Key' --output text"
 )
 assert cache_keys in ("", "None"), cache_keys
@@ -312,28 +192,24 @@ genesis_key = cloud(
 )
 assert genesis_key not in ("", "UNSET", "None")
 
-# Skew before migration so cooldown and receipt timestamps remain valid. The
-# 2s test poll exercises the unchanged /dev/ptp0 servo without waiting five minutes.
+# Exercise both the hard-step and PI-servo paths against the real /dev/ptp0.
 host_ts = int(blue.succeed("date +%s").strip())
 enclave_ts = int(
-    blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix").strip()
+    blue.succeed(
+        "curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix"
+    ).strip()
 )
 assert abs(enclave_ts - host_ts) <= 2, (enclave_ts, host_ts)
-
-# The boot hard-step against /dev/ptp0 must have engaged.
 blue.succeed(
     "grep -q 'clock sync: initial hard-step to hypervisor PTP completed' "
     "/var/log/enclave-console.log"
 )
 
-# This excludes the distinct "initial hard-step" boot message.
 initial_hardsteps = int(
     blue.succeed(
         "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
     ).strip()
 )
-
-# A +5s skew exceeds the 100ms hard-step threshold on the next 2s poll.
 clock_resp = json.loads(
     blue.succeed(
         "curl -skf --http1.1 -X POST -H 'Content-Type: application/json' "
@@ -343,15 +219,11 @@ clock_resp = json.loads(
 skewed_ts = clock_resp["after"]["unix"]
 host_ts_after = int(blue.succeed("date +%s").strip())
 assert skewed_ts - host_ts_after >= 3, (skewed_ts, host_ts_after)
-
-# Wait for the syncer to hard-step the clock back onto the PHC.
 blue.wait_until_succeeds(
     f"test \"$(grep -c 'clock sync: hard-step' /var/log/enclave-console.log)\" "
     f"-ge {initial_hardsteps + 1}",
     timeout=30,
 )
-
-# Poll until the enclave clock is back within 2s of the outer host.
 blue.wait_until_succeeds(
     "test $(( $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) "
     "- $(date +%s) )) -le 2 "
@@ -367,9 +239,6 @@ final_hardsteps = int(
 assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
 wait_healthy(blue)
 
-# A sub-threshold skew (50ms < the 100ms maxStep threshold) must NOT hard-step:
-# the PI servo frequency-disciplines it instead. Evidence: a post-skew
-# "disciplined" tick reflecting the injected offset, with no new hard-step.
 hardsteps_before_sub = int(
     blue.succeed(
         "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
@@ -380,17 +249,12 @@ blue.succeed(
     "curl -skf --http1.1 -X POST -H 'Content-Type: application/json' "
     "--data '{\"offset_ms\":50}' https://127.0.0.1/test/clock"
 )
-
-# Wait for a post-skew tick that observed the injected ~50ms offset. A bare
-# "disciplined" line is insufficient: on a slow runner the POST round trip
-# outlasts the 2s poll, and a pre-skew steady-state tick would satisfy it.
 blue.wait_until_succeeds(
     f"tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
     "| grep 'clock sync: disciplined' "
     "| jq -e 'select(.offset_us != null and (.offset_us | fabs) >= 30000)'",
     timeout=15,
 )
-
 _, sub_lines = blue.execute(
     f"tail -n +{log_lines_before + 1} /var/log/enclave-console.log "
     "| grep 'clock sync: disciplined' || true"
@@ -403,7 +267,6 @@ for line in sub_lines.splitlines():
         continue
     max_offset_us = max(max_offset_us, abs(float(entry.get("offset_us", 0))))
 assert max_offset_us >= 30000, max_offset_us
-
 hardsteps_after_sub = int(
     blue.succeed(
         "grep -c 'clock sync: hard-step' /var/log/enclave-console.log || true"
@@ -415,21 +278,7 @@ assert hardsteps_after_sub == hardsteps_before_sub, (
 )
 wait_healthy(blue)
 
-# Prove the next infrastructure change creates only green, but do not apply
-# the saved plan yet: a real EC2 create would immediately boot the AMI, and
-# green must not boot until blue has committed the migration.
-write_tfvars(
-    {"blue": blue_instance, "green": green_instance},
-    "blue",
-)
-add_green_plan = plan("add-green")
-add_green_changes = changed_resources(add_green_plan)
-assert add_green_changes == [
-    ('aws_instance.nitro["green"]', ["create"]),
-], add_green_changes
-
-# vhost-device-vsock 0.3 may drop migration-proxy requests. Repeating the same
-# target's request is safe, so retry until a valid response arrives.
+# Green remains off until blue has atomically committed the handoff.
 migration_request_output = ""
 for _ in range(30):
     migration_status, migration_request_output = blue.execute(
@@ -447,31 +296,17 @@ for _ in range(30):
     )
     if migration_status == 0 and valid_status == 0:
         break
-    # vhost-device-vsock drops cluster under rapid-fire new connections;
-    # spacing the retries out recovers more reliably than hammering.
     time.sleep(1)
 else:
     print(migration_request_output)
     print(blue.execute("cat /tmp/request-migration.json 2>/dev/null || true")[1])
-    print(
-        blue.execute(
-            "systemctl status migration-proxy vhost-device-vsock --no-pager"
-        )[1]
-    )
-    print(
-        blue.execute(
-            "journalctl -u migration-proxy -u vhost-device-vsock --no-pager -n 100"
-        )[1]
-    )
-    print(blue.execute("tail -n 100 /var/log/enclave-console.log")[1])
-    # Distinguishes an enclave crash from a dropped transport on the next run.
-    print(blue.execute("curl -sk https://127.0.0.1/health || true")[1])
+    print_enclave_diagnostics(blue)
     raise Exception("request-migration did not succeed")
-intent_bucket = tofu("output -raw migration_intent_log_bucket")
+
 assert (
     int(
         cloud(
-            f"s3api list-object-versions --bucket {intent_bucket} "
+            f"s3api list-object-versions --bucket {INTENT_BUCKET} "
             "--query 'length(Versions)' --output text"
         )
     )
@@ -480,8 +315,6 @@ assert (
 blue.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
     "| jq -e '.migration.state == \"eligible\"'",
-    # The eligible-state read is a runtime HTTP round trip; give the slow
-    # 4-vCPU runner room.
     timeout=120,
 )
 
@@ -496,8 +329,6 @@ for attempt in range(30):
         "--output /tmp/finalise-migration.json "
         "http://127.0.0.1:8003/finalise-migration"
     )
-    if finalise_status != 0:
-        print(f"finalise attempt {attempt}: curl rc={finalise_status}")
     response_status, _ = blue.execute(
         f"jq -e --arg p '{BLUE_PCR0}' "
         "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
@@ -505,37 +336,18 @@ for attempt in range(30):
     )
     if finalise_status == 0 and response_status == 0:
         finalise_response_valid = True
-    # KMSKeyID is the final atomic-commit write, proving success despite a
-    # dropped response. MiniStack reads take ~3s, so check every third failed
-    # attempt and after every successful response.
     if finalise_status == 0 or attempt % 3 == 2:
         migration_key = cloud(
-            f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+            f"ssm get-parameter --name {key_param} "
+            "--query Parameter.Value --output text"
         )
         if migration_key != genesis_key:
             break
     time.sleep(1)
 else:
     print(finalise_output)
-    print(
-        blue.execute("cat /tmp/finalise-migration.json 2>/dev/null || true")[1]
-    )
-    print(
-        "=== console ===\n"
-        + blue.execute("tail -n 120 /var/log/enclave-console.log 2>&1")[1]
-    )
-    print(
-        "=== watchdog ===\n"
-        + blue.execute(
-            "journalctl -u enclave-watchdog -u enclave-start --no-pager -n 60 2>&1"
-        )[1]
-    )
-    print(
-        "=== migration-proxy/vsock ===\n"
-        + blue.execute(
-            "journalctl -u migration-proxy -u vhost-device-vsock --no-pager -n 60 2>&1"
-        )[1]
-    )
+    print(blue.execute("cat /tmp/finalise-migration.json 2>/dev/null || true")[1])
+    print_enclave_diagnostics(blue)
     raise Exception("finalise-migration did not commit")
 
 if finalise_response_valid:
@@ -546,25 +358,7 @@ if finalise_response_valid:
     )
 assert migration_key != genesis_key
 
-tofu(f"apply -auto-approve -input=false {add_green_plan}")
-clear_released_lock()
-ids = instance_ids()
-green_instance_id = ids["green"]
-assert ids["blue"] == blue_instance_id
-assert (
-    cloud(
-        f"ec2 describe-instances --instance-ids {green_instance_id} "
-        "--query 'Reservations[0].Instances[0].ImageId' --output text"
-    )
-    == green_ami
-)
-assert (
-    cloud("ec2 describe-addresses --query 'Addresses[0].InstanceId' --output text")
-    == blue_instance_id
-)
-
-# Point green's TLS at Pebble. The runtime reads these SSM params once per
-# boot at ConfigureTLS; blue already booted self-signed and is unaffected.
+# ACME settings are loaded once at boot, so blue remains self-signed.
 put_env("ENCLAVE_NITRIDING_USE_ACME", "true")
 put_env("ENCLAVE_NITRIDING_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
 put_env("ENCLAVE_NITRIDING_ACME_EMAIL", f"acme-test@{FQDN}")
@@ -575,7 +369,6 @@ green.wait_for_unit("multi-user.target")
 green.wait_for_unit("mock-imds-forward.service")
 green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green.wait_for_unit("enclave-start.service")
-green.wait_for_unit("enclave-watchdog.service")
 wait_healthy(green)
 assert secret_value(green) == blue_secret
 green.succeed(
@@ -587,7 +380,6 @@ green.succeed(
     "and .migration.source_pcr0 == $current'"
 )
 
-# Validate the served chain against Pebble's per-launch issuance root.
 leaf_issuer = served_leaf(green, "-noout -issuer")
 assert "Pebble" in leaf_issuer, leaf_issuer
 leaf_san = served_leaf(green, "-noout -ext subjectAltName")
@@ -606,19 +398,22 @@ aws.succeed(
     "-CAfile /tmp/pebble-root.pem -verify_return_error </dev/null 2>/dev/null"
 )
 
-# Pebble confirms it issued exactly the certificate the enclave serves.
 leaf_serial = served_leaf(green, "-noout -serial").split("=", 1)[1].lower()
 cert_status = json.loads(
-    aws.succeed(f"curl -ks https://127.0.0.1:15000/cert-status-by-serial/{leaf_serial}")
+    aws.succeed(
+        f"curl -ks https://127.0.0.1:15000/cert-status-by-serial/{leaf_serial}"
+    )
 )
 assert cert_status["Status"] == "Valid", cert_status
-aws.succeed(f"printf %s {shlex.quote(cert_status['Certificate'])} > /tmp/mgmt-leaf.pem")
+aws.succeed(
+    f"printf %s {shlex.quote(cert_status['Certificate'])} > /tmp/mgmt-leaf.pem"
+)
 mgmt_sha = aws.succeed(
-    "openssl x509 -in /tmp/mgmt-leaf.pem -outform DER | sha256sum | cut -d' ' -f1"
+    "openssl x509 -in /tmp/mgmt-leaf.pem -outform DER "
+    "| sha256sum | cut -d' ' -f1"
 ).strip()
 assert mgmt_sha == served_leaf_sha(green)
 
-# The attestation is bound to the ACME leaf, and only the FQDN is served.
 status, out = enclave_curl(green, GREEN_PCR0)
 assert status == 0, out
 status, _ = green.execute(
@@ -628,21 +423,19 @@ status, _ = green.execute(
 assert status != 0
 
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {tls_bucket} "
+    f"s3api list-objects-v2 --bucket {TLS_BUCKET} "
     "--query 'Contents[].Key' --output text"
 ).split()
 assert f"dev/testapp/data/acme/{FQDN}" in cache_keys, cache_keys
 assert all(k.startswith("dev/testapp/data/acme/") for k in cache_keys), cache_keys
 aws.succeed("rm -rf /tmp/tls-cache")
-cloud(f"s3 cp s3://{tls_bucket} /tmp/tls-cache --recursive")
+cloud(f"s3 cp s3://{TLS_BUCKET} /tmp/tls-cache --recursive")
 _, pem_hits = aws.execute(
     "grep -rl 'BEGIN CERTIFICATE' /tmp/tls-cache 2>/dev/null; "
     "grep -rl 'PRIVATE KEY' /tmp/tls-cache 2>/dev/null; true"
 )
 assert pem_hits.strip() == "", pem_hits
 
-# Restart green to prove the migrated slot reuses the encrypted S3 certificate
-# cache while recovering non-genesis state.
 leaf_sha_before = served_leaf_sha(green)
 green.succeed("kill $(cat /run/enclave-qemu.pid)")
 green.succeed("systemctl restart enclave-start")
@@ -651,38 +444,5 @@ assert served_leaf_sha(green) == leaf_sha_before
 status, out = enclave_curl(green, GREEN_PCR0)
 assert status == 0, out
 
-write_tfvars(
-    {"blue": blue_instance, "green": green_instance},
-    "green",
-)
-flip_plan = plan("flip-green")
-flip_changes = changed_resources(flip_plan)
-assert len(flip_changes) == 1, flip_changes
-assert flip_changes[0][0] == "aws_eip_association.instance", flip_changes
-tofu(f"apply -auto-approve -input=false {flip_plan}")
-clear_released_lock()
-assert tofu("output -raw elastic_ip") == elastic_ip
-assert (
-    cloud("ec2 describe-addresses --query 'Addresses[0].InstanceId' --output text")
-    == green_instance_id
-)
 wait_healthy(blue)
-wait_healthy(green)
-
-write_tfvars({"green": green_instance}, "green")
-retire_plan = plan("retire-blue")
-retire_changes = changed_resources(retire_plan)
-assert retire_changes == [
-    ('aws_instance.nitro["blue"]', ["delete"]),
-], retire_changes
-tofu(f"apply -auto-approve -input=false {retire_plan}")
-clear_released_lock()
-assert list(instance_ids()) == ["green"]
-assert tofu("output -raw elastic_ip") == elastic_ip
-assert (
-    cloud("ec2 describe-addresses --query 'Addresses[0].InstanceId' --output text")
-    == green_instance_id
-)
-
-blue.shutdown()
 wait_healthy(green)

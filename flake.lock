@@ -72,8 +72,7 @@
     "root": {
       "inputs": {
         "aws-nitro-util": "aws-nitro-util",
-        "nixpkgs": "nixpkgs_2",
-        "tofunix": "tofunix"
+        "nixpkgs": "nixpkgs_2"
       }
     },
     "systems": {
@@ -89,23 +88,6 @@
         "owner": "nix-systems",
         "repo": "default",
         "type": "github"
-      }
-    },
-    "tofunix": {
-      "locked": {
-        "dir": "lib",
-        "lastModified": 1781504075,
-        "narHash": "sha256-Xc+GYomzfFtTY21Z9v7YqUIS7tiTeWSUnxofetCmhf8=",
-        "owner": "technofab",
-        "repo": "tofunix",
-        "rev": "a43a66cfbed02da3cf66f632635a27811126c0df",
-        "type": "gitlab"
-      },
-      "original": {
-        "dir": "lib",
-        "owner": "technofab",
-        "repo": "tofunix",
-        "type": "gitlab"
       }
     }
   },

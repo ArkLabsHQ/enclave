@@ -6,10 +6,10 @@ conditioned on the enclave's PCR0 measurement, exposes an attested HTTPS
 endpoint, and implements a blue/green migration protocol that transfers that
 state to a successor enclave with a different measurement.
 
-The repository provides four Nix functions that build the enclave image, the EC2
-host system, and the OpenTofu stack that deploys them; a Go client library and
-CLI that verify an enclave's attestation before talking to it; and a NixOS test
-that exercises the entire deployment against an AWS emulator under nested KVM.
+The repository exports `lib.buildEif` for constructing enclave images, packages
+the runtime and client CLI, provides a downstream application template and
+development shell, and includes NixOS tests that exercise the runtime against an
+AWS emulator under nested KVM.
 
 Supported systems for the runtime, enclave images, and checks are `x86_64-linux`
 and `aarch64-linux`. The CLI and client library additionally build on
@@ -36,13 +36,13 @@ and `aarch64-linux`. The CLI and client library additionally build on
 | `runtime/` | The Go runtime that runs as PID 1 inside the enclave. Separate Go module, `github.com/ArkLabsHQ/enclave/runtime`. |
 | `client/` | Go client library for attestation-verified requests. Part of the root module. |
 | `cmd/enclave/` | The `enclave` CLI. |
-| `nix/` | The four exported build functions plus runtime, CLI, and dependency packaging. |
-| `nix/tests/` | Flake checks, including the full blue/green NixOS test. |
+| `nix/` | `buildEif`, runtime and CLI packaging, the downstream template, and the development shell. |
+| `nix/tests/` | EIF construction and full blue/green runtime checks. |
 
 ## Quickstart
 
-Add the flake as an input and build an enclave image, a host AMI, and a
-deployment stack from your application derivation.
+Add the flake as an input and build an enclave image from your application
+derivation.
 
 ```nix
 {
@@ -78,16 +78,6 @@ deployment stack from your application derivation.
     {
       packages.${system} = {
         inherit eif;
-
-        ami =
-          (enclave.lib.mkEnclaveAmi { inherit pkgs eif; })
-          .config.system.build.images.amazon;
-
-        tofu = enclave.lib.mkEnclaveTofu {
-          inherit pkgs;
-          app = "myapp";
-          deployment = "prod";
-        };
       };
     };
 }
@@ -104,7 +94,9 @@ cat result/pcr.json          # {"PCR0":"...","PCR1":"...","PCR2":"..."}
 conditioned on and what clients pin. It changes whenever the runtime, the
 application, or the baked environment changes.
 
-Once deployed, verify the running enclave from a client:
+Provide the resulting EIF to a Nitro-capable host that satisfies the
+[deployment requirements](#deployment). Once it is running, verify it from a
+client:
 
 ```sh
 nix run github:ArkLabsHQ/enclave -- curl /v1/enclave-info \
@@ -114,45 +106,23 @@ nix run github:ArkLabsHQ/enclave -- curl /v1/enclave-info \
 
 ## Architecture
 
-Four layers, each built by a separate function.
+`buildEif` combines the packaged runtime, the application executable, and the
+baked environment into one measured EIF.
 
 ```text
-┌─ OpenTofu stack ──────────────────────────────────────────┐
-│  aws_instance.nitro["blue"]   aws_instance.nitro["green"] │
-│                    \             /                        │
-│                  aws_eip (stable public address,          │
-│                           follows active_slot)            │
-│  S3: tls-cache, migration-intent-log (Object Lock)        │
-│  SSM: bucket-name parameters   IAM: instance role         │
-└───────────────────────────────────────────────────────────┘
-                            │  each instance boots
-                            ▼
-┌─ EC2 host AMI (mkEnclaveAmi) ─────────────────────────────┐
-│  gvproxy          vsock:1024  L2 network for the enclave  │
-│  imds-proxy       vsock:8002 -> 169.254.169.254:80        │
-│  migration-proxy  127.0.0.1:8003 -> enclave vsock:8003    │
-│  enclave-start    nitro-cli run-enclave                   │
-│  enclave-watchdog restarts the enclave if it dies         │
-└───────────────────────────────────────────────────────────┘
-                            │  launches
-                            ▼
-┌─ Enclave image, EIF (buildEif) ───────────────────────────┐
+┌─ Enclave image, EIF ──────────────────────────────────────┐
 │  /app/runtime   PID 1: clock, network, AWS, state, TLS    │
-│  /app/<name>    your application, exec'd by the runtime   │
+│  /app/<name>    application, exec'd by the runtime        │
 │                 listens on 127.0.0.1:7074                 │
 └───────────────────────────────────────────────────────────┘
+          │ AWS APIs through host networking and IMDS
+          │ HTTPS application and attestation endpoint
+          ▼
+   encrypted AWS state                 verified clients
 ```
 
-### Host services
-
-The host services are production code shared between the real AMI and the QEMU
-test host. `nix/enclave-host-module.nix` owns all five services; the two
-wrappers differ only in a small launcher interface with `run`, `alive`,
-`terminate`, `path`, and `requires` members. `mk-enclave-ami.nix` supplies a
-`nitro-cli` launcher and the Nitro allocator; `mk-enclave-qemu-ami.nix` supplies
-a `qemu-system-x86_64 -M nitro-enclave` launcher and `vhost-device-vsock`. New
-host behaviour belongs in the shared module unless it is genuinely specific to
-Nitro hardware or to QEMU.
+The host launcher and infrastructure are external to this flake. Their required
+interfaces are documented under [Deployment](#deployment).
 
 ### Ports
 
@@ -166,9 +136,8 @@ Nitro hardware or to QEMU.
 | TCP 127.0.0.1:8080 | inside enclave | internal runtime API |
 | TCP 127.0.0.1:7074 | inside enclave | the application |
 
-Port 8003 is bound to host loopback only. Operators reach it through SSM Session
-Manager port forwarding; the instance role carries
-`AmazonSSMManagedInstanceCore` for this.
+The migration control API has no application-level authentication. The host must
+expose vsock port 8003 only through a restricted operator control plane.
 
 ### State model
 
@@ -186,7 +155,7 @@ under a KMS key that only the measured enclave can use.
 - `/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is written last, both at
   genesis and at migration finalisation. It is the atomic commit point: its
   value selects which generation of ciphertexts is live. It must never be
-  managed by OpenTofu.
+  managed by deployment tooling.
 
 ### Boot paths
 
@@ -205,7 +174,7 @@ environment overlay, static secret export, then exec of the application.
 
 ## Nix API
 
-The flake exports four functions under `lib`.
+The flake exports one function under `lib`.
 
 ### `lib.buildEif`
 
@@ -232,76 +201,34 @@ Produces a derivation containing `image.eif` and `pcr.json`.
   runtime never shells out. Applications that need `/bin/sh` or other utilities
   must request them: `extraPackages = [ pkgs.busybox ]`.
 
-### `lib.mkEnclaveAmi`
+### Packages
 
-Builds the NixOS system for the EC2 host instance.
+The flake also exposes these packages:
 
-Arguments:
+| Package | Systems | Purpose |
+|---|---|---|
+| `runtime` | Linux | The runtime executable embedded by `buildEif`. |
+| `cli`, `default` | Linux and Darwin | The `enclave` client CLI. |
 
-```nix
-{
-  eif,                       # result of buildEif
-  pkgs,                      # preserved as-is, including overlays
-  memoryMib ? 4320,          # memory allocated to the enclave
-  cpuCount ? 2,              # vCPUs allocated to the enclave
-  enclaveCID ? 16,           # enclave vsock CID
-  enclaveName ? "enclave",   # nitro-cli enclave name
-}
+For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
+`nix build github:ArkLabsHQ/enclave#runtime` builds the standalone runtime.
+
+### Application template
+
+Initialize a downstream Go application flake with:
+
+```sh
+nix flake init -t github:ArkLabsHQ/enclave
 ```
 
-Returns a `nixosSystem` result. Two attributes matter:
+The template packages the application and defines development and production
+EIF outputs using `buildEif`. Replace its placeholders, pin the enclave input,
+and set the application's vendor hash before building.
 
-| Attribute | Purpose |
-|---|---|
-| `config.system.build.toplevel` | The system closure. This is what the `ami-build` check builds. |
-| `config.system.build.images.amazon` | The EC2 disk image to upload and register as an AMI. |
+### Development shell
 
-The Nitro allocator is configured with `memoryMib + 1820` MiB to cover enclave
-overhead.
-
-### `lib.mkEnclaveQemuAmi`
-
-Returns a NixOS **module**, not a system. It configures a NixOS test node to run
-the same host services as the production AMI, launching the enclave under QEMU's
-`nitro-enclave` machine instead of Nitro hardware.
-
-Arguments:
-
-```nix
-{
-  eif,                       # result of buildEif
-  memoryMib ? 2048,
-  cpuCount ? 2,
-  enclaveCID ? 16,
-  enclaveName ? "enclave",
-}
-```
-
-Use it in a test node's `imports`. It requires nested KVM; see
-[Testing](#testing).
-
-### `lib.mkEnclaveTofu`
-
-Generates the OpenTofu stack and a CLI wrapper that runs it.
-
-Arguments:
-
-```nix
-{
-  pkgs,
-  app,                       # application name
-  deployment,                # environment name; must match ENCLAVE_DEPLOYMENT
-  local ? false,             # target an AWS emulator instead of real AWS
-  region ? "us-east-1",
-}
-```
-
-Returns a derivation providing a `tofunix` binary, with `.tfjson` (the generated
-`main.tf.json`) and `.module` attached. `app` and `deployment` determine the
-resource name prefix and the SSM parameter paths. `region` is a build-time
-argument, not an OpenTofu variable; changing region means rebuilding the
-derivation. Set `local = true` only for emulator use — it injects
-`http://localhost:4566` endpoints and `test` credentials.
+`nix develop` provides Go, `gopls`, formatting tools, and `golangci-lint` for
+working on this repository.
 
 ## Runtime configuration
 
@@ -346,7 +273,6 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_CLOCK_POLL_INTERVAL` | `5m` | Poll cadence for disciplining `CLOCK_REALTIME` against `/dev/ptp0`. |
 
 The runtime hard-steps the clock onto the PTP hardware clock at startup, then
 runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
@@ -446,10 +372,10 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 | Path | Written by | Purpose |
 |---|---|---|
-| `/D/A/TLSCacheBucketName` | OpenTofu | ACME certificate cache bucket. |
-| `/D/A/MigrationIntentBucketName` | OpenTofu | Object-Locked intent log bucket. |
+| `/D/A/TLSCacheBucketName` | operator | ACME certificate cache bucket. |
+| `/D/A/MigrationIntentBucketName` | operator | Object-Locked intent log bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
-| `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with OpenTofu. |
+| `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
@@ -495,9 +421,9 @@ endpoints, or the application proxy.
 
 ### Migration control, vsock :8003
 
-Reached from the host through `migration-proxy` on `127.0.0.1:8003`. No
-authentication; access is controlled by the fact that the port is bound to host
-loopback and reachable only through SSM Session Manager.
+The host must provide trusted operators with controlled access to this vsock
+listener. It has no application-level authentication and must not be exposed to
+untrusted networks.
 
 | Method | Path | Body | Purpose |
 |---|---|---|---|
@@ -510,54 +436,37 @@ malformed body.
 
 ## Deployment
 
-### Variables
+This flake builds the EIF but does not provision or configure its host or AWS
+resources. Any deployment system may be used if it supplies the following
+interfaces.
 
-| Variable | Type | Default | Purpose |
-|---|---|---|---|
-| `instances` | `map(object({ami_id = string, instance_type = string}))` | `{}` | Slot name to instance definition. |
-| `active_slot` | `string` | `"blue"` | Which slot the Elastic IP points at. Must be a key of `instances`. |
-| `account` | `string` | none, required | AWS account ID, used in IAM resource ARNs. |
+### Host requirements
 
-```json
-{
-  "account": "123456789012",
-  "instances": {
-    "blue":  { "ami_id": "ami-0123456789abcdef0", "instance_type": "m5.xlarge" },
-    "green": { "ami_id": "ami-0fedcba9876543210", "instance_type": "m5.xlarge" }
-  },
-  "active_slot": "blue"
-}
+- Launch the EIF with AWS Nitro Enclaves and allocate sufficient CPU and memory.
+- Make `/dev/nsm` and `/dev/ptp0` available inside the enclave.
+- Run gvproxy at host CID 3, vsock port 1024, with outbound connectivity to the
+  configured AWS endpoints and any application dependencies.
+- Forward IMDS from host CID 3, vsock port 8002, to the host's instance metadata
+  service so the runtime can obtain AWS credentials.
+- Answer the EIF boot heartbeat at host CID 3, vsock port 9000.
+- Expose the enclave's migration control listener on vsock port 8003 only to
+  trusted operators.
+- Route intended client traffic to the enclave's TLS listener, TCP port 443 by
+  default.
+
+### AWS requirements
+
+Create a private S3 bucket for the ACME cache and a separate private S3 bucket
+for migration intents. The intent bucket must have versioning and Object Lock
+enabled when it is created; the runtime applies retention to each intent object.
+Write their names to these SSM parameters:
+
+```text
+/<deployment>/<app>/TLSCacheBucketName
+/<deployment>/<app>/MigrationIntentBucketName
 ```
 
-### Resources
-
-Per slot, via `for_each` on `instances`:
-
-- `aws_instance.nitro[<slot>]` — Nitro Enclaves enabled, 32 GiB encrypted gp2
-  root volume, tagged with `Slot`.
-
-Singletons:
-
-- `aws_eip.instance` and `aws_eip_association.instance` — the stable public
-  address, associated with `instances[active_slot]`.
-- `aws_s3_bucket.tls_cache` — ACME certificate cache. Public access fully
-  blocked.
-- `aws_s3_bucket.migration_intent_log` — versioning enabled and Object Lock
-  enabled at creation. Retention is set per object by the runtime.
-- `aws_ssm_parameter.tls_cache_bucket_name`,
-  `aws_ssm_parameter.migration_intent_bucket_name`.
-- `aws_iam_role.instance`, `aws_iam_instance_profile.instance`,
-  `aws_iam_role_policy.enclave`, plus an attachment of
-  `AmazonSSMManagedInstanceCore`.
-- `aws_security_group.nitro` with ingress on 443 and unrestricted egress.
-
-Both buckets set `force_destroy = false`, so `tofu destroy` fails while either
-is non-empty. Networking uses the account's default VPC; there is no `vpc_id` or
-`subnet_id` argument.
-
-### IAM
-
-The instance role grants:
+AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
@@ -566,61 +475,16 @@ The instance role grants:
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | `CreateLogGroup`, `CreateLogStream`, `PutLogEvents`, `PutRetentionPolicy`, `FilterLogEvents`, `DescribeLogStreams` on `/enclave/*`. |
+| `CloudWatchLogsAccess` | When CloudWatch logging is enabled: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents`, `PutRetentionPolicy`, `FilterLogEvents`, `DescribeLogStreams` on `/enclave/*`. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned
-policy, not by the instance role, so possessing the role is not sufficient to
-read enclave state.
+policy, not by the host credentials, so possessing those credentials is not
+sufficient to read enclave state.
 
-### Outputs
-
-| Output | Meaning |
-|---|---|
-| `elastic_ip` | The stable public address. |
-| `instance_ids` | Map of slot to EC2 instance ID. |
-| `instance_ips` | Map of slot to auto-assigned public IP, for testing a slot before cutover. |
-| `ec2_role_arn` | Instance role ARN. |
-| `tls_cache_bucket` | TLS cache bucket name. |
-| `migration_intent_log_bucket` | Intent log bucket name. |
-
-### Running the stack
-
-The generated binary is `tofunix` and is a pass-through to OpenTofu with the AWS
-provider pinned and vendored, so `init` works offline. The state backend
-declares only `key` and `encrypt`; the bucket, region, and lock table are
-supplied at `init` time and must be created once beforehand.
-
-```sh
-aws s3api create-bucket --bucket my-tofu-state
-aws dynamodb create-table --table-name my-tofu-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
-
-cd /srv/enclave-deploy
-tofunix init -input=false \
-  -backend-config=bucket=my-tofu-state \
-  -backend-config=region=eu-west-1 \
-  -backend-config=dynamodb_table=my-tofu-lock
-
-tofunix plan  -input=false -out=/srv/enclave-deploy/add-green.plan \
-              -var-file=/srv/enclave-deploy/deploy.tfvars.json
-tofunix show  -json /srv/enclave-deploy/add-green.plan
-tofunix apply -input=false /srv/enclave-deploy/add-green.plan
-```
-
-`tofunix` runs OpenTofu against a temporary root module containing a symlink to
-the generated, immutable `main.tf.json`. Two consequences:
-
-- **All file paths passed on the command line must be absolute.** A relative
-  `-var-file`, `-out`, or plan argument resolves inside the temporary directory.
-- `terraform.tfvars` and `*.auto.tfvars` in the working directory are not
-  loaded. Pass `-var-file` explicitly.
-
-`.terraform`, `.terraform.lock.hcl`, and `terraform.tfstate` are linked from and
-written back to the working directory, so run every command from the same
-directory.
+`/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is owned exclusively by the
+runtime. Do not pre-create or declaratively manage it: absence selects genesis,
+and the runtime writes it last to commit genesis and migration transitions.
 
 ## Blue/green migration
 
@@ -630,47 +494,40 @@ find `KMSKeyID` pointing at a key whose policy does not admit it, and fail.
 
 The order is:
 
-1. Build the green EIF and read its PCR0. Green's `ENCLAVE_PREVIOUS_PCR0` must
-   be set to blue's PCR0, which means blue's measurement is an input to green's
-   build.
-2. Register the green AMI and add green to `instances`, but **do not apply yet**.
-   Verify the plan first — the only change must be creation of
-   `aws_instance.nitro["green"]`.
-3. Request the migration against blue:
+1. Build the successor EIF and read its PCR0. Its
+   `ENCLAVE_PREVIOUS_PCR0` must be set to the predecessor's PCR0, so the
+   predecessor measurement is an input to the successor build.
+2. Prepare the successor host and routing, but do not boot the successor.
+3. Request the migration against the predecessor:
    ```sh
-   curl -fsS -H 'Content-Type: application/json' \
-     --data '{"action":"requested","target_pcr0":"<green PCR0>"}' \
-     http://127.0.0.1:8003/request-migration
+     curl -fsS -H 'Content-Type: application/json' \
+       --data '{"action":"requested","target_pcr0":"<successor PCR0>"}' \
+     http://<migration-control-endpoint>/request-migration
    ```
    This writes an Object-Locked record to the intent log. It cannot be deleted.
 4. Wait for the cooldown. Poll `/v1/enclave-info` until
    `migration.state == "eligible"`.
 5. Finalise:
    ```sh
-   curl -fsS -H 'Content-Type: application/json' \
-     --data '{"new_pcr0":"<green PCR0>"}' \
-     http://127.0.0.1:8003/finalise-migration
+     curl -fsS -H 'Content-Type: application/json' \
+       --data '{"new_pcr0":"<successor PCR0>"}' \
+     http://<migration-control-endpoint>/finalise-migration
    ```
-   Blue commits green's PCR0 into its own PCR31, creates a KMS key admitting
-   both PCR0s, re-encrypts the DEK and every static secret, writes its
-   post-PCR31 attestation and the transition receipt, then writes `KMSKeyID`
-   last.
+   The predecessor commits the successor's PCR0 into its own PCR31, creates a
+   KMS key admitting both PCR0s, re-encrypts the DEK and every static secret,
+   writes its post-PCR31 attestation and the transition receipt, then writes
+   `KMSKeyID` last.
 6. Confirm `KMSKeyID` changed. That parameter is the commit; if it changed, the
    handoff succeeded.
-7. Apply the saved plan to create green, then let it boot. Green verifies the
-   predecessor attestation, the PCR31 commitment, the key policy, and the
-   transition receipt before adopting the state.
-8. Confirm adoption on green's `/v1/enclave-info`: `previous_pcr0` equals blue's
-   PCR0, `previous_pcr0_attestation` is non-empty, and
-   `migration.source_pcr0` equals green's own PCR0.
-9. Cut over by setting `active_slot = "green"` and applying. The only change must
-   be `aws_eip_association.instance`, and `elastic_ip` must not change.
-10. Soak. Both hosts remain healthy and reachable.
-11. Retire blue by removing it from `instances`. The only change must be
-    deletion of `aws_instance.nitro["blue"]`.
-
-Each of the three plans should touch exactly one resource. Anything else
-indicates drift and should be investigated before applying.
+7. Boot the successor. It verifies the predecessor attestation, the PCR31
+   commitment, the key policy, and the transition receipt before adopting the
+   state.
+8. Confirm adoption on the successor's `/v1/enclave-info`:
+   `previous_pcr0` equals the predecessor PCR0,
+   `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
+   the successor's own PCR0.
+9. Shift client traffic using the deployment system's normal routing mechanism.
+10. Keep both enclaves healthy for the soak period, then retire the predecessor.
 
 ## Verifying an enclave
 
@@ -786,10 +643,8 @@ nix flake check
 
 | Check | Purpose |
 |---|---|
-| `eif-build` | Builds two EIFs, validates PCR0 shape, and proves the measurements differ. |
-| `ami-build` | Builds the production host system closure. |
-| `tofu-validate` | Resolves the pinned AWS provider offline and runs `tofu validate` against the generated stack. |
-| `e2e` | The complete lifecycle: AMI registration, OpenTofu blue/green, runtime genesis, clock-skew recovery, migration handshake, EIP cutover, and retirement. |
+| `eif-build` | Portable check that builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
+| `e2e` | x86-only runtime lifecycle across ordinary `aws`, `blue`, and `green` NixOS nodes: direct AWS setup, genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
 
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
@@ -797,8 +652,8 @@ available.
 
 ### Requirements
 
-`e2e` is `x86_64-linux` only because QEMU's `nitro-enclave` machine type is
-x86_64 only. The remaining checks run on `aarch64-linux` as well.
+`eif-build` runs on `x86_64-linux` and `aarch64-linux`. `e2e` is
+`x86_64-linux` only because QEMU's `nitro-enclave` machine type is x86_64 only.
 
 The e2e check needs a builder with:
 
@@ -809,11 +664,10 @@ The e2e check needs a builder with:
 Nested KVM is not optional. The runtime requires `/dev/ptp0` inside the enclave,
 which the guest kernel provides through `ptp_kvm`, which in turn issues the
 `KVM_HC_CLOCK_PAIRING` hypercall. The intermediate VM's KVM only services that
-hypercall while its own clocksource is TSC-based, so the QEMU host module forces
-`clocksource=tsc` with `lib.mkAfter` — NixOS test instrumentation otherwise
-appends `clocksource=acpi_pm`, and the kernel honours the last value on the
-command line. Without this the enclave has no `/dev/ptp0` and the boot fails
-before networking starts.
+hypercall while its own clocksource is TSC-based. The blue and green test nodes
+therefore force `clocksource=tsc`; NixOS test instrumentation otherwise appends
+`clocksource=acpi_pm`, and the kernel honours the last value on the command line.
+Without this the enclave has no `/dev/ptp0` and boot fails before networking.
 
 After the cache is warm the full e2e test takes roughly four minutes.
 
@@ -832,60 +686,42 @@ nix flake check --print-build-logs 2>&1 |
 
 `pipefail` preserves the exit status through the filter.
 
-### What the e2e test approximates
+### E2E boundaries
 
-The QEMU host differs from the production AMI in exactly these respects.
-Everything else — networking, IMDS, migration proxy, enclave startup, and the
-watchdog — is the same code.
+The e2e test uses three ordinary NixOS test nodes. `aws` runs the AWS emulator,
+the attestation-aware KMS `Recipient` proxy, IMDS, and ACME fixtures. `blue` and
+`green` launch measured EIFs with QEMU's `nitro-enclave` machine and
+`vhost-device-vsock`.
 
-| Concern | Production | QEMU test host |
-|---|---|---|
-| Enclave launcher | `nitro-cli run-enclave` | `qemu-system-x86_64 -M nitro-enclave` |
-| Vsock backend | Nitro hardware | `vhost-device-vsock` |
-| Allocator | Nitro allocator service | not present |
-| Boot heartbeat | handled by Nitro tooling | `socat` responder on vsock:9000 |
-| Host-to-enclave CID | enclave CID, default 16 | host loopback CID 1 |
-| Host clock | EC2 host clock | forced invariant TSC |
-
-AWS is emulated by MiniStack, with a local proxy that implements the Nitro KMS
-`Recipient` flow that MiniStack lacks. MiniStack is patched in two places: to
-add `RegisterImage`, and to round-trip the EC2 and EIP fields the plan
-assertions depend on. Upgrading MiniStack without carrying those patches forward
-causes the second plan to report spurious changes to blue.
+The test driver creates the required buckets and SSM parameters directly through
+AWS APIs, then controls node startup according to the runtime migration order.
+It does not simulate a deployment system, host image lifecycle, or traffic
+cutover.
 
 The test EIF sets `ENCLAVE_DEPLOYMENT=dev`, because QEMU's emulated NSM produces
-no AWS certificate chain, and `ENCLAVE_CLOCK_POLL_INTERVAL=2s`, so clock-skew
-recovery completes within the test rather than after five minutes. Neither
-changes the logic being tested.
+no AWS certificate chain, and `ENCLAVE_DEV=true`, which shortens the clock-sync
+poll interval from five minutes to five seconds. Neither changes the logic being
+tested.
 
 ### Troubleshooting
 
-**The enclave does not start.** Check the host services and the enclave console:
-
-```sh
-systemctl status gvproxy imds-proxy migration-proxy enclave-start enclave-watchdog
-tail -n 200 /var/log/enclave-console.log
-```
+**The enclave does not start.** Inspect the QEMU launcher and enclave console on
+the affected blue or green node.
 
 **`starting clock sync failed: open /dev/ptp0`.** Nested KVM, invariant TSC
 exposure, or the clocksource. Confirm the guest's kernel command line ends with
 `clocksource=tsc`.
 
-**The runtime cannot obtain credentials.** Confirm IMDS is reachable from the
-host and that `imds-proxy` is running:
+**The runtime cannot obtain credentials.** Confirm the test IMDS endpoint and
+the host's vsock port 8002 forward are reachable.
 
 ```sh
 curl -fsS http://169.254.169.254/latest/meta-data/
-systemctl status imds-proxy
 ```
 
 **`/health` is ready but application routes fail.** `/health` only proves the
 application process started. Check an application endpoint directly and read the
 enclave console for application errors.
-
-**A plan wants to change the inactive slot.** Do not apply. Inspect
-`tofunix show -json <plan>`. Adding green should create
-`aws_instance.nitro["green"]` and nothing else.
 
 **`/request-migration` returns an empty reply under QEMU.** `vhost-device-vsock`
 0.3 occasionally drops a forwarded host-to-guest connection before it reaches
@@ -913,15 +749,15 @@ return successfully when the response signature is absent or invalid, and report
 it through that field. The CLI treats it as a fatal error; library consumers
 should do the same.
 
-**Never manage `KMSKeyID` with OpenTofu.** Its absence selects the genesis path,
-and the runtime rewrites it as the final step of every state transition. A
-declaratively managed value would fight the runtime and could roll a live
-deployment back to a key that no longer decrypts anything.
+**Never manage `KMSKeyID` with deployment tooling.** Its absence selects the
+genesis path, and the runtime rewrites it as the final step of every state
+transition. A declaratively managed value would fight the runtime and could roll
+a live deployment back to a key that no longer decrypts anything.
 
-**The instance role cannot read enclave state.** It grants `kms:CreateKey` but
+**Host credentials cannot read enclave state.** They grant `kms:CreateKey` but
 not `Decrypt`, `Encrypt`, or `GenerateDataKey`. Those are authorised by the
-enclave-created key policy, which is conditioned on PCR0. Compromising the EC2
-host does not yield the state.
+enclave-created key policy, which is conditioned on PCR0. Compromising the host
+does not yield the state.
 
 **Static secrets are measured.** Each is committed to a PCR that is then locked,
 so a successor enclave cannot silently substitute a different value; migration

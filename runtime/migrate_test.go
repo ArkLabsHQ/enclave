@@ -103,14 +103,10 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("rollback-to-self ignores PCR31 target", func(t *testing.T) {
-		failedTargetPCR0Bytes := bytes.Repeat([]byte{0xef}, 48)
-
-		// The first arg is the fresh rollback boot PCR0; the map is the stored
-		// predecessor attestation from the earlier v2 -> v3 migration attempt.
+	t.Run("rejects self as predecessor", func(t *testing.T) {
 		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
 			0:                 currentPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0Bytes),
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
 		err := verifyPredecessorCommitment(nsm, unverifiedState{
@@ -119,7 +115,7 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			predecessorAttestation: attestation,
 		})
 
-		require.NoError(t, err)
+		require.ErrorContains(t, err, "cannot be its own predecessor")
 	})
 }
 
@@ -129,10 +125,13 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
 
 	ctx := context.Background()
+	infoPCR0Bytes := bytes.Repeat([]byte{0x5a}, 48)
+	infoPCR0 := hex.EncodeToString(infoPCR0Bytes)
 
 	t.Run("genesis", func(t *testing.T) {
 		m, err := NewMigrator(
-			nil, nil, NewSSM(&fakeSSM{}), newFakeS3(), nil, nil, migrationIntentTestBucket,
+			kmsTestNSMWithPCR0(t, infoPCR0Bytes), nil, NewSSM(&fakeSSM{}),
+			newFakeS3(), nil, nil, migrationIntentTestBucket,
 		)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
@@ -142,10 +141,11 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	})
 
 	t.Run("recorded predecessor", func(t *testing.T) {
-		m, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
-			migrationPreviousPCR0Param():            "abc123",
-			migrationPreviousPCR0AttestationParam(): "attestation",
-		}}), newFakeS3(), nil, nil, migrationIntentTestBucket)
+		m, err := NewMigrator(
+			kmsTestNSMWithPCR0(t, infoPCR0Bytes), nil, NewSSM(&fakeSSM{params: map[string]string{
+				migrationPreviousPCR0Param(infoPCR0):            "abc123",
+				migrationPreviousPCR0AttestationParam(infoPCR0): "attestation",
+			}}), newFakeS3(), nil, nil, migrationIntentTestBucket)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
 
@@ -300,6 +300,7 @@ func TestCompleteMigration(t *testing.T) {
 		}}
 		ssmf := &fakeSSM{params: map[string]string{
 			migrationIntentBucketParam(): migrationIntentBucketName,
+			kmsKeyIDParam(oldPCR0Hex):    "old-key",
 		}}
 		ssm := NewSSM(ssmf)
 		s3f := newFakeS3()
@@ -346,7 +347,10 @@ func TestCompleteMigration(t *testing.T) {
 		got, err := fx.m.CompleteMigration(ctx)
 
 		require.NoError(t, err)
-		require.Empty(t, fx.ssmf.calls, "migration must not read successor ciphertexts back")
+		require.Equal(
+			t, []string{kmsKeyIDParam(newPCR0)}, fx.ssmf.calls,
+			"finalise reads only the successor's commit pointer, never ciphertexts back",
+		)
 		require.Equal(t, oldPCR0Hex, got.PCR0)
 		require.Equal(t, []string{"signing_key"}, got.Exported)
 
@@ -355,15 +359,19 @@ func TestCompleteMigration(t *testing.T) {
 		require.Equal(t, pcrExtendFromZero(newPCR0Bytes), fx.session.pcrs[migrationPCRIndex])
 		require.True(t, fx.session.locks[migrationPCRIndex])
 
-		require.Equal(t, oldPCR0Hex, fx.ssmf.params[migrationPreviousPCR0Param()])
-		require.NotEmpty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam()])
-		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam()])
+		require.Equal(t, oldPCR0Hex, fx.ssmf.params[migrationPreviousPCR0Param(newPCR0)])
+		require.NotEmpty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam(newPCR0)])
+		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam(newPCR0)])
+		require.Equal(
+			t, "old-key", fx.ssmf.params[kmsKeyIDParam(oldPCR0Hex)],
+			"the predecessor's own commit pointer must survive the handoff",
+		)
 		require.NotEmpty(t, fx.ssmf.params[storageDEKCiphertextParam(migrationKeyID)])
 		require.NotEmpty(t, fx.ssmf.params[migrationStateOriginReceiptParam(migrationKeyID)])
 		requireKMSCiphertextPlaintext(t, fx.kmsf,
 			fx.ssmf.params[secretCiphertextParam("signing_key", migrationKeyID)], secretPlaintext)
 		require.NoError(t, VerifyKeyPolicyPosture(
-			fx.kmsf.keyPolicy(migrationKeyID), []string{oldPCR0Hex, newPCR0}, true,
+			fx.kmsf.keyPolicy(migrationKeyID), []string{newPCR0}, true,
 		))
 		require.NotNil(t, fx.session.attestationRoots)
 
@@ -386,15 +394,50 @@ func TestCompleteMigration(t *testing.T) {
 		newReceipt := stateOriginReceiptParam(migrationKeyID, newPCR0)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 
-		oldNSM := &nsmW{nsm: &fakeNSM{
-			session:     newStatefulNSMSession(t, map[uint][]byte{0: oldPCR0}),
-			verifyRoots: fx.session.attestationRoots,
-		}}
-		_, err = EstablishState(ctx, oldNSM, fx.kmsf, &fakeSTS{}, fx.ssm)
-		require.NoError(t, err)
-		require.NotEmpty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
+		// The predecessor never adopts the migration key: it has no receipt
+		// under it, and the key's policy does not admit its PCR0.
+		require.Empty(t, fx.ssmf.params[stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)])
+		require.Error(t, VerifyKeyPolicyPosture(
+			fx.kmsf.keyPolicy(migrationKeyID), []string{oldPCR0Hex}, true,
+		))
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 	})
+
+	t.Run("refuses to re-finalise onto an existing target pointer", func(t *testing.T) {
+		fx := setup(t)
+		fx.ssmf.params[kmsKeyIDParam(newPCR0)] = "already-committed"
+		request(t, fx, newPCR0)
+
+		_, err := fx.m.CompleteMigration(ctx)
+
+		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
+		// The guard runs before PCR31 and before any key is minted, so a refusal
+		// leaves the successor's committed generation exactly as it was.
+		require.Equal(t, "already-committed", fx.ssmf.params[kmsKeyIDParam(newPCR0)])
+		require.Equal(t, make([]byte, 48), fx.session.pcrs[migrationPCRIndex])
+		fx.kmsf.mu.Lock()
+		require.Empty(t, fx.kmsf.keys)
+		fx.kmsf.mu.Unlock()
+	})
+
+	t.Run("predecessor cannot read back what it wrote under the migration key",
+		func(t *testing.T) {
+			fx := setup(t)
+			request(t, fx, newPCR0)
+
+			_, err := fx.m.CompleteMigration(ctx)
+			require.NoError(t, err)
+
+			predecessorOnMigrationKey := &kmsW{
+				nsm:   fx.m.nsm,
+				kms:   fx.kmsf,
+				keyID: migrationKeyID,
+			}
+			_, err = predecessorOnMigrationKey.Decrypt(
+				ctx, fx.ssmf.params[storageDEKCiphertextParam(migrationKeyID)],
+			)
+			require.ErrorContains(t, err, "AccessDenied")
+		})
 
 	t.Run("requires a published intent with zero cooldown", func(t *testing.T) {
 		fx := setup(t)
@@ -402,7 +445,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err := fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationIntentAbsent)
-		requireNoMigrationSideEffects(t, fx)
+		requireNoMigrationSideEffects(t, fx, newPCR0)
 	})
 
 	t.Run("rejects active cooldown", func(t *testing.T) {
@@ -415,7 +458,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err = fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationCooldownActive)
-		requireNoMigrationSideEffects(t, fx)
+		requireNoMigrationSideEffects(t, fx, newPCR0)
 	})
 
 	t.Run("rejects aborted intent", func(t *testing.T) {
@@ -427,7 +470,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err = fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
-		requireNoMigrationSideEffects(t, fx)
+		requireNoMigrationSideEffects(t, fx, newPCR0)
 	})
 
 	t.Run("fails closed on intent store error", func(t *testing.T) {
@@ -437,7 +480,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err := fx.m.CompleteMigration(ctx)
 
 		require.ErrorContains(t, err, "list failed")
-		requireNoMigrationSideEffects(t, fx)
+		requireNoMigrationSideEffects(t, fx, newPCR0)
 	})
 
 	t.Run("recovers intent after migrator restart", func(t *testing.T) {
@@ -457,7 +500,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err = restarted.CompleteMigration(ctx)
 
 		require.NoError(t, err)
-		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam()])
+		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam(newPCR0)])
 	})
 
 	t.Run("serializes request and completion", func(t *testing.T) {
@@ -560,7 +603,7 @@ func TestCompleteMigration(t *testing.T) {
 	t.Run("fails when KMSKeyID write fails", func(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.ssmf.putErrs = map[string]error{
-				kmsKeyIDParam(): errors.New("set failed"),
+				kmsKeyIDParam(newPCR0): errors.New("set failed"),
 			}
 		})
 		request(t, fx, newPCR0)
@@ -568,7 +611,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err := fx.m.CompleteMigration(ctx)
 
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to update current KMS key ID")
+		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
 	})
 }
 
@@ -607,7 +650,11 @@ func (k *blockingPrimaryKMS) CreateMigrationKMS(
 	return nil, errors.New("blocked migration KMS creation")
 }
 
-func requireNoMigrationSideEffects(t *testing.T, fx *startMigrationFixture) {
+func requireNoMigrationSideEffects(
+	t *testing.T,
+	fx *startMigrationFixture,
+	targetPCR0 string,
+) {
 	t.Helper()
 	require.Equal(t, make([]byte, 48), fx.session.pcrs[migrationPCRIndex])
 	require.False(t, fx.session.locks[migrationPCRIndex])
@@ -617,9 +664,9 @@ func requireNoMigrationSideEffects(t *testing.T, fx *startMigrationFixture) {
 	require.Empty(t, fx.kmsf.blobs)
 	fx.kmsf.mu.Unlock()
 
-	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
-	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0Param()])
-	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam()])
+	require.Empty(t, fx.ssmf.params[kmsKeyIDParam(targetPCR0)])
+	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0Param(targetPCR0)])
+	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam(targetPCR0)])
 	for name := range fx.ssmf.params {
 		require.NotContains(t, name, "/Ciphertext/")
 		require.NotContains(t, name, "StateOriginReceipt/")

@@ -69,7 +69,7 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
 	require.JSONEq(t, want, got)
 }
 
-func TestBuildKMSPolicy_RecoveryMigrationGolden(t *testing.T) {
+func TestBuildKMSPolicy_RecoveryMultiPCR0Golden(t *testing.T) {
 	got := mustBuildKMSPolicy(
 		t,
 		testAssumedRoleARN,

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/hf/nitrite"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
@@ -22,7 +21,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	pcr0Hex := hex.EncodeToString(pcr0)
 	policy := mustBuildKMSPolicy(t, testRoleARN, []string{pcr0Hex}, "")
-	attestation := base64.StdEncoding.EncodeToString([]byte("migration attestation"))
 
 	t.Run("existing key accepted", func(t *testing.T) {
 		kmsf := newFakeKMS()
@@ -34,8 +32,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			kmsf,
 			&fakeSTS{},
 			"key-existing",
-			"",
-			"",
 		)
 
 		require.NoError(t, err)
@@ -55,136 +51,27 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			kmsf,
 			&fakeSTS{},
 			"key-stale",
-			"",
-			"",
 		)
 
 		require.Error(t, err)
 	})
 
-	t.Run("rollback-to-self accepts committed target policy", func(t *testing.T) {
-		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
-		targetPCR0Hex := hex.EncodeToString(targetPCR0)
+	t.Run("multi-PCR0 policy rejected", func(t *testing.T) {
+		otherPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
 		kmsf := newFakeKMS()
-		kmsf.putKey("key-rollback", mustBuildKMSPolicy(
+		kmsf.putKey("key-dual", mustBuildKMSPolicy(
 			t,
 			testRoleARN,
-			[]string{pcr0Hex, targetPCR0Hex},
+			[]string{pcr0Hex, otherPCR0},
 			"",
 		))
-		got, err := FetchOrCreatePrimaryKMS(
-			ctx,
-			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
-				0:                 pcr0,
-				migrationPCRIndex: pcrExtendFromZero(targetPCR0),
-			}, nil)),
-			kmsf,
-			&fakeSTS{},
-			"key-rollback",
-			pcr0Hex,
-			attestation,
-		)
 
-		require.NoError(t, err)
-		require.Equal(t, "key-rollback", got.KeyID())
-	})
-
-	t.Run("rollback-to-self rejects uncommitted target policy", func(t *testing.T) {
-		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
-		targetPCR0Hex := hex.EncodeToString(targetPCR0)
-		evilPCR0 := bytes.Repeat([]byte{0xef}, 48)
-		kmsf := newFakeKMS()
-		kmsf.putKey("key-rollback", mustBuildKMSPolicy(
-			t,
-			testRoleARN,
-			[]string{pcr0Hex, targetPCR0Hex},
-			"",
-		))
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
-			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
-				0:                 pcr0,
-				migrationPCRIndex: pcrExtendFromZero(evilPCR0),
-			}, nil)),
+			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
-			"key-rollback",
-			pcr0Hex,
-			attestation,
-		)
-
-		require.Error(t, err)
-	})
-
-	t.Run("rollback-to-self rejects policy without target PCR0", func(t *testing.T) {
-		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
-		kmsf := newFakeKMS()
-		kmsf.putKey("key-rollback", mustBuildKMSPolicy(t, testRoleARN, []string{pcr0Hex}, ""))
-		_, err := FetchOrCreatePrimaryKMS(
-			ctx,
-			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
-				0:                 pcr0,
-				migrationPCRIndex: pcrExtendFromZero(targetPCR0),
-			}, nil)),
-			kmsf,
-			&fakeSTS{},
-			"key-rollback",
-			pcr0Hex,
-			attestation,
-		)
-
-		require.Error(t, err)
-	})
-
-	t.Run("rollback-to-self rejects policy with extra target PCR0", func(t *testing.T) {
-		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
-		targetPCR0Hex := hex.EncodeToString(targetPCR0)
-		evilPCR0Hex := hex.EncodeToString(bytes.Repeat([]byte{0xef}, 48))
-		kmsf := newFakeKMS()
-		kmsf.putKey("key-rollback", mustBuildKMSPolicy(
-			t,
-			testRoleARN,
-			[]string{pcr0Hex, targetPCR0Hex, evilPCR0Hex},
-			"",
-		))
-		_, err := FetchOrCreatePrimaryKMS(
-			ctx,
-			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
-				0:                 pcr0,
-				migrationPCRIndex: pcrExtendFromZero(targetPCR0),
-			}, nil)),
-			kmsf,
-			&fakeSTS{},
-			"key-rollback",
-			pcr0Hex,
-			attestation,
-		)
-
-		require.Error(t, err)
-	})
-
-	t.Run("rollback-to-self rejects policy missing current PCR0", func(t *testing.T) {
-		targetPCR0 := bytes.Repeat([]byte{0xcd}, 48)
-		targetPCR0Hex := hex.EncodeToString(targetPCR0)
-		evilPCR0Hex := hex.EncodeToString(bytes.Repeat([]byte{0xef}, 48))
-		kmsf := newFakeKMS()
-		kmsf.putKey("key-rollback", mustBuildKMSPolicy(
-			t,
-			testRoleARN,
-			[]string{targetPCR0Hex, evilPCR0Hex},
-			"",
-		))
-		_, err := FetchOrCreatePrimaryKMS(
-			ctx,
-			kmsTestNSMWithVerifiedDoc(t, pcr0, verifyDocResult(map[uint][]byte{
-				0:                 pcr0,
-				migrationPCRIndex: pcrExtendFromZero(targetPCR0),
-			}, nil)),
-			kmsf,
-			&fakeSTS{},
-			"key-rollback",
-			pcr0Hex,
-			attestation,
+			"key-dual",
 		)
 
 		require.Error(t, err)
@@ -198,8 +85,6 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{arn: testRoleARN},
-			"",
-			"",
 			"",
 		)
 
@@ -284,11 +169,16 @@ func TestCreateMigrationKMS(t *testing.T) {
 	}
 	require.NoError(
 		t,
+		VerifyKeyPolicyPosture(kmsf.keyPolicy(got.KeyID()), []string{newPCR0}, true),
+	)
+	require.Error(
+		t,
 		VerifyKeyPolicyPosture(
 			kmsf.keyPolicy(got.KeyID()),
-			[]string{hex.EncodeToString(curPCR0), newPCR0},
+			[]string{hex.EncodeToString(curPCR0)},
 			true,
 		),
+		"migration key must not admit the predecessor",
 	)
 }
 
@@ -299,16 +189,6 @@ func kmsTestNSMWithPCR0(t *testing.T, pcr0 []byte) NSM {
 			attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
 		},
 	}}}
-}
-
-func kmsTestNSMWithVerifiedDoc(t *testing.T, currentPCR0 []byte, verifyResult *nitrite.Result) NSM {
-	t.Helper()
-	return &nsmW{nsm: &fakeNSM{
-		session: &fakeNSMSession{responses: []response.Response{
-			attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: currentPCR0})),
-		}},
-		verifyResult: verifyResult,
-	}}
 }
 
 func kmsTestNSMWithRecipient(t *testing.T) NSM {

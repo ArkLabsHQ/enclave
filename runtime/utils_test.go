@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -262,6 +263,9 @@ func (f *fakeKMS) Decrypt(
 	in *kms.DecryptInput,
 	_ ...func(*kms.Options),
 ) (*kms.DecryptOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	f.init()
 	plaintext, ok := f.blobs[string(in.CiphertextBlob)]
@@ -285,6 +289,9 @@ func (f *fakeKMS) GenerateDataKey(
 	in *kms.GenerateDataKeyInput,
 	_ ...func(*kms.Options),
 ) (*kms.GenerateDataKeyOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
 	n := int(aws.ToInt32(in.NumberOfBytes))
 	if n == 0 {
 		n = 32
@@ -312,6 +319,52 @@ func (f *fakeKMS) GenerateDataKey(
 	}
 	out.CiphertextForRecipient = enveloped
 	return out, nil
+}
+
+func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientInfo) error {
+	f.mu.Lock()
+	f.init()
+	policy, ok := f.keys[keyID]
+	f.mu.Unlock()
+	if !ok || policy == "" || recipient == nil {
+		return nil
+	}
+
+	admitted, err := KeyPolicyAdmittedPCR0s(policy)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	pcr0, err := fakeKMSAttestedPCR0(recipient.AttestationDocument)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	if !admitted[pcr0] {
+		return fmt.Errorf(
+			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
+		)
+	}
+	return nil
+}
+
+func fakeKMSAttestedPCR0(attestationDoc []byte) (string, error) {
+	var coseSign1 []cbor.RawMessage
+	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
+		return "", err
+	}
+	if len(coseSign1) < 3 {
+		return "", fmt.Errorf("invalid attestation document")
+	}
+	var payload []byte
+	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
+		return "", err
+	}
+	var doc struct {
+		PCRs map[uint][]byte `cbor:"pcrs"`
+	}
+	if err := cbor.Unmarshal(payload, &doc); err != nil {
+		return "", err
+	}
+	return strings.ToLower(hex.EncodeToString(doc.PCRs[0])), nil
 }
 
 func (f *fakeKMS) GetKeyPolicy(

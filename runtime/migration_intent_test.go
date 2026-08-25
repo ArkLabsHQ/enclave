@@ -177,6 +177,19 @@ func TestMigrationIntentAppend(t *testing.T) {
 	require.Equal(t, targetB, head.TargetPCR0)
 }
 
+func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
+	fx := newMigrationIntentFixtureWithRetention(t, "24h")
+
+	// A self-targeted handoff would overwrite this enclave's own commit pointer
+	// and satisfy the PCR31 check trivially.
+	_, err := fx.log.Request(context.Background(), strings.ToUpper(fx.source))
+
+	require.ErrorIs(t, err, errMigrationIntentSelfTarget)
+	head, err := fx.log.Head(context.Background())
+	require.NoError(t, err)
+	require.Nil(t, head, "a refused request must publish no intent")
+}
+
 func TestMigrationIntentRetentionConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

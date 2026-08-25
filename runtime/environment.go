@@ -99,7 +99,7 @@ func getAppName() string {
 }
 
 func getPreviousPCR0() string {
-	return os.Getenv("ENCLAVE_PREVIOUS_PCR0")
+	return strings.TrimSpace(os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
 }
 
 func getStaticSecretsConfig() string {
@@ -123,9 +123,14 @@ func lockSegment() string {
 	return "unlocked"
 }
 
-// kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
-func kmsKeyIDParam() string {
-	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
+func kmsKeyIDParam(pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/%s/KMSKeyID/%s",
+		getDeployment(),
+		getAppName(),
+		lockSegment(),
+		strings.ToLower(pcr0),
+	)
 }
 
 func getMigrationCooldown() (time.Duration, error) {
@@ -258,15 +263,26 @@ func migrationStateOriginReceiptParam(keyID string) string {
 	)
 }
 
-// migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0.
-func migrationPreviousPCR0Param() string {
-	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", getDeployment(), getAppName())
+// migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0,
+// scoped by the successor PCR0 that reads it.
+func migrationPreviousPCR0Param(pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationPreviousPCR0/%s",
+		getDeployment(),
+		getAppName(),
+		strings.ToLower(pcr0),
+	)
 }
 
 // migrationPreviousPCR0AttestationParam: SSM path for the predecessor enclave's
-// attestation document.
-func migrationPreviousPCR0AttestationParam() string {
-	return fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", getDeployment(), getAppName())
+// attestation document, scoped by the successor PCR0 that reads it.
+func migrationPreviousPCR0AttestationParam(pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationPreviousPCR0Attestation/%s",
+		getDeployment(),
+		getAppName(),
+		strings.ToLower(pcr0),
+	)
 }
 
 func envVarOverridePath(name string) string {

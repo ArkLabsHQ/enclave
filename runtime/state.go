@@ -55,6 +55,7 @@ type verifiedState struct {
 // reconstructed from SSM.
 type persistedStateSnapshot struct {
 	kmsKeyID                  string
+	ownerPCR0                 string
 	staticSecrets             []persistedSecret
 	storageDEK                string
 	migrationIntentBucketName string
@@ -91,15 +92,7 @@ func EstablishState(
 		return verifiedState{}, fmt.Errorf("failed to verify predecessor commitment: %w", err)
 	}
 
-	kms, err := FetchOrCreatePrimaryKMS(
-		ctx,
-		nsm,
-		kmsAPI,
-		sts,
-		state.kmsKeyID,
-		state.predecessorPCR0,
-		state.predecessorAttestation,
-	)
+	kms, err := FetchOrCreatePrimaryKMS(ctx, nsm, kmsAPI, sts, state.kmsKeyID)
 	if err != nil {
 		return verifiedState{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
@@ -146,16 +139,18 @@ func loadUnverifiedState(
 		return unverifiedState{}, fmt.Errorf("failed to get migration intent bucket name: %w", err)
 	}
 
-	keyID, err := ssm.MayGet(ctx, kmsKeyIDParam())
+	currentPCR0Hex := hex.EncodeToString(currentPCR0)
+
+	keyID, err := ssm.MayGet(ctx, kmsKeyIDParam(currentPCR0Hex))
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
-	predecessorPCR0, err := ssm.MayGet(ctx, migrationPreviousPCR0Param())
+	predecessorPCR0, err := ssm.MayGet(ctx, migrationPreviousPCR0Param(currentPCR0Hex))
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
 	}
 	predecessorAttestation, err := ssm.MayGet(
-		ctx, migrationPreviousPCR0AttestationParam(),
+		ctx, migrationPreviousPCR0AttestationParam(currentPCR0Hex),
 	)
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf(
@@ -183,6 +178,7 @@ func loadUnverifiedState(
 		predecessorPCR0:        predecessorPCR0,
 		predecessorAttestation: predecessorAttestation,
 		snapshot: persistedStateSnapshot{
+			ownerPCR0:                 currentPCR0Hex,
 			migrationIntentBucketName: migrationIntentBucketName,
 		},
 	}
@@ -195,10 +191,7 @@ func loadUnverifiedState(
 		return state, nil
 	}
 
-	receipt, err := ssm.MayGet(
-		ctx,
-		stateOriginReceiptParam(keyID, hex.EncodeToString(currentPCR0)),
-	)
+	receipt, err := ssm.MayGet(ctx, stateOriginReceiptParam(keyID, currentPCR0Hex))
 	if err != nil {
 		return unverifiedState{}, fmt.Errorf(
 			"failed to get state-origin receipt SSM param: %w",
@@ -268,24 +261,30 @@ func verifyPredecessorCommitment(nsm NSM, state unverifiedState) error {
 		return fmt.Errorf("previous PCR0 attestation is required")
 	}
 
-	isRollbackToSelf := strings.EqualFold(
-		state.predecessorPCR0,
-		hex.EncodeToString(state.currentPCR0),
-	)
+	if strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
+		return fmt.Errorf("an enclave cannot be its own predecessor")
+	}
 
-	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) && !isRollbackToSelf {
+	if !strings.EqualFold(eifPreviousPCR0, state.predecessorPCR0) {
 		return fmt.Errorf(
 			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
 		)
 	}
 
-	expectedPCRs := map[uint]string{0: state.predecessorPCR0}
-	// Verify PCR31 if this is not a rollback (curPCR0 != prevPCR0).
-	if !isRollbackToSelf {
-		expectedPCRs[migrationPCRIndex] = hex.EncodeToString(pcrExtendFromZero(state.currentPCR0))
-	}
+	return nsm.VerifyAttestation(
+		state.predecessorAttestation,
+		predecessorHandoffPCRs(state),
+		nil,
+	)
+}
 
-	return nsm.VerifyAttestation(state.predecessorAttestation, expectedPCRs, nil)
+// predecessorHandoffPCRs is the PCR set a predecessor's attestation must carry
+// for this enclave: its own PCR0, and PCR31 committing to ours.
+func predecessorHandoffPCRs(state unverifiedState) map[uint]string {
+	return map[uint]string{
+		0:                 state.predecessorPCR0,
+		migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(state.currentPCR0)),
+	}
 }
 
 func establishLoadedState(
@@ -309,6 +308,8 @@ func establishLoadedState(
 		snapshot = state.snapshot
 	}
 
+	snapshot.ownerPCR0 = hex.EncodeToString(state.currentPCR0)
+
 	root, err := stateRoot(snapshot)
 	if err != nil {
 		return verifiedState{}, fmt.Errorf("failed to build state root: %v", err)
@@ -326,25 +327,12 @@ func establishLoadedState(
 			return verifiedState{}, fmt.Errorf("invalid state-origin receipt: %w", err)
 		}
 	case startStateMigration:
-		curPCR0 := hex.EncodeToString(state.currentPCR0)
-
-		expectedPCRs := map[uint]string{
-			0: state.predecessorPCR0,
-		}
-
-		// Verify PCR31 if this migration is not a rollback (curPCR0 != prevPCR0)
-		if !strings.EqualFold(state.predecessorPCR0, curPCR0) {
-			expectedPCRs[migrationPCRIndex] = hex.EncodeToString(
-				pcrExtendFromZero(state.currentPCR0),
-			)
-		}
-
 		if err := verifyStateOriginReceipt(
 			nsm,
 			state.receipt,
 			purposeMigrationTransition,
 			root,
-			expectedPCRs,
+			predecessorHandoffPCRs(state),
 		); err != nil {
 			return verifiedState{}, fmt.Errorf("invalid state-origin receipt: %w", err)
 		}
@@ -372,7 +360,7 @@ func establishLoadedState(
 			return verifiedState{}, fmt.Errorf("failed to write state-origin receipt: %w", err)
 		}
 		if state.startState == startStateGenesis {
-			if err := ssm.Set(ctx, kmsKeyIDParam(), kms.KeyID()); err != nil {
+			if err := ssm.Set(ctx, kmsKeyIDParam(snapshot.ownerPCR0), kms.KeyID()); err != nil {
 				return verifiedState{}, fmt.Errorf("failed to commit genesis KMS key ID: %w", err)
 			}
 		}
@@ -495,6 +483,13 @@ func validateStaticSecretNames(metadata []StaticSecretMetadata) error {
 // stateRoot returns the canonical state_root over one immutable snapshot. It
 // performs no external reads.
 func stateRoot(snapshot persistedStateSnapshot) ([]byte, error) {
+	// The KMSKeyID path is PCR0-scoped and its name is part of the hashed
+	// pre-image, so a missing owner would silently yield a root the counterpart
+	// cannot reproduce. Fail loudly instead.
+	if snapshot.ownerPCR0 == "" {
+		return nil, fmt.Errorf("state_root: snapshot has no owner PCR0")
+	}
+
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
@@ -502,7 +497,7 @@ func stateRoot(snapshot persistedStateSnapshot) ([]byte, error) {
 
 	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+3)
 	arts = append(arts, ssmArtifactV1{
-		Name: kmsKeyIDParam(), Value: snapshot.kmsKeyID,
+		Name: kmsKeyIDParam(snapshot.ownerPCR0), Value: snapshot.kmsKeyID,
 	})
 	arts = append(arts, ssmArtifactV1{
 		Name: migrationIntentBucketParam(), Value: snapshot.migrationIntentBucketName,
@@ -598,9 +593,9 @@ type ssmArtifactV1 struct {
 }
 
 // stateRootInputV1 is the state_root pre-image. Migration provenance is
-// deliberately excluded: the predecessor params are overwritten on every
-// migration attempt, so committing to them would brick an enclave's own receipt
-// on reboot — the handoff is authenticated by the transition receipt instead.
+// deliberately excluded: the transition receipt is an attestation signed by the
+// predecessor, and verifyPredecessorCommitment checks its PCR0 and PCR31
+// directly, which binds the handoff more strongly than a hash in user_data would.
 type stateRootInputV1 struct {
 	Schema       string          `cbor:"schema"`
 	SSMArtifacts []ssmArtifactV1 `cbor:"ssm_artifacts"`

@@ -532,9 +532,10 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 
 	ctx := context.Background()
+	ownPCR0 := strings.Repeat("ab", 48)
 	ssm := NewSSM(&fakeSSM{params: map[string]string{
-		migrationPreviousPCR0Param():            "previous",
-		migrationPreviousPCR0AttestationParam(): "attestation",
+		migrationPreviousPCR0Param(ownPCR0):            "previous",
+		migrationPreviousPCR0AttestationParam(ownPCR0): "attestation",
 	}})
 	signer, err := NewAttestedSigner()
 	require.NoError(t, err)

@@ -19,9 +19,6 @@ import (
 type RuntimeState interface {
 	Ready() bool
 	NotifyReady()
-	NotifyHalt()
-	Halt() <-chan struct{}
-	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
@@ -242,10 +239,6 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		_ = child.Stop()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 
-	case <-rt.Halt():
-		slog.Info("received halt circuit-breaker")
-		return waitForRuntime(ctx, rt, child)
-
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
 			_ = child.Stop()
@@ -287,9 +280,6 @@ type runtimeState struct {
 	isReady         atomic.Bool
 	isExit          atomic.Bool
 	exitError       atomic.Value
-	rollbackHalt    atomic.Bool
-	haltOnce        sync.Once
-	haltCh          chan struct{}
 	tlsReadyOnce    sync.Once
 	tlsCertCallback TLSCertCallback
 	tlsReadyCh      chan struct{}
@@ -303,21 +293,6 @@ func (r *runtimeState) Ready() bool {
 
 func (r *runtimeState) NotifyReady() {
 	r.isReady.Store(true)
-}
-
-func (r *runtimeState) NotifyHalt() {
-	r.rollbackHalt.Store(true)
-	r.haltOnce.Do(func() {
-		close(r.haltCh)
-	})
-}
-
-func (r *runtimeState) Halt() <-chan struct{} {
-	return r.haltCh
-}
-
-func (r *runtimeState) Halted() bool {
-	return r.rollbackHalt.Load()
 }
 
 func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
@@ -371,7 +346,6 @@ func (r *runtimeState) ChildDone() <-chan error {
 
 func newRuntimeState() *runtimeState {
 	return &runtimeState{
-		haltCh:      make(chan struct{}),
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),

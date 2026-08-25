@@ -89,36 +89,6 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	}
 }
 
-func TestSuperviseHaltWaitsForRuntime(t *testing.T) {
-	rt := &observableRuntimeState{
-		runtimeState: newRuntimeState(),
-		listenCalls:  make(chan struct{}, 2),
-	}
-	app := &fakeAppProcess{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	rt.NotifyHalt()
-
-	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app) }()
-
-	waitTestSignal(t, rt.listenCalls)
-	waitTestSignal(t, rt.listenCalls)
-	cancel()
-
-	if err := waitTestResult(t, done); err != nil {
-		t.Fatalf("supervise error = %v, want nil", err)
-	}
-	// The halt breaker leaves the app running, so shutdown must stop it.
-	if app.stops != 1 {
-		t.Fatalf("Stop calls = %d, want 1", app.stops)
-	}
-	if !rt.Halted() {
-		t.Fatalf("Halted() = false, want true")
-	}
-}
-
 func TestWaitForRuntimeStopsChildOnCauseCancel(t *testing.T) {
 	rt := newRuntimeState()
 	app := &fakeAppProcess{}

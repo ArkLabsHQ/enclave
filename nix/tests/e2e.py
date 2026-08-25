@@ -15,6 +15,17 @@ def cloud(command):
     return aws.succeed(f"{CLOUD} {command}").strip()
 
 
+def key_param(pcr0):
+    return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
+
+
+def get_param(name):
+    status, out = aws.execute(
+        f"{CLOUD} ssm get-parameter --name {name} --query Parameter.Value --output text"
+    )
+    return out.strip() if status == 0 else ""
+
+
 def put_env(name, value):
     cloud(
         f"ssm put-parameter --name /dev/testapp/env/{name} "
@@ -186,11 +197,10 @@ status, out = enclave_curl(blue, BLUE_PCR0)
 assert status == 0, out
 assert "WARNING" in out, out
 
-key_param = "/dev/testapp/unlocked/KMSKeyID"
-genesis_key = cloud(
-    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
-)
+genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")
+# Green's commit pointer is created by blue at finalise; it must not exist yet.
+assert get_param(key_param(GREEN_PCR0)) == ""
 
 # Exercise both the hard-step and PI-servo paths against the real /dev/ptp0.
 host_ts = int(blue.succeed("date +%s").strip())
@@ -319,29 +329,31 @@ blue.wait_until_succeeds(
 )
 
 finalise_response_valid = False
-migration_key = genesis_key
+migration_key = ""
 finalise_output = ""
+committed = False
 for attempt in range(30):
-    finalise_status, finalise_output = blue.execute(
-        "rm -f /tmp/finalise-migration.json; "
-        "curl --fail-with-body -sS -H 'Content-Type: application/json' "
-        f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
-        "--output /tmp/finalise-migration.json "
-        "http://127.0.0.1:8003/finalise-migration"
-    )
-    response_status, _ = blue.execute(
-        f"jq -e --arg p '{BLUE_PCR0}' "
-        "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
-        "/tmp/finalise-migration.json"
-    )
-    if finalise_status == 0 and response_status == 0:
-        finalise_response_valid = True
-    if finalise_status == 0 or attempt % 3 == 2:
-        migration_key = cloud(
-            f"ssm get-parameter --name {key_param} "
-            "--query Parameter.Value --output text"
+    if not committed:
+        finalise_status, finalise_output = blue.execute(
+            "rm -f /tmp/finalise-migration.json; "
+            "curl --fail-with-body -sS -H 'Content-Type: application/json' "
+            f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
+            "--output /tmp/finalise-migration.json "
+            "http://127.0.0.1:8003/finalise-migration"
         )
-        if migration_key != genesis_key:
+        response_status, _ = blue.execute(
+            f"jq -e --arg p '{BLUE_PCR0}' "
+            "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
+            "/tmp/finalise-migration.json"
+        )
+        if finalise_status == 0 and response_status == 0:
+            finalise_response_valid = True
+        # Finalising is not idempotent: once it commits, a retry is a 409. Stop
+        # POSTing and just wait for the pointer to be readable.
+        committed = finalise_status == 0
+    if committed or attempt % 3 == 2:
+        migration_key = get_param(key_param(GREEN_PCR0))
+        if migration_key != "":
             break
     time.sleep(1)
 else:
@@ -356,7 +368,27 @@ if finalise_response_valid:
         "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
         "/tmp/finalise-migration.json"
     )
+assert migration_key not in ("", "UNSET", "None")
 assert migration_key != genesis_key
+# The handoff writes only into green's scope: blue's pointer is untouched, which
+# is what lets blue keep serving and reboot without any rollback machinery.
+assert get_param(key_param(BLUE_PCR0)) == genesis_key
+# Blue is genesis-born, so its own lineage is unchanged by having finalised.
+blue.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "| jq -e '.previous_pcr0 == \"genesis\"'"
+)
+# The migration key admits green alone: blue can write under it but not read.
+aws.succeed(
+    f"{CLOUD} kms get-key-policy --key-id {migration_key} --policy-name default "
+    "--query Policy --output text > /tmp/migration-key-policy.json"
+)
+aws.succeed(
+    f"jq -e --arg g {shlex.quote(GREEN_PCR0)} "
+    "'[.Statement[].Condition.StringEqualsIgnoreCase"
+    '."kms:RecipientAttestation:PCR0"] | map(select(. != null)) | flatten '
+    "| . == [$g]' /tmp/migration-key-policy.json"
+)
 
 # ACME settings are loaded once at boot, so blue remains self-signed.
 put_env("ENCLAVE_NITRIDING_USE_ACME", "true")
@@ -442,6 +474,21 @@ green.succeed("systemctl restart enclave-start")
 wait_healthy(green)
 assert served_leaf_sha(green) == leaf_sha_before
 status, out = enclave_curl(green, GREEN_PCR0)
+assert status == 0, out
+
+# Blue reboots onto its own untouched key long after handing off to green. This
+# is what makes rollback machinery unnecessary: a failed successor is survived by
+# leaving the predecessor running, and the predecessor is always restartable.
+blue.succeed("kill $(cat /run/enclave-qemu.pid)")
+blue.succeed("systemctl restart enclave-start")
+wait_healthy(blue)
+assert secret_value(blue) == blue_secret
+assert get_param(key_param(BLUE_PCR0)) == genesis_key
+blue.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "| jq -e '.previous_pcr0 == \"genesis\"'"
+)
+status, out = enclave_curl(blue, BLUE_PCR0)
 assert status == 0, out
 
 wait_healthy(blue)

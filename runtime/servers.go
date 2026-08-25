@@ -322,8 +322,11 @@ func migrationHTTPStatus(err error) int {
 		return http.StatusTooEarly
 	case errors.Is(err, errMigrationIntentAbsent),
 		errors.Is(err, errMigrationIntentAborted),
-		errors.Is(err, errMigrationIntentAlreadyRequested):
+		errors.Is(err, errMigrationIntentAlreadyRequested),
+		errors.Is(err, errMigrationAlreadyFinalised):
 		return http.StatusConflict
+	case errors.Is(err, errMigrationIntentSelfTarget):
+		return http.StatusBadRequest
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
 		return http.StatusServiceUnavailable
 	default:

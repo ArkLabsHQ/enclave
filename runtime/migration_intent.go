@@ -37,6 +37,10 @@ var (
 	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
+	errMigrationIntentSelfTarget       = errors.New(
+		"migration intent: target PCR0 is this enclave",
+	)
+	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
 )
 
 type migrationIntentV1 struct {
@@ -120,6 +124,11 @@ func (l *migrationIntentLog) Request(
 	sourcePCR0, err := l.sourcePCR0()
 	if err != nil {
 		return nil, err
+	}
+	// A self-targeted handoff would overwrite this enclave's own commit pointer
+	// and would satisfy the PCR31 check trivially.
+	if strings.EqualFold(targetPCR0, sourcePCR0) {
+		return nil, errMigrationIntentSelfTarget
 	}
 	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {

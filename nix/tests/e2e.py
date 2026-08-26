@@ -7,7 +7,8 @@ import time
 
 CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
 FQDN = "enclave.test"
-STORAGE_BUCKET = "enclave-e2e-storage"
+CERT_BUCKET = "enclave-e2e-certificates"
+LEASE_BUCKET = "enclave-e2e-leases"
 INTENT_BUCKET = "enclave-e2e-migration-intent"
 CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
@@ -55,7 +56,7 @@ def kms_key_count():
 
 def cert_etag():
     return cloud(
-        f"s3api head-object --bucket {STORAGE_BUCKET} --key {CERT_KEY} "
+        f"s3api head-object --bucket {CERT_BUCKET} --key {CERT_KEY} "
         "--query ETag --output text"
     )
 
@@ -173,7 +174,8 @@ aws.wait_until_succeeds(
 )
 
 # Create only the AWS resources consumed by the runtime.
-cloud(f"s3api create-bucket --bucket {STORAGE_BUCKET}")
+cloud(f"s3api create-bucket --bucket {CERT_BUCKET}")
+cloud(f"s3api create-bucket --bucket {LEASE_BUCKET}")
 cloud(
     f"s3api create-bucket --bucket {INTENT_BUCKET} "
     "--object-lock-enabled-for-bucket"
@@ -183,8 +185,12 @@ cloud(
     "--versioning-configuration Status=Enabled"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/StorageBucketName "
-    f"--type String --value {STORAGE_BUCKET}"
+    "ssm put-parameter --name /dev/testapp/CertBucketName "
+    f"--type String --value {CERT_BUCKET}"
+)
+cloud(
+    "ssm put-parameter --name /dev/testapp/LeaseBucketName "
+    f"--type String --value {LEASE_BUCKET}"
 )
 cloud(
     "ssm put-parameter --name /dev/testapp/MigrationIntentBucketName "
@@ -227,7 +233,7 @@ assert "AWS Nitro enclave application" in leaf_subject, leaf_subject
 leaf_san = served_leaf(blue, "-noout -ext subjectAltName")
 assert f"DNS:{FQDN}" in leaf_san, leaf_san
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {STORAGE_BUCKET} "
+    f"s3api list-objects-v2 --bucket {CERT_BUCKET} "
     "--query 'Contents[].Key' --output text"
 )
 assert cache_keys in ("", "None"), cache_keys
@@ -478,12 +484,12 @@ status, _ = aws.execute(
 assert status != 0
 
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {STORAGE_BUCKET} "
+    f"s3api list-objects-v2 --bucket {CERT_BUCKET} "
     "--query 'Contents[].Key' --output text"
 ).split()
 assert sorted(cache_keys) == sorted([CERT_KEY, ACCOUNT_KEY]), cache_keys
 aws.succeed("rm -rf /tmp/tls-cache")
-cloud(f"s3 cp s3://{STORAGE_BUCKET} /tmp/tls-cache --recursive")
+cloud(f"s3 cp s3://{CERT_BUCKET} /tmp/tls-cache --recursive")
 _, pem_hits = aws.execute(
     "grep -rl 'BEGIN CERTIFICATE' /tmp/tls-cache 2>/dev/null; "
     "grep -rl 'PRIVATE KEY' /tmp/tls-cache 2>/dev/null; true"

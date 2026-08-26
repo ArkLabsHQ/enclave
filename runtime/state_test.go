@@ -87,7 +87,9 @@ func TestLoadUnverifiedState(t *testing.T) {
 			want:   startStateResume,
 		},
 		{
-			name: "without receipt fails", params: withKey(map[string]string{}), wantErr: "hasMigrationArtifacts = false",
+			name:    "without receipt fails",
+			params:  withKey(map[string]string{}),
+			wantErr: "hasMigrationArtifacts = false",
 		},
 		{
 			name:   "migration with transition receipt",
@@ -374,7 +376,9 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fake, ssm := stateOriginTestSSM(map[string]string{kmsKeyIDParam(): "UNSET"})
 	fake.putErrs = map[string]error{
-		stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0)): errors.New("receipt write failed"),
+		stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0)): errors.New(
+			"receipt write failed",
+		),
 	}
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	unverified, err := loadUnverifiedState(context.Background(), ssm, pcr0)

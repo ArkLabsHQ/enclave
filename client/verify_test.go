@@ -10,19 +10,16 @@ import (
 	"time"
 
 	"github.com/hf/nitrite"
+	"github.com/stretchr/testify/require"
 )
 
 // loadTestAttestation reads the real attestation document fixture.
 func loadTestAttestation(t *testing.T) []byte {
 	t.Helper()
 	b64, err := os.ReadFile("testdata/attestation.b64")
-	if err != nil {
-		t.Fatalf("read attestation fixture: %v", err)
-	}
+	require.NoError(t, err)
 	doc, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b64)))
-	if err != nil {
-		t.Fatalf("decode attestation base64: %v", err)
-	}
+	require.NoError(t, err)
 	return doc
 }
 
@@ -34,49 +31,27 @@ func TestVerifyRealAttestationDocument(t *testing.T) {
 		CurrentTime: time.Now(),
 	})
 	// Certificate may have expired but signature should be OK.
-	if result == nil {
-		t.Fatalf("nitrite.Verify returned nil result: %v", err)
-		return
-	}
-	if !result.SignatureOK {
-		t.Fatalf("attestation signature not OK: %v", err)
-	}
-	if result.Document == nil {
-		t.Fatal("attestation document is nil")
-		return
-	}
+	require.NotNil(t, result, "nitrite.Verify failed: %v", err)
+	require.True(t, result.SignatureOK, "attestation signature not OK: %v", err)
+	require.NotNil(t, result.Document)
 
 	// Verify PCR0 matches expected value.
 	pcr0, ok := result.Document.PCRs[0]
-	if !ok {
-		t.Fatal("PCR0 not found in attestation document")
-	}
+	require.True(t, ok, "PCR0 not found in attestation document")
 	expectedPCR0 := "834837d8fdff29f35317acc40ba4e1e505b71a3cf7374ebba016a38e05c43784a01f0c1e88bf2b6174e4dbfc6f679ba9"
-	if !strings.EqualFold(hex.EncodeToString(pcr0), expectedPCR0) {
-		t.Fatalf("PCR0 mismatch: expected %s, got %s", expectedPCR0, hex.EncodeToString(pcr0))
-	}
+	require.Equal(t, expectedPCR0, hex.EncodeToString(pcr0))
 
 	// Verify nonce matches what we sent.
 	expectedNonce := "deadbeefcafebabe1234567890abcdef01020304"
-	if hex.EncodeToString(result.Document.Nonce) != expectedNonce {
-		t.Fatalf("nonce mismatch: expected %s, got %s", expectedNonce, hex.EncodeToString(result.Document.Nonce))
-	}
+	require.Equal(t, expectedNonce, hex.EncodeToString(result.Document.Nonce))
 
 	// Verify UserData is present (68 bytes for nitriding).
-	if len(result.Document.UserData) < 68 {
-		t.Fatalf("UserData too short: %d bytes", len(result.Document.UserData))
-	}
+	require.GreaterOrEqual(t, len(result.Document.UserData), 68)
 
 	// Verify mandatory fields.
-	if result.Document.ModuleID == "" {
-		t.Fatal("module_id is empty")
-	}
-	if result.Document.Digest != "SHA384" {
-		t.Fatalf("digest is %q, expected SHA384", result.Document.Digest)
-	}
-	if result.Document.Timestamp == 0 {
-		t.Fatal("timestamp is 0")
-	}
+	require.NotEmpty(t, result.Document.ModuleID)
+	require.Equal(t, "SHA384", result.Document.Digest)
+	require.NotZero(t, result.Document.Timestamp)
 }
 
 func TestVerifyAttestationRejectsTamperedDocument(t *testing.T) {
@@ -88,9 +63,7 @@ func TestVerifyAttestationRejectsTamperedDocument(t *testing.T) {
 	result, err := nitrite.Verify(doc, nitrite.VerifyOptions{
 		CurrentTime: time.Now(),
 	})
-	if err == nil && result != nil && result.SignatureOK {
-		t.Fatal("tampered document should not have a valid signature")
-	}
+	require.False(t, err == nil && result != nil && result.SignatureOK)
 }
 
 func TestSchnorrSignatureVerification(t *testing.T) {
@@ -101,9 +74,7 @@ func TestSchnorrSignatureVerification(t *testing.T) {
 	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
 
 	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	if err != nil {
-		t.Fatalf("Schnorr verification failed: %v", err)
-	}
+	require.NoError(t, err)
 }
 
 func TestSchnorrRejectsWrongBody(t *testing.T) {
@@ -112,7 +83,7 @@ func TestSchnorrRejectsWrongBody(t *testing.T) {
 	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
 
 	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	requireErrContains(t, err, "signature verification failed")
+	require.ErrorContains(t, err, "signature verification failed")
 }
 
 func TestSchnorrRejectsWrongPubkey(t *testing.T) {
@@ -122,7 +93,7 @@ func TestSchnorrRejectsWrongPubkey(t *testing.T) {
 	pubkeyHex := "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	requireErrContains(t, err, "signature verification failed")
+	require.ErrorContains(t, err, "signature verification failed")
 }
 
 func TestKeyBindingSigningKey(t *testing.T) {
@@ -131,19 +102,15 @@ func TestKeyBindingSigningKey(t *testing.T) {
 	result, _ := nitrite.Verify(doc, nitrite.VerifyOptions{
 		CurrentTime: time.Now(),
 	})
-	if result == nil || result.Document == nil {
-		t.Fatal("failed to verify attestation")
-	}
+	require.NotNil(t, result)
+	require.NotNil(t, result.Document)
 
 	userData := result.Document.UserData
-	if len(userData) < 68 {
-		t.Fatalf("UserData too short: %d", len(userData))
-	}
+	require.GreaterOrEqual(t, len(userData), 68)
 
 	// Check multihash prefix at offset 34.
-	if userData[34] != 0x12 || userData[35] != 0x20 {
-		t.Fatalf("bad multihash prefix at offset 34: %02x %02x", userData[34], userData[35])
-	}
+	require.Equal(t, byte(0x12), userData[34])
+	require.Equal(t, byte(0x20), userData[35])
 
 	signingKeyHash := userData[36:68]
 
@@ -155,24 +122,16 @@ func TestKeyBindingSigningKey(t *testing.T) {
 			break
 		}
 	}
-	if allZero {
-		t.Fatal("signingKeyHash is all zeros")
-	}
+	require.False(t, allZero, "signingKeyHash is all zeros")
 
 	// Verify SHA256(attestation_pubkey) matches signingKeyHash.
 	// The pubkey is from the enclave-info response.
 	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
 	pubkeyBytes, err := hex.DecodeString(pubkeyHex)
-	if err != nil {
-		t.Fatalf("decode pubkey: %v", err)
-	}
+	require.NoError(t, err)
 
 	expectedHash := sha256.Sum256(pubkeyBytes)
-	if string(expectedHash[:]) != string(signingKeyHash) {
-		t.Fatalf("signingKeyHash mismatch:\n  expected: %s\n  got:      %s",
-			hex.EncodeToString(expectedHash[:]),
-			hex.EncodeToString(signingKeyHash))
-	}
+	require.Equal(t, expectedHash[:], signingKeyHash)
 }
 
 func TestIsAllZeroHex(t *testing.T) {
@@ -184,9 +143,7 @@ func TestIsAllZeroHex(t *testing.T) {
 		"0000000000000000000000000000000a": false,
 	}
 	for in, want := range cases {
-		if got := isAllZeroHex(in); got != want {
-			t.Errorf("isAllZeroHex(%q) = %v, want %v", in, got, want)
-		}
+		require.Equal(t, want, isAllZeroHex(in), "input %q", in)
 	}
 }
 
@@ -196,22 +153,24 @@ func TestVerifyLeafCertPin(t *testing.T) {
 	good := hex.EncodeToString(sum[:])
 
 	// Match (case-insensitive).
-	if err := verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)); err != nil {
-		t.Fatalf("matching cert must pin: %v", err)
-	}
+	require.NoError(t, verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)))
 	// Mismatch.
-	if err := verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)); err == nil {
-		t.Fatal("mismatched fingerprint must be rejected")
-	}
+	require.ErrorContains(
+		t,
+		verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)),
+		"TLS cert fingerprint mismatch",
+	)
 	// No peer cert.
-	if err := verifyLeafCertPin(nil, good); err == nil {
-		t.Fatal("missing peer certificate must be rejected")
-	}
+	require.ErrorContains(t, verifyLeafCertPin(nil, good), "no peer certificate presented")
 	// Empty / all-zero expected hash (uninitialized binding).
-	if err := verifyLeafCertPin([][]byte{cert}, ""); err == nil {
-		t.Fatal("empty expected hash must be rejected")
-	}
-	if err := verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)); err == nil {
-		t.Fatal("all-zero expected hash must be rejected")
-	}
+	require.ErrorContains(
+		t,
+		verifyLeafCertPin([][]byte{cert}, ""),
+		"no attested TLS cert fingerprint",
+	)
+	require.ErrorContains(
+		t,
+		verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)),
+		"no attested TLS cert fingerprint",
+	)
 }

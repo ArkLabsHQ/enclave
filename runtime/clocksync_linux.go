@@ -115,7 +115,11 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 			return nil, fmt.Errorf("read current clocksource: %w", err)
 		}
 		if clocksource := strings.TrimSpace(string(data)); clocksource != wantClockSource {
-			return nil, fmt.Errorf("current clocksource is %q, want %q", clocksource, wantClockSource)
+			return nil, fmt.Errorf(
+				"current clocksource is %q, want %q",
+				clocksource,
+				wantClockSource,
+			)
 		}
 	}
 
@@ -145,7 +149,11 @@ func newClockSyncer() (*clockSyncer, error) {
 		return nil, fmt.Errorf("read PTP clock %s: %w", ptpDevicePath, err)
 	}
 	if err := clockGettime(unix.CLOCK_REALTIME, &sys); err == nil {
-		slog.Info("clock sync: initial offset before hard-step", "offset_ms", clockOffsetNsec(ptp, sys)/1_000_000)
+		slog.Info(
+			"clock sync: initial offset before hard-step",
+			"offset_ms",
+			clockOffsetNsec(ptp, sys)/1_000_000,
+		)
 	}
 	if err := clockSettime(unix.CLOCK_REALTIME, &ptp); err != nil {
 		_ = file.Close()
@@ -264,9 +272,17 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 	proportionalPpm := 0.0
 	nextIntegralPpm := cs.integralPpm
 	if correctingFreqPpm, ok := cs.frequencyErrorPpm(m); ok {
-		nextIntegralPpm = clampFloat(cs.integralPpm+cs.cfg.ki*correctingFreqPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+		nextIntegralPpm = clampFloat(
+			cs.integralPpm+cs.cfg.ki*correctingFreqPpm,
+			-cs.cfg.freqClampPpm,
+			cs.cfg.freqClampPpm,
+		)
 		proportionalPpm = cs.cfg.kp * correctingFreqPpm
-		applied = clampFloat(proportionalPpm+nextIntegralPpm, -cs.cfg.freqClampPpm, cs.cfg.freqClampPpm)
+		applied = clampFloat(
+			proportionalPpm+nextIntegralPpm,
+			-cs.cfg.freqClampPpm,
+			cs.cfg.freqClampPpm,
+		)
 	}
 
 	tx := unix.Timex{

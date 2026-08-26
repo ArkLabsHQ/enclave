@@ -24,7 +24,7 @@ type acmeStorageCache struct {
 }
 
 func NewAcmeStorageCache(ctx context.Context, s3 S3API, dek DEK, ssm SSM) (autocert.Cache, error) {
-	bucketParam := fmt.Sprintf("/%s/%s/StorageBucketName", getDeployment(), getAppName())
+	bucketParam := fmt.Sprintf("/%s/%s/TLSCacheBucketName", getDeployment(), getAppName())
 	bucketName, err := ssm.MustGet(ctx, bucketParam)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get storage bucket name SSM param: %w", err)
@@ -96,5 +96,5 @@ func (c *acmeStorageCache) Delete(ctx context.Context, key string) error {
 }
 
 func prefixAcmeCacheKey(key string) string {
-	return getDeployment() + "/" + getAppName() + acmeStoragePrefix + key
+	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + key
 }

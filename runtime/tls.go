@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -34,6 +34,22 @@ const (
 )
 
 type TLSCertCallback func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
+// withDefaultSNI fills a missing server name so IP/loopback probes reach the
+// same cert source as named clients. autocert rejects an empty ServerName.
+func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
+	if fqdn == "" {
+		return next
+	}
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if hello.ServerName != "" {
+			return next(hello)
+		}
+		h := *hello
+		h.ServerName = fqdn
+		return next(&h)
+	}
+}
 
 func ConfigureTLS(
 	ctx context.Context,
@@ -73,7 +89,10 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 		return nil
 	}
 
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_FQDN", func(val string) { cfg.FQDN = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_FQDN",
+		func(val string) { cfg.FQDN = val },
+	); err != nil {
 		return err
 	}
 	if err := loadSSMOverride("ENCLAVE_NITRIDING_USE_ACME", func(val string) {
@@ -86,10 +105,16 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	}); err != nil {
 		return err
 	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_EMAIL", func(val string) { cfg.ACMEEmail = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_ACME_EMAIL",
+		func(val string) { cfg.ACMEEmail = val },
+	); err != nil {
 		return err
 	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_CA", func(val string) { cfg.ACMECA = val }); err != nil {
+	if err := loadSSMOverride(
+		"ENCLAVE_NITRIDING_ACME_CA",
+		func(val string) { cfg.ACMECA = val },
+	); err != nil {
 		return err
 	}
 

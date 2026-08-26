@@ -104,7 +104,6 @@ func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
 func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_ANCHOR_WINDOW", "10h")
 	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
 	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
 	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "10h")
@@ -154,7 +153,6 @@ func TestApplyEnvOverrides(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, ssmFor(map[string]string{
 			path("ENCLAVE_DEPLOYMENT"):                 "dev",
 			path("ENCLAVE_APP_NAME"):                   "evil",
-			path("ENCLAVE_ANCHOR_WINDOW"):              "1s",
 			path("ENCLAVE_KMS_KEY_LOCKED"):             "false",
 			path("ENCLAVE_MIGRATION_COOLDOWN"):         "0s",
 			path("ENCLAVE_MIGRATION_INTENT_RETENTION"): "1s",
@@ -165,7 +163,6 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "prod", os.Getenv("ENCLAVE_DEPLOYMENT"))
 		require.Equal(t, "myapp", os.Getenv("ENCLAVE_APP_NAME"))
-		require.Equal(t, "10h", os.Getenv("ENCLAVE_ANCHOR_WINDOW"))
 		require.Equal(t, "true", os.Getenv("ENCLAVE_KMS_KEY_LOCKED"))
 		require.Equal(t, "1m", os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
 		require.Equal(t, "10h", os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION"))

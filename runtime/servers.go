@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )
@@ -45,7 +45,6 @@ var (
 
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
-	StartRESPServer(ctx context.Context, resp RESPServer) error
 	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
 	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
 }
@@ -115,7 +114,7 @@ func SetupHttpServers(
 	ext := &http.Server{
 		Handler: metricsMW(attestationMW(em)),
 		TLSConfig: &tls.Config{
-			GetCertificate: certCallback(rt, cfg),
+			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
 			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
 		},
@@ -161,7 +160,12 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	}()
 
 	go func() {
-		if err := s.ext.ServeTLS(public, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.ext.ServeTLS(
+			public,
+			"",
+			"",
+		); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
 			s.rt.NotifyListenerError(fmt.Errorf("public listener: %w", err))
 		}
 	}()
@@ -170,34 +174,6 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 		<-ctx.Done()
 		_ = s.int.Close()
 		_ = s.ext.Close()
-	}()
-
-	return nil
-}
-
-func (s *servers) StartRESPServer(ctx context.Context, resp RESPServer) error {
-	port := respPort()
-	addr := fmt.Sprintf(":%d", port)
-
-	raw, err := net.Listen("tcp", addr)
-	if err != nil {
-		slog.Error("RESP listener bind failed", "addr", addr, "error", err)
-		return err
-	}
-
-	lis := tls.NewListener(raw, s.ext.TLSConfig)
-	slog.Info("starting RESP listener", "addr", addr)
-
-	go func() {
-		<-ctx.Done()
-		_ = lis.Close()
-	}()
-
-	go func() {
-		if err := resp.Serve(lis); err != nil && ctx.Err() == nil {
-			slog.Error("RESP listener exited", "error", err)
-			s.rt.NotifyListenerError(fmt.Errorf("RESP listener: %w", err))
-		}
 	}()
 
 	return nil
@@ -263,7 +239,11 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 func (s *servers) StartMigrationControlServer(ctx context.Context, migrator Migrator) error {
 	lis, err := vsock.Listen(migrationControlPort, nil)
 	if err != nil {
-		return fmt.Errorf("listen on migration control vsock port %d: %w", migrationControlPort, err)
+		return fmt.Errorf(
+			"listen on migration control vsock port %d: %w",
+			migrationControlPort,
+			err,
+		)
 	}
 
 	slog.Info("starting migration control listener", "vsock_port", migrationControlPort)
@@ -430,18 +410,14 @@ func withTokenAuth(token string, handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// certCallback fills missing SNI with cfg.FQDN so ACME works for IP/loopback probes.
-func certCallback(rt RuntimeState, cfg Config) TLSCertCallback {
+// certCallback blocks each handshake until the runtime's TLS cert source is
+// configured. SNI defaulting lives in withDefaultSNI, applied where the
+// post-SSM-override FQDN is final.
+func certCallback(rt RuntimeState) TLSCertCallback {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		getCert, err := rt.GetTLSCertCallback(hello.Context())
 		if err != nil {
 			return nil, nil
-		}
-
-		if hello.ServerName == "" && cfg.FQDN != "" {
-			h := *hello
-			h.ServerName = cfg.FQDN
-			return getCert(&h)
 		}
 		return getCert(hello)
 	}

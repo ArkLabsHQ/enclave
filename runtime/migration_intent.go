@@ -32,7 +32,9 @@ var (
 	errMigrationIntentAmbiguous        = errors.New("migration intent: ambiguous head")
 	errMigrationIntentAbsent           = errors.New("migration intent: absent")
 	errMigrationIntentAborted          = errors.New("migration intent: aborted")
-	errMigrationIntentAlreadyRequested = errors.New("migration intent: already requested, abort first")
+	errMigrationIntentAlreadyRequested = errors.New(
+		"migration intent: already requested, abort first",
+	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 )
@@ -194,10 +196,19 @@ func (l *migrationIntentLog) append(
 		ObjectLockRetainUntilDate: aws.Time(time.Now().Add(l.retention)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: put migration intent sequence %d: %w", errMigrationIntentStoreUnavailable, sequence, err)
+		return nil, fmt.Errorf(
+			"%w: put migration intent sequence %d: %w",
+			errMigrationIntentStoreUnavailable,
+			sequence,
+			err,
+		)
 	}
 	if out == nil || aws.ToString(out.VersionId) == "" {
-		return nil, fmt.Errorf("%w: put migration intent sequence %d: S3 returned no version ID", errMigrationIntentStoreUnavailable, sequence)
+		return nil, fmt.Errorf(
+			"%w: put migration intent sequence %d: S3 returned no version ID",
+			errMigrationIntentStoreUnavailable,
+			sequence,
+		)
 	}
 
 	head, tie, err := l.deriveHead(ctx, sourcePCR0)
@@ -208,7 +219,11 @@ func (l *migrationIntentLog) append(
 		return nil, errMigrationIntentAmbiguous
 	}
 	if head == nil || head.Sequence < sequence {
-		return nil, fmt.Errorf("%w: migration intent sequence %d missing after write", errMigrationIntentStoreUnavailable, sequence)
+		return nil, fmt.Errorf(
+			"%w: migration intent sequence %d missing after write",
+			errMigrationIntentStoreUnavailable,
+			sequence,
+		)
 	}
 
 	return head, nil
@@ -240,13 +255,18 @@ func (l *migrationIntentLog) deriveHead(
 			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("%w: list migration intents: %w", errMigrationIntentStoreUnavailable, err)
+			return nil, false, fmt.Errorf(
+				"%w: list migration intents: %w",
+				errMigrationIntentStoreUnavailable,
+				err,
+			)
 		}
 		for _, version := range out.Versions {
 			key := aws.ToString(version.Key)
 			keySourcePCR0, sequence, ok := parseMigrationIntentObjectKey(key)
 			versionID := aws.ToString(version.VersionId)
-			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || version.LastModified == nil {
+			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" ||
+				version.LastModified == nil {
 				continue
 			}
 			nextHead, valid, err := l.fetchIntent(
@@ -275,7 +295,10 @@ func (l *migrationIntentLog) deriveHead(
 			return head, tie, nil
 		}
 		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return nil, false, fmt.Errorf("%w: list migration intents: truncated response missing markers", errMigrationIntentStoreUnavailable)
+			return nil, false, fmt.Errorf(
+				"%w: list migration intents: truncated response missing markers",
+				errMigrationIntentStoreUnavailable,
+			)
 		}
 		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
 	}
@@ -293,12 +316,24 @@ func (l *migrationIntentLog) fetchIntent(
 		VersionId: aws.String(versionID),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: get migration intent %q version %q: %w", errMigrationIntentStoreUnavailable, key, versionID, err)
+		return nil, false, fmt.Errorf(
+			"%w: get migration intent %q version %q: %w",
+			errMigrationIntentStoreUnavailable,
+			key,
+			versionID,
+			err,
+		)
 	}
 	defer func() { _ = out.Body.Close() }()
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: read migration intent %q version %q: %w", errMigrationIntentStoreUnavailable, key, versionID, err)
+		return nil, false, fmt.Errorf(
+			"%w: read migration intent %q version %q: %w",
+			errMigrationIntentStoreUnavailable,
+			key,
+			versionID,
+			err,
+		)
 	}
 	entry, err := decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||
@@ -314,7 +349,12 @@ func (l *migrationIntentLog) fetchIntent(
 		TargetPCR0: entry.TargetPCR0,
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("encode migration intent %q version %q: %w", key, versionID, err)
+		return nil, false, fmt.Errorf(
+			"encode migration intent %q version %q: %w",
+			key,
+			versionID,
+			err,
+		)
 	}
 	if err := l.nsm.VerifyAttestation(
 		entry.Attestation,

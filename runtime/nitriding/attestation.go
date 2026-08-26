@@ -20,9 +20,12 @@ const (
 )
 
 var (
-	errBadForm           = "failed to parse POST form data"
-	errNoNonce           = "could not find nonce in URL query parameters"
-	errBadNonceFormat    = fmt.Sprintf("unexpected nonce format; must be %d-digit hex string", nonceNumDigits)
+	errBadForm        = "failed to parse POST form data"
+	errNoNonce        = "could not find nonce in URL query parameters"
+	errBadNonceFormat = fmt.Sprintf(
+		"unexpected nonce format; must be %d-digit hex string",
+		nonceNumDigits,
+	)
 	errFailedAttestation = "failed to obtain attestation document from hypervisor"
 	errProfilingSet      = "attestation disabled because profiling is enabled"
 

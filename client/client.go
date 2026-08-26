@@ -71,17 +71,6 @@ type Options struct {
 	// tests where the emulated NSM doesn't produce an AWS-rooted ECDSA384
 	// signature. Never set this against a real production enclave.
 	InsecureSkipCOSEVerify bool
-
-	// VerifyProvenance enables GitHub artifact attestation verification
-	// for the deployment manifest. When true, NewFromManifest checks that
-	// deployment.json has a valid build provenance attestation from GitHub
-	// Actions, proving it was produced by CI — not manually uploaded.
-	// Requires the repo to be public, or GitHubToken to be set for private repos.
-	VerifyProvenance bool
-
-	// GitHubToken is an optional GitHub API token for verifying attestations
-	// on private repositories. Not needed for public repos.
-	GitHubToken string
 }
 
 // Response wraps an HTTP response with attestation verification metadata.
@@ -242,7 +231,11 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	if attestResult.AttestationKey != "" {
 		sigHex := resp.Header.Get("X-Attestation-Signature")
 		if sigHex != "" {
-			if err := verifySchnorrSignature(body, sigHex, attestResult.AttestationKey); err == nil {
+			if err := verifySchnorrSignature(
+				body,
+				sigHex,
+				attestResult.AttestationKey,
+			); err == nil {
 				sigVerified = true
 			}
 		}
@@ -278,7 +271,13 @@ func (c *Client) ensureVerified(ctx context.Context) (*AttestationResult, error)
 // verify performs full attestation verification and caches the result.
 func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 	// 1. Bootstrap over the unpinned client (carries no secrets).
-	nitResult, err := fetchAndVerifyAttestation(ctx, c.bootstrapClient, c.baseURL, c.opts.ExpectedPCR0, c.opts.InsecureSkipCOSEVerify)
+	nitResult, err := fetchAndVerifyAttestation(
+		ctx,
+		c.bootstrapClient,
+		c.baseURL,
+		c.opts.ExpectedPCR0,
+		c.opts.InsecureSkipCOSEVerify,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +304,12 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 			return nil, fmt.Errorf("PCR%d not found in attestation document", pcrIndex)
 		}
 		if !strings.EqualFold(actual, expectedHash) {
-			return nil, fmt.Errorf("PCR%d mismatch: expected %s, got %s", pcrIndex, expectedHash, actual)
+			return nil, fmt.Errorf(
+				"PCR%d mismatch: expected %s, got %s",
+				pcrIndex,
+				expectedHash,
+				actual,
+			)
 		}
 	}
 
@@ -350,7 +354,6 @@ type Manifest struct {
 	PCR2      string `json:"pcr2"`
 	Timestamp string `json:"timestamp"`
 	Commit    string `json:"commit"`
-	Repo      string `json:"repo"`
 }
 
 // ManifestURL returns the GitHub Releases URL for a repo's deployment manifest.
@@ -367,72 +370,62 @@ func ManifestURL(repo, tag string) string {
 //
 //	m, err := client.FetchManifest(ctx, client.ManifestURL("myorg/my-app", "latest"))
 func FetchManifest(ctx context.Context, manifestURL string) (*Manifest, error) {
-	m, _, err := fetchManifestRaw(ctx, manifestURL)
-	return m, err
-}
-
-// fetchManifestRaw fetches manifest and returns both parsed struct and raw bytes.
-func fetchManifestRaw(ctx context.Context, manifestURL string) (*Manifest, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fetch manifest: %w", err)
+		return nil, fmt.Errorf("fetch manifest: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, nil, fmt.Errorf("manifest status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf(
+			"manifest status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read manifest: %w", err)
+		return nil, fmt.Errorf("read manifest: %w", err)
 	}
 
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, nil, fmt.Errorf("decode manifest: %w", err)
+		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 
 	if m.BaseURL == "" {
-		return nil, nil, fmt.Errorf("manifest missing base_url")
+		return nil, fmt.Errorf("manifest missing base_url")
 	}
 	if m.PCR0 == "" {
-		return nil, nil, fmt.Errorf("manifest missing pcr0")
+		return nil, fmt.Errorf("manifest missing pcr0")
 	}
 
-	return &m, raw, nil
+	return &m, nil
 }
 
 // NewFromManifest creates a client by fetching deployment metadata from a URL.
 // The manifest provides the enclave's base URL and PCR0, so callers only need
 // to know the manifest endpoint. Additional options (ExpectedPCRs, CacheTTL)
 // can be set to augment verification.
-//
-// When opts.VerifyProvenance is true, verifies that the manifest has a valid
-// GitHub artifact attestation before trusting its PCR values.
 func NewFromManifest(ctx context.Context, manifestURL string, opts Options) (*Client, error) {
-	m, raw, err := fetchManifestRaw(ctx, manifestURL)
+	m, err := FetchManifest(ctx, manifestURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest: %w", err)
 	}
 
-	if opts.VerifyProvenance {
-		if m.Repo == "" {
-			return nil, fmt.Errorf("manifest missing repo field, cannot verify provenance")
-		}
-		if err := VerifyManifestProvenance(ctx, m.Repo, raw, opts.GitHubToken); err != nil {
-			return nil, fmt.Errorf("manifest provenance: %w", err)
-		}
-	}
-
 	if opts.ExpectedPCR0 != "" && !strings.EqualFold(opts.ExpectedPCR0, m.PCR0) {
-		return nil, fmt.Errorf("manifest PCR0 %s does not match expected %s", m.PCR0, opts.ExpectedPCR0)
+		return nil, fmt.Errorf(
+			"manifest PCR0 %s does not match expected %s",
+			m.PCR0,
+			opts.ExpectedPCR0,
+		)
 	}
 	opts.ExpectedPCR0 = m.PCR0
 

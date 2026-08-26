@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCertCallback(t *testing.T) {
+func TestWithDefaultSNI(t *testing.T) {
 	cert := tlsTestCertificate(t)
 	for _, tc := range []struct {
 		name, sni, wantSNI string
@@ -26,12 +26,14 @@ func TestCertCallback(t *testing.T) {
 		{"other server name is left untouched", "other.example", "other.example"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt := newRuntimeState()
 			delegated := make(chan string, 1)
-			rt.SetTLSCertCallback(func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				delegated <- h.ServerName
-				return &cert, nil
-			})
+			getCert := withDefaultSNI(
+				"enclave.test",
+				func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					delegated <- h.ServerName
+					return &cert, nil
+				},
+			)
 
 			serverConn, clientConn := net.Pipe()
 			deadline := time.Now().Add(time.Second)
@@ -42,7 +44,7 @@ func TestCertCallback(t *testing.T) {
 			go func() {
 				server := tls.Server(
 					serverConn,
-					&tls.Config{GetCertificate: certCallback(rt, Config{FQDN: "enclave.test"})},
+					&tls.Config{GetCertificate: getCert},
 				)
 				serverDone <- server.Handshake()
 				_ = server.Close()
@@ -62,6 +64,16 @@ func TestCertCallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWithDefaultSNINoFQDNLeavesSNIUntouched(t *testing.T) {
+	var got string
+	cb := withDefaultSNI("", func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		got = h.ServerName
+		return nil, nil
+	})
+	_, _ = cb(&tls.ClientHelloInfo{})
+	require.Empty(t, got)
 }
 
 func tlsTestCertificate(t *testing.T) tls.Certificate {

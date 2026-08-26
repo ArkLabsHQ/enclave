@@ -9,7 +9,7 @@ import (
 )
 
 func checkFdLimit(t *testing.T, cur, max uint64) {
-	var rLimit = new(syscall.Rlimit)
+	rLimit := new(syscall.Rlimit)
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, rLimit); err != nil {
 		t.Fatalf("Failed to get file descriptor limit: %s", err)
 	}

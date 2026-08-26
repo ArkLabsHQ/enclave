@@ -19,55 +19,6 @@ import (
 	"github.com/hf/nitrite"
 )
 
-// VerifyManifestProvenance checks that a deployment manifest has a valid
-// GitHub artifact attestation, proving it was produced by a GitHub Actions
-// workflow — not manually uploaded. It calls the GitHub Attestations API
-// with the SHA256 digest of the manifest bytes.
-//
-// For public repos, token can be empty. For private repos, pass a GitHub
-// token with attestations:read permission.
-func VerifyManifestProvenance(ctx context.Context, repo string, manifestBytes []byte, token string) error {
-	digest := sha256.Sum256(manifestBytes)
-	digestStr := fmt.Sprintf("sha256:%x", digest)
-
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/attestations/%s", repo, digestStr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("attestations API: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("attestations API status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var result struct {
-		Attestations []json.RawMessage `json:"attestations"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode attestations: %w", err)
-	}
-
-	if len(result.Attestations) == 0 {
-		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
-	}
-
-	return nil
-}
-
 // enclaveInfoResponse is the JSON structure returned by /v1/enclave-info.
 type enclaveInfoResponse struct {
 	Version           string `json:"version"`
@@ -84,7 +35,12 @@ type enclaveInfoResponse struct {
 // check is bypassed (the document is parsed manually). PCR0 and nonce checks
 // still run. Used for local QEMU tests where the emulated NSM doesn't sign
 // with AWS Nitro keys.
-func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, baseURL, expectedPCR0 string, insecureSkipCOSEVerify bool) (*nitrite.Result, error) {
+func fetchAndVerifyAttestation(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL, expectedPCR0 string,
+	insecureSkipCOSEVerify bool,
+) (*nitrite.Result, error) {
 	// Generate a random nonce to prevent replay attacks.
 	nonce := make([]byte, 20)
 	if _, err := rand.Read(nonce); err != nil {
@@ -106,7 +62,11 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("attestation status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf(
+			"attestation status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
 
 	payload, err := io.ReadAll(resp.Body)
@@ -176,7 +136,11 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 		return nil, fmt.Errorf("attestation missing PCR0")
 	}
 	if !strings.EqualFold(hex.EncodeToString(pcr0), expectedPCR0) {
-		return nil, fmt.Errorf("PCR0 mismatch: expected %s, got %s", expectedPCR0, hex.EncodeToString(pcr0))
+		return nil, fmt.Errorf(
+			"PCR0 mismatch: expected %s, got %s",
+			expectedPCR0,
+			hex.EncodeToString(pcr0),
+		)
 	}
 
 	return result, nil
@@ -242,7 +206,11 @@ func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
 	}
 	got := sha256.Sum256(rawCerts[0])
 	if !strings.EqualFold(hex.EncodeToString(got[:]), expectedHashHex) {
-		return fmt.Errorf("TLS cert fingerprint mismatch: expected %s, got %x", expectedHashHex, got[:])
+		return fmt.Errorf(
+			"TLS cert fingerprint mismatch: expected %s, got %x",
+			expectedHashHex,
+			got[:],
+		)
 	}
 	return nil
 }
@@ -250,20 +218,25 @@ func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
 // verifyKeyBinding verifies the enclave's ephemeral attestation key by
 // checking that the pubkey from /v1/enclave-info matches the signingKeyHash
 // in the attestation document's UserData.
-func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL string, attestResult *nitrite.Result) (string, error) {
+func verifyKeyBinding(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL string,
+	attestResult *nitrite.Result,
+) (string, error) {
 	if attestResult == nil || attestResult.Document == nil {
 		return "", fmt.Errorf("no attestation result to verify against")
 	}
 
 	const (
-		hashPrefix = "sha256:"
-		hashSep    = ";"
-		tlsStart   = len(hashPrefix)
-		tlsEnd     = tlsStart + 32
-		sepStart   = tlsEnd
-		sigKeyPrefix  = sepStart + len(hashSep)
-		sigKeyStart   = sigKeyPrefix + len(hashPrefix)
-		sigKeyEnd     = sigKeyStart + 32
+		hashPrefix   = "sha256:"
+		hashSep      = ";"
+		tlsStart     = len(hashPrefix)
+		tlsEnd       = tlsStart + 32
+		sepStart     = tlsEnd
+		sigKeyPrefix = sepStart + len(hashSep)
+		sigKeyStart  = sigKeyPrefix + len(hashPrefix)
+		sigKeyEnd    = sigKeyStart + 32
 	)
 
 	userData := attestResult.Document.UserData
@@ -272,13 +245,27 @@ func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL stri
 		return "", nil
 	}
 	if !bytes.Equal(userData[:tlsStart], []byte(hashPrefix)) {
-		return "", fmt.Errorf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(userData[:tlsStart]))
+		return "", fmt.Errorf(
+			"UserData missing %q prefix at offset 0 (got %q)",
+			hashPrefix,
+			string(userData[:tlsStart]),
+		)
 	}
 	if string(userData[sepStart:sigKeyPrefix]) != hashSep {
-		return "", fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:sigKeyPrefix]))
+		return "", fmt.Errorf(
+			"UserData missing %q separator at offset %d (got %q)",
+			hashSep,
+			sepStart,
+			string(userData[sepStart:sigKeyPrefix]),
+		)
 	}
 	if !bytes.Equal(userData[sigKeyPrefix:sigKeyStart], []byte(hashPrefix)) {
-		return "", fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, sigKeyPrefix, string(userData[sigKeyPrefix:sigKeyStart]))
+		return "", fmt.Errorf(
+			"UserData missing %q prefix at offset %d (got %q)",
+			hashPrefix,
+			sigKeyPrefix,
+			string(userData[sigKeyPrefix:sigKeyStart]),
+		)
 	}
 	signingKeyHash := userData[sigKeyStart:sigKeyEnd]
 
@@ -355,7 +342,11 @@ func verifySchnorrSignature(body []byte, sigHex, attestPubkeyHex string) error {
 }
 
 // fetchEnclaveInfo fetches the /v1/enclave-info endpoint.
-func fetchEnclaveInfo(ctx context.Context, httpClient *http.Client, baseURL string) (*enclaveInfoResponse, error) {
+func fetchEnclaveInfo(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL string,
+) (*enclaveInfoResponse, error) {
 	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
 	if err != nil {

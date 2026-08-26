@@ -99,7 +99,6 @@ func FetchOrCreatePrimaryKMS(
 			otherPCR0Bytes, err := hex.DecodeString(otherPCR0)
 			if err != nil {
 				return nil, fmt.Errorf("failed decode other admitted PCR0: %w", err)
-
 			}
 			// verify the rollback-from PCR0 was committed to in the migration attestation
 			if err := nsm.VerifyAttestation(migrationAttest, map[uint]string{

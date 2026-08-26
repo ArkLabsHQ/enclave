@@ -14,7 +14,7 @@ func TestACMEStorageCache(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "acme_cache")
 
 	const bucketName = "cert-bucket"
-	bucketParam := "/unittest/acme_cache/StorageBucketName"
+	bucketParam := "/unittest/acme_cache/TLSCacheBucketName"
 	ctx := context.Background()
 
 	newCache := func(t *testing.T) (*acmeStorageCache, *fakeS3) {
@@ -31,6 +31,12 @@ func TestACMEStorageCache(t *testing.T) {
 	t.Run("loads bucket from SSM", func(t *testing.T) {
 		c, _ := newCache(t)
 		require.Equal(t, bucketName, c.bucket)
+	})
+
+	t.Run("key layout", func(t *testing.T) {
+		require.Equal(t,
+			"unittest/acme_cache/data/acme/example.com",
+			prefixAcmeCacheKey("example.com"))
 	})
 
 	t.Run("get miss", func(t *testing.T) {

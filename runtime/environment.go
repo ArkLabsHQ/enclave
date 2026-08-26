@@ -17,7 +17,6 @@ import (
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":                 true,
 	"ENCLAVE_APP_NAME":                   true,
-	"ENCLAVE_ANCHOR_WINDOW":              true,
 	"ENCLAVE_KMS_KEY_LOCKED":             true,
 	"ENCLAVE_MIGRATION_COOLDOWN":         true,
 	"ENCLAVE_MIGRATION_INTENT_RETENTION": true,
@@ -169,27 +168,6 @@ func verifyClockSourceEnabled() bool {
 	return strings.EqualFold(
 		strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE")), "true",
 	)
-}
-
-// respPort is the TLS port for the RESP K/V listener.
-func respPort() uint16 {
-	if s := strings.TrimSpace(os.Getenv("ENCLAVE_KV_RESP_PORT")); s != "" {
-		if n, err := strconv.ParseUint(s, 10, 16); err == nil {
-			return uint16(n)
-		}
-	}
-	return 6379
-}
-
-// anchorWindow is the Object-Lock retain-until duration set on each anchor
-// object. Defaults to ~10 years.
-func anchorWindow() time.Duration {
-	if s := strings.TrimSpace(os.Getenv("ENCLAVE_ANCHOR_WINDOW")); s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
-	}
-	return 10 * 365 * 24 * time.Hour
 }
 
 func logBufferSize() int {

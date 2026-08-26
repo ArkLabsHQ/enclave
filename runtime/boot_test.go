@@ -809,7 +809,12 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 
 	planned, err := boot.Plan(ctx)
 	require.NoError(t, err)
-	require.IsType(t, &genesisBoot{}, planned.mode, "holding the lease means genesis is still ours to do")
+	require.IsType(
+		t,
+		&genesisBoot{},
+		planned.mode,
+		"holding the lease means genesis is still ours to do",
+	)
 	require.NoError(t, lease.Release(context.Background()))
 }
 

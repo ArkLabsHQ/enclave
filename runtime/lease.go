@@ -181,7 +181,9 @@ func (l *Lease) heartbeat() {
 			l.cancel(fmt.Errorf("%w: %s", ErrLeaseLost, l.key))
 			return
 		case l.lapsed():
-			l.cancel(fmt.Errorf("%w: %s: heartbeat failed past expiry: %w", ErrLeaseLost, l.key, err))
+			l.cancel(
+				fmt.Errorf("%w: %s: heartbeat failed past expiry: %w", ErrLeaseLost, l.key, err),
+			)
 			return
 		default:
 			slog.Warn("lease heartbeat failed, retrying", "key", l.key, "error", err)

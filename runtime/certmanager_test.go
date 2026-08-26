@@ -92,7 +92,10 @@ func newCertTestStore(s3f *fakeS3) *certStore {
 	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 }
 
-func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, *AttestationHashes, error) {
+func tryNewCertTestManager(
+	s3f *fakeS3,
+	issuer certIssuer,
+) (*certManager, *AttestationHashes, error) {
 	hashes := &AttestationHashes{}
 	m, err := newCertManager(
 		context.Background(), newCertTestStore(s3f), issuer,
@@ -101,7 +104,11 @@ func tryNewCertTestManager(s3f *fakeS3, issuer certIssuer) (*certManager, *Attes
 	return m, hashes, err
 }
 
-func newCertTestManager(t *testing.T, s3f *fakeS3, issuer certIssuer) (*certManager, *AttestationHashes) {
+func newCertTestManager(
+	t *testing.T,
+	s3f *fakeS3,
+	issuer certIssuer,
+) (*certManager, *AttestationHashes) {
 	t.Helper()
 	m, hashes, err := tryNewCertTestManager(s3f, issuer)
 	require.NoError(t, err)
@@ -319,7 +326,8 @@ func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	ctx := context.Background()
 
-	require.Equal(t,
+	require.Equal(
+		t,
 		attestedHash([sha256.Size]byte{}),
 		(&AttestationHashes{}).Serialize(),
 	)

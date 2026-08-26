@@ -75,13 +75,25 @@ type bootMode interface {
 
 	// buildSnapshot produces the artifacts the state_root is computed over —
 	// created and persisted for genesis, already loaded for everyone else.
-	buildSnapshot(ctx context.Context, state *bootState, kms PrimaryKMS, ssm SSM) (bootSnapshot, error)
+	buildSnapshot(
+		ctx context.Context,
+		state *bootState,
+		kms PrimaryKMS,
+		ssm SSM,
+	) (bootSnapshot, error)
 
 	// verifySnapshot proves the snapshot came from an enclave we accept.
 	verifySnapshot(state *bootState, nsm NSM, snapshotRoot []byte) error
 
 	// commitSnapshot records what this boot established, if anything.
-	commitSnapshot(ctx context.Context, state *bootState, nsm NSM, ssm SSM, kms PrimaryKMS, snapshotRoot []byte) error
+	commitSnapshot(
+		ctx context.Context,
+		state *bootState,
+		nsm NSM,
+		ssm SSM,
+		kms PrimaryKMS,
+		snapshotRoot []byte,
+	) error
 }
 
 type genesisBoot struct {
@@ -213,7 +225,6 @@ func (b *Boot) determineMode(ctx context.Context, state *bootState) (bootMode, e
 	}
 
 	state.migrationReceipt, err = b.ssm.MayGet(ctx, migrationStateOriginReceiptParam(keyID))
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
 	}
@@ -239,7 +250,9 @@ func (b *resumeBoot) verify(nsm NSM, state *bootState) error {
 
 func (b *migrationBoot) verify(nsm NSM, state *bootState) error {
 	if state.predecessorPCR0 == "" {
-		return fmt.Errorf("no state-origin receipt for this PCR0 and no predecessor to migrate from")
+		return fmt.Errorf(
+			"no state-origin receipt for this PCR0 and no predecessor to migrate from",
+		)
 	}
 	if state.migrationReceipt == "" {
 		return fmt.Errorf("predecessor artifacts present but no migration transition receipt")
@@ -338,7 +351,8 @@ func (b *Boot) loadPredecessor(ctx context.Context) (pcr0, attestation string, e
 	if (pcr0 != "") != (attestation != "") {
 		return "", "", fmt.Errorf(
 			"inconsistent migration predecessor artifacts (pcr0 present=%v, attestation present=%v)",
-			pcr0 != "", attestation != "",
+			pcr0 != "",
+			attestation != "",
 		)
 	}
 	return pcr0, attestation, nil
@@ -494,7 +508,14 @@ func (b *genesisBoot) commitSnapshot(
 }
 
 // A resumed boot establishes nothing new; its receipt already exists.
-func (b *resumeBoot) commitSnapshot(context.Context, *bootState, NSM, SSM, PrimaryKMS, []byte) error {
+func (b *resumeBoot) commitSnapshot(
+	context.Context,
+	*bootState,
+	NSM,
+	SSM,
+	PrimaryKMS,
+	[]byte,
+) error {
 	return nil
 }
 

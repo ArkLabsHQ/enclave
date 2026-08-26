@@ -167,9 +167,9 @@ On startup the runtime reads SSM and selects one of three paths.
 | `KMSKeyID` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
 
 Boot order is fixed and every step is fatal: clock synchronisation against
-`/dev/ptp0`, networking, AWS clients, telemetry, attestation signer, HTTP
-servers, state establishment, PCR extension, migration control server, TLS, SSM
-environment overlay, static secret export, then exec of the application.
+`/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
+establishment, PCR extension, migration control server, TLS, SSM environment
+overlay, static secret export, then exec of the application.
 
 ## Nix API
 
@@ -379,16 +379,16 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 ### External listener, TCP :443
 
-TLS 1.2 minimum. Every non-gRPC response carries `X-Attestation-Signature` and
-`X-Attestation-Pubkey`, a BIP-340 Schnorr signature over the SHA-256 of the
-response body. `/v1/*` responses also carry permissive CORS headers.
+TLS 1.2 minimum. HTTP and gRPC clients authenticate the enclave by verifying its
+PCRs and pinning the live TLS leaf to the hash in the attestation document.
+`/v1/*` responses also carry permissive CORS headers.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS leaf DER. |
 | GET | `/enclave` | none | Human-readable index. |
 | GET | `/enclave/config` | none | Effective runtime configuration as JSON. |
-| GET | `/v1/enclave-info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
+| GET | `/v1/enclave-info` | none | Version, PCR0, predecessor PCR0 and attestation, migration status, application status. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | GET | `/v1/enclave-metrics` | none | Metric snapshot. |
 | GET | `/v1/enclave-logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
@@ -544,7 +544,7 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, TLS pin, key binding, and response signature are still verified. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
@@ -558,8 +558,8 @@ enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 ```
 
-The CLI exits non-zero if the response signature is missing or invalid, and if
-the HTTP status is 400 or above.
+The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
+status is 400 or above.
 
 ### Go client
 
@@ -580,11 +580,6 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Do, Get, and Post report signature failure through this field rather than
-// returning an error. Callers must check it.
-if !resp.SignatureVerified {
-    log.Fatal("enclave response signature missing or invalid")
-}
 if resp.StatusCode >= 400 {
     log.Fatalf("HTTP %d: %s", resp.StatusCode, resp.Body)
 }
@@ -600,7 +595,6 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
-| `SkipKeyBinding` | `false` | Skips signing-key binding, and therefore response signature verification. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
 | `InsecureTLS` | unset | Removes the certificate pin entirely. |
 
@@ -611,19 +605,16 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| TLS leaf certificate SHA-256 matches the value in the attestation `user_data` | on | `InsecureTLS` |
+| `user_data` is exactly `sha256:` plus the raw 32-byte TLS leaf SHA-256, and the live certificate matches it | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
-| Attestation public key hashes to the `user_data` signing key hash | on | `SkipKeyBinding` |
-| Per-response Schnorr signature over the body | on | `SkipKeyBinding` |
 
 The certificate pin is installed from the attestation document before any
 request carrying data is made, so a request issued before verification completes
 fails closed.
 
-`GRPCConn` pins the leaf certificate but does not perform public CA validation
-and carries no per-response signature, because gRPC bypasses the response
-signing middleware. Applications serving gRPC must set
+`GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
+but does not perform public CA validation. Applications serving gRPC must set
 `ENCLAVE_NITRIDING_UPSTREAM=h2c`.
 
 ## Testing
@@ -737,10 +728,9 @@ overridden from SSM.
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is
 running, not that it is running your code.
 
-**Callers must check `Response.SignatureVerified`.** `Get`, `Post`, and `Do`
-return successfully when the response signature is absent or invalid, and report
-it through that field. The CLI treats it as a fatal error; library consumers
-should do the same.
+**HTTP and gRPC trust the attested TLS channel.** The client verifies the Nitro
+attestation and PCRs before sending application requests, then pins the live TLS
+leaf to the exact hash carried in `user_data`.
 
 **Never manage `KMSKeyID` with deployment tooling.** Its absence selects the
 genesis path, and the runtime rewrites it as the final step of every state

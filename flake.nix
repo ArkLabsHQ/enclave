@@ -65,7 +65,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-/LPCpvpa1869AaFWPQAZNOmdIFPe8ZoQqLHwPXcifcA=";
+                  vendorHash = "sha256-UpYTFzOGPnETUaftmz0SwC/gDKbeUWj5zeYULCAsyf8=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"

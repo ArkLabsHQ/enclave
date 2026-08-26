@@ -13,16 +13,13 @@ import (
 
 // GRPCConn returns a *grpc.ClientConn whose TLS handshake pins the
 // enclave's leaf cert fingerprint to the value embedded in the NSM
-// attestation document's user_data. The attestation chain (PCR0,
-// optional secret PCRs, attestation key binding) is verified before
-// the connection is established and the result is cached for the
+// attestation document's user_data. PCR0 and optional secret PCRs are verified
+// before the connection is established, and the result is cached for the
 // configured CacheTTL.
 //
-// Native gRPC requests bypass the framework's response-signing
-// middleware, so per-response Schnorr verification is not available
-// over this transport. Trust is established at TLS handshake time
-// instead: a wrong PCR0 or a TLS cert that does not match the
-// attestation's tlsKeyHash makes the handshake fail.
+// HTTP and gRPC use the same trust model: verified Nitro attestation plus a TLS
+// handshake pinned to its leaf hash. A wrong PCR0 or mismatched certificate
+// makes the connection fail.
 //
 // Usage:
 //

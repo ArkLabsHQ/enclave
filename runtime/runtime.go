@@ -75,13 +75,6 @@ func Run(ctx context.Context, cfg Config) error {
 
 	hashes := &AttestationHashes{}
 
-	attestationSigner, err := NewAttestedSigner()
-	if err != nil {
-		return fmt.Errorf("failed to create attestation signer: %w", err)
-	}
-
-	hashes.SetSigningKeyHash(attestationSigner.PubkeyHash())
-
 	authToken, err := generateRuntimeToken()
 	if err != nil {
 		return fmt.Errorf("generate runtime token: %w", err)
@@ -98,7 +91,6 @@ func Run(ctx context.Context, cfg Config) error {
 		metrics,
 		logging,
 		tracing,
-		attestationSigner,
 		hashes,
 		authToken,
 	)

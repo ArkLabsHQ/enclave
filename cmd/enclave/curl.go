@@ -26,9 +26,9 @@ func newCurlCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "curl <path>",
 		Short: "Make an attestation-verified request",
-		Long: `Verifies the enclave's Nitro attestation and PCR0, binds the live TLS
-certificate to the attestation document, then makes the requested call. The
-response must carry a valid enclave response signature.
+		Long: `Verifies the enclave's Nitro attestation and PCR0, pins the live TLS
+certificate to the leaf hash in the attestation document, then makes the
+requested call over that authenticated connection.
 
 Use /v1/enclave-info for runtime, status, and migration information.`,
 		Args: cobra.ExactArgs(1),
@@ -125,14 +125,11 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 	if err != nil {
 		return fmt.Errorf("verified request: %w", err)
 	}
-	if !resp.SignatureVerified {
-		return fmt.Errorf("enclave response signature was missing or invalid")
-	}
 
 	if opts.verbose {
 		fmt.Fprintf(
 			os.Stderr,
-			"< %d (PCR0, attestation key, TLS pin, and response signature verified)\n",
+			"< %d (PCR0 and attested TLS pin verified)\n",
 			resp.StatusCode,
 		)
 	}

@@ -83,12 +83,9 @@ func (f *fakeIssuer) Issue(context.Context, string) ([]byte, []byte, error) {
 	return certPEM, keyPEM, nil
 }
 
-// attestedHash is user_data for a leaf before a response-signing key is set.
+// attestedHash is the user_data payload for a leaf: the prefix plus its SHA-256.
 func attestedHash(leaf [sha256.Size]byte) []byte {
-	payload := append([]byte(hashPrefix), leaf[:]...)
-	payload = append(payload, hashSeparator...)
-	payload = append(payload, hashPrefix...)
-	return append(payload, make([]byte, sha256.Size)...)
+	return append([]byte(hashPrefix), leaf[:]...)
 }
 
 func newCertTestStore(s3f *fakeS3) *certStore {

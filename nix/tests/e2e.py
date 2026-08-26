@@ -42,8 +42,8 @@ def served_leaf_sha(node):
 
 
 def enclave_curl(node, pcr0, path="/health"):
-    # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, TLS pin,
-    # key binding, and the response signature remain verified.
+    # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
+    # 39-byte TLS binding, and live certificate pinning remain checked.
     return node.execute(
         f"enclave curl {path} --base-url https://127.0.0.1 "
         f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify 2>&1"

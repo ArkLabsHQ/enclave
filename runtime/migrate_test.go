@@ -411,6 +411,7 @@ func TestCompleteMigration(t *testing.T) {
 		_, err := fx.m.CompleteMigration(ctx)
 
 		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
+		require.NotContains(t, err.Error(), "delete")
 		// The guard runs before PCR31 and before any key is minted, so a refusal
 		// leaves the successor's committed generation exactly as it was.
 		require.Equal(t, "already-committed", fx.ssmf.params[kmsKeyIDParam(newPCR0)])

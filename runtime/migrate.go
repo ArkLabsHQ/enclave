@@ -237,10 +237,9 @@ func (m *migrator) CompleteMigration(
 	}
 	if existing != "" {
 		return nil, fmt.Errorf(
-			"%w: %s already holds %s; delete it to re-run this handoff deliberately",
+			"%w: %s already has a committed generation",
 			errMigrationAlreadyFinalised,
 			kmsKeyIDParam(targetPCR0),
-			existing,
 		)
 	}
 

@@ -19,19 +19,6 @@ func (a *fakeAppProcess) Stop() error {
 	return a.err
 }
 
-type observableRuntimeState struct {
-	*runtimeState
-	listenCalls chan struct{}
-}
-
-func (r *observableRuntimeState) ListenError() <-chan error {
-	select {
-	case r.listenCalls <- struct{}{}:
-	default:
-	}
-	return r.runtimeState.ListenError()
-}
-
 func TestSuperviseContextDoneStopsApp(t *testing.T) {
 	rt := newRuntimeState()
 	want := errors.New("stop failed")

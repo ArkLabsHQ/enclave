@@ -485,7 +485,7 @@ let
         };
         serviceConfig = {
           Type = "simple";
-          ExecStart = "${testPebble}/bin/pebble -config ${pebbleFixtures}/pebble-config.json -strict false -dnsserver 127.0.0.1:8053";
+          ExecStart = "${testPebble}/bin/pebble -config ${pebbleFixtures}/pebble-config.json -strict=false -dnsserver 127.0.0.1:8053";
           Restart = "on-failure";
         };
       };

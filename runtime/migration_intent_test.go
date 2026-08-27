@@ -38,6 +38,8 @@ func newMigrationIntentFixtureWithRetention(
 	retention string,
 ) *migrationIntentFixture {
 	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "intent")
 	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", retention)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
@@ -594,3 +596,109 @@ func mustMigrationIntentPayload(
 }
 
 var _ S3API = (*migrationIntentPagedS3)(nil)
+
+// Genesis records share the head chain with handoffs. Nothing downstream may
+// mistake one for a pending migration.
+func TestGenesisRecordIsNotAPendingMigration(t *testing.T) {
+	ctx := context.Background()
+	fx := newMigrationIntentFixture(t)
+
+	genesis, err := fx.log.Genesis(ctx)
+	require.NoError(t, err)
+	require.Equal(t, migrationIntentGenesis, genesis.Action)
+	require.Equal(t, uint64(1), genesis.Sequence)
+	require.Equal(t, fx.source, genesis.TargetPCR0, "genesis names its own creator")
+
+	// Zero cooldown is the case that would otherwise report eligible immediately.
+	require.Equal(t, migrationStateNone, migrationStatusAt(genesis, 0, time.Now()).State)
+
+	_, err = fx.log.Abort(ctx)
+	require.ErrorIs(t, err, errMigrationIntentAbsent, "there is no handoff to abort")
+
+	// A real migration still follows, continuing the sequence.
+	target := strings.Repeat("cd", 48)
+	requested, err := fx.log.Request(ctx, target)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), requested.Sequence)
+	require.Equal(t, migrationStateEligible, migrationStatusAt(requested, 0, time.Now()).State)
+}
+
+func TestGenesisIsRecordedOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	fx := newMigrationIntentFixture(t)
+
+	_, err := fx.log.Genesis(ctx)
+	require.NoError(t, err)
+
+	_, err = fx.log.Genesis(ctx)
+	require.ErrorContains(t, err, "cannot record genesis")
+
+	_, err = fx.log.Request(ctx, strings.Repeat("cd", 48))
+	require.NoError(t, err)
+	_, err = fx.log.Genesis(ctx)
+	require.ErrorContains(t, err, "cannot record genesis")
+}
+
+func TestGenesisRecordedIgnoresNonGenesisRecords(t *testing.T) {
+	ctx := context.Background()
+	fx := newMigrationIntentFixture(t)
+
+	recorded, err := fx.log.GenesisRecorded(ctx)
+	require.NoError(t, err)
+	require.False(t, recorded, "an empty log is a deployment that does not exist yet")
+
+	// A successor's first record is also sequence 1, so the sequence alone
+	// cannot stand in for the action.
+	_, err = fx.log.Request(ctx, strings.Repeat("cd", 48))
+	require.NoError(t, err)
+	recorded, err = fx.log.GenesisRecorded(ctx)
+	require.NoError(t, err)
+	require.False(t, recorded, "a handoff request is not a genesis")
+
+	other := strings.Repeat("ef", 48)
+	fx.s3.putRawObject(
+		migrationIntentObjectKey(other, 1),
+		fx.object(t, 1, migrationIntentGenesis, other, migrationIntentTestBucket, fx.pcr0),
+	)
+	recorded, err = fx.log.GenesisRecorded(ctx)
+
+	require.NoError(t, err)
+	require.True(t, recorded)
+}
+
+func TestMigrationIntentBucketNameDerivation(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "wallet")
+	name := migrationIntentBucketName("123456789012")
+
+	require.Regexp(t, `^enclave-123456789012-[0-9a-f]{16}-migration-intents$`, name)
+	require.LessOrEqual(t, len(name), 63, "S3 bucket names cap at 63 characters")
+	require.Equal(t, name, migrationIntentBucketName("123456789012"), "must be stable")
+
+	// The account is what keeps two accounts off the same globally unique name.
+	require.NotEqual(t, name, migrationIntentBucketName("210987654321"))
+
+	t.Run("distinct per application", func(t *testing.T) {
+		t.Setenv("ENCLAVE_APP_NAME", "vault")
+		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
+	})
+
+	t.Run("distinct per deployment", func(t *testing.T) {
+		t.Setenv("ENCLAVE_DEPLOYMENT", "staging")
+		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
+	})
+
+	t.Run("survives names S3 would reject", func(t *testing.T) {
+		t.Setenv("ENCLAVE_DEPLOYMENT", "Prod_EU_West")
+		t.Setenv("ENCLAVE_APP_NAME", strings.Repeat("long", 40))
+		long := migrationIntentBucketName("123456789012")
+		require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, long)
+		require.LessOrEqual(t, len(long), 63)
+	})
+
+	t.Run("separator prevents identity collisions", func(t *testing.T) {
+		t.Setenv("ENCLAVE_DEPLOYMENT", "prodwal")
+		t.Setenv("ENCLAVE_APP_NAME", "let")
+		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
+	})
+}

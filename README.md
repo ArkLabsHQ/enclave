@@ -155,16 +155,26 @@ under a KMS key that only the measured enclave can use.
   genesis and at migration finalisation. It is the atomic commit point: its
   value selects which generation of ciphertexts is live. It must never be
   managed by deployment tooling.
+- Genesis is recorded in the Object-Locked migration intent log immediately
+  before that commit, so the fact that a deployment exists outlives any SSM
+  parameter.
 
 ### Boot paths
 
-On startup the runtime reads SSM and selects one of three paths.
+Whether a deployment already exists is decided by the Object-Locked migration
+intent log, not by SSM. Genesis writes a `genesis` record immediately before
+committing `KMSKeyID`, and it cannot be deleted for the length of the Object Lock
+retention, so "this deployment has been created" is a fact no host can retract.
+`KMSKeyID` is still the atomic commit point; it is no longer the thing that
+decides the boot path.
 
 | Condition | Path | Behaviour |
 |---|---|---|
-| `KMSKeyID` absent, empty, or `UNSET` | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis` and no predecessor artifacts. Creates the key, generates the DEK and secrets, writes a state-origin receipt, then commits `KMSKeyID`. |
+| intent log empty | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis`, no predecessor artifacts, and no committed `KMSKeyID`. Creates the key, generates the DEK and secrets, writes a state-origin receipt, records genesis in the log, then commits `KMSKeyID`. |
 | `KMSKeyID` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
 | `KMSKeyID` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
+| genesis recorded, `KMSKeyID` absent | fatal | Either the parameter was deleted or a genesis died between its record and the commit. The two are indistinguishable, so both fail closed: restore the parameter rather than re-creating the deployment. |
+| log empty, `KMSKeyID` present | fatal | The intent log was wiped or the bucket repointed. |
 
 Boot order is fixed and every step is fatal: clock synchronisation against
 `/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
@@ -365,7 +375,6 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | Path | Written by | Purpose |
 |---|---|---|
 | `/D/A/TLSCacheBucketName` | operator | ACME certificate cache bucket. |
-| `/D/A/MigrationIntentBucketName` | operator | Object-Locked intent log bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
 | `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
@@ -448,22 +457,30 @@ interfaces.
 
 ### AWS requirements
 
-Create a private S3 bucket for the ACME cache and a separate private S3 bucket
-for migration intents. The intent bucket must have versioning and Object Lock
-enabled when it is created; the runtime applies retention to each intent object.
-Write their names to these SSM parameters:
+Create a private S3 bucket for the ACME cache and write its name to
+`/<deployment>/<app>/TLSCacheBucketName`.
+
+The migration intent bucket is **not** configured. Its name is derived, so no
+parameter a host can rewrite decides where the genesis record is looked for:
 
 ```text
-/<deployment>/<app>/TLSCacheBucketName
-/<deployment>/<app>/MigrationIntentBucketName
+enclave-<account-id>-<sha256(deployment \x00 app)[:8]>-migration-intents
 ```
+
+Provisioning must create exactly that bucket, with versioning and Object Lock
+enabled at creation, before the enclave first boots; the runtime only reads and
+writes it. The digest keeps the name inside S3's 63-character limit and its
+character rules whatever the deployment and application are called, and the
+account ID keeps two AWS accounts off the same globally unique name. One bucket
+per deployment/application falls out of the derivation, so no application's
+genesis record can veto another's.
 
 AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
 | `S3TLSCacheReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the TLS cache bucket. |
-| `S3MigrationIntentLogObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the intent log bucket. |
+| `S3MigrationIntentLogObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent log bucket. Grant no `s3:CreateBucket`: the runtime must never create it, or a boot that cannot find the deployment could manufacture an empty one. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |
 | `STSAccess` | `GetCallerIdentity`. |
@@ -732,10 +749,42 @@ running, not that it is running your code.
 attestation and PCRs before sending application requests, then pins the live TLS
 leaf to the exact hash carried in `user_data`.
 
-**Never manage `KMSKeyID` with deployment tooling.** Its absence selects the
-genesis path, and the runtime rewrites it as the final step of every state
-transition. A declaratively managed value would fight the runtime and could roll
-a live deployment back to a key that no longer decrypts anything.
+**Never manage `KMSKeyID` with deployment tooling.** The runtime rewrites it as
+the final step of every state transition. A declaratively managed value would
+fight the runtime and could roll a live deployment back to a key that no longer
+decrypts anything. Deleting it no longer causes a state fork — the intent log
+records that the deployment exists, so the boot fails instead of creating a
+second generation — but it still stops the deployment booting until it is
+restored.
+
+**Genesis is vetoed by presence, never authorised by it.** The deployment-wide
+scan looks for a `genesis` record and is deliberately unverified: a forged record
+can only stop a genesis — visible in the bucket, and recoverable — while treating
+an unverifiable one as absent would fail open and re-create a deployment that
+already exists. Permission to create a deployment comes from
+*absence*, which Object Lock Compliance retention makes impossible to
+manufacture. The scan reads the version listing rather than the current view,
+because Object Lock stops a version being erased but does not stop a delete
+marker hiding it.
+
+**The intent bucket is on the boot path.** An unreachable or unwritable bucket
+now fails the boot rather than only blocking migration. That is the intended
+trade: an enclave that cannot check whether the deployment exists must not guess.
+
+**Seed the log before adopting this on any existing deployment.** No runtime
+before this change wrote a `genesis` record, so *every* deployment created
+earlier lacks one — migrated or not. Create the derived bucket and write a
+`genesis` record for the running PCR0 into it before upgrading. Without the
+bucket the boot fails reading the log; with an empty one it reaches the genesis
+path, finds its committed `KMSKeyID`, and fails there.
+
+Existing intent records cannot be carried across. Each record's `bucket_name` is
+part of its attested pre-image, so one copied into the derived bucket no longer
+verifies and is skipped without an error — migration history restarts. The seeded
+record is unverifiable for the same reason, since only an enclave of that PCR0
+could sign one. That is enough for the genesis check, which is unverified by
+design, but the record never appears as a migration head, so the first real
+handoff is written at sequence 1 beside it.
 
 **Host credentials cannot read enclave state.** They grant `kms:CreateKey` but
 not `Decrypt`, `Encrypt`, or `GenerateDataKey`. Those are authorised by the

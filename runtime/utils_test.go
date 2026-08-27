@@ -199,6 +199,8 @@ func (f *fakeSSM) ListParams(_ context.Context, prefix string) ([]Param, error) 
 	return out, nil
 }
 
+const fakeSTSAccountID = "123456789012"
+
 type fakeSTS struct {
 	arn string
 	err error
@@ -214,9 +216,12 @@ func (f *fakeSTS) GetCallerIdentity(
 	}
 	arn := f.arn
 	if arn == "" {
-		arn = "arn:aws:iam::123456789012:role/enclave"
+		arn = "arn:aws:iam::" + fakeSTSAccountID + ":role/enclave"
 	}
-	return &sts.GetCallerIdentityOutput{Arn: aws.String(arn)}, nil
+	return &sts.GetCallerIdentityOutput{
+		Arn:     aws.String(arn),
+		Account: aws.String(fakeSTSAccountID),
+	}, nil
 }
 
 type fakeKMS struct {

@@ -162,6 +162,9 @@ func migrationStatusAt(
 	if head == nil {
 		return &MigrationStatus{State: migrationStateNone}
 	}
+	if head.Action == migrationIntentGenesis {
+		return &MigrationStatus{State: migrationStateNone, SourcePCR0: head.SourcePCR0}
+	}
 	publishedAt := head.PublishedAt
 	status := &MigrationStatus{
 		SourcePCR0:  head.SourcePCR0,

@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,7 @@ const (
 
 	migrationIntentRequested = "requested"
 	migrationIntentAborted   = "aborted"
+	migrationIntentGenesis   = "genesis"
 )
 
 var (
@@ -72,8 +74,11 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-func migrationIntentBucketParam() string {
-	return fmt.Sprintf("/%s/%s/MigrationIntentBucketName", getDeployment(), getAppName())
+
+func migrationIntentBucketName(accountID string) string {
+	identity := getDeployment() + "\x00" + getAppName()
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }
 
 func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
@@ -107,6 +112,74 @@ func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error)
 	}
 
 	return head, nil
+}
+
+func (l *migrationIntentLog) GenesisRecorded(ctx context.Context) (bool, error) {
+	var keyMarker, versionMarker *string
+	for {
+		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(l.bucket),
+			Prefix:          aws.String(migrationIntentPrefix),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			return false, fmt.Errorf(
+				"%w: list deployment intents: %w",
+				errMigrationIntentStoreUnavailable,
+				err,
+			)
+		}
+		for _, version := range out.Versions {
+			key := aws.ToString(version.Key)
+			versionID := aws.ToString(version.VersionId)
+			_, sequence, ok := parseMigrationIntentObjectKey(key)
+			// Genesis is the first record its creator writes, so no other
+			// sequence needs fetching.
+			if !ok || sequence != 1 || versionID == "" {
+				continue
+			}
+			// Unverified on purpose: presence only ever vetoes a genesis, so
+			// treating an unverifiable record as absent would fail open.
+			entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
+			if err != nil {
+				return false, err
+			}
+			if valid && entry.Action == migrationIntentGenesis {
+				return true, nil
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return false, nil
+		}
+		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
+			return false, fmt.Errorf(
+				"%w: list deployment intents: truncated response missing markers",
+				errMigrationIntentStoreUnavailable,
+			)
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+	}
+}
+
+// Genesis records that this enclave created the deployment, so no later boot can
+// claim genesis again.
+func (l *migrationIntentLog) Genesis(ctx context.Context) (*migrationIntent, error) {
+	sourcePCR0, err := l.sourcePCR0()
+	if err != nil {
+		return nil, err
+	}
+	head, _, err := l.deriveHead(ctx, sourcePCR0)
+	if err != nil {
+		return nil, err
+	}
+	if head != nil {
+		return nil, fmt.Errorf(
+			"cannot record genesis: intent log already holds a %q record at sequence %d",
+			head.Action, head.Sequence,
+		)
+	}
+	return l.append(ctx, sourcePCR0, 0, migrationIntentGenesis, sourcePCR0)
 }
 
 func (l *migrationIntentLog) Request(
@@ -149,6 +222,10 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error
 	}
 	if head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
+	}
+	if head.Action == migrationIntentGenesis {
+		// Aborting would file a record whose target is this enclave itself.
+		return nil, errMigrationIntentAbsent
 	}
 	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
 }
@@ -304,19 +381,21 @@ func (l *migrationIntentLog) deriveHead(
 	}
 }
 
-func (l *migrationIntentLog) fetchIntent(
+// readIntent returns one version if it is a well-formed record at the expected
+// sequence. It does not verify the attestation.
+func (l *migrationIntentLog) readIntent(
 	ctx context.Context,
-	key, versionID, sourcePCR0 string,
+	key, versionID string,
 	sequence uint64,
-	publishedAt time.Time,
-) (*migrationIntent, bool, error) {
+) (migrationIntentObjectV1, bool, error) {
+	var entry migrationIntentObjectV1
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:    aws.String(l.bucket),
 		Key:       aws.String(key),
 		VersionId: aws.String(versionID),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf(
+		return entry, false, fmt.Errorf(
 			"%w: get migration intent %q version %q: %w",
 			errMigrationIntentStoreUnavailable,
 			key,
@@ -327,7 +406,7 @@ func (l *migrationIntentLog) fetchIntent(
 	defer func() { _ = out.Body.Close() }()
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf(
+		return entry, false, fmt.Errorf(
 			"%w: read migration intent %q version %q: %w",
 			errMigrationIntentStoreUnavailable,
 			key,
@@ -335,11 +414,24 @@ func (l *migrationIntentLog) fetchIntent(
 			err,
 		)
 	}
-	entry, err := decodeMigrationIntentObject(body)
+	entry, err = decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||
-		(entry.Action != migrationIntentRequested && entry.Action != migrationIntentAborted) ||
+		!isMigrationIntentAction(entry.Action) ||
 		entry.Attestation == "" || !isCanonicalPCR0(entry.TargetPCR0) {
-		return nil, false, nil
+		return entry, false, nil
+	}
+	return entry, true, nil
+}
+
+func (l *migrationIntentLog) fetchIntent(
+	ctx context.Context,
+	key, versionID, sourcePCR0 string,
+	sequence uint64,
+	publishedAt time.Time,
+) (*migrationIntent, bool, error) {
+	entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
+	if err != nil || !valid {
+		return nil, false, err
 	}
 	payload, err := l.enc.Marshal(migrationIntentV1{
 		Schema:     entry.Schema,
@@ -403,6 +495,14 @@ func normalizePCR0(value string) (string, []byte, error) {
 		return "", nil, fmt.Errorf("must be valid hex")
 	}
 	return hex.EncodeToString(decoded), decoded, nil
+}
+
+func isMigrationIntentAction(action string) bool {
+	switch action {
+	case migrationIntentRequested, migrationIntentAborted, migrationIntentGenesis:
+		return true
+	}
+	return false
 }
 
 func isCanonicalPCR0(value string) bool {

@@ -257,7 +257,9 @@ func TestMigrationRequestValidate(t *testing.T) {
 
 func TestCompleteMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
-	const migrationIntentBucketName = "migration-intent-bucket"
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	migrationIntentBucketName := migrationIntentBucketName(fakeSTSAccountID)
 
 	oldPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
@@ -289,11 +291,12 @@ func TestCompleteMigration(t *testing.T) {
 			session:     session,
 			verifyRoots: session.attestationSign.roots,
 		}}
-		ssmf := &fakeSSM{params: map[string]string{
-			migrationIntentBucketParam(): migrationIntentBucketName,
-		}}
+		ssmf := &fakeSSM{params: map[string]string{}}
 		ssm := NewSSM(ssmf)
 		s3f := newFakeS3()
+		// Any deployment that reaches a migration was created by a genesis, and
+		// the successor's boot reads that record to know it exists.
+		seedGenesisRecord(t, s3f, oldPCR0Hex)
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
 		fx := &startMigrationFixture{
@@ -331,7 +334,6 @@ func TestCompleteMigration(t *testing.T) {
 
 	t.Run("happy path commits raw PCR0 and predecessor validates", func(t *testing.T) {
 		fx := setup(t)
-		fx.ssmf.params[migrationIntentBucketParam()] = "repointed-after-startup"
 		request(t, fx, newPCR0)
 
 		got, err := fx.m.CompleteMigration(ctx)
@@ -358,7 +360,6 @@ func TestCompleteMigration(t *testing.T) {
 		))
 		require.NotNil(t, fx.session.attestationRoots)
 
-		fx.ssmf.params[migrationIntentBucketParam()] = migrationIntentBucketName
 		newNSM := &nsmW{nsm: &fakeNSM{
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,

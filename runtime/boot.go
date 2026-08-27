@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	stscmd "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -31,6 +33,8 @@ const (
 	purposeMigrationTransition = "enclave.state_origin.migration_transition"
 
 	genesisLeaseName = "genesis"
+
+	migrationIntentBucketArtifact = "migration-intent-bucket"
 
 	// genesisLeaseWait bounds how long we queue behind a peer's genesis.
 	genesisLeaseWait = 10 * time.Minute
@@ -97,7 +101,8 @@ type bootMode interface {
 }
 
 type genesisBoot struct {
-	lease *Lease
+	lease  *Lease
+	intent *migrationIntentLog
 }
 
 type resumeBoot struct{}
@@ -138,9 +143,13 @@ func (b *Boot) Plan(ctx context.Context) (*plannedBoot, error) {
 	if err := validateStaticSecretNames(metadata); err != nil {
 		return nil, fmt.Errorf("invalid static secret metadata: %w", err)
 	}
-	migrationIntentBucketName, err := b.ssm.MustGet(ctx, migrationIntentBucketParam())
+	migrationIntentBucketName, err := b.migrationIntentBucket(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get migration intent bucket name: %w", err)
+		return nil, err
+	}
+	intent, err := newMigrationIntentLog(b.s3, b.nsm, migrationIntentBucketName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open migration intent log: %w", err)
 	}
 
 	predecessorPCR0, predecessorAttestation, err := b.loadPredecessor(ctx)
@@ -157,7 +166,7 @@ func (b *Boot) Plan(ctx context.Context) (*plannedBoot, error) {
 		},
 	}
 
-	mode, err := b.determineMode(ctx, &state)
+	mode, err := b.determineMode(ctx, &state, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -198,16 +207,28 @@ func (b *Boot) Finalise(ctx context.Context, planned *plannedBoot) (bootResult, 
 	return b.establish(ctx, planned, kms)
 }
 
-// determineMode loads what a committed key names — the params embed the key ID,
-// so with none committed there is nothing to read — and decides the mode.
-func (b *Boot) determineMode(ctx context.Context, state *bootState) (bootMode, error) {
+func (b *Boot) determineMode(
+	ctx context.Context, state *bootState, intent *migrationIntentLog,
+) (bootMode, error) {
+	genesisRecorded, err := intent.GenesisRecorded(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read deployment intent log: %w", err)
+	}
 	keyID, err := b.committedKeyID(ctx)
 	if err != nil {
 		return nil, err
 	}
 	state.kmsKeyID = keyID
+
+	if !genesisRecorded {
+		return &genesisBoot{intent: intent}, nil
+	}
+
 	if keyID == "" {
-		return &genesisBoot{}, nil
+		return nil, fmt.Errorf(
+			"deployment genesis is recorded but %s holds no key",
+			kmsKeyIDParam(),
+		)
 	}
 
 	state.bootReceipt, err = b.ssm.MayGet(ctx,
@@ -232,6 +253,12 @@ func (b *Boot) determineMode(ctx context.Context, state *bootState) (bootMode, e
 }
 
 func (b *genesisBoot) verify(nsm NSM, state *bootState) error {
+	if state.kmsKeyID != "" {
+		return fmt.Errorf(
+			"genesis boot with a committed KMS key: the intent log is empty but %s is set",
+			kmsKeyIDParam(),
+		)
+	}
 	if state.predecessorPCR0 != "" {
 		return fmt.Errorf("genesis state has predecessor artifacts")
 	}
@@ -356,6 +383,18 @@ func (b *Boot) loadPredecessor(ctx context.Context) (pcr0, attestation string, e
 		)
 	}
 	return pcr0, attestation, nil
+}
+
+func (b *Boot) migrationIntentBucket(ctx context.Context) (string, error) {
+	identity, err := b.sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
+	if err != nil {
+		return "", fmt.Errorf("sts get-caller-identity: %w", err)
+	}
+	accountID := aws.ToString(identity.Account)
+	if accountID == "" {
+		return "", fmt.Errorf("sts get-caller-identity returned no account ID")
+	}
+	return migrationIntentBucketName(accountID), nil
 }
 
 func (b *Boot) committedKeyID(ctx context.Context) (string, error) {
@@ -501,6 +540,13 @@ func (b *genesisBoot) commitSnapshot(
 			return fmt.Errorf("refusing to commit genesis: %w", err)
 		}
 	}
+
+	// Immediately before the key: a crash any earlier leaves an empty log and the
+	// next boot retries cleanly.
+	if _, err := b.intent.Genesis(ctx); err != nil {
+		return fmt.Errorf("failed to record genesis in the intent log: %w", err)
+	}
+
 	if err := ssm.Set(ctx, kmsKeyIDParam(), kms.KeyID()); err != nil {
 		return fmt.Errorf("failed to commit genesis KMS key ID: %w", err)
 	}
@@ -623,7 +669,7 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 		Name: kmsKeyIDParam(), Value: snapshot.kmsKeyID,
 	})
 	arts = append(arts, ssmArtifactV1{
-		Name: migrationIntentBucketParam(), Value: snapshot.migrationIntentBucketName,
+		Name: migrationIntentBucketArtifact, Value: snapshot.migrationIntentBucketName,
 	})
 
 	// The root must be deterministic; map order is not.

@@ -1,15 +1,18 @@
 # default.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
 # The NixOS test driver injects aws, blue, green, and green_peer.
 
+import hashlib
 import json
 import shlex
 import time
 
 CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
+AWS_ACCOUNT_ID = "000000000000"
 FQDN = "enclave.test"
 CERT_BUCKET = "enclave-e2e-certificates"
 LEASE_BUCKET = "enclave-e2e-leases"
-INTENT_BUCKET = "enclave-e2e-migration-intent"
+INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
+INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
@@ -192,10 +195,6 @@ cloud(
     "ssm put-parameter --name /dev/testapp/LeaseBucketName "
     f"--type String --value {LEASE_BUCKET}"
 )
-cloud(
-    "ssm put-parameter --name /dev/testapp/MigrationIntentBucketName "
-    f"--type String --value {INTENT_BUCKET}"
-)
 route53_zone_id = cloud(
     f"route53 create-hosted-zone --name {FQDN}. --caller-reference enclave-e2e "
     "--query HostedZone.Id --output text"
@@ -246,6 +245,18 @@ genesis_key = cloud(
     f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
 )
 assert genesis_key not in ("", "UNSET", "None")
+
+# Genesis is decided by the Object-Locked log, not by KMSKeyID. The record is
+# written before the key is committed, so deleting the parameter can never read
+# as a fresh deployment.
+genesis_records = cloud(
+    f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+    f"--prefix migration-intent/{BLUE_PCR0}/ "
+    "--query 'Versions[].Key' --output text"
+).split()
+assert genesis_records == [
+    f"migration-intent/{BLUE_PCR0}/00000000000000000001"
+], genesis_records
 
 # Exercise both the hard-step and PI-servo paths against the real /dev/ptp0.
 host_ts = int(blue.succeed("date +%s").strip())

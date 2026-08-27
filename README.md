@@ -130,13 +130,12 @@ interfaces are documented under [Deployment](#deployment).
 | vsock CID 3:1024 | enclave to host | gvproxy L2 network |
 | vsock CID 3:8002 | enclave to host | IMDS forwarding |
 | vsock CID 3:9000 | EIF init to host | boot heartbeat |
-| vsock :8003 | host to enclave | migration control HTTP |
 | TCP :443 | public to enclave | TLS, runtime API, application proxy |
 | TCP 127.0.0.1:8080 | inside enclave | internal runtime API |
 | TCP 127.0.0.1:7074 | inside enclave | the application |
 
-The migration control API has no application-level authentication. The host must
-expose vsock port 8003 only through a restricted operator control plane.
+Migration has no control endpoint. It runs over SSM between the enclaves
+themselves, so there is no inbound surface to authenticate or restrict.
 
 ### State model
 
@@ -162,18 +161,27 @@ under a KMS key that only the measured enclave can use.
 
 ### Boot paths
 
-On startup the runtime reads SSM and selects one of three paths, or fails.
+Every enclave boots into **candidate**: NSM, attestation and the migration
+control path are up, but there is no canonical state, no static secrets and no
+application. It leaves candidate only by obtaining state. A genesis or resuming
+enclave passes through in a single SSM read; a successor stays until its
+predecessor commits.
 
 | Condition | Path | Behaviour |
 |---|---|---|
-| `KMSKeyID/<pcr0>` absent, empty, or `UNSET`, and `ENCLAVE_PREVIOUS_PCR0=genesis` | genesis | Requires no predecessor artifacts. Creates the key, generates the DEK and secrets, writes a state-origin receipt, then commits `KMSKeyID/<pcr0>`. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
-| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
-| `KMSKeyID/<pcr0>` absent and `ENCLAVE_PREVIOUS_PCR0` names a predecessor | fatal | The predecessor has not finalised the handoff. The boot fails rather than falling through to genesis with fresh state. |
+| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies that the recorded predecessor is the one baked into its own measurement, that predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
+| `KMSKeyID/<pcr0>` absent and `ENCLAVE_PREVIOUS_PCR0=genesis` | genesis | Requires no predecessor artifacts. Creates the key, generates the DEK and secrets, writes a state-origin receipt, then commits `KMSKeyID/<pcr0>`. |
+| `KMSKeyID/<pcr0>` absent and `ENCLAVE_PREVIOUS_PCR0` names a predecessor | remains candidate | Waits, indefinitely, for that predecessor to commit to it. |
+
+A candidate serves a self-signed certificate so it stays observable, reports
+`status: "candidate"` on `/v1/enclave-info`, and answers `503` on `/health` and
+on any application path. It promotes in place when its commit pointer appears —
+no restart, and no action by the host.
 
 Boot order is fixed and every step is fatal: clock synchronisation against
 `/dev/ptp0`, networking, AWS clients, telemetry, attestation signer, HTTP
-servers, state establishment, PCR extension, migration control server, TLS, SSM
+servers, state establishment, PCR extension, TLS, SSM
 environment overlay, static secret export, then exec of the application.
 
 ## Nix API
@@ -233,7 +241,7 @@ measurement. A subset can be overridden at runtime from SSM.
 |---|---|---|
 | `ENCLAVE_DEPLOYMENT` | `dev` | First SSM path segment. The value `dev` disables COSE signature verification of attestation documents. See [Security notes](#security-notes). |
 | `ENCLAVE_APP_NAME` | `app` | Second SSM path segment. |
-| `ENCLAVE_PREVIOUS_PCR0` | none | Required. Either the literal `genesis`, or the predecessor's PCR0 when adopting migrated state. Unset fails the boot. |
+| `ENCLAVE_PREVIOUS_PCR0` | none | Required. Either the literal `genesis`, or the predecessor's PCR0 when adopting migrated state. Unset fails the boot. Measured and not SSM-overridable. |
 | `ENCLAVE_KMS_KEY_LOCKED` | `false` | When `true`, the KMS key policy omits the root recovery principal and the SSM namespace segment becomes `locked` instead of `unlocked`. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
@@ -258,7 +266,7 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_MIGRATION_COOLDOWN` | `0` | Minimum interval between `/request-migration` and `/finalise-migration`. A negative or unparseable value fails the boot. |
+| `ENCLAVE_MIGRATION_COOLDOWN` | `0` | Minimum interval between a candidate's attestation being adopted and the handoff committing. The window in which an abort can be written. A negative or unparseable value fails the boot. |
 | `ENCLAVE_MIGRATION_INTENT_RETENTION` | `87600h` (10 years) | S3 Object Lock retention applied to each migration intent record. |
 
 ### Clock
@@ -372,6 +380,9 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
 | `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
+| `/D/A/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge published by a predecessor, rotated every minute. |
+| `/D/A/SuccessorAttestation/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
+| `/D/A/MigrationAbort/<sourcePCR0>` | operator | Naming the pending target PCR0 cancels the handoff during the cooldown. |
 | `/D/A/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
 | `/D/A/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
 
@@ -416,21 +427,6 @@ This is the endpoint advertised to the application through
 `ENCLAVE_PROXY_PORT`. It does not serve `/v1/enclave-info`, the `/enclave/*`
 endpoints, or the application proxy.
 
-### Migration control, vsock :8003
-
-The host must provide trusted operators with controlled access to this vsock
-listener. It has no application-level authentication and must not be exposed to
-untrusted networks.
-
-| Method | Path | Body | Purpose |
-|---|---|---|---|
-| POST | `/request-migration` | `{"action":"requested"\|"aborted","target_pcr0":"<96 hex>"}` | Records an attested, Object-Locked intent in S3. Returns migration status. |
-| POST | `/finalise-migration` | `{"new_pcr0":"<96 hex>"}` | Performs the handoff and flips `KMSKeyID`. |
-
-Status codes: `425` while the cooldown is active, `409` if no matching intent
-exists or it was aborted, `503` if the intent store is unavailable, `400` for a
-malformed body.
-
 ## Deployment
 
 This flake builds the EIF but does not provision or configure its host or AWS
@@ -446,8 +442,6 @@ interfaces.
 - Forward IMDS from host CID 3, vsock port 8002, to the host's instance metadata
   service so the runtime can obtain AWS credentials.
 - Answer the EIF boot heartbeat at host CID 3, vsock port 9000.
-- Expose the enclave's migration control listener on vsock port 8003 only to
-  trusted operators.
 - Route intended client traffic to the enclave's TLS listener, TCP port 443 by
   default.
 
@@ -487,8 +481,33 @@ the runtime refuse to finalise a handoff onto that PCR0.
 ## Blue/green migration
 
 Migration transfers state from a running enclave to a successor with a different
-PCR0. The successor must not boot before the predecessor has finalised: it would
-find no artifacts in its own PCR0 scope, and fail rather than start fresh.
+PCR0. The successor must already be running as a candidate: the predecessor
+derives its identity from a fresh attestation it produces, so a migration cannot
+be aimed at an image that does not exist.
+
+The protocol is autonomous and runs entirely over SSM between the two enclaves.
+There is no control endpoint, no request to send, and nowhere to name a
+successor. **Booting a candidate is the request.**
+
+```text
+predecessor                                candidate
+  publish challenge   ------------------>  read it
+  read answers        <------------------  publish attestation
+  verify, record Object-Locked intent
+  ... cooldown, abort window ...
+  commit KMSKeyID/<target>  ------------>  promote
+```
+
+This is the authority boundary. The host decides when a candidate exists and can
+stop one, but it cannot forge a measurement, replay an old answer, or write the
+commit pointer. What it can still choose is *which* image to run as a candidate.
+The predecessor verifies that the answering enclave is real, is measured for this
+deployment, and answered the challenge it published minutes ago; it cannot verify
+that the image is the one an operator intended.
+
+If two candidates answer the same challenge the predecessor records nothing and
+keeps serving: an ambiguous round is nobody's intent. Remove the extra candidate
+and the next round proceeds.
 
 Nothing here is reversible and nothing needs to be. The predecessor keeps its own
 key, ciphertexts, and commit pointer throughout, so if the successor turns out to
@@ -497,44 +516,47 @@ rollback path because there is nothing to roll back.
 
 The order is:
 
-1. Build the successor EIF and read its PCR0. Its
-   `ENCLAVE_PREVIOUS_PCR0` must be set to the predecessor's PCR0, so the
-   predecessor measurement is an input to the successor build.
-2. Prepare the successor host and routing, but do not boot the successor.
-3. Request the migration against the predecessor:
-   ```sh
-     curl -fsS -H 'Content-Type: application/json' \
-       --data '{"action":"requested","target_pcr0":"<successor PCR0>"}' \
-     http://<migration-control-endpoint>/request-migration
-   ```
-   This writes an Object-Locked record to the intent log. It cannot be deleted.
-4. Wait for the cooldown. Poll `/v1/enclave-info` until
-   `migration.state == "eligible"`.
-5. Finalise:
-   ```sh
-     curl -fsS -H 'Content-Type: application/json' \
-       --data '{"new_pcr0":"<successor PCR0>"}' \
-     http://<migration-control-endpoint>/finalise-migration
-   ```
-   The predecessor commits the successor's PCR0 into its own PCR31, creates a
-   KMS key admitting the successor's PCR0 alone, re-encrypts the DEK and every
+1. Build the successor EIF with `ENCLAVE_PREVIOUS_PCR0` set to the
+   predecessor's PCR0, so the successor's own measurement commits to the
+   enclave it will adopt from.
+2. Boot the successor. It comes up as a candidate: it holds no state, serves no
+   application, and answers any challenge it finds under
+   `/<deployment>/<app>/MigrationChallenge/`.
+3. The predecessor adopts it. It verifies the document's signature and chain,
+   that its nonce is the challenge it published, and that its `user_data` claims
+   this deployment; it then takes the target PCR0 **from the document** and
+   writes an Object-Locked record to the intent log.
+
+   Confirm it is the successor you meant: `/v1/enclave-info` on the predecessor
+   reports `migration.target_pcr0`. The candidate reports the same handoff as
+   `candidate.awaiting_handoff_from` — informational only, since the intent log
+   is host-writable.
+4. The cooldown runs. This is the abort window: writing the pending target PCR0
+   to `/<deployment>/<app>/MigrationAbort/<predecessor PCR0>` cancels the
+   handoff. It is the only operator control in the protocol.
+5. The predecessor commits, on its own, once the intent is eligible and no abort
+   names the target. It commits the successor's PCR0 into its own PCR31, creates
+   a KMS key admitting the successor's PCR0 alone, re-encrypts the DEK and every
    static secret under it, writes its post-PCR31 attestation and the transition
    receipt, then writes `KMSKeyID/<successor PCR0>` last.
 
-   Finalising is not idempotent by design. If `KMSKeyID/<successor PCR0>`
-   already holds a value the request is refused with `409`, so a retry can never
-   mint a second key and displace a generation the successor may already be
-   running.
+   Committing is not a no-op if repeated: a second run would mint another key and
+   try to repoint the successor at it. The final `KMSKeyID` write is therefore an
+   atomic create-only SSM operation. When predecessor replicas race, exactly one
+   can commit; every loser observes an already-finalised migration and cannot
+   displace the generation the successor may already be running.
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that
    `KMSKeyID/<predecessor PCR0>` is unchanged. The first is the commit; the
    second is the guarantee that the predecessor is still intact.
-7. Boot the successor. It verifies the predecessor attestation, the PCR31
-   commitment, the key policy, and the transition receipt before adopting the
-   state.
-8. Confirm adoption on the successor's `/v1/enclave-info`:
-   `previous_pcr0` equals the predecessor PCR0,
-   `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
-   the successor's own PCR0.
+7. The successor promotes itself. It notices its commit pointer, checks that the
+   recorded predecessor matches the PCR0 baked into its own measurement, verifies
+   that predecessor's attestation, the PCR31 commitment to its own PCR0, the key
+   policy and the transition receipt, then adopts the state — in the same
+   process, without a restart and without the host doing anything.
+8. Confirm adoption on the successor's `/v1/enclave-info`: `status` is `ready`,
+    `previous_pcr0` equals the predecessor PCR0,
+    `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
+    the successor's own PCR0.
 9. Shift client traffic using the deployment system's normal routing mechanism.
 10. Keep both enclaves healthy for the soak period, then retire the predecessor.
     Its key and SSM generation stay live; leave them alone unless you are certain
@@ -738,7 +760,7 @@ curl -fsS http://169.254.169.254/latest/meta-data/
 application process started. Check an application endpoint directly and read the
 enclave console for application errors.
 
-**`/request-migration` returns an empty reply under QEMU.** `vhost-device-vsock`
+**Migration stalls under QEMU.** `vhost-device-vsock`
 0.3 occasionally drops a forwarded host-to-guest connection before it reaches
 the enclave. Retry. This affects the emulated transport only; production uses
 Nitro AF_VSOCK. A genuine validation failure returns an HTTP status and body and
@@ -778,3 +800,18 @@ does not yield the state.
 so a successor enclave cannot silently substitute a different value; migration
 carries the ciphertexts forward under a key admitting the successor's
 measurement alone.
+
+**Migration authority rests on a live attestation, not on a supplied name.** The
+predecessor derives the successor's PCR0 from a Nitro document that answers a
+challenge it issued seconds earlier, so the host cannot invent a measurement and
+cannot replay an old one. What this does **not** establish is that the answering
+image is the one an operator authorised: a PCR0 cannot be inverted to learn what
+an image was built for, so the check binds the successor to this deployment and
+to liveness, not to a specific approved build. Closing that gap would need an
+external trust root — an operator-signed successor statement — which the runtime
+deliberately does not have.
+
+**The e2e test cannot validate this.** `ENCLAVE_DEV=true`, which the test
+harness sets, makes the runtime skip COSE signature verification entirely. A
+forged document passes there. The attestation checks are covered only by the Go
+unit tests, against a real test signer.

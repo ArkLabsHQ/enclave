@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -21,6 +23,11 @@ const (
 	purposeStateOrigin         = "enclave.state_origin"
 	purposeMigrationTransition = "enclave.state_origin.migration_transition"
 )
+
+// errAwaitingHandoff means this enclave holds no state and is not permitted to
+// create the deployment: it is a candidate, and must wait for a predecessor to
+// commit to it. Distinct from every other load failure, which stays fatal.
+var errAwaitingHandoff = errors.New("awaiting migration handoff")
 
 type startState int
 
@@ -122,6 +129,46 @@ func WriteTransitionReceipt(
 	)
 }
 
+const (
+	handoffPollMin = time.Second
+	handoffPollMax = 30 * time.Second
+)
+
+// establishStateAwaitingHandoff establishes state, waiting rather than failing
+// while this enclave is a candidate. Only errAwaitingHandoff waits; every other
+// failure is fatal, so a genuinely broken enclave still dies loudly instead of
+// hanging. There is deliberately no timeout: a candidate legitimately sits until
+// an operator migrates to it, and giving up would only force a fresh challenge
+// exchange after a needless restart.
+func establishStateAwaitingHandoff(
+	ctx context.Context,
+	nsm NSM,
+	kmsAPI KMSAPI,
+	sts STSAPI,
+	ssm SSM,
+) (verifiedState, error) {
+	backoff := handoffPollMin
+	for {
+		verified, err := EstablishState(ctx, nsm, kmsAPI, sts, ssm)
+		if !errors.Is(err, errAwaitingHandoff) {
+			return verified, err
+		}
+
+		if backoff == handoffPollMin {
+			slog.Info("candidate: awaiting migration handoff")
+		}
+
+		select {
+		case <-ctx.Done():
+			return verifiedState{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < handoffPollMax {
+			backoff = min(backoff*2, handoffPollMax)
+		}
+	}
+}
+
 func loadUnverifiedState(
 	ctx context.Context,
 	ssm SSM,
@@ -184,6 +231,9 @@ func loadUnverifiedState(
 	}
 
 	if keyID == "" {
+		if getPreviousPCR0() != "genesis" {
+			return unverifiedState{}, errAwaitingHandoff
+		}
 		if hasPredecessor {
 			return unverifiedState{}, fmt.Errorf("genesis state has predecessor artifacts")
 		}

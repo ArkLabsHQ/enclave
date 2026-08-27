@@ -105,29 +105,17 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	ssm := NewSSM(aws.SSM)
-	verified, err := EstablishState(
-		ctx,
-		nsm,
-		aws.KMS,
-		aws.STS,
-		ssm,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to establish state: %w", err)
-	}
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, verified.secrets); err != nil {
-		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
+	migrationIntentBucket, err := ssm.MustGet(ctx, migrationIntentBucketParam())
+	if err != nil {
+		return fmt.Errorf("failed to get migration intent bucket name: %w", err)
 	}
 
 	migrator, err := NewMigrator(
 		nsm,
-		verified.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
 		aws.S3,
-		verified.dek,
-		verified.secrets,
-		verified.migrationIntentBucketName,
+		migrationIntentBucket,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
@@ -137,9 +125,28 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
-	if err := servers.StartMigrationControlServer(ctx, migrator); err != nil {
-		return fmt.Errorf("failed to start migration control server: %w", err)
+	// Answer any predecessor's challenge while we wait. A candidate that never
+	// gets migrated to simply keeps answering; nothing else happens.
+	go migrator.RunCandidateAttestation(ctx)
+
+	candidateCertCb, err := configureSelfSignedCert(&cfg, hashes)
+	if err != nil {
+		return fmt.Errorf("failed to configure candidate TLS: %w", err)
 	}
+	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
+
+	verified, err := establishStateAwaitingHandoff(ctx, nsm, aws.KMS, aws.STS, ssm)
+	if err != nil {
+		return fmt.Errorf("failed to establish state: %w", err)
+	}
+
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, verified.secrets); err != nil {
+		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
+	}
+
+	migrator.Promote(verified.kms, verified.dek, verified.secrets)
+
+	go migrator.RunMigrationControl(ctx)
 
 	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
 	if err != nil {
@@ -281,6 +288,7 @@ type runtimeState struct {
 	isExit          atomic.Bool
 	exitError       atomic.Value
 	tlsReadyOnce    sync.Once
+	tlsMu           sync.RWMutex
 	tlsCertCallback TLSCertCallback
 	tlsReadyCh      chan struct{}
 	listenErrCh     chan error
@@ -309,15 +317,18 @@ func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
 }
 
 func (r *runtimeState) SetTLSCertCallback(cb TLSCertCallback) {
-	r.tlsReadyOnce.Do(func() {
-		r.tlsCertCallback = cb
-		close(r.tlsReadyCh)
-	})
+	r.tlsMu.Lock()
+	r.tlsCertCallback = cb
+	r.tlsMu.Unlock()
+
+	r.tlsReadyOnce.Do(func() { close(r.tlsReadyCh) })
 }
 
 func (r *runtimeState) GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error) {
 	select {
 	case <-r.tlsReadyCh:
+		r.tlsMu.RLock()
+		defer r.tlsMu.RUnlock()
 		return r.tlsCertCallback, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()

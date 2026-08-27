@@ -134,12 +134,3 @@ func waitTestResult(t *testing.T, ch <-chan error) error {
 		return nil
 	}
 }
-
-func waitTestSignal(t *testing.T, ch <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for signal")
-	}
-}

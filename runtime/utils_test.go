@@ -67,6 +67,11 @@ func (f *fakeSSM) PutParameter(
 	if f.params == nil {
 		f.params = map[string]string{}
 	}
+	if !aws.ToBool(in.Overwrite) {
+		if _, exists := f.params[aws.ToString(in.Name)]; exists {
+			return nil, &ssmtypes.ParameterAlreadyExists{}
+		}
+	}
 	f.params[aws.ToString(in.Name)] = aws.ToString(in.Value)
 	return &ssm.PutParameterOutput{}, nil
 }
@@ -151,6 +156,27 @@ func (f *fakeSSM) Set(_ context.Context, key, val string, _ ...SSMSetOption) err
 	}
 	f.params[key] = val
 	return nil
+}
+
+func (f *fakeSSM) SetIfAbsent(
+	_ context.Context,
+	key, val string,
+	_ ...SSMSetOption,
+) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	if err := f.putErrs[key]; err != nil {
+		return false, err
+	}
+	if f.params == nil {
+		f.params = map[string]string{}
+	}
+	if _, exists := f.params[key]; exists {
+		return false, nil
+	}
+	f.params[key] = val
+	return true, nil
 }
 
 func (f *fakeSSM) MustGet(_ context.Context, key string) (string, error) {

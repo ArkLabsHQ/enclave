@@ -22,6 +22,7 @@ type Param struct {
 
 type SSM interface {
 	Set(ctx context.Context, key, val string, opts ...SSMSetOption) error
+	SetIfAbsent(ctx context.Context, key, val string, opts ...SSMSetOption) (bool, error)
 	MustGet(ctx context.Context, key string) (string, error)
 	MayGet(ctx context.Context, key string) (string, error)
 	ListParams(ctx context.Context, prefix string) ([]Param, error)
@@ -44,6 +45,27 @@ func NewSSM(ssm SSMAPI) SSM {
 }
 
 func (s *ssmW) Set(ctx context.Context, key, val string, opts ...SSMSetOption) error {
+	_, err := s.put(ctx, key, val, true, opts...)
+	return err
+}
+
+// SetIfAbsent creates a parameter without overwriting an existing value. SSM
+// applies Overwrite=false atomically, so it can be used as a cross-process
+// write-once commit point.
+func (s *ssmW) SetIfAbsent(
+	ctx context.Context,
+	key, val string,
+	opts ...SSMSetOption,
+) (bool, error) {
+	return s.put(ctx, key, val, false, opts...)
+}
+
+func (s *ssmW) put(
+	ctx context.Context,
+	key, val string,
+	overwrite bool,
+	opts ...SSMSetOption,
+) (bool, error) {
 	so := &SSMSetOptions{tier: ssmtypes.ParameterTierStandard}
 
 	for _, opt := range opts {
@@ -54,12 +76,16 @@ func (s *ssmW) Set(ctx context.Context, key, val string, opts ...SSMSetOption) e
 		Name:      aws.String(key),
 		Value:     aws.String(val),
 		Type:      ssmtypes.ParameterTypeString,
-		Overwrite: aws.Bool(true),
+		Overwrite: aws.Bool(overwrite),
 		Tier:      so.tier,
 	}); err != nil {
-		return fmt.Errorf("ssm put-parameter %s: %w", key, err)
+		var exists *ssmtypes.ParameterAlreadyExists
+		if !overwrite && errors.As(err, &exists) {
+			return false, nil
+		}
+		return false, fmt.Errorf("ssm put-parameter %s: %w", key, err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *ssmW) MustGet(ctx context.Context, key string) (string, error) {

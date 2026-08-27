@@ -41,6 +41,12 @@ var (
 		"migration intent: target PCR0 is this enclave",
 	)
 	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
+	errMigrationCandidate        = errors.New(
+		"migration: this enclave is a candidate and holds no state to hand off",
+	)
+	errMigrationSuccessorAmbiguous = errors.New(
+		"migration: more than one candidate answered the challenge",
+	)
 )
 
 type migrationIntentV1 struct {
@@ -160,6 +166,64 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error
 		return nil, errMigrationIntentAborted
 	}
 	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
+}
+
+func (l *migrationIntentLog) InboundIntent(
+	ctx context.Context,
+	targetPCR0 string,
+) (*migrationIntent, error) {
+	sources := map[string]bool{}
+	var keyMarker, versionMarker *string
+	for {
+		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(l.bucket),
+			Prefix:          aws.String(migrationIntentPrefix),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf(
+				"%w: list migration intent sources: %w",
+				errMigrationIntentStoreUnavailable,
+				err,
+			)
+		}
+		for _, version := range out.Versions {
+			source, _, ok := parseMigrationIntentObjectKey(aws.ToString(version.Key))
+			if ok && !strings.EqualFold(source, targetPCR0) {
+				sources[source] = true
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
+			return nil, fmt.Errorf(
+				"%w: list migration intent sources: truncated response missing markers",
+				errMigrationIntentStoreUnavailable,
+			)
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+	}
+
+	var newest *migrationIntent
+	for source := range sources {
+		head, tie, err := l.deriveHead(ctx, source)
+		if err != nil {
+			return nil, err
+		}
+		if head == nil || tie || head.Action != migrationIntentRequested {
+			continue
+		}
+		if !strings.EqualFold(head.TargetPCR0, targetPCR0) {
+			continue
+		}
+		if newest == nil || head.PublishedAt.After(newest.PublishedAt) {
+			newest = head
+		}
+	}
+
+	return newest, nil
 }
 
 func (l *migrationIntentLog) append(

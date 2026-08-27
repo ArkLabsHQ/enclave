@@ -60,6 +60,17 @@ type servers struct {
 	metrics *Metrics
 }
 
+// runtimeV1Paths are the runtime's own endpoints beneath /v1. Everything else under
+// /v1 belongs to the application and is proxied to it.
+var runtimeV1Paths = []string{
+	"/v1/metrics",
+	"/v1/enclave-metrics",
+	"/v1/logs",
+	"/v1/enclave-logs",
+	"/v1/traces",
+	"/v1/enclave-traces",
+}
+
 func SetupHttpServers(
 	rt RuntimeState,
 	cfg Config,
@@ -103,7 +114,19 @@ func SetupHttpServers(
 	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 	em.HandleFunc("GET /enclave", rootHandler(cfg))
 	em.HandleFunc("GET /enclave/config", configHandler(cfg))
-	em.Handle("/v1/", corsWildcard(sm))
+	// Registered path by path rather than as a "/v1/" subtree. A subtree pattern here
+	// claims the whole namespace, so an application serving its own versioned API under
+	// /v1 would have every one of those routes answered by sm — which does not know
+	// them — instead of reaching revProxy below.
+	for _, path := range runtimeV1Paths {
+		em.Handle(path, corsWildcard(sm))
+	}
+
+	// ConfigureEnclaveInfoHandler registers GET /v1/enclave-info later. The subtree
+	// pattern used to answer its preflight; register that explicitly so the CORS
+	// behaviour is unchanged.
+	em.Handle("OPTIONS /v1/enclave-info", corsWildcard(http.NotFoundHandler()))
+
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
 

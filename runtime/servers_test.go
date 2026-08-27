@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -604,4 +605,62 @@ func assertCORSHeaders(t *testing.T, h http.Header) {
 	if h.Get("Access-Control-Max-Age") != "600" {
 		t.Fatalf("Access-Control-Max-Age: got %q, want 600", h.Get("Access-Control-Max-Age"))
 	}
+}
+
+// A "/v1/" subtree pattern on the external mux claims the whole namespace, so an
+// application serving its own versioned API under /v1 has every one of those routes
+// answered by the runtime's 404 instead of reaching the reverse proxy.
+func TestExternalMuxLeavesApplicationV1RoutesToTheProxy(t *testing.T) {
+	var proxied []string
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied = append(proxied, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer app.Close()
+
+	appURL, err := url.Parse(app.URL)
+	require.NoError(t, err)
+
+	metrics := NewMetrics()
+	signer, err := NewAttestedSigner()
+	require.NoError(t, err)
+
+	s := SetupHttpServers(
+		newRuntimeState(),
+		Config{AppWebSrv: appURL},
+		&nsmW{},
+		metrics,
+		NewLogging(metrics, nil),
+		NewTracing(nil),
+		signer,
+		NewAttestationHashes(),
+		"token",
+	).(*servers)
+
+	t.Run("application routes reach the proxy", func(t *testing.T) {
+		for _, path := range []string{"/v1/info", "/v1/tx", "/v1/anything"} {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			require.Equal(t, http.StatusOK, rr.Code, path)
+			require.Contains(t, proxied, path)
+		}
+	})
+
+	t.Run("runtime routes are still claimed", func(t *testing.T) {
+		for _, path := range runtimeV1Paths {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			require.NotContains(t, proxied, path)
+		}
+	})
+
+	t.Run("preflight still answered for runtime routes", func(t *testing.T) {
+		paths := append(append([]string{}, runtimeV1Paths...), "/v1/enclave-info")
+		for _, path := range paths {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodOptions, path, nil))
+			require.Equal(t, http.StatusNoContent, rr.Code, path)
+			require.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"), path)
+		}
+	})
 }

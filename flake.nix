@@ -73,6 +73,10 @@
                   ldflags = [
                     "-X main.Version=${finalAttrs.version}"
                   ];
+
+                  # subPackages installs cmd/enclave as bin/enclave, but nix run derives
+                  # the program name from pname and would look for bin/enclave-cli.
+                  meta.mainProgram = "enclave";
                 });
                 default = self.packages.${system}.cli;
               }

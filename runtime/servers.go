@@ -21,16 +21,12 @@ import (
 	"time"
 
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
-	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )
 
 const (
-	indexPage                 = "This host runs inside an AWS Nitro Enclave.\n"
-	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
-	migrationControlPort      = 8003
-	migrationRequestPath      = "/request-migration"
-	migrationFinalisationPath = "/finalise-migration"
+	indexPage      = "This host runs inside an AWS Nitro Enclave.\n"
+	nonceNumDigits = 40 // 20-byte nonce, hex-encoded
 )
 
 var (
@@ -46,7 +42,6 @@ var (
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
 	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
-	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
 }
 
 type servers struct {
@@ -105,7 +100,9 @@ func SetupHttpServers(
 	em.HandleFunc("GET /enclave/config", configHandler(cfg))
 	em.Handle("/v1/", corsWildcard(sm))
 	em.Handle("/health", sm)
-	em.Handle("/", revProxy)
+	// A candidate has no application behind the proxy. Say so, rather than
+	// letting every unmatched path 502 against a process that was never started.
+	em.Handle("/", appProxy(rt, revProxy))
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
@@ -182,6 +179,8 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 // RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
 type RuntimeInfo struct {
 	Version                  string           `json:"version"`
+	Status                   string           `json:"status"`
+	Candidate                *CandidateInfo   `json:"candidate,omitempty"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
 	AttestationPubkey        string           `json:"attestation_pubkey,omitempty"`
@@ -191,6 +190,11 @@ type RuntimeInfo struct {
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
 }
+
+const (
+	runtimeStatusCandidate = "candidate"
+	runtimeStatusReady     = "ready"
+)
 
 func (s *servers) ConfigureEnclaveInfoHandler(
 	ctx context.Context,
@@ -220,8 +224,22 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			return
 		}
 
+		status := runtimeStatusReady
+		var candidate *CandidateInfo
+		if !migrator.Ready() {
+			status = runtimeStatusCandidate
+			// Best-effort: a candidate that cannot reach the intent log is
+			// still a candidate, and should say so rather than fail.
+			if candidate, err = migrator.CandidateInfo(r.Context()); err != nil {
+				slog.Warn("could not read inbound migration intent", "error", err)
+				candidate = nil
+			}
+		}
+
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                  Version,
+			Status:                   status,
+			Candidate:                candidate,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
 			AttestationPubkey:        s.signer.Pubkey(),
@@ -236,97 +254,10 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	return nil
 }
 
-func (s *servers) StartMigrationControlServer(ctx context.Context, migrator Migrator) error {
-	lis, err := vsock.Listen(migrationControlPort, nil)
-	if err != nil {
-		return fmt.Errorf(
-			"listen on migration control vsock port %d: %w",
-			migrationControlPort,
-			err,
-		)
-	}
-
-	slog.Info("starting migration control listener", "vsock_port", migrationControlPort)
-	s.serveMigrationControl(ctx, migrator, lis)
-	return nil
-}
-
-func (s *servers) serveMigrationControl(
-	ctx context.Context,
-	migrator Migrator,
-	lis net.Listener,
-) {
-	server := &http.Server{Handler: migrationControlHandler(migrator)}
-
-	go func() {
-		<-ctx.Done()
-		_ = server.Close()
-	}()
-
-	go func() {
-		if err := server.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.rt.NotifyListenerError(fmt.Errorf("migration control listener: %w", err))
-		}
-	}()
-}
-
-func migrationControlHandler(migrator Migrator) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+migrationRequestPath, func(w http.ResponseWriter, r *http.Request) {
-		var req MigrationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		if err := req.Validate(); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		status, err := migrator.HandleMigrationRequest(r.Context(), req.Action, req.TargetPCR0)
-		if err != nil {
-			http.Error(
-				w,
-				fmt.Sprintf("failed to handle migration request: %v", err),
-				migrationHTTPStatus(err),
-			)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(status)
-	})
-
-	mux.HandleFunc("POST "+migrationFinalisationPath, func(w http.ResponseWriter, r *http.Request) {
-		res, err := migrator.CompleteMigration(r.Context())
-		if err != nil {
-			http.Error(
-				w,
-				fmt.Sprintf("failed to finalise migration: %v", err),
-				migrationHTTPStatus(err),
-			)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(res)
-	})
-
-	return mux
-}
-
+// migrationHTTPStatus maps the errors /v1/enclave-info can surface. Migration
+// itself has no HTTP surface; only reading its status does.
 func migrationHTTPStatus(err error) int {
 	switch {
-	case errors.Is(err, errMigrationCooldownActive):
-		return http.StatusTooEarly
-	case errors.Is(err, errMigrationIntentAbsent),
-		errors.Is(err, errMigrationIntentAborted),
-		errors.Is(err, errMigrationIntentAlreadyRequested),
-		errors.Is(err, errMigrationAlreadyFinalised):
-		return http.StatusConflict
-	case errors.Is(err, errMigrationIntentSelfTarget):
-		return http.StatusBadRequest
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
 		return http.StatusServiceUnavailable
 	default:
@@ -424,6 +355,21 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 		}
 		return getCert(hello)
 	}
+}
+
+// appProxy gates the reverse proxy on the application having been started.
+// Readiness flips only when the child process is forked, so this is exactly
+// "there is something to proxy to".
+func appProxy(rt RuntimeState, revProxy http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rt.Ready() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "initializing"})
+			return
+		}
+		revProxy.ServeHTTP(w, r)
+	})
 }
 
 func formatIndexPage(appURL *url.URL) string {

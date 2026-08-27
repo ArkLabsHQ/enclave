@@ -35,6 +35,23 @@ func (s *ssmTTLCache) Set(ctx context.Context, key, val string, opts ...SSMSetOp
 	return nil
 }
 
+func (s *ssmTTLCache) SetIfAbsent(
+	ctx context.Context,
+	key, val string,
+	opts ...SSMSetOption,
+) (bool, error) {
+	created, err := s.ssm.SetIfAbsent(ctx, key, val, opts...)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		s.mu.Lock()
+		delete(s.cache, key)
+		s.mu.Unlock()
+	}
+	return created, nil
+}
+
 func (s *ssmTTLCache) MustGet(ctx context.Context, key string) (string, error) {
 	if val, ok := s.get(key); ok {
 		return val, nil

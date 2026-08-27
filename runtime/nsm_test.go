@@ -530,6 +530,18 @@ func (s *testAttestationSigner) build(
 	publicKey ...[]byte,
 ) signedAttestation {
 	t.Helper()
+	return s.buildWithNonce(t, pcrs, timestamp, userData, nil, publicKey...)
+}
+
+func (s *testAttestationSigner) buildWithNonce(
+	t *testing.T,
+	pcrs map[uint][]byte,
+	timestamp time.Time,
+	userData []byte,
+	nonce []byte,
+	publicKey ...[]byte,
+) signedAttestation {
+	t.Helper()
 
 	document := &nitrite.Document{
 		ModuleID:    "test-module",
@@ -539,6 +551,7 @@ func (s *testAttestationSigner) build(
 		Certificate: s.leafDER,
 		CABundle:    [][]byte{s.caDER},
 		UserData:    userData,
+		Nonce:       nonce,
 	}
 	if len(publicKey) > 0 {
 		document.PublicKey = publicKey[0]
@@ -796,13 +809,9 @@ func buildSignedAttestationForRequest(
 	req *request.Attestation,
 ) signedAttestation {
 	t.Helper()
-	return signer.build(
-		t,
-		pcrs,
-		time.Now(),
-		req.UserData,
-		req.PublicKey,
-	)
+	// The nonce must survive into the document: it is the only freshness signal
+	// a verifier has, so a fake that dropped it would make replay untestable.
+	return signer.buildWithNonce(t, pcrs, time.Now(), req.UserData, req.Nonce, req.PublicKey)
 }
 
 func clonePCRs(pcrs map[uint][]byte) map[uint][]byte {

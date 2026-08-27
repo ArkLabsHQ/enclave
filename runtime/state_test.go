@@ -77,7 +77,57 @@ func TestStateRootIsOwnerPCR0Scoped(t *testing.T) {
 	require.ErrorContains(t, err, "no owner PCR0")
 }
 
-func TestEstablishStateRefusesSuccessorBeforeHandoff(t *testing.T) {
+func TestGenesisRequiresTheGenesisSentinel(t *testing.T) {
+	// Set before the table: the param paths below are built from these.
+	setStateOriginTestEnv(t)
+
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	pcr0Hex := hex.EncodeToString(pcr0)
+	otherPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
+
+	for _, tc := range []struct {
+		name         string
+		previousPCR0 string
+		params       map[string]string
+		wantStart    startState
+		wantErr      error
+	}{
+		{
+			name:         "genesis image creates the deployment",
+			previousPCR0: "genesis",
+			wantStart:    startStateGenesis,
+		},
+		{
+			name:         "a successor waits to be handed state",
+			previousPCR0: otherPCR0,
+			wantErr:      errAwaitingHandoff,
+		},
+		{
+			name:         "a successor waits even alongside another generation",
+			previousPCR0: otherPCR0,
+			params:       map[string]string{kmsKeyIDParam(otherPCR0): "someone-elses-key"},
+			wantErr:      errAwaitingHandoff,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setStateOriginTestEnv(t)
+			t.Setenv("ENCLAVE_PREVIOUS_PCR0", tc.previousPCR0)
+
+			fake, ssm := stateOriginTestSSM(tc.params)
+			got, err := loadUnverifiedState(context.Background(), ssm, pcr0)
+
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				require.Empty(t, fake.params[kmsKeyIDParam(pcr0Hex)])
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantStart, got.startState)
+		})
+	}
+}
+
+func TestEstablishStateAwaitsHandoffWithoutMintingAKey(t *testing.T) {
 	setStateOriginTestEnv(t)
 	// A successor's measurement names its predecessor; only a first enclave
 	// carries "genesis".
@@ -87,7 +137,6 @@ func TestEstablishStateRefusesSuccessorBeforeHandoff(t *testing.T) {
 	fake, ssm := stateOriginTestSSM(nil)
 	kmsf := newFakeKMS()
 
-	// Nothing is scoped to this PCR0 yet: the predecessor has not finalised.
 	_, err := EstablishState(
 		context.Background(),
 		&nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{0: pcr0})}},
@@ -96,11 +145,11 @@ func TestEstablishStateRefusesSuccessorBeforeHandoff(t *testing.T) {
 		ssm,
 	)
 
-	require.ErrorContains(t, err, "previous PCR0 is required")
-	require.Empty(t, fake.params[kmsKeyIDParam(hex.EncodeToString(pcr0))],
-		"a successor that boots early must not fall through to genesis")
+	// A candidate waits; it must not quietly become its own genesis.
+	require.ErrorIs(t, err, errAwaitingHandoff)
+	require.Empty(t, fake.params[kmsKeyIDParam(hex.EncodeToString(pcr0))])
 	kmsf.mu.Lock()
-	require.Empty(t, kmsf.keys, "no key may be minted for an early successor")
+	require.Empty(t, kmsf.keys, "no key may be minted while awaiting a handoff")
 	kmsf.mu.Unlock()
 }
 
@@ -633,6 +682,9 @@ func setStateOriginTestEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "state-origin")
+	// Most of these fixtures exercise a deployment this enclave created.
+	// Cases about candidacy override it.
+	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
 		{"name":"alpha","env_var":"ALPHA"},
 		{"name":"beta","env_var":"BETA"}

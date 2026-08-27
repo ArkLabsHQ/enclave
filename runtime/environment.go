@@ -295,3 +295,40 @@ func envOr(key, fallback string) string {
 	}
 	return fallback
 }
+
+// migrationChallengeParam: the live challenge published by a predecessor.
+func migrationChallengeParam(sourcePCR0 string) string {
+	return migrationChallengePrefix() + strings.ToLower(sourcePCR0)
+}
+
+func migrationChallengePrefix() string {
+	return fmt.Sprintf("/%s/%s/MigrationChallenge/", getDeployment(), getAppName())
+}
+
+// successorAttestationParam: a candidate's answer to sourcePCR0's challenge.
+// Advanced tier: an attestation document exceeds the 4 KB Standard-tier limit.
+func successorAttestationParam(sourcePCR0, candidatePCR0 string) string {
+	return successorAttestationPrefix(sourcePCR0) + strings.ToLower(candidatePCR0)
+}
+
+// successorAttestationPrefix: the answers to one predecessor's challenge. Its
+// children are one level deep, so ListParams enumerates the candidates.
+func successorAttestationPrefix(sourcePCR0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/SuccessorAttestation/%s/",
+		getDeployment(),
+		getAppName(),
+		strings.ToLower(sourcePCR0),
+	)
+}
+
+// migrationAbortParam: operator-written. Naming the pending target PCR0 stops the
+// handoff before it commits. This is the only operator control in the protocol.
+func migrationAbortParam(sourcePCR0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationAbort/%s",
+		getDeployment(),
+		getAppName(),
+		strings.ToLower(sourcePCR0),
+	)
+}

@@ -258,19 +258,6 @@ let
         };
       };
 
-      systemd.services.migration-proxy = {
-        description = "Migration control proxy";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8003,bind=127.0.0.1,fork,reuseaddr VSOCK-CONNECT:1:8003";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
       systemd.services.mock-imds-forward = {
         description = "Test IMDS endpoint";
         wantedBy = [ "multi-user.target" ];

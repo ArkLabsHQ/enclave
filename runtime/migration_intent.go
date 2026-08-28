@@ -27,7 +27,6 @@ const (
 
 	migrationIntentRequested = "requested"
 	migrationIntentAborted   = "aborted"
-	migrationIntentGenesis   = "genesis"
 )
 
 var (
@@ -74,7 +73,6 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-
 func migrationIntentBucketName(accountID string) string {
 	identity := getDeployment() + "\x00" + getAppName()
 	digest := sha256.Sum256([]byte(identity))
@@ -98,11 +96,10 @@ func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIn
 	}, nil
 }
 
-func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error) {
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
-	}
+func (l *migrationIntentLog) Head(
+	ctx context.Context,
+	sourcePCR0 string,
+) (*migrationIntent, error) {
 	head, tie, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
@@ -114,85 +111,13 @@ func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error)
 	return head, nil
 }
 
-func (l *migrationIntentLog) GenesisRecorded(ctx context.Context) (bool, error) {
-	var keyMarker, versionMarker *string
-	for {
-		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-			Bucket:          aws.String(l.bucket),
-			Prefix:          aws.String(migrationIntentPrefix),
-			KeyMarker:       keyMarker,
-			VersionIdMarker: versionMarker,
-		})
-		if err != nil {
-			return false, fmt.Errorf(
-				"%w: list deployment intents: %w",
-				errMigrationIntentStoreUnavailable,
-				err,
-			)
-		}
-		for _, version := range out.Versions {
-			key := aws.ToString(version.Key)
-			versionID := aws.ToString(version.VersionId)
-			_, sequence, ok := parseMigrationIntentObjectKey(key)
-			// Genesis is the first record its creator writes, so no other
-			// sequence needs fetching.
-			if !ok || sequence != 1 || versionID == "" {
-				continue
-			}
-			// Unverified on purpose: presence only ever vetoes a genesis, so
-			// treating an unverifiable record as absent would fail open.
-			entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
-			if err != nil {
-				return false, err
-			}
-			if valid && entry.Action == migrationIntentGenesis {
-				return true, nil
-			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			return false, nil
-		}
-		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return false, fmt.Errorf(
-				"%w: list deployment intents: truncated response missing markers",
-				errMigrationIntentStoreUnavailable,
-			)
-		}
-		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
-	}
-}
-
-// Genesis records that this enclave created the deployment, so no later boot can
-// claim genesis again.
-func (l *migrationIntentLog) Genesis(ctx context.Context) (*migrationIntent, error) {
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
-	}
-	head, _, err := l.deriveHead(ctx, sourcePCR0)
-	if err != nil {
-		return nil, err
-	}
-	if head != nil {
-		return nil, fmt.Errorf(
-			"cannot record genesis: intent log already holds a %q record at sequence %d",
-			head.Action, head.Sequence,
-		)
-	}
-	return l.append(ctx, sourcePCR0, 0, migrationIntentGenesis, sourcePCR0)
-}
-
 func (l *migrationIntentLog) Request(
 	ctx context.Context,
-	targetPCR0 string,
+	sourcePCR0, targetPCR0 string,
 ) (*migrationIntent, error) {
 	targetPCR0, _, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
-	}
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
 	}
 	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
@@ -208,11 +133,10 @@ func (l *migrationIntentLog) Request(
 	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
 }
 
-func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error) {
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
-	}
+func (l *migrationIntentLog) Abort(
+	ctx context.Context,
+	sourcePCR0 string,
+) (*migrationIntent, error) {
 	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
@@ -223,10 +147,7 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error
 	if head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
-	if head.Action == migrationIntentGenesis {
-		// Aborting would file a record whose target is this enclave itself.
-		return nil, errMigrationIntentAbsent
-	}
+
 	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
 }
 
@@ -306,79 +227,42 @@ func (l *migrationIntentLog) append(
 	return head, nil
 }
 
-func (l *migrationIntentLog) sourcePCR0() (string, error) {
-	pcr0, err := l.nsm.PCR0()
-	if err != nil {
-		return "", fmt.Errorf("read source PCR0: %w", err)
-	}
-	if len(pcr0) != 48 {
-		return "", fmt.Errorf("source PCR0 must be 48 bytes, got %d", len(pcr0))
-	}
-	return hex.EncodeToString(pcr0), nil
-}
-
 func (l *migrationIntentLog) deriveHead(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, bool, error) {
 	var head *migrationIntent
 	var tie bool
-	var keyMarker, versionMarker *string
-	for {
-		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-			Bucket:          aws.String(l.bucket),
-			Prefix:          aws.String(migrationIntentPrefix + sourcePCR0 + "/"),
-			KeyMarker:       keyMarker,
-			VersionIdMarker: versionMarker,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf(
-				"%w: list migration intents: %w",
-				errMigrationIntentStoreUnavailable,
-				err,
-			)
-		}
-		for _, version := range out.Versions {
-			key := aws.ToString(version.Key)
+	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
+		errMigrationIntentStoreUnavailable, "list migration intents",
+		func(key, versionID string, lastModified *time.Time) (bool, error) {
 			keySourcePCR0, sequence, ok := parseMigrationIntentObjectKey(key)
-			versionID := aws.ToString(version.VersionId)
-			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" ||
-				version.LastModified == nil {
-				continue
+			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || lastModified == nil {
+				return false, nil
 			}
 			nextHead, valid, err := l.fetchIntent(
-				ctx, key, versionID, keySourcePCR0, sequence, version.LastModified.UTC(),
+				ctx, key, versionID, keySourcePCR0, sequence, lastModified.UTC(),
 			)
-			if err != nil {
-				return nil, false, err
-			}
-			if !valid {
-				continue
+			if err != nil || !valid {
+				return false, err
 			}
 			switch {
 			case head == nil || nextHead.Sequence > head.Sequence:
 				head = nextHead
 				tie = false
 			case nextHead.Sequence < head.Sequence:
-				continue
 			case nextHead.PublishedAt.Before(head.PublishedAt):
 				head = nextHead
 				tie = false
 			case nextHead.PublishedAt.Equal(head.PublishedAt):
 				tie = true
 			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			return head, tie, nil
-		}
-		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return nil, false, fmt.Errorf(
-				"%w: list migration intents: truncated response missing markers",
-				errMigrationIntentStoreUnavailable,
-			)
-		}
-		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+			return false, nil
+		})
+	if err != nil {
+		return nil, false, err
 	}
+	return head, tie, nil
 }
 
 // readIntent returns one version if it is a well-formed record at the expected
@@ -499,7 +383,7 @@ func normalizePCR0(value string) (string, []byte, error) {
 
 func isMigrationIntentAction(action string) bool {
 	switch action {
-	case migrationIntentRequested, migrationIntentAborted, migrationIntentGenesis:
+	case migrationIntentRequested, migrationIntentAborted:
 		return true
 	}
 	return false

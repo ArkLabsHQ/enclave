@@ -151,30 +151,28 @@ under a KMS key that only the measured enclave can use.
 - Each static secret is committed to a PCR: secret *i* extends PCR(16+i), which
   is then locked. The secrets are therefore part of the enclave's measurement
   from the point of generation onward.
-- `/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is written last, both at
-  genesis and at migration finalisation. It is the atomic commit point: its
-  value selects which generation of ciphertexts is live. It must never be
-  managed by deployment tooling.
-- Genesis is recorded in the Object-Locked migration intent log immediately
-  before that commit, so the fact that a deployment exists outlives any SSM
-  parameter.
+- At genesis, an immutable, attested `deployment-genesis` object naming the
+  creating enclave's PCR0 is the final commit record. Before writing it, genesis
+  claims the SSM `KMSKeyID` with a create-only write.
+- Genesis is not a migration intent. It shares the bucket with the migration
+  intent log and nothing else: it is deployment-wide rather than scoped to one
+  PCR0, it never forms a sequence, and it is written once and never revised.
 
 ### Boot paths
 
-Whether a deployment already exists is decided by the Object-Locked migration
-intent log, not by SSM. Genesis writes a `genesis` record immediately before
-committing `KMSKeyID`, and it cannot be deleted for the length of the Object Lock
-retention, so "this deployment has been created" is a fact no host can retract.
-`KMSKeyID` is still the atomic commit point; it is no longer the thing that
-decides the boot path.
+Whether a deployment already exists is decided by the Object-Locked
+`deployment-genesis` object, not by SSM alone. That key is fixed and
+identity-independent, so any enclave's genesis vetoes every later one. The
+preceding create-only SSM write prevents two enclaves from claiming
+different keys even if a lease expires between verification and commit.
 
 | Condition | Path | Behaviour |
 |---|---|---|
-| intent log empty | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis`, no predecessor artifacts, and no committed `KMSKeyID`. Creates the key, generates the DEK and secrets, writes a state-origin receipt, records genesis in the log, then commits `KMSKeyID`. |
+| genesis intent and `KMSKeyID` absent | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis` and no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID` without overwrite, then conditionally creates the immutable genesis intent. |
 | `KMSKeyID` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
 | `KMSKeyID` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
-| genesis recorded, `KMSKeyID` absent | fatal | Either the parameter was deleted or a genesis died between its record and the commit. The two are indistinguishable, so both fail closed: restore the parameter rather than re-creating the deployment. |
-| log empty, `KMSKeyID` present | fatal | The intent log was wiped or the bucket repointed. |
+| genesis intent present, `KMSKeyID` absent | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
+| genesis intent absent, `KMSKeyID` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
 Boot order is fixed and every step is fatal: clock synchronisation against
 `/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
@@ -461,7 +459,7 @@ Create a private S3 bucket for the ACME cache and write its name to
 `/<deployment>/<app>/TLSCacheBucketName`.
 
 The migration intent bucket is **not** configured. Its name is derived, so no
-parameter a host can rewrite decides where the genesis record is looked for:
+parameter a host can rewrite decides where deployment state is looked for:
 
 ```text
 enclave-<account-id>-<sha256(deployment \x00 app)[:8]>-migration-intents
@@ -469,18 +467,16 @@ enclave-<account-id>-<sha256(deployment \x00 app)[:8]>-migration-intents
 
 Provisioning must create exactly that bucket, with versioning and Object Lock
 enabled at creation, before the enclave first boots; the runtime only reads and
-writes it. The digest keeps the name inside S3's 63-character limit and its
+writes it. The digest keeps its name inside S3's 63-character limit and its
 character rules whatever the deployment and application are called, and the
-account ID keeps two AWS accounts off the same globally unique name. One bucket
-per deployment/application falls out of the derivation, so no application's
-genesis record can veto another's.
+account ID keeps two AWS accounts off the same globally unique name.
 
 AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
 | `S3TLSCacheReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the TLS cache bucket. |
-| `S3MigrationIntentLogObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent log bucket. Grant no `s3:CreateBucket`: the runtime must never create it, or a boot that cannot find the deployment could manufacture an empty one. |
+| `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |
 | `STSAccess` | `GetCallerIdentity`. |
@@ -492,8 +488,9 @@ policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
 `/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is owned exclusively by the
-runtime. Do not pre-create or declaratively manage it: absence selects genesis,
-and the runtime writes it last to commit genesis and migration transitions.
+runtime. Do not pre-create or declaratively manage it. Genesis claims it
+create-only, immediately before writing the `deployment-genesis` object;
+migration finalisation writes it last, as the atomic commit.
 
 ## Blue/green migration
 
@@ -749,34 +746,36 @@ running, not that it is running your code.
 attestation and PCRs before sending application requests, then pins the live TLS
 leaf to the exact hash carried in `user_data`.
 
-**Never manage `KMSKeyID` with deployment tooling.** The runtime rewrites it as
-the final step of every state transition. A declaratively managed value would
-fight the runtime and could roll a live deployment back to a key that no longer
-decrypts anything. Deleting it no longer causes a state fork — the intent log
-records that the deployment exists, so the boot fails instead of creating a
-second generation — but it still stops the deployment booting until it is
-restored.
+**Never manage `KMSKeyID` with deployment tooling.** Migration finalisation
+rewrites it as its atomic commit, and genesis claims it create-only. A
+declaratively managed value would fight the runtime and could roll a live
+deployment back to a key that no longer decrypts anything. Once the
+`deployment-genesis` object exists, deleting the parameter cannot fork the
+state — the boot fails instead of creating a second generation — but it still
+stops the deployment booting until it is restored. Genesis claims the parameter
+before writing that object, so a crash between the two leaves a window in which
+deleting the parameter does re-open genesis.
 
-**Genesis is vetoed by presence, never authorised by it.** The deployment-wide
-scan looks for a `genesis` record and is deliberately unverified: a forged record
-can only stop a genesis — visible in the bucket, and recoverable — while treating
-an unverifiable one as absent would fail open and re-create a deployment that
-already exists. Permission to create a deployment comes from
-*absence*, which Object Lock Compliance retention makes impossible to
-manufacture. The scan reads the version listing rather than the current view,
-because Object Lock stops a version being erased but does not stop a delete
-marker hiding it.
+**Genesis is committed exactly once.** Every contender first performs a
+create-only SSM key claim. Only that winner writes the `deployment-genesis`
+object, itself a create-only put under Object Lock, so a second write is
+rejected rather than layered on top. Its attestation binds the creating
+enclave's PCR0 and the bucket. Boot lists that one key's versions rather than
+reading it directly, because Object Lock cannot stop a delete marker hiding the
+object, and it reads them unverified: a record it cannot verify still vetoes a
+genesis, because treating it as absent would fail open. The contents are
+therefore advisory — presence is the only thing boot trusts.
 
 **The intent bucket is on the boot path.** An unreachable or unwritable bucket
 now fails the boot rather than only blocking migration. That is the intended
 trade: an enclave that cannot check whether the deployment exists must not guess.
 
-**Seed the log before adopting this on any existing deployment.** No runtime
-before this change wrote a `genesis` record, so *every* deployment created
-earlier lacks one — migrated or not. Create the derived bucket and write a
-`genesis` record for the running PCR0 into it before upgrading. Without the
-bucket the boot fails reading the log; with an empty one it reaches the genesis
-path, finds its committed `KMSKeyID`, and fails there.
+**Seed the genesis object before adopting this on any existing deployment.** No
+runtime before this change wrote one, so *every* deployment created earlier
+lacks it — migrated or not. Create the derived bucket and write a
+`deployment-genesis` object naming the running PCR0 into it before upgrading.
+Without the bucket the boot fails reading the store; with an empty one it
+reaches the genesis path, finds its committed `KMSKeyID`, and fails there.
 
 Existing intent records cannot be carried across. Each record's `bucket_name` is
 part of its attested pre-image, so one copied into the derived bucket no longer

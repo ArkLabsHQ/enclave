@@ -34,6 +34,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        strings.Repeat("0", 96),
 			predecessorAttestation: attestation,
 			migrationReceipt:       "transition",
@@ -53,6 +54,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        claimedPCR0,
 			predecessorAttestation: attestation,
 			migrationReceipt:       "transition",
@@ -69,6 +71,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        prevPCR0,
 			predecessorAttestation: attestation,
 			migrationReceipt:       "transition",
@@ -85,6 +88,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        strings.ToUpper(prevPCR0),
 			predecessorAttestation: attestation,
 			migrationReceipt:       "transition",
@@ -105,6 +109,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
 			predecessorAttestation: attestation,
 			migrationReceipt:       "transition",
@@ -294,9 +299,10 @@ func TestCompleteMigration(t *testing.T) {
 		ssmf := &fakeSSM{params: map[string]string{}}
 		ssm := NewSSM(ssmf)
 		s3f := newFakeS3()
-		// Any deployment that reaches a migration was created by a genesis, and
-		// the successor's boot reads that record to know it exists.
-		seedGenesisRecord(t, s3f, oldPCR0Hex)
+		genesis, err := newGenesisLog(s3f, nsm, migrationIntentBucketName)
+		require.NoError(t, err)
+		_, err = genesis.CommitGenesis(ctx, oldPCR0Hex)
+		require.NoError(t, err)
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
 		fx := &startMigrationFixture{

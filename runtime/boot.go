@@ -101,8 +101,8 @@ type bootMode interface {
 }
 
 type genesisBoot struct {
-	lease  *Lease
-	intent *migrationIntentLog
+	lease   *Lease
+	genesis *genesisLog
 }
 
 type resumeBoot struct{}
@@ -149,7 +149,7 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 		if lease != nil {
 			defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 		}
-		
+
 		planned, err = b.plan(ctx)
 		if err != nil {
 			return bootResult{}, fmt.Errorf("failed to replan boot after genesis wait: %w", err)
@@ -183,9 +183,9 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	if err != nil {
 		return nil, err
 	}
-	intent, err := newMigrationIntentLog(b.s3, b.nsm, migrationIntentBucketName)
+	genesis, err := newGenesisLog(b.s3, b.nsm, migrationIntentBucketName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open migration intent log: %w", err)
+		return nil, fmt.Errorf("failed to open deployment genesis log: %w", err)
 	}
 
 	predecessorPCR0, predecessorAttestation, err := b.loadPredecessor(ctx)
@@ -202,7 +202,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 		},
 	}
 
-	mode, err := b.determineMode(ctx, &state, intent)
+	mode, err := b.determineMode(ctx, &state, genesis)
 	if err != nil {
 		return nil, err
 	}
@@ -213,20 +213,21 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 }
 
 func (b *Boot) determineMode(
-	ctx context.Context, state *bootState, intent *migrationIntentLog,
+	ctx context.Context, state *bootState, genesis *genesisLog,
 ) (bootMode, error) {
-	genesisRecorded, err := intent.GenesisRecorded(ctx)
+	genesisArtifact, err := genesis.Genesis(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read deployment intent log: %w", err)
+		return nil, fmt.Errorf("failed to read deployment genesis: %w", err)
 	}
 	keyID, err := b.ssm.MayGet(ctx, kmsKeyIDParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
+
 	state.kmsKeyID = keyID
 
-	if !genesisRecorded {
-		return &genesisBoot{intent: intent}, nil
+	if genesisArtifact == nil {
+		return &genesisBoot{genesis: genesis}, nil
 	}
 
 	if keyID == "" {
@@ -528,25 +529,26 @@ func (b *migrationBoot) verifySnapshot(state *bootState, nsm NSM, snapshotRoot [
 func (b *genesisBoot) commitSnapshot(
 	ctx context.Context, state *bootState, nsm NSM, ssm SSM, kms PrimaryKMS, snapshotRoot []byte,
 ) error {
+	if b.lease == nil {
+		return fmt.Errorf("refusing to commit genesis without lease")
+	}
+
 	if err := writeOriginReceipt(ctx, nsm, ssm, kms, snapshotRoot, state.currentPCR0); err != nil {
 		return err
 	}
 
-	if b.lease != nil {
-		if err := b.lease.Verify(ctx); err != nil {
-			return fmt.Errorf("refusing to commit genesis: %w", err)
-		}
+	if err := b.lease.Verify(ctx); err != nil {
+		return fmt.Errorf("refusing to commit genesis: %w", err)
 	}
 
-	// Immediately before the key: a crash any earlier leaves an empty log and the
-	// next boot retries cleanly.
-	if _, err := b.intent.Genesis(ctx); err != nil {
-		return fmt.Errorf("failed to record genesis in the intent log: %w", err)
+	if err := ssm.Set(ctx, kmsKeyIDParam(), kms.KeyID(), WithoutOverwrite()); err != nil {
+		return fmt.Errorf("failed to claim genesis KMS key ID: %w", err)
 	}
 
-	if err := ssm.Set(ctx, kmsKeyIDParam(), kms.KeyID()); err != nil {
-		return fmt.Errorf("failed to commit genesis KMS key ID: %w", err)
+	if _, err := b.genesis.CommitGenesis(ctx, hex.EncodeToString(state.currentPCR0)); err != nil {
+		return fmt.Errorf("failed to commit deployment genesis: %w", err)
 	}
+
 	return nil
 }
 

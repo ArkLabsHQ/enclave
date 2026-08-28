@@ -360,6 +360,11 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	boot := &Boot{nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
+	lease, err := TryAcquireLease(ctx, s3f, "genesis-leases", genesisLeaseName, leaseTTL)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	planned.mode.(*genesisBoot).lease = lease
 
 	established, err := (&Boot{nsm: nsm, ssm: ssm}).establish(
 		ctx, planned, &stateOriginTestKMS{keyID: keyID},
@@ -383,6 +388,27 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	require.False(t, hasLegacyReceipt)
 }
 
+func TestEstablishLoadedStateGenesisWithoutLeaseWritesNoReceipt(t *testing.T) {
+	setStateOriginTestEnv(t)
+
+	ctx := context.Background()
+	keyID := "key-genesis-without-lease"
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fake, ssm := stateOriginTestSSM(nil)
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
+	s3f := newFakeS3()
+	planned, err := (&Boot{nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(ctx)
+	require.NoError(t, err)
+
+	_, err = (&Boot{nsm: nsm, ssm: ssm}).establish(
+		ctx, planned, &stateOriginTestKMS{keyID: keyID},
+	)
+
+	require.ErrorContains(t, err, "refusing to commit genesis without lease")
+	require.Empty(t, fake.params[stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))])
+}
+
 func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	setStateOriginTestEnv(t)
 
@@ -399,6 +425,13 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	boot := &Boot{nsm: nsm, ssm: ssm, s3: newFakeS3(), sts: &fakeSTS{}, pcr0: pcr0}
 	planned, err := boot.plan(context.Background())
 	require.NoError(t, err)
+	lease, err := TryAcquireLease(
+		context.Background(), boot.s3, "genesis-leases", genesisLeaseName, leaseTTL,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	planned.mode.(*genesisBoot).lease = lease
 
 	_, err = (&Boot{nsm: nsm, ssm: ssm}).establish(
 		context.Background(), planned, &stateOriginTestKMS{keyID: keyID},
@@ -487,7 +520,9 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		s3f := newFakeS3()
 		seedGenesisRecord(t, s3f, prevPCR0Hex)
 		boot := &Boot{
-			nsm: fakePredecessorNSM{NSM: nsm, doc: "previous-attestation"},
+			nsm: seededGenesisNSM{NSM: fakePredecessorNSM{
+				NSM: nsm, doc: "previous-attestation",
+			}},
 			ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: ownPCR0,
 		}
 		planned, err := boot.plan(ctx)
@@ -671,18 +706,16 @@ type genesisFixture struct {
 }
 
 // seedGenesisRecord writes the record a completed genesis leaves behind. The
-// attestation is a placeholder: GenesisRecorded does not verify it.
-func seedGenesisRecord(t *testing.T, s3f *fakeS3, sourcePCR0 string) {
+// attestation is a placeholder: Genesis does not verify it.
+func seedGenesisRecord(t *testing.T, s3f *fakeS3, targetPCR0 string) {
 	t.Helper()
-	body, err := json.Marshal(migrationIntentObjectV1{
-		Schema:      migrationIntentSchemaV1,
-		Sequence:    1,
-		Action:      migrationIntentGenesis,
-		TargetPCR0:  sourcePCR0,
-		Attestation: "seeded",
+	body, err := json.Marshal(deploymentGenesisV1{
+		Schema:      deploymentGenesisSchemaV1,
+		PCR0:        targetPCR0,
+		Attestation: seededGenesisAttestation,
 	})
 	require.NoError(t, err)
-	s3f.putRawObject(migrationIntentObjectKey(sourcePCR0, 1), body)
+	s3f.putRawObject(deploymentGenesisKey, body)
 }
 
 func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
@@ -897,6 +930,23 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 
 // fakePredecessorNSM answers the predecessor attestation check, which the tests
 // using it are not about, and delegates every other document.
+const seededGenesisAttestation = "seeded"
+
+// seededGenesisNSM accepts the placeholder attestation seedGenesisRecord writes,
+// so a seeded peer record reads back as a genuine one.
+type seededGenesisNSM struct {
+	NSM
+}
+
+func (n seededGenesisNSM) VerifyAttestation(
+	doc string, pcrs map[uint]string, userData []byte,
+) error {
+	if doc == seededGenesisAttestation {
+		return nil
+	}
+	return n.NSM.VerifyAttestation(doc, pcrs, userData)
+}
+
 type fakePredecessorNSM struct {
 	NSM
 	doc string
@@ -911,7 +961,7 @@ func (n fakePredecessorNSM) VerifyAttestation(
 	return n.NSM.VerifyAttestation(doc, pcrs, userData)
 }
 
-func TestDeletingKMSKeyIDDoesNotReGenesis(t *testing.T) {
+func TestDeletingKMSKeyIDFailsClosed(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
@@ -928,12 +978,13 @@ func TestDeletingKMSKeyIDDoesNotReGenesis(t *testing.T) {
 
 	_, err = fx.establish(ctx)
 
-	require.Error(t, err)
+	require.ErrorContains(t, err, "deployment genesis is recorded but")
+	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
 	require.Equal(t, originalDEK, fx.ssmf.params[storageDEKCiphertextParam(first.kms.KeyID())],
 		"the original generation's ciphertexts must survive")
 }
 
-func TestGenesisRequiresAnEmptyIntentLog(t *testing.T) {
+func TestGenesisRequiresAnEmptyGenesisIntent(t *testing.T) {
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	pcr0Hex := hex.EncodeToString(pcr0)
@@ -951,8 +1002,9 @@ func TestGenesisRequiresAnEmptyIntentLog(t *testing.T) {
 			name: "another enclave's record vetoes genesis",
 			seed: func(t *testing.T, fx *genesisFixture) {
 				seedGenesisRecord(t, fx.s3f, otherPCR0)
+				fx.nsm = seededGenesisNSM{NSM: fx.nsm}
 			},
-			wantErr: "deployment genesis is recorded",
+			wantErr: "deployment genesis is recorded but",
 		},
 		{
 			name: "a committed key with an empty log is a wiped log",
@@ -974,8 +1026,10 @@ func TestGenesisRequiresAnEmptyIntentLog(t *testing.T) {
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
 				require.Empty(t, fx.kmsf.keys, "no key may be minted on a refused genesis")
-				require.Empty(t, fx.s3f.latestBody(migrationIntentObjectKey(pcr0Hex, 1)),
-					"a refused genesis must not claim the log")
+				if tc.name == "a committed key with an empty log is a wiped log" {
+					require.Empty(t, fx.s3f.latestBody(migrationIntentObjectKey(pcr0Hex, 1)),
+						"a refused genesis must not claim the intent")
+				}
 				return
 			}
 			require.NoError(t, err)
@@ -984,9 +1038,8 @@ func TestGenesisRequiresAnEmptyIntentLog(t *testing.T) {
 	}
 }
 
-// The record goes in before the key, so a deployment can never hold a committed
-// key the log does not know about.
-func TestGenesisRecordsItsClaimBeforeCommittingTheKey(t *testing.T) {
+// A failed create-only key claim must not leave an immutable genesis commit.
+func TestGenesisClaimsKMSKeyBeforeCommittingIntent(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
@@ -1000,76 +1053,65 @@ func TestGenesisRecordsItsClaimBeforeCommittingTheKey(t *testing.T) {
 
 	require.ErrorContains(t, err, "key commit failed")
 	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
-	require.Equal(t, migrationIntentGenesis, mustIntentHead(t, ctx, fx).Action)
+	intent, loadErr := newGenesisLog(
+		fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket(),
+	)
+	require.NoError(t, loadErr)
+	commit, loadErr := intent.Genesis(ctx)
+	require.NoError(t, loadErr)
+	require.Nil(t, commit)
 }
 
-// The mirror image: with the log unwritable, nothing may be committed.
-func TestGenesisWithoutTheIntentLogCommitsNothing(t *testing.T) {
-	setStateOriginTestEnv(t)
-
-	ctx := context.Background()
-	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
-	fx.s3f.putErr = errors.New("intent bucket unwritable")
-
-	_, err := fx.establish(ctx)
-
-	require.ErrorContains(t, err, "intent bucket unwritable")
-	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
-}
-
-// An interrupted genesis is not resumed. Nothing can tell it apart from a
-// deployment whose commit pointer was deleted, so both fail closed.
-func TestInterruptedGenesisFailsRatherThanRestarting(t *testing.T) {
+// A peer claiming KMSKeyID inside the window between our verify and our
+// create-only write must stop us dead, leaving its claim and no genesis.
+func TestGenesisAbandonsCommitWhenPeerClaimsKeyFirst(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
+	fx.ssmf.beforePut = func(name string) {
+		if name == kmsKeyIDParam() {
+			fx.ssmf.params[name] = "peer-key"
+		}
+	}
 
-	// Die between recording genesis and committing the key.
-	intent, err := newMigrationIntentLog(fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket())
-	require.NoError(t, err)
-	_, err = intent.Genesis(ctx)
-	require.NoError(t, err)
+	_, err := fx.establish(ctx)
 
-	_, err = fx.establish(ctx)
-
-	require.ErrorContains(t, err, "deployment genesis is recorded")
-	require.Empty(t, fx.ssmf.params[kmsKeyIDParam()])
-	require.Empty(t, fx.kmsf.keys, "no key may be minted for a deployment that already exists")
+	require.ErrorContains(t, err, "failed to claim genesis KMS key ID")
+	require.Equal(t, "peer-key", fx.ssmf.params[kmsKeyIDParam()],
+		"the peer's claim must stand")
+	genesis, loadErr := newGenesisLog(fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket())
+	require.NoError(t, loadErr)
+	committed, loadErr := genesis.Genesis(ctx)
+	require.NoError(t, loadErr)
+	require.Nil(t, committed, "a lost key claim must not record genesis")
 }
 
-// GenesisRecorded must read the version listing. fakeS3 reports nothing from
-// ListObjectsV2, so a record found here proves the current view is not consulted
-// — the view a delete marker would empty.
-func TestGenesisRecordedReadsVersionsNotTheCurrentView(t *testing.T) {
+// Once the create-only KMS claim succeeds, an intent failure leaves an
+// interrupted genesis that every later boot rejects.
+func TestGenesisIntentFailureLeavesFailClosedKMSClaim(t *testing.T) {
 	setStateOriginTestEnv(t)
 
 	ctx := context.Background()
-	s3f := newFakeS3()
-	pcr0Hex := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 48))
-	seedGenesisRecord(t, s3f, pcr0Hex)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+	boot := &Boot{nsm: fx.nsm, ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
+	planned, err := boot.plan(ctx)
+	require.NoError(t, err)
+	lease, err := TryAcquireLease(
+		ctx, fx.s3f, "genesis-leases", genesisLeaseName, leaseTTL,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	planned.mode.(*genesisBoot).lease = lease
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	fx.s3f.putErr = errors.New("intent bucket unwritable")
 
-	current, err := s3f.ListObjectsV2(ctx, nil)
-	require.NoError(t, err)
-	require.Empty(t, current.Contents)
+	_, err = boot.establish(ctx, planned, &stateOriginTestKMS{keyID: "claimed-key"})
 
-	intent, err := newMigrationIntentLog(s3f, nil, stateOriginTestMigrationIntentBucket())
-	require.NoError(t, err)
-	recorded, err := intent.GenesisRecorded(ctx)
-
-	require.NoError(t, err)
-	require.True(t, recorded)
-}
-
-func mustIntentHead(t *testing.T, ctx context.Context, fx *genesisFixture) *migrationIntent {
-	t.Helper()
-	intent, err := newMigrationIntentLog(fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket())
-	require.NoError(t, err)
-	head, err := intent.Head(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, head)
-	return head
+	require.ErrorContains(t, err, "intent bucket unwritable")
+	require.Equal(t, "claimed-key", fx.ssmf.params[kmsKeyIDParam()])
 }
 
 // The intent bucket is measured, never read from SSM. A host that can write the

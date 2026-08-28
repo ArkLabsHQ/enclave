@@ -21,12 +21,13 @@ import (
 const migrationIntentTestBucket = "migration-intent-test"
 
 type migrationIntentFixture struct {
-	log    *migrationIntentLog
-	s3     *fakeS3
-	nsm    *nsmW
-	pcr0   []byte
-	source string
-	signer *testAttestationSigner
+	log     *migrationIntentLog
+	genesis *genesisLog
+	s3      *fakeS3
+	nsm     *nsmW
+	pcr0    []byte
+	source  string
+	signer  *testAttestationSigner
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
@@ -50,13 +51,16 @@ func newMigrationIntentFixtureWithRetention(
 	s3f := newFakeS3()
 	log, err := newMigrationIntentLog(s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
+	genesis, err := newGenesisLog(s3f, nsm, migrationIntentTestBucket)
+	require.NoError(t, err)
 	return &migrationIntentFixture{
-		log:    log,
-		s3:     s3f,
-		nsm:    nsm,
-		pcr0:   pcr0,
-		source: strings.Repeat("ab", 48),
-		signer: session.attestationSign,
+		log:     log,
+		genesis: genesis,
+		s3:      s3f,
+		nsm:     nsm,
+		pcr0:    pcr0,
+		source:  strings.Repeat("ab", 48),
+		signer:  session.attestationSign,
 	}
 }
 
@@ -139,10 +143,10 @@ func TestMigrationIntentAppend(t *testing.T) {
 	targetA := strings.Repeat("cd", 48)
 	targetB := strings.Repeat("ef", 48)
 	empty := newMigrationIntentFixtureWithRetention(t, "24h")
-	_, err := empty.log.Abort(context.Background())
+	_, err := empty.log.Abort(context.Background(), empty.source)
 	require.ErrorIs(t, err, errMigrationIntentAbsent)
 
-	head, err := fx.log.Request(context.Background(), strings.ToUpper(targetA))
+	head, err := fx.log.Request(context.Background(), fx.source, strings.ToUpper(targetA))
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), head.Sequence)
 	require.Equal(t, migrationIntentRequested, head.Action)
@@ -161,19 +165,19 @@ func TestMigrationIntentAppend(t *testing.T) {
 	require.NoError(t, fx.nsm.VerifyAttestation(entry.Attestation, map[uint]string{0: fx.source},
 		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket)))
 
-	_, err = fx.log.Request(context.Background(), targetB)
+	_, err = fx.log.Request(context.Background(), fx.source, targetB)
 	require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
 
-	head, err = fx.log.Abort(context.Background())
+	head, err = fx.log.Abort(context.Background(), fx.source)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), head.Sequence)
 	require.Equal(t, migrationIntentAborted, head.Action)
 	require.Equal(t, targetA, head.TargetPCR0)
 
-	_, err = fx.log.Abort(context.Background())
+	_, err = fx.log.Abort(context.Background(), fx.source)
 	require.ErrorIs(t, err, errMigrationIntentAborted)
 
-	head, err = fx.log.Request(context.Background(), targetB)
+	head, err = fx.log.Request(context.Background(), fx.source, targetB)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), head.Sequence)
 	require.Equal(t, targetB, head.TargetPCR0)
@@ -230,7 +234,7 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 			base.Add(2*time.Minute),
 		)
 
-		head, err := fx.log.Head(context.Background())
+		head, err := fx.log.Head(context.Background(), fx.source)
 		require.NoError(t, err)
 		require.Equal(t, uint64(2), head.Sequence)
 		require.Equal(t, targetB, head.TargetPCR0)
@@ -238,7 +242,7 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		fx.s3.mu.Lock()
 		delete(fx.s3.objects, migrationIntentObjectKey(fx.source, 2))
 		fx.s3.mu.Unlock()
-		head, err = fx.log.Head(context.Background())
+		head, err = fx.log.Head(context.Background(), fx.source)
 		require.NoError(t, err)
 		require.Equal(t, migrationIntentAborted, head.Action)
 		require.Equal(t, base.UTC(), head.PublishedAt)
@@ -259,7 +263,7 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		fx.s3.putRawObjectAt(key, body, base)
 		fx.s3.putRawObjectAt(key, body, base.Add(time.Minute))
 
-		head, err := fx.log.Head(context.Background())
+		head, err := fx.log.Head(context.Background(), fx.source)
 		require.NoError(t, err)
 		require.Equal(t, base, head.PublishedAt)
 	})
@@ -275,17 +279,17 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 			fx.object(t, 1, migrationIntentRequested, targetB, migrationIntentTestBucket, fx.pcr0),
 			publishedAt)
 
-		_, err := fx.log.Head(context.Background())
+		_, err := fx.log.Head(context.Background(), fx.source)
 		require.ErrorIs(t, err, errMigrationIntentAmbiguous)
 
-		_, err = fx.log.Request(context.Background(), targetB)
+		_, err = fx.log.Request(context.Background(), fx.source, targetB)
 		require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
 
-		head, err := fx.log.Abort(context.Background())
+		head, err := fx.log.Abort(context.Background(), fx.source)
 		require.NoError(t, err)
 		require.Equal(t, uint64(2), head.Sequence)
 
-		head, err = fx.log.Request(context.Background(), targetB)
+		head, err = fx.log.Request(context.Background(), fx.source, targetB)
 		require.NoError(t, err)
 		require.Equal(t, uint64(3), head.Sequence)
 	})
@@ -443,7 +447,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 				migrationIntentObjectKey(fx.source, 2), invalidBody(t, fx), base.Add(time.Minute),
 			)
 
-			head, err := fx.log.Head(context.Background())
+			head, err := fx.log.Head(context.Background(), fx.source)
 			require.NoError(t, err)
 			require.Equal(t, uint64(1), head.Sequence)
 		})
@@ -474,7 +478,7 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 				time.Now(),
 			)
 			configure(fx.s3)
-			_, err := fx.log.Head(ctx)
+			_, err := fx.log.Head(ctx, fx.source)
 			require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 		})
 	}
@@ -482,14 +486,14 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 	t.Run("put", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		fx.s3.putErr = errors.New("put failed")
-		_, err := fx.log.Request(ctx, target)
+		_, err := fx.log.Request(ctx, fx.source, target)
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 	})
 
 	t.Run("missing put version ID", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		fx.s3.missingVersionID = true
-		_, err := fx.log.Request(ctx, target)
+		_, err := fx.log.Request(ctx, fx.source, target)
 		require.ErrorContains(t, err, "no version ID")
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 	})
@@ -511,7 +515,7 @@ func TestMigrationIntentSequenceOverflow(t *testing.T) {
 		time.Now(),
 	)
 
-	_, err := fx.log.Request(context.Background(), target)
+	_, err := fx.log.Request(context.Background(), fx.source, target)
 	require.ErrorContains(t, err, "overflow")
 }
 
@@ -571,7 +575,7 @@ func TestMigrationIntentPagination(t *testing.T) {
 	paged := &migrationIntentPagedS3{fakeS3: fx.s3}
 	fx.log.s3 = paged
 
-	head, err := fx.log.Head(context.Background())
+	head, err := fx.log.Head(context.Background(), fx.source)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), head.Sequence)
 	require.Equal(t, 1, paged.page)
@@ -596,75 +600,6 @@ func mustMigrationIntentPayload(
 }
 
 var _ S3API = (*migrationIntentPagedS3)(nil)
-
-// Genesis records share the head chain with handoffs. Nothing downstream may
-// mistake one for a pending migration.
-func TestGenesisRecordIsNotAPendingMigration(t *testing.T) {
-	ctx := context.Background()
-	fx := newMigrationIntentFixture(t)
-
-	genesis, err := fx.log.Genesis(ctx)
-	require.NoError(t, err)
-	require.Equal(t, migrationIntentGenesis, genesis.Action)
-	require.Equal(t, uint64(1), genesis.Sequence)
-	require.Equal(t, fx.source, genesis.TargetPCR0, "genesis names its own creator")
-
-	// Zero cooldown is the case that would otherwise report eligible immediately.
-	require.Equal(t, migrationStateNone, migrationStatusAt(genesis, 0, time.Now()).State)
-
-	_, err = fx.log.Abort(ctx)
-	require.ErrorIs(t, err, errMigrationIntentAbsent, "there is no handoff to abort")
-
-	// A real migration still follows, continuing the sequence.
-	target := strings.Repeat("cd", 48)
-	requested, err := fx.log.Request(ctx, target)
-	require.NoError(t, err)
-	require.Equal(t, uint64(2), requested.Sequence)
-	require.Equal(t, migrationStateEligible, migrationStatusAt(requested, 0, time.Now()).State)
-}
-
-func TestGenesisIsRecordedOnlyOnce(t *testing.T) {
-	ctx := context.Background()
-	fx := newMigrationIntentFixture(t)
-
-	_, err := fx.log.Genesis(ctx)
-	require.NoError(t, err)
-
-	_, err = fx.log.Genesis(ctx)
-	require.ErrorContains(t, err, "cannot record genesis")
-
-	_, err = fx.log.Request(ctx, strings.Repeat("cd", 48))
-	require.NoError(t, err)
-	_, err = fx.log.Genesis(ctx)
-	require.ErrorContains(t, err, "cannot record genesis")
-}
-
-func TestGenesisRecordedIgnoresNonGenesisRecords(t *testing.T) {
-	ctx := context.Background()
-	fx := newMigrationIntentFixture(t)
-
-	recorded, err := fx.log.GenesisRecorded(ctx)
-	require.NoError(t, err)
-	require.False(t, recorded, "an empty log is a deployment that does not exist yet")
-
-	// A successor's first record is also sequence 1, so the sequence alone
-	// cannot stand in for the action.
-	_, err = fx.log.Request(ctx, strings.Repeat("cd", 48))
-	require.NoError(t, err)
-	recorded, err = fx.log.GenesisRecorded(ctx)
-	require.NoError(t, err)
-	require.False(t, recorded, "a handoff request is not a genesis")
-
-	other := strings.Repeat("ef", 48)
-	fx.s3.putRawObject(
-		migrationIntentObjectKey(other, 1),
-		fx.object(t, 1, migrationIntentGenesis, other, migrationIntentTestBucket, fx.pcr0),
-	)
-	recorded, err = fx.log.GenesisRecorded(ctx)
-
-	require.NoError(t, err)
-	require.True(t, recorded)
-}
 
 func TestMigrationIntentBucketNameDerivation(t *testing.T) {
 	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")

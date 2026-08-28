@@ -48,6 +48,10 @@ type fakeSSM struct {
 	// before anything committed the parameter.
 	getSeq map[string][]string
 
+	// beforePut fires just before a write lands, for races that turn on a peer
+	// winning a create-only claim inside our window.
+	beforePut func(name string)
+
 	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
 	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
 	// (empty string = no more). lastDecryption captures the last call's
@@ -72,7 +76,16 @@ func (f *fakeSSM) PutParameter(
 	if f.params == nil {
 		f.params = map[string]string{}
 	}
-	f.params[aws.ToString(in.Name)] = aws.ToString(in.Value)
+	name := aws.ToString(in.Name)
+	if f.beforePut != nil {
+		f.beforePut(name)
+	}
+	if !aws.ToBool(in.Overwrite) {
+		if _, exists := f.params[name]; exists {
+			return nil, &ssmtypes.ParameterAlreadyExists{}
+		}
+	}
+	f.params[name] = aws.ToString(in.Value)
 	return &ssm.PutParameterOutput{}, nil
 }
 
@@ -153,12 +166,21 @@ func (f *fakeSSM) GetParametersByPath(
 	return &ssm.GetParametersByPathOutput{Parameters: out}, nil
 }
 
-func (f *fakeSSM) Set(_ context.Context, key, val string, _ ...SSMSetOption) error {
+func (f *fakeSSM) Set(_ context.Context, key, val string, opts ...SSMSetOption) error {
 	if f.err != nil {
 		return f.err
 	}
 	if f.params == nil {
 		f.params = map[string]string{}
+	}
+	so := &SSMSetOptions{overwrite: true}
+	for _, opt := range opts {
+		opt(so)
+	}
+	if !so.overwrite {
+		if _, exists := f.params[key]; exists {
+			return fmt.Errorf("parameter %s already exists", key)
+		}
 	}
 	f.params[key] = val
 	return nil

@@ -120,12 +120,17 @@ func (m *migrator) HandleMigrationRequest(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	sourcePCR0, err := m.sourcePCR0()
+	if err != nil {
+		return nil, err
+	}
+
 	var intentHead *migrationIntent
 	switch action {
 	case migrationIntentRequested:
-		intentHead, err = m.intent.Request(ctx, targetPCR0)
+		intentHead, err = m.intent.Request(ctx, sourcePCR0, targetPCR0)
 	case migrationIntentAborted:
-		intentHead, err = m.intent.Abort(ctx)
+		intentHead, err = m.intent.Abort(ctx, sourcePCR0)
 	default:
 		return nil, fmt.Errorf("unknown migration action %q", action)
 	}
@@ -140,18 +145,31 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 	if err != nil {
 		return nil, err
 	}
-	head, err := m.intent.Head(ctx)
+	sourcePCR0, err := m.sourcePCR0()
+	if err != nil {
+		return nil, err
+	}
+	head, err := m.intent.Head(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
 	status := migrationStatusAt(head, cooldown, time.Now())
 	if head == nil {
-		status.SourcePCR0, err = m.intent.sourcePCR0()
-		if err != nil {
-			return nil, err
-		}
+		status.SourcePCR0 = sourcePCR0
 	}
 	return status, nil
+}
+
+func (m *migrator) sourcePCR0() (string, error) {
+	pcr0, err := m.nsm.PCR0()
+	if err != nil {
+		return "", fmt.Errorf("read source PCR0: %w", err)
+	}
+	if len(pcr0) != 48 {
+		return "", fmt.Errorf("source PCR0 must be 48 bytes, got %d", len(pcr0))
+	}
+
+	return hex.EncodeToString(pcr0), nil
 }
 
 func migrationStatusAt(
@@ -161,9 +179,6 @@ func migrationStatusAt(
 ) *MigrationStatus {
 	if head == nil {
 		return &MigrationStatus{State: migrationStateNone}
-	}
-	if head.Action == migrationIntentGenesis {
-		return &MigrationStatus{State: migrationStateNone, SourcePCR0: head.SourcePCR0}
 	}
 	publishedAt := head.PublishedAt
 	status := &MigrationStatus{

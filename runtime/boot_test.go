@@ -144,7 +144,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 				},
 				ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: currentPCR0,
 			}
-			planned, err := boot.Plan(ctx)
+			planned, err := boot.plan(ctx)
 
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
@@ -310,7 +310,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 	boot := &Boot{ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
-	planned, err := boot.Plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
 	fake.params[storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
@@ -340,7 +340,7 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 
-	_, err := (&Boot{ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).Plan(ctx)
+	_, err := (&Boot{ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(ctx)
 
 	require.Error(t, err)
 	_, exists := fake.params[secretCiphertextParam("alpha", keyID)]
@@ -358,7 +358,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	s3f := newFakeS3()
 	boot := &Boot{nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
-	planned, err := boot.Plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 
 	established, err := (&Boot{nsm: nsm, ssm: ssm}).establish(
@@ -397,7 +397,7 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	boot := &Boot{nsm: nsm, ssm: ssm, s3: newFakeS3(), sts: &fakeSTS{}, pcr0: pcr0}
-	planned, err := boot.Plan(context.Background())
+	planned, err := boot.plan(context.Background())
 	require.NoError(t, err)
 
 	_, err = (&Boot{nsm: nsm, ssm: ssm}).establish(
@@ -436,7 +436,7 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			s3f := newFakeS3()
 			seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 			boot := &Boot{ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
-			planned, err := boot.Plan(ctx)
+			planned, err := boot.plan(ctx)
 			require.NoError(t, err)
 			kms := &stateOriginTestKMS{keyID: keyID}
 
@@ -490,7 +490,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			nsm: fakePredecessorNSM{NSM: nsm, doc: "previous-attestation"},
 			ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: ownPCR0,
 		}
-		planned, err := boot.Plan(ctx)
+		planned, err := boot.plan(ctx)
 		require.NoError(t, err)
 
 		_, err = (&Boot{nsm: nsm, ssm: ssm}).establish(
@@ -707,11 +707,7 @@ func (f *genesisFixture) establish(ctx context.Context) (bootResult, error) {
 	if err != nil {
 		return bootResult{}, err
 	}
-	planned, err := boot.Plan(ctx)
-	if err != nil {
-		return bootResult{}, err
-	}
-	return boot.Finalise(ctx, planned)
+	return boot.Boot(ctx)
 }
 
 // A live peer lease must stop genesis before any KMS key is minted
@@ -787,7 +783,7 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, lease, "a committed genesis needs no lease")
 
-	planned, err := boot.Plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	require.IsType(t, &resumeBoot{}, planned.mode, "a peer's committed genesis leaves us resuming")
 }
@@ -834,7 +830,7 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lease, "a lapsed lock must be reclaimable")
 
-	planned, err := boot.Plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	require.IsType(
 		t,
@@ -879,7 +875,7 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
 
 	boot := &Boot{nsm: fx.nsm, ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
-	planned, err := boot.Plan(ctx)
+	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	genesis, ok := planned.mode.(*genesisBoot)
 	require.True(t, ok, "an uncommitted deployment must plan a genesis boot")

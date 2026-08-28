@@ -304,6 +304,13 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, err
 	}
+
+	if kms.KeyID() != snapshot.kmsKeyID {
+		return bootResult{}, fmt.Errorf(
+			"state KMS key ID %q does not match active KMS key ID %q",
+			snapshot.kmsKeyID, kms.KeyID(),
+		)
+	}
 	snapshotRoot, err := stateRoot(snapshot)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to build state root: %v", err)
@@ -312,12 +319,6 @@ func (b *Boot) establish(
 		return bootResult{}, err
 	}
 
-	if kms.KeyID() != snapshot.kmsKeyID {
-		return bootResult{}, fmt.Errorf(
-			"state KMS key ID %q does not match active KMS key ID %q",
-			snapshot.kmsKeyID, kms.KeyID(),
-		)
-	}
 	dekPlaintext, err := kms.Decrypt(ctx, snapshot.storageDEK)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to decrypt DEK: %w", err)

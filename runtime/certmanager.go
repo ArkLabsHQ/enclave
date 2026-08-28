@@ -98,15 +98,7 @@ func (m *certManager) resolve(ctx context.Context) (*certBundle, error) {
 	}
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
-	// A peer may have issued while we queued.
-	if bundle, err = m.store.LoadCert(ctx); err != nil {
-		return nil, err
-	}
-	if bundle != nil {
-		return bundle, nil
-	}
-	// Still nothing stored, so the write must be create-only.
-	return m.renew(ctx, "")
+	return m.renewWithLease(ctx, lease, "")
 }
 
 // Run polls for a peer's renewal and renews when the certificate ages out.
@@ -169,7 +161,36 @@ func (m *certManager) renewUnderLease(ctx context.Context, certETag string) (*ce
 	}
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
-	return m.renew(ctx, certETag)
+	return m.renewWithLease(ctx, lease, certETag)
+}
+
+func (m *certManager) renewWithLease(
+	ctx context.Context,
+	lease *Lease,
+	certETag string,
+) (*certBundle, error) {
+	renewCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(lease.Context(), func() {
+		cancel(context.Cause(lease.Context()))
+	})
+	defer stop()
+	
+	if cause := context.Cause(lease.Context()); cause != nil {
+		cancel(cause)
+	}
+
+	bundle, err := m.store.LoadCert(renewCtx)
+	if err != nil {
+		return nil, err
+	}
+	if bundle != nil {
+		if time.Until(bundle.notAfter) > renewBefore {
+			return bundle, nil
+		}
+		certETag = bundle.etag
+	}
+	return m.renew(renewCtx, certETag)
 }
 
 // renew issues a new certificate and commits it against certETag.

@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -69,7 +68,7 @@ func ConfigureTLS(
 	}
 
 	if !cfg.UseACME {
-		return configureSelfSignedCert(cfg, hashes)
+		return configureSelfSigned(ctx, cfg, s3, dek, ssm, hashes)
 	}
 
 	// Outside an enclave there is no DEK to seal the shared store with, so ACME
@@ -190,22 +189,73 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	return nil
 }
 
-// configureSelfSignedCert generates an ECDSA-P256 leaf cert, records its fingerprint
-// in the attestation hashes so clients can pin it against the NSM document
-func configureSelfSignedCert(cfg *Config, hashes *AttestationHashes) (TLSCertCallback, error) {
+// configureSelfSigned shares one self-signed certificate across the fleet when
+// the deployment can seal and coordinate it, so a client that pinned the leaf
+// from any enclave reaches every other one. Without an enclave to seal it or the
+// buckets to coordinate it, each enclave serves its own.
+func configureSelfSigned(
+	ctx context.Context,
+	cfg *Config,
+	s3 S3API,
+	dek DEK,
+	ssm SSM,
+	hashes *AttestationHashes,
+) (TLSCertCallback, error) {
+	if !nitriding.InEnclave() {
+		return configureSelfSignedCert(cfg, hashes)
+	}
+	certBucket, err := ssm.MayGet(ctx, certBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
+	}
+	leaseBucket, err := ssm.MayGet(ctx, leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
+	}
+	if certBucket == "" || leaseBucket == "" {
+		slog.Warn(
+			"no shared certificate store, serving a per-enclave self-signed certificate",
+			"fqdn", cfg.FQDN,
+		)
+		return configureSelfSignedCert(cfg, hashes)
+	}
+
+	store := newCertStore(s3, dek, certBucket, cfg.FQDN)
+	manager, err := newCertManager(
+		ctx, store, selfSignedIssuer{},
+		s3, leaseBucket, cfg.FQDN, hashes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
+	}
+	go manager.Run(ctx)
+
+	slog.Info("serving fleet-shared self-signed certificate", "fqdn", cfg.FQDN)
+	return manager.GetCertificate, nil
+}
+
+// selfSignedIssuer mints the certificate itself, for deployments with no public
+// CA. It satisfies certIssuer, so the shared store, the issuance lease and
+// renewal all behave exactly as they do for ACME.
+type selfSignedIssuer struct{}
+
+func (selfSignedIssuer) Issue(
+	_ context.Context,
+	domain string,
+) (certPEM, keyPEM []byte, err error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate cert key: %w", err)
+		return nil, nil, fmt.Errorf("generate cert key: %w", err)
 	}
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
-		return nil, fmt.Errorf("generate cert serial: %w", err)
+		return nil, nil, fmt.Errorf("generate cert serial: %w", err)
 	}
 	template := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{Organization: []string{certificateOrg}},
-		DNSNames:              []string{cfg.FQDN},
+		DNSNames:              []string{domain},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(certificateValidity),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -220,55 +270,42 @@ func configureSelfSignedCert(cfg *Config, hashes *AttestationHashes) (TLSCertCal
 		privKey,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create certificate: %w", err)
+		return nil, nil, fmt.Errorf("create certificate: %w", err)
 	}
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	if pemCert == nil {
-		return nil, fmt.Errorf("encode certificate to PEM")
+		return nil, nil, fmt.Errorf("encode certificate to PEM")
 	}
-
-	leafFingerprint := func(raw []byte) ([sha256.Size]byte, error) {
-		for len(raw) > 0 {
-			var block *pem.Block
-			block, raw = pem.Decode(raw)
-			if block == nil {
-				return [sha256.Size]byte{}, fmt.Errorf("pem.Decode found no PEM data")
-			}
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				return [sha256.Size]byte{}, fmt.Errorf("parse certificate: %w", err)
-			}
-			if !cert.IsCA {
-				return sha256.Sum256(cert.Raw), nil
-			}
-		}
-		return [sha256.Size]byte{}, fmt.Errorf("no non-CA leaf certificate found in TLS chain")
-	}
-
-	h, err := leafFingerprint(pemCert)
-	if err != nil {
-		return nil, err
-	}
-	hashes.SetTLSKeyHashSource(staticKeyHash(h))
 
 	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {
-		return nil, fmt.Errorf("marshal private key: %w", err)
+		return nil, nil, fmt.Errorf("marshal private key: %w", err)
 	}
-
 	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
 	if pemKey == nil {
-		return nil, fmt.Errorf("encode private key to PEM")
+		return nil, nil, fmt.Errorf("encode private key to PEM")
 	}
+	return pemCert, pemKey, nil
+}
+
+// configureSelfSignedCert serves a certificate only this enclave holds, pinned
+// by the fingerprint it publishes. Clients that reach a different enclave will
+// see a different leaf, so this is the single-enclave fallback.
+func configureSelfSignedCert(cfg *Config, hashes *AttestationHashes) (TLSCertCallback, error) {
+	pemCert, pemKey, err := selfSignedIssuer{}.Issue(context.Background(), cfg.FQDN)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := parseCertBundle(pemCert, pemKey)
+	if err != nil {
+		return nil, err
+	}
+	hashes.SetTLSKeyHashSource(staticKeyHash(bundle.leafHash))
 
 	cert, err := tls.X509KeyPair(pemCert, pemKey)
 	if err != nil {
 		return nil, fmt.Errorf("load X509 key pair: %w", err)
 	}
-
 	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		return &cert, nil
 	}, nil

@@ -67,7 +67,12 @@ type fakeIssuer struct {
 	onIssue func()
 }
 
-func (f *fakeIssuer) Issue(context.Context, string) ([]byte, []byte, error) {
+func (f *fakeIssuer) Issue(ctx context.Context, _ string) ([]byte, []byte, error) {
+	// A real CA order dies with its context; a fake that ignores it cannot show
+	// that losing the lease stops the work.
+	if ctx.Err() != nil {
+		return nil, nil, context.Cause(ctx)
+	}
 	f.calls++
 	if f.onIssue != nil {
 		f.onIssue()
@@ -86,6 +91,26 @@ func (f *fakeIssuer) Issue(context.Context, string) ([]byte, []byte, error) {
 // attestedHash is the user_data payload for a leaf: the prefix plus its SHA-256.
 func attestedHash(leaf [sha256.Size]byte) []byte {
 	return append([]byte(hashPrefix), leaf[:]...)
+}
+
+func TestSelfSignedIssuerSharesOneCertAcrossTheFleet(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+
+	first, firstHashes, err := tryNewCertTestManager(s3f, selfSignedIssuer{})
+	require.NoError(t, err)
+	second, secondHashes, err := tryNewCertTestManager(s3f, selfSignedIssuer{})
+	require.NoError(t, err)
+
+	firstCert, err := first.GetCertificate(nil)
+	require.NoError(t, err)
+	secondCert, err := second.GetCertificate(nil)
+	require.NoError(t, err)
+
+	require.Equal(t, firstCert.Certificate[0], secondCert.Certificate[0],
+		"every enclave must serve the leaf a client could have pinned from any other")
+	require.Equal(t, firstHashes.Serialize(), secondHashes.Serialize(),
+		"and must publish that leaf as the hash clients pin against")
 }
 
 func newCertTestStore(s3f *fakeS3) *certStore {
@@ -113,6 +138,59 @@ func newCertTestManager(
 	m, hashes, err := tryNewCertTestManager(s3f, issuer)
 	require.NoError(t, err)
 	return m, hashes
+}
+
+// A peer that finishes renewing between our read and our lease must be adopted,
+// not raced: an order we then have to throw away still costs a rate-limit slot.
+func TestRenewUnderLeaseAdoptsAPeerRenewalWithoutOrdering(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	issuer := &fakeIssuer{t: t, cn: "enclave.test", notAfter: time.Now().Add(time.Hour)}
+	m, _ := newCertTestManager(t, s3f, issuer)
+	require.Equal(t, 1, issuer.calls)
+
+	// A peer renews and releases while we hold a stale view of the store.
+	stale := m.currentCert.Load()
+	peer := &fakeIssuer{t: t, cn: "enclave.test"}
+	peerCert, peerKey, err := peer.Issue(context.Background(), "enclave.test")
+	require.NoError(t, err)
+	_, err = m.store.SaveCert(context.Background(), peerCert, peerKey, stale.etag)
+	require.NoError(t, err)
+
+	renewed, err := m.renewUnderLease(context.Background(), stale.etag)
+
+	require.NoError(t, err)
+	require.NotNil(t, renewed)
+	require.Equal(t, 1, issuer.calls, "the peer's certificate must be adopted, not re-ordered")
+	require.NotEqual(t, stale.etag, renewed.etag)
+}
+
+// Losing the lease mid-order must end the work it was protecting.
+func TestRenewWithLeaseStopsWhenTheLeaseIsLost(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	// Already inside renewBefore, so the reload under the lease renews.
+	issuer := &fakeIssuer{t: t, cn: "enclave.test", notAfter: time.Now().Add(time.Hour)}
+	m, _ := newCertTestManager(t, s3f, issuer)
+	require.Equal(t, 1, issuer.calls)
+
+	// A short TTL so the heartbeat notices the theft inside the test.
+	lease, err := TryAcquireLease(
+		context.Background(), s3f, certTestBucket, "renew-test", time.Second,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+
+	// A peer steals it, so the heartbeat cancels the lease context.
+	writeLeaseDoc(t, s3f, leaseObjectKey("renew-test"), time.Now().Add(time.Hour))
+	require.Eventually(t, func() bool {
+		return lease.Context().Err() != nil
+	}, 2*time.Second, 10*time.Millisecond, "heartbeat should detect the theft")
+
+	_, err = m.renewWithLease(context.Background(), lease, "")
+
+	require.ErrorIs(t, err, ErrLeaseLost)
+	require.Equal(t, 1, issuer.calls, "no order may start once the lease is gone")
 }
 
 func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {

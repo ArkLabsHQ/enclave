@@ -119,7 +119,7 @@ func (l *Lease) Verify(ctx context.Context) error {
 	if live != l.currentGuard() {
 		return fmt.Errorf("%w: %s: taken over by a peer", ErrLeaseLost, l.key)
 	}
-	
+
 	if doc.lapsed(time.Now()) {
 		return fmt.Errorf("%w: %s: lapsed before renewal", ErrLeaseLost, l.key)
 	}
@@ -167,28 +167,28 @@ func (l *Lease) heartbeat() {
 	ticker := time.NewTicker(l.ttl / 3)
 	defer ticker.Stop()
 
-	expiry := time.NewTimer(time.Until(l.expiry()))
-	defer expiry.Stop()
-
 	for {
+		expiresAt := l.expiry()
+
 		select {
 		case <-l.stop:
 			return
-		case <-expiry.C:
-			l.cancel(fmt.Errorf("%w: %s: lapsed before renewal", ErrLeaseLost, l.key))
+		case <-time.After(time.Until(expiresAt)):
+			l.cancel(fmt.Errorf("%w: %s: expired", ErrLeaseLost, l.key))
 			return
 		case <-ticker.C:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), leaseWriteTimeout)
-		guard, expiresAt, err := l.put(ctx)
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			min(leaseWriteTimeout, time.Until(expiresAt)),
+		)
+		guard, nextExpiry, err := l.put(ctx)
 		cancel()
 
 		switch {
 		case err == nil:
-			l.renewedAt(guard, expiresAt)
-			expiry.Stop()
-			expiry.Reset(time.Until(expiresAt))
+			l.renewedAt(guard, nextExpiry)
 		case isPreconditionFailed(err):
 			l.cancel(fmt.Errorf("%w: %s", ErrLeaseLost, l.key))
 			return

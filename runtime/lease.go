@@ -192,6 +192,9 @@ func (l *Lease) heartbeat() {
 		case isPreconditionFailed(err):
 			l.cancel(fmt.Errorf("%w: %s", ErrLeaseLost, l.key))
 			return
+		case isNoSuchKey(err):
+			l.cancel(fmt.Errorf("%w: %s: lease object is gone", ErrLeaseLost, l.key))
+			return
 		case l.lapsed():
 			l.cancel(
 				fmt.Errorf("%w: %s: heartbeat failed past expiry: %w", ErrLeaseLost, l.key, err),
@@ -242,6 +245,8 @@ func (l *Lease) claim(ctx context.Context) (bool, error) {
 			return true, nil
 		case isPreconditionFailed(err):
 			return false, nil // a peer stole it first
+		case isNoSuchKey(err):
+			continue // released between our get and our put
 		case isConditionalConflict(err):
 			if err := backoff(ctx, attempt); err != nil {
 				return false, err

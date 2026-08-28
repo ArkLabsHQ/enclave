@@ -261,6 +261,25 @@ func TestCertStoreSaveIsConditional(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A peer deleting the object mid-write is the same "adopt what is there now"
+// case as a peer rewriting it: S3 answers the conditional write with 404.
+func TestSaveCertReportsChangedWhenObjectDeletedMidWrite(t *testing.T) {
+	setCertTestEnv(t)
+	ctx := context.Background()
+	s3f := newFakeS3()
+	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+
+	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(24*time.Hour))
+	saved, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+	require.NoError(t, err)
+
+	s3f.beforePut = func(key string) { delete(s3f.objects, key) }
+
+	_, err = store.SaveCert(ctx, certPEM, keyPEM, saved.etag)
+
+	require.ErrorIs(t, err, errCertChanged)
+}
+
 func TestCertStoreRoundTripsThroughDEK(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()

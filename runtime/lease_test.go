@@ -199,6 +199,57 @@ func TestLeaseHeartbeatDetectsTheft(t *testing.T) {
 	require.Equal(t, stolen, s3.currentETag(key), "release is conditional on our ETag")
 }
 
+// S3 answers a conditional write against a missing object with 404, not 412, so
+// a deleted lease object must read as lost ownership rather than a retryable
+// blip that keeps the lease live until expiry.
+func TestLeaseHeartbeatDetectsDeletedObject(t *testing.T) {
+	setLeaseTestEnv(t)
+	ctx := context.Background()
+	s3 := newFakeS3()
+	key := leaseObjectKey("genesis")
+
+	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+
+	s3.mu.Lock()
+	delete(s3.objects, key)
+	s3.mu.Unlock()
+
+	select {
+	case <-lease.Context().Done():
+		require.ErrorIs(t, context.Cause(lease.Context()), ErrLeaseLost)
+		require.ErrorContains(t, context.Cause(lease.Context()), "lease object is gone")
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not detect the deleted lease")
+	}
+}
+
+// The holder releasing between our read and our steal is the create-only case
+// again, not a failure: the next attempt simply wins the empty key.
+func TestLeaseClaimRetriesWhenHolderReleasesMidSteal(t *testing.T) {
+	setLeaseTestEnv(t)
+	ctx := context.Background()
+	s3 := newFakeS3()
+	key := leaseObjectKey("genesis")
+
+	// A lapsed holder, so the claim reaches its steal path.
+	writeLeaseDoc(t, s3, key, time.Now().Add(-time.Minute))
+	puts := 0
+	s3.beforePut = func(k string) {
+		puts++
+		if puts == 2 {
+			delete(s3.objects, k) // released between our get and our steal
+		}
+	}
+
+	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+
+	require.NoError(t, err, "a clean release mid-steal must not fail the claim")
+	require.NotNil(t, lease)
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+}
+
 func TestAcquireLeaseBlocksUntilContextEnds(t *testing.T) {
 	setLeaseTestEnv(t)
 	s3 := newFakeS3()

@@ -531,6 +531,10 @@ type fakeS3 struct {
 	// putConflicts makes the next N conditional writes fail with S3's retryable 409.
 	putConflicts int
 
+	// beforePut fires just before a write is evaluated, so a test can change the
+	// object out from under the condition the caller is about to apply.
+	beforePut func(key string)
+
 	// getMissing simulates an object disappearing between HeadObject and GetObject.
 	getMissing map[string]bool
 }
@@ -640,6 +644,11 @@ func (f *fakeS3) PutObject(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := aws.ToString(in.Key)
+	if f.beforePut != nil {
+		// Runs holding f.mu, for races that turn on the object changing between
+		// a read and the conditional write that follows it.
+		f.beforePut(key)
+	}
 	conditional := in.IfNoneMatch != nil || in.IfMatch != nil
 	if conditional && f.putConflicts > 0 {
 		f.putConflicts--
@@ -682,8 +691,15 @@ func (f *fakeS3) checkConditions(key string, ifMatch, ifNoneMatch *string) error
 			return preconditionFailed()
 		}
 	}
-	if ifMatch != nil && (!exists || cur.etag != *ifMatch) {
-		return preconditionFailed()
+	if ifMatch != nil {
+		// S3 answers a conditional write against a missing object with 404, not
+		// 412: a concurrent delete is a different event from a peer's write.
+		if !exists {
+			return &s3types.NoSuchKey{}
+		}
+		if cur.etag != *ifMatch {
+			return preconditionFailed()
+		}
 	}
 	return nil
 }

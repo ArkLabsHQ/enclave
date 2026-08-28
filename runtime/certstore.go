@@ -203,7 +203,7 @@ func (c *certStore) putConditional(
 		// between concurrent conditional writes — different cause, same response
 		// here: adopt whatever is there now rather than reporting a broken
 		// issuance and burning another duplicate-certificate slot on a retry.
-		if isPreconditionFailed(err) || isConditionalConflict(err) {
+		if isPreconditionFailed(err) || isConditionalConflict(err) || isNoSuchKey(err) {
 			return "", fmt.Errorf("%w: %s", errCertChanged, key)
 		}
 		return "", fmt.Errorf("put %q: %w", key, err)

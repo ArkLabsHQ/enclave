@@ -81,6 +81,9 @@ func (c *certStore) SaveCert(
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLeaf(bundle.cert.Leaf, c.fqdn, time.Now()); err != nil {
+		return nil, fmt.Errorf("refusing to store certificate: %w", err)
+	}
 	body, err := json.Marshal(storedCertV1{CertPEM: certPEM, KeyPEM: keyPEM})
 	if err != nil {
 		return nil, fmt.Errorf("encode certificate: %w", err)
@@ -213,6 +216,20 @@ func (c *certStore) putConditional(
 
 // parseCertBundle builds the served form and records the leaf fingerprint that
 // clients pin against.
+
+func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
+	if now.Before(leaf.NotBefore) {
+		return fmt.Errorf("not valid until %s", leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(leaf.NotAfter) {
+		return fmt.Errorf("expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return fmt.Errorf("does not serve %q: %w", domain, err)
+	}
+	return nil
+}
+
 func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {

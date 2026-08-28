@@ -113,6 +113,60 @@ func TestSelfSignedIssuerSharesOneCertAcrossTheFleet(t *testing.T) {
 		"and must publish that leaf as the hash clients pin against")
 }
 
+func TestSaveCertRejectsAnUnusableLeaf(t *testing.T) {
+	setCertTestEnv(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name    string
+		cn      string
+		expires time.Time
+		wantErr string
+	}{
+		{
+			name:    "expired",
+			cn:      "enclave.test",
+			expires: time.Now().Add(-time.Minute),
+			wantErr: "expired at",
+		},
+		{
+			name:    "another deployment's name",
+			cn:      "someone.else",
+			expires: time.Now().Add(24 * time.Hour),
+			wantErr: `does not serve "enclave.test"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s3f := newFakeS3()
+			store := newCertTestStore(s3f)
+			certPEM, keyPEM := issueTestCert(t, tc.cn, tc.expires)
+
+			_, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+
+			require.ErrorContains(t, err, tc.wantErr)
+			stored, loadErr := store.LoadCert(ctx)
+			require.NoError(t, loadErr)
+			require.Nil(t, stored, "a rejected certificate must not reach the store")
+		})
+	}
+}
+
+// An endpoint addressed by IP needs an IP SAN, or the store's own hostname check
+// rejects the certificate this enclave just minted for itself.
+func TestSelfSignedIssuerServesAnIPEndpoint(t *testing.T) {
+	setCertTestEnv(t)
+	ctx := context.Background()
+	s3f := newFakeS3()
+	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "192.0.2.10")
+
+	certPEM, keyPEM, err := selfSignedIssuer{}.Issue(ctx, "192.0.2.10")
+	require.NoError(t, err)
+
+	_, err = store.SaveCert(ctx, certPEM, keyPEM, "")
+
+	require.NoError(t, err)
+}
+
 func newCertTestStore(s3f *fakeS3) *certStore {
 	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 }

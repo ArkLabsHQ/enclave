@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -255,12 +256,18 @@ func (selfSignedIssuer) Issue(
 	template := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{Organization: []string{certificateOrg}},
-		DNSNames:              []string{domain},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(certificateValidity),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+	}
+	// An endpoint addressed by IP needs the SAN to match, or nothing that checks
+	// the name — including our own store — will accept the certificate.
+	if ip := net.ParseIP(domain); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{domain}
 	}
 	derBytes, err := x509.CreateCertificate(
 		rand.Reader,

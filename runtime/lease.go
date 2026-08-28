@@ -109,7 +109,7 @@ func (l *Lease) Verify(ctx context.Context) error {
 	if l.ctx.Err() != nil {
 		return fmt.Errorf("%w: %s: %w", ErrLeaseLost, l.key, context.Cause(l.ctx))
 	}
-	_, live, err := l.get(ctx)
+	doc, live, err := l.get(ctx)
 	if err != nil {
 		if isNoSuchKey(err) {
 			return fmt.Errorf("%w: %s: lease object is gone", ErrLeaseLost, l.key)
@@ -118,6 +118,10 @@ func (l *Lease) Verify(ctx context.Context) error {
 	}
 	if live != l.currentGuard() {
 		return fmt.Errorf("%w: %s: taken over by a peer", ErrLeaseLost, l.key)
+	}
+	
+	if doc.lapsed(time.Now()) {
+		return fmt.Errorf("%w: %s: lapsed before renewal", ErrLeaseLost, l.key)
 	}
 	return nil
 }
@@ -163,9 +167,15 @@ func (l *Lease) heartbeat() {
 	ticker := time.NewTicker(l.ttl / 3)
 	defer ticker.Stop()
 
+	expiry := time.NewTimer(time.Until(l.expiry()))
+	defer expiry.Stop()
+
 	for {
 		select {
 		case <-l.stop:
+			return
+		case <-expiry.C:
+			l.cancel(fmt.Errorf("%w: %s: lapsed before renewal", ErrLeaseLost, l.key))
 			return
 		case <-ticker.C:
 		}
@@ -177,6 +187,8 @@ func (l *Lease) heartbeat() {
 		switch {
 		case err == nil:
 			l.renewedAt(guard, expiresAt)
+			expiry.Stop()
+			expiry.Reset(time.Until(expiresAt))
 		case isPreconditionFailed(err):
 			l.cancel(fmt.Errorf("%w: %s", ErrLeaseLost, l.key))
 			return
@@ -272,6 +284,12 @@ func (l *Lease) renewedAt(guard string, expiresAt time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.guard, l.expiresAt = guard, expiresAt
+}
+
+func (l *Lease) expiry() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.expiresAt
 }
 
 func (l *Lease) lapsed() bool {

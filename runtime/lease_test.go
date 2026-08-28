@@ -150,6 +150,29 @@ func TestLeaseHeartbeatRenews(t *testing.T) {
 	require.NoError(t, lease.Release(ctx))
 }
 
+// A lease can lapse without being stolen: the ETag still matches, so only the
+// document's expiry reveals it.
+func TestLeaseVerifyRejectsLapsedLease(t *testing.T) {
+	setLeaseTestEnv(t)
+	ctx := context.Background()
+	s3 := newFakeS3()
+	key := leaseObjectKey("genesis")
+
+	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	require.NoError(t, lease.Verify(ctx))
+
+	writeLeaseDoc(t, s3, key, time.Now().Add(-time.Minute))
+	lease.setGuard(s3.currentETag(key))
+
+	err = lease.Verify(ctx)
+
+	require.ErrorIs(t, err, ErrLeaseLost)
+	require.ErrorContains(t, err, "lapsed before renewal")
+}
+
 func TestLeaseHeartbeatDetectsTheft(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()

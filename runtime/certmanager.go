@@ -128,6 +128,8 @@ func (m *certManager) tick(ctx context.Context) error {
 	}
 	if stored != nil && stored.etag != m.currentETag() {
 		m.currentCert.Store(stored)
+		slog.Info("adopted a peer's certificate renewal",
+			"fqdn", m.fqdn, "etag", stored.etag, "not_after", stored.notAfter.UTC())
 	}
 
 	bundle := m.currentCert.Load()
@@ -175,14 +177,14 @@ func (m *certManager) renewWithLease(
 		cancel(context.Cause(lease.Context()))
 	})
 	defer stop()
-	
+
 	if cause := context.Cause(lease.Context()); cause != nil {
 		cancel(cause)
 	}
 
 	bundle, err := m.store.LoadCert(renewCtx)
 	if err != nil {
-		return nil, err
+		return nil, withLeaseCause(renewCtx, err)
 	}
 	if bundle != nil {
 		if time.Until(bundle.notAfter) > renewBefore {
@@ -190,7 +192,11 @@ func (m *certManager) renewWithLease(
 		}
 		certETag = bundle.etag
 	}
-	return m.renew(renewCtx, certETag)
+	bundle, err = m.renew(renewCtx, certETag)
+	if err != nil {
+		return nil, withLeaseCause(renewCtx, err)
+	}
+	return bundle, nil
 }
 
 // renew issues a new certificate and commits it against certETag.
@@ -218,6 +224,8 @@ func (m *certManager) renew(ctx context.Context, certETag string) (*certBundle, 
 		}
 		return nil, err
 	}
+	slog.Info("renewed the fleet certificate",
+		"fqdn", m.fqdn, "not_after", bundle.notAfter.UTC())
 	return bundle, nil
 }
 
@@ -228,4 +236,14 @@ func (m *certManager) currentETag() string {
 func jitteredPoll() time.Duration {
 	spread := certPollMax - certPollMin
 	return certPollMin + time.Duration(rand.Int63n(int64(spread)+1))
+}
+
+// withLeaseCause names the lease as the reason work stopped. The store and the
+// CA both report a bare cancellation, which tells a caller nothing about why.
+func withLeaseCause(ctx context.Context, err error) error {
+	cause := context.Cause(ctx)
+	if cause == nil || errors.Is(err, cause) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", cause, err)
 }

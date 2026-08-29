@@ -634,10 +634,13 @@ func stringValue(value string) *commonpb.AnyValue {
 }
 
 func (f *fakeS3) PutObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.PutObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.putErr != nil {
 		return nil, f.putErr
 	}
@@ -724,10 +727,13 @@ func conditionalRequestConflict() error {
 }
 
 func (f *fakeS3) GetObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.GetObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.GetObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -750,10 +756,13 @@ func (f *fakeS3) GetObject(
 }
 
 func (f *fakeS3) HeadObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.HeadObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.HeadObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -770,10 +779,13 @@ func (f *fakeS3) HeadObject(
 }
 
 func (f *fakeS3) ListObjectVersions(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.ListObjectVersionsInput,
 	_ ...func(*s3.Options),
 ) (*s3.ListObjectVersionsOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -809,10 +821,13 @@ func (f *fakeS3) ListObjectsV2(
 }
 
 func (f *fakeS3) DeleteObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.DeleteObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.DeleteObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := aws.ToString(in.Key)

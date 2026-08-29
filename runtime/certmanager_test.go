@@ -28,6 +28,15 @@ func setCertTestEnv(t *testing.T) {
 // issueTestCert mints a self-signed leaf standing in for a CA-issued one.
 func issueTestCert(t *testing.T, cn string, notAfter time.Time) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return issueTestCertAt(t, cn, time.Now().Add(-time.Hour), notAfter)
+}
+
+func issueTestCertAt(
+	t *testing.T,
+	cn string,
+	notBefore, notAfter time.Time,
+) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
@@ -38,7 +47,7 @@ func issueTestCert(t *testing.T, cn string, notAfter time.Time) (certPEM, keyPEM
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: cn},
 		DNSNames:              []string{cn},
-		NotBefore:             time.Now().Add(-time.Hour),
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -121,6 +130,7 @@ func TestSaveCertRejectsAnUnusableLeaf(t *testing.T) {
 		name    string
 		cn      string
 		expires time.Time
+		notYet  bool
 		wantErr string
 	}{
 		{
@@ -128,6 +138,13 @@ func TestSaveCertRejectsAnUnusableLeaf(t *testing.T) {
 			cn:      "enclave.test",
 			expires: time.Now().Add(-time.Minute),
 			wantErr: "expired at",
+		},
+		{
+			name:    "not yet valid",
+			cn:      "enclave.test",
+			expires: time.Now().Add(24 * time.Hour),
+			notYet:  true,
+			wantErr: "not valid until",
 		},
 		{
 			name:    "another deployment's name",
@@ -140,6 +157,11 @@ func TestSaveCertRejectsAnUnusableLeaf(t *testing.T) {
 			s3f := newFakeS3()
 			store := newCertTestStore(s3f)
 			certPEM, keyPEM := issueTestCert(t, tc.cn, tc.expires)
+			if tc.notYet {
+				certPEM, keyPEM = issueTestCertAt(
+					t, tc.cn, time.Now().Add(time.Hour), tc.expires,
+				)
+			}
 
 			_, err := store.SaveCert(ctx, certPEM, keyPEM, "")
 

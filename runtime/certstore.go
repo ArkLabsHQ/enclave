@@ -214,21 +214,6 @@ func (c *certStore) putConditional(
 	return aws.ToString(out.ETag), nil
 }
 
-// parseCertBundle builds the served form and records the leaf fingerprint that
-// clients pin against.
-
-func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
-	if now.Before(leaf.NotBefore) {
-		return fmt.Errorf("not valid until %s", leaf.NotBefore.UTC().Format(time.RFC3339))
-	}
-	if now.After(leaf.NotAfter) {
-		return fmt.Errorf("expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
-	}
-	if err := leaf.VerifyHostname(domain); err != nil {
-		return fmt.Errorf("does not serve %q: %w", domain, err)
-	}
-	return nil
-}
 
 func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -249,6 +234,19 @@ func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 		notAfter: leaf.NotAfter,
 		leafHash: sha256.Sum256(cert.Certificate[0]),
 	}, nil
+}
+
+func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
+	if now.Before(leaf.NotBefore) {
+		return fmt.Errorf("not valid until %s", leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(leaf.NotAfter) {
+		return fmt.Errorf("expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return fmt.Errorf("does not serve %q: %w", domain, err)
+	}
+	return nil
 }
 
 func objectKeyFor(name string) string {

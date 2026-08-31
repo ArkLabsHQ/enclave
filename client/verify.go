@@ -19,7 +19,7 @@ import (
 	"github.com/hf/nitrite"
 )
 
-// enclaveInfoResponse is the JSON structure returned by /v1/enclave-info.
+// enclaveInfoResponse is the JSON structure returned by /enclave/v1/info.
 type enclaveInfoResponse struct {
 	Version           string `json:"version"`
 	PreviousPCR0      string `json:"previous_pcr0"`
@@ -216,7 +216,7 @@ func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
 }
 
 // verifyKeyBinding verifies the enclave's ephemeral attestation key by
-// checking that the pubkey from /v1/enclave-info matches the signingKeyHash
+// checking that the pubkey from /enclave/v1/info matches the signingKeyHash
 // in the attestation document's UserData.
 func verifyKeyBinding(
 	ctx context.Context,
@@ -341,13 +341,13 @@ func verifySchnorrSignature(body []byte, sigHex, attestPubkeyHex string) error {
 	return nil
 }
 
-// fetchEnclaveInfo fetches the /v1/enclave-info endpoint.
+// fetchEnclaveInfo fetches the /enclave/v1/info endpoint.
 func fetchEnclaveInfo(
 	ctx context.Context,
 	httpClient *http.Client,
 	baseURL string,
 ) (*enclaveInfoResponse, error) {
-	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
+	infoURL := strings.TrimRight(baseURL, "/") + "/enclave/v1/info"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
 	if err != nil {
 		return nil, err

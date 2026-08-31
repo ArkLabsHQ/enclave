@@ -31,6 +31,7 @@ const (
 	migrationControlPort      = 8003
 	migrationRequestPath      = "/request-migration"
 	migrationFinalisationPath = "/finalise-migration"
+	externalRuntimeV1Prefix   = "/enclave/v1/"
 )
 
 var (
@@ -53,22 +54,12 @@ type servers struct {
 	ext     *http.Server
 	int     *http.Server
 	sm      *http.ServeMux
+	rm      *http.ServeMux
 	im      *http.ServeMux
 	em      *http.ServeMux
 	rt      RuntimeState
 	signer  AttestedSigner
 	metrics *Metrics
-}
-
-// runtimeV1Paths are the runtime's own endpoints beneath /v1. Everything else under
-// /v1 belongs to the application and is proxied to it.
-var runtimeV1Paths = []string{
-	"/v1/metrics",
-	"/v1/enclave-metrics",
-	"/v1/logs",
-	"/v1/enclave-logs",
-	"/v1/traces",
-	"/v1/enclave-traces",
 }
 
 func SetupHttpServers(
@@ -102,30 +93,19 @@ func SetupHttpServers(
 	}
 
 	sm := http.NewServeMux()
-	sm.HandleFunc("POST /v1/metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
-	sm.HandleFunc("GET /v1/enclave-metrics", HandleMetricGet(metrics))
+	registerRuntimeV1Handlers(sm, "/v1/", metrics, logging, tracing, authToken)
 	sm.Handle("GET /health", healthHandler(rt))
-	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(logging)))
-	sm.HandleFunc("GET /v1/enclave-logs", handleLogsGet(logging))
-	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
-	sm.HandleFunc("GET /v1/enclave-traces", HandleTracingGet(tracing))
+
+	rm := http.NewServeMux()
+	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, metrics, logging, tracing, authToken)
 
 	em := http.NewServeMux()
 	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 	em.HandleFunc("GET /enclave", rootHandler(cfg))
 	em.HandleFunc("GET /enclave/config", configHandler(cfg))
-	// Registered path by path rather than as a "/v1/" subtree. A subtree pattern here
-	// claims the whole namespace, so an application serving its own versioned API under
-	// /v1 would have every one of those routes answered by sm — which does not know
-	// them — instead of reaching revProxy below.
-	for _, path := range runtimeV1Paths {
-		em.Handle(path, corsWildcard(sm))
-	}
-
-	// ConfigureEnclaveInfoHandler registers GET /v1/enclave-info later. The subtree
-	// pattern used to answer its preflight; register that explicitly so the CORS
-	// behaviour is unchanged.
-	em.Handle("OPTIONS /v1/enclave-info", corsWildcard(http.NotFoundHandler()))
+	// Keep the public runtime API beneath /enclave/v1 so the application owns every
+	// other external path, including /v1.
+	em.Handle(externalRuntimeV1Prefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
@@ -156,12 +136,29 @@ func SetupHttpServers(
 		ext:     ext,
 		int:     int,
 		sm:      sm,
+		rm:      rm,
 		em:      em,
 		im:      im,
 		rt:      rt,
 		signer:  signer,
 		metrics: metrics,
 	}
+}
+
+func registerRuntimeV1Handlers(
+	mux *http.ServeMux,
+	prefix string,
+	metrics *Metrics,
+	logging *Logging,
+	tracing *Tracing,
+	authToken string,
+) {
+	mux.HandleFunc("POST "+prefix+"metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
+	mux.HandleFunc("GET "+prefix+"metrics", HandleMetricGet(metrics))
+	mux.HandleFunc("POST "+prefix+"logs", withTokenAuth(authToken, HandleLogsPost(logging)))
+	mux.HandleFunc("GET "+prefix+"logs", handleLogsGet(logging))
+	mux.HandleFunc("POST "+prefix+"traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
+	mux.HandleFunc("GET "+prefix+"traces", HandleTracingGet(tracing))
 }
 
 func (s *servers) Start(ctx context.Context, cfg Config) error {
@@ -202,7 +199,7 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
+// RuntimeInfo is the JSON body returned by GET /enclave/v1/info.
 type RuntimeInfo struct {
 	Version                  string           `json:"version"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
@@ -220,7 +217,7 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	migrator Migrator,
 	ssm SSM,
 ) error {
-	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
+	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		migrationStatus, err := migrator.MigrationStatus(r.Context())
@@ -557,7 +554,7 @@ func upstreamTransport(mode string) http.RoundTripper {
 	}
 }
 
-// corsWildcard adds permissive CORS to /v1/* admin endpoints; app CORS stays upstream.
+// corsWildcard adds permissive CORS to external runtime API endpoints.
 func corsWildcard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

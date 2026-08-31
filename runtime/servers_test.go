@@ -242,7 +242,7 @@ func TestCorsWildcard(t *testing.T) {
 		}))
 
 		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodOptions, "/v1/enclave-info", nil))
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodOptions, "/enclave/v1/info", nil))
 
 		if rr.Code != http.StatusNoContent {
 			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusNoContent)
@@ -259,7 +259,7 @@ func TestCorsWildcard(t *testing.T) {
 		}))
 
 		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/enclave-info", nil))
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
 
 		if rr.Code != http.StatusCreated {
 			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusCreated)
@@ -486,7 +486,7 @@ func TestMigrationControlHandlerExposesOnlyControlRoutes(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: migrationRequestPath, code: http.StatusMethodNotAllowed},
 		{method: http.MethodGet, path: migrationFinalisationPath, code: http.StatusMethodNotAllowed},
-		{method: http.MethodGet, path: "/v1/enclave-info", code: http.StatusNotFound},
+		{method: http.MethodGet, path: "/enclave/v1/info", code: http.StatusNotFound},
 		{method: http.MethodGet, path: "/health", code: http.StatusNotFound},
 		{method: http.MethodPost, path: "/unknown", code: http.StatusNotFound},
 	} {
@@ -541,7 +541,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	require.NoError(t, err)
 	rt := newRuntimeState()
 	metrics := NewMetrics()
-	s := &servers{em: http.NewServeMux(), rt: rt, signer: signer, metrics: metrics}
+	s := &servers{rm: http.NewServeMux(), rt: rt, signer: signer, metrics: metrics}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
 	})}}
@@ -554,7 +554,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
-	s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/enclave-info", nil))
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want %d", rr.Code, http.StatusOK)
@@ -578,12 +578,12 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 func TestConfigureEnclaveInfoHandlerFailsClosedOnStatusError(t *testing.T) {
 	statusErr := fmt.Errorf("S3 unavailable: %w", errMigrationIntentStoreUnavailable)
-	s := &servers{em: http.NewServeMux()}
+	s := &servers{rm: http.NewServeMux()}
 	migrator := &migrationControlMigrator{statusErr: statusErr}
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
 
 	rr := httptest.NewRecorder()
-	s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/enclave-info", nil))
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
 
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
 	require.Contains(t, rr.Body.String(), statusErr.Error())
@@ -607,10 +607,7 @@ func assertCORSHeaders(t *testing.T, h http.Header) {
 	}
 }
 
-// A "/v1/" subtree pattern on the external mux claims the whole namespace, so an
-// application serving its own versioned API under /v1 has every one of those routes
-// answered by the runtime's 404 instead of reaching the reverse proxy.
-func TestExternalMuxLeavesApplicationV1RoutesToTheProxy(t *testing.T) {
+func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	var proxied []string
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxied = append(proxied, r.URL.Path)
@@ -636,31 +633,67 @@ func TestExternalMuxLeavesApplicationV1RoutesToTheProxy(t *testing.T) {
 		NewAttestationHashes(),
 		"token",
 	).(*servers)
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), &migrationControlMigrator{
+		previous: &PreviousPCR0Info{},
+		status:   &MigrationStatus{},
+	}, nil))
 
 	t.Run("application routes reach the proxy", func(t *testing.T) {
-		for _, path := range []string{"/v1/info", "/v1/tx", "/v1/anything"} {
+		for _, route := range []struct {
+			method string
+			path   string
+		}{
+			{http.MethodGet, "/v1/info"},
+			{http.MethodPost, "/v1/metrics"},
+			{http.MethodPost, "/v1/logs"},
+			{http.MethodPost, "/v1/traces"},
+			{http.MethodGet, "/anything"},
+		} {
 			rr := httptest.NewRecorder()
-			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
-			require.Equal(t, http.StatusOK, rr.Code, path)
-			require.Contains(t, proxied, path)
+			s.em.ServeHTTP(rr, httptest.NewRequest(route.method, route.path, nil))
+			require.Equal(t, http.StatusOK, rr.Code, "%s %s", route.method, route.path)
+			require.Contains(t, proxied, route.path)
 		}
 	})
 
-	t.Run("runtime routes are still claimed", func(t *testing.T) {
-		for _, path := range runtimeV1Paths {
+	t.Run("runtime routes are handled by the runtime", func(t *testing.T) {
+		for _, route := range []struct {
+			method string
+			path   string
+			status int
+		}{
+			{http.MethodGet, "/enclave/v1/info", http.StatusOK},
+			{http.MethodGet, "/enclave/v1/metrics", http.StatusOK},
+			{http.MethodGet, "/enclave/v1/logs", http.StatusOK},
+			{http.MethodGet, "/enclave/v1/traces", http.StatusOK},
+			{http.MethodPost, "/enclave/v1/metrics", http.StatusUnauthorized},
+			{http.MethodPost, "/enclave/v1/logs", http.StatusUnauthorized},
+			{http.MethodPost, "/enclave/v1/traces", http.StatusUnauthorized},
+		} {
 			rr := httptest.NewRecorder()
-			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
-			require.NotContains(t, proxied, path)
+			s.em.ServeHTTP(rr, httptest.NewRequest(route.method, route.path, nil))
+			require.Equal(t, route.status, rr.Code, "%s %s", route.method, route.path)
+			require.NotContains(t, proxied, route.path)
+			assertCORSHeaders(t, rr.Header())
 		}
 	})
 
-	t.Run("preflight still answered for runtime routes", func(t *testing.T) {
-		paths := append(append([]string{}, runtimeV1Paths...), "/v1/enclave-info")
-		for _, path := range paths {
+	t.Run("runtime namespace handles preflight and rejects unknown routes", func(t *testing.T) {
+		for _, path := range []string{
+			"/enclave/v1/info",
+			"/enclave/v1/metrics",
+			"/enclave/v1/logs",
+			"/enclave/v1/traces",
+		} {
 			rr := httptest.NewRecorder()
 			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodOptions, path, nil))
 			require.Equal(t, http.StatusNoContent, rr.Code, path)
-			require.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"), path)
+			assertCORSHeaders(t, rr.Header())
 		}
+
+		rr := httptest.NewRecorder()
+		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/unknown", nil))
+		require.Equal(t, http.StatusNotFound, rr.Code)
+		require.NotContains(t, proxied, "/enclave/v1/unknown")
 	})
 }

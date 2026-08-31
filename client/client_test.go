@@ -112,7 +112,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
 		)
 		require.NoError(t, err)
-		resp, err := c.Get(context.Background(), "/v1/enclave-info")
+		resp, err := c.Get(context.Background(), "/enclave/v1/info")
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 	})
@@ -126,7 +126,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		// Strict default: a missing signing key is a hard failure (no silent skip).
 		strict, err := New(srv.URL, Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true})
 		require.NoError(t, err)
-		_, err = strict.Get(context.Background(), "/v1/enclave-info")
+		_, err = strict.Get(context.Background(), "/enclave/v1/info")
 		require.ErrorContains(t, err, "attestation key not yet registered")
 
 		// Explicit PCR0 + pin only: proceeds (this is curl's mode).
@@ -135,7 +135,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
 		)
 		require.NoError(t, err)
-		_, err = lite.Get(context.Background(), "/v1/enclave-info")
+		_, err = lite.Get(context.Background(), "/enclave/v1/info")
 		require.NoError(t, err)
 	})
 
@@ -153,7 +153,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
 		)
 		require.NoError(t, err)
-		_, err = c.Get(context.Background(), "/v1/enclave-info")
+		_, err = c.Get(context.Background(), "/enclave/v1/info")
 		require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
 		fe.mu.Lock()
 		defer fe.mu.Unlock()

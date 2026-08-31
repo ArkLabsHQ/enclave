@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -26,12 +25,12 @@ import (
 )
 
 const (
-	indexPage                 = "This host runs inside an AWS Nitro Enclave.\n"
 	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
 	migrationControlPort      = 8003
 	migrationRequestPath      = "/request-migration"
 	migrationFinalisationPath = "/finalise-migration"
-	externalRuntimeV1Prefix   = "/enclave/v1/"
+	enclavePrefix             = "/enclave/"
+	externalRuntimeV1Prefix   = enclavePrefix + "v1/"
 )
 
 var (
@@ -98,14 +97,10 @@ func SetupHttpServers(
 
 	rm := http.NewServeMux()
 	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, metrics, logging, tracing, authToken)
+	rm.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 
 	em := http.NewServeMux()
-	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
-	em.HandleFunc("GET /enclave", rootHandler(cfg))
-	em.HandleFunc("GET /enclave/config", configHandler(cfg))
-	// Keep the public runtime API beneath /enclave/v1 so the application owns every
-	// other external path, including /v1.
-	em.Handle(externalRuntimeV1Prefix, corsWildcard(rm))
+	em.Handle(enclavePrefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
@@ -121,10 +116,6 @@ func SetupHttpServers(
 			MinVersion:     tls.VersionTLS12,
 			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
 		},
-	}
-
-	if cfg.DisableKeepAlives {
-		ext.SetKeepAlivesEnabled(false)
 	}
 
 	int := &http.Server{
@@ -440,26 +431,6 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 			return nil, nil
 		}
 		return getCert(hello)
-	}
-}
-
-func formatIndexPage(appURL *url.URL) string {
-	page := indexPage
-	if appURL != nil {
-		page += fmt.Sprintf("\nIt runs the following code: %s\n", appURL.String())
-	}
-	return page
-}
-
-func rootHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
-	}
-}
-
-func configHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, cfg)
 	}
 }
 

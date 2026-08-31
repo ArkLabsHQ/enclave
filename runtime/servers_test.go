@@ -644,9 +644,11 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			path   string
 		}{
 			{http.MethodGet, "/v1/info"},
+			{http.MethodOptions, "/v1/orders"},
 			{http.MethodPost, "/v1/metrics"},
 			{http.MethodPost, "/v1/logs"},
 			{http.MethodPost, "/v1/traces"},
+			{http.MethodGet, "/enclavex/v1"},
 			{http.MethodGet, "/anything"},
 		} {
 			rr := httptest.NewRecorder()
@@ -691,9 +693,24 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			assertCORSHeaders(t, rr.Header())
 		}
 
+		for _, route := range []struct {
+			method string
+			path   string
+		}{
+			{http.MethodGet, "/enclave/unknown"},
+			{http.MethodGet, "/enclave/v1ish"},
+			{http.MethodGet, "/enclave/v1/unknown"},
+		} {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(route.method, route.path, nil))
+			require.Equal(t, http.StatusNotFound, rr.Code, "%s %s", route.method, route.path)
+			require.NotContains(t, proxied, route.path)
+		}
+
 		rr := httptest.NewRecorder()
-		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/unknown", nil))
-		require.Equal(t, http.StatusNotFound, rr.Code)
-		require.NotContains(t, proxied, "/enclave/v1/unknown")
+		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/enclave", nil))
+		require.Equal(t, http.StatusMovedPermanently, rr.Code)
+		require.Equal(t, "/enclave/", rr.Header().Get("Location"))
+		require.NotContains(t, proxied, "/enclave")
 	})
 }

@@ -8,9 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
-
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"

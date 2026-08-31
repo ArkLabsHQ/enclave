@@ -5,6 +5,7 @@
 }:
 let
   lib = pkgs.lib;
+
   awsNodeIP = "192.168.1.1";
 
   testApp = pkgs.buildGoModule {
@@ -278,7 +279,9 @@ let
       system.tools.nixos-generate-config.enable = false;
       boot.loader.grub.enable = lib.mkForce false;
 
-      virtualisation.memorySize = 4096;
+      # The inner enclave QEMU takes 2048M; 3072 leaves the node headroom while
+      # keeping four enclave nodes inside a developer machine's free memory.
+      virtualisation.memorySize = 3072;
       virtualisation.cores = 2;
       virtualisation.qemu.options = [ "-cpu host,migratable=off,+invtsc" ];
 
@@ -535,6 +538,7 @@ in
     nodes = {
       aws = awsNode;
       blue = mkEnclaveNode blueEif;
+      blue_peer = mkEnclaveNode blueEif;
       green = mkEnclaveNode greenEif;
       green_peer = mkEnclaveNode greenEif;
     };

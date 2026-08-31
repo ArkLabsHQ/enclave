@@ -45,12 +45,27 @@ type certStore struct {
 	dek    DEK
 	bucket string
 	fqdn   string
+	prefix string
 }
 
-const acmeStoragePrefix = "data/acme/"
+const (
+	acmeStoragePrefix       = "data/acme/"
+	selfSignedStoragePrefix = "data/self-signed/"
+)
 
 func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
-	return &certStore{s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn}
+	return &certStore{
+		s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
+	}
+}
+
+// newSelfSignedCertStore keys the fleet's own certificate away from the ACME
+// one. Nothing in a stored bundle records who issued it, so a shared key would
+// let an ACME manager adopt a self-signed certificate and never order.
+func newSelfSignedCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
+	store := newCertStore(s3api, dek, bucket, fqdn)
+	store.prefix = selfSignedStoragePrefix
+	return store
 }
 
 // LoadCert returns the stored bundle, or nil when the fleet has no certificate.
@@ -134,11 +149,11 @@ func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, 
 }
 
 func (c *certStore) certObjectKey() string {
-	return objectKeyFor(c.fqdn + "/cert")
+	return objectKeyFor(c.prefix, c.fqdn+"/cert")
 }
 
 func (c *certStore) accountObjectKey() string {
-	return objectKeyFor("account.key")
+	return objectKeyFor(acmeStoragePrefix, "account.key")
 }
 
 // loadAccountKey returns the fleet-shared ACME account key, or nil if unset.
@@ -214,7 +229,6 @@ func (c *certStore) putConditional(
 	return aws.ToString(out.ETag), nil
 }
 
-
 func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -249,6 +263,6 @@ func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
 	return nil
 }
 
-func objectKeyFor(name string) string {
-	return getDeployment() + "/" + getAppName() + "/" + acmeStoragePrefix + name
+func objectKeyFor(prefix, name string) string {
+	return getDeployment() + "/" + getAppName() + "/" + prefix + name
 }

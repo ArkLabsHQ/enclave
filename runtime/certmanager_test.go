@@ -189,6 +189,36 @@ func TestSelfSignedIssuerServesAnIPEndpoint(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// Nothing in a stored bundle records who issued it, so the two paths must not
+// share an object key: an ACME manager that found a self-signed certificate
+// would adopt it and never order one.
+func TestACMEDoesNotAdoptTheSelfSignedCertificate(t *testing.T) {
+	setCertTestEnv(t)
+	ctx := context.Background()
+	s3f := newFakeS3()
+	d := &dek{key: make([]byte, 32)}
+
+	// The fleet ran self-signed first.
+	selfSignedStore := newSelfSignedCertStore(s3f, d, certTestBucket, "enclave.test")
+	_, err := newCertManager(ctx, selfSignedStore, selfSignedIssuer{},
+		s3f, certTestBucket, "enclave.test", &AttestationHashes{})
+	require.NoError(t, err)
+
+	// Then ACME was switched on.
+	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
+	withACME, err := newCertManager(ctx, newCertTestStore(s3f), issuer,
+		s3f, certTestBucket, "enclave.test", &AttestationHashes{})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, issuer.calls,
+		"enabling ACME must order a certificate, not adopt the self-signed one")
+	served, err := withACME.GetCertificate(nil)
+	require.NoError(t, err)
+	stored, err := selfSignedStore.LoadCert(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, stored.cert.Certificate[0], served.Certificate[0])
+}
+
 func newCertTestStore(s3f *fakeS3) *certStore {
 	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
 }

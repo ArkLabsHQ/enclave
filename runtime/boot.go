@@ -141,8 +141,8 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 		return bootResult{}, err
 	}
 
-	if _, ok := planned.mode.(*genesisBoot); ok {
-		lease, err := b.awaitGenesisLease(ctx)
+	if pending, ok := planned.mode.(*genesisBoot); ok {
+		lease, err := b.awaitGenesisLease(ctx, pending.genesis)
 		if err != nil {
 			return bootResult{}, err
 		}
@@ -404,7 +404,25 @@ func (b *Boot) migrationIntentBucket(ctx context.Context) (string, error) {
 	return migrationIntentBucketName(accountID), nil
 }
 
-func (b *Boot) awaitGenesisLease(ctx context.Context) (*Lease, error) {
+func (b *Boot) genesisCommitted(ctx context.Context, genesis *genesisLog) (string, error) {
+	artifact, err := genesis.Genesis(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to read deployment genesis: %w", err)
+	}
+	if artifact == nil {
+		return "", nil
+	}
+	keyID, err := b.ssm.MayGet(ctx, kmsKeyIDParam())
+	if err != nil {
+		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+	}
+	return keyID, nil
+}
+
+func (b *Boot) awaitGenesisLease(
+	ctx context.Context,
+	genesis *genesisLog,
+) (*Lease, error) {
 	bucket, err := b.ssm.MustGet(ctx, leaseBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read lease bucket name for genesis lease: %w", err)
@@ -414,9 +432,9 @@ func (b *Boot) awaitGenesisLease(ctx context.Context) (*Lease, error) {
 	defer cancel()
 
 	for {
-		keyID, err := b.ssm.MayGet(waitCtx, kmsKeyIDParam())
+		keyID, err := b.genesisCommitted(waitCtx, genesis)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+			return nil, err
 		}
 		if keyID != "" {
 			slog.Info("genesis completed by a peer, resuming", "key_id", prefix16(keyID))
@@ -428,10 +446,10 @@ func (b *Boot) awaitGenesisLease(ctx context.Context) (*Lease, error) {
 			return nil, fmt.Errorf("failed to acquire genesis lease: %w", err)
 		}
 		if lease != nil {
-			keyID, err := b.ssm.MayGet(waitCtx, kmsKeyIDParam())
+			keyID, err := b.genesisCommitted(waitCtx, genesis)
 			if err != nil {
 				_ = lease.Release(context.WithoutCancel(ctx))
-				return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+				return nil, err
 			}
 			if keyID != "" {
 				_ = lease.Release(context.WithoutCancel(ctx))

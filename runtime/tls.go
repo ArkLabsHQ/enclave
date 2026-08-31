@@ -221,7 +221,7 @@ func configureSelfSigned(
 		return configureSelfSignedCert(cfg, hashes)
 	}
 
-	store := newCertStore(s3, dek, certBucket, cfg.FQDN)
+	store := newSelfSignedCertStore(s3, dek, certBucket, cfg.FQDN)
 	manager, err := newCertManager(
 		ctx, store, selfSignedIssuer{},
 		s3, leaseBucket, cfg.FQDN, hashes,

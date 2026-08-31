@@ -718,6 +718,13 @@ func seedGenesisRecord(t *testing.T, s3f *fakeS3, targetPCR0 string) {
 	s3f.putRawObject(deploymentGenesisKey, body)
 }
 
+func (f *genesisFixture) genesisLog(t *testing.T) *genesisLog {
+	t.Helper()
+	log, err := newGenesisLog(f.s3f, f.nsm, stateOriginTestMigrationIntentBucket())
+	require.NoError(t, err)
+	return log
+}
+
 func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 	t.Helper()
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
@@ -811,7 +818,7 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
-	lease, err := boot.awaitGenesisLease(ctx)
+	lease, err := boot.awaitGenesisLease(ctx, fx.genesisLog(t))
 
 	require.NoError(t, err)
 	require.Nil(t, lease, "a committed genesis needs no lease")
@@ -819,6 +826,28 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	require.IsType(t, &resumeBoot{}, planned.mode, "a peer's committed genesis leaves us resuming")
+}
+
+// A peer that has claimed the key but not yet written the artifact has not
+// finished. Resuming there replans into a genesis boot with a committed key,
+// which verify refuses — so the wait must hold until both are visible.
+func TestAwaitGenesisWaitsForTheArtifactNotTheKeyAlone(t *testing.T) {
+	setStateOriginTestEnv(t)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	fx := newGenesisFixture(t, pcr0)
+
+	// Mid-genesis: key claimed, artifact not written, peer still holding.
+	fx.ssmf.params[kmsKeyIDParam()] = "key-from-peer"
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(genesisLeaseName), time.Now().Add(time.Hour))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
+
+	lease, err := boot.awaitGenesisLease(ctx, fx.genesisLog(t))
+
+	require.Error(t, err, "an unfinished genesis must keep us waiting, not resume")
+	require.Nil(t, lease)
 }
 
 // A peer can commit between our poll and our winning the lease. Winning proves
@@ -829,7 +858,9 @@ func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
-	// The key lands between our poll and our re-read under the lease.
+	// The artifact is visible while our first cross-service key read is stale;
+	// the re-read under the lease observes the completed commit.
+	seedGenesisRecord(t, fx.s3f, hex.EncodeToString(pcr0))
 	fx.ssmf.getSeq = map[string][]string{
 		kmsKeyIDParam(): {"", "key-from-peer"},
 	}
@@ -837,7 +868,7 @@ func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
-	lease, err := boot.awaitGenesisLease(ctx)
+	lease, err := boot.awaitGenesisLease(ctx, fx.genesisLog(t))
 
 	require.NoError(t, err)
 	require.Nil(t, lease, "a genesis completed under us must not leave us holding the lease")
@@ -858,7 +889,7 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
-	lease, err := boot.awaitGenesisLease(ctx)
+	lease, err := boot.awaitGenesisLease(ctx, fx.genesisLog(t))
 
 	require.NoError(t, err)
 	require.NotNil(t, lease, "a lapsed lock must be reclaimable")
@@ -884,7 +915,8 @@ func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	lease, err := (&Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}).awaitGenesisLease(ctx)
+	lease, err := (&Boot{ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}).
+		awaitGenesisLease(ctx, fx.genesisLog(t))
 
 	require.Nil(t, lease)
 	require.ErrorContains(t, err, "genesis did not complete")

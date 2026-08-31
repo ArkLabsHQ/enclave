@@ -197,6 +197,51 @@ status, out = enclave_curl(blue, BLUE_PCR0)
 assert status == 0, out
 assert "WARNING" in out, out
 
+log_groups = cloud(
+    "logs describe-log-groups --log-group-name-prefix /enclave/dev/testapp "
+    "--query 'logGroups[].logGroupName' --output text"
+).split()
+assert sorted(log_groups) == [
+    "/enclave/dev/testapp/logs",
+    "/enclave/dev/testapp/metrics",
+    "/enclave/dev/testapp/traces",
+], log_groups
+
+shipped = cloud(
+    "logs describe-log-streams --log-group-name /enclave/dev/testapp/logs "
+    "--query 'logStreams[].storedBytes' --output text"
+)
+assert shipped not in ("", "None"), shipped
+
+# The buffers are gone, so their read-back endpoints are too.
+blue.succeed(
+    'test "$(curl -sk -o /dev/null -w %{http_code} --http1.1 '
+    'https://127.0.0.1/v1/enclave-logs)" = 404'
+)
+
+# The app's own OTLP reaches CloudWatch through the runtime's ingest endpoints,
+# emitted by the stock OpenTelemetry exporters.
+blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null")
+
+
+def wait_for_shipped(group, needle, timeout=90):
+    deadline = time.time() + timeout
+    while True:
+        events = cloud(
+            f"logs filter-log-events --log-group-name /enclave/dev/testapp/{group} "
+            "--query 'events[].message' --output text"
+        )
+        if needle in events:
+            return
+        if time.time() > deadline:
+            raise Exception(f"{needle!r} never reached /enclave/dev/testapp/{group}")
+        time.sleep(2)
+
+
+wait_for_shipped("logs", "handled health")
+wait_for_shipped("traces", '"name":"health"')
+wait_for_shipped("metrics", "testapp_requests_total")
+
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")
 # Green's commit pointer is created by blue at finalise; it must not exist yet.

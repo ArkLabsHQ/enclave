@@ -175,26 +175,13 @@ func verifyClockSourceEnabled() bool {
 	)
 }
 
-func logBufferSize() int {
-	if s := os.Getenv("ENCLAVE_LOG_BUFFER_SIZE"); s != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 1000
-}
-
-func cloudwatchLogsEnabled() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("ENCLAVE_LOG_CLOUDWATCH")), "true")
-}
-
 func logShipInterval() time.Duration {
 	if s := os.Getenv("ENCLAVE_LOG_SHIP_INTERVAL"); s != "" {
 		if d, err := time.ParseDuration(strings.TrimSpace(s)); err == nil && d > 0 {
 			return d
 		}
 	}
-	return 5 * time.Second
+	return 10 * time.Second
 }
 
 func logRetentionDays() int32 {
@@ -204,15 +191,6 @@ func logRetentionDays() int32 {
 		}
 	}
 	return 30
-}
-
-func spanBufferSize() int {
-	if s := os.Getenv("ENCLAVE_SPAN_BUFFER_SIZE"); s != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 1000
 }
 
 // secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and

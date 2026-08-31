@@ -274,14 +274,17 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_LOG_CLOUDWATCH` | `false` | Ship logs and traces to CloudWatch Logs. |
-| `ENCLAVE_LOG_BUFFER_SIZE` | `1000` | In-memory log ring buffer capacity. |
-| `ENCLAVE_SPAN_BUFFER_SIZE` | `1000` | In-memory span ring buffer capacity. |
-| `ENCLAVE_LOG_SHIP_INTERVAL` | `5s` | Flush cadence. Batches also flush at 100 events. |
+| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
 
-Log groups are `/enclave/<deployment>/<app>/logs` and
-`/enclave/<deployment>/<app>/traces`.
+Log groups are `/enclave/<deployment>/<app>/logs`,
+`/enclave/<deployment>/<app>/traces` and `/enclave/<deployment>/<app>/metrics`.
+
+Events timestamped more than an hour from now, either direction, are dropped on
+arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS
+requires. The narrow timestamp window keeps normally produced batches well
+inside the 24-hour span `PutLogEvents` rejects wholesale. An application that
+deliberately ships backdated telemetry will lose it.
 
 ### AWS endpoint overrides
 
@@ -395,9 +398,6 @@ response body. `/v1/*` responses also carry permissive CORS headers.
 | GET | `/enclave/config` | none | Effective runtime configuration as JSON. |
 | GET | `/v1/enclave-info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
-| GET | `/v1/enclave-metrics` | none | Metric snapshot. |
-| GET | `/v1/enclave-logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
-| GET | `/v1/enclave-traces` | none | Buffered spans. Accepts `since`, `limit`, `service`. |
 | POST | `/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
 | POST | `/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
 | POST | `/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
@@ -472,7 +472,7 @@ AWS credentials delivered through IMDS must allow:
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | When CloudWatch logging is enabled: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents`, `PutRetentionPolicy`, `FilterLogEvents`, `DescribeLogStreams` on `/enclave/*`. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/enclave/*`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned
@@ -754,6 +754,21 @@ attestation document` at startup. PCR comparison and `user_data` checks still
 apply. Always set `ENCLAVE_DEPLOYMENT` explicitly for anything other than local
 testing. The value is baked into the measurement and cannot be overridden from
 SSM.
+
+**CloudWatch is a hard boot dependency.** Each stream is created *and written to*
+before the application starts, and a failure aborts the boot. The write matters:
+creating a log group proves nothing about being able to put events into it, so a
+role missing `logs:PutLogEvents` would otherwise boot clean and lose everything
+silently. An enclave whose telemetry goes
+nowhere cannot be audited, so it does not run. The trade is that a CloudWatch
+outage or a missing `CloudWatchLogsAccess` statement becomes an availability
+outage rather than a silent gap in the record.
+
+**Telemetry is not readable from the enclave.** Logs and spans are shipped and
+forgotten; there is no queryable history and no endpoint that reads one back. The runtime's
+IAM statement is write-only for the same reason, so a host that compromises the
+enclave recovers neither a buffered window of application logs nor the ability to
+query what was already shipped.
 
 **Clients must pin PCR0.** `client.New` refuses to construct a client without
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is

@@ -554,6 +554,10 @@ type fakeCloudWatchLogs struct {
 	retentionDays      []int32
 	puts               []*cloudwatchlogs.PutLogEventsInput
 	putCh              chan *cloudwatchlogs.PutLogEventsInput
+
+	// putBlock stalls PutLogEvents until closed, standing in for a CloudWatch
+	// that has stopped accepting writes.
+	putBlock chan struct{}
 }
 
 func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
@@ -604,8 +608,16 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	in *cloudwatchlogs.PutLogEventsInput,
 	_ ...func(*cloudwatchlogs.Options),
 ) (*cloudwatchlogs.PutLogEventsOutput, error) {
-	if f.putLogEventsErr != nil {
-		return nil, f.putLogEventsErr
+	f.mu.Lock()
+	putErr := f.putLogEventsErr
+	f.mu.Unlock()
+	if putErr != nil {
+		return nil, putErr
+	}
+	// The startup marker proves the stream is writable; blocking it would stall
+	// Start rather than the shipping this hook exists to stall.
+	if f.putBlock != nil && !isShipperMarker(in) {
+		<-f.putBlock
 	}
 	f.mu.Lock()
 	copyIn := *in
@@ -621,14 +633,36 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	return &cloudwatchlogs.PutLogEventsOutput{}, nil
 }
 
-func requireCloudWatchPut(t *testing.T, cw *fakeCloudWatchLogs) *cloudwatchlogs.PutLogEventsInput {
+// requireCloudWatchPutTo waits for a batch on one log group. The three signals
+// share a client, so a bare "next put" would race between them.
+func isShipperMarker(in *cloudwatchlogs.PutLogEventsInput) bool {
+	return len(in.LogEvents) == 1 &&
+		strings.Contains(aws.ToString(in.LogEvents[0].Message), "shipper_started")
+}
+
+func requireCloudWatchPutTo(
+	t *testing.T,
+	cw *fakeCloudWatchLogs,
+	group string,
+) *cloudwatchlogs.PutLogEventsInput {
 	t.Helper()
-	select {
-	case put := <-cw.putCh:
-		return put
-	case <-time.After(time.Second):
-		require.FailNow(t, "timed out waiting for PutLogEvents")
-		return nil
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case put := <-cw.putCh:
+			if aws.ToString(put.LogGroupName) != group {
+				continue
+			}
+			// Start writes a marker to prove the stream is writable; callers of
+			// this helper are waiting for their own events.
+			if isShipperMarker(put) {
+				continue
+			}
+			return put
+		case <-deadline:
+			require.FailNow(t, "timed out waiting for PutLogEvents on "+group)
+			return nil
+		}
 	}
 }
 

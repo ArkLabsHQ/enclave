@@ -47,14 +47,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 
-	metrics := NewMetrics()
-	tracing := NewTracing(aws.CWL)
-
-	if err := tracing.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
+	telemetry := NewTelemetry(aws.CWL)
+	if err := telemetry.Start(ctx); err != nil {
+		return err
 	}
 
-	ctx, initSpan := tracing.Span(ctx, "init")
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {
@@ -62,13 +62,6 @@ func Run(ctx context.Context, cfg Config) error {
 			initSpan.End()
 		}
 	}()
-
-	logging := NewLogging(metrics, aws.CWL)
-	slog.SetDefault(slog.New(NewBufferHandler(logging)))
-
-	if err := logging.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
-	}
 
 	hashes := NewAttestationHashes()
 
@@ -92,9 +85,7 @@ func Run(ctx context.Context, cfg Config) error {
 		rt,
 		cfg,
 		nsm,
-		metrics,
-		logging,
-		tracing,
+		telemetry,
 		attestationSigner,
 		hashes,
 		authToken,

@@ -564,7 +564,6 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		PreviousPCR0:             "previous",
 		PreviousPCR0Attestation:  "attestation",
 		AttestationPubkey:        signer.Pubkey(),
-		Metrics:                  metrics.MetricsSnapshot(),
 		MigrationCooldownSeconds: 120,
 		Migration: &MigrationStatus{
 			State: migrationStateNone, SourcePCR0: strings.Repeat("ab", 48),

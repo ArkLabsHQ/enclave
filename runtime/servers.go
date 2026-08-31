@@ -64,13 +64,12 @@ func SetupHttpServers(
 	rt RuntimeState,
 	cfg Config,
 	nsm NSM,
-	metrics *Metrics,
-	logging *Logging,
-	tracing *Tracing,
+	telemetry *Telemetry,
 	signer AttestedSigner,
 	hashes AttestationHashes,
 	authToken string,
 ) Servers {
+	metrics := telemetry.Metrics
 	metricsMW := metricsMiddleware(metrics)
 	attestationMW := responseSignerMiddleware(signer)
 
@@ -82,22 +81,19 @@ func SetupHttpServers(
 	revProxy.Transport = upstreamTransport(cfg.UpstreamProtocol)
 	revProxy.FlushInterval = -1
 	revProxy.ModifyResponse = func(*http.Response) error {
-		metrics.Inc(metrics.AppProxiedRequests, "enclave_app_proxied_requests_total")
+		metrics.Inc(metricAppProxiedRequests)
 		return nil
 	}
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		metrics.Inc(metrics.AppProxiedErrors, "enclave_app_proxied_errors_total")
+		metrics.Inc(metricAppProxiedErrors)
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
 	sm := http.NewServeMux()
 	sm.HandleFunc("POST /v1/metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
-	sm.HandleFunc("GET /v1/enclave-metrics", HandleMetricGet(metrics))
 	sm.Handle("GET /health", healthHandler(rt))
-	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(logging)))
-	sm.HandleFunc("GET /v1/enclave-logs", handleLogsGet(logging))
-	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
-	sm.HandleFunc("GET /v1/enclave-traces", HandleTracingGet(tracing))
+	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)))
+	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)))
 
 	em := http.NewServeMux()
 	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
@@ -185,7 +181,6 @@ type RuntimeInfo struct {
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
 	AttestationPubkey        string           `json:"attestation_pubkey,omitempty"`
-	Metrics                  map[string]any   `json:"metrics"`
 	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
 	Migration                *MigrationStatus `json:"migration"`
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
@@ -225,7 +220,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
 			AttestationPubkey:        s.signer.Pubkey(),
-			Metrics:                  s.metrics.MetricsSnapshot(),
 			MigrationCooldownSeconds: int(cooldown.Seconds()),
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
@@ -376,9 +370,9 @@ func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
 				"status", sw.status,
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
-			metrics.Inc(metrics.HTTPRequests, "http_requests_total")
+			metrics.Inc(metricHTTPRequests)
 			if sw.status >= 400 {
-				metrics.Inc(metrics.HTTPErrors, "http_errors_total")
+				metrics.Inc(metricHTTPErrors)
 			}
 		})
 	}

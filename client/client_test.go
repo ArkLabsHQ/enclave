@@ -106,12 +106,12 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true},
 		)
 		require.NoError(t, err)
-		resp, err := c.Get(context.Background(), "/v1/enclave-info")
+		resp, err := c.Get(context.Background(), "/enclave/v1/info")
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		fe.mu.Lock()
 		defer fe.mu.Unlock()
-		require.Equal(t, []string{"/v1/enclave-info"}, fe.appPaths)
+		require.Equal(t, []string{"/enclave/v1/info"}, fe.appPaths)
 	})
 
 	t.Run("mismatch → fail closed, no app request sent", func(t *testing.T) {
@@ -128,7 +128,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true},
 		)
 		require.NoError(t, err)
-		_, err = c.Get(context.Background(), "/v1/enclave-info")
+		_, err = c.Get(context.Background(), "/enclave/v1/info")
 		require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
 		fe.mu.Lock()
 		defer fe.mu.Unlock()

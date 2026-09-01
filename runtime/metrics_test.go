@@ -121,7 +121,7 @@ func TestMetricHandlers(t *testing.T) {
 		metrics.SetAppMetric("custom", 2)
 		w := httptest.NewRecorder()
 
-		HandleMetricGet(metrics)(w, httptest.NewRequest(http.MethodGet, "/v1/enclave-metrics", nil))
+		HandleMetricGet(metrics)(w, httptest.NewRequest(http.MethodGet, "/v1/metrics", nil))
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{

@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -24,11 +23,12 @@ import (
 )
 
 const (
-	indexPage                 = "This host runs inside an AWS Nitro Enclave.\n"
 	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
 	migrationControlPort      = 8003
 	migrationRequestPath      = "/request-migration"
 	migrationFinalisationPath = "/finalise-migration"
+	enclavePrefix             = "/enclave/"
+	externalRuntimeV1Prefix   = enclavePrefix + "v1/"
 )
 
 var (
@@ -51,6 +51,7 @@ type servers struct {
 	ext     *http.Server
 	int     *http.Server
 	sm      *http.ServeMux
+	rm      *http.ServeMux
 	im      *http.ServeMux
 	em      *http.ServeMux
 	rt      RuntimeState
@@ -86,19 +87,16 @@ func SetupHttpServers(
 	}
 
 	sm := http.NewServeMux()
-	sm.HandleFunc("POST /v1/metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
-	sm.HandleFunc("GET /v1/enclave-metrics", HandleMetricGet(metrics))
+	registerRuntimeV1Handlers(sm, "/v1/", metrics, logging, tracing, authToken)
 	sm.Handle("GET /health", healthHandler(rt))
-	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(logging)))
-	sm.HandleFunc("GET /v1/enclave-logs", handleLogsGet(logging))
-	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
-	sm.HandleFunc("GET /v1/enclave-traces", HandleTracingGet(tracing))
+
+	rm := http.NewServeMux()
+	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, metrics, logging, tracing, authToken)
+	rm.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 
 	em := http.NewServeMux()
-	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
-	em.HandleFunc("GET /enclave", rootHandler(cfg))
-	em.HandleFunc("GET /enclave/config", configHandler(cfg))
-	em.Handle("/v1/", corsWildcard(sm))
+	em.Handle(enclavePrefix, corsWildcard(rm))
+
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
 
@@ -115,10 +113,6 @@ func SetupHttpServers(
 		},
 	}
 
-	if cfg.DisableKeepAlives {
-		ext.SetKeepAlivesEnabled(false)
-	}
-
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
 		Handler: metricsMW(im),
@@ -128,11 +122,28 @@ func SetupHttpServers(
 		ext:     ext,
 		int:     int,
 		sm:      sm,
+		rm:      rm,
 		em:      em,
 		im:      im,
 		rt:      rt,
 		metrics: metrics,
 	}
+}
+
+func registerRuntimeV1Handlers(
+	mux *http.ServeMux,
+	prefix string,
+	metrics *Metrics,
+	logging *Logging,
+	tracing *Tracing,
+	authToken string,
+) {
+	mux.HandleFunc("POST "+prefix+"metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
+	mux.HandleFunc("GET "+prefix+"metrics", HandleMetricGet(metrics))
+	mux.HandleFunc("POST "+prefix+"logs", withTokenAuth(authToken, HandleLogsPost(logging)))
+	mux.HandleFunc("GET "+prefix+"logs", handleLogsGet(logging))
+	mux.HandleFunc("POST "+prefix+"traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
+	mux.HandleFunc("GET "+prefix+"traces", HandleTracingGet(tracing))
 }
 
 func (s *servers) Start(ctx context.Context, cfg Config) error {
@@ -173,7 +184,7 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
+// RuntimeInfo is the JSON body returned by GET /enclave/v1/info.
 type RuntimeInfo struct {
 	Version                  string           `json:"version"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
@@ -190,7 +201,7 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	migrator Migrator,
 	ssm SSM,
 ) error {
-	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
+	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		migrationStatus, err := migrator.MigrationStatus(r.Context())
@@ -386,26 +397,6 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 	}
 }
 
-func formatIndexPage(appURL *url.URL) string {
-	page := indexPage
-	if appURL != nil {
-		page += fmt.Sprintf("\nIt runs the following code: %s\n", appURL.String())
-	}
-	return page
-}
-
-func rootHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
-	}
-}
-
-func configHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, cfg)
-	}
-}
-
 // attestationHandler serves NSM attestation bound to the currently served TLS leaf.
 func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -497,7 +488,7 @@ func upstreamTransport(mode string) http.RoundTripper {
 	}
 }
 
-// corsWildcard adds permissive CORS to /v1/* admin endpoints; app CORS stays upstream.
+// corsWildcard adds permissive CORS to external runtime API endpoints.
 func corsWildcard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

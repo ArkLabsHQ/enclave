@@ -182,7 +182,7 @@ func TestTracingHandlers(t *testing.T) {
 			tracing,
 		)(
 			w,
-			httptest.NewRequest(http.MethodGet, "/v1/enclave-traces?service=app&limit=1", nil),
+			httptest.NewRequest(http.MethodGet, "/v1/traces?service=app&limit=1", nil),
 		)
 
 		require.Equal(t, http.StatusOK, w.Code)
@@ -201,7 +201,7 @@ func TestTracingHandlers(t *testing.T) {
 		tracing := &Tracing{buf: newSpanBuffer(1)}
 		w := httptest.NewRecorder()
 
-		HandleTracingGet(tracing)(w, httptest.NewRequest(http.MethodGet, "/v1/enclave-traces", nil))
+		HandleTracingGet(tracing)(w, httptest.NewRequest(http.MethodGet, "/v1/traces", nil))
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `[]`, w.Body.String())

@@ -237,7 +237,7 @@ for node in BLUES:
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
     node.succeed(
-        "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+        "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg p '{BLUE_PCR0}' "
         "'.previous_pcr0 == \"genesis\" and .migration.state == \"none\" "
         "and .migration.source_pcr0 == $p'"
@@ -425,7 +425,7 @@ assert (
     >= 1
 )
 blue.wait_until_succeeds(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.migration.state == \"eligible\"'",
     timeout=120,
 )
@@ -480,7 +480,7 @@ for node in BLUES:
     assert secret_value(node) == blue_secret
     assert served_leaf_sha(node) == blue_leaf_sha
     node.wait_until_succeeds(
-        "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+        "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg p '{BLUE_PCR0}' --arg t '{GREEN_PCR0}' "
         "'.previous_pcr0 == $p and .migration.state == \"eligible\" "
         "and .migration.target_pcr0 == $t'"
@@ -506,7 +506,7 @@ aws.wait_until_succeeds(
 wait_healthy(green)
 assert secret_value(green) == blue_secret
 green.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
     "'.previous_pcr0 == $prev "
     "and (.previous_pcr0_attestation | length) > 0 "
@@ -598,7 +598,7 @@ assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
 green_peer.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
     "'.previous_pcr0 == $prev "
     "and (.previous_pcr0_attestation | length) > 0 "

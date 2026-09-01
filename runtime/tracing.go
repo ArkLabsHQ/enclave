@@ -246,7 +246,7 @@ func HandleTracingPost(t *Tracing) http.HandlerFunc {
 }
 
 // HandleTracingGet returns buffered spans.
-// GET /v1/enclave-traces?since=RFC3339&limit=100&service=app|supervisor
+// GET /enclave/v1/traces externally; GET /v1/traces on the internal listener.
 func HandleTracingGet(t *Tracing) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var since time.Time

@@ -30,7 +30,7 @@ func newCurlCommand() *cobra.Command {
 certificate to the attestation document, then makes the requested call. The
 response must carry a valid enclave response signature.
 
-Use /v1/enclave-info for runtime, status, and migration information.`,
+Use /enclave/v1/info for runtime, status, and migration information.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCurl(cmd, curlOptions{

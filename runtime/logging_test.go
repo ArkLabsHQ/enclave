@@ -168,7 +168,7 @@ func TestLogHandlers(t *testing.T) {
 			logging,
 		)(
 			w,
-			httptest.NewRequest(http.MethodGet, "/v1/enclave-logs?level=error", nil),
+			httptest.NewRequest(http.MethodGet, "/v1/logs?level=error", nil),
 		)
 
 		require.Equal(t, http.StatusOK, w.Code)

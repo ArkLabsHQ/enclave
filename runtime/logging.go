@@ -240,7 +240,7 @@ func (l *Logging) StartCloudWatchExport(ctx context.Context) error {
 	return nil
 }
 
-// HandleLogsPost accepts OTLP protobuf logs.
+// HandleLogsPost accepts OTLP protobuf logs over POST.
 func HandleLogsPost(l *Logging) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
@@ -291,7 +291,7 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 	}
 }
 
-// handleLogsGet returns buffered logs; read-only/no auth.
+// handleLogsGet returns buffered logs over GET; read-only/no auth.
 func handleLogsGet(l *Logging) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var since time.Time

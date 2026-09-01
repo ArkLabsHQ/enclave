@@ -98,7 +98,7 @@ Provide the resulting EIF to a Nitro-capable host that satisfies the
 client:
 
 ```sh
-nix run github:ArkLabsHQ/enclave -- curl /v1/enclave-info \
+nix run github:ArkLabsHQ/enclave -- curl /enclave/v1/info \
   --base-url https://enclave.example.com \
   --expected-pcr0 "$(jq -r .PCR0 result/pcr.json)"
 ```
@@ -246,7 +246,6 @@ measurement. A subset can be overridden at runtime from SSM.
 | `ENCLAVE_NITRIDING_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
 | `ENCLAVE_NITRIDING_FQDN` | `localhost` | Hostname for the TLS certificate. |
 | `ENCLAVE_NITRIDING_HOST_PROXY_PORT` | `1024` | Host vsock port where gvproxy listens. |
-| `ENCLAVE_NITRIDING_DEBUG` | `false` | Reported by `GET /enclave/config`. |
 | `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
@@ -381,24 +380,29 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 TLS 1.2 minimum. Every non-gRPC response carries `X-Attestation-Signature` and
 `X-Attestation-Pubkey`, a BIP-340 Schnorr signature over the SHA-256 of the
-response body. `/v1/*` responses also carry permissive CORS headers.
+response body. `/enclave/*` responses also carry permissive CORS headers, and
+an `OPTIONS` preflight to any path in that namespace is answered `204` by the
+runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. |
-| GET | `/enclave` | none | Human-readable index. |
-| GET | `/enclave/config` | none | Effective runtime configuration as JSON. |
-| GET | `/v1/enclave-info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
+| GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
-| GET | `/v1/enclave-metrics` | none | Metric snapshot. |
-| GET | `/v1/enclave-logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
-| GET | `/v1/enclave-traces` | none | Buffered spans. Accepts `since`, `limit`, `service`. |
-| POST | `/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
-| POST | `/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
-| POST | `/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
-| any | everything else | none | Reverse-proxied to the application. |
+| GET | `/enclave/v1/metrics` | none | Metric snapshot. |
+| GET | `/enclave/v1/logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
+| GET | `/enclave/v1/traces` | none | Buffered spans. Accepts `since`, `limit`, `service`. |
+| POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
+| POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
+| POST | `/enclave/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
+| any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. |
 
 Bearer endpoints expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`.
+
+The complete `/enclave` namespace is reserved for runtime APIs. Unknown
+non-preflight paths beneath it return the runtime's `404` response, and no
+request in that namespace is proxied to the application. A request to the bare
+`/enclave` is redirected to `/enclave/`, which then returns that `404`.
 
 `/health` reports ready as soon as the application process has been started,
 which is marginally before it binds its port. Readiness probes should target an
@@ -406,9 +410,11 @@ application endpoint.
 
 ### Internal listener, TCP 127.0.0.1:8080
 
-Serves `/v1/*` and `/health` only, with the same handlers and authentication.
+Serves `/v1/metrics`, `/v1/logs`, `/v1/traces`, and `/health` only, with the
+same handlers and authentication. The HTTP method selects metric, log, and trace
+ingest (POST) or readback (GET).
 This is the endpoint advertised to the application through
-`ENCLAVE_PROXY_PORT`. It does not serve `/v1/enclave-info`, the `/enclave/*`
+`ENCLAVE_PROXY_PORT`. It does not serve `/enclave/v1/info`, the `/enclave/*`
 endpoints, or the application proxy.
 
 ### Migration control, vsock :8003
@@ -497,7 +503,7 @@ The order is:
      http://<migration-control-endpoint>/request-migration
    ```
    This writes an Object-Locked record to the intent log. It cannot be deleted.
-4. Wait for the cooldown. Poll `/v1/enclave-info` until
+4. Wait for the cooldown. Poll `/enclave/v1/info` until
    `migration.state == "eligible"`.
 5. Finalise:
    ```sh
@@ -514,7 +520,7 @@ The order is:
 7. Boot the successor. It verifies the predecessor attestation, the PCR31
    commitment, the key policy, and the transition receipt before adopting the
    state.
-8. Confirm adoption on the successor's `/v1/enclave-info`:
+8. Confirm adoption on the successor's `/enclave/v1/info`:
    `previous_pcr0` equals the predecessor PCR0,
    `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
    the successor's own PCR0.
@@ -549,7 +555,7 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 
 ```sh
 # Runtime and migration status.
-enclave curl /v1/enclave-info \
+enclave curl /enclave/v1/info \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 
 # Authenticated POST.

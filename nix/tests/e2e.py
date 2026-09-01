@@ -165,7 +165,7 @@ blue.succeed(
 )
 blue_secret = secret_value(blue)
 blue.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg p '{BLUE_PCR0}' "
     "'.previous_pcr0 == \"genesis\" and .migration.state == \"none\" "
     "and .migration.source_pcr0 == $p'"
@@ -313,7 +313,7 @@ assert (
     >= 1
 )
 blue.wait_until_succeeds(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.migration.state == \"eligible\"'",
     timeout=120,
 )
@@ -372,7 +372,7 @@ green.wait_for_unit("enclave-start.service")
 wait_healthy(green)
 assert secret_value(green) == blue_secret
 green.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
     "'.previous_pcr0 == $prev "
     "and (.previous_pcr0_attestation | length) > 0 "

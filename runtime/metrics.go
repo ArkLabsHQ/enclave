@@ -287,7 +287,7 @@ func readProcMeminfo() (map[string]float64, error) {
 }
 
 // HandleMetricGet returns a JSON snapshot of all metrics.
-// GET /v1/enclave-metrics
+// GET /enclave/v1/metrics externally; GET /v1/metrics on the internal listener.
 func HandleMetricGet(metrics *Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -348,8 +348,10 @@ the application:
 | `ENCLAVE_NITRIDING_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_NITRIDING_ACME_CA` | PEM CA bundle for a private ACME server. |
 
-With ACME enabled the certificate cache is stored in the TLS cache bucket,
-encrypted under the storage DEK.
+With ACME enabled, the shared certificate and ACME account key are stored in
+the certificate bucket, encrypted under the storage DEK. A separate lease
+bucket holds the ephemeral coordination objects used during certificate
+issuance and renewal.
 
 ### Application process environment
 
@@ -372,7 +374,8 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 | Path | Written by | Purpose |
 |---|---|---|
-| `/D/A/TLSCacheBucketName` | operator | ACME certificate cache bucket. |
+| `/D/A/CertBucketName` | operator | Shared certificate and ACME account-key bucket. |
+| `/D/A/LeaseBucketName` | operator | Ephemeral coordination lease bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
 | `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
@@ -455,8 +458,10 @@ interfaces.
 
 ### AWS requirements
 
-Create a private S3 bucket for the ACME cache and write its name to
-`/<deployment>/<app>/TLSCacheBucketName`.
+Create a private S3 bucket for shared certificate state and write its name to
+`/<deployment>/<app>/CertBucketName`. Create a separate private S3 bucket for
+ephemeral coordination leases and write its name to
+`/<deployment>/<app>/LeaseBucketName`.
 
 The migration intent bucket is **not** configured. Its name is derived, so no
 parameter a host can rewrite decides where deployment state is looked for:
@@ -475,7 +480,7 @@ AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
-| `S3TLSCacheReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the TLS cache bucket. |
+| `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
 | `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |

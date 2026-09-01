@@ -633,10 +633,14 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		NewAttestationHashes(),
 		"token",
 	).(*servers)
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), &migrationControlMigrator{
-		previous: &PreviousPCR0Info{},
-		status:   &MigrationStatus{},
-	}, nil))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(
+		context.Background(),
+		&migrationControlMigrator{
+			previous: &PreviousPCR0Info{},
+			status:   &MigrationStatus{},
+		},
+		nil,
+	))
 
 	t.Run("application routes reach the proxy", func(t *testing.T) {
 		for _, route := range []struct {
@@ -709,7 +713,7 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 
 		rr := httptest.NewRecorder()
 		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/enclave", nil))
-		
+
 		require.Contains(t, []int{
 			http.StatusMovedPermanently,
 			http.StatusTemporaryRedirect,

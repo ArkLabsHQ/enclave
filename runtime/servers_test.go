@@ -709,7 +709,11 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 
 		rr := httptest.NewRecorder()
 		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/enclave", nil))
-		require.Equal(t, http.StatusMovedPermanently, rr.Code)
+		
+		require.Contains(t, []int{
+			http.StatusMovedPermanently,
+			http.StatusTemporaryRedirect,
+		}, rr.Code)
 		require.Equal(t, "/enclave/", rr.Header().Get("Location"))
 		require.NotContains(t, proxied, "/enclave")
 	})

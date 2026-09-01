@@ -452,7 +452,8 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		0: bytes.Repeat([]byte{0xab}, 48),
 	})}}
 	migrator, err := NewMigrator(
-		nsm, nil, ssm, newFakeS3(), nil, nil, migrationIntentTestBucket,
+		nsm, nil, ssm, newFakeS3(), nil, nil,
+		newTestTLSKey(t), migrationIntentTestBucket,
 	)
 	require.NoError(t, err)
 

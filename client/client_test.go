@@ -26,7 +26,7 @@ func TestPinnedHTTPClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sum := sha256.Sum256(srv.Certificate().Raw)
+	sum := sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
 	goodHash := hex.EncodeToString(sum[:])
 
 	// Match → handler runs.
@@ -42,7 +42,7 @@ func TestPinnedHTTPClient(t *testing.T) {
 	bad, err := PinnedHTTPClient(strings.Repeat("cd", 32), false)
 	require.NoError(t, err)
 	_, err = bad.Get(srv.URL)
-	require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
+	require.ErrorContains(t, err, "TLS public-key fingerprint mismatch")
 	require.False(t, reached, "handler must not run when the pin fails")
 }
 
@@ -99,7 +99,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		fe := &fakeEnclave{pcr0Hex: pcr0}
 		srv := httptest.NewTLSServer(fe.handler())
 		defer srv.Close()
-		fe.attestedTLS = sha256.Sum256(srv.Certificate().Raw) // attest the real cert
+		fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
 
 		c, err := New(
 			srv.URL,
@@ -129,7 +129,7 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		)
 		require.NoError(t, err)
 		_, err = c.Get(context.Background(), "/enclave/v1/info")
-		require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
+		require.ErrorContains(t, err, "TLS public-key fingerprint mismatch")
 		fe.mu.Lock()
 		defer fe.mu.Unlock()
 		require.Empty(t, fe.appPaths, "no app request must be sent on a pin mismatch")

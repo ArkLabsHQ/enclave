@@ -1,7 +1,7 @@
 // Package client provides a verified HTTP client for AWS Nitro Enclaves.
 //
 // Every request first verifies the enclave's attestation document (PCR0 and
-// optional secret PCRs), then pins the live TLS leaf to the attested
+// optional secret PCRs), then pins the live TLS public key to the attested
 // fingerprint. This ensures the expected code terminates the connection.
 //
 // Usage:
@@ -79,7 +79,7 @@ type Response struct {
 type AttestationResult struct {
 	PCR0       string
 	PCRs       map[uint]string
-	TLSKeyHash string // hex-encoded SHA-256 of the enclave's TLS leaf cert (from user_data)
+	TLSKeyHash string // hex-encoded SHA-256 of the enclave TLS PublicKey
 	Verified   bool
 	VerifiedAt time.Time
 }
@@ -160,11 +160,11 @@ func New(baseURL string, opts Options) (*Client, error) {
 	return c, nil
 }
 
-// PinnedHTTPClient returns a client that pins the live leaf cert to tlsKeyHashHex
-// (same check as the HTTP/gRPC clients). strict adds public CA/hostname validation.
+// PinnedHTTPClient returns a client that pins the live certificate's PublicKey
+// to tlsKeyHashHex. strict adds public CA and hostname validation.
 func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
 	if isAllZeroHex(tlsKeyHashHex) {
-		return nil, fmt.Errorf("no TLS cert fingerprint to pin against")
+		return nil, fmt.Errorf("no TLS public-key fingerprint to pin against")
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{

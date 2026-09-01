@@ -128,7 +128,8 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 
 	t.Run("genesis", func(t *testing.T) {
 		m, err := NewMigrator(
-			nil, nil, NewSSM(&fakeSSM{}), newFakeS3(), nil, nil, migrationIntentTestBucket,
+			nil, nil, NewSSM(&fakeSSM{}), newFakeS3(), nil, nil,
+			newTestTLSKey(t), migrationIntentTestBucket,
 		)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
@@ -141,7 +142,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 		m, err := NewMigrator(nil, nil, NewSSM(&fakeSSM{params: map[string]string{
 			migrationPreviousPCR0Param():            "abc123",
 			migrationPreviousPCR0AttestationParam(): "attestation",
-		}}), newFakeS3(), nil, nil, migrationIntentTestBucket)
+		}}), newFakeS3(), nil, nil, newTestTLSKey(t), migrationIntentTestBucket)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
 
@@ -323,6 +324,7 @@ func TestCompleteMigration(t *testing.T) {
 			s3f,
 			&dek{key: dekKey},
 			[]StaticSecret{secret},
+			newTestTLSKey(t),
 			migrationIntentBucketName,
 		)
 		require.NoError(t, err)
@@ -446,6 +448,7 @@ func TestCompleteMigration(t *testing.T) {
 			fx.s3f,
 			fx.m.dek,
 			fx.m.staticSecrets,
+			fx.m.tlsKey,
 			migrationIntentBucketName,
 		)
 		require.NoError(t, err)

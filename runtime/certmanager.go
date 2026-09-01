@@ -9,6 +9,7 @@ package runtime
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
@@ -37,7 +38,7 @@ const (
 )
 
 type certIssuer interface {
-	Issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error)
+	Issue(ctx context.Context, domain string, key crypto.Signer) (certPEM []byte, err error)
 }
 
 // certManager serves the shared certificate and keeps it fresh.
@@ -48,6 +49,7 @@ type certManager struct {
 	leaseBucket string
 	fqdn        string
 	hashes      *AttestationHashes
+	key         crypto.Signer
 
 	currentCert atomic.Pointer[certBundle]
 }
@@ -58,6 +60,7 @@ func newCertManager(
 	issuer certIssuer,
 	s3api S3API,
 	leaseBucket, fqdn string,
+	key crypto.Signer,
 	hashes *AttestationHashes,
 ) (*certManager, error) {
 	m := &certManager{
@@ -67,6 +70,7 @@ func newCertManager(
 		leaseBucket: leaseBucket,
 		fqdn:        fqdn,
 		hashes:      hashes,
+		key:         key,
 	}
 
 	bundle, err := m.resolve(ctx)
@@ -76,7 +80,7 @@ func newCertManager(
 	m.currentCert.Store(bundle)
 
 	hashes.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
-		return m.currentCert.Load().leafHash, true
+		return m.currentCert.Load().keyHash, true
 	})
 	return m, nil
 }
@@ -204,12 +208,11 @@ func (m *certManager) renew(ctx context.Context, certETag string) (*certBundle, 
 	ctx, cancel := context.WithTimeout(ctx, certIssueTimeout)
 	defer cancel()
 
-	certPEM, keyPEM, err := m.issuer.Issue(ctx, m.fqdn)
+	certPEM, err := m.issuer.Issue(ctx, m.fqdn, m.key)
 	if err != nil {
 		return nil, fmt.Errorf("issue certificate for %q: %w", m.fqdn, err)
 	}
-
-	bundle, err := m.store.SaveCert(ctx, certPEM, keyPEM, certETag)
+	bundle, err := m.store.SaveCert(ctx, certPEM, certETag)
 	if err != nil {
 		if errors.Is(err, errCertChanged) {
 			slog.Info("peer renewed the certificate first, adopting theirs")

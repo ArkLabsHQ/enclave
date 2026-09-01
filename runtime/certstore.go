@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,6 @@ var errCertChanged = errors.New("certificate store: object changed")
 // storedCertV1 is the sealed object body.
 type storedCertV1 struct {
 	CertPEM []byte `json:"cert_pem"`
-	KeyPEM  []byte `json:"key_pem"`
 }
 
 // certBundle is the parsed, ready-to-serve form. etag is the version of the
@@ -36,13 +36,14 @@ type storedCertV1 struct {
 type certBundle struct {
 	cert     *tls.Certificate
 	notAfter time.Time
-	leafHash [sha256.Size]byte
+	keyHash  [sha256.Size]byte
 	etag     string
 }
 
 type certStore struct {
 	s3     S3API
 	dek    DEK
+	key    crypto.Signer
 	bucket string
 	fqdn   string
 	prefix string
@@ -53,17 +54,19 @@ const (
 	selfSignedStoragePrefix = "data/self-signed/"
 )
 
-func newCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
+func newCertStore(s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string) *certStore {
 	return &certStore{
-		s3: s3api, dek: dek, bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
+		s3: s3api, dek: dek, key: key, bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
 	}
 }
 
 // newSelfSignedCertStore keys the fleet's own certificate away from the ACME
 // one. Nothing in a stored bundle records who issued it, so a shared key would
 // let an ACME manager adopt a self-signed certificate and never order.
-func newSelfSignedCertStore(s3api S3API, dek DEK, bucket, fqdn string) *certStore {
-	store := newCertStore(s3api, dek, bucket, fqdn)
+func newSelfSignedCertStore(
+	s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string,
+) *certStore {
+	store := newCertStore(s3api, dek, key, bucket, fqdn)
 	store.prefix = selfSignedStoragePrefix
 	return store
 }
@@ -79,7 +82,7 @@ func (c *certStore) LoadCert(ctx context.Context) (*certBundle, error) {
 	if err := json.Unmarshal(raw, &stored); err != nil {
 		return nil, fmt.Errorf("decode stored certificate: %w", err)
 	}
-	bundle, err := parseCertBundle(stored.CertPEM, stored.KeyPEM)
+	bundle, err := parseCertBundle(stored.CertPEM, c.key)
 	if err != nil {
 		return nil, err
 	}
@@ -89,17 +92,17 @@ func (c *certStore) LoadCert(ctx context.Context) (*certBundle, error) {
 
 func (c *certStore) SaveCert(
 	ctx context.Context,
-	certPEM, keyPEM []byte,
+	certPEM []byte,
 	expectedETag string,
 ) (*certBundle, error) {
-	bundle, err := parseCertBundle(certPEM, keyPEM)
+	bundle, err := parseCertBundle(certPEM, c.key)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateLeaf(bundle.cert.Leaf, c.fqdn, time.Now()); err != nil {
 		return nil, fmt.Errorf("refusing to store certificate: %w", err)
 	}
-	body, err := json.Marshal(storedCertV1{CertPEM: certPEM, KeyPEM: keyPEM})
+	body, err := json.Marshal(storedCertV1{CertPEM: certPEM})
 	if err != nil {
 		return nil, fmt.Errorf("encode certificate: %w", err)
 	}
@@ -229,7 +232,15 @@ func (c *certStore) putConditional(
 	return aws.ToString(out.ETag), nil
 }
 
-func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
+func parseCertBundle(certPEM []byte, key crypto.Signer) (*certBundle, error) {
+	if key == nil {
+		return nil, errors.New("TLS key is required")
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal TLS key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("load X509 key pair: %w", err)
@@ -246,7 +257,7 @@ func parseCertBundle(certPEM, keyPEM []byte) (*certBundle, error) {
 	return &certBundle{
 		cert:     &cert,
 		notAfter: leaf.NotAfter,
-		leafHash: sha256.Sum256(cert.Certificate[0]),
+		keyHash:  sha256.Sum256(leaf.RawSubjectPublicKeyInfo),
 	}, nil
 }
 

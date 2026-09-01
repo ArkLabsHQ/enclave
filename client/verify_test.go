@@ -1,9 +1,15 @@
 package client
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -155,17 +161,40 @@ func TestIsAllZeroHex(t *testing.T) {
 }
 
 func TestVerifyLeafCertPin(t *testing.T) {
-	cert := []byte("a fake DER certificate")
-	sum := sha256.Sum256(cert)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "enclave.test"},
+		DNSNames:     []string{"enclave.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	cert, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(cert)
+	require.NoError(t, err)
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	good := hex.EncodeToString(sum[:])
 
 	// Match (case-insensitive).
 	require.NoError(t, verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)))
+
+	// A renewed certificate with different DER but the same key keeps the same pin.
+	renewedTemplate := *tmpl
+	renewedTemplate.SerialNumber = big.NewInt(2)
+	renewedTemplate.NotAfter = time.Now().Add(90 * 24 * time.Hour)
+	renewed, err := x509.CreateCertificate(
+		rand.Reader, &renewedTemplate, &renewedTemplate, &key.PublicKey, key,
+	)
+	require.NoError(t, err)
+	require.NotEqual(t, cert, renewed)
+	require.NoError(t, verifyLeafCertPin([][]byte{renewed}, good))
 	// Mismatch.
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)),
-		"TLS cert fingerprint mismatch",
+		"TLS public-key fingerprint mismatch",
 	)
 	// No peer cert.
 	require.ErrorContains(t, verifyLeafCertPin(nil, good), "no peer certificate presented")
@@ -173,11 +202,11 @@ func TestVerifyLeafCertPin(t *testing.T) {
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, ""),
-		"no attested TLS cert fingerprint",
+		"no attested TLS public-key fingerprint",
 	)
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)),
-		"no attested TLS cert fingerprint",
+		"no attested TLS public-key fingerprint",
 	)
 }

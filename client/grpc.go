@@ -12,7 +12,7 @@ import (
 )
 
 // GRPCConn returns a *grpc.ClientConn whose TLS handshake pins the
-// enclave's leaf cert fingerprint to the value embedded in the NSM
+// enclave's TLS PublicKey fingerprint to the value embedded in the NSM
 // attestation document's user_data. PCR0 and optional secret PCRs are verified
 // before the connection is established, and the result is cached for the
 // configured CacheTTL.
@@ -34,7 +34,7 @@ func (c *Client) GRPCConn(ctx context.Context, opts ...grpc.DialOption) (*grpc.C
 		return nil, fmt.Errorf("attestation: %w", err)
 	}
 	if attest.TLSKeyHash == "" {
-		return nil, fmt.Errorf("attestation result has no TLS cert fingerprint")
+		return nil, fmt.Errorf("attestation result has no TLS public-key fingerprint")
 	}
 
 	tlsCfg := &tls.Config{

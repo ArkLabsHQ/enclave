@@ -3,6 +3,9 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -616,6 +619,10 @@ func (k *stateOriginTestKMS) GenerateDataKey(context.Context) (*DataKey, error) 
 	}, nil
 }
 
+func (k *stateOriginTestKMS) Encrypt(_ context.Context, plaintext []byte) (string, error) {
+	return base64.StdEncoding.EncodeToString(plaintext), nil
+}
+
 func (k *stateOriginTestKMS) Decrypt(_ context.Context, ciphertext string) ([]byte, error) {
 	k.decryptCalls = append(k.decryptCalls, ciphertext)
 	return base64.StdEncoding.DecodeString(ciphertext)
@@ -628,11 +635,20 @@ func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
 }
 
 func stateOriginParams(keyID string) map[string]string {
+	tlsKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	tlsKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(tlsKey)
+	if err != nil {
+		panic(err)
+	}
 	params := map[string]string{
 		kmsKeyIDParam(): keyID,
 		storageDEKCiphertextParam(keyID): base64.StdEncoding.EncodeToString(
 			[]byte{0xde, 0xad, 0xbe, 0xef},
 		),
+		tlsKeyCiphertextParam(keyID): base64.StdEncoding.EncodeToString(tlsKeyPKCS8),
 	}
 	for i, secret := range stateOriginTestSecrets {
 		params[secretCiphertextParam(secret.Name, keyID)] = base64.StdEncoding.EncodeToString(
@@ -658,10 +674,13 @@ func mustStateRoot(
 	}
 	dekCiphertext, err := ssm.MustGet(ctx, storageDEKCiphertextParam(keyID))
 	require.NoError(t, err)
+	tlsKeyCiphertext, err := ssm.MustGet(ctx, tlsKeyCiphertextParam(keyID))
+	require.NoError(t, err)
 	root, err := stateRoot(bootSnapshot{
 		kmsKeyID:                  keyID,
 		staticSecrets:             secrets,
 		storageDEK:                dekCiphertext,
+		tlsKeyCiphertext:          tlsKeyCiphertext,
 		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 	})
 	require.NoError(t, err)

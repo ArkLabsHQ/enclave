@@ -347,10 +347,9 @@ the application:
 | `ENCLAVE_NITRIDING_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_NITRIDING_ACME_CA` | PEM CA bundle for a private ACME server. |
 
-With ACME enabled, the shared certificate and ACME account key are stored in
-the certificate bucket, encrypted under the storage DEK. A separate lease
-bucket holds the ephemeral coordination objects used during certificate
-issuance and renewal.
+The TLS key is generated at genesis, encrypted with KMS, and included in the
+state root. Renewed certificates reuse it. The certificate bucket stores the
+certificate and, when ACME is enabled, the ACME account key.
 
 ### Application process environment
 
@@ -378,6 +377,7 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
 | `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
+| `/D/A/L/TLSKey/Ciphertext/<keyID>` | runtime | Encrypted TLS key. |
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
 | `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
@@ -389,13 +389,13 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 ### External listener, TCP :443
 
 TLS 1.2 minimum. HTTP and gRPC clients authenticate the enclave by verifying its
-PCRs and pinning the live TLS leaf to the hash in the attestation document.
+PCRs and pinning the live TLS public key to the PublicKey hash in the attestation document.
 `/enclave/*` responses also carry permissive CORS headers, and an `OPTIONS`
 preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS leaf DER. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. |
 | GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, migration status, application status. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | GET | `/enclave/v1/metrics` | none | Metric snapshot. |
@@ -629,7 +629,7 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| `user_data` is exactly `sha256:` plus the raw 32-byte TLS leaf SHA-256, and the live certificate matches it | on | `InsecureTLS` |
+| `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
 

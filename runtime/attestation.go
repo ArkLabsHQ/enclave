@@ -7,8 +7,7 @@ import (
 
 const hashPrefix = "sha256:"
 
-// TLSKeyHashFunc reports the fingerprint of the TLS leaf currently served; ok is
-// false before the first certificate is installed.
+// TLSKeyHashFunc reports the TLS PublicKey hash.
 type TLSKeyHashFunc func() (hash [sha256.Size]byte, ok bool)
 
 // attestationDocument represents the CBOR structure of a Nitro attestation document.
@@ -17,7 +16,7 @@ type attestationDocument struct {
 }
 
 // AttestationHashes is the user_data payload of NSM attestation documents,
-// binding them to the served TLS leaf. Its zero value attests an all-zero hash.
+// binding them to the served TLS public key. Its zero value attests an all-zero hash.
 type AttestationHashes struct {
 	tlsKeyHash atomic.Pointer[TLSKeyHashFunc]
 }
@@ -28,7 +27,7 @@ func (a *AttestationHashes) SetTLSKeyHashSource(src TLSKeyHashFunc) {
 	a.tlsKeyHash.Store(&src)
 }
 
-// Serialize returns "sha256:" followed by the raw TLS leaf hash: exactly 39 bytes.
+// Serialize returns "sha256:" followed by the TLS PublicKey hash.
 func (a *AttestationHashes) Serialize() []byte {
 	var tlsHash [sha256.Size]byte
 	if src := a.tlsKeyHash.Load(); src != nil {
@@ -37,9 +36,4 @@ func (a *AttestationHashes) Serialize() []byte {
 		}
 	}
 	return append([]byte(hashPrefix), tlsHash[:]...)
-}
-
-// staticKeyHash is the source for a certificate that never changes.
-func staticKeyHash(h [sha256.Size]byte) TLSKeyHashFunc {
-	return func() ([sha256.Size]byte, bool) { return h, true }
 }

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -25,20 +26,24 @@ func setCertTestEnv(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 }
 
-// issueTestCert mints a self-signed leaf standing in for a CA-issued one.
-func issueTestCert(t *testing.T, cn string, notAfter time.Time) (certPEM, keyPEM []byte) {
+// issueTestCertWithKey mints a self-signed leaf standing in for a CA-issued one.
+func issueTestCertWithKey(
+	t *testing.T,
+	cn string,
+	notAfter time.Time,
+	key crypto.Signer,
+) []byte {
 	t.Helper()
-	return issueTestCertAt(t, cn, time.Now().Add(-time.Hour), notAfter)
+	return issueTestCertWithKeyAt(t, cn, time.Now().Add(-time.Hour), notAfter, key)
 }
 
-func issueTestCertAt(
+func issueTestCertWithKeyAt(
 	t *testing.T,
 	cn string,
 	notBefore, notAfter time.Time,
-) (certPEM, keyPEM []byte) {
+	key crypto.Signer,
+) []byte {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
 
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	require.NoError(t, err)
@@ -53,14 +58,9 @@ func issueTestCertAt(
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, key.Public(), key)
 	require.NoError(t, err)
-
-	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
-	require.NoError(t, err)
-
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 // fakeIssuer hands out a fresh certificate per call and counts orders, standing
@@ -76,25 +76,24 @@ type fakeIssuer struct {
 	onIssue func()
 }
 
-func (f *fakeIssuer) Issue(ctx context.Context, _ string) ([]byte, []byte, error) {
+func (f *fakeIssuer) Issue(ctx context.Context, _ string, key crypto.Signer) ([]byte, error) {
 	// A real CA order dies with its context; a fake that ignores it cannot show
 	// that losing the lease stops the work.
 	if ctx.Err() != nil {
-		return nil, nil, context.Cause(ctx)
+		return nil, context.Cause(ctx)
 	}
 	f.calls++
 	if f.onIssue != nil {
 		f.onIssue()
 	}
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, f.err
 	}
 	notAfter := f.notAfter
 	if notAfter.IsZero() {
 		notAfter = time.Now().Add(90 * 24 * time.Hour)
 	}
-	certPEM, keyPEM := issueTestCert(f.t, f.cn, notAfter)
-	return certPEM, keyPEM, nil
+	return issueTestCertWithKey(f.t, f.cn, notAfter, key), nil
 }
 
 // attestedHash is the user_data payload for a leaf: the prefix plus its SHA-256.
@@ -102,14 +101,34 @@ func attestedHash(leaf [sha256.Size]byte) []byte {
 	return append([]byte(hashPrefix), leaf[:]...)
 }
 
+func certKeyHash(t *testing.T, certDER []byte) [sha256.Size]byte {
+	t.Helper()
+	leaf, err := x509.ParseCertificate(certDER)
+	require.NoError(t, err)
+	return sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+}
+
 func TestSelfSignedIssuerSharesOneCertAcrossTheFleet(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
+	key := newTestTLSKey(t)
+	firstStore := newCertStore(
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"enclave.test",
+	)
+	secondStore := newCertStore(
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"enclave.test",
+	)
 
-	first, firstHashes, err := tryNewCertTestManager(s3f, selfSignedIssuer{})
-	require.NoError(t, err)
-	second, secondHashes, err := tryNewCertTestManager(s3f, selfSignedIssuer{})
-	require.NoError(t, err)
+	first, firstHashes := newCertTestManagerForStore(t, firstStore, selfSignedIssuer{})
+	second, secondHashes := newCertTestManagerForStore(t, secondStore, selfSignedIssuer{})
 
 	firstCert, err := first.GetCertificate(nil)
 	require.NoError(t, err)
@@ -156,14 +175,14 @@ func TestSaveCertRejectsAnUnusableLeaf(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s3f := newFakeS3()
 			store := newCertTestStore(s3f)
-			certPEM, keyPEM := issueTestCert(t, tc.cn, tc.expires)
+			certPEM := issueTestCertWithKey(t, tc.cn, tc.expires, store.key)
 			if tc.notYet {
-				certPEM, keyPEM = issueTestCertAt(
-					t, tc.cn, time.Now().Add(time.Hour), tc.expires,
+				certPEM = issueTestCertWithKeyAt(
+					t, tc.cn, time.Now().Add(time.Hour), tc.expires, store.key,
 				)
 			}
 
-			_, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+			_, err := store.SaveCert(ctx, certPEM, "")
 
 			require.ErrorContains(t, err, tc.wantErr)
 			stored, loadErr := store.LoadCert(ctx)
@@ -179,12 +198,13 @@ func TestSelfSignedIssuerServesAnIPEndpoint(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()
 	s3f := newFakeS3()
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "192.0.2.10")
-
-	certPEM, keyPEM, err := selfSignedIssuer{}.Issue(ctx, "192.0.2.10")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "192.0.2.10")
+	certPEM, err := selfSignedIssuer{}.Issue(ctx, "192.0.2.10", key)
 	require.NoError(t, err)
 
-	_, err = store.SaveCert(ctx, certPEM, keyPEM, "")
+	_, err = store.SaveCert(ctx, certPEM, "")
 
 	require.NoError(t, err)
 }
@@ -197,17 +217,19 @@ func TestACMEDoesNotAdoptTheSelfSignedCertificate(t *testing.T) {
 	ctx := context.Background()
 	s3f := newFakeS3()
 	d := &dek{key: make([]byte, 32)}
+	key := newTestTLSKey(t)
 
 	// The fleet ran self-signed first.
-	selfSignedStore := newSelfSignedCertStore(s3f, d, certTestBucket, "enclave.test")
+	selfSignedStore := newSelfSignedCertStore(s3f, d, key, certTestBucket, "enclave.test")
 	_, err := newCertManager(ctx, selfSignedStore, selfSignedIssuer{},
-		s3f, certTestBucket, "enclave.test", &AttestationHashes{})
+		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
 	require.NoError(t, err)
 
 	// Then ACME was switched on.
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	withACME, err := newCertManager(ctx, newCertTestStore(s3f), issuer,
-		s3f, certTestBucket, "enclave.test", &AttestationHashes{})
+	acmeStore := newCertStore(s3f, d, key, certTestBucket, "enclave.test")
+	withACME, err := newCertManager(ctx, acmeStore, issuer,
+		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, issuer.calls,
@@ -220,7 +242,18 @@ func TestACMEDoesNotAdoptTheSelfSignedCertificate(t *testing.T) {
 }
 
 func newCertTestStore(s3f *fakeS3) *certStore {
-	return newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "enclave.test")
+}
+
+func newTestTLSKey(t *testing.T) crypto.Signer {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	return key
 }
 
 func tryNewCertTestManager(
@@ -228,9 +261,10 @@ func tryNewCertTestManager(
 	issuer certIssuer,
 ) (*certManager, *AttestationHashes, error) {
 	hashes := &AttestationHashes{}
+	store := newCertTestStore(s3f)
 	m, err := newCertManager(
-		context.Background(), newCertTestStore(s3f), issuer,
-		s3f, certTestBucket, "enclave.test", hashes,
+		context.Background(), store, issuer,
+		s3f, certTestBucket, "enclave.test", store.key, hashes,
 	)
 	return m, hashes, err
 }
@@ -242,6 +276,21 @@ func newCertTestManager(
 ) (*certManager, *AttestationHashes) {
 	t.Helper()
 	m, hashes, err := tryNewCertTestManager(s3f, issuer)
+	require.NoError(t, err)
+	return m, hashes
+}
+
+func newCertTestManagerForStore(
+	t *testing.T,
+	store *certStore,
+	issuer certIssuer,
+) (*certManager, *AttestationHashes) {
+	t.Helper()
+	hashes := &AttestationHashes{}
+	m, err := newCertManager(
+		context.Background(), store, issuer,
+		store.s3, store.bucket, store.fqdn, store.key, hashes,
+	)
 	require.NoError(t, err)
 	return m, hashes
 }
@@ -258,9 +307,10 @@ func TestRenewUnderLeaseAdoptsAPeerRenewalWithoutOrdering(t *testing.T) {
 	// A peer renews and releases while we hold a stale view of the store.
 	stale := m.currentCert.Load()
 	peer := &fakeIssuer{t: t, cn: "enclave.test"}
-	peerCert, peerKey, err := peer.Issue(context.Background(), "enclave.test")
+	peerKey := stale.cert.PrivateKey.(crypto.Signer)
+	peerCert, err := peer.Issue(context.Background(), "enclave.test", peerKey)
 	require.NoError(t, err)
-	_, err = m.store.SaveCert(context.Background(), peerCert, peerKey, stale.etag)
+	_, err = m.store.SaveCert(context.Background(), peerCert, stale.etag)
 	require.NoError(t, err)
 
 	renewed, err := m.renewUnderLease(context.Background(), stale.etag)
@@ -311,7 +361,7 @@ func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {
 	require.NotNil(t, cert)
 
 	// The attested fingerprint must describe the leaf actually served.
-	served := sha256.Sum256(cert.Certificate[0])
+	served := certKeyHash(t, cert.Certificate[0])
 	require.Equal(t, attestedHash(served), hashes.Serialize())
 
 	// The lease is released, so a peer is not blocked behind us.
@@ -323,12 +373,13 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	// A peer already issued for the fleet.
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	stored, err := newCertTestStore(s3f).SaveCert(context.Background(), certPEM, keyPEM, "")
+	store := newCertTestStore(s3f)
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(90*24*time.Hour), store.key)
+	stored, err := store.SaveCert(context.Background(), certPEM, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, stored.etag)
 
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	m, hashes := newCertTestManagerForStore(t, store, issuer)
 
 	require.Zero(t, issuer.calls, "a stored certificate must not trigger an order")
 	// Adopting must record the version too, or the first poll re-downloads a
@@ -336,7 +387,7 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	require.Equal(t, stored.etag, m.currentETag())
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
-	served := sha256.Sum256(cert.Certificate[0])
+	served := certKeyHash(t, cert.Certificate[0])
 	require.Equal(t, attestedHash(served), hashes.Serialize())
 }
 
@@ -354,18 +405,25 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 
 	// This enclave observes an empty store, so its write is create-only.
 	var peerLeaf [sha256.Size]byte
+	var peerKeyHash [sha256.Size]byte
 	issuer.onIssue = func() {
 		// While our order runs, a peer takes over and commits its own.
-		peerCert, peerKey := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-		_, err := store.SaveCert(ctx, peerCert, peerKey, "")
+		peerCert := issueTestCertWithKey(
+			t,
+			"enclave.test",
+			time.Now().Add(90*24*time.Hour),
+			store.key,
+		)
+		_, err := store.SaveCert(ctx, peerCert, "")
 		require.NoError(t, err)
 
 		block, _ := pem.Decode(peerCert)
 		require.NotNil(t, block)
 		peerLeaf = sha256.Sum256(block.Bytes)
+		peerKeyHash = certKeyHash(t, block.Bytes)
 	}
 
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	m, hashes := newCertTestManagerForStore(t, store, issuer)
 
 	// The store must still hold the peer's certificate: ours was rejected.
 	stored, err := store.LoadCert(ctx)
@@ -377,7 +435,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	require.Equal(t, peerLeaf, sha256.Sum256(cert.Certificate[0]))
-	require.Equal(t, attestedHash(peerLeaf), hashes.Serialize())
+	require.Equal(t, attestedHash(peerKeyHash), hashes.Serialize())
 
 	require.Equal(t, 1, issuer.calls, "a rejected write must not re-run the order")
 }
@@ -387,11 +445,12 @@ func TestCertManagerRenewSkipsWhenLeaseIsUnavailable(t *testing.T) {
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	_, err := newCertTestStore(s3f).SaveCert(context.Background(), certPEM, keyPEM, "")
+	store := newCertTestStore(s3f)
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(90*24*time.Hour), store.key)
+	_, err := store.SaveCert(context.Background(), certPEM, "")
 	require.NoError(t, err)
 
-	m, _ := newCertTestManager(t, s3f, issuer)
+	m, _ := newCertTestManagerForStore(t, store, issuer)
 
 	writeLeaseDoc(t, s3f, leaseObjectKey(certLeaseName), time.Now().Add(time.Hour))
 
@@ -413,8 +472,13 @@ func TestCertManagerAdoptsPeerRenewalOnPoll(t *testing.T) {
 	require.NoError(t, err)
 
 	// A peer renews out from under us.
-	peerCert, peerKey := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	_, err = m.store.SaveCert(ctx, peerCert, peerKey, m.currentETag())
+	peerCert := issueTestCertWithKey(
+		t,
+		"enclave.test",
+		time.Now().Add(90*24*time.Hour),
+		m.store.key,
+	)
+	_, err = m.store.SaveCert(ctx, peerCert, m.currentETag())
 	require.NoError(t, err)
 
 	require.NoError(t, m.tick(ctx))
@@ -425,23 +489,88 @@ func TestCertManagerAdoptsPeerRenewalOnPoll(t *testing.T) {
 	require.Equal(t, 1, issuer.calls, "adopting must not trigger an order")
 }
 
+func TestRoutineRenewalKeepsFleetTLSIdentity(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	issuer := &fakeIssuer{
+		t:        t,
+		cn:       "enclave.test",
+		notAfter: time.Now().Add(time.Hour),
+	}
+	m, hashes := newCertTestManager(t, s3f, issuer)
+
+	before, err := m.GetCertificate(nil)
+	require.NoError(t, err)
+	beforeDER := append([]byte(nil), before.Certificate[0]...)
+	beforeKeyHash := certKeyHash(t, beforeDER)
+	beforeAttestation := append([]byte(nil), hashes.Serialize()...)
+
+	require.NoError(t, m.tick(context.Background()))
+
+	after, err := m.GetCertificate(nil)
+	require.NoError(t, err)
+	require.NotEqual(t, beforeDER, after.Certificate[0], "renewal must install a new certificate")
+	require.Equal(t, beforeKeyHash, certKeyHash(t, after.Certificate[0]),
+		"routine renewal must reuse the fleet TLS key")
+	require.Equal(t, beforeAttestation, hashes.Serialize(),
+		"certificate renewal must not change the attested fleet identity")
+	require.Equal(t, 2, issuer.calls)
+}
+
+func TestFleetKeepsOneIdentityWhilePeerHasNotAdoptedRenewal(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	issuer := &fakeIssuer{
+		t:        t,
+		cn:       "enclave.test",
+		notAfter: time.Now().Add(time.Hour),
+	}
+	key := newTestTLSKey(t)
+	renewerStore := newCertStore(
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"enclave.test",
+	)
+	peerStore := newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "enclave.test")
+	renewer, renewerHashes := newCertTestManagerForStore(t, renewerStore, issuer)
+	peer, peerHashes := newCertTestManagerForStore(t, peerStore, issuer)
+
+	oldCert, err := peer.GetCertificate(nil)
+	require.NoError(t, err)
+	require.NoError(t, renewer.tick(context.Background()))
+	newCert, err := renewer.GetCertificate(nil)
+	require.NoError(t, err)
+
+	require.NotEqual(t, oldCert.Certificate[0], newCert.Certificate[0],
+		"the peer intentionally has not polled and still serves the old certificate")
+	require.Equal(t,
+		certKeyHash(t, oldCert.Certificate[0]),
+		certKeyHash(t, newCert.Certificate[0]),
+		"old and renewed certificates must carry the same fleet public key",
+	)
+	require.Equal(t, peerHashes.Serialize(), renewerHashes.Serialize(),
+		"attestation from either side of the rollout must publish one identity")
+}
+
 func TestCertStoreSaveIsConditional(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()
 	s3f := newFakeS3()
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	store := newCertTestStore(s3f)
 
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(24*time.Hour))
-	saved, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(24*time.Hour), store.key)
+	saved, err := store.SaveCert(ctx, certPEM, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, saved.etag)
 
 	// Create-only against an existing object must fail.
-	_, err = store.SaveCert(ctx, certPEM, keyPEM, "")
+	_, err = store.SaveCert(ctx, certPEM, "")
 	require.ErrorIs(t, err, errCertChanged)
 
 	// The current ETag must succeed.
-	_, err = store.SaveCert(ctx, certPEM, keyPEM, saved.etag)
+	_, err = store.SaveCert(ctx, certPEM, saved.etag)
 	require.NoError(t, err)
 }
 
@@ -451,15 +580,15 @@ func TestSaveCertReportsChangedWhenObjectDeletedMidWrite(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()
 	s3f := newFakeS3()
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	store := newCertTestStore(s3f)
 
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(24*time.Hour))
-	saved, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(24*time.Hour), store.key)
+	saved, err := store.SaveCert(ctx, certPEM, "")
 	require.NoError(t, err)
 
 	s3f.beforePut = func(key string) { delete(s3f.objects, key) }
 
-	_, err = store.SaveCert(ctx, certPEM, keyPEM, saved.etag)
+	_, err = store.SaveCert(ctx, certPEM, saved.etag)
 
 	require.ErrorIs(t, err, errCertChanged)
 }
@@ -468,16 +597,16 @@ func TestCertStoreRoundTripsThroughDEK(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()
 	s3f := newFakeS3()
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	store := newCertTestStore(s3f)
 
 	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", notAfter)
-	_, err := store.SaveCert(ctx, certPEM, keyPEM, "")
+	certPEM := issueTestCertWithKey(t, "enclave.test", notAfter, store.key)
+	_, err := store.SaveCert(ctx, certPEM, "")
 	require.NoError(t, err)
 
-	// The object on the wire must not contain the key in the clear.
+	// The object on the wire must not contain the certificate in the clear.
 	raw := s3f.latestBody(store.certObjectKey())
-	require.NotContains(t, string(raw), "PRIVATE KEY")
+	require.NotContains(t, string(raw), "BEGIN CERTIFICATE")
 
 	bundle, err := store.LoadCert(ctx)
 	require.NoError(t, err)
@@ -487,7 +616,7 @@ func TestCertStoreRoundTripsThroughDEK(t *testing.T) {
 
 func TestCertStoreMissingObject(t *testing.T) {
 	setCertTestEnv(t)
-	store := newCertStore(newFakeS3(), &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	store := newCertTestStore(newFakeS3())
 
 	bundle, err := store.LoadCert(context.Background())
 	require.NoError(t, err)
@@ -498,7 +627,7 @@ func TestLoadOrCreateAccountKeyConvergesOnOne(t *testing.T) {
 	setCertTestEnv(t)
 	ctx := context.Background()
 	s3f := newFakeS3()
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, certTestBucket, "enclave.test")
+	store := newCertTestStore(s3f)
 
 	first, err := store.LoadOrCreateAccountKey(ctx)
 	require.NoError(t, err)
@@ -545,18 +674,27 @@ func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
 	served := func() [sha256.Size]byte {
 		cert, err := m.GetCertificate(nil)
 		require.NoError(t, err)
-		return sha256.Sum256(cert.Certificate[0])
+		return certKeyHash(t, cert.Certificate[0])
 	}
 	require.Equal(t, served(), attested(), "after bootstrap")
 
 	// Adopting a peer's certificate moves both together too.
-	before := served()
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
-	bundle, err := m.store.SaveCert(ctx, certPEM, keyPEM, m.currentETag())
+	beforeIdentity := served()
+	beforeCert, err := m.GetCertificate(nil)
+	require.NoError(t, err)
+	beforeDER := append([]byte(nil), beforeCert.Certificate[0]...)
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(90*24*time.Hour), m.store.key)
+	bundle, err := m.store.SaveCert(ctx, certPEM, m.currentETag())
 	require.NoError(t, err)
 	m.currentCert.Store(bundle)
 
-	require.NotEqual(t, before, served(), "the served leaf should have changed")
+	require.NotEqual(
+		t,
+		beforeDER,
+		bundle.cert.Certificate[0],
+		"the served leaf should have changed",
+	)
+	require.Equal(t, beforeIdentity, served(), "the fleet identity should remain stable")
 	require.Equal(t, served(), attested(), "after adopting a peer's certificate")
 }
 
@@ -568,11 +706,11 @@ func TestCertStoreConditionalConflictIsCertChanged(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	dek := &dek{key: make([]byte, 32)}
-	store := newCertStore(s3f, dek, certTestBucket, "enclave.test")
-	certPEM, keyPEM := issueTestCert(t, "enclave.test", time.Now().Add(90*24*time.Hour))
+	store := newCertStore(s3f, dek, newTestTLSKey(t), certTestBucket, "enclave.test")
+	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(90*24*time.Hour), store.key)
 
 	s3f.putConflicts = 1
-	_, err := store.SaveCert(context.Background(), certPEM, keyPEM, "")
+	_, err := store.SaveCert(context.Background(), certPEM, "")
 	require.ErrorIs(t, err, errCertChanged,
 		"a 409 must surface as cert-changed so the caller adopts instead of failing")
 }

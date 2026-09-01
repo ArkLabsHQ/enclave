@@ -40,3 +40,8 @@ func TestAttestationUserData(t *testing.T) {
 		require.Len(t, h.Serialize(), 39)
 	})
 }
+
+// staticKeyHash is the source for a certificate that never changes.
+func staticKeyHash(h [sha256.Size]byte) TLSKeyHashFunc {
+	return func() ([sha256.Size]byte, bool) { return h, true }
+}

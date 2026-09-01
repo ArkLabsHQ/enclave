@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -141,7 +142,7 @@ func fetchAndVerifyAttestation(
 //
 //	"sha256:" ++ tlsKeyHash(32)
 //
-// Total 39 bytes, with the raw TLS leaf hash at bytes 7:39.
+// Total 39 bytes, with the raw TLS PublicKey hash at bytes 7:39.
 const (
 	udHashPrefix = "sha256:"
 	udTLSStart   = len(udHashPrefix)
@@ -149,7 +150,7 @@ const (
 )
 
 // extractTLSKeyHash returns the hex-encoded SHA-256 fingerprint of the
-// enclave's TLS leaf cert, taken from bytes 7:39 of user_data.
+// enclave's TLS PublicKey, taken from bytes 7:39 of user_data.
 func extractTLSKeyHash(attestResult *nitrite.Result) (string, error) {
 	if attestResult == nil || attestResult.Document == nil {
 		return "", fmt.Errorf("no attestation result")
@@ -183,19 +184,24 @@ func isAllZeroHex(s string) bool {
 	return true
 }
 
-// verifyLeafCertPin returns nil iff SHA-256 of the live leaf cert (rawCerts[0])
-// equals expectedHashHex; missing/empty/all-zero is rejected. Shared by HTTP+gRPC.
+// verifyLeafCertPin returns nil iff SHA-256 of the live leaf certificate's
+// PublicKey equals expectedHashHex. The public key remains
+// stable across routine certificate renewal. Shared by HTTP and gRPC.
 func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
 	if isAllZeroHex(expectedHashHex) {
-		return fmt.Errorf("no attested TLS cert fingerprint to pin against")
+		return fmt.Errorf("no attested TLS public-key fingerprint to pin against")
 	}
 	if len(rawCerts) == 0 {
 		return fmt.Errorf("no peer certificate presented")
 	}
-	got := sha256.Sum256(rawCerts[0])
+	leaf, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return fmt.Errorf("parse peer leaf certificate: %w", err)
+	}
+	got := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	if !strings.EqualFold(hex.EncodeToString(got[:]), expectedHashHex) {
 		return fmt.Errorf(
-			"TLS cert fingerprint mismatch: expected %s, got %x",
+			"TLS public-key fingerprint mismatch: expected %s, got %x",
 			expectedHashHex,
 			got[:],
 		)

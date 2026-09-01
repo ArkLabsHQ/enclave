@@ -253,6 +253,14 @@ func storageDEKCiphertextParam(keyID string) string {
 	)
 }
 
+// tlsKeyCiphertextParam returns the encrypted TLS key path.
+func tlsKeyCiphertextParam(keyID string) string {
+	return fmt.Sprintf(
+		"/%s/%s/%s/TLSKey/Ciphertext/%s",
+		getDeployment(), getAppName(), lockSegment(), keyID,
+	)
+}
+
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
 // own state at genesis (and after adopting a migration). Scoped by key ID and PCR0.
 func stateOriginReceiptParam(keyID, pcr0 string) string {

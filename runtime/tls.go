@@ -2,8 +2,7 @@ package runtime
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
+	"crypto"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -18,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/crypto/acme"
 )
 
@@ -62,6 +60,7 @@ func ConfigureTLS(
 	dek DEK,
 	ssm SSM,
 	r53 Route53API,
+	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
@@ -69,14 +68,7 @@ func ConfigureTLS(
 	}
 
 	if !cfg.UseACME {
-		return configureSelfSigned(ctx, cfg, s3, dek, ssm, hashes)
-	}
-
-	// Outside an enclave there is no DEK to seal the shared store with, so ACME
-	// is unavailable; local runs get a self-signed certificate.
-	if !nitriding.InEnclave() {
-		slog.Warn("not running in an enclave, serving a self-signed certificate")
-		return configureSelfSignedCert(cfg, hashes)
+		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
 	}
 
 	zoneID, err := ssm.MayGet(ctx, route53ZoneIDParam())
@@ -91,7 +83,7 @@ func ConfigureTLS(
 				"and needs a Route53 hosted zone", route53ZoneIDParam(),
 		)
 	}
-	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, hashes)
+	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, hashes)
 }
 
 func configureDNS01Cert(
@@ -102,6 +94,7 @@ func configureDNS01Cert(
 	ssm SSM,
 	r53 Route53API,
 	zoneID string,
+	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	certBucket, err := ssm.MustGet(ctx, certBucketParam())
@@ -113,7 +106,7 @@ func configureDNS01Cert(
 		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}
 
-	store := newCertStore(s3, dek, certBucket, cfg.FQDN)
+	store := newCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
 
 	accountKey, err := store.LoadOrCreateAccountKey(ctx)
 	if err != nil {
@@ -135,7 +128,7 @@ func configureDNS01Cert(
 
 	manager, err := newCertManager(
 		ctx, store, issuer,
-		s3, leaseBucket, cfg.FQDN, hashes,
+		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
@@ -190,21 +183,17 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	return nil
 }
 
-// configureSelfSigned shares one self-signed certificate across the fleet when
-// the deployment can seal and coordinate it, so a client that pinned the leaf
-// from any enclave reaches every other one. Without an enclave to seal it or the
-// buckets to coordinate it, each enclave serves its own.
+// configureSelfSigned shares one self-signed certificate across the fleet, so a
+// client that pinned the leaf from any enclave reaches every other one.
 func configureSelfSigned(
 	ctx context.Context,
 	cfg *Config,
 	s3 S3API,
 	dek DEK,
 	ssm SSM,
+	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	if !nitriding.InEnclave() {
-		return configureSelfSignedCert(cfg, hashes)
-	}
 	certBucket, err := ssm.MayGet(ctx, certBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
@@ -214,17 +203,16 @@ func configureSelfSigned(
 		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}
 	if certBucket == "" || leaseBucket == "" {
-		slog.Warn(
-			"no shared certificate store, serving a per-enclave self-signed certificate",
-			"fqdn", cfg.FQDN,
+		return nil, fmt.Errorf(
+			"the shared certificate store needs both %s and %s",
+			certBucketParam(), leaseBucketParam(),
 		)
-		return configureSelfSignedCert(cfg, hashes)
 	}
 
-	store := newSelfSignedCertStore(s3, dek, certBucket, cfg.FQDN)
+	store := newSelfSignedCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
 	manager, err := newCertManager(
 		ctx, store, selfSignedIssuer{},
-		s3, leaseBucket, cfg.FQDN, hashes,
+		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
@@ -243,15 +231,15 @@ type selfSignedIssuer struct{}
 func (selfSignedIssuer) Issue(
 	_ context.Context,
 	domain string,
-) (certPEM, keyPEM []byte, err error) {
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate cert key: %w", err)
+	key crypto.Signer,
+) (certPEM []byte, err error) {
+	if key == nil {
+		return nil, fmt.Errorf("certificate key is required")
 	}
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate cert serial: %w", err)
+		return nil, fmt.Errorf("generate cert serial: %w", err)
 	}
 	template := x509.Certificate{
 		SerialNumber:          serial,
@@ -273,49 +261,17 @@ func (selfSignedIssuer) Issue(
 		rand.Reader,
 		&template,
 		&template,
-		&privKey.PublicKey,
-		privKey,
+		key.Public(),
+		key,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create certificate: %w", err)
+		return nil, fmt.Errorf("create certificate: %w", err)
 	}
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	if pemCert == nil {
-		return nil, nil, fmt.Errorf("encode certificate to PEM")
+		return nil, fmt.Errorf("encode certificate to PEM")
 	}
-
-	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal private key: %w", err)
-	}
-	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
-	if pemKey == nil {
-		return nil, nil, fmt.Errorf("encode private key to PEM")
-	}
-	return pemCert, pemKey, nil
-}
-
-// configureSelfSignedCert serves a certificate only this enclave holds, pinned
-// by the fingerprint it publishes. Clients that reach a different enclave will
-// see a different leaf, so this is the single-enclave fallback.
-func configureSelfSignedCert(cfg *Config, hashes *AttestationHashes) (TLSCertCallback, error) {
-	pemCert, pemKey, err := selfSignedIssuer{}.Issue(context.Background(), cfg.FQDN)
-	if err != nil {
-		return nil, err
-	}
-	bundle, err := parseCertBundle(pemCert, pemKey)
-	if err != nil {
-		return nil, err
-	}
-	hashes.SetTLSKeyHashSource(staticKeyHash(bundle.leafHash))
-
-	cert, err := tls.X509KeyPair(pemCert, pemKey)
-	if err != nil {
-		return nil, fmt.Errorf("load X509 key pair: %w", err)
-	}
-	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		return &cert, nil
-	}, nil
+	return pemCert, nil
 }
 
 // acmeClientForDirectory builds a custom client for https:// dirs or staging.

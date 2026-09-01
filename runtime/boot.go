@@ -2,7 +2,12 @@ package runtime
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -45,6 +50,7 @@ type bootResult struct {
 	kms     PrimaryKMS
 	dek     DEK
 	secrets []StaticSecret
+	tlsKey  crypto.Signer
 
 	migrationIntentBucketName string
 }
@@ -56,6 +62,7 @@ type bootSnapshot struct {
 	kmsKeyID                  string
 	staticSecrets             map[StaticSecretMetadata]string // metadata → ciphertext
 	storageDEK                string
+	tlsKeyCiphertext          string
 	migrationIntentBucketName string
 }
 
@@ -323,6 +330,18 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to decrypt DEK: %w", err)
 	}
+	tlsKeyPKCS8, err := kms.Decrypt(ctx, snapshot.tlsKeyCiphertext)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("failed to decrypt TLS key: %w", err)
+	}
+	tlsKeyAny, err := x509.ParsePKCS8PrivateKey(tlsKeyPKCS8)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("failed to parse TLS key: %w", err)
+	}
+	tlsKey, ok := tlsKeyAny.(crypto.Signer)
+	if !ok {
+		return bootResult{}, fmt.Errorf("TLS key of type %T cannot sign", tlsKeyAny)
+	}
 
 	secrets := make([]StaticSecret, 0, len(state.metadata))
 	for _, meta := range state.metadata {
@@ -349,6 +368,7 @@ func (b *Boot) establish(
 		kms:                       kms,
 		dek:                       &dek{key: dekPlaintext},
 		secrets:                   secrets,
+		tlsKey:                    tlsKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 	}, nil
 }
@@ -367,9 +387,14 @@ func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyI
 	if err != nil {
 		return fmt.Errorf("required DEK SSM param missing: %w", err)
 	}
+	tlsKeyCiphertext, err := b.ssm.MustGet(ctx, tlsKeyCiphertextParam(keyID))
+	if err != nil {
+		return fmt.Errorf("required TLS key SSM param missing: %w", err)
+	}
 	state.snapshot.kmsKeyID = keyID
 	state.snapshot.staticSecrets = secrets
 	state.snapshot.storageDEK = dekCiphertext
+	state.snapshot.tlsKeyCiphertext = tlsKeyCiphertext
 	return nil
 }
 
@@ -501,11 +526,29 @@ func (b *genesisBoot) buildSnapshot(
 		}
 		persistedSecrets[secret] = ciphertext
 	}
+	tlsKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return bootSnapshot{}, fmt.Errorf("generate TLS key: %w", err)
+	}
+	tlsKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(tlsKey)
+	if err != nil {
+		return bootSnapshot{}, fmt.Errorf("marshal TLS key: %w", err)
+	}
+	tlsKeyCiphertext, err := kms.Encrypt(ctx, tlsKeyPKCS8)
+	if err != nil {
+		return bootSnapshot{}, fmt.Errorf("encrypt TLS key: %w", err)
+	}
+	if err := ssm.Set(
+		ctx, tlsKeyCiphertextParam(kms.KeyID()), tlsKeyCiphertext,
+	); err != nil {
+		return bootSnapshot{}, fmt.Errorf("store TLS key: %w", err)
+	}
 
 	return bootSnapshot{
 		kmsKeyID:                  kms.KeyID(),
 		staticSecrets:             persistedSecrets,
 		storageDEK:                dekCiphertext,
+		tlsKeyCiphertext:          tlsKeyCiphertext,
 		migrationIntentBucketName: state.snapshot.migrationIntentBucketName,
 	}, nil
 }
@@ -682,7 +725,7 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
 	}
 
-	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+3)
+	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+4)
 	arts = append(arts, ssmArtifactV1{
 		Name: kmsKeyIDParam(), Value: snapshot.kmsKeyID,
 	})
@@ -714,6 +757,13 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 	}
 
 	arts = append(arts, ssmArtifactV1{Name: dekParam, ValueSHA256: dekHash})
+
+	tlsKeyParam := tlsKeyCiphertextParam(snapshot.kmsKeyID)
+	tlsKeyHash, err := sha256OfB64(snapshot.tlsKeyCiphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed sha256 hash of TLS key %s: %w", tlsKeyParam, err)
+	}
+	arts = append(arts, ssmArtifactV1{Name: tlsKeyParam, ValueSHA256: tlsKeyHash})
 
 	inputBytes, err := enc.Marshal(stateRootInputV1{
 		Schema:       stateRootSchemaV1,

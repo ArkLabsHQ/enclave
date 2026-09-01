@@ -3,6 +3,8 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -65,6 +67,7 @@ type migrator struct {
 	ssm           SSM
 	dek           DEK
 	staticSecrets []StaticSecret
+	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
 }
 
@@ -75,6 +78,7 @@ func NewMigrator(
 	s3 S3API,
 	dek DEK,
 	secrets []StaticSecret,
+	tlsKey crypto.Signer,
 	migrationIntentBucketName string,
 ) (Migrator, error) {
 	intent, err := newMigrationIntentLog(s3, nsm, migrationIntentBucketName)
@@ -87,6 +91,7 @@ func NewMigrator(
 		ssm:           ssm,
 		dek:           dek,
 		staticSecrets: secrets,
+		tlsKey:        tlsKey,
 		intent:        intent,
 	}, nil
 }
@@ -300,6 +305,21 @@ func (m *migrator) CompleteMigration(
 	if err != nil {
 		return nil, fmt.Errorf("DEK export failed: %w", err)
 	}
+	tlsKey, err := x509.MarshalPKCS8PrivateKey(m.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal TLS key: %w", err)
+	}
+	tlsKeyCiphertext, err := migrationKMS.Encrypt(ctx, tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-encrypt TLS key: %w", err)
+	}
+	if err := m.ssm.Set(
+		ctx,
+		tlsKeyCiphertextParam(migrationKMS.KeyID()),
+		tlsKeyCiphertext,
+	); err != nil {
+		return nil, fmt.Errorf("failed to store TLS key: %w", err)
+	}
 
 	attestDoc, _, err := m.nsm.BuildAttestationDocument()
 	if err != nil {
@@ -332,6 +352,7 @@ func (m *migrator) CompleteMigration(
 			kmsKeyID:                  migrationKMS.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
+			tlsKeyCiphertext:          tlsKeyCiphertext,
 			migrationIntentBucketName: m.intent.bucket,
 		},
 	); err != nil {

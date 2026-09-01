@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -52,50 +51,49 @@ func newACMEIssuer(
 	return &acmeIssuer{client: client, r53: r53, zoneID: zoneID, email: email}, nil
 }
 
-// Issue runs a complete order for domain and returns the PEM chain and key.
-func (i *acmeIssuer) Issue(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
+// Issue runs a complete order for domain using the fleet TLS key and returns
+// the PEM certificate chain.
+func (i *acmeIssuer) Issue(
+	ctx context.Context,
+	domain string,
+	key crypto.Signer,
+) (certPEM []byte, err error) {
 	if err := i.register(ctx); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	order, err := i.client.AuthorizeOrder(ctx, acme.DomainIDs(domain))
 	if err != nil {
-		return nil, nil, fmt.Errorf("authorize order for %q: %w", domain, err)
+		return nil, fmt.Errorf("authorize order for %q: %w", domain, err)
 	}
 
 	if err := i.solveChallenges(ctx, order); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if _, err := i.client.WaitOrder(ctx, order.URI); err != nil {
-		return nil, nil, fmt.Errorf("wait for order %q: %w", order.URI, err)
+		return nil, fmt.Errorf("wait for order %q: %w", order.URI, err)
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate certificate key: %w", err)
+	if key == nil {
+		return nil, errors.New("certificate key is required")
 	}
 	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
 		Subject:  pkix.Name{CommonName: domain},
 		DNSNames: []string{domain},
 	}, key)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create CSR: %w", err)
+		return nil, fmt.Errorf("create CSR: %w", err)
 	}
 
 	chain, _, err := i.client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("finalize order for %q: %w", domain, err)
+		return nil, fmt.Errorf("finalize order for %q: %w", domain, err)
 	}
 	if len(chain) == 0 {
-		return nil, nil, errors.New("CA returned an empty certificate chain")
+		return nil, errors.New("CA returned an empty certificate chain")
 	}
-
-	keyPEM, err = encodeECKey(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	return encodeCertChain(chain), keyPEM, nil
+	return encodeCertChain(chain), nil
 }
 
 // register creates the ACME account. The account key is fleet-shared, so on

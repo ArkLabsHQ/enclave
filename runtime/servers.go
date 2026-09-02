@@ -43,7 +43,7 @@ var (
 
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
-	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
+	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ancestry Ancestry) error
 	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
 }
 
@@ -199,13 +199,17 @@ type RuntimeInfo struct {
 	Migration                *MigrationStatus `json:"migration"`
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
+	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(
 	ctx context.Context,
 	migrator Migrator,
-	ssm SSM,
+	ancestry Ancestry,
 ) error {
+	if ancestry != nil {
+		ancestry.Start(ctx)
+	}
 	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -229,6 +233,13 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			return
 		}
 
+		// Reading the audit cannot block or fail, so it is safe this late in the
+		// handler and cannot make the endpoint slow or unavailable.
+		var ancestryInfo *AncestryInfo
+		if ancestry != nil {
+			ancestryInfo = ancestry.Snapshot()
+		}
+
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                  Version,
 			PreviousPCR0:             prevInfo.PCR0,
@@ -237,6 +248,7 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
 			KMSKeyLocked:             kmsKeyLocked(),
+			Ancestry:                 ancestryInfo,
 		})
 	})
 

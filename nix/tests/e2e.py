@@ -532,7 +532,7 @@ assert migration_key != genesis_key
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
 # Blue is genesis-born, so its own lineage is unchanged by having finalised.
 blue.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.previous_pcr0 == \"genesis\"'"
 )
 # The migration key admits green alone: blue can write under it but not read.
@@ -589,6 +589,26 @@ green.succeed(
     "and (.previous_pcr0_attestation | length) > 0 "
     "and .migration.state == \"none\" "
     "and .migration.source_pcr0 == $current'"
+)
+
+# The ancestor-key audit must name blue as the one prior generation and report
+# its key as live: blue's key was never deleted, so anything else -- and
+# "deleted" above all -- would be a false retirement receipt.
+green.wait_until_succeeds(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    f"| jq -e --arg prev '{BLUE_PCR0}' "
+    "'.ancestry.checked_at != null "
+    "and .ancestry.complete == true "
+    "and (.ancestry.generations | length) == 1 "
+    "and .ancestry.generations[0].pcr0 == $prev "
+    "and (.ancestry.generations[0].key_id | length) > 0 "
+    "and .ancestry.generations[0].state == \"exists\" "
+    # Blue is genesis-born, so the record names it and the chain ends there. The
+    # runtime states no verdict on that; a client compares the two itself, which
+    # is what this assertion stands in for.
+    "and .ancestry.genesis.pcr0 == $prev "
+    "and (.ancestry.genesis.attestation | length) > 0'",
+    timeout=60,
 )
 
 leaf_issuer = served_leaf(green, "-noout -issuer")
@@ -748,7 +768,7 @@ wait_healthy(blue)
 assert secret_value(blue) == blue_secret
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
 blue.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/v1/enclave-info "
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.previous_pcr0 == \"genesis\"'"
 )
 status, out = enclave_curl(blue, BLUE_PCR0)

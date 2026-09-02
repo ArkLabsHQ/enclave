@@ -32,8 +32,11 @@ func BuildKMSPolicy(roleARN string, pcr0Values []string, recoveryAccount string)
 			Sid:       "EnclaveOperations",
 			Effect:    "Allow",
 			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			Action:    []string{"kms:Encrypt", "kms:GetKeyPolicy"},
-			Resource:  "*",
+			// DescribeKey is read-only metadata, needed so a successor can report
+			// whether this generation's key has been deleted. Older keys lack it and
+			// fall back to GetKeyPolicy, which cannot see a pending deletion.
+			Action:   []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
+			Resource: "*",
 		},
 		{
 			Sid:       "AllowKeyDeletion",

@@ -115,7 +115,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
+	genesisLog, err := newGenesisLog(aws.S3, nsm, result.migrationIntentBucketName)
+	if err != nil {
+		return fmt.Errorf("failed to open the deployment genesis log: %w", err)
+	}
+	ancestry := NewAncestry(nsm, ssm, NewKeyAuditor(aws.KMS), genesisLog)
+
+	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 

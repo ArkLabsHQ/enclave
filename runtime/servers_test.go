@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
@@ -458,8 +459,20 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = s.ConfigureEnclaveInfoHandler(ctx, migrator, ssm)
+	ancestry := &stubAncestry{snap: &AncestryInfo{
+		Generations: []AncestorGeneration{{
+			PCR0:       strings.Repeat("cd", 48),
+			KeyID:      "key-1",
+			State:      keyStateDeleted,
+			CheckedVia: checkedViaDescribeKey,
+		}},
+		Complete:  true,
+		CheckedAt: &ancestryTestCheckedAt,
+	}}
+
+	err = s.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry)
 	require.NoError(t, err)
+	require.True(t, ancestry.started, "the handler must own the audit's refresh lifecycle")
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
@@ -477,12 +490,105 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		},
 		UpstreamApp:  rt.UpstreamAppInfo(),
 		KMSKeyLocked: true,
+		Ancestry:     ancestry.snap,
 	})
 	require.NoError(t, err)
 	require.JSONEq(t, string(want), rr.Body.String())
 	var got map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
 	require.NotContains(t, got, "attestation_pubkey")
+}
+
+var ancestryTestCheckedAt = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+type stubAncestry struct {
+	snap    *AncestryInfo
+	started bool
+}
+
+func (s *stubAncestry) Start(context.Context) { s.started = true }
+
+func (s *stubAncestry) Snapshot() *AncestryInfo { return s.snap }
+
+// A caller that wires no audit must get no audit block, rather than an empty one
+// that reads as "every ancestor key is accounted for".
+func TestConfigureEnclaveInfoHandlerOmitsAncestryWhenUnset(t *testing.T) {
+	s, migrator := enclaveInfoTestServer(t)
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
+
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.NotContains(t, rr.Body.String(), "ancestry")
+}
+
+// A blind audit must still serve, and must never let "we could not tell" render
+// as "the key is gone".
+func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
+	s, migrator := enclaveInfoTestServer(t)
+	ancestry := &stubAncestry{snap: &AncestryInfo{
+		Generations: []AncestorGeneration{{
+			PCR0:       strings.Repeat("cd", 48),
+			KeyID:      "key-1",
+			State:      keyStateUnknown,
+			CheckedVia: checkedViaGetKeyPolicy,
+		}},
+		CheckedAt: &ancestryTestCheckedAt,
+	}}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, ancestry))
+
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), `"state":"unknown"`)
+	require.NotContains(t, rr.Body.String(), keyStateDeleted)
+}
+
+// A KMS that answers nothing must cost the endpoint nothing.
+func TestConfigureEnclaveInfoHandlerSurvivesABlindAudit(t *testing.T) {
+	setAncestryTestEnv(t)
+	s, migrator := enclaveInfoTestServer(t)
+	kms := newFakeKMS()
+	kms.describeErr = errors.New("kms unreachable")
+	kms.getKeyPolicyErr = errors.New("kms unreachable")
+	ancestry := newTestAncestry(t, ancestryChain(2), NewKeyAuditor(kms))
+	ancestry.refresh(context.Background())
+
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, ancestry))
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var got RuntimeInfo
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got.Ancestry.Generations, 2)
+	for _, gen := range got.Ancestry.Generations {
+		require.Equal(t, keyStateUnknown, gen.State)
+	}
+}
+
+func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
+	t.Helper()
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
+
+	s := &servers{
+		rm:      http.NewServeMux(),
+		rt:      newRuntimeState(),
+		metrics: NewMetrics(),
+	}
+	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
+		0: bytes.Repeat([]byte{0xab}, 48),
+	})}}
+	migrator, err := NewMigrator(
+		nsm, nil, NewSSM(&fakeSSM{}), newFakeS3(), nil, nil,
+		newTestTLSKey(t), migrationIntentTestBucket,
+	)
+	require.NoError(t, err)
+	return s, migrator
 }
 
 func TestConfigureEnclaveInfoHandlerFailsClosedOnStatusError(t *testing.T) {

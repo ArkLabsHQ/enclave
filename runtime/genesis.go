@@ -40,6 +40,7 @@ type GenesisArtifact struct {
 	PCR0        string
 	PublishedAt time.Time
 	VersionID   string
+	Attestation string
 }
 
 type deploymentGenesisV1 struct {
@@ -81,6 +82,7 @@ func (l *genesisLog) Genesis(ctx context.Context) (*GenesisArtifact, error) {
 				PCR0:        entry.PCR0,
 				PublishedAt: lastModified.UTC(),
 				VersionID:   versionID,
+				Attestation: entry.Attestation,
 			}
 			return true, nil
 		})
@@ -99,13 +101,9 @@ func (l *genesisLog) CommitGenesis(
 	if !isCanonicalPCR0(pcr0) {
 		return nil, fmt.Errorf("genesis PCR0 must be 96 lowercase hex characters")
 	}
-	payload, err := l.enc.Marshal(deploymentGenesisPayloadV1{
-		Schema:     deploymentGenesisSchemaV1,
-		BucketName: l.bucket,
-		PCR0:       pcr0,
-	})
+	payload, err := l.preImage(pcr0)
 	if err != nil {
-		return nil, fmt.Errorf("encode deployment genesis: %w", err)
+		return nil, err
 	}
 	doc, _, err := l.nsm.BuildAttestationDocument(WithUserData(payload))
 	if err != nil {
@@ -152,6 +150,22 @@ func (l *genesisLog) CommitGenesis(
 		)
 	}
 	return genesis, nil
+}
+
+// preImage is the user_data a genesis record is signed over: canonical CBOR
+// binding the schema, this bucket and the PCR0. The bucket is inside the
+// signature, so a record cannot be moved between deployments — which is what a
+// verifier relies on when it derives the bucket name itself.
+func (l *genesisLog) preImage(pcr0 string) ([]byte, error) {
+	payload, err := l.enc.Marshal(deploymentGenesisPayloadV1{
+		Schema:     deploymentGenesisSchemaV1,
+		BucketName: l.bucket,
+		PCR0:       pcr0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode deployment genesis: %w", err)
+	}
+	return payload, nil
 }
 
 // readGenesis returns one version if it is a well-formed genesis object. It does

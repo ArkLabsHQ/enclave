@@ -400,6 +400,12 @@ ever overwritten. Each handoff therefore adds a generation rather than replacing
 one; prune retired generations only once you are certain you will never boot
 their PCR0 again.
 
+The ancestor-key audit adds no parameters of its own: it walks
+`MigrationPreviousPCR0/<pcr0>` backwards and reads `L/KMSKeyID/<pcr0>` at each
+hop. Pruning a retired generation's `KMSKeyID` therefore makes that generation
+report `unknown`, not `deleted` — the record of which key to check is gone, not
+the key. Delete the key first, confirm the audit reports `deleted`, then prune.
+
 ## HTTP API
 
 ### External listener, TCP :443
@@ -412,7 +418,7 @@ preflight to any path in that namespace is answered `204` by the runtime.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. |
-| GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, migration status, application status. |
+| GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
 | POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
@@ -432,6 +438,59 @@ request in that namespace is proxied to the application. A request to the bare
 `/health` reports ready as soon as the application process has been started,
 which is marginally before it binds its port. Readiness probes should target an
 application endpoint.
+
+#### Ancestor-key audit
+
+Each generation mints its own KMS key and migration is strictly additive, so a
+retired generation keeps a key that can still decrypt state until an operator
+deletes it. The `ancestry` block of `/enclave/v1/info` reports what became of
+those keys, newest first.
+
+`complete` reports only what the walk observed: that it ran out of
+`MigrationPreviousPCR0` entries rather than stopping on a cycle, a malformed
+record or an SSM failure, which `reason` explains. It is not a claim that the
+chain reached the deployment's origin.
+
+Whether the chain reaches the origin is yours to decide. The `genesis` block
+carries the Object-Locked `deployment-genesis` record — its `pcr0`, and its
+`attestation` in base64 — so you can compare the oldest generation reported
+against it yourself. The runtime draws no conclusion from the pair: a verdict
+from the enclave under audit is worth nothing to a client that does not already
+trust it, and the runtime's own boot treats the record as advisory anyway, since
+one it cannot verify must still veto a genesis rather than fail open.
+
+Verify it against the AWS Nitro root, require PCR0 to equal the block's `pcr0`,
+and require `user_data` to equal the canonical CBOR of
+`{schema, bucket_name, pcr0}` for the intent bucket name you derived
+independently. That last check is what makes the record non-transferable: the
+bucket is inside the signature, so one copied from another deployment fails.
+
+| `state` | Meaning |
+|---|---|
+| `exists` | The key is present. Under `checked_via: describe_key` this also proves it is not scheduled for deletion. |
+| `pending_deletion` | Deletion is scheduled; `deletion_date` says when it completes. |
+| `deleted` | KMS no longer knows the key. This generation can no longer decrypt anything. |
+| `unknown` | The state could not be read. The cause is logged, not published: the AWS error names role ARNs and account IDs, and this endpoint is unauthenticated. |
+
+`checked_via` is `describe_key`, `get_key_policy`, or `none`. The `get_key_policy`
+rung is the fallback for locked keys minted before `kms:DescribeKey` was in the
+key policy: it distinguishes present from deleted, but reports a key awaiting
+deletion as `exists`. It therefore understates deletion progress and never
+overstates it.
+
+`unknown` never means deleted. Only KMS reporting the key as absent produces
+`deleted`, so a permissions failure or a KMS outage can never be read as proof
+that a retired generation was retired.
+
+The block is a cached snapshot, rebuilt once at boot and then daily: `checked_at`
+is when it was built, and is `null` before the first probe completes. Reading it
+never calls SSM or KMS, so the endpoint cannot be made slow or unavailable by
+either.
+
+The chain has no length cap. Truncating it would drop the oldest generations,
+which are the most retired and so the ones the audit exists to account for. A
+corrupt chain still terminates: a PCR0 that repeats stops the walk and is
+reported through `complete` and `reason`.
 
 ### Internal listener, TCP 127.0.0.1:8080
 
@@ -504,7 +563,7 @@ AWS credentials delivered through IMDS must allow:
 | `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
 | `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
-| `KMSAccess` | `CreateKey`, `TagResource`. |
+| `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. `DescribeKey` is only effective on unlocked keys, whose `RootRecovery` statement delegates it to IAM; locked keys authorise it through their own `EnclaveOperations` statement instead, so keys minted before that statement gained the action can never be described. |
 | `STSAccess` | `GetCallerIdentity`. |
 | `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/enclave/*`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
@@ -512,6 +571,10 @@ AWS credentials delivered through IMDS must allow:
 operations are authorised by the enclave-created key's own PCR0-conditioned
 policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
+
+`DescribeKey` is read-only metadata and grants nothing over ciphertext. It exists
+so a running enclave can report whether its ancestors' keys have been deleted;
+host credentials still cannot read enclave state with it.
 
 `/<deployment>/<app>/<locked|unlocked>/KMSKeyID/<pcr0>` is owned exclusively by
 the runtime. Do not pre-create or declaratively manage it. Genesis claims it
@@ -574,6 +637,13 @@ The order is:
 10. Keep both enclaves healthy for the soak period, then retire the predecessor.
     Its key and SSM generation stay live; leave them alone unless you are certain
     you will never boot that PCR0 again.
+11. If you do retire a generation's key, schedule its deletion out of band, then
+    poll the successor's `/enclave/v1/info` until that generation reports
+    `state: "deleted"` in the `ancestry` block. Responses on that route are
+    signed by the attestation-bound key, so that reading is the receipt that the
+    retired generation can no longer decrypt anything. Do not prune the
+    generation's `KMSKeyID` parameter before then — without it the audit reports
+    `unknown` rather than `deleted`.
 
 Lock posture must not change across a handoff. `ENCLAVE_KMS_KEY_LOCKED` selects
 the `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a

@@ -254,6 +254,16 @@ type fakeKMS struct {
 	blobs        map[string][]byte
 	encryptErr   error
 	createKeyErr error
+
+	// Key-audit surface: keyStates overrides what DescribeKey reports, describeErr
+	// forces a DescribeKey failure, and the counters prove which rung of the
+	// audit ladder ran.
+	keyStates           map[string]*kmstypes.KeyMetadata
+	describeErr         error
+	describeNilMetadata bool
+	getKeyPolicyErr     error
+	describeCalls       int
+	policyCalls         int
 }
 
 func newFakeKMS() *fakeKMS { return &fakeKMS{keys: map[string]string{}, blobs: map[string][]byte{}} }
@@ -414,11 +424,49 @@ func (f *fakeKMS) GetKeyPolicy(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
+	f.policyCalls++
+	if f.getKeyPolicyErr != nil {
+		return nil, f.getKeyPolicyErr
+	}
 	policy, ok := f.keys[aws.ToString(in.KeyId)]
 	if !ok {
-		return nil, fmt.Errorf("fake kms key not found")
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
 	}
 	return &kms.GetKeyPolicyOutput{Policy: aws.String(policy)}, nil
+}
+
+// DescribeKey reports keyStates when seeded, otherwise derives presence from the
+// key set: a known key is Enabled, an unknown one is gone.
+func (f *fakeKMS) DescribeKey(
+	_ context.Context,
+	in *kms.DescribeKeyInput,
+	_ ...func(*kms.Options),
+) (*kms.DescribeKeyOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.describeCalls++
+	if f.describeErr != nil {
+		return nil, f.describeErr
+	}
+	if f.describeNilMetadata {
+		return &kms.DescribeKeyOutput{}, nil
+	}
+	keyID := aws.ToString(in.KeyId)
+	if md, ok := f.keyStates[keyID]; ok {
+		return &kms.DescribeKeyOutput{KeyMetadata: md}, nil
+	}
+	if _, ok := f.keys[keyID]; !ok {
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
+	}
+	return &kms.DescribeKeyOutput{KeyMetadata: &kmstypes.KeyMetadata{
+		KeyId:    aws.String(keyID),
+		KeyState: kmstypes.KeyStateEnabled,
+	}}, nil
 }
 
 func (f *fakeKMS) CreateKey(

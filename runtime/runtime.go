@@ -73,14 +73,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
 	}
 
-	hashes := NewAttestationHashes()
-
-	attestationSigner, err := NewAttestedSigner()
-	if err != nil {
-		return fmt.Errorf("failed to create attestation signer: %w", err)
-	}
-
-	hashes.SetSigningKeyHash(attestationSigner.PubkeyHash())
+	hashes := &AttestationHashes{}
 
 	authToken, err := generateRuntimeToken()
 	if err != nil {
@@ -98,7 +91,6 @@ func Run(ctx context.Context, cfg Config) error {
 		metrics,
 		logging,
 		tracing,
-		attestationSigner,
 		hashes,
 		authToken,
 	)
@@ -108,29 +100,28 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	ssm := NewSSM(aws.SSM)
-	verified, err := EstablishState(
-		ctx,
-		nsm,
-		aws.KMS,
-		aws.STS,
-		ssm,
-	)
+	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
+	if err != nil {
+		return fmt.Errorf("failed to establish state: %w", err)
+	}
+	result, err := boot.Boot(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, verified.secrets); err != nil {
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
 	migrator, err := NewMigrator(
 		nsm,
-		verified.kms,
+		result.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
 		aws.S3,
-		verified.dek,
-		verified.secrets,
-		verified.migrationIntentBucketName,
+		result.dek,
+		result.secrets,
+		result.tlsKey,
+		result.migrationIntentBucketName,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
@@ -144,7 +135,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start migration control server: %w", err)
 	}
 
-	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
+	tlsCertCb, err := ConfigureTLS(
+		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
 	}
@@ -154,8 +147,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
-	// overriding verified secret state
-	if err := SetStaticSecretEnvVars(verified.secrets); err != nil {
+	// overriding established secret state
+	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
 		return fmt.Errorf("failed to set static secrets env vars: %w", err)
 	}
 

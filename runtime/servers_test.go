@@ -129,42 +129,6 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 	})
 }
 
-func TestIsGRPCRequest(t *testing.T) {
-	tests := []struct {
-		name        string
-		protoMajor  int
-		contentType string
-		want        bool
-	}{
-		{"native grpc over h2", 2, "application/grpc", true},
-		{"grpc with proto subtype", 2, "application/grpc+proto", true},
-		{"grpc with charset", 2, "application/grpc; charset=utf-8", true},
-		{"grpc-web over h2", 2, "application/grpc-web+proto", true},
-		{"grpc-web over h1", 1, "application/grpc-web", true},
-		{"grpc-web-text over h1", 1, "application/grpc-web-text", true},
-		{"grpc-web binary over h1", 1, "application/grpc-web+proto", true},
-		{"json over h2", 2, "application/json", false},
-		{"grpc-shaped CT over h1", 1, "application/grpc", false},
-		{"empty CT over h2", 2, "", false},
-		{"text plain over h2", 2, "text/plain", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, "/", nil)
-			r.ProtoMajor = tc.protoMajor
-			if tc.contentType != "" {
-				r.Header.Set("Content-Type", tc.contentType)
-			}
-
-			if got := isGRPCRequest(r); got != tc.want {
-				t.Fatalf("isGRPCRequest(proto=%d, ct=%q): got %v, want %v",
-					tc.protoMajor, tc.contentType, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestHealthHandler(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -268,65 +232,10 @@ func TestCorsWildcard(t *testing.T) {
 	})
 }
 
-func TestAttestationMiddleware(t *testing.T) {
-	signer, err := NewAttestedSigner()
-	require.NoError(t, err)
-
-	t.Run("signs non grpc response", func(t *testing.T) {
-		h := responseSignerMiddleware(
-			signer,
-		)(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusAccepted)
-				_, _ = w.Write([]byte("attested body"))
-			}),
-		)
-
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
-
-		if rr.Code != http.StatusAccepted {
-			t.Fatalf("status: got %d, want %d", rr.Code, http.StatusAccepted)
-		}
-		if rr.Body.String() != "attested body" {
-			t.Fatalf("body: got %q", rr.Body.String())
-		}
-		if rr.Header().Get("X-Attestation-Signature") == "" {
-			t.Fatal("missing attestation signature")
-		}
-		if got := rr.Header().Get("X-Attestation-Pubkey"); got != signer.Pubkey() {
-			t.Fatalf("pubkey: got %q, want %q", got, signer.Pubkey())
-		}
-	})
-
-	t.Run("bypasses grpc", func(t *testing.T) {
-		h := responseSignerMiddleware(
-			signer,
-		)(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = w.Write([]byte("stream"))
-			}),
-		)
-
-		req := httptest.NewRequest(http.MethodPost, "/", nil)
-		req.ProtoMajor = 2
-		req.Header.Set("Content-Type", "application/grpc")
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-
-		if rr.Body.String() != "stream" {
-			t.Fatalf("body: got %q", rr.Body.String())
-		}
-		if rr.Header().Get("X-Attestation-Signature") != "" {
-			t.Fatal("grpc response was signed")
-		}
-	})
-}
-
 func TestAttestationHandler(t *testing.T) {
 	t.Run("missing nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -336,7 +245,7 @@ func TestAttestationHandler(t *testing.T) {
 
 	t.Run("bad nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, NewAttestationHashes()).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce=not-hex", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -347,11 +256,9 @@ func TestAttestationHandler(t *testing.T) {
 	t.Run("returns document bound to nonce and user data", func(t *testing.T) {
 		doc := []byte("attestation document")
 		session := &fakeNSMSession{responses: []response.Response{attestationDocumentResponse(doc)}}
-		hashes := NewAttestationHashes()
+		hashes := &AttestationHashes{}
 		tlsHash := sha256.Sum256([]byte("tls"))
-		signingHash := sha256.Sum256([]byte("signing"))
-		hashes.SetTLSKeyHash(tlsHash)
-		hashes.SetSigningKeyHash(signingHash)
+		hashes.SetTLSKeyHashSource(staticKeyHash(tlsHash))
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 
 		rr := httptest.NewRecorder()
@@ -379,6 +286,7 @@ func TestAttestationHandler(t *testing.T) {
 		if !bytes.Equal(req.UserData, hashes.Serialize()) {
 			t.Fatalf("user_data: got %x, want %x", req.UserData, hashes.Serialize())
 		}
+		require.Len(t, req.UserData, 39)
 	})
 }
 
@@ -537,16 +445,15 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		migrationPreviousPCR0Param():            "previous",
 		migrationPreviousPCR0AttestationParam(): "attestation",
 	}})
-	signer, err := NewAttestedSigner()
-	require.NoError(t, err)
 	rt := newRuntimeState()
 	metrics := NewMetrics()
-	s := &servers{rm: http.NewServeMux(), rt: rt, signer: signer, metrics: metrics}
+	s := &servers{rm: http.NewServeMux(), rt: rt, metrics: metrics}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
 	})}}
 	migrator, err := NewMigrator(
-		nsm, nil, ssm, newFakeS3(), nil, nil, migrationIntentTestBucket,
+		nsm, nil, ssm, newFakeS3(), nil, nil,
+		newTestTLSKey(t), migrationIntentTestBucket,
 	)
 	require.NoError(t, err)
 
@@ -563,7 +470,6 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		Version:                  Version,
 		PreviousPCR0:             "previous",
 		PreviousPCR0Attestation:  "attestation",
-		AttestationPubkey:        signer.Pubkey(),
 		Metrics:                  metrics.MetricsSnapshot(),
 		MigrationCooldownSeconds: 120,
 		Migration: &MigrationStatus{
@@ -574,6 +480,9 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.JSONEq(t, string(want), rr.Body.String())
+	var got map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.NotContains(t, got, "attestation_pubkey")
 }
 
 func TestConfigureEnclaveInfoHandlerFailsClosedOnStatusError(t *testing.T) {
@@ -619,8 +528,6 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	require.NoError(t, err)
 
 	metrics := NewMetrics()
-	signer, err := NewAttestedSigner()
-	require.NoError(t, err)
 
 	s := SetupHttpServers(
 		newRuntimeState(),
@@ -629,8 +536,7 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		metrics,
 		NewLogging(metrics, nil),
 		NewTracing(nil),
-		signer,
-		NewAttestationHashes(),
+		&AttestationHashes{},
 		"token",
 	).(*servers)
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(

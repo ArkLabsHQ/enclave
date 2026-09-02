@@ -3,7 +3,6 @@ package runtime
 // servers.go wires public/private muxes, admin handlers, reverse proxy, and listeners.
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -11,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -57,7 +55,6 @@ type servers struct {
 	im      *http.ServeMux
 	em      *http.ServeMux
 	rt      RuntimeState
-	signer  AttestedSigner
 	metrics *Metrics
 }
 
@@ -68,12 +65,10 @@ func SetupHttpServers(
 	metrics *Metrics,
 	logging *Logging,
 	tracing *Tracing,
-	signer AttestedSigner,
-	hashes AttestationHashes,
+	hashes *AttestationHashes,
 	authToken string,
 ) Servers {
 	metricsMW := metricsMiddleware(metrics)
-	attestationMW := responseSignerMiddleware(signer)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -110,17 +105,17 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMW(attestationMW(em)),
+		Handler: metricsMW(em),
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
-			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
 	}
 
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
-		Handler: metricsMW(attestationMW(im)),
+		Handler: metricsMW(im),
 	}
 
 	return &servers{
@@ -131,7 +126,6 @@ func SetupHttpServers(
 		em:      em,
 		im:      im,
 		rt:      rt,
-		signer:  signer,
 		metrics: metrics,
 	}
 }
@@ -195,7 +189,6 @@ type RuntimeInfo struct {
 	Version                  string           `json:"version"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
-	AttestationPubkey        string           `json:"attestation_pubkey,omitempty"`
 	Metrics                  map[string]any   `json:"metrics"`
 	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
 	Migration                *MigrationStatus `json:"migration"`
@@ -235,7 +228,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			Version:                  Version,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
-			AttestationPubkey:        s.signer.Pubkey(),
 			Metrics:                  s.metrics.MetricsSnapshot(),
 			MigrationCooldownSeconds: int(cooldown.Seconds()),
 			Migration:                migrationStatus,
@@ -342,35 +334,6 @@ func migrationHTTPStatus(err error) int {
 	}
 }
 
-func responseSignerMiddleware(signer AttestedSigner) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip signing for gRPC; attested TLS verifies identity, and buffering breaks streams.
-			if isGRPCRequest(r) {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			rec := &responseRecorder{
-				headers: w.Header(),
-				body:    &bytes.Buffer{},
-				status:  http.StatusOK,
-			}
-			next.ServeHTTP(rec, r)
-
-			body := rec.body.Bytes()
-			if sig := signer.Sign(body); sig != "" {
-				w.Header().Set("X-Attestation-Signature", sig)
-				w.Header().Set("X-Attestation-Pubkey", signer.Pubkey())
-			} else {
-				w.Header().Set("X-Attestation-Error", "signing-failed")
-			}
-			w.WriteHeader(rec.status)
-			_, _ = w.Write(body)
-		})
-	}
-}
-
 func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -434,8 +397,8 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 	}
 }
 
-// attestationHandler serves NSM attestation binding TLS and response-signing key hashes.
-func attestationHandler(nsm NSM, hashes AttestationHashes) http.HandlerFunc {
+// attestationHandler serves NSM attestation bound to the currently served TLS leaf.
+func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, errBadForm, http.StatusBadRequest)
@@ -542,20 +505,6 @@ func corsWildcard(next http.Handler) http.Handler {
 	})
 }
 
-// responseRecorder buffers body/status for response-signing middleware.
-type responseRecorder struct {
-	headers http.Header
-	body    *bytes.Buffer
-	status  int
-}
-
-func (r *responseRecorder) Header() http.Header         { return r.headers }
-func (r *responseRecorder) WriteHeader(code int)        { r.status = code }
-func (r *responseRecorder) Write(b []byte) (int, error) { return r.body.Write(b) }
-func (r *responseRecorder) ReadFrom(s io.Reader) (int64, error) {
-	return io.Copy(r.body, s)
-}
-
 // statusWriter captures status and forwards Flush for streaming responses.
 type statusWriter struct {
 	http.ResponseWriter
@@ -571,16 +520,4 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-// isGRPCRequest detects gRPC/gRPC-Web so signing middleware can avoid buffering.
-func isGRPCRequest(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "application/grpc-web") {
-		return true
-	}
-	if r.ProtoMajor != 2 {
-		return false
-	}
-	return strings.HasPrefix(ct, "application/grpc")
 }

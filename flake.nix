@@ -44,7 +44,7 @@
                 version = "0.1.0";
                 src = ./runtime;
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-8bNEo1h22hmnzttU49QzHQslt/WnrDqTf1LRgwd1eN4=";
+                vendorHash = "sha256-npi7g0YtHbxtOeYHOQ8aExneTUU65jsWYCpFrS51hxU=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -65,7 +65,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-/LPCpvpa1869AaFWPQAZNOmdIFPe8ZoQqLHwPXcifcA=";
+                  vendorHash = "sha256-UpYTFzOGPnETUaftmz0SwC/gDKbeUWj5zeYULCAsyf8=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"

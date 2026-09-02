@@ -296,7 +296,8 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 	cs.integralPpm = nextIntegralPpm
 	cs.lastXMonoNs = m.xMonoNs
 
-	slog.Info("clock sync: disciplined",
+	slog.Info(
+		"clock sync: disciplined",
 		"freq_ppm", applied, // what is applied: proportional + integral
 		"integral_ppm", cs.integralPpm,
 		"proportional_ppm", proportionalPpm,

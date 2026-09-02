@@ -1,14 +1,22 @@
 # default.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
-# The NixOS test driver injects aws, blue, and green.
+# The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
+import hashlib
 import json
 import shlex
 import time
 
 CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
+AWS_ACCOUNT_ID = "000000000000"
 FQDN = "enclave.test"
-TLS_BUCKET = "enclave-e2e-tls-cache"
-INTENT_BUCKET = "enclave-e2e-migration-intent"
+CERT_BUCKET = "enclave-e2e-certificates"
+LEASE_BUCKET = "enclave-e2e-leases"
+INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
+INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
+CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
+ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
+SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
+CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 
 
 def cloud(command):
@@ -37,13 +45,61 @@ def served_leaf_sha(node):
     ).strip()
 
 
-def enclave_curl(node, pcr0):
-    # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, TLS pin,
-    # key binding, and the response signature remain verified.
+def console_has(node, needle):
+    status, _ = node.execute(
+        "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
+        f"| grep -F {shlex.quote(needle)} >/dev/null"
+    )
+    return status == 0
+
+
+def console_owners(nodes, needle):
+    return [n.name for n in nodes if console_has(n, needle)]
+
+
+def enclave_curl(node, pcr0, path="/health"):
+    # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
+    # 39-byte TLS binding, and live certificate pinning remain checked.
     return node.execute(
-        f"enclave curl /health --base-url https://127.0.0.1 "
+        f"enclave curl {path} --base-url https://127.0.0.1 "
         f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify 2>&1"
     )
+
+
+def kms_key_count():
+    return int(cloud("kms list-keys --query 'length(Keys)' --output text"))
+
+
+def cert_etag():
+    return cloud(
+        f"s3api head-object --bucket {CERT_BUCKET} --key {CERT_KEY} "
+        "--query ETag --output text"
+    )
+
+
+def challenge_event_count():
+    return int(
+        aws.succeed(
+            "test -e /var/lib/route53-dns-proxy/events "
+            "&& wc -l < /var/lib/route53-dns-proxy/events || printf 0"
+        ).strip()
+    )
+
+
+def challenge_record_count(zone_id):
+    return int(
+        cloud(
+            f"route53 list-resource-record-sets --hosted-zone-id {zone_id} "
+            f"--query \"length(ResourceRecordSets[?Name=='{CHALLENGE_NAME}' "
+            "&& Type=='TXT'])\" --output text"
+        )
+    )
+
+
+def env_value(node, name):
+    return node.succeed(
+        f"curl -skf --http1.1 https://127.0.0.1/test/env/{name} | jq -r .value"
+    ).strip()
 
 
 def print_enclave_diagnostics(node):
@@ -126,13 +182,16 @@ aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
 aws.wait_for_open_port(4000)
 aws.wait_for_open_port(1338)
 aws.wait_for_open_port(14000)
+aws.wait_for_open_port(8055)
+aws.wait_for_open_port(4570)
 aws.wait_until_succeeds(
     "curl -fsS --cacert /etc/pebble/ca.crt https://127.0.0.1:14000/dir "
     "| grep -q newOrder"
 )
 
 # Create only the AWS resources consumed by the runtime.
-cloud(f"s3api create-bucket --bucket {TLS_BUCKET}")
+cloud(f"s3api create-bucket --bucket {CERT_BUCKET}")
+cloud(f"s3api create-bucket --bucket {LEASE_BUCKET}")
 cloud(
     f"s3api create-bucket --bucket {INTENT_BUCKET} "
     "--object-lock-enabled-for-bucket"
@@ -142,55 +201,108 @@ cloud(
     "--versioning-configuration Status=Enabled"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/TLSCacheBucketName "
-    f"--type String --value {TLS_BUCKET}"
+    "ssm put-parameter --name /dev/testapp/CertBucketName "
+    f"--type String --value {CERT_BUCKET}"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/MigrationIntentBucketName "
-    f"--type String --value {INTENT_BUCKET}"
+    "ssm put-parameter --name /dev/testapp/LeaseBucketName "
+    f"--type String --value {LEASE_BUCKET}"
+)
+route53_zone_id = cloud(
+    f"route53 create-hosted-zone --name {FQDN}. --caller-reference enclave-e2e "
+    "--query HostedZone.Id --output text"
+).rsplit("/", 1)[-1]
+cloud(
+    "ssm put-parameter --name /dev/testapp/Route53ZoneID "
+    f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
 put_env("ENCLAVE_NITRIDING_FQDN", FQDN)
 
-blue.start()
-blue.wait_for_unit("multi-user.target")
-blue.wait_for_unit("mock-imds-forward.service")
-blue.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
-blue.wait_for_unit("enclave-start.service")
-wait_healthy(blue)
-blue.succeed(
-    "test \"$(curl -skf --http1.1 "
-    "https://127.0.0.1/test/env/E2E_OVERRIDE "
-    "| jq -r .value)\" = override-from-ssm"
-)
-blue_secret = secret_value(blue)
-blue.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    f"| jq -e --arg p '{BLUE_PCR0}' "
-    "'.previous_pcr0 == \"genesis\" and .migration.state == \"none\" "
-    "and .migration.source_pcr0 == $p'"
-)
+BLUES = (blue, blue_peer)
+kms_keys_before_genesis = kms_key_count()
 
-leaf_issuer = served_leaf(blue, "-noout -issuer")
-assert "AWS Nitro enclave application" in leaf_issuer, leaf_issuer
-leaf_subject = served_leaf(blue, "-noout -subject")
-assert "AWS Nitro enclave application" in leaf_subject, leaf_subject
-leaf_san = served_leaf(blue, "-noout -ext subjectAltName")
-assert f"DNS:{FQDN}" in leaf_san, leaf_san
+# Both blues boot into genesis together: exactly one wins the lease and mints
+# the key, the other resumes onto it. start() is asynchronous, so issuing both
+# before any wait is what creates the overlap.
+blue.start()
+blue_peer.start()
+for node in BLUES:
+    node.wait_for_unit("multi-user.target")
+    node.wait_for_unit("mock-imds-forward.service")
+    node.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
+    node.wait_for_unit("enclave-start.service")
+    wait_healthy(node)
+
+for node in BLUES:
+    assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
+    node.succeed(
+        "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+        f"| jq -e --arg p '{BLUE_PCR0}' "
+        "'.previous_pcr0 == \"genesis\" and .migration.state == \"none\" "
+        "and .migration.source_pcr0 == $p'"
+    )
+blue_secret = secret_value(blue)
+assert secret_value(blue_peer) == blue_secret
+
+for node in BLUES:
+    leaf_issuer = served_leaf(node, "-noout -issuer")
+    assert "AWS Nitro enclave application" in leaf_issuer, leaf_issuer
+    leaf_subject = served_leaf(node, "-noout -subject")
+    assert "AWS Nitro enclave application" in leaf_subject, leaf_subject
+    leaf_san = served_leaf(node, "-noout -ext subjectAltName")
+    assert f"DNS:{FQDN}" in leaf_san, leaf_san
+
+# The fleet shares one self-signed certificate: a client that pinned the leaf
+# from either enclave must reach the other.
+blue_leaf_sha = served_leaf_sha(blue)
+assert served_leaf_sha(blue_peer) == blue_leaf_sha
+assert len(console_owners(BLUES, "renewed the fleet certificate")) == 1
+
+# One stored object for the whole fleet, not one per enclave.
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {TLS_BUCKET} "
+    f"s3api list-objects-v2 --bucket {CERT_BUCKET} "
     "--query 'Contents[].Key' --output text"
 )
-assert cache_keys in ("", "None"), cache_keys
-status, out = enclave_curl(blue, BLUE_PCR0)
-assert status == 0, out
-assert "WARNING" in out, out
+assert cache_keys == SELF_SIGNED_KEY, cache_keys
+for node in BLUES:
+    status, out = enclave_curl(node, BLUE_PCR0)
+    assert status == 0, out
+    assert "WARNING" in out, out
 
 key_param = "/dev/testapp/unlocked/KMSKeyID"
 genesis_key = cloud(
     f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
 )
 assert genesis_key not in ("", "UNSET", "None")
+
+# Once present, the Object-Locked deployment-genesis object decides that the
+# deployment exists independently of KMSKeyID. Its fixed, identity-independent
+# key means deleting the parameter cannot reopen genesis, and one enclave's
+# completed genesis vetoes every later one.
+genesis_records = cloud(
+    f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+    "--prefix deployment-genesis "
+    "--query 'Versions[].Key' --output text"
+).split()
+assert genesis_records == ["deployment-genesis"], genesis_records
+
+# Exactly one enclave ran genesis; the other resumed onto its key.
+minted = console_owners(BLUES, "created primary KMS key")
+resumed = console_owners(BLUES, "genesis completed by a peer")
+assert len(minted) == 1, minted
+assert len(resumed) <= 1, resumed
+assert not set(minted) & set(resumed), (minted, resumed)
+assert kms_key_count() == kms_keys_before_genesis + 1
+print(f"genesis race: minted={minted} resumed={resumed}")
+
+# And it is not a migration intent: the creator's own intent chain stays empty.
+intent_records = cloud(
+    f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+    f"--prefix migration-intent/{BLUE_PCR0}/ "
+    "--query 'Versions[].Key' --output text"
+).split()
+assert intent_records in ([], ["None"]), intent_records
 
 # Exercise both the hard-step and PI-servo paths against the real /dev/ptp0.
 host_ts = int(blue.succeed("date +%s").strip())
@@ -358,6 +470,23 @@ if finalise_response_valid:
     )
 assert migration_key != genesis_key
 
+# The blue fleet outlives the handoff it performed. Only `blue` was asked to
+# finalise, so exactly one migration key exists; `blue_peer` keeps serving from
+# state it established under the retired key. Both now report themselves as
+# their own predecessor, because finalise records the finalising PCR0 and the
+# fleet shares it — so "genesis" is no longer the expected value here.
+for node in BLUES:
+    wait_healthy(node)
+    assert secret_value(node) == blue_secret
+    assert served_leaf_sha(node) == blue_leaf_sha
+    node.wait_until_succeeds(
+        "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+        f"| jq -e --arg p '{BLUE_PCR0}' --arg t '{GREEN_PCR0}' "
+        "'.previous_pcr0 == $p and .migration.state == \"eligible\" "
+        "and .migration.target_pcr0 == $t'"
+    )
+assert kms_key_count() == kms_keys_before_genesis + 2
+
 # ACME settings are loaded once at boot, so blue remains self-signed.
 put_env("ENCLAVE_NITRIDING_USE_ACME", "true")
 put_env("ENCLAVE_NITRIDING_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
@@ -369,6 +498,11 @@ green.wait_for_unit("multi-user.target")
 green.wait_for_unit("mock-imds-forward.service")
 green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green.wait_for_unit("enclave-start.service")
+# DNS-01 issuance is part of boot, not triggered by the first TLS request.
+aws.wait_until_succeeds(
+    "test -s /var/lib/route53-dns-proxy/events",
+    timeout=900,
+)
 wait_healthy(green)
 assert secret_value(green) == blue_secret
 green.succeed(
@@ -416,33 +550,114 @@ assert mgmt_sha == served_leaf_sha(green)
 
 status, out = enclave_curl(green, GREEN_PCR0)
 assert status == 0, out
-status, _ = green.execute(
-    "openssl s_client -connect 127.0.0.1:443 -servername other.example "
-    "</dev/null 2>/dev/null | openssl x509 -noout -subject"
+status, _ = aws.execute(
+    f"openssl s_client -connect {FQDN}:443 -servername other.example "
+    "-verify_hostname other.example -verify_return_error "
+    "-CAfile /tmp/pebble-root.pem </dev/null >/dev/null 2>&1"
 )
 assert status != 0
 
 cache_keys = cloud(
-    f"s3api list-objects-v2 --bucket {TLS_BUCKET} "
+    f"s3api list-objects-v2 --bucket {CERT_BUCKET} "
     "--query 'Contents[].Key' --output text"
 ).split()
-assert f"dev/testapp/data/acme/{FQDN}" in cache_keys, cache_keys
-assert all(k.startswith("dev/testapp/data/acme/") for k in cache_keys), cache_keys
+assert sorted(cache_keys) == sorted(
+    [CERT_KEY, ACCOUNT_KEY, SELF_SIGNED_KEY]
+), cache_keys
 aws.succeed("rm -rf /tmp/tls-cache")
-cloud(f"s3 cp s3://{TLS_BUCKET} /tmp/tls-cache --recursive")
+cloud(f"s3 cp s3://{CERT_BUCKET} /tmp/tls-cache --recursive")
 _, pem_hits = aws.execute(
     "grep -rl 'BEGIN CERTIFICATE' /tmp/tls-cache 2>/dev/null; "
     "grep -rl 'PRIVATE KEY' /tmp/tls-cache 2>/dev/null; true"
 )
 assert pem_hits.strip() == "", pem_hits
+assert challenge_record_count(route53_zone_id) == 0
 
+# Snapshot the established fleet state before a same-EIF peer joins.
 leaf_sha_before = served_leaf_sha(green)
+leaf_serial_before = leaf_serial
+cert_etag_before = cert_etag()
+challenge_events_before = challenge_event_count()
+kms_keys_before = kms_key_count()
+assert cloud(
+    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+) == migration_key
+
+green_peer.start()
+green_peer.wait_for_unit("multi-user.target")
+green_peer.wait_for_unit("mock-imds-forward.service")
+green_peer.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
+green_peer.wait_for_unit("enclave-start.service")
+wait_healthy(green_peer)
+
+# Joining must resume the committed state, not perform genesis or issue a cert.
+assert cloud(
+    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+) == migration_key
+assert kms_key_count() == kms_keys_before
+assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
+green_peer.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
+    "'.previous_pcr0 == $prev "
+    "and (.previous_pcr0_attestation | length) > 0 "
+    "and .migration.state == \"none\" "
+    "and .migration.source_pcr0 == $current'"
+)
+assert served_leaf_sha(green_peer) == leaf_sha_before
+assert served_leaf_sha(green) == leaf_sha_before
+assert cert_etag() == cert_etag_before
+assert challenge_event_count() == challenge_events_before
+assert challenge_record_count(route53_zone_id) == 0
+
+for node in (green, green_peer):
+    status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
+    assert status == 0, out
+    for _ in range(5):
+        node.succeed(
+            "curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null; "
+            "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY >/dev/null; "
+            "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_OVERRIDE >/dev/null"
+        )
+    node.succeed(
+        "pids=''; for _ in $(seq 1 5); do "
+        "curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null & "
+        "pids=\"$pids $!\"; done; "
+        "for pid in $pids; do wait \"$pid\"; done"
+    )
+
+# Scale one node in while its peer remains live, then rejoin the same fleet.
 green.succeed("kill $(cat /run/enclave-qemu.pid)")
+green.wait_until_fails(
+    "curl --connect-timeout 1 --max-time 2 -skf https://127.0.0.1/health",
+    timeout=60,
+)
+wait_healthy(green_peer)
+assert secret_value(green_peer) == blue_secret
+assert served_leaf_sha(green_peer) == leaf_sha_before
+status, out = enclave_curl(green_peer, GREEN_PCR0, "/test/health")
+assert status == 0, out
+
 green.succeed("systemctl restart enclave-start")
 wait_healthy(green)
 assert served_leaf_sha(green) == leaf_sha_before
-status, out = enclave_curl(green, GREEN_PCR0)
+assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
+assert secret_value(green) == blue_secret
+assert cloud(
+    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+) == migration_key
+assert kms_key_count() == kms_keys_before
+assert cert_etag() == cert_etag_before
+assert challenge_event_count() == challenge_events_before
+assert challenge_record_count(route53_zone_id) == 0
+status, out = enclave_curl(green, GREEN_PCR0, "/test/health")
 assert status == 0, out
 
-wait_healthy(blue)
-wait_healthy(green)
+# Green and green_peer were checked immediately above. Recheck that their
+# kill/rejoin did not disturb the still-running blue fleet.
+for node in (blue, blue_peer, green, green_peer):
+    wait_healthy(node)
+for node in BLUES:
+    assert served_leaf_sha(node) == blue_leaf_sha
+    assert secret_value(node) == blue_secret

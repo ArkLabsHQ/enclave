@@ -3,6 +3,8 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -65,6 +67,7 @@ type migrator struct {
 	ssm           SSM
 	dek           DEK
 	staticSecrets []StaticSecret
+	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
 }
 
@@ -75,6 +78,7 @@ func NewMigrator(
 	s3 S3API,
 	dek DEK,
 	secrets []StaticSecret,
+	tlsKey crypto.Signer,
 	migrationIntentBucketName string,
 ) (Migrator, error) {
 	intent, err := newMigrationIntentLog(s3, nsm, migrationIntentBucketName)
@@ -87,6 +91,7 @@ func NewMigrator(
 		ssm:           ssm,
 		dek:           dek,
 		staticSecrets: secrets,
+		tlsKey:        tlsKey,
 		intent:        intent,
 	}, nil
 }
@@ -120,12 +125,17 @@ func (m *migrator) HandleMigrationRequest(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	sourcePCR0, err := m.sourcePCR0()
+	if err != nil {
+		return nil, err
+	}
+
 	var intentHead *migrationIntent
 	switch action {
 	case migrationIntentRequested:
-		intentHead, err = m.intent.Request(ctx, targetPCR0)
+		intentHead, err = m.intent.Request(ctx, sourcePCR0, targetPCR0)
 	case migrationIntentAborted:
-		intentHead, err = m.intent.Abort(ctx)
+		intentHead, err = m.intent.Abort(ctx, sourcePCR0)
 	default:
 		return nil, fmt.Errorf("unknown migration action %q", action)
 	}
@@ -140,18 +150,31 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 	if err != nil {
 		return nil, err
 	}
-	head, err := m.intent.Head(ctx)
+	sourcePCR0, err := m.sourcePCR0()
+	if err != nil {
+		return nil, err
+	}
+	head, err := m.intent.Head(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
 	status := migrationStatusAt(head, cooldown, time.Now())
 	if head == nil {
-		status.SourcePCR0, err = m.intent.sourcePCR0()
-		if err != nil {
-			return nil, err
-		}
+		status.SourcePCR0 = sourcePCR0
 	}
 	return status, nil
+}
+
+func (m *migrator) sourcePCR0() (string, error) {
+	pcr0, err := m.nsm.PCR0()
+	if err != nil {
+		return "", fmt.Errorf("read source PCR0: %w", err)
+	}
+	if len(pcr0) != 48 {
+		return "", fmt.Errorf("source PCR0 must be 48 bytes, got %d", len(pcr0))
+	}
+
+	return hex.EncodeToString(pcr0), nil
 }
 
 func migrationStatusAt(
@@ -249,7 +272,7 @@ func (m *migrator) CompleteMigration(
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
-	transitionSecrets := make([]persistedSecret, 0, len(m.staticSecrets))
+	transitionSecrets := make(map[StaticSecretMetadata]string, len(m.staticSecrets))
 	for _, secret := range m.staticSecrets {
 		secretBytes, err := hex.DecodeString(secret.Plaintext)
 		if err != nil {
@@ -274,16 +297,28 @@ func (m *migrator) CompleteMigration(
 		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
 			return nil, fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
 		}
-		transitionSecrets = append(transitionSecrets, persistedSecret{
-			metadata:   secret.StaticSecretMetadata,
-			ciphertext: ciphertextB64,
-		})
+		transitionSecrets[secret.StaticSecretMetadata] = ciphertextB64
 		exportedNames = append(exportedNames, secret.Name)
 	}
 
 	dekCiphertext, err := m.dek.ExportKey(ctx, migrationKMS, m.ssm)
 	if err != nil {
 		return nil, fmt.Errorf("DEK export failed: %w", err)
+	}
+	tlsKey, err := x509.MarshalPKCS8PrivateKey(m.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal TLS key: %w", err)
+	}
+	tlsKeyCiphertext, err := migrationKMS.Encrypt(ctx, tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-encrypt TLS key: %w", err)
+	}
+	if err := m.ssm.Set(
+		ctx,
+		tlsKeyCiphertextParam(migrationKMS.KeyID()),
+		tlsKeyCiphertext,
+	); err != nil {
+		return nil, fmt.Errorf("failed to store TLS key: %w", err)
 	}
 
 	attestDoc, _, err := m.nsm.BuildAttestationDocument()
@@ -313,10 +348,11 @@ func (m *migrator) CompleteMigration(
 		ctx,
 		m.nsm,
 		m.ssm,
-		persistedStateSnapshot{
+		bootSnapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
+			tlsKeyCiphertext:          tlsKeyCiphertext,
 			migrationIntentBucketName: m.intent.bucket,
 		},
 	); err != nil {

@@ -23,6 +23,16 @@ func TestSSMSetAndGet(t *testing.T) {
 	}
 }
 
+func TestSSMSetWithoutOverwrite(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeSSM{}
+	ssm := NewSSM(fake)
+
+	require.NoError(t, ssm.Set(ctx, "/app/key", "winner", WithoutOverwrite()))
+	require.Error(t, ssm.Set(ctx, "/app/key", "loser", WithoutOverwrite()))
+	require.Equal(t, "winner", fake.params["/app/key"])
+}
+
 func TestSSMGet(t *testing.T) {
 	ctx := context.Background()
 	ssm := NewSSM(&fakeSSM{params: map[string]string{

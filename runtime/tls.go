@@ -2,30 +2,25 @@ package runtime
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
+	"crypto"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
 )
 
 const (
-	acmeCertCacheDir = "cert-cache"
 	// acmeStagingDirectoryURL is Let's Encrypt's staging ACME endpoint — an
 	// untrusted root with high rate limits, used for testing.
 	acmeStagingDirectoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -36,7 +31,7 @@ const (
 type TLSCertCallback func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 // withDefaultSNI fills a missing server name so IP/loopback probes reach the
-// same cert source as named clients. autocert rejects an empty ServerName.
+// same cert source as named clients.
 func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
 	if fqdn == "" {
 		return next
@@ -51,30 +46,97 @@ func withDefaultSNI(fqdn string, next TLSCertCallback) TLSCertCallback {
 	}
 }
 
+// ConfigureTLS picks the certificate source: self-signed when ACME is off,
+// otherwise a fleet-shared certificate obtained via DNS-01.
+//
+// DNS-01 is the only supported challenge. tls-alpn-01 cannot survive a load
+// balancer — the CA's connection is hashed to an arbitrary target while only the
+// enclave that created the order holds the challenge certificate — so ACME
+// requires a Route53 hosted zone.
 func ConfigureTLS(
 	ctx context.Context,
 	cfg *Config,
 	s3 S3API,
 	dek DEK,
 	ssm SSM,
-	hashes AttestationHashes,
+	r53 Route53API,
+	tlsKey crypto.Signer,
+	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load TLS SSM overrides: %w", err)
 	}
 
 	if !cfg.UseACME {
-		return configureSelfSignedCert(cfg, hashes)
+		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
 	}
 
-	if !nitriding.InEnclave() {
-		return configureACME(cfg, autocert.DirCache(acmeCertCacheDir), hashes)
-	}
-	acmeCache, err := NewAcmeStorageCache(ctx, s3, dek, ssm)
+	zoneID, err := ssm.MayGet(ctx, route53ZoneIDParam())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create ACME cache: %w", err)
+		return nil, fmt.Errorf("failed to read Route53 zone ID: %w", err)
 	}
-	return configureACME(cfg, acmeCache, hashes)
+	if zoneID == "" {
+		// Fail rather than quietly serve self-signed: an operator who asked for
+		// ACME and silently got an untrusted certificate finds out from clients.
+		return nil, fmt.Errorf(
+			"ACME is enabled but %s is unset; DNS-01 is the only supported challenge "+
+				"and needs a Route53 hosted zone", route53ZoneIDParam(),
+		)
+	}
+	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, hashes)
+}
+
+func configureDNS01Cert(
+	ctx context.Context,
+	cfg *Config,
+	s3 S3API,
+	dek DEK,
+	ssm SSM,
+	r53 Route53API,
+	zoneID string,
+	tlsKey crypto.Signer,
+	hashes *AttestationHashes,
+) (TLSCertCallback, error) {
+	certBucket, err := ssm.MustGet(ctx, certBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
+	}
+	leaseBucket, err := ssm.MustGet(ctx, leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
+	}
+
+	store := newCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
+
+	accountKey, err := store.LoadOrCreateAccountKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client, err := acmeClientForDirectory(cfg.ACMEDirectory, cfg.ACMECA)
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		client = &acme.Client{DirectoryURL: acme.LetsEncryptURL}
+	}
+	client.Key = accountKey
+
+	issuer, err := newACMEIssuer(client, r53, zoneID, cfg.ACMEEmail)
+	if err != nil {
+		return nil, err
+	}
+
+	manager, err := newCertManager(
+		ctx, store, issuer,
+		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
+	}
+	go manager.Run(ctx)
+
+	slog.Info("serving fleet-shared certificate via DNS-01", "fqdn", cfg.FQDN, "zone", zoneID)
+	return manager.GetCertificate, nil
 }
 
 func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) error {
@@ -121,43 +183,58 @@ func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) er
 	return nil
 }
 
-func configureACME(
+// configureSelfSigned shares one self-signed certificate across the fleet, so a
+// client that pinned the leaf from any enclave reaches every other one.
+func configureSelfSigned(
+	ctx context.Context,
 	cfg *Config,
-	cache autocert.Cache,
-	hashes AttestationHashes,
+	s3 S3API,
+	dek DEK,
+	ssm SSM,
+	tlsKey crypto.Signer,
+	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	client, err := acmeClientForDirectory(cfg.ACMEDirectory, cfg.ACMECA)
+	certBucket, err := ssm.MayGet(ctx, certBucketParam())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
+	}
+	leaseBucket, err := ssm.MayGet(ctx, leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
+	}
+	if certBucket == "" || leaseBucket == "" {
+		return nil, fmt.Errorf(
+			"the shared certificate store needs both %s and %s",
+			certBucketParam(), leaseBucketParam(),
+		)
 	}
 
-	mgr := autocert.Manager{
-		Cache:      cache,
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.FQDN),
-		Email:      cfg.ACMEEmail,
-		Client:     client,
+	store := newSelfSignedCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
+	manager, err := newCertManager(
+		ctx, store, selfSignedIssuer{},
+		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
 	}
+	go manager.Run(ctx)
 
-	// Hash live ACME leaf; autocert may rotate it.
-	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		cert, err := mgr.GetCertificate(hello)
-		if err == nil && cert != nil && len(cert.Certificate) > 0 {
-			h := sha256.Sum256(cert.Certificate[0])
-			if hashes.SetTLSKeyHashIfChanged(h) {
-				slog.Info("TLS: bound attestation to ACME cert", "sha256", hex.EncodeToString(h[:]))
-			}
-		}
-		return cert, err
-	}, nil
+	slog.Info("serving fleet-shared self-signed certificate", "fqdn", cfg.FQDN)
+	return manager.GetCertificate, nil
 }
 
-// configureSelfSignedCert generates an ECDSA-P256 leaf cert, records its fingerprint
-// in the attestation hashes so clients can pin it against the NSM document
-func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCallback, error) {
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate cert key: %w", err)
+// selfSignedIssuer mints the certificate itself, for deployments with no public
+// CA. It satisfies certIssuer, so the shared store, the issuance lease and
+// renewal all behave exactly as they do for ACME.
+type selfSignedIssuer struct{}
+
+func (selfSignedIssuer) Issue(
+	_ context.Context,
+	domain string,
+	key crypto.Signer,
+) (certPEM []byte, err error) {
+	if key == nil {
+		return nil, fmt.Errorf("certificate key is required")
 	}
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
@@ -167,19 +244,25 @@ func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCall
 	template := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{Organization: []string{certificateOrg}},
-		DNSNames:              []string{cfg.FQDN},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(certificateValidity),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
+	// An endpoint addressed by IP needs the SAN to match, or nothing that checks
+	// the name — including our own store — will accept the certificate.
+	if ip := net.ParseIP(domain); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{domain}
+	}
 	derBytes, err := x509.CreateCertificate(
 		rand.Reader,
 		&template,
 		&template,
-		&privKey.PublicKey,
-		privKey,
+		key.Public(),
+		key,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create certificate: %w", err)
@@ -188,52 +271,7 @@ func configureSelfSignedCert(cfg *Config, hashes AttestationHashes) (TLSCertCall
 	if pemCert == nil {
 		return nil, fmt.Errorf("encode certificate to PEM")
 	}
-
-	leafFingerprint := func(raw []byte) ([sha256.Size]byte, error) {
-		for len(raw) > 0 {
-			var block *pem.Block
-			block, raw = pem.Decode(raw)
-			if block == nil {
-				return [sha256.Size]byte{}, fmt.Errorf("pem.Decode found no PEM data")
-			}
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				return [sha256.Size]byte{}, fmt.Errorf("parse certificate: %w", err)
-			}
-			if !cert.IsCA {
-				return sha256.Sum256(cert.Raw), nil
-			}
-		}
-		return [sha256.Size]byte{}, fmt.Errorf("no non-CA leaf certificate found in TLS chain")
-	}
-
-	h, err := leafFingerprint(pemCert)
-	if err != nil {
-		return nil, err
-	}
-	hashes.SetTLSKeyHash(h)
-
-	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("marshal private key: %w", err)
-	}
-
-	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
-	if pemKey == nil {
-		return nil, fmt.Errorf("encode private key to PEM")
-	}
-
-	cert, err := tls.X509KeyPair(pemCert, pemKey)
-	if err != nil {
-		return nil, fmt.Errorf("load X509 key pair: %w", err)
-	}
-
-	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		return &cert, nil
-	}, nil
+	return pemCert, nil
 }
 
 // acmeClientForDirectory builds a custom client for https:// dirs or staging.

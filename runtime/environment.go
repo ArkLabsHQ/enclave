@@ -123,6 +123,25 @@ func lockSegment() string {
 	return "unlocked"
 }
 
+// certBucketParam: SSM path for the bucket holding the fleet certificate and
+// the ACME account key.
+func certBucketParam() string {
+	return fmt.Sprintf("/%s/%s/CertBucketName", getDeployment(), getAppName())
+}
+
+// leaseBucketParam: SSM path for the bucket holding leases. Separate from the
+// certificate bucket: leases are ephemeral coordination objects, and nothing in
+// it survives losing the bucket.
+func leaseBucketParam() string {
+	return fmt.Sprintf("/%s/%s/LeaseBucketName", getDeployment(), getAppName())
+}
+
+// route53ZoneIDParam: SSM path for the hosted zone DNS-01 writes into. Required
+// whenever ACME is enabled.
+func route53ZoneIDParam() string {
+	return fmt.Sprintf("/%s/%s/Route53ZoneID", getDeployment(), getAppName())
+}
+
 // kmsKeyIDParam: SSM path for the primary KMS key ID, lock-scoped.
 func kmsKeyIDParam() string {
 	return fmt.Sprintf("/%s/%s/%s/KMSKeyID", getDeployment(), getAppName(), lockSegment())
@@ -231,6 +250,14 @@ func storageDEKCiphertextParam(keyID string) string {
 		getAppName(),
 		lockSegment(),
 		keyID,
+	)
+}
+
+// tlsKeyCiphertextParam returns the encrypted TLS key path.
+func tlsKeyCiphertextParam(keyID string) string {
+	return fmt.Sprintf(
+		"/%s/%s/%s/TLSKey/Ciphertext/%s",
+		getDeployment(), getAppName(), lockSegment(), keyID,
 	)
 }
 

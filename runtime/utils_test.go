@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -31,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -41,6 +41,16 @@ type fakeSSM struct {
 	err     error
 	putErrs map[string]error
 	calls   []string
+
+	// getSeq scripts successive reads of one parameter, for races that turn on
+	// a value changing between two reads. The i-th read returns the i-th entry;
+	// the last entry repeats. An empty entry reads as absent, as it would
+	// before anything committed the parameter.
+	getSeq map[string][]string
+
+	// beforePut fires just before a write lands, for races that turn on a peer
+	// winning a create-only claim inside our window.
+	beforePut func(name string)
 
 	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
 	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
@@ -66,7 +76,16 @@ func (f *fakeSSM) PutParameter(
 	if f.params == nil {
 		f.params = map[string]string{}
 	}
-	f.params[aws.ToString(in.Name)] = aws.ToString(in.Value)
+	name := aws.ToString(in.Name)
+	if f.beforePut != nil {
+		f.beforePut(name)
+	}
+	if !aws.ToBool(in.Overwrite) {
+		if _, exists := f.params[name]; exists {
+			return nil, &ssmtypes.ParameterAlreadyExists{}
+		}
+	}
+	f.params[name] = aws.ToString(in.Value)
 	return &ssm.PutParameterOutput{}, nil
 }
 
@@ -81,6 +100,12 @@ func (f *fakeSSM) GetParameter(
 		return nil, f.err
 	}
 	v, ok := f.params[name]
+	if seq, scripted := f.getSeq[name]; scripted && len(seq) > 0 {
+		v, ok = seq[0], seq[0] != ""
+		if len(seq) > 1 {
+			f.getSeq[name] = seq[1:]
+		}
+	}
 	if !ok {
 		return nil, &ssmtypes.ParameterNotFound{}
 	}
@@ -141,12 +166,21 @@ func (f *fakeSSM) GetParametersByPath(
 	return &ssm.GetParametersByPathOutput{Parameters: out}, nil
 }
 
-func (f *fakeSSM) Set(_ context.Context, key, val string, _ ...SSMSetOption) error {
+func (f *fakeSSM) Set(_ context.Context, key, val string, opts ...SSMSetOption) error {
 	if f.err != nil {
 		return f.err
 	}
 	if f.params == nil {
 		f.params = map[string]string{}
+	}
+	so := &SSMSetOptions{overwrite: true}
+	for _, opt := range opts {
+		opt(so)
+	}
+	if !so.overwrite {
+		if _, exists := f.params[key]; exists {
+			return fmt.Errorf("parameter %s already exists", key)
+		}
 	}
 	f.params[key] = val
 	return nil
@@ -187,6 +221,8 @@ func (f *fakeSSM) ListParams(_ context.Context, prefix string) ([]Param, error) 
 	return out, nil
 }
 
+const fakeSTSAccountID = "123456789012"
+
 type fakeSTS struct {
 	arn string
 	err error
@@ -202,9 +238,12 @@ func (f *fakeSTS) GetCallerIdentity(
 	}
 	arn := f.arn
 	if arn == "" {
-		arn = "arn:aws:iam::123456789012:role/enclave"
+		arn = "arn:aws:iam::" + fakeSTSAccountID + ":role/enclave"
 	}
-	return &sts.GetCallerIdentityOutput{Arn: aws.String(arn)}, nil
+	return &sts.GetCallerIdentityOutput{
+		Arn:     aws.String(arn),
+		Account: aws.String(fakeSTSAccountID),
+	}, nil
 }
 
 type fakeKMS struct {
@@ -471,6 +510,7 @@ func fakeKMSRSAPublicKey(attestationDoc []byte) (*rsa.PublicKey, error) {
 
 type fakeS3Object struct {
 	id           string
+	etag         string
 	body         []byte
 	lockMode     s3types.ObjectLockMode
 	retainUntil  time.Time
@@ -487,6 +527,16 @@ type fakeS3 struct {
 	readErr          error
 	putErr           error
 	missingVersionID bool
+
+	// putConflicts makes the next N conditional writes fail with S3's retryable 409.
+	putConflicts int
+
+	// beforePut fires just before a write is evaluated, so a test can change the
+	// object out from under the condition the caller is about to apply.
+	beforePut func(key string)
+
+	// getMissing simulates an object disappearing between HeadObject and GetObject.
+	getMissing map[string]bool
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]fakeS3Object{}} }
@@ -584,46 +634,114 @@ func stringValue(value string) *commonpb.AnyValue {
 }
 
 func (f *fakeS3) PutObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.PutObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.putErr != nil {
 		return nil, f.putErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	key := aws.ToString(in.Key)
+	if f.beforePut != nil {
+		// Runs holding f.mu, for races that turn on the object changing between
+		// a read and the conditional write that follows it.
+		f.beforePut(key)
+	}
+	conditional := in.IfNoneMatch != nil || in.IfMatch != nil
+	if conditional && f.putConflicts > 0 {
+		f.putConflicts--
+		return nil, conditionalRequestConflict()
+	}
+	if err := f.checkConditions(key, in.IfMatch, in.IfNoneMatch); err != nil {
+		return nil, err
+	}
 	body, _ := io.ReadAll(in.Body)
 	f.seq++
 	id := strconv.Itoa(f.seq)
-	key := aws.ToString(in.Key)
+	etag := fmt.Sprintf("%q", "etag-"+id)
 	f.objects[key] = append(
 		f.objects[key],
 		fakeS3Object{
 			id:           id,
+			etag:         etag,
 			body:         body,
 			lockMode:     in.ObjectLockMode,
 			retainUntil:  aws.ToTime(in.ObjectLockRetainUntilDate),
 			lastModified: time.Now().UTC(),
 		},
 	)
-	out := &s3.PutObjectOutput{VersionId: aws.String(id)}
+	out := &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
 	if f.missingVersionID {
 		out.VersionId = nil
 	}
 	return out, nil
 }
 
+// checkConditions mirrors S3's If-Match / If-None-Match evaluation against the
+// current object. Caller holds f.mu.
+func (f *fakeS3) checkConditions(key string, ifMatch, ifNoneMatch *string) error {
+	cur, exists := f.currentLocked(key)
+	if ifNoneMatch != nil {
+		if *ifNoneMatch == "*" && exists {
+			return preconditionFailed()
+		}
+		if *ifNoneMatch != "*" && exists && cur.etag == *ifNoneMatch {
+			return preconditionFailed()
+		}
+	}
+	if ifMatch != nil {
+		// S3 answers a conditional write against a missing object with 404, not
+		// 412: a concurrent delete is a different event from a peer's write.
+		if !exists {
+			return &s3types.NoSuchKey{}
+		}
+		if cur.etag != *ifMatch {
+			return preconditionFailed()
+		}
+	}
+	return nil
+}
+
+func (f *fakeS3) currentLocked(key string) (fakeS3Object, bool) {
+	objects := f.objects[key]
+	if len(objects) == 0 {
+		return fakeS3Object{}, false
+	}
+	return objects[len(objects)-1], true
+}
+
+func preconditionFailed() error {
+	return &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "precondition failed"}
+}
+
+func conditionalRequestConflict() error {
+	return &smithy.GenericAPIError{
+		Code:    "ConditionalRequestConflict",
+		Message: "conditional request conflict",
+	}
+}
+
 func (f *fakeS3) GetObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.GetObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.GetObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getMissing[aws.ToString(in.Key)] {
+		return nil, &s3types.NoSuchKey{}
+	}
 	objects := f.objects[aws.ToString(in.Key)]
 	for i := len(objects) - 1; i >= 0; i-- {
 		if in.VersionId == nil || objects[i].id == aws.ToString(in.VersionId) {
@@ -631,17 +749,43 @@ func (f *fakeS3) GetObject(
 			if f.readErr != nil {
 				body = io.NopCloser(iotest.ErrReader(f.readErr))
 			}
-			return &s3.GetObjectOutput{Body: body}, nil
+			return &s3.GetObjectOutput{Body: body, ETag: aws.String(objects[i].etag)}, nil
 		}
 	}
 	return nil, &s3types.NoSuchKey{}
 }
 
+func (f *fakeS3) HeadObject(
+	ctx context.Context,
+	in *s3.HeadObjectInput,
+	_ ...func(*s3.Options),
+) (*s3.HeadObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.currentLocked(aws.ToString(in.Key))
+	if !ok {
+		return nil, &s3types.NotFound{}
+	}
+	return &s3.HeadObjectOutput{
+		ETag:          aws.String(cur.etag),
+		ContentLength: aws.Int64(int64(len(cur.body))),
+	}, nil
+}
+
 func (f *fakeS3) ListObjectVersions(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.ListObjectVersionsInput,
 	_ ...func(*s3.Options),
 ) (*s3.ListObjectVersionsOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -677,13 +821,21 @@ func (f *fakeS3) ListObjectsV2(
 }
 
 func (f *fakeS3) DeleteObject(
-	_ context.Context,
+	ctx context.Context,
 	in *s3.DeleteObjectInput,
 	_ ...func(*s3.Options),
 ) (*s3.DeleteObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := aws.ToString(in.Key)
+	if in.IfMatch != nil {
+		if err := f.checkConditions(key, in.IfMatch, nil); err != nil {
+			return nil, err
+		}
+	}
 	objects := f.objects[key]
 	if len(objects) == 0 {
 		return &s3.DeleteObjectOutput{}, nil
@@ -729,11 +881,23 @@ func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq++
+	id := strconv.Itoa(f.seq)
 	f.objects[key] = append(f.objects[key], fakeS3Object{
-		id:           strconv.Itoa(f.seq),
+		id:           id,
+		etag:         fmt.Sprintf("%q", "etag-"+id),
 		body:         body,
 		lastModified: lastModified,
 	})
+}
+
+func (f *fakeS3) currentETag(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.currentLocked(key)
+	if !ok {
+		return ""
+	}
+	return cur.etag
 }
 
 func (f *fakeS3) latestBody(key string) []byte {
@@ -780,9 +944,4 @@ func TestFakeS3DeleteObjectRespectsCompliance(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "x", string(got))
-}
-
-func isNoSuchKey(err error) bool {
-	var noSuchKey *s3types.NoSuchKey
-	return errors.As(err, &noSuchKey)
 }

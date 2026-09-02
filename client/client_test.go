@@ -26,7 +26,7 @@ func TestPinnedHTTPClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sum := sha256.Sum256(srv.Certificate().Raw)
+	sum := sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
 	goodHash := hex.EncodeToString(sum[:])
 
 	// Match → handler runs.
@@ -42,7 +42,7 @@ func TestPinnedHTTPClient(t *testing.T) {
 	bad, err := PinnedHTTPClient(strings.Repeat("cd", 32), false)
 	require.NoError(t, err)
 	_, err = bad.Get(srv.URL)
-	require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
+	require.ErrorContains(t, err, "TLS public-key fingerprint mismatch")
 	require.False(t, reached, "handler must not run when the pin fails")
 }
 
@@ -62,12 +62,6 @@ func (f *fakeEnclave) handler() http.Handler {
 			nonce, _ := hex.DecodeString(nonceHex)
 			pcr0, _ := hex.DecodeString(f.pcr0Hex)
 			ud := append([]byte("sha256:"), f.attestedTLS[:]...)
-			ud = append(ud, ';')
-			ud = append(ud, []byte("sha256:")...)
-			ud = append(
-				ud,
-				make([]byte, 32)...,
-			) // attestation signing key hash all-zero (unregistered)
 			_, _ = w.Write([]byte(buildInsecureCOSEDoc(nitrite.Document{
 				PCRs:     map[uint][]byte{0: pcr0},
 				Nonce:    nonce,
@@ -105,38 +99,19 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		fe := &fakeEnclave{pcr0Hex: pcr0}
 		srv := httptest.NewTLSServer(fe.handler())
 		defer srv.Close()
-		fe.attestedTLS = sha256.Sum256(srv.Certificate().Raw) // attest the real cert
+		fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
 
 		c, err := New(
 			srv.URL,
-			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
+			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true},
 		)
 		require.NoError(t, err)
 		resp, err := c.Get(context.Background(), "/enclave/v1/info")
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
-	})
-
-	t.Run("strict default vs SkipKeyBinding (no signing key registered)", func(t *testing.T) {
-		fe := &fakeEnclave{pcr0Hex: pcr0} // handler serves an all-zero signing-key hash
-		srv := httptest.NewTLSServer(fe.handler())
-		defer srv.Close()
-		fe.attestedTLS = sha256.Sum256(srv.Certificate().Raw) // pin matches
-
-		// Strict default: a missing signing key is a hard failure (no silent skip).
-		strict, err := New(srv.URL, Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true})
-		require.NoError(t, err)
-		_, err = strict.Get(context.Background(), "/enclave/v1/info")
-		require.ErrorContains(t, err, "attestation key not yet registered")
-
-		// Explicit PCR0 + pin only: proceeds (this is curl's mode).
-		lite, err := New(
-			srv.URL,
-			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
-		)
-		require.NoError(t, err)
-		_, err = lite.Get(context.Background(), "/enclave/v1/info")
-		require.NoError(t, err)
+		fe.mu.Lock()
+		defer fe.mu.Unlock()
+		require.Equal(t, []string{"/enclave/v1/info"}, fe.appPaths)
 	})
 
 	t.Run("mismatch → fail closed, no app request sent", func(t *testing.T) {
@@ -150,11 +125,11 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 
 		c, err := New(
 			srv.URL,
-			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SkipKeyBinding: true},
+			Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true},
 		)
 		require.NoError(t, err)
 		_, err = c.Get(context.Background(), "/enclave/v1/info")
-		require.ErrorContains(t, err, "TLS cert fingerprint mismatch")
+		require.ErrorContains(t, err, "TLS public-key fingerprint mismatch")
 		fe.mu.Lock()
 		defer fe.mu.Unlock()
 		require.Empty(t, fe.appPaths, "no app request must be sent on a pin mismatch")

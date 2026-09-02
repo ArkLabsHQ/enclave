@@ -28,7 +28,8 @@ type SSM interface {
 }
 
 type SSMSetOptions struct {
-	tier ssmtypes.ParameterTier
+	tier      ssmtypes.ParameterTier
+	overwrite bool
 }
 
 type SSMSetOption func(*SSMSetOptions)
@@ -39,12 +40,18 @@ func WithAdvancedTier() SSMSetOption {
 	}
 }
 
+func WithoutOverwrite() SSMSetOption {
+	return func(so *SSMSetOptions) {
+		so.overwrite = false
+	}
+}
+
 func NewSSM(ssm SSMAPI) SSM {
 	return &ssmW{ssm: ssm}
 }
 
 func (s *ssmW) Set(ctx context.Context, key, val string, opts ...SSMSetOption) error {
-	so := &SSMSetOptions{tier: ssmtypes.ParameterTierStandard}
+	so := &SSMSetOptions{tier: ssmtypes.ParameterTierStandard, overwrite: true}
 
 	for _, opt := range opts {
 		opt(so)
@@ -54,7 +61,7 @@ func (s *ssmW) Set(ctx context.Context, key, val string, opts ...SSMSetOption) e
 		Name:      aws.String(key),
 		Value:     aws.String(val),
 		Type:      ssmtypes.ParameterTypeString,
-		Overwrite: aws.Bool(true),
+		Overwrite: aws.Bool(so.overwrite),
 		Tier:      so.tier,
 	}); err != nil {
 		return fmt.Errorf("ssm put-parameter %s: %w", key, err)

@@ -74,7 +74,7 @@ func simulateDrift(cs *clockSyncer, d drift) driftResult {
 			}
 		}
 		fTotal := d.nativeDriftPpm + appliedSim
-		trueOffsetNs += -(fTotal) * nsPerPpmPerSec * interval
+		trueOffsetNs += -fTotal * nsPerPpmPerSec * interval
 		xMonoNs += int64(interval * nsPerSecond)
 	}
 	res.applied, res.integral, res.offsetNs, res.integralSpread = appliedSim, cs.integralPpm, trueOffsetNs, maxI-minI

@@ -151,25 +151,33 @@ under a KMS key that only the measured enclave can use.
 - Each static secret is committed to a PCR: secret *i* extends PCR(16+i), which
   is then locked. The secrets are therefore part of the enclave's measurement
   from the point of generation onward.
-- `/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is written last, both at
-  genesis and at migration finalisation. It is the atomic commit point: its
-  value selects which generation of ciphertexts is live. It must never be
-  managed by deployment tooling.
+- At genesis, an immutable, attested `deployment-genesis` object naming the
+  creating enclave's PCR0 is the final commit record. Before writing it, genesis
+  claims the SSM `KMSKeyID` with a create-only write.
+- Genesis is not a migration intent. It shares the bucket with the migration
+  intent log and nothing else: it is deployment-wide rather than scoped to one
+  PCR0, it never forms a sequence, and it is written once and never revised.
 
 ### Boot paths
 
-On startup the runtime reads SSM and selects one of three paths.
+Whether a deployment already exists is decided by the Object-Locked
+`deployment-genesis` object, not by SSM alone. That key is fixed and
+identity-independent, so any enclave's genesis vetoes every later one. The
+preceding create-only SSM write prevents two enclaves from claiming
+different keys even if a lease expires between verification and commit.
 
 | Condition | Path | Behaviour |
 |---|---|---|
-| `KMSKeyID` absent, empty, or `UNSET` | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis` and no predecessor artifacts. Creates the key, generates the DEK and secrets, writes a state-origin receipt, then commits `KMSKeyID`. |
+| genesis intent and `KMSKeyID` absent | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis` and no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID` without overwrite, then conditionally creates the immutable genesis intent. |
 | `KMSKeyID` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
 | `KMSKeyID` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
+| genesis intent present, `KMSKeyID` absent | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
+| genesis intent absent, `KMSKeyID` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
 Boot order is fixed and every step is fatal: clock synchronisation against
-`/dev/ptp0`, networking, AWS clients, telemetry, attestation signer, HTTP
-servers, state establishment, PCR extension, migration control server, TLS, SSM
-environment overlay, static secret export, then exec of the application.
+`/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
+establishment, PCR extension, migration control server, TLS, SSM environment
+overlay, static secret export, then exec of the application.
 
 ## Nix API
 
@@ -339,8 +347,9 @@ the application:
 | `ENCLAVE_NITRIDING_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_NITRIDING_ACME_CA` | PEM CA bundle for a private ACME server. |
 
-With ACME enabled the certificate cache is stored in the TLS cache bucket,
-encrypted under the storage DEK.
+The TLS key is generated at genesis, encrypted with KMS, and included in the
+state root. Renewed certificates reuse it. The certificate bucket stores the
+certificate and, when ACME is enabled, the ACME account key.
 
 ### Application process environment
 
@@ -363,11 +372,12 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 | Path | Written by | Purpose |
 |---|---|---|
-| `/D/A/TLSCacheBucketName` | operator | ACME certificate cache bucket. |
-| `/D/A/MigrationIntentBucketName` | operator | Object-Locked intent log bucket. |
+| `/D/A/CertBucketName` | operator | Shared certificate and ACME account-key bucket. |
+| `/D/A/LeaseBucketName` | operator | Ephemeral coordination lease bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
 | `/D/A/L/KMSKeyID` | runtime | Atomic commit point. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
+| `/D/A/L/TLSKey/Ciphertext/<keyID>` | runtime | Encrypted TLS key. |
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
 | `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
@@ -378,16 +388,15 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 ### External listener, TCP :443
 
-TLS 1.2 minimum. Every non-gRPC response carries `X-Attestation-Signature` and
-`X-Attestation-Pubkey`, a BIP-340 Schnorr signature over the SHA-256 of the
-response body. `/enclave/*` responses also carry permissive CORS headers, and
-an `OPTIONS` preflight to any path in that namespace is answered `204` by the
-runtime.
+TLS 1.2 minimum. HTTP and gRPC clients authenticate the enclave by verifying its
+PCRs and pinning the live TLS public key to the PublicKey hash in the attestation document.
+`/enclave/*` responses also carry permissive CORS headers, and an `OPTIONS`
+preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. |
-| GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. |
+| GET | `/enclave/v1/info` | none | Version, PCR0, predecessor PCR0 and attestation, migration status, application status. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | GET | `/enclave/v1/metrics` | none | Metric snapshot. |
 | GET | `/enclave/v1/logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
@@ -454,22 +463,30 @@ interfaces.
 
 ### AWS requirements
 
-Create a private S3 bucket for the ACME cache and a separate private S3 bucket
-for migration intents. The intent bucket must have versioning and Object Lock
-enabled when it is created; the runtime applies retention to each intent object.
-Write their names to these SSM parameters:
+Create a private S3 bucket for shared certificate state and write its name to
+`/<deployment>/<app>/CertBucketName`. Create a separate private S3 bucket for
+ephemeral coordination leases and write its name to
+`/<deployment>/<app>/LeaseBucketName`.
+
+The migration intent bucket is **not** configured. Its name is derived, so no
+parameter a host can rewrite decides where deployment state is looked for:
 
 ```text
-/<deployment>/<app>/TLSCacheBucketName
-/<deployment>/<app>/MigrationIntentBucketName
+enclave-<account-id>-<sha256(deployment \x00 app)[:8]>-migration-intents
 ```
+
+Provisioning must create exactly that bucket, with versioning and Object Lock
+enabled at creation, before the enclave first boots; the runtime only reads and
+writes it. The digest keeps its name inside S3's 63-character limit and its
+character rules whatever the deployment and application are called, and the
+account ID keeps two AWS accounts off the same globally unique name.
 
 AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
-| `S3TLSCacheReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the TLS cache bucket. |
-| `S3MigrationIntentLogObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the intent log bucket. |
+| `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
+| `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`. |
 | `STSAccess` | `GetCallerIdentity`. |
@@ -481,8 +498,9 @@ policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
 `/<deployment>/<app>/<locked|unlocked>/KMSKeyID` is owned exclusively by the
-runtime. Do not pre-create or declaratively manage it: absence selects genesis,
-and the runtime writes it last to commit genesis and migration transitions.
+runtime. Do not pre-create or declaratively manage it. Genesis claims it
+create-only, immediately before writing the `deployment-genesis` object;
+migration finalisation writes it last, as the atomic commit.
 
 ## Blue/green migration
 
@@ -550,7 +568,7 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, TLS pin, key binding, and response signature are still verified. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
@@ -564,8 +582,8 @@ enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 ```
 
-The CLI exits non-zero if the response signature is missing or invalid, and if
-the HTTP status is 400 or above.
+The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
+status is 400 or above.
 
 ### Go client
 
@@ -586,11 +604,6 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Do, Get, and Post report signature failure through this field rather than
-// returning an error. Callers must check it.
-if !resp.SignatureVerified {
-    log.Fatal("enclave response signature missing or invalid")
-}
 if resp.StatusCode >= 400 {
     log.Fatalf("HTTP %d: %s", resp.StatusCode, resp.Body)
 }
@@ -606,7 +619,6 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
-| `SkipKeyBinding` | `false` | Skips signing-key binding, and therefore response signature verification. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
 | `InsecureTLS` | unset | Removes the certificate pin entirely. |
 
@@ -617,19 +629,16 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| TLS leaf certificate SHA-256 matches the value in the attestation `user_data` | on | `InsecureTLS` |
+| `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
-| Attestation public key hashes to the `user_data` signing key hash | on | `SkipKeyBinding` |
-| Per-response Schnorr signature over the body | on | `SkipKeyBinding` |
 
 The certificate pin is installed from the attestation document before any
 request carrying data is made, so a request issued before verification completes
 fails closed.
 
-`GRPCConn` pins the leaf certificate but does not perform public CA validation
-and carries no per-response signature, because gRPC bypasses the response
-signing middleware. Applications serving gRPC must set
+`GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
+but does not perform public CA validation. Applications serving gRPC must set
 `ENCLAVE_NITRIDING_UPSTREAM=h2c`.
 
 ## Testing
@@ -743,15 +752,48 @@ overridden from SSM.
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is
 running, not that it is running your code.
 
-**Callers must check `Response.SignatureVerified`.** `Get`, `Post`, and `Do`
-return successfully when the response signature is absent or invalid, and report
-it through that field. The CLI treats it as a fatal error; library consumers
-should do the same.
+**HTTP and gRPC trust the attested TLS channel.** The client verifies the Nitro
+attestation and PCRs before sending application requests, then pins the live TLS
+leaf to the exact hash carried in `user_data`.
 
-**Never manage `KMSKeyID` with deployment tooling.** Its absence selects the
-genesis path, and the runtime rewrites it as the final step of every state
-transition. A declaratively managed value would fight the runtime and could roll
-a live deployment back to a key that no longer decrypts anything.
+**Never manage `KMSKeyID` with deployment tooling.** Migration finalisation
+rewrites it as its atomic commit, and genesis claims it create-only. A
+declaratively managed value would fight the runtime and could roll a live
+deployment back to a key that no longer decrypts anything. Once the
+`deployment-genesis` object exists, deleting the parameter cannot fork the
+state — the boot fails instead of creating a second generation — but it still
+stops the deployment booting until it is restored. Genesis claims the parameter
+before writing that object, so a crash between the two leaves a window in which
+deleting the parameter does re-open genesis.
+
+**Genesis is committed exactly once.** Every contender first performs a
+create-only SSM key claim. Only that winner writes the `deployment-genesis`
+object, itself a create-only put under Object Lock, so a second write is
+rejected rather than layered on top. Its attestation binds the creating
+enclave's PCR0 and the bucket. Boot lists that one key's versions rather than
+reading it directly, because Object Lock cannot stop a delete marker hiding the
+object, and it reads them unverified: a record it cannot verify still vetoes a
+genesis, because treating it as absent would fail open. The contents are
+therefore advisory — presence is the only thing boot trusts.
+
+**The intent bucket is on the boot path.** An unreachable or unwritable bucket
+now fails the boot rather than only blocking migration. That is the intended
+trade: an enclave that cannot check whether the deployment exists must not guess.
+
+**Seed the genesis object before adopting this on any existing deployment.** No
+runtime before this change wrote one, so *every* deployment created earlier
+lacks it — migrated or not. Create the derived bucket and write a
+`deployment-genesis` object naming the running PCR0 into it before upgrading.
+Without the bucket the boot fails reading the store; with an empty one it
+reaches the genesis path, finds its committed `KMSKeyID`, and fails there.
+
+Existing intent records cannot be carried across. Each record's `bucket_name` is
+part of its attested pre-image, so one copied into the derived bucket no longer
+verifies and is skipped without an error — migration history restarts. The seeded
+record is unverifiable for the same reason, since only an enclave of that PCR0
+could sign one. That is enough for the genesis check, which is unverified by
+design, but the record never appears as a migration head, so the first real
+handoff is written at sequence 1 beside it.
 
 **Host credentials cannot read enclave state.** They grant `kms:CreateKey` but
 not `Decrypt`, `Encrypt`, or `GenerateDataKey`. Those are authorised by the

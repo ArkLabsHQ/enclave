@@ -15,14 +15,12 @@
     let
       enclaveSystems = [
         "x86_64-linux"
-        "aarch64-linux"
       ];
 
       allSystems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
-        "x86_64-darwin"
       ];
 
       forSystems =
@@ -46,7 +44,7 @@
                 version = "0.1.0";
                 src = ./runtime;
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-8bNEo1h22hmnzttU49QzHQslt/WnrDqTf1LRgwd1eN4=";
+                vendorHash = "sha256-npi7g0YtHbxtOeYHOQ8aExneTUU65jsWYCpFrS51hxU=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -67,7 +65,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-/LPCpvpa1869AaFWPQAZNOmdIFPe8ZoQqLHwPXcifcA=";
+                  vendorHash = "sha256-UpYTFzOGPnETUaftmz0SwC/gDKbeUWj5zeYULCAsyf8=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"
@@ -75,6 +73,10 @@
                   ldflags = [
                     "-X main.Version=${finalAttrs.version}"
                   ];
+
+                  # subPackages installs cmd/enclave as bin/enclave, but nix run derives
+                  # the program name from pname and would look for bin/enclave-cli.
+                  meta.mainProgram = "enclave";
                 });
                 default = self.packages.${system}.cli;
               }

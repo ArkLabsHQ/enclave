@@ -2,75 +2,46 @@ package runtime
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"testing"
 
-	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/stretchr/testify/require"
 )
 
-func TestAttestationHashes(t *testing.T) {
+func TestAttestationUserData(t *testing.T) {
 	t.Run("zero value serializes fixed user_data format", func(t *testing.T) {
-		h := NewAttestationHashes()
+		h := &AttestationHashes{}
 
 		var zero [sha256.Size]byte
 		want := append([]byte(hashPrefix), zero[:]...)
-		want = append(want, hashSeparator...)
-		want = append(want, hashPrefix...)
-		want = append(want, zero[:]...)
 
 		require.Equal(t, want, h.Serialize())
 	})
 
-	t.Run("set hashes serialize exact raw bytes", func(t *testing.T) {
-		h := NewAttestationHashes()
-		var tlsHash, signingHash [sha256.Size]byte
+	t.Run("set hash serializes exact raw bytes", func(t *testing.T) {
+		h := &AttestationHashes{}
+		var tlsHash [sha256.Size]byte
 		for i := range tlsHash {
 			tlsHash[i] = byte(i)
-			signingHash[i] = byte(sha256.Size - i)
 		}
 
-		h.SetTLSKeyHash(tlsHash)
-		h.SetSigningKeyHash(signingHash)
+		h.SetTLSKeyHashSource(staticKeyHash(tlsHash))
 
 		want := append([]byte(hashPrefix), tlsHash[:]...)
-		want = append(want, hashSeparator...)
-		want = append(want, hashPrefix...)
-		want = append(want, signingHash[:]...)
 
 		require.Equal(t, want, h.Serialize())
 	})
 
-	t.Run("SetTLSKeyHashIfChanged returns true false true", func(t *testing.T) {
-		h := NewAttestationHashes()
-		one := sha256.Sum256([]byte("one"))
-		two := sha256.Sum256([]byte("two"))
+	// The wire format is fixed-width and clients slice it by offset, so its
+	// length is part of the contract.
+	t.Run("user_data is 39 bytes", func(t *testing.T) {
+		h := &AttestationHashes{}
+		h.SetTLSKeyHashSource(staticKeyHash(sha256.Sum256([]byte("leaf"))))
 
-		require.True(t, h.SetTLSKeyHashIfChanged(one))
-		require.False(t, h.SetTLSKeyHashIfChanged(one))
-		require.True(t, h.SetTLSKeyHashIfChanged(two))
+		require.Len(t, h.Serialize(), 39)
 	})
 }
 
-func TestAttestationSigner(t *testing.T) {
-	signer, err := NewAttestedSigner()
-	require.NoError(t, err)
-
-	pubkeyBytes, err := hex.DecodeString(signer.Pubkey())
-	require.NoError(t, err)
-	require.Len(t, pubkeyBytes, 33)
-
-	pubkey, err := btcec.ParsePubKey(pubkeyBytes)
-	require.NoError(t, err)
-	require.Equal(t, sha256.Sum256(pubkeyBytes), signer.PubkeyHash())
-
-	body := []byte("attested response")
-	sigBytes, err := hex.DecodeString(signer.Sign(body))
-	require.NoError(t, err)
-	sig, err := schnorr.ParseSignature(sigBytes)
-	require.NoError(t, err)
-
-	bodyHash := sha256.Sum256(body)
-	require.True(t, sig.Verify(bodyHash[:], pubkey))
+// staticKeyHash is the source for a certificate that never changes.
+func staticKeyHash(h [sha256.Size]byte) TLSKeyHashFunc {
+	return func() ([sha256.Size]byte, bool) { return h, true }
 }

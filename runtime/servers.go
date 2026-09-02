@@ -3,7 +3,6 @@ package runtime
 // servers.go wires public/private muxes, admin handlers, reverse proxy, and listeners.
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -11,12 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -26,11 +23,12 @@ import (
 )
 
 const (
-	indexPage                 = "This host runs inside an AWS Nitro Enclave.\n"
 	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
 	migrationControlPort      = 8003
 	migrationRequestPath      = "/request-migration"
 	migrationFinalisationPath = "/finalise-migration"
+	enclavePrefix             = "/enclave/"
+	externalRuntimeV1Prefix   = enclavePrefix + "v1/"
 )
 
 var (
@@ -53,10 +51,10 @@ type servers struct {
 	ext     *http.Server
 	int     *http.Server
 	sm      *http.ServeMux
+	rm      *http.ServeMux
 	im      *http.ServeMux
 	em      *http.ServeMux
 	rt      RuntimeState
-	signer  AttestedSigner
 	metrics *Metrics
 }
 
@@ -65,13 +63,11 @@ func SetupHttpServers(
 	cfg Config,
 	nsm NSM,
 	telemetry *Telemetry,
-	signer AttestedSigner,
-	hashes AttestationHashes,
+	hashes *AttestationHashes,
 	authToken string,
 ) Servers {
 	metrics := telemetry.Metrics
 	metricsMW := metricsMiddleware(metrics)
-	attestationMW := responseSignerMiddleware(signer)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -90,16 +86,16 @@ func SetupHttpServers(
 	}
 
 	sm := http.NewServeMux()
-	sm.HandleFunc("POST /v1/metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
+	registerRuntimeV1Handlers(sm, "/v1/", telemetry, authToken)
 	sm.Handle("GET /health", healthHandler(rt))
-	sm.HandleFunc("POST /v1/logs", withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)))
-	sm.HandleFunc("POST /v1/traces", withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)))
+
+	rm := http.NewServeMux()
+	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, telemetry, authToken)
+	rm.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 
 	em := http.NewServeMux()
-	em.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
-	em.HandleFunc("GET /enclave", rootHandler(cfg))
-	em.HandleFunc("GET /enclave/config", configHandler(cfg))
-	em.Handle("/v1/", corsWildcard(sm))
+	em.Handle(enclavePrefix, corsWildcard(rm))
+
 	em.Handle("/health", sm)
 	em.Handle("/", revProxy)
 
@@ -108,33 +104,52 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMW(attestationMW(em)),
+		Handler: metricsMW(em),
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
-			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
-	}
-
-	if cfg.DisableKeepAlives {
-		ext.SetKeepAlivesEnabled(false)
 	}
 
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
-		Handler: metricsMW(attestationMW(im)),
+		Handler: metricsMW(im),
 	}
 
 	return &servers{
 		ext:     ext,
 		int:     int,
 		sm:      sm,
+		rm:      rm,
 		em:      em,
 		im:      im,
 		rt:      rt,
-		signer:  signer,
 		metrics: metrics,
 	}
+}
+
+// registerRuntimeV1Handlers mounts the OTLP ingest endpoints under prefix. Ingest
+// only: the runtime ships telemetry to CloudWatch and never reads it back, so a
+// compromised enclave has no history to serve.
+func registerRuntimeV1Handlers(
+	mux *http.ServeMux,
+	prefix string,
+	telemetry *Telemetry,
+	authToken string,
+) {
+	mux.HandleFunc(
+		"POST "+prefix+"metrics",
+		withTokenAuth(authToken, HandleMetricPost(telemetry.Metrics)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"logs",
+		withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"traces",
+		withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)),
+	)
 }
 
 func (s *servers) Start(ctx context.Context, cfg Config) error {
@@ -175,12 +190,11 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// RuntimeInfo is the JSON body returned by GET /v1/enclave-info.
+// RuntimeInfo is the JSON body returned by GET /enclave/v1/info.
 type RuntimeInfo struct {
 	Version                  string           `json:"version"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
-	AttestationPubkey        string           `json:"attestation_pubkey,omitempty"`
 	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
 	Migration                *MigrationStatus `json:"migration"`
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
@@ -192,7 +206,7 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	migrator Migrator,
 	ssm SSM,
 ) error {
-	s.em.HandleFunc("GET /v1/enclave-info", func(w http.ResponseWriter, r *http.Request) {
+	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		migrationStatus, err := migrator.MigrationStatus(r.Context())
@@ -219,7 +233,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			Version:                  Version,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
-			AttestationPubkey:        s.signer.Pubkey(),
 			MigrationCooldownSeconds: int(cooldown.Seconds()),
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
@@ -328,35 +341,6 @@ func migrationHTTPStatus(err error) int {
 	}
 }
 
-func responseSignerMiddleware(signer AttestedSigner) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip signing for gRPC; attested TLS verifies identity, and buffering breaks streams.
-			if isGRPCRequest(r) {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			rec := &responseRecorder{
-				headers: w.Header(),
-				body:    &bytes.Buffer{},
-				status:  http.StatusOK,
-			}
-			next.ServeHTTP(rec, r)
-
-			body := rec.body.Bytes()
-			if sig := signer.Sign(body); sig != "" {
-				w.Header().Set("X-Attestation-Signature", sig)
-				w.Header().Set("X-Attestation-Pubkey", signer.Pubkey())
-			} else {
-				w.Header().Set("X-Attestation-Error", "signing-failed")
-			}
-			w.WriteHeader(rec.status)
-			_, _ = w.Write(body)
-		})
-	}
-}
-
 func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -420,28 +404,8 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 	}
 }
 
-func formatIndexPage(appURL *url.URL) string {
-	page := indexPage
-	if appURL != nil {
-		page += fmt.Sprintf("\nIt runs the following code: %s\n", appURL.String())
-	}
-	return page
-}
-
-func rootHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, formatIndexPage(cfg.AppURL))
-	}
-}
-
-func configHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintln(w, cfg)
-	}
-}
-
-// attestationHandler serves NSM attestation binding TLS and response-signing key hashes.
-func attestationHandler(nsm NSM, hashes AttestationHashes) http.HandlerFunc {
+// attestationHandler serves NSM attestation bound to the currently served TLS leaf.
+func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, errBadForm, http.StatusBadRequest)
@@ -531,7 +495,7 @@ func upstreamTransport(mode string) http.RoundTripper {
 	}
 }
 
-// corsWildcard adds permissive CORS to /v1/* admin endpoints; app CORS stays upstream.
+// corsWildcard adds permissive CORS to external runtime API endpoints.
 func corsWildcard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -546,20 +510,6 @@ func corsWildcard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// responseRecorder buffers body/status for response-signing middleware.
-type responseRecorder struct {
-	headers http.Header
-	body    *bytes.Buffer
-	status  int
-}
-
-func (r *responseRecorder) Header() http.Header         { return r.headers }
-func (r *responseRecorder) WriteHeader(code int)        { r.status = code }
-func (r *responseRecorder) Write(b []byte) (int, error) { return r.body.Write(b) }
-func (r *responseRecorder) ReadFrom(s io.Reader) (int64, error) {
-	return io.Copy(r.body, s)
 }
 
 // statusWriter captures status and forwards Flush for streaming responses.
@@ -577,16 +527,4 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-// isGRPCRequest detects gRPC/gRPC-Web so signing middleware can avoid buffering.
-func isGRPCRequest(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "application/grpc-web") {
-		return true
-	}
-	if r.ProtoMajor != 2 {
-		return false
-	}
-	return strings.HasPrefix(ct, "application/grpc")
 }

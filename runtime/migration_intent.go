@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -76,8 +77,10 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-func migrationIntentBucketParam() string {
-	return fmt.Sprintf("/%s/%s/MigrationIntentBucketName", getDeployment(), getAppName())
+func migrationIntentBucketName(accountID string) string {
+	identity := getDeployment() + "\x00" + getAppName()
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }
 
 func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
@@ -97,11 +100,10 @@ func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIn
 	}, nil
 }
 
-func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error) {
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
-	}
+func (l *migrationIntentLog) Head(
+	ctx context.Context,
+	sourcePCR0 string,
+) (*migrationIntent, error) {
 	head, tie, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
@@ -115,15 +117,11 @@ func (l *migrationIntentLog) Head(ctx context.Context) (*migrationIntent, error)
 
 func (l *migrationIntentLog) Request(
 	ctx context.Context,
-	targetPCR0 string,
+	sourcePCR0, targetPCR0 string,
 ) (*migrationIntent, error) {
 	targetPCR0, _, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
-	}
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
 	}
 	// A self-targeted handoff would overwrite this enclave's own commit pointer
 	// and would satisfy the PCR31 check trivially.
@@ -144,11 +142,10 @@ func (l *migrationIntentLog) Request(
 	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
 }
 
-func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error) {
-	sourcePCR0, err := l.sourcePCR0()
-	if err != nil {
-		return nil, err
-	}
+func (l *migrationIntentLog) Abort(
+	ctx context.Context,
+	sourcePCR0 string,
+) (*migrationIntent, error) {
 	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
@@ -159,6 +156,7 @@ func (l *migrationIntentLog) Abort(ctx context.Context) (*migrationIntent, error
 	if head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
+
 	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
 }
 
@@ -238,94 +236,59 @@ func (l *migrationIntentLog) append(
 	return head, nil
 }
 
-func (l *migrationIntentLog) sourcePCR0() (string, error) {
-	pcr0, err := l.nsm.PCR0()
-	if err != nil {
-		return "", fmt.Errorf("read source PCR0: %w", err)
-	}
-	if len(pcr0) != 48 {
-		return "", fmt.Errorf("source PCR0 must be 48 bytes, got %d", len(pcr0))
-	}
-	return hex.EncodeToString(pcr0), nil
-}
-
 func (l *migrationIntentLog) deriveHead(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, bool, error) {
 	var head *migrationIntent
 	var tie bool
-	var keyMarker, versionMarker *string
-	for {
-		out, err := l.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-			Bucket:          aws.String(l.bucket),
-			Prefix:          aws.String(migrationIntentPrefix + sourcePCR0 + "/"),
-			KeyMarker:       keyMarker,
-			VersionIdMarker: versionMarker,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf(
-				"%w: list migration intents: %w",
-				errMigrationIntentStoreUnavailable,
-				err,
-			)
-		}
-		for _, version := range out.Versions {
-			key := aws.ToString(version.Key)
+	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
+		errMigrationIntentStoreUnavailable, "list migration intents",
+		func(key, versionID string, lastModified *time.Time) (bool, error) {
 			keySourcePCR0, sequence, ok := parseMigrationIntentObjectKey(key)
-			versionID := aws.ToString(version.VersionId)
-			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" ||
-				version.LastModified == nil {
-				continue
+			if !ok || keySourcePCR0 != sourcePCR0 || versionID == "" || lastModified == nil {
+				return false, nil
 			}
 			nextHead, valid, err := l.fetchIntent(
-				ctx, key, versionID, keySourcePCR0, sequence, version.LastModified.UTC(),
+				ctx, key, versionID, keySourcePCR0, sequence, lastModified.UTC(),
 			)
-			if err != nil {
-				return nil, false, err
-			}
-			if !valid {
-				continue
+			if err != nil || !valid {
+				return false, err
 			}
 			switch {
 			case head == nil || nextHead.Sequence > head.Sequence:
 				head = nextHead
 				tie = false
 			case nextHead.Sequence < head.Sequence:
-				continue
 			case nextHead.PublishedAt.Before(head.PublishedAt):
 				head = nextHead
 				tie = false
 			case nextHead.PublishedAt.Equal(head.PublishedAt):
 				tie = true
 			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			return head, tie, nil
-		}
-		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
-			return nil, false, fmt.Errorf(
-				"%w: list migration intents: truncated response missing markers",
-				errMigrationIntentStoreUnavailable,
-			)
-		}
-		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+			return false, nil
+		})
+	if err != nil {
+		return nil, false, err
 	}
+	return head, tie, nil
 }
 
-func (l *migrationIntentLog) fetchIntent(
+// readIntent returns one version if it is a well-formed record at the expected
+// sequence. It does not verify the attestation.
+func (l *migrationIntentLog) readIntent(
 	ctx context.Context,
-	key, versionID, sourcePCR0 string,
+	key, versionID string,
 	sequence uint64,
-	publishedAt time.Time,
-) (*migrationIntent, bool, error) {
+) (migrationIntentObjectV1, bool, error) {
+	var entry migrationIntentObjectV1
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:    aws.String(l.bucket),
 		Key:       aws.String(key),
 		VersionId: aws.String(versionID),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf(
+		return entry, false, fmt.Errorf(
 			"%w: get migration intent %q version %q: %w",
 			errMigrationIntentStoreUnavailable,
 			key,
@@ -336,7 +299,7 @@ func (l *migrationIntentLog) fetchIntent(
 	defer func() { _ = out.Body.Close() }()
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf(
+		return entry, false, fmt.Errorf(
 			"%w: read migration intent %q version %q: %w",
 			errMigrationIntentStoreUnavailable,
 			key,
@@ -344,11 +307,24 @@ func (l *migrationIntentLog) fetchIntent(
 			err,
 		)
 	}
-	entry, err := decodeMigrationIntentObject(body)
+	entry, err = decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||
-		(entry.Action != migrationIntentRequested && entry.Action != migrationIntentAborted) ||
+		!isMigrationIntentAction(entry.Action) ||
 		entry.Attestation == "" || !isCanonicalPCR0(entry.TargetPCR0) {
-		return nil, false, nil
+		return entry, false, nil
+	}
+	return entry, true, nil
+}
+
+func (l *migrationIntentLog) fetchIntent(
+	ctx context.Context,
+	key, versionID, sourcePCR0 string,
+	sequence uint64,
+	publishedAt time.Time,
+) (*migrationIntent, bool, error) {
+	entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
+	if err != nil || !valid {
+		return nil, false, err
 	}
 	payload, err := l.enc.Marshal(migrationIntentV1{
 		Schema:     entry.Schema,
@@ -412,6 +388,14 @@ func normalizePCR0(value string) (string, []byte, error) {
 		return "", nil, fmt.Errorf("must be valid hex")
 	}
 	return hex.EncodeToString(decoded), decoded, nil
+}
+
+func isMigrationIntentAction(action string) bool {
+	switch action {
+	case migrationIntentRequested, migrationIntentAborted:
+		return true
+	}
+	return false
 }
 
 func isCanonicalPCR0(value string) bool {

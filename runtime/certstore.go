@@ -1,0 +1,279 @@
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+// errCertChanged reports a conditional write that lost: a peer rewrote the
+// object while we were issuing.
+var errCertChanged = errors.New("certificate store: object changed")
+
+// storedCertV1 is the sealed object body.
+type storedCertV1 struct {
+	CertPEM []byte `json:"cert_pem"`
+}
+
+// certBundle is the parsed, ready-to-serve form. etag is the version of the
+// stored object it came from, carried here so installing a certificate and
+// recording its version cannot drift apart.
+type certBundle struct {
+	cert     *tls.Certificate
+	notAfter time.Time
+	keyHash  [sha256.Size]byte
+	etag     string
+}
+
+type certStore struct {
+	s3     S3API
+	dek    DEK
+	key    crypto.Signer
+	bucket string
+	fqdn   string
+	prefix string
+}
+
+const (
+	acmeStoragePrefix       = "data/acme/"
+	selfSignedStoragePrefix = "data/self-signed/"
+)
+
+func newCertStore(s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string) *certStore {
+	return &certStore{
+		s3: s3api, dek: dek, key: key, bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
+	}
+}
+
+// newSelfSignedCertStore keys the fleet's own certificate away from the ACME
+// one. Nothing in a stored bundle records who issued it, so a shared key would
+// let an ACME manager adopt a self-signed certificate and never order.
+func newSelfSignedCertStore(
+	s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string,
+) *certStore {
+	store := newCertStore(s3api, dek, key, bucket, fqdn)
+	store.prefix = selfSignedStoragePrefix
+	return store
+}
+
+// LoadCert returns the stored bundle, or nil when the fleet has no certificate.
+func (c *certStore) LoadCert(ctx context.Context) (*certBundle, error) {
+	raw, etag, err := c.get(ctx, c.certObjectKey())
+	if err != nil || raw == nil {
+		return nil, err
+	}
+
+	var stored storedCertV1
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return nil, fmt.Errorf("decode stored certificate: %w", err)
+	}
+	bundle, err := parseCertBundle(stored.CertPEM, c.key)
+	if err != nil {
+		return nil, err
+	}
+	bundle.etag = etag
+	return bundle, nil
+}
+
+func (c *certStore) SaveCert(
+	ctx context.Context,
+	certPEM []byte,
+	expectedETag string,
+) (*certBundle, error) {
+	bundle, err := parseCertBundle(certPEM, c.key)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLeaf(bundle.cert.Leaf, c.fqdn, time.Now()); err != nil {
+		return nil, fmt.Errorf("refusing to store certificate: %w", err)
+	}
+	body, err := json.Marshal(storedCertV1{CertPEM: certPEM})
+	if err != nil {
+		return nil, fmt.Errorf("encode certificate: %w", err)
+	}
+	etag, err := c.putConditional(ctx, c.certObjectKey(), body, expectedETag)
+	if err != nil {
+		return nil, err
+	}
+	bundle.etag = etag
+	return bundle, nil
+}
+
+// LoadOrCreateAccountKey returns ACME account key
+func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, error) {
+	pemBytes, err := c.loadAccountKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pemBytes != nil {
+		return parseECKey(pemBytes)
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ACME account key: %w", err)
+	}
+	encoded, err := encodeECKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.saveAccountKey(ctx, encoded); err != nil {
+		if !errors.Is(err, errCertChanged) {
+			return nil, fmt.Errorf("store ACME account key: %w", err)
+		}
+		// A peer created the account between our load and our write. Theirs is
+		// the fleet's key; discard the one we just generated.
+		pemBytes, err = c.loadAccountKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if pemBytes == nil {
+			return nil, errors.New("ACME account key: create lost the race but no key is stored")
+		}
+		return parseECKey(pemBytes)
+	}
+	return key, nil
+}
+
+func (c *certStore) certObjectKey() string {
+	return objectKeyFor(c.prefix, c.fqdn+"/cert")
+}
+
+func (c *certStore) accountObjectKey() string {
+	return objectKeyFor(acmeStoragePrefix, "account.key")
+}
+
+// loadAccountKey returns the fleet-shared ACME account key, or nil if unset.
+func (c *certStore) loadAccountKey(ctx context.Context) ([]byte, error) {
+	raw, _, err := c.get(ctx, c.accountObjectKey())
+	return raw, err
+}
+
+// saveAccountKey stores the account key create-only, returning errCertChanged if
+// a peer stored one first.
+func (c *certStore) saveAccountKey(ctx context.Context, keyPEM []byte) error {
+	_, err := c.putConditional(ctx, c.accountObjectKey(), keyPEM, "")
+	return err
+}
+
+func (c *certStore) get(ctx context.Context, key string) ([]byte, string, error) {
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isNoSuchKey(err) {
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("get %q: %w", key, err)
+	}
+	defer func() { _ = out.Body.Close() }()
+
+	sealed, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %q: %w", key, err)
+	}
+	plaintext, err := c.dek.Open(sealed, []byte(key))
+	if err != nil {
+		return nil, "", fmt.Errorf("open %q: %w", key, err)
+	}
+	return plaintext, aws.ToString(out.ETag), nil
+}
+
+func (c *certStore) putConditional(
+	ctx context.Context,
+	key string,
+	plaintext []byte,
+	expectedETag string,
+) (string, error) {
+	sealed, err := c.dek.Seal(plaintext, []byte(key))
+	if err != nil {
+		return "", err
+	}
+
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(sealed),
+	}
+	if expectedETag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(expectedETag)
+	}
+
+	out, err := c.s3.PutObject(ctx, in)
+	if err != nil {
+		// 412 means a peer moved the object. 409 is S3 losing an internal race
+		// between concurrent conditional writes — different cause, same response
+		// here: adopt whatever is there now rather than reporting a broken
+		// issuance and burning another duplicate-certificate slot on a retry.
+		if isPreconditionFailed(err) || isConditionalConflict(err) || isNoSuchKey(err) {
+			return "", fmt.Errorf("%w: %s", errCertChanged, key)
+		}
+		return "", fmt.Errorf("put %q: %w", key, err)
+	}
+	return aws.ToString(out.ETag), nil
+}
+
+func parseCertBundle(certPEM []byte, key crypto.Signer) (*certBundle, error) {
+	if key == nil {
+		return nil, errors.New("TLS key is required")
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal TLS key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("load X509 key pair: %w", err)
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, errors.New("certificate chain is empty")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse leaf certificate: %w", err)
+	}
+	cert.Leaf = leaf
+
+	return &certBundle{
+		cert:     &cert,
+		notAfter: leaf.NotAfter,
+		keyHash:  sha256.Sum256(leaf.RawSubjectPublicKeyInfo),
+	}, nil
+}
+
+func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
+	if now.Before(leaf.NotBefore) {
+		return fmt.Errorf("not valid until %s", leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(leaf.NotAfter) {
+		return fmt.Errorf("expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return fmt.Errorf("does not serve %q: %w", domain, err)
+	}
+	return nil
+}
+
+func objectKeyFor(prefix, name string) string {
+	return getDeployment() + "/" + getAppName() + "/" + prefix + name
+}

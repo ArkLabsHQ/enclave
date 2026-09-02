@@ -3,7 +3,6 @@ module github.com/ArkLabsHQ/enclave
 go 1.25.0
 
 require (
-	github.com/btcsuite/btcd/btcec/v2 v2.3.3
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/hf/nitrite v0.0.0-20241225144000-c2d5d3c4f303
 	github.com/spf13/cobra v1.10.2
@@ -12,10 +11,7 @@ require (
 )
 
 require (
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/decred/dcrd/crypto/blake256 v1.0.0 // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect

@@ -1,9 +1,15 @@
 package client
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -45,8 +51,9 @@ func TestVerifyRealAttestationDocument(t *testing.T) {
 	expectedNonce := "deadbeefcafebabe1234567890abcdef01020304"
 	require.Equal(t, expectedNonce, hex.EncodeToString(result.Document.Nonce))
 
-	// Verify UserData is present (68 bytes for nitriding).
-	require.GreaterOrEqual(t, len(result.Document.UserData), 68)
+	// This historical signed fixture predates the current runtime wire format.
+	// It remains useful for COSE verification but is not parsed as a TLS binding.
+	require.NotEmpty(t, result.Document.UserData)
 
 	// Verify mandatory fields.
 	require.NotEmpty(t, result.Document.ModuleID)
@@ -66,72 +73,78 @@ func TestVerifyAttestationRejectsTamperedDocument(t *testing.T) {
 	require.False(t, err == nil && result != nil && result.SignatureOK)
 }
 
-func TestSchnorrSignatureVerification(t *testing.T) {
-	// Real test vector captured from a running enclave.
-	// Body includes trailing newline.
-	body := []byte("{\"status\":\"ready\"}\n")
-	sigHex := "f2f2c20eff91556cd3614fcf230a6e14b4d0574d3f91f8bf33b9acc76d61da40a691821f451e364385cbfed6ba6338e650f1de6fbca58c4a0cc7144185fa6eff"
-	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
+func TestExtractTLSKeyHashRequiresExactFormat(t *testing.T) {
+	digest := sha256.Sum256([]byte("tls leaf"))
+	valid := append([]byte(udHashPrefix), digest[:]...)
+	short := append([]byte(nil), valid[:len(valid)-1]...)
+	long := append(append([]byte(nil), valid...), 0)
+	legacy := append(append([]byte(nil), valid...), ';')
+	legacy = append(legacy, []byte(udHashPrefix)...)
+	legacy = append(legacy, make([]byte, sha256.Size)...)
+	badPrefix := append([]byte(nil), valid...)
+	badPrefix[0] = 'x'
+	zero := append([]byte(udHashPrefix), make([]byte, sha256.Size)...)
+	require.Len(t, valid, 39)
+	require.Len(t, short, 38)
+	require.Len(t, long, 40)
+	require.Len(t, legacy, 79)
 
-	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	require.NoError(t, err)
-}
-
-func TestSchnorrRejectsWrongBody(t *testing.T) {
-	body := []byte("{\"status\":\"tampered\"}\n")
-	sigHex := "f2f2c20eff91556cd3614fcf230a6e14b4d0574d3f91f8bf33b9acc76d61da40a691821f451e364385cbfed6ba6338e650f1de6fbca58c4a0cc7144185fa6eff"
-	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
-
-	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	require.ErrorContains(t, err, "signature verification failed")
-}
-
-func TestSchnorrRejectsWrongPubkey(t *testing.T) {
-	body := []byte("{\"status\":\"ready\"}\n")
-	sigHex := "f2f2c20eff91556cd3614fcf230a6e14b4d0574d3f91f8bf33b9acc76d61da40a691821f451e364385cbfed6ba6338e650f1de6fbca58c4a0cc7144185fa6eff"
-	// Completely different pubkey (different x-coordinate).
-	pubkeyHex := "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-	err := verifySchnorrSignature(body, sigHex, pubkeyHex)
-	require.ErrorContains(t, err, "signature verification failed")
-}
-
-func TestKeyBindingSigningKey(t *testing.T) {
-	doc := loadTestAttestation(t)
-
-	result, _ := nitrite.Verify(doc, nitrite.VerifyOptions{
-		CurrentTime: time.Now(),
-	})
-	require.NotNil(t, result)
-	require.NotNil(t, result.Document)
-
-	userData := result.Document.UserData
-	require.GreaterOrEqual(t, len(userData), 68)
-
-	// Check multihash prefix at offset 34.
-	require.Equal(t, byte(0x12), userData[34])
-	require.Equal(t, byte(0x20), userData[35])
-
-	signingKeyHash := userData[36:68]
-
-	// signingKeyHash should not be all zeros.
-	allZero := true
-	for _, b := range signingKeyHash {
-		if b != 0 {
-			allZero = false
-			break
-		}
+	tests := []struct {
+		name        string
+		result      *nitrite.Result
+		want        string
+		errContains string
+	}{
+		{
+			name:   "valid exact payload",
+			result: &nitrite.Result{Document: &nitrite.Document{UserData: valid}},
+			want:   hex.EncodeToString(digest[:]),
+		},
+		{
+			name:        "short payload",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: short}},
+			errContains: "exactly 39 bytes",
+		},
+		{
+			name:        "long payload",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: long}},
+			errContains: "exactly 39 bytes",
+		},
+		{
+			name:        "legacy two-hash payload",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: legacy}},
+			errContains: "exactly 39 bytes",
+		},
+		{
+			name:        "bad prefix",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: badPrefix}},
+			errContains: "missing \"sha256:\" prefix",
+		},
+		{
+			name:        "all-zero digest",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: zero}},
+			errContains: "all-zero",
+		},
+		{name: "nil attestation", errContains: "no attestation result"},
+		{
+			name:        "nil document",
+			result:      &nitrite.Result{},
+			errContains: "no attestation result",
+		},
 	}
-	require.False(t, allZero, "signingKeyHash is all zeros")
 
-	// Verify SHA256(attestation_pubkey) matches signingKeyHash.
-	// The pubkey is from the enclave-info response.
-	pubkeyHex := "028d0bcf2b3384781e74e647351c01c0852775b59f063cde314d67328927d20dd0"
-	pubkeyBytes, err := hex.DecodeString(pubkeyHex)
-	require.NoError(t, err)
-
-	expectedHash := sha256.Sum256(pubkeyBytes)
-	require.Equal(t, expectedHash[:], signingKeyHash)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := extractTLSKeyHash(tc.result)
+			if tc.errContains != "" {
+				require.ErrorContains(t, err, tc.errContains)
+				require.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }
 
 func TestIsAllZeroHex(t *testing.T) {
@@ -148,17 +161,40 @@ func TestIsAllZeroHex(t *testing.T) {
 }
 
 func TestVerifyLeafCertPin(t *testing.T) {
-	cert := []byte("a fake DER certificate")
-	sum := sha256.Sum256(cert)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "enclave.test"},
+		DNSNames:     []string{"enclave.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	cert, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(cert)
+	require.NoError(t, err)
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	good := hex.EncodeToString(sum[:])
 
 	// Match (case-insensitive).
 	require.NoError(t, verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)))
+
+	// A renewed certificate with different DER but the same key keeps the same pin.
+	renewedTemplate := *tmpl
+	renewedTemplate.SerialNumber = big.NewInt(2)
+	renewedTemplate.NotAfter = time.Now().Add(90 * 24 * time.Hour)
+	renewed, err := x509.CreateCertificate(
+		rand.Reader, &renewedTemplate, &renewedTemplate, &key.PublicKey, key,
+	)
+	require.NoError(t, err)
+	require.NotEqual(t, cert, renewed)
+	require.NoError(t, verifyLeafCertPin([][]byte{renewed}, good))
 	// Mismatch.
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)),
-		"TLS cert fingerprint mismatch",
+		"TLS public-key fingerprint mismatch",
 	)
 	// No peer cert.
 	require.ErrorContains(t, verifyLeafCertPin(nil, good), "no peer certificate presented")
@@ -166,11 +202,11 @@ func TestVerifyLeafCertPin(t *testing.T) {
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, ""),
-		"no attested TLS cert fingerprint",
+		"no attested TLS public-key fingerprint",
 	)
 	require.ErrorContains(
 		t,
 		verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)),
-		"no attested TLS cert fingerprint",
+		"no attested TLS public-key fingerprint",
 	)
 }

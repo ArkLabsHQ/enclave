@@ -11,6 +11,7 @@ import (
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -71,6 +72,11 @@ type S3API interface {
 		params *s3.GetObjectInput,
 		optFns ...func(*s3.Options),
 	) (*s3.GetObjectOutput, error)
+	HeadObject(
+		ctx context.Context,
+		params *s3.HeadObjectInput,
+		optFns ...func(*s3.Options),
+	) (*s3.HeadObjectOutput, error)
 	PutObject(
 		ctx context.Context,
 		params *s3.PutObjectInput,
@@ -91,6 +97,20 @@ type S3API interface {
 		params *s3.ListObjectVersionsInput,
 		optFns ...func(*s3.Options),
 	) (*s3.ListObjectVersionsOutput, error)
+}
+
+// Route53API is the subset of *route53.Client used by DNS-01 issuance.
+type Route53API interface {
+	ChangeResourceRecordSets(
+		ctx context.Context,
+		params *route53.ChangeResourceRecordSetsInput,
+		optFns ...func(*route53.Options),
+	) (*route53.ChangeResourceRecordSetsOutput, error)
+	GetChange(
+		ctx context.Context,
+		params *route53.GetChangeInput,
+		optFns ...func(*route53.Options),
+	) (*route53.GetChangeOutput, error)
 }
 
 // STSAPI is the subset of *sts.Client used by the runtime.
@@ -128,11 +148,12 @@ type CloudWatchLogsAPI interface {
 
 // AWSClient bundles runtime AWS clients from one shared config.
 type AWSClient struct {
-	KMS KMSAPI
-	SSM SSMAPI
-	S3  S3API
-	STS STSAPI
-	CWL CloudWatchLogsAPI
+	KMS     KMSAPI
+	SSM     SSMAPI
+	S3      S3API
+	STS     STSAPI
+	CWL     CloudWatchLogsAPI
+	Route53 Route53API
 }
 
 // NewAWSClient constructs all SDK clients from a single shared aws.Config.
@@ -143,12 +164,23 @@ func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
 	return &AWSClient{
-		KMS: newKMSClient(cfg),
-		SSM: newSSMClient(cfg),
-		S3:  newS3Client(cfg),
-		STS: newSTSClient(cfg),
-		CWL: newCloudWatchLogsClient(cfg),
+		KMS:     newKMSClient(cfg),
+		SSM:     newSSMClient(cfg),
+		S3:      newS3Client(cfg),
+		STS:     newSTSClient(cfg),
+		CWL:     newCloudWatchLogsClient(cfg),
+		Route53: newRoute53Client(cfg),
 	}, nil
+}
+
+// newRoute53Client creates a Route53 client, respecting AWS_ENDPOINT_URL_ROUTE53
+// for localstack.
+func newRoute53Client(cfg aws.Config) *route53.Client {
+	return route53.NewFromConfig(cfg, func(o *route53.Options) {
+		if ep := os.Getenv("AWS_ENDPOINT_URL_ROUTE53"); ep != "" {
+			o.BaseEndpoint = aws.String(ep)
+		}
+	})
 }
 
 // newKMSClient creates a KMS client, respecting AWS_ENDPOINT_URL_KMS for localstack.

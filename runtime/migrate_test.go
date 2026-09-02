@@ -16,26 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestVerifyPredecessorCommitment_Genesis(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "genesis")
-
-	t.Run("no predecessor", func(t *testing.T) {
-		err := verifyPredecessorCommitment(nil, unverifiedState{})
-		require.NoError(t, err)
-	})
-
-	t.Run("rejects predecessor", func(t *testing.T) {
-		errs := verifyPredecessorCommitment(nil, unverifiedState{
-			predecessorPCR0:        "abc123",
-			predecessorAttestation: "attestation",
-		})
-		require.Error(t, errs)
-	})
-}
-
-func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
+func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 	prevPCR0Bytes := bytes.Repeat([]byte{0xab}, 48)
 	currentPCR0Bytes := bytes.Repeat([]byte{0xcd}, 48)
 	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
@@ -45,31 +26,40 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "myapp")
 	t.Setenv("ENCLAVE_PREVIOUS_PCR0", prevPCR0)
 
-	t.Run("missing previous PCR0", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{currentPCR0: currentPCR0Bytes},
-		)
+	t.Run("SSM predecessor must match the PCR0 baked into the EIF", func(t *testing.T) {
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, nil))
+
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
+			predecessorPCR0:        strings.Repeat("0", 96),
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
 		require.Error(t, err)
 	})
 
-	t.Run("mismatched previous PCR0", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{
-				currentPCR0:            currentPCR0Bytes,
-				predecessorPCR0:        strings.Repeat("0", 96),
-				predecessorAttestation: attestation,
-			},
-		)
-		require.Error(t, err)
-	})
+	t.Run("attested PCR0 must match the claimed predecessor", func(t *testing.T) {
+		claimedPCR0Bytes := bytes.Repeat([]byte{0xef}, 48)
+		claimedPCR0 := hex.EncodeToString(claimedPCR0Bytes)
+		t.Setenv("ENCLAVE_PREVIOUS_PCR0", claimedPCR0)
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, nil))
 
-	t.Run("requires attestation", func(t *testing.T) {
-		err := verifyPredecessorCommitment(
-			predecessorNSM(t, currentPCR0Bytes, nil),
-			unverifiedState{currentPCR0: currentPCR0Bytes, predecessorPCR0: prevPCR0},
-		)
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
+			predecessorPCR0:        claimedPCR0,
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
 		require.Error(t, err)
 	})
 
@@ -79,10 +69,12 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        prevPCR0,
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.Error(t, err)
@@ -94,10 +86,12 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        strings.ToUpper(prevPCR0),
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.NoError(t, err)
@@ -109,10 +103,12 @@ func TestVerifyPredecessorCommitment_Predecessor(t *testing.T) {
 			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
 		}, nil))
 
-		err := verifyPredecessorCommitment(nsm, unverifiedState{
+		err := (&migrationBoot{}).verify(nsm, &bootState{
 			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
 			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
 			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
 		})
 
 		require.ErrorContains(t, err, "cannot be its own predecessor")
@@ -131,7 +127,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 	t.Run("genesis", func(t *testing.T) {
 		m, err := NewMigrator(
 			kmsTestNSMWithPCR0(t, infoPCR0Bytes), nil, NewSSM(&fakeSSM{}),
-			newFakeS3(), nil, nil, migrationIntentTestBucket,
+			newFakeS3(), nil, nil, newTestTLSKey(t), migrationIntentTestBucket,
 		)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
@@ -145,7 +141,7 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 			kmsTestNSMWithPCR0(t, infoPCR0Bytes), nil, NewSSM(&fakeSSM{params: map[string]string{
 				migrationPreviousPCR0Param(infoPCR0):            "abc123",
 				migrationPreviousPCR0AttestationParam(infoPCR0): "attestation",
-			}}), newFakeS3(), nil, nil, migrationIntentTestBucket)
+			}}), newFakeS3(), nil, nil, newTestTLSKey(t), migrationIntentTestBucket)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
 
@@ -266,7 +262,9 @@ func TestMigrationRequestValidate(t *testing.T) {
 
 func TestCompleteMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
-	const migrationIntentBucketName = "migration-intent-bucket"
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "myapp")
+	migrationIntentBucketName := migrationIntentBucketName(fakeSTSAccountID)
 
 	oldPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
@@ -299,11 +297,14 @@ func TestCompleteMigration(t *testing.T) {
 			verifyRoots: session.attestationSign.roots,
 		}}
 		ssmf := &fakeSSM{params: map[string]string{
-			migrationIntentBucketParam(): migrationIntentBucketName,
-			kmsKeyIDParam(oldPCR0Hex):    "old-key",
+			kmsKeyIDParam(oldPCR0Hex): "old-key",
 		}}
 		ssm := NewSSM(ssmf)
 		s3f := newFakeS3()
+		genesis, err := newGenesisLog(s3f, nsm, migrationIntentBucketName)
+		require.NoError(t, err)
+		_, err = genesis.CommitGenesis(ctx, oldPCR0Hex)
+		require.NoError(t, err)
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
 		fx := &startMigrationFixture{
@@ -324,6 +325,7 @@ func TestCompleteMigration(t *testing.T) {
 			s3f,
 			&dek{key: dekKey},
 			[]StaticSecret{secret},
+			newTestTLSKey(t),
 			migrationIntentBucketName,
 		)
 		require.NoError(t, err)
@@ -341,7 +343,6 @@ func TestCompleteMigration(t *testing.T) {
 
 	t.Run("happy path commits raw PCR0 and predecessor validates", func(t *testing.T) {
 		fx := setup(t)
-		fx.ssmf.params[migrationIntentBucketParam()] = "repointed-after-startup"
 		request(t, fx, newPCR0)
 
 		got, err := fx.m.CompleteMigration(ctx)
@@ -375,18 +376,13 @@ func TestCompleteMigration(t *testing.T) {
 		))
 		require.NotNil(t, fx.session.attestationRoots)
 
-		fx.ssmf.params[migrationIntentBucketParam()] = migrationIntentBucketName
 		newNSM := &nsmW{nsm: &fakeNSM{
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		established, err := EstablishState(
-			ctx,
-			newNSM,
-			fx.kmsf,
-			&fakeSTS{},
-			fx.ssm,
-		)
+		newBoot, err := NewBoot(newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		require.NoError(t, err)
+		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
@@ -494,6 +490,7 @@ func TestCompleteMigration(t *testing.T) {
 			fx.s3f,
 			fx.m.dek,
 			fx.m.staticSecrets,
+			fx.m.tlsKey,
 			migrationIntentBucketName,
 		)
 		require.NoError(t, err)

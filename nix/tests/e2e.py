@@ -48,7 +48,7 @@ def served_leaf_sha(node):
 def console_has(node, needle):
     status, _ = node.execute(
         "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
-        f"| grep -qF {shlex.quote(needle)}"
+        f"| grep -F {shlex.quote(needle)} >/dev/null"
     )
     return status == 0
 

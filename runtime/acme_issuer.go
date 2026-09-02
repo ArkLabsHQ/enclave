@@ -58,6 +58,10 @@ func (i *acmeIssuer) Issue(
 	domain string,
 	key crypto.Signer,
 ) (certPEM []byte, err error) {
+	if key == nil {
+		return nil, errors.New("certificate key is required")
+	}
+
 	if err := i.register(ctx); err != nil {
 		return nil, err
 	}
@@ -75,9 +79,6 @@ func (i *acmeIssuer) Issue(
 		return nil, fmt.Errorf("wait for order %q: %w", order.URI, err)
 	}
 
-	if key == nil {
-		return nil, errors.New("certificate key is required")
-	}
 	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
 		Subject:  pkix.Name{CommonName: domain},
 		DNSNames: []string{domain},

@@ -603,11 +603,7 @@ green.wait_until_succeeds(
     "and .ancestry.generations[0].pcr0 == $prev "
     "and (.ancestry.generations[0].key_id | length) > 0 "
     "and .ancestry.generations[0].state == \"exists\" "
-    # Blue is genesis-born, so the record names it and the chain ends there. The
-    # runtime states no verdict on that; a client compares the two itself, which
-    # is what this assertion stands in for.
-    "and .ancestry.genesis.pcr0 == $prev "
-    "and (.ancestry.genesis.attestation | length) > 0'",
+    "and (.ancestry | has(\"genesis\") | not)'",
     timeout=60,
 )
 
@@ -755,6 +751,7 @@ assert status == 0, out
 # kill/rejoin did not disturb the still-running blue fleet.
 for node in (blue, blue_peer, green, green_peer):
     wait_healthy(node)
+
 for node in BLUES:
     assert served_leaf_sha(node) == blue_leaf_sha
     assert secret_value(node) == blue_secret
@@ -776,3 +773,23 @@ assert status == 0, out
 
 for node in (blue, blue_peer, green, green_peer):
     wait_healthy(node)
+
+# KMS deletion has a mandatory waiting period. Scheduling the retired blue key
+# must therefore appear as pending_deletion in green's ancestry.
+cloud(
+    f"kms schedule-key-deletion --key-id {shlex.quote(genesis_key)} "
+    "--pending-window-in-days 7"
+)
+green.succeed("kill $(cat /run/enclave-qemu.pid)")
+green.succeed("systemctl restart enclave-start")
+wait_healthy(green)
+green.wait_until_succeeds(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    f"| jq -e --arg key {shlex.quote(genesis_key)} "
+    "'.ancestry.complete == true "
+    "and (.ancestry.generations | length) == 1 "
+    "and .ancestry.generations[0].key_id == $key "
+    "and .ancestry.generations[0].state == \"pending_deletion\" "
+    "and .ancestry.generations[0].deletion_date != null'",
+    timeout=60,
+)

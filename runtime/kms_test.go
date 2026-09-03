@@ -6,7 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
@@ -202,4 +205,88 @@ func kmsTestNSMWithRecipient(t *testing.T) NSM {
 			), nil
 		},
 	}}}
+}
+
+func TestKeyStatus(t *testing.T) {
+	deletionDate := time.Now().Add(30 * 24 * time.Hour).UTC()
+	tests := []struct {
+		name         string
+		state        kmstypes.KeyState
+		wantState    string
+		wantDeletion bool
+	}{
+		{"enabled", kmstypes.KeyStateEnabled, keyStateExists, false},
+		{"disabled", kmstypes.KeyStateDisabled, keyStateExists, false},
+		{"creating", kmstypes.KeyStateCreating, keyStateExists, false},
+		{"updating", kmstypes.KeyStateUpdating, keyStateExists, false},
+		{"unavailable", kmstypes.KeyStateUnavailable, keyStateExists, false},
+		{"pending import", kmstypes.KeyStatePendingImport, keyStateExists, false},
+		{"pending deletion", kmstypes.KeyStatePendingDeletion, keyStatePendingDeletion, true},
+		{
+			"pending replica deletion", kmstypes.KeyStatePendingReplicaDeletion,
+			keyStatePendingDeletion, true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeKMS()
+			fake.keyStates = map[string]*kmstypes.KeyMetadata{
+				"key-1": {
+					KeyId: aws.String("key-1"), KeyState: tc.state,
+					DeletionDate: aws.Time(deletionDate),
+				},
+			}
+
+			got := (&kmsW{kms: fake}).KeyStatus(context.Background(), "key-1")
+
+			require.Equal(t, tc.wantState, got.State)
+			require.Equal(t, 1, fake.describeCalls)
+			if tc.wantDeletion {
+				require.Equal(t, deletionDate, got.DeletionDate.UTC())
+			} else {
+				require.Nil(t, got.DeletionDate)
+			}
+		})
+	}
+}
+
+func TestKeyStatusDeleted(t *testing.T) {
+	fake := newFakeKMS()
+
+	got := (&kmsW{kms: fake}).KeyStatus(context.Background(), "gone")
+
+	require.Equal(t, keyStateDeleted, got.State)
+	require.Equal(t, 1, fake.describeCalls)
+}
+
+func TestKeyStatusUnknown(t *testing.T) {
+	t.Run("missing metadata", func(t *testing.T) {
+		fake := newFakeKMS()
+		fake.putKey("key-1", "{}")
+		fake.describeNilMetadata = true
+
+		got := (&kmsW{kms: fake}).KeyStatus(context.Background(), "key-1")
+
+		require.Equal(t, keyStateUnknown, got.State)
+		require.Contains(t, got.Reason, "no key metadata")
+	})
+
+	t.Run("describe error", func(t *testing.T) {
+		fake := newFakeKMS()
+		fake.describeErr = &kmstypes.KMSInvalidStateException{Message: aws.String("bad state")}
+
+		got := (&kmsW{kms: fake}).KeyStatus(context.Background(), "key-1")
+
+		require.Equal(t, keyStateUnknown, got.State)
+		require.Contains(t, got.Reason, "describe_key:")
+	})
+
+	t.Run("empty key ID", func(t *testing.T) {
+		fake := newFakeKMS()
+
+		got := (&kmsW{kms: fake}).KeyStatus(context.Background(), "")
+
+		require.Equal(t, keyStateUnknown, got.State)
+		require.Zero(t, fake.describeCalls)
+	})
 }

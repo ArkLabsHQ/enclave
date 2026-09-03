@@ -281,6 +281,14 @@ func migrationPreviousPCR0Param(pcr0 string) string {
 	)
 }
 
+// migrationPreviousKMSKeyIDParam returns the predecessor key path for a generation.
+func migrationPreviousKMSKeyIDParam(pcr0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationPreviousKMSKeyID/%s",
+		getDeployment(), getAppName(), strings.ToLower(pcr0),
+	)
+}
+
 // migrationPreviousPCR0AttestationParam: SSM path for the predecessor enclave's
 // attestation document, scoped by the successor PCR0 that reads it.
 func migrationPreviousPCR0AttestationParam(pcr0 string) string {

@@ -50,8 +50,7 @@ type NSM interface {
 	VerifyAttestation(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
-		expectedUserData []byte,
-	) error
+	) ([]byte, error)
 	BuildAttestationDocument(opts ...BuildAttestationOption) ([]byte, *rsa.PrivateKey, error)
 	LockPCR(index uint) error
 	ExtendPCR(index uint, data []byte) error
@@ -96,35 +95,30 @@ func NewNSM(opts ...VerifyAttestationOption) NSM {
 func (n *nsmW) VerifyAttestation(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,
-	expectedUserData []byte,
-) error {
+) ([]byte, error) {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
-		return fmt.Errorf("decode attestation base64: %w", err)
+		return nil, fmt.Errorf("decode attestation base64: %w", err)
 	}
 
 	result, err := n.nsm.VerifyAttestationSig(attestDoc)
 	if err != nil {
-		return fmt.Errorf("verify predecessor attestation: %w", err)
+		return nil, fmt.Errorf("verify predecessor attestation: %w", err)
 	}
 
 	for index, expected := range expectedPCRs {
 		attestedPCR, ok := result.Document.PCRs[index]
 		if !ok {
-			return fmt.Errorf("PCR%d not found in attestation document", index)
+			return nil, fmt.Errorf("PCR%d not found in attestation document", index)
 		}
 		attestedPCRHex := hex.EncodeToString(attestedPCR)
 		if !strings.EqualFold(attestedPCRHex, expected) {
-			return fmt.Errorf("attested PCR%d does not match expected: %s != %s",
+			return nil, fmt.Errorf("attested PCR%d does not match expected: %s != %s",
 				index, attestedPCRHex, expected)
 		}
 	}
 
-	if !bytes.Equal(result.Document.UserData, expectedUserData) {
-		return fmt.Errorf("attested user data does not match expected user data")
-	}
-
-	return nil
+	return result.Document.UserData, nil
 }
 
 func (n *nsmW) BuildAttestationDocument(

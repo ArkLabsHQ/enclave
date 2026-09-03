@@ -4,14 +4,24 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	kmscmd "github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	stscmd "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/edgebitio/nitro-enclaves-sdk-go/crypto/cms"
+)
+
+const (
+	keyStateExists          = "exists"
+	keyStatePendingDeletion = "pending_deletion"
+	keyStateDeleted         = "deleted"
+	keyStateUnknown         = "unknown"
+	keyProbeTimeout         = 5 * time.Second
 )
 
 type kmsW struct {
@@ -26,6 +36,12 @@ type DataKey struct {
 	Plaintext  []byte
 }
 
+type KeyStatus struct {
+	State        string
+	DeletionDate *time.Time
+	Reason       string
+}
+
 type KMS interface {
 	KeyID() string
 	GenerateDataKey(ctx context.Context) (*DataKey, error)
@@ -35,7 +51,12 @@ type KMS interface {
 
 type PrimaryKMS interface {
 	KMS
+	KeyAuditor
 	CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, error)
+}
+
+type KeyAuditor interface {
+	KeyStatus(ctx context.Context, keyID string) KeyStatus
 }
 
 // FetchOrCreatePrimaryKMS returns the key at keyID after proving its policy
@@ -241,4 +262,31 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 	}
 
 	return &kmsW{nsm: k.nsm, kms: k.kms, keyID: *out.KeyMetadata.KeyId}, nil
+}
+
+func (k *kmsW) KeyStatus(ctx context.Context, keyID string) KeyStatus {
+	if keyID == "" {
+		return KeyStatus{State: keyStateUnknown, Reason: "no KMS key ID to probe"}
+	}
+	ctx, cancel := context.WithTimeout(ctx, keyProbeTimeout)
+	defer cancel()
+
+	out, err := k.kms.DescribeKey(ctx, &kmscmd.DescribeKeyInput{KeyId: aws.String(keyID)})
+	if err != nil {
+		var notFound *kmstypes.NotFoundException
+		if errors.As(err, &notFound) {
+			return KeyStatus{State: keyStateDeleted}
+		}
+		return KeyStatus{State: keyStateUnknown, Reason: fmt.Sprintf("describe_key: %v", err)}
+	}
+	if out == nil || out.KeyMetadata == nil {
+		return KeyStatus{State: keyStateUnknown, Reason: "describe_key returned no key metadata"}
+	}
+	if out.KeyMetadata.KeyState == kmstypes.KeyStatePendingDeletion ||
+		out.KeyMetadata.KeyState == kmstypes.KeyStatePendingReplicaDeletion {
+		return KeyStatus{
+			State: keyStatePendingDeletion, DeletionDate: out.KeyMetadata.DeletionDate,
+		}
+	}
+	return KeyStatus{State: keyStateExists}
 }

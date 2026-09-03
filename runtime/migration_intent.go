@@ -341,7 +341,8 @@ func (l *migrationIntentLog) fetchIntent(
 			err,
 		)
 	}
-	if err := l.nsm.VerifyAttestation(
+	if err := verifyAttestationUserData(
+		l.nsm,
 		entry.Attestation,
 		map[uint]string{0: sourcePCR0},
 		payload,

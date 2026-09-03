@@ -461,10 +461,9 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 	ancestry := &stubAncestry{snap: &AncestryInfo{
 		Generations: []AncestorGeneration{{
-			PCR0:       strings.Repeat("cd", 48),
-			KeyID:      "key-1",
-			State:      keyStateDeleted,
-			CheckedVia: checkedViaDescribeKey,
+			PCR0:  strings.Repeat("cd", 48),
+			KeyID: "key-1",
+			State: keyStateDeleted,
 		}},
 		Complete:  true,
 		CheckedAt: &ancestryTestCheckedAt,
@@ -529,10 +528,9 @@ func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
 	s, migrator := enclaveInfoTestServer(t)
 	ancestry := &stubAncestry{snap: &AncestryInfo{
 		Generations: []AncestorGeneration{{
-			PCR0:       strings.Repeat("cd", 48),
-			KeyID:      "key-1",
-			State:      keyStateUnknown,
-			CheckedVia: checkedViaGetKeyPolicy,
+			PCR0:  strings.Repeat("cd", 48),
+			KeyID: "key-1",
+			State: keyStateUnknown,
 		}},
 		CheckedAt: &ancestryTestCheckedAt,
 	}}
@@ -548,12 +546,16 @@ func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
 
 // A KMS that answers nothing must cost the endpoint nothing.
 func TestConfigureEnclaveInfoHandlerSurvivesABlindAudit(t *testing.T) {
-	setAncestryTestEnv(t)
 	s, migrator := enclaveInfoTestServer(t)
 	kms := newFakeKMS()
 	kms.describeErr = errors.New("kms unreachable")
-	kms.getKeyPolicyErr = errors.New("kms unreachable")
-	ancestry := newTestAncestry(t, ancestryChain(2), NewKeyAuditor(kms))
+	p0, p1, p2 := ancestryPCR0(1), ancestryPCR0(2), ancestryPCR0(3)
+	fx := newAncestryFixture(
+		t, testSnapshot(p2, "key-2", p1, "key-1"), &kmsW{kms: kms},
+	)
+	fx.storeOriginReceipt(t, testSnapshot(p1, "key-1", p0, "key-0"))
+	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
+	ancestry := fx.a
 	ancestry.refresh(context.Background())
 
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, ancestry))

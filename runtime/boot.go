@@ -53,6 +53,14 @@ type bootResult struct {
 	tlsKey  crypto.Signer
 
 	migrationIntentBucketName string
+	lineage                   stateLineage
+}
+
+type stateLineage struct {
+	ownerPCR0           string
+	kmsKeyID            string
+	predecessorPCR0     string
+	predecessorKMSKeyID string
 }
 
 // bootSnapshot is the exact SSM-backed state covered by a
@@ -60,11 +68,20 @@ type bootResult struct {
 // reconstructed from SSM.
 type bootSnapshot struct {
 	kmsKeyID                  string
-	ownerPCR0                 string                          // generation the KMSKeyID path is scoped to
+	ownerPCR0                 string // generation the KMSKeyID path is scoped to
+	predecessorPCR0           string
+	predecessorKMSKeyID       string
 	staticSecrets             map[StaticSecretMetadata]string // metadata → ciphertext
 	storageDEK                string
 	tlsKeyCiphertext          string
 	migrationIntentBucketName string
+}
+
+func (s bootSnapshot) lineage() stateLineage {
+	return stateLineage{
+		ownerPCR0: s.ownerPCR0, kmsKeyID: s.kmsKeyID,
+		predecessorPCR0: s.predecessorPCR0, predecessorKMSKeyID: s.predecessorKMSKeyID,
+	}
 }
 
 // bootState is what every boot knows, whatever brought it about.
@@ -74,6 +91,7 @@ type bootState struct {
 	kmsKeyID    string
 
 	predecessorPCR0        string
+	predecessorKMSKeyID    string
 	predecessorAttestation string
 	bootReceipt            string // state-origin receipt for this PCR0
 	migrationReceipt       string // predecessor's transition receipt
@@ -95,7 +113,9 @@ type bootMode interface {
 	) (bootSnapshot, error)
 
 	// verifySnapshot proves the snapshot came from an enclave we accept.
-	verifySnapshot(state *bootState, nsm NSM, snapshotRoot []byte) error
+	verifySnapshot(
+		state *bootState, nsm NSM, snapshot bootSnapshot, snapshotRoot []byte,
+	) error
 
 	// commitSnapshot records what this boot established, if anything.
 	commitSnapshot(
@@ -104,6 +124,7 @@ type bootMode interface {
 		nsm NSM,
 		ssm SSM,
 		kms PrimaryKMS,
+		snapshot bootSnapshot,
 		snapshotRoot []byte,
 	) error
 }
@@ -193,7 +214,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 		return nil, fmt.Errorf("failed to open deployment genesis log: %w", err)
 	}
 
-	predecessorPCR0, predecessorAttestation, err := b.loadPredecessor(ctx)
+	predecessorPCR0, predecessorKMSKeyID, predecessorAttestation, err := b.loadPredecessor(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +222,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 		currentPCR0:            append([]byte(nil), b.pcr0...),
 		metadata:               metadata,
 		predecessorPCR0:        predecessorPCR0,
+		predecessorKMSKeyID:    predecessorKMSKeyID,
 		predecessorAttestation: predecessorAttestation,
 		snapshot: bootSnapshot{
 			ownerPCR0:                 hex.EncodeToString(b.pcr0),
@@ -310,7 +332,6 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, err
 	}
-
 	if kms.KeyID() != snapshot.kmsKeyID {
 		return bootResult{}, fmt.Errorf(
 			"state KMS key ID %q does not match active KMS key ID %q",
@@ -321,7 +342,7 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to build state root: %v", err)
 	}
-	if err := planned.mode.verifySnapshot(state, b.nsm, snapshotRoot); err != nil {
+	if err := planned.mode.verifySnapshot(state, b.nsm, snapshot, snapshotRoot); err != nil {
 		return bootResult{}, err
 	}
 
@@ -360,7 +381,9 @@ func (b *Boot) establish(
 		})
 	}
 
-	if err := planned.mode.commitSnapshot(ctx, state, b.nsm, b.ssm, kms, snapshotRoot); err != nil {
+	if err := planned.mode.commitSnapshot(
+		ctx, state, b.nsm, b.ssm, kms, snapshot, snapshotRoot,
+	); err != nil {
 		return bootResult{}, err
 	}
 	return bootResult{
@@ -369,6 +392,7 @@ func (b *Boot) establish(
 		secrets:                   secrets,
 		tlsKey:                    tlsKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
+		lineage:                   snapshot.lineage(),
 	}, nil
 }
 
@@ -391,30 +415,39 @@ func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyI
 		return fmt.Errorf("required TLS key SSM param missing: %w", err)
 	}
 	state.snapshot.kmsKeyID = keyID
+	state.snapshot.predecessorPCR0 = state.predecessorPCR0
+	state.snapshot.predecessorKMSKeyID = state.predecessorKMSKeyID
 	state.snapshot.staticSecrets = secrets
 	state.snapshot.storageDEK = dekCiphertext
 	state.snapshot.tlsKeyCiphertext = tlsKeyCiphertext
 	return nil
 }
 
-func (b *Boot) loadPredecessor(ctx context.Context) (pcr0, attestation string, err error) {
+func (b *Boot) loadPredecessor(
+	ctx context.Context,
+) (pcr0, keyID, attestation string, err error) {
 	ownPCR0 := hex.EncodeToString(b.pcr0)
 	pcr0, err = b.ssm.MayGet(ctx, migrationPreviousPCR0Param(ownPCR0))
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
+		return "", "", "", fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
+	}
+	keyID, err = b.ssm.MayGet(ctx, migrationPreviousKMSKeyIDParam(ownPCR0))
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
 	}
 	attestation, err = b.ssm.MayGet(ctx, migrationPreviousPCR0AttestationParam(ownPCR0))
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
+		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
-	if (pcr0 != "") != (attestation != "") {
-		return "", "", fmt.Errorf(
-			"inconsistent migration predecessor artifacts (pcr0 present=%v, attestation present=%v)",
+	if (pcr0 != "") != (keyID != "") || (pcr0 != "") != (attestation != "") {
+		return "", "", "", fmt.Errorf(
+			"inconsistent migration predecessor artifacts (pcr0 present=%v, key present=%v, attestation present=%v)",
 			pcr0 != "",
+			keyID != "",
 			attestation != "",
 		)
 	}
-	return pcr0, attestation, nil
+	return pcr0, keyID, attestation, nil
 }
 
 func (b *Boot) migrationIntentBucket(ctx context.Context) (string, error) {
@@ -567,19 +600,24 @@ func (b *migrationBoot) buildSnapshot(
 }
 
 // Genesis has nothing to verify against: it is the origin.
-func (b *genesisBoot) verifySnapshot(*bootState, NSM, []byte) error { return nil }
+func (b *genesisBoot) verifySnapshot(*bootState, NSM, bootSnapshot, []byte) error {
+	return nil
+}
 
-func (b *resumeBoot) verifySnapshot(state *bootState, nsm NSM, snapshotRoot []byte) error {
-	if err := verifyStateReceipt(
-		nsm, state.bootReceipt, purposeStateOrigin, snapshotRoot,
-		map[uint]string{0: hex.EncodeToString(state.currentPCR0)},
+func (b *resumeBoot) verifySnapshot(
+	state *bootState, nsm NSM, snapshot bootSnapshot, snapshotRoot []byte,
+) error {
+	if err := verifyOriginReceipt(
+		nsm, state.bootReceipt, snapshotRoot, snapshot.lineage(),
 	); err != nil {
 		return fmt.Errorf("invalid state-origin receipt: %w", err)
 	}
 	return nil
 }
 
-func (b *migrationBoot) verifySnapshot(state *bootState, nsm NSM, snapshotRoot []byte) error {
+func (b *migrationBoot) verifySnapshot(
+	state *bootState, nsm NSM, _ bootSnapshot, snapshotRoot []byte,
+) error {
 	if err := verifyStateReceipt(
 		nsm, state.migrationReceipt, purposeMigrationTransition,
 		snapshotRoot, predecessorExpectedPCRs(state),
@@ -590,13 +628,14 @@ func (b *migrationBoot) verifySnapshot(state *bootState, nsm NSM, snapshotRoot [
 }
 
 func (b *genesisBoot) commitSnapshot(
-	ctx context.Context, state *bootState, nsm NSM, ssm SSM, kms PrimaryKMS, snapshotRoot []byte,
+	ctx context.Context, state *bootState, nsm NSM, ssm SSM, kms PrimaryKMS,
+	snapshot bootSnapshot, snapshotRoot []byte,
 ) error {
 	if b.lease == nil {
 		return fmt.Errorf("refusing to commit genesis without lease")
 	}
 
-	if err := writeOriginReceipt(ctx, nsm, ssm, kms, snapshotRoot, state.currentPCR0); err != nil {
+	if err := writeOriginReceipt(ctx, nsm, ssm, snapshotRoot, snapshot.lineage()); err != nil {
 		return err
 	}
 
@@ -627,28 +666,51 @@ func (b *resumeBoot) commitSnapshot(
 	NSM,
 	SSM,
 	PrimaryKMS,
+	bootSnapshot,
 	[]byte,
 ) error {
 	return nil
 }
 
 func (b *migrationBoot) commitSnapshot(
-	ctx context.Context, state *bootState, nsm NSM, ssm SSM, kms PrimaryKMS, snapshotRoot []byte,
+	ctx context.Context, _ *bootState, nsm NSM, ssm SSM, _ PrimaryKMS,
+	snapshot bootSnapshot, snapshotRoot []byte,
 ) error {
-	return writeOriginReceipt(ctx, nsm, ssm, kms, snapshotRoot, state.currentPCR0)
+	return writeOriginReceipt(ctx, nsm, ssm, snapshotRoot, snapshot.lineage())
 }
 
 func writeOriginReceipt(
-	ctx context.Context, nsm NSM, ssm SSM, kms PrimaryKMS, snapshotRoot, currentPCR0 []byte,
+	ctx context.Context, nsm NSM, ssm SSM, snapshotRoot []byte, lineage stateLineage,
 ) error {
-	if err := writeStateReceipt(
-		ctx, nsm, ssm, snapshotRoot, purposeStateOrigin,
-		stateOriginReceiptParam(kms.KeyID(), hex.EncodeToString(currentPCR0)),
+	payload := stateOriginPayloadV1{
+		Purpose: purposeStateOrigin, StateRoot: snapshotRoot,
+		KMSKeyID: lineage.kmsKeyID, PredecessorPCR0: lineage.predecessorPCR0,
+		PredecessorKMSKeyID: lineage.predecessorKMSKeyID,
+	}
+	if err := writeReceipt(
+		ctx, nsm, ssm, payload,
+		stateOriginReceiptParam(lineage.kmsKeyID, lineage.ownerPCR0),
 	); err != nil {
 		return fmt.Errorf("failed to write state-origin receipt: %w", err)
 	}
-	slog.Info("wrote state-origin receipt", "key_id", prefix16(kms.KeyID()))
+	slog.Info("wrote state-origin receipt", "key_id", prefix16(lineage.kmsKeyID))
 	return nil
+}
+
+func verifyOriginReceipt(
+	nsm NSM, receipt string, stateRoot []byte, lineage stateLineage,
+) error {
+	payload, err := cbor.Marshal(stateOriginPayloadV1{
+		Purpose: purposeStateOrigin, StateRoot: stateRoot,
+		KMSKeyID: lineage.kmsKeyID, PredecessorPCR0: lineage.predecessorPCR0,
+		PredecessorKMSKeyID: lineage.predecessorKMSKeyID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to encode state origin payload: %w", err)
+	}
+	return verifyAttestationUserData(
+		nsm, receipt, map[uint]string{0: lineage.ownerPCR0}, payload,
+	)
 }
 
 // predecessorExpectedPCRs is the PCR set a predecessor's attestation must carry
@@ -684,8 +746,11 @@ func verifyPredecessorCommitment(nsm NSM, state *bootState) error {
 			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
 		)
 	}
-	return nsm.VerifyAttestation(
-		state.predecessorAttestation, predecessorExpectedPCRs(state), nil,
+	return verifyAttestationUserData(
+		nsm,
+		state.predecessorAttestation,
+		predecessorExpectedPCRs(state),
+		nil,
 	)
 }
 
@@ -737,12 +802,19 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
 	}
 
-	arts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+4)
-	arts = append(arts, ssmArtifactV1{
+	artifacts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+6)
+	artifacts = append(artifacts, ssmArtifactV1{
 		Name: kmsKeyIDParam(snapshot.ownerPCR0), Value: snapshot.kmsKeyID,
 	})
-	arts = append(arts, ssmArtifactV1{
+	artifacts = append(artifacts, ssmArtifactV1{
 		Name: migrationIntentBucketArtifact, Value: snapshot.migrationIntentBucketName,
+	})
+	artifacts = append(artifacts, ssmArtifactV1{
+		Name: migrationPreviousPCR0Param(snapshot.ownerPCR0), Value: snapshot.predecessorPCR0,
+	})
+	artifacts = append(artifacts, ssmArtifactV1{
+		Name:  migrationPreviousKMSKeyIDParam(snapshot.ownerPCR0),
+		Value: snapshot.predecessorKMSKeyID,
 	})
 
 	// The root must be deterministic; map order is not.
@@ -757,7 +829,7 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 				"failed sha256 hash of ciphertext %s: %w", param, err,
 			)
 		}
-		arts = append(arts, ssmArtifactV1{Name: param, ValueSHA256: h})
+		artifacts = append(artifacts, ssmArtifactV1{Name: param, ValueSHA256: h})
 	}
 
 	dekParam := storageDEKCiphertextParam(snapshot.kmsKeyID)
@@ -768,18 +840,18 @@ func stateRoot(snapshot bootSnapshot) ([]byte, error) {
 		)
 	}
 
-	arts = append(arts, ssmArtifactV1{Name: dekParam, ValueSHA256: dekHash})
+	artifacts = append(artifacts, ssmArtifactV1{Name: dekParam, ValueSHA256: dekHash})
 
 	tlsKeyParam := tlsKeyCiphertextParam(snapshot.kmsKeyID)
 	tlsKeyHash, err := sha256OfB64(snapshot.tlsKeyCiphertext)
 	if err != nil {
 		return nil, fmt.Errorf("failed sha256 hash of TLS key %s: %w", tlsKeyParam, err)
 	}
-	arts = append(arts, ssmArtifactV1{Name: tlsKeyParam, ValueSHA256: tlsKeyHash})
+	artifacts = append(artifacts, ssmArtifactV1{Name: tlsKeyParam, ValueSHA256: tlsKeyHash})
 
 	inputBytes, err := enc.Marshal(stateRootInputV1{
 		Schema:       stateRootSchemaV1,
-		SSMArtifacts: arts,
+		SSMArtifacts: artifacts,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("state_root: serialize input: %w", err)
@@ -805,7 +877,15 @@ func writeStateReceipt(
 	stateRoot []byte,
 	purpose, param string,
 ) error {
-	payload, err := cbor.Marshal(stateOriginPayloadV1{Purpose: purpose, StateRoot: stateRoot})
+	return writeReceipt(ctx, nsm, ssm, stateOriginPayloadV1{
+		Purpose: purpose, StateRoot: stateRoot,
+	}, param)
+}
+
+func writeReceipt(
+	ctx context.Context, nsm NSM, ssm SSM, receipt stateOriginPayloadV1, param string,
+) error {
+	payload, err := cbor.Marshal(receipt)
 	if err != nil {
 		return fmt.Errorf("serialize receipt payload: %w", err)
 	}
@@ -835,7 +915,7 @@ func verifyStateReceipt(
 		return fmt.Errorf("failed to encode state origin payload: %w", err)
 	}
 
-	return nsm.VerifyAttestation(receiptB64, expectedPCRs, expectedUserData)
+	return verifyAttestationUserData(nsm, receiptB64, expectedPCRs, expectedUserData)
 }
 
 // ssmArtifactV1 records a param value or its SHA256.
@@ -845,10 +925,7 @@ type ssmArtifactV1 struct {
 	ValueSHA256 []byte `cbor:"value_sha256,omitempty"`
 }
 
-// stateRootInputV1 is the state_root pre-image. Migration provenance is
-// deliberately excluded: the predecessor params are overwritten on every
-// migration attempt, so committing to them would brick an enclave's own receipt
-// on reboot — the handoff is authenticated by the transition receipt instead.
+// stateRootInputV1 is the state root pre-image.
 type stateRootInputV1 struct {
 	Schema       string          `cbor:"schema"`
 	SSMArtifacts []ssmArtifactV1 `cbor:"ssm_artifacts"`
@@ -859,10 +936,13 @@ type stateRootV1Doc struct {
 	Hash    []byte `cbor:"hash"`
 }
 
-// stateOriginPayloadV1 is the receipt's user_data.
+// stateOriginPayloadV1 is the receipt's user data.
 type stateOriginPayloadV1 struct {
-	Purpose   string `cbor:"purpose"`
-	StateRoot []byte `cbor:"state_root"`
+	Purpose             string `cbor:"purpose"`
+	StateRoot           []byte `cbor:"state_root"`
+	KMSKeyID            string `cbor:"kms_key_id,omitempty"`
+	PredecessorPCR0     string `cbor:"predecessor_pcr0,omitempty"`
+	PredecessorKMSKeyID string `cbor:"predecessor_kms_key_id,omitempty"`
 }
 
 func sha256OfB64(b64 string) ([]byte, error) {

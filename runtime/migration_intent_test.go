@@ -162,8 +162,10 @@ func TestMigrationIntentAppend(t *testing.T) {
 	require.WithinDuration(t, time.Now().Add(24*time.Hour), stored.retainUntil, time.Second)
 	entry, err := decodeMigrationIntentObject(stored.body)
 	require.NoError(t, err)
-	require.NoError(t, fx.nsm.VerifyAttestation(entry.Attestation, map[uint]string{0: fx.source},
-		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket)))
+	require.NoError(t, verifyAttestationUserData(
+		fx.nsm, entry.Attestation, map[uint]string{0: fx.source},
+		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket),
+	))
 
 	_, err = fx.log.Request(context.Background(), fx.source, targetB)
 	require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)

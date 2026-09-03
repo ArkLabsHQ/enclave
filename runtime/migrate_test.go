@@ -80,6 +80,23 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("non-empty user data", func(t *testing.T) {
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, []byte("unexpected")))
+
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
+			predecessorPCR0:        prevPCR0,
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
+		require.ErrorContains(t, err, "attested user data does not match")
+	})
+
 	t.Run("success", func(t *testing.T) {
 		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
 			0:                 prevPCR0Bytes,
@@ -361,6 +378,9 @@ func TestCompleteMigration(t *testing.T) {
 		require.True(t, fx.session.locks[migrationPCRIndex])
 
 		require.Equal(t, oldPCR0Hex, fx.ssmf.params[migrationPreviousPCR0Param(newPCR0)])
+		require.Equal(
+			t, "old-key", fx.ssmf.params[migrationPreviousKMSKeyIDParam(newPCR0)],
+		)
 		require.NotEmpty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam(newPCR0)])
 		require.Equal(t, migrationKeyID, fx.ssmf.params[kmsKeyIDParam(newPCR0)])
 		require.Equal(
@@ -664,6 +684,7 @@ func requireNoMigrationSideEffects(
 
 	require.Empty(t, fx.ssmf.params[kmsKeyIDParam(targetPCR0)])
 	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0Param(targetPCR0)])
+	require.Empty(t, fx.ssmf.params[migrationPreviousKMSKeyIDParam(targetPCR0)])
 	require.Empty(t, fx.ssmf.params[migrationPreviousPCR0AttestationParam(targetPCR0)])
 	for name := range fx.ssmf.params {
 		require.NotContains(t, name, "/Ciphertext/")

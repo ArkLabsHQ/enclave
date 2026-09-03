@@ -393,6 +393,7 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
 | `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
 | `/D/A/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
+| `/D/A/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Predecessor KMS key ID, committed into the successor's state root. |
 | `/D/A/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
 
 Every runtime-written path is scoped by a key ID, a PCR0, or both, so nothing is
@@ -400,11 +401,9 @@ ever overwritten. Each handoff therefore adds a generation rather than replacing
 one; prune retired generations only once you are certain you will never boot
 their PCR0 again.
 
-The ancestor-key audit adds no parameters of its own: it walks
-`MigrationPreviousPCR0/<pcr0>` backwards and reads `L/KMSKeyID/<pcr0>` at each
-hop. Pruning a retired generation's `KMSKeyID` therefore makes that generation
-report `unknown`, not `deleted` — the record of which key to check is gone, not
-the key. Delete the key first, confirm the audit reports `deleted`, then prune.
+Each state-origin receipt includes the generation's KMS key ID and its
+predecessor's PCR0 and KMS key ID. The audit follows those attested links without
+loading the generations' ciphertexts.
 
 ## HTTP API
 
@@ -446,37 +445,18 @@ retired generation keeps a key that can still decrypt state until an operator
 deletes it. The `ancestry` block of `/enclave/v1/info` reports what became of
 those keys, newest first.
 
-`complete` reports only what the walk observed: that it ran out of
-`MigrationPreviousPCR0` entries rather than stopping on a cycle, a malformed
-record or an SSM failure, which `reason` explains. It is not a claim that the
-chain reached the deployment's origin.
-
-Whether the chain reaches the origin is yours to decide. The `genesis` block
-carries the Object-Locked `deployment-genesis` record — its `pcr0`, and its
-`attestation` in base64 — so you can compare the oldest generation reported
-against it yourself. The runtime draws no conclusion from the pair: a verdict
-from the enclave under audit is worth nothing to a client that does not already
-trust it, and the runtime's own boot treats the record as advisory anyway, since
-one it cannot verify must still veto a genesis rather than fail open.
-
-Verify it against the AWS Nitro root, require PCR0 to equal the block's `pcr0`,
-and require `user_data` to equal the canonical CBOR of
-`{schema, bucket_name, pcr0}` for the intent bucket name you derived
-independently. That last check is what makes the record non-transferable: the
-bucket is inside the signature, so one copied from another deployment fails.
+`complete` is true only when every state-origin receipt verifies and the walk
+reaches a receipt with no predecessor. Missing, altered, malformed or
+cyclic state makes it false and `reason` explains the failure without exposing
+the underlying AWS error. The genesis generation is not repeated separately:
+it is the final verified state-origin receipt in the chain.
 
 | `state` | Meaning |
 |---|---|
-| `exists` | The key is present. Under `checked_via: describe_key` this also proves it is not scheduled for deletion. |
+| `exists` | `DescribeKey` reports that the key is present and not scheduled for deletion. |
 | `pending_deletion` | Deletion is scheduled; `deletion_date` says when it completes. |
 | `deleted` | KMS no longer knows the key. This generation can no longer decrypt anything. |
 | `unknown` | The state could not be read. The cause is logged, not published: the AWS error names role ARNs and account IDs, and this endpoint is unauthenticated. |
-
-`checked_via` is `describe_key`, `get_key_policy`, or `none`. The `get_key_policy`
-rung is the fallback for locked keys minted before `kms:DescribeKey` was in the
-key policy: it distinguishes present from deleted, but reports a key awaiting
-deletion as `exists`. It therefore understates deletion progress and never
-overstates it.
 
 `unknown` never means deleted. Only KMS reporting the key as absent produces
 `deleted`, so a permissions failure or a KMS outage can never be read as proof
@@ -487,10 +467,9 @@ is when it was built, and is `null` before the first probe completes. Reading it
 never calls SSM or KMS, so the endpoint cannot be made slow or unavailable by
 either.
 
-The chain has no length cap. Truncating it would drop the oldest generations,
-which are the most retired and so the ones the audit exists to account for. A
-corrupt chain still terminates: a PCR0 that repeats stops the walk and is
-reported through `complete` and `reason`.
+The chain has no length cap. A corrupt chain still terminates: a repeated
+PCR0/key identity stops the walk and is reported through `complete` and
+`reason`.
 
 ### Internal listener, TCP 127.0.0.1:8080
 
@@ -563,7 +542,7 @@ AWS credentials delivered through IMDS must allow:
 | `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
 | `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
-| `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. `DescribeKey` is only effective on unlocked keys, whose `RootRecovery` statement delegates it to IAM; locked keys authorise it through their own `EnclaveOperations` statement instead, so keys minted before that statement gained the action can never be described. |
+| `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
 | `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/enclave/*`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
@@ -641,9 +620,9 @@ The order is:
     poll the successor's `/enclave/v1/info` until that generation reports
     `state: "deleted"` in the `ancestry` block. Responses on that route are
     signed by the attestation-bound key, so that reading is the receipt that the
-    retired generation can no longer decrypt anything. Do not prune the
-    generation's `KMSKeyID` parameter before then — without it the audit reports
-    `unknown` rather than `deleted`.
+    retired generation can no longer decrypt anything. Preserve its state-origin
+    receipt until the audit has verified the deletion; a missing receipt makes
+    the ancestry incomplete rather than proving retirement.
 
 Lock posture must not change across a handoff. `ENCLAVE_KMS_KEY_LOCKED` selects
 the `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a

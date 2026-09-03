@@ -255,9 +255,7 @@ type fakeKMS struct {
 	encryptErr   error
 	createKeyErr error
 
-	// Key-audit surface: keyStates overrides what DescribeKey reports, describeErr
-	// forces a DescribeKey failure, and the counters prove which rung of the
-	// audit ladder ran.
+	// Key-audit surface.
 	keyStates           map[string]*kmstypes.KeyMetadata
 	describeErr         error
 	describeNilMetadata bool

@@ -351,6 +351,11 @@ func (m *migrator) CompleteMigration(
 			"failed to set SSM param %s: %w", migrationPreviousPCR0Param(targetPCR0), err,
 		)
 	}
+	if err := m.ssm.Set(
+		ctx, migrationPreviousKMSKeyIDParam(targetPCR0), m.kms.KeyID(),
+	); err != nil {
+		return nil, fmt.Errorf("failed to store predecessor KMS key ID: %w", err)
+	}
 
 	// Write handoff receipt before committing KMSKeyID.
 	if err := WriteTransitionReceipt(
@@ -360,6 +365,8 @@ func (m *migrator) CompleteMigration(
 		bootSnapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
 			ownerPCR0:                 targetPCR0,
+			predecessorPCR0:           ownPCR0,
+			predecessorKMSKeyID:       m.kms.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
 			tlsKeyCiphertext:          tlsKeyCiphertext,

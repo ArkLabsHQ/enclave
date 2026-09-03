@@ -15,8 +15,6 @@ const testLeaseBucket = "test-bucket"
 
 func setLeaseTestEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 }
 
 // writeLeaseDoc injects a lease object directly, as a peer enclave would have.
@@ -35,11 +33,11 @@ func TestLeaseAcquireUncontended(t *testing.T) {
 	ctx := context.Background()
 	s3 := newFakeS3()
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 	require.Equal(t, "prod/app/lock/genesis", key)
 	require.NotEmpty(t, s3.currentETag(key))
 	require.NoError(t, lease.Context().Err())
@@ -54,9 +52,9 @@ func TestLeaseAcquireContendedReturnsNil(t *testing.T) {
 	ctx := context.Background()
 	s3 := newFakeS3()
 	// A peer holds a lease that has not lapsed.
-	writeLeaseDoc(t, s3, leaseObjectKey("genesis"), time.Now().Add(time.Minute))
+	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(time.Minute))
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err, "contention is not an error")
 	require.Nil(t, lease)
 }
@@ -64,13 +62,13 @@ func TestLeaseAcquireContendedReturnsNil(t *testing.T) {
 func TestLeaseStealsOnlyAfterExpiry(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
 	t.Run("unexpired is not stealable", func(t *testing.T) {
 		s3 := newFakeS3()
 		writeLeaseDoc(t, s3, key, time.Now().Add(time.Second))
 
-		lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+		lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 		require.NoError(t, err)
 		require.Nil(t, lease)
 	})
@@ -79,7 +77,7 @@ func TestLeaseStealsOnlyAfterExpiry(t *testing.T) {
 		s3 := newFakeS3()
 		writeLeaseDoc(t, s3, key, time.Now().Add(-time.Second))
 
-		lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+		lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 		require.NoError(t, err)
 		require.NotNil(t, lease)
 		require.NoError(t, lease.Release(ctx))
@@ -90,7 +88,7 @@ func TestLeaseConcurrentStealAdmitsExactlyOne(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	writeLeaseDoc(t, s3, leaseObjectKey("genesis"), time.Now().Add(-time.Second))
+	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(-time.Second))
 
 	const racers = 8
 	var (
@@ -102,7 +100,7 @@ func TestLeaseConcurrentStealAdmitsExactlyOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+			lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 			require.NoError(t, err)
 			if lease != nil {
 				mu.Lock()
@@ -125,7 +123,7 @@ func TestLeaseRetriesConditionalConflict(t *testing.T) {
 	// retryable and must not be mistaken for contention.
 	s3.putConflicts = 2
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	require.NoError(t, lease.Release(ctx))
@@ -135,9 +133,16 @@ func TestLeaseHeartbeatRenews(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", 150*time.Millisecond)
+	lease, err := TryAcquireLease(
+		ctx,
+		testCfg,
+		s3,
+		testLeaseBucket,
+		"genesis",
+		150*time.Millisecond,
+	)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	first := s3.currentETag(key)
@@ -156,9 +161,9 @@ func TestLeaseVerifyRejectsLapsedLease(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	t.Cleanup(func() { _ = lease.Release(context.Background()) })
@@ -177,9 +182,16 @@ func TestLeaseHeartbeatDetectsTheft(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", 150*time.Millisecond)
+	lease, err := TryAcquireLease(
+		ctx,
+		testCfg,
+		s3,
+		testLeaseBucket,
+		"genesis",
+		150*time.Millisecond,
+	)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 
@@ -206,9 +218,9 @@ func TestLeaseHeartbeatDetectsDeletedObject(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Second)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Second)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 
@@ -231,7 +243,7 @@ func TestLeaseClaimRetriesWhenHolderReleasesMidSteal(t *testing.T) {
 	setLeaseTestEnv(t)
 	ctx := context.Background()
 	s3 := newFakeS3()
-	key := leaseObjectKey("genesis")
+	key := leaseObjectKey(testCfg, "genesis")
 
 	// A lapsed holder, so the claim reaches its steal path.
 	writeLeaseDoc(t, s3, key, time.Now().Add(-time.Minute))
@@ -243,7 +255,7 @@ func TestLeaseClaimRetriesWhenHolderReleasesMidSteal(t *testing.T) {
 		}
 	}
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 
 	require.NoError(t, err, "a clean release mid-steal must not fail the claim")
 	require.NotNil(t, lease)
@@ -253,12 +265,12 @@ func TestLeaseClaimRetriesWhenHolderReleasesMidSteal(t *testing.T) {
 func TestAcquireLeaseBlocksUntilContextEnds(t *testing.T) {
 	setLeaseTestEnv(t)
 	s3 := newFakeS3()
-	writeLeaseDoc(t, s3, leaseObjectKey("genesis"), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(time.Hour))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	lease, err := AcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := AcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.Nil(t, lease)
 	require.True(t, errors.Is(err, context.DeadlineExceeded))
 }
@@ -269,7 +281,7 @@ func TestAcquireLeaseReturnsImmediatelyWhenFree(t *testing.T) {
 	defer cancel()
 	s3 := newFakeS3()
 
-	lease, err := AcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := AcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	require.NoError(t, lease.Release(ctx))
@@ -280,9 +292,9 @@ func TestLeaseUnparseableObjectIsStealable(t *testing.T) {
 	ctx := context.Background()
 	s3 := newFakeS3()
 	// A corrupt lease must not wedge the lock forever.
-	s3.putRawObject(leaseObjectKey("genesis"), []byte("not json"))
+	s3.putRawObject(leaseObjectKey(testCfg, "genesis"), []byte("not json"))
 
-	lease, err := TryAcquireLease(ctx, s3, testLeaseBucket, "genesis", time.Minute)
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 	require.NoError(t, lease.Release(ctx))

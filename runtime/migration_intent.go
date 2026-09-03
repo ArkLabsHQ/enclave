@@ -70,6 +70,7 @@ type migrationIntent struct {
 }
 
 type migrationIntentLog struct {
+	cfg       *Config
 	s3        S3API
 	nsm       NSM
 	bucket    string
@@ -77,26 +78,26 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-func migrationIntentBucketName(accountID string) string {
-	identity := getDeployment() + "\x00" + getAppName()
+func migrationIntentBucketName(cfg *Config, accountID string) string {
+	identity := cfg.Deployment + "\x00" + cfg.AppName
 	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }
 
-func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
+func newMigrationIntentLog(
+	cfg *Config, s3Client S3API, nsm NSM, bucket string,
+) (*migrationIntentLog, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("migration intent bucket is required")
 	}
-	retention, err := migrationIntentRetention()
-	if err != nil {
-		return nil, err
-	}
+	retention := cfg.IntentRetention
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build migration intent CBOR encoder: %w", err)
 	}
 	return &migrationIntentLog{
-		s3: s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
+		cfg: cfg,
+		s3:  s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
 	}, nil
 }
 

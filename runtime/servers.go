@@ -48,6 +48,7 @@ type Servers interface {
 }
 
 type servers struct {
+	cfg     *Config
 	ext     *http.Server
 	int     *http.Server
 	sm      *http.ServeMux
@@ -118,6 +119,7 @@ func SetupHttpServers(
 	}
 
 	return &servers{
+		cfg:     &cfg,
 		ext:     ext,
 		int:     int,
 		sm:      sm,
@@ -226,13 +228,6 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 				http.StatusInternalServerError)
 			return
 		}
-		cooldown, err := getMigrationCooldown()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to get migration cooldown: %v", err),
-				http.StatusInternalServerError)
-			return
-		}
-
 		// Reading the audit cannot block or fail, so it is safe this late in the
 		// handler and cannot make the endpoint slow or unavailable.
 		var ancestryInfo *AncestryInfo
@@ -244,10 +239,10 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 			Version:                  Version,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
-			MigrationCooldownSeconds: int(cooldown.Seconds()),
+			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
-			KMSKeyLocked:             kmsKeyLocked(),
+			KMSKeyLocked:             s.cfg.KMSLocked,
 			Ancestry:                 ancestryInfo,
 		})
 	})

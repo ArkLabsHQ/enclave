@@ -63,15 +63,13 @@ func TestParseOTLPSpans(t *testing.T) {
 }
 
 func TestTracingHandlers(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	t.Run("post ships otlp", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		req := httptest.NewRequest(
@@ -85,16 +83,14 @@ func TestTracingHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/traces")
-		require.Equal(t, "/enclave/test/app/traces", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
+		require.Equal(t, "/enclave/prod/app/traces", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"test"`)
 	})
 }
 
 func TestTracingShipsToCloudWatch(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
@@ -104,7 +100,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		for i := 0; i < telemetryBatch; i++ {
@@ -120,8 +116,8 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/traces")
-		require.Equal(t, "/enclave/test/app/traces", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
+		require.Equal(t, "/enclave/prod/app/traces", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest span was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -131,7 +127,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 	t.Run("flushes on shutdown", func(t *testing.T) {
 		ctx := context.Background()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		now := time.Now().UTC()
@@ -146,7 +142,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/traces")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"flush me"`)
 	})

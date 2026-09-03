@@ -33,7 +33,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -47,7 +47,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 
-	telemetry := NewTelemetry(aws.CWL)
+	telemetry := NewTelemetry(&cfg, aws.CWL)
 	if err := telemetry.Start(ctx); err != nil {
 		return err
 	}
@@ -72,7 +72,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv()
+	nsm := nsmFromEnv(&cfg)
 
 	servers := SetupHttpServers(
 		rt,
@@ -88,7 +88,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	ssm := NewSSM(aws.SSM)
-	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
+	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
@@ -102,6 +102,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	migrator, err := NewMigrator(
+		&cfg,
 		nsm,
 		result.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
@@ -115,7 +116,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	ancestry := NewAncestry(nsm, ssm, result.kms, result.lineage)
+	ancestry := NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage)
 
 	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
@@ -133,7 +134,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
+	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
@@ -154,8 +155,8 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv() NSM {
-	return NewNSM(WithAttestationUnsigned(skipCOSEVerification()))
+func nsmFromEnv(cfg *Config) NSM {
+	return NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 }
 
 type appProcess interface {

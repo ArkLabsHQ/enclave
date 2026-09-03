@@ -77,14 +77,14 @@ type Telemetry struct {
 }
 
 // NewTelemetry wires the three signals in dependency order.
-func NewTelemetry(cw CloudWatchLogsAPI) *Telemetry {
+func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
 	t := &Telemetry{cw: cw}
 
 	name := time.Now().UTC().Format("2006-01-02T15-04-05Z")
 	for sig := signal(0); sig < signalCount; sig++ {
 		t.streams[sig] = &stream{
 			group: fmt.Sprintf(
-				"/enclave/%s/%s/%s", getDeployment(), getAppName(), sig),
+				"/enclave/%s/%s/%s", cfg.Deployment, cfg.AppName, sig),
 			name:   name,
 			events: make(chan cwltypes.InputLogEvent, telemetryQueue),
 		}

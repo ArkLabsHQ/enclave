@@ -73,15 +73,13 @@ func TestParseOTLPLogs(t *testing.T) {
 }
 
 func TestLogHandlers(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	t.Run("post ships otlp", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		req := httptest.NewRequest(
@@ -104,14 +102,14 @@ func TestLogHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
-		require.Equal(t, "/enclave/test/app/logs", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"test"`)
 	})
 
 	t.Run("post rejects unknown format", func(t *testing.T) {
-		telemetry := NewTelemetry(newFakeCloudWatchLogs())
+		telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 		logging := telemetry.Logging
 		req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader([]byte("{}")))
 		w := httptest.NewRecorder()
@@ -124,8 +122,6 @@ func TestLogHandlers(t *testing.T) {
 }
 
 func TestLoggingShipsToCloudWatch(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
@@ -135,7 +131,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		now := time.Now().UTC()
@@ -150,8 +146,8 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
-		require.Equal(t, "/enclave/test/app/logs", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest event was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -161,7 +157,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 	t.Run("flushes on shutdown", func(t *testing.T) {
 		ctx := context.Background()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		now := time.Now().UTC()
@@ -174,28 +170,26 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"flush me"`)
 	})
 }
 
 func TestSlogHandler(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	t.Run("ships the enclave own entry", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 		logger := slog.New(NewSlogHandler(telemetry.Logging)).With("component", "test")
 
 		logger.Warn("test message", "key", "value")
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.NotEmpty(t, put.LogEvents)
 		var entry logEntry
 		require.NoError(t,

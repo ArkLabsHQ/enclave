@@ -35,9 +35,11 @@ type Ancestry interface {
 }
 
 // NewAncestry starts from the lineage already authenticated during boot.
-func NewAncestry(nsm NSM, ssm SSM, keys KeyAuditor, current stateLineage) Ancestry {
+func NewAncestry(
+	cfg *Config, nsm NSM, ssm SSM, keys KeyAuditor, current stateLineage,
+) Ancestry {
 	return &ancestry{
-		nsm: nsm, ssm: ssm, keys: keys, current: current,
+		cfg: cfg, nsm: nsm, ssm: ssm, keys: keys, current: current,
 		snap: &AncestryInfo{
 			Generations: []AncestorGeneration{},
 			Reason:      ancestryNotYetProbed,
@@ -46,6 +48,7 @@ func NewAncestry(nsm NSM, ssm SSM, keys KeyAuditor, current stateLineage) Ancest
 }
 
 type ancestry struct {
+	cfg     *Config
 	nsm     NSM
 	ssm     SSM
 	keys    KeyAuditor
@@ -149,7 +152,7 @@ func (a *ancestry) walkAncestors(ctx context.Context) ([]AncestorGeneration, boo
 func (a *ancestry) loadVerifiedLineage(
 	ctx context.Context, pcr0, keyID string,
 ) (string, string, error) {
-	receipt, err := a.ssm.MustGet(ctx, stateOriginReceiptParam(keyID, pcr0))
+	receipt, err := a.ssm.MustGet(ctx, a.cfg.stateOriginReceiptParam(keyID, pcr0))
 	if err != nil {
 		return "", "", err
 	}

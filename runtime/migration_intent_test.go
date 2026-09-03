@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,17 +32,7 @@ type migrationIntentFixture struct {
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
-	return newMigrationIntentFixtureWithRetention(t, "87600h")
-}
-
-func newMigrationIntentFixtureWithRetention(
-	t *testing.T,
-	retention string,
-) *migrationIntentFixture {
 	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "intent")
-	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", retention)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{
@@ -49,9 +40,9 @@ func newMigrationIntentFixtureWithRetention(
 		verifyRoots: session.attestationSign.roots,
 	}}
 	s3f := newFakeS3()
-	log, err := newMigrationIntentLog(s3f, nsm, migrationIntentTestBucket)
+	log, err := newMigrationIntentLog(testCfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
-	genesis, err := newGenesisLog(s3f, nsm, migrationIntentTestBucket)
+	genesis, err := newGenesisLog(testCfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
 	return &migrationIntentFixture{
 		log:     log,
@@ -139,10 +130,10 @@ func TestMigrationIntentObjectKey(t *testing.T) {
 }
 
 func TestMigrationIntentAppend(t *testing.T) {
-	fx := newMigrationIntentFixtureWithRetention(t, "24h")
+	fx := newMigrationIntentFixture(t)
 	targetA := strings.Repeat("cd", 48)
 	targetB := strings.Repeat("ef", 48)
-	empty := newMigrationIntentFixtureWithRetention(t, "24h")
+	empty := newMigrationIntentFixture(t)
 	_, err := empty.log.Abort(context.Background(), empty.source)
 	require.ErrorIs(t, err, errMigrationIntentAbsent)
 
@@ -159,7 +150,12 @@ func TestMigrationIntentAppend(t *testing.T) {
 	stored := fx.s3.objects[key][0]
 	fx.s3.mu.Unlock()
 	require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
-	require.WithinDuration(t, time.Now().Add(24*time.Hour), stored.retainUntil, time.Second)
+	require.WithinDuration(
+		t,
+		time.Now().Add(testCfg.IntentRetention),
+		stored.retainUntil,
+		time.Second,
+	)
 	entry, err := decodeMigrationIntentObject(stored.body)
 	require.NoError(t, err)
 	require.NoError(t, verifyAttestationUserData(
@@ -186,7 +182,7 @@ func TestMigrationIntentAppend(t *testing.T) {
 }
 
 func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
-	fx := newMigrationIntentFixtureWithRetention(t, "24h")
+	fx := newMigrationIntentFixture(t)
 
 	// A self-targeted handoff would overwrite this enclave's own commit pointer
 	// and satisfy the PCR31 check trivially.
@@ -198,21 +194,34 @@ func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
 	require.Nil(t, head, "a refused request must publish no intent")
 }
 
-func TestMigrationIntentRetentionConfig(t *testing.T) {
+
+func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		value   string
-		wantErr string
+		name  string
+		isDev bool
 	}{
-		{name: "missing", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must not be empty"},
-		{name: "invalid", value: "later", wantErr: `invalid ENCLAVE_MIGRATION_INTENT_RETENTION "later"`},
-		{name: "zero", value: "0s", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
-		{name: "negative", value: "-1h", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
+		{name: "production", isDev: false},
+		{name: "dev", isDev: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", tc.value)
-			_, err := newMigrationIntentLog(newFakeS3(), nil, migrationIntentTestBucket)
-			require.ErrorContains(t, err, tc.wantErr)
+			t.Setenv("ENCLAVE_DEV", strconv.FormatBool(tc.isDev))
+			fx := newMigrationIntentFixture(t)
+
+			_, err := fx.log.Request(
+				context.Background(), fx.source, strings.Repeat("cd", 48),
+			)
+			require.NoError(t, err)
+
+			fx.s3.mu.Lock()
+			stored := fx.s3.objects[migrationIntentObjectKey(fx.source, 1)][0]
+			fx.s3.mu.Unlock()
+			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
+			require.WithinDuration(
+				t,
+				time.Now().Add(testCfg.IntentRetention),
+				stored.retainUntil,
+				10*time.Second,
+			)
 		})
 	}
 }
@@ -617,38 +626,31 @@ func mustMigrationIntentPayload(
 var _ S3API = (*migrationIntentPagedS3)(nil)
 
 func TestMigrationIntentBucketNameDerivation(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "wallet")
-	name := migrationIntentBucketName("123456789012")
+	const account = "123456789012"
+	nameFor := func(deployment, app string) string {
+		return migrationIntentBucketName(newTestConfig(deployment, app, false), account)
+	}
+	name := nameFor("prod", "wallet")
 
 	require.Regexp(t, `^enclave-123456789012-[0-9a-f]{16}-migration-intents$`, name)
 	require.LessOrEqual(t, len(name), 63, "S3 bucket names cap at 63 characters")
-	require.Equal(t, name, migrationIntentBucketName("123456789012"), "must be stable")
+	require.Equal(t, name, nameFor("prod", "wallet"), "must be stable")
 
 	// The account is what keeps two accounts off the same globally unique name.
-	require.NotEqual(t, name, migrationIntentBucketName("210987654321"))
+	require.NotEqual(t, name, migrationIntentBucketName(
+		newTestConfig("prod", "wallet", false), "210987654321",
+	))
 
-	t.Run("distinct per application", func(t *testing.T) {
-		t.Setenv("ENCLAVE_APP_NAME", "vault")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
-	})
+	require.NotEqual(t, name, nameFor("prod", "vault"), "distinct per application")
+	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per deployment")
 
-	t.Run("distinct per deployment", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "staging")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
-	})
+	// The NUL separator is what stops "prodwal"+"let" colliding with
+	// "prod"+"wallet".
+	require.NotEqual(t, name, nameFor("prodwal", "let"))
 
 	t.Run("survives names S3 would reject", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "Prod_EU_West")
-		t.Setenv("ENCLAVE_APP_NAME", strings.Repeat("long", 40))
-		long := migrationIntentBucketName("123456789012")
+		long := nameFor("Prod_EU_West", strings.Repeat("long", 40))
 		require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, long)
 		require.LessOrEqual(t, len(long), 63)
-	})
-
-	t.Run("separator prevents identity collisions", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "prodwal")
-		t.Setenv("ENCLAVE_APP_NAME", "let")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
 	})
 }

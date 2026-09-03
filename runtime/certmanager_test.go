@@ -22,8 +22,6 @@ const certTestBucket = "cert-bucket"
 
 func setCertTestEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 }
 
 // issueTestCertWithKey mints a self-signed leaf standing in for a CA-issued one.
@@ -112,14 +110,14 @@ func TestSelfSignedIssuerSharesOneCertAcrossTheFleet(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	key := newTestTLSKey(t)
-	firstStore := newCertStore(
+	firstStore := newCertStore(testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
 		certTestBucket,
 		"enclave.test",
 	)
-	secondStore := newCertStore(
+	secondStore := newCertStore(testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
@@ -200,7 +198,14 @@ func TestSelfSignedIssuerServesAnIPEndpoint(t *testing.T) {
 	s3f := newFakeS3()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	store := newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "192.0.2.10")
+	store := newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"192.0.2.10",
+	)
 	certPEM, err := selfSignedIssuer{}.Issue(ctx, "192.0.2.10", key)
 	require.NoError(t, err)
 
@@ -220,15 +225,15 @@ func TestACMEDoesNotAdoptTheSelfSignedCertificate(t *testing.T) {
 	key := newTestTLSKey(t)
 
 	// The fleet ran self-signed first.
-	selfSignedStore := newSelfSignedCertStore(s3f, d, key, certTestBucket, "enclave.test")
-	_, err := newCertManager(ctx, selfSignedStore, selfSignedIssuer{},
+	selfSignedStore := newSelfSignedCertStore(testCfg, s3f, d, key, certTestBucket, "enclave.test")
+	_, err := newCertManager(ctx, testCfg, selfSignedStore, selfSignedIssuer{},
 		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
 	require.NoError(t, err)
 
 	// Then ACME was switched on.
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	acmeStore := newCertStore(s3f, d, key, certTestBucket, "enclave.test")
-	withACME, err := newCertManager(ctx, acmeStore, issuer,
+	acmeStore := newCertStore(testCfg, s3f, d, key, certTestBucket, "enclave.test")
+	withACME, err := newCertManager(ctx, testCfg, acmeStore, issuer,
 		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
 	require.NoError(t, err)
 
@@ -246,7 +251,14 @@ func newCertTestStore(s3f *fakeS3) *certStore {
 	if err != nil {
 		panic(err)
 	}
-	return newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "enclave.test")
+	return newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"enclave.test",
+	)
 }
 
 func newTestTLSKey(t *testing.T) crypto.Signer {
@@ -263,7 +275,7 @@ func tryNewCertTestManager(
 	hashes := &AttestationHashes{}
 	store := newCertTestStore(s3f)
 	m, err := newCertManager(
-		context.Background(), store, issuer,
+		context.Background(), testCfg, store, issuer,
 		s3f, certTestBucket, "enclave.test", store.key, hashes,
 	)
 	return m, hashes, err
@@ -288,7 +300,7 @@ func newCertTestManagerForStore(
 	t.Helper()
 	hashes := &AttestationHashes{}
 	m, err := newCertManager(
-		context.Background(), store, issuer,
+		context.Background(), testCfg, store, issuer,
 		store.s3, store.bucket, store.fqdn, store.key, hashes,
 	)
 	require.NoError(t, err)
@@ -332,13 +344,13 @@ func TestRenewWithLeaseStopsWhenTheLeaseIsLost(t *testing.T) {
 
 	// A short TTL so the heartbeat notices the theft inside the test.
 	lease, err := TryAcquireLease(
-		context.Background(), s3f, certTestBucket, "renew-test", time.Second,
+		context.Background(), testCfg, s3f, certTestBucket, "renew-test", time.Second,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, lease)
 
 	// A peer steals it, so the heartbeat cancels the lease context.
-	writeLeaseDoc(t, s3f, leaseObjectKey("renew-test"), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, s3f, leaseObjectKey(testCfg, "renew-test"), time.Now().Add(time.Hour))
 	require.Eventually(t, func() bool {
 		return lease.Context().Err() != nil
 	}, 2*time.Second, 10*time.Millisecond, "heartbeat should detect the theft")
@@ -365,7 +377,7 @@ func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {
 	require.Equal(t, attestedHash(served), hashes.Serialize())
 
 	// The lease is released, so a peer is not blocked behind us.
-	require.Empty(t, s3f.currentETag(leaseObjectKey(certLeaseName)))
+	require.Empty(t, s3f.currentETag(leaseObjectKey(testCfg, certLeaseName)))
 }
 
 func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
@@ -452,7 +464,7 @@ func TestCertManagerRenewSkipsWhenLeaseIsUnavailable(t *testing.T) {
 
 	m, _ := newCertTestManagerForStore(t, store, issuer)
 
-	writeLeaseDoc(t, s3f, leaseObjectKey(certLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, s3f, leaseObjectKey(testCfg, certLeaseName), time.Now().Add(time.Hour))
 
 	renewed, err := m.renewUnderLease(context.Background(), "")
 	require.NoError(t, err)
@@ -526,14 +538,21 @@ func TestFleetKeepsOneIdentityWhilePeerHasNotAdoptedRenewal(t *testing.T) {
 		notAfter: time.Now().Add(time.Hour),
 	}
 	key := newTestTLSKey(t)
-	renewerStore := newCertStore(
+	renewerStore := newCertStore(testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
 		certTestBucket,
 		"enclave.test",
 	)
-	peerStore := newCertStore(s3f, &dek{key: make([]byte, 32)}, key, certTestBucket, "enclave.test")
+	peerStore := newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: make([]byte, 32)},
+		key,
+		certTestBucket,
+		"enclave.test",
+	)
 	renewer, renewerHashes := newCertTestManagerForStore(t, renewerStore, issuer)
 	peer, peerHashes := newCertTestManagerForStore(t, peerStore, issuer)
 
@@ -646,7 +665,11 @@ func TestCertManagerIssueFailurePropagates(t *testing.T) {
 
 	require.Nil(t, m, "a manager must not exist without a certificate")
 	require.ErrorContains(t, err, "CA unavailable")
-	require.Empty(t, s3f.currentETag(leaseObjectKey(certLeaseName)), "lease must be released")
+	require.Empty(
+		t,
+		s3f.currentETag(leaseObjectKey(testCfg, certLeaseName)),
+		"lease must be released",
+	)
 }
 
 // The attested hash and the served certificate must never disagree: a client
@@ -706,7 +729,7 @@ func TestCertStoreConditionalConflictIsCertChanged(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	dek := &dek{key: make([]byte, 32)}
-	store := newCertStore(s3f, dek, newTestTLSKey(t), certTestBucket, "enclave.test")
+	store := newCertStore(testCfg, s3f, dek, newTestTLSKey(t), certTestBucket, "enclave.test")
 	certPEM := issueTestCertWithKey(t, "enclave.test", time.Now().Add(90*24*time.Hour), store.key)
 
 	s3f.putConflicts = 1

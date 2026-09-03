@@ -69,8 +69,6 @@ derivation.
           ENCLAVE_DEPLOYMENT = "prod";
           ENCLAVE_APP_NAME = "myapp";
           ENCLAVE_AWS_REGION = "eu-west-1";
-          ENCLAVE_PREVIOUS_PCR0 = "genesis";
-          ENCLAVE_MIGRATION_INTENT_RETENTION = "87600h";
         };
       };
     in
@@ -176,7 +174,7 @@ different keys even if a lease expires between verification and commit.
 
 | Condition | Path | Behaviour |
 |---|---|---|
-| genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires `ENCLAVE_PREVIOUS_PCR0=genesis` and no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
+| genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
 | `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
 | genesis object present and `KMSKeyID/<pcr0>` absent | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
@@ -246,9 +244,7 @@ measurement. A subset can be overridden at runtime from SSM.
 |---|---|---|
 | `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
-| `ENCLAVE_DEV` | `false` | When `true`, disables COSE signature and certificate chain verification of attestation documents and shortens the clock-sync poll interval from five minutes to five seconds. For local testing against emulated NSM only. See [Security notes](#security-notes). |
-| `ENCLAVE_PREVIOUS_PCR0` | none | Required. Either the literal `genesis`, or the predecessor's PCR0 when adopting migrated state. Unset fails the boot. |
-| `ENCLAVE_KMS_KEY_LOCKED` | `false` | When `true`, the KMS key policy omits the root recovery principal and the SSM namespace segment becomes `locked` instead of `unlocked`. |
+| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and one minute, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours. There is no way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
 
@@ -256,29 +252,32 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_NITRIDING_EXT_PORT` | `443` | External TLS listener. |
-| `ENCLAVE_NITRIDING_INT_PORT` | `8080` | Internal loopback API listener. |
 | `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
 | `ENCLAVE_NITRIDING_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
 | `ENCLAVE_NITRIDING_FQDN` | `localhost` | Hostname for the TLS certificate. |
-| `ENCLAVE_NITRIDING_HOST_PROXY_PORT` | `1024` | Host vsock port where gvproxy listens. |
 | `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
 | `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
 
+The external TLS listener (443), the internal loopback listener (8080) and the
+host vsock port gvproxy listens on (1024) are fixed. The last of those is
+hardcoded on the host side too, so a value only the enclave knew about would
+silently break networking.
+
 ### Migration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `ENCLAVE_MIGRATION_COOLDOWN` | `0` | Minimum interval between `/request-migration` and `/finalise-migration`. A negative or unparseable value fails the boot. |
-| `ENCLAVE_MIGRATION_INTENT_RETENTION` | none | Required. Positive Go duration for the S3 Object Lock retention applied to each migration intent record. |
+The cooldown between `/request-migration` and `/finalise-migration`, and the S3
+Object Lock retention on each migration intent record, are not configurable. They
+are 24 hours and ten years in production, two seconds and one minute under
+`ENCLAVE_DEV`. An operator who could shorten them could wait out the Object Lock
+and roll back undetected, so the measured image settles them.
 
 ### Clock
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `ENCLAVE_VERIFY_CLOCK_SOURCE` | `false` | When `true`, fails the boot unless the system clock source is `kvm-clock`. |
+Production fails the boot unless the system clock source is `kvm-clock`. Under
+`ENCLAVE_DEV` the assertion is skipped, because the QEMU harness boots without
+the paravirtualized clock.
 
 The runtime hard-steps the clock onto the PTP hardware clock at startup, then
 runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
@@ -339,12 +338,13 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Nine names are refused, because they define the enclave's identity or security
+Four names are refused, because they define the enclave's identity or security
 posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
-`ENCLAVE_APP_NAME`, `ENCLAVE_KMS_KEY_LOCKED`,
-`ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_MIGRATION_INTENT_RETENTION`,
-`ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_PREVIOUS_PCR0`, `ENCLAVE_DEV`,
-`ENCLAVE_VERIFY_CLOCK_SOURCE`.
+`ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_DEV`. The list used to be
+nine: the lock posture, the migration cooldown, the intent retention and the
+clock-source assertion left it by ceasing to be configuration at all —
+`ENCLAVE_DEV` settles all four — and the predecessor PCR0 left it because the
+predecessor's own attestation carries the binding.
 
 Five TLS and ACME settings are read **only** from this overlay, never from the
 baked environment, because TLS is configured before the overlay is applied to
@@ -574,9 +574,7 @@ rollback path because there is nothing to roll back.
 
 The order is:
 
-1. Build the successor EIF and read its PCR0. Its
-   `ENCLAVE_PREVIOUS_PCR0` must be set to the predecessor's PCR0, so the
-   predecessor measurement is an input to the successor build.
+1. Build the successor EIF and read its PCR0.
 2. Prepare the successor host and routing, but do not boot the successor.
 3. Request the migration against the predecessor:
    ```sh
@@ -624,9 +622,10 @@ The order is:
     receipt until the audit has verified the deletion; a missing receipt makes
     the ancestry incomplete rather than proving retirement.
 
-Lock posture must not change across a handoff. `ENCLAVE_KMS_KEY_LOCKED` selects
-the `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
-different subtree, finds nothing, and fails to boot.
+Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
+`locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
+different subtree, finds nothing, and fails to boot. A production image can
+therefore never adopt a deployment created by a dev image, or the reverse.
 
 ## Verifying an enclave
 
@@ -789,9 +788,10 @@ cutover.
 
 The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace. It separately
 sets `ENCLAVE_DEV=true` because QEMU's emulated NSM produces no AWS certificate
-chain. This skips COSE signature and certificate chain verification and shortens
-the clock-sync poll interval from five minutes to five seconds; it is only for
-local testing against the emulator.
+chain and the harness has no paravirtualized clock. That one flag also gives the
+suite the short Object Lock retentions and two-second cooldown it needs to
+exercise a handoff in seconds rather than years; it is only for local testing
+against the emulator.
 
 ### Troubleshooting
 
@@ -821,8 +821,12 @@ should not be retried.
 
 ## Security notes
 
-**`ENCLAVE_DEV=true` disables COSE signature verification.** In that mode the
-runtime decodes attestation documents but does not verify their signature or
+**`ENCLAVE_DEV=true` selects the insecure security envelope.** It disables COSE
+signature verification, skips the `kvm-clock` assertion, leaves the KMS key
+policy amendable with its root recovery principal, and cuts both S3 Object Lock
+retentions to minutes and the migration cooldown to seconds — so a dev
+deployment's migration anchor can be waited out almost immediately. In that mode
+the runtime decodes attestation documents but does not verify their signature or
 validate the certificate chain against the AWS Nitro root. It logs `INSECURE:
 skipping COSE signature verification of attestation document` at startup. PCR
 comparison and `user_data` checks still apply. Only set `ENCLAVE_DEV=true` for

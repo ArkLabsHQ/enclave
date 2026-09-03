@@ -200,9 +200,6 @@ let
     ENCLAVE_DEV = "true";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_AWS_REGION = "us-east-1";
-    ENCLAVE_KMS_KEY_LOCKED = "false";
-    ENCLAVE_MIGRATION_COOLDOWN = "2s";
-    ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
     ENCLAVE_NITRIDING_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
@@ -230,13 +227,11 @@ let
     };
 
   blueEif = mkTestEif {
-    ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
   };
   bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
 
   greenEif = mkTestEif {
-    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
     ENCLAVE_TEST_SALT = "green";
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;

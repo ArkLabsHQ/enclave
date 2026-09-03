@@ -399,8 +399,7 @@ func (n *awsNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
 	}
 
 	if n.unsigned {
-		slog.Warn("INSECURE: skipping COSE signature verification of attestation document",
-			"deployment", getDeployment())
+		slog.Warn("INSECURE: skipping COSE signature verification of attestation document")
 		return &nitrite.Result{
 			Document:    &document,
 			Protected:   envelope.Protected,

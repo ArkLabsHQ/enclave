@@ -17,10 +17,7 @@ import (
 )
 
 func TestNewTelemetryWiresDropCountingThroughMetrics(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
-	telemetry := NewTelemetry(newFakeCloudWatchLogs())
+	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 
 	// Every signal reports drops through the metrics counters, which is the
 	// dependency that forces metrics to be built first.
@@ -35,30 +32,25 @@ func TestNewTelemetryWiresDropCountingThroughMetrics(t *testing.T) {
 }
 
 func TestTelemetryStartsAllThreeSignals(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 
 	startTelemetry(t, ctx, telemetry)
 
 	require.ElementsMatch(t, []string{
-		"/enclave/test/app/logs",
-		"/enclave/test/app/traces",
-		"/enclave/test/app/metrics",
+		"/enclave/prod/app/logs",
+		"/enclave/prod/app/traces",
+		"/enclave/prod/app/metrics",
 	}, cw.groups)
 }
 
 // A failure to start must surface rather than be logged into the sink that
 // failed, so slog is redirected only after all three are shipping.
 func TestTelemetryLeavesSlogAloneWhenStartFails(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
 
@@ -66,7 +58,7 @@ func TestTelemetryLeavesSlogAloneWhenStartFails(t *testing.T) {
 	cw := newFakeCloudWatchLogs()
 	cw.createLogGroupErr = sentinel
 
-	err := NewTelemetry(cw).Start(context.Background())
+	err := NewTelemetry(testCfg, cw).Start(context.Background())
 
 	require.ErrorIs(t, err, sentinel)
 	require.ErrorContains(t, err, "cloudwatch export")
@@ -74,19 +66,16 @@ func TestTelemetryLeavesSlogAloneWhenStartFails(t *testing.T) {
 }
 
 func TestCloudWatchStreamBatches(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
 	t.Run("creates the group and stream once", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		startTelemetry(t, ctx, NewTelemetry(cw))
+		startTelemetry(t, ctx, NewTelemetry(testCfg, cw))
 
 		require.ElementsMatch(t, []string{
-			"/enclave/test/app/logs",
-			"/enclave/test/app/traces",
-			"/enclave/test/app/metrics",
+			"/enclave/prod/app/logs",
+			"/enclave/prod/app/traces",
+			"/enclave/prod/app/metrics",
 		}, cw.groups)
 		require.Len(t, cw.streams, int(signalCount))
 	})
@@ -98,7 +87,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		// Sent newest first, so an unsorted batch would be rejected by CloudWatch.
@@ -108,7 +97,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 				map[string]int{"seq": i})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.Len(t, put.LogEvents, telemetryBatch)
 		for i := 1; i < len(put.LogEvents); i++ {
 			require.LessOrEqual(t,
@@ -121,12 +110,12 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
 		telemetry.Send(signalLogs, time.Now().UTC(), map[string]string{"msg": "alone"})
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"alone"`)
 	})
@@ -134,7 +123,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 	t.Run("keeps the event that crosses the byte boundary", func(t *testing.T) {
 		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(cw)
+		telemetry := NewTelemetry(testCfg, cw)
 
 		before := slog.Default()
 		t.Cleanup(func() { slog.SetDefault(before) })
@@ -145,7 +134,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 			telemetry.Send(signalLogs, time.Now().UTC(), payload)
 		}
 
-		first := requireCloudWatchPutTo(t, cw, "/enclave/test/app/logs")
+		first := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.Len(t, first.LogEvents, 4)
 		telemetry.Shutdown()
 
@@ -153,7 +142,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		defer cw.mu.Unlock()
 		shipped := 0
 		for _, put := range cw.puts {
-			if aws.ToString(put.LogGroupName) == "/enclave/test/app/logs" &&
+			if aws.ToString(put.LogGroupName) == "/enclave/prod/app/logs" &&
 				!isShipperMarker(put) {
 				shipped += len(put.LogEvents)
 			}
@@ -166,8 +155,6 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 // Send must never block. It is the reason slog and the request handlers can call
 // it, so this is the property to fail on if someone makes the send synchronous.
 func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h") // never flush on the tick
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -177,7 +164,7 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 	cw.putBlock = release
 	defer close(release)
 
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 	startTelemetry(t, ctx, telemetry)
 
 	const overfill = telemetryQueue * 3
@@ -204,19 +191,17 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 }
 
 func TestMetricsShipSnapshot(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 	telemetry.Metrics.Inc(metricHTTPRequests)
 	telemetry.Metrics.SetAppMetric("custom", 2)
 	startTelemetry(t, ctx, telemetry)
 
-	put := requireCloudWatchPutTo(t, cw, "/enclave/test/app/metrics")
+	put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/metrics")
 
 	// One snapshot per tick, and a flush may carry more than one of them.
 	require.NotEmpty(t, put.LogEvents)
@@ -236,7 +221,7 @@ func TestMetricsShipSnapshot(t *testing.T) {
 // it pins the API change against accidental reinstatement.
 func TestTelemetryReadEndpointsAreGone(t *testing.T) {
 	sm := http.NewServeMux()
-	telemetry := NewTelemetry(newFakeCloudWatchLogs())
+	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 
 	sm.HandleFunc("POST /v1/metrics", HandleMetricPost(telemetry.Metrics))
 	sm.HandleFunc("POST /v1/logs", HandleLogsPost(telemetry.Logging))
@@ -266,9 +251,6 @@ func TestEnclaveInfoCarriesNoMetrics(t *testing.T) {
 // Creating a log group proves nothing about writing to it. Without the startup
 // write, a role missing logs:PutLogEvents boots clean and loses everything.
 func TestStartFailsWhenTheStreamIsNotWritable(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
 
@@ -276,7 +258,7 @@ func TestStartFailsWhenTheStreamIsNotWritable(t *testing.T) {
 	cw := newFakeCloudWatchLogs()
 	cw.putLogEventsErr = sentinel
 
-	err := NewTelemetry(cw).Start(context.Background())
+	err := NewTelemetry(testCfg, cw).Start(context.Background())
 
 	require.ErrorIs(t, err, sentinel)
 	require.ErrorContains(t, err, "write to log stream")
@@ -286,14 +268,12 @@ func TestStartFailsWhenTheStreamIsNotWritable(t *testing.T) {
 // A batch AWS keeps refusing must not be retried forever: that would stall the
 // stream behind one poisoned event and hold its memory for the whole run.
 func TestFlushShedsAPoisonedBatchInsteadOfStalling(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 	startTelemetry(t, ctx, telemetry)
 
 	// Refuse everything after the startup write.
@@ -314,10 +294,7 @@ func TestFlushShedsAPoisonedBatchInsteadOfStalling(t *testing.T) {
 // Events CloudWatch would reject on age are shed as they arrive, so one stale
 // event cannot take the whole batch with it.
 func TestSendShedsEventsCloudWatchWouldReject(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
-	telemetry := NewTelemetry(newFakeCloudWatchLogs())
+	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startTelemetry(t, ctx, telemetry)
@@ -349,10 +326,7 @@ func TestRejectedCountReadsThePutResponse(t *testing.T) {
 
 // An oversized event would reject every batch it joined, so it is shed at Send.
 func TestSendShedsAnOversizedEvent(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-
-	telemetry := NewTelemetry(newFakeCloudWatchLogs())
+	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 	telemetry.Send(signalLogs, time.Now(), strings.Repeat("x", maxEventBytes))
 
 	require.Equal(t, int64(1), telemetry.Dropped(signalLogs))
@@ -360,12 +334,10 @@ func TestSendShedsAnOversizedEvent(t *testing.T) {
 
 // Shutdown must wait for the pumps, or Run returning ends the process mid-write.
 func TestShutdownFlushesWhatIsStillQueued(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h") // only Shutdown can flush this
 
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 	startTelemetry(t, context.Background(), telemetry)
 
 	telemetry.Send(signalLogs, time.Now().UTC(), map[string]string{"msg": "last words"})
@@ -385,15 +357,13 @@ func TestShutdownFlushesWhatIsStillQueued(t *testing.T) {
 }
 
 func TestShutdownShedsAFinalBatchAfterRetryLimit(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
 
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(cw)
+	telemetry := NewTelemetry(testCfg, cw)
 	require.NoError(t, telemetry.Start(context.Background()))
 
 	cw.mu.Lock()

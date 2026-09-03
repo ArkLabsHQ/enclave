@@ -43,6 +43,7 @@ type certIssuer interface {
 
 // certManager serves the shared certificate and keeps it fresh.
 type certManager struct {
+	cfg         *Config
 	store       *certStore
 	issuer      certIssuer
 	s3          S3API
@@ -56,6 +57,7 @@ type certManager struct {
 
 func newCertManager(
 	ctx context.Context,
+	cfg *Config,
 	store *certStore,
 	issuer certIssuer,
 	s3api S3API,
@@ -64,6 +66,7 @@ func newCertManager(
 	hashes *AttestationHashes,
 ) (*certManager, error) {
 	m := &certManager{
+		cfg:         cfg,
 		store:       store,
 		issuer:      issuer,
 		s3:          s3api,
@@ -96,7 +99,7 @@ func (m *certManager) resolve(ctx context.Context) (*certBundle, error) {
 
 	// Prevents duplicate issuance if multiple enclaves start up at once.
 	slog.Info("no shared certificate found, issuing", "fqdn", m.fqdn)
-	lease, err := AcquireLease(ctx, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
+	lease, err := AcquireLease(ctx, m.cfg, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
 	if err != nil {
 		return nil, fmt.Errorf("acquire renewal lease for first issuance: %w", err)
 	}
@@ -158,7 +161,7 @@ func (m *certManager) tick(ctx context.Context) error {
 
 // renewUnderLease renews only if this enclave wins the lease;
 func (m *certManager) renewUnderLease(ctx context.Context, certETag string) (*certBundle, error) {
-	lease, err := TryAcquireLease(ctx, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
+	lease, err := TryAcquireLease(ctx, m.cfg, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
 	if err != nil {
 		return nil, fmt.Errorf("acquire renewal lease: %w", err)
 	}

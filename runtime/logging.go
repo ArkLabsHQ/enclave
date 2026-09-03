@@ -5,27 +5,20 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/proto"
 )
 
-// logEntry is a single structured log entry emitted by the enclave app or supervisor.
+// logEntry is a single structured log entry emitted by the enclave or the app.
 type logEntry struct {
 	ID         string         `json:"id"`
 	Timestamp  string         `json:"timestamp"`
@@ -33,105 +26,6 @@ type logEntry struct {
 	Message    string         `json:"message"`
 	Attributes map[string]any `json:"attributes,omitempty"`
 	Source     string         `json:"source"`
-}
-
-// validTraceLevels maps log levels to severity order.
-var validTraceLevels = map[string]int{
-	"debug": 0,
-	"info":  1,
-	"warn":  2,
-	"error": 3,
-}
-
-// logBuffer is a bounded ring buffer for log entries.
-// Safe for concurrent use.
-type logBuffer struct {
-	mu      sync.Mutex
-	entries []logEntry
-	cap     int
-	head    int // next write position
-	count   int
-}
-
-func newLogBuffer(capacity int) *logBuffer {
-	if capacity <= 0 {
-		capacity = 1000
-	}
-	return &logBuffer{
-		entries: make([]logEntry, capacity),
-		cap:     capacity,
-	}
-}
-
-// add appends one or more log entries, evicting oldest when full.
-func (tb *logBuffer) add(entries ...logEntry) {
-	if len(entries) == 0 {
-		return
-	}
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	for _, e := range entries {
-		tb.entries[tb.head] = e
-		tb.head = (tb.head + 1) % tb.cap
-		if tb.count < tb.cap {
-			tb.count++
-		}
-	}
-}
-
-// query filters logs oldest-first; zero values disable filters.
-func (tb *logBuffer) query(since time.Time, level string, limit int) []logEntry {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	if tb.count == 0 {
-		return []logEntry{}
-	}
-
-	start := 0
-	if tb.count == tb.cap {
-		start = tb.head
-	}
-
-	minSeverity := -1
-	if level != "" {
-		if s, ok := validTraceLevels[level]; ok {
-			minSeverity = s
-		}
-	}
-
-	result := make([]logEntry, 0, tb.count)
-	for i := 0; i < tb.count; i++ {
-		idx := (start + i) % tb.cap
-		entry := tb.entries[idx]
-
-		if !since.IsZero() {
-			if t, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
-				if !t.After(since) {
-					continue
-				}
-			}
-		}
-
-		if minSeverity >= 0 {
-			if s, ok := validTraceLevels[entry.Level]; !ok || s < minSeverity {
-				continue
-			}
-		}
-
-		result = append(result, entry)
-	}
-
-	if limit > 0 && len(result) > limit {
-		result = result[len(result)-limit:]
-	}
-	return result
-}
-
-func (tb *logBuffer) len() int {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	return tb.count
 }
 
 // generateLogID returns a short random log ID.
@@ -143,104 +37,19 @@ func generateLogID() string {
 	return hex.EncodeToString(b)
 }
 
-// Logging owns the log buffer and optional CloudWatch shipper.
+// Logging accepts application logs and ships them to CloudWatch. It keeps no
+// queryable history: CloudWatch is the record, and a truncated in-memory window
+// readable from the enclave would only be a weaker second one.
 type Logging struct {
-	buf     *logBuffer
-	shipCh  chan logEntry // nil when CloudWatch shipping is disabled
-	metrics *Metrics
-	cw      CloudWatchLogsAPI
+	telemetry *Telemetry
+	metrics   *Metrics
 }
 
-// NewLogging builds logging; cw is used only when CloudWatch shipping is enabled.
-func NewLogging(metrics *Metrics, cw CloudWatchLogsAPI) *Logging {
-	buf := newLogBuffer(logBufferSize())
-
-	if !cloudwatchLogsEnabled() {
-		return &Logging{buf: buf, metrics: metrics}
-	}
-
-	return &Logging{
-		buf:     buf,
-		shipCh:  make(chan logEntry, 1000),
-		metrics: metrics,
-		cw:      cw,
-	}
+func NewLogging(telemetry *Telemetry, metrics *Metrics) *Logging {
+	return &Logging{telemetry: telemetry, metrics: metrics}
 }
 
-// StartCloudWatchExport ships log batches to CloudWatch; no-op when disabled.
-func (l *Logging) StartCloudWatchExport(ctx context.Context) error {
-	if l.shipCh == nil {
-		return nil
-	}
-
-	deployment := getDeployment()
-	appName := getAppName()
-	logGroup := fmt.Sprintf("/enclave/%s/%s/logs", deployment, appName)
-	logStream := time.Now().UTC().Format("2006-01-02T15-04-05Z")
-
-	if err := ensureLogGroupAndStream(ctx, l.cw, logGroup, logStream); err != nil {
-		return err
-	}
-
-	var batch []cwltypes.InputLogEvent
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		sort.Slice(batch, func(i, j int) bool {
-			return *batch[i].Timestamp < *batch[j].Timestamp
-		})
-		_, err := l.cw.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
-			LogGroupName:  aws.String(logGroup),
-			LogStreamName: aws.String(logStream),
-			LogEvents:     batch,
-		})
-		if err != nil {
-			slog.Warn("log shipper: PutLogEvents failed", "error", err, "count", len(batch))
-			return
-		}
-		batch = nil
-	}
-
-	go func() {
-		slog.Info("log shipper started", "log_group", logGroup, "log_stream", logStream)
-
-		ticker := time.NewTicker(logShipInterval())
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				flush()
-				return
-			case entry, ok := <-l.shipCh:
-				if !ok {
-					flush()
-					return
-				}
-				msg, _ := json.Marshal(entry)
-				ts := time.Now().UnixMilli()
-				if t, err := time.Parse(time.RFC3339Nano, entry.Timestamp); err == nil {
-					ts = t.UnixMilli()
-				}
-				batch = append(batch, cwltypes.InputLogEvent{
-					Message:   aws.String(string(msg)),
-					Timestamp: aws.Int64(ts),
-				})
-				if len(batch) >= 100 {
-					flush()
-				}
-			case <-ticker.C:
-				flush()
-			}
-		}
-	}()
-
-	return nil
-}
-
-// HandleLogsPost accepts OTLP protobuf logs over POST.
+// HandleLogsPost accepts OTLP protobuf logs.
 func HandleLogsPost(l *Logging) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
@@ -271,18 +80,11 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 			return
 		}
 
-		l.buf.add(entries...)
 		if l.metrics != nil {
-			l.metrics.IncBy(l.metrics.LogEntries, "log_entries_total", int64(len(entries)))
+			l.metrics.IncBy(metricLogEntries, int64(len(entries)))
 		}
-
-		if l.shipCh != nil {
-			for _, entry := range entries {
-				select {
-				case l.shipCh <- entry:
-				default: // drop if channel full
-				}
-			}
+		for _, entry := range entries {
+			l.telemetry.Send(signalLogs, entryTime(entry.Timestamp), entry)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -291,101 +93,39 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 	}
 }
 
-// handleLogsGet returns buffered logs over GET; read-only/no auth.
-func handleLogsGet(l *Logging) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var since time.Time
-		if s := r.URL.Query().Get("since"); s != "" {
-			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				since = t
-			} else if t, err := time.Parse(time.RFC3339, s); err == nil {
-				since = t
-			}
-		}
-
-		level := strings.ToLower(r.URL.Query().Get("level"))
-		limit := 0
-		if lim := r.URL.Query().Get("limit"); lim != "" {
-			if n, err := strconv.Atoi(lim); err == nil && n > 0 {
-				limit = n
-			}
-		}
-
-		entries := l.buf.query(since, level, limit)
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(entries)
-	}
+// slogHandler tees the enclave's own records to stderr and to CloudWatch. stderr keeps
+// every line whatever CloudWatch is doing, so the console and journal stay
+// complete even when shipping is dropping.
+type slogHandler struct {
+	stderr    slog.Handler
+	telemetry *Telemetry
+	metrics   *Metrics
+	attrs     []slog.Attr
+	group     string
 }
 
-// ensureLogGroupAndStream creates the CloudWatch log group and stream if they
-// don't already exist. Both operations are idempotent.
-func ensureLogGroupAndStream(
-	ctx context.Context,
-	client CloudWatchLogsAPI,
-	logGroup, logStream string,
-) error {
-	_, err := client.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
-		LogGroupName: aws.String(logGroup),
-	})
-	if err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("create log group: %w", err)
-	}
-
-	_, _ = client.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
-		LogGroupName:    aws.String(logGroup),
-		RetentionInDays: aws.Int32(logRetentionDays()),
-	})
-
-	_, err = client.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{
-		LogGroupName:  aws.String(logGroup),
-		LogStreamName: aws.String(logStream),
-	})
-	if err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("create log stream: %w", err)
-	}
-
-	return nil
-}
-
-func isAlreadyExists(err error) bool {
-	var alreadyGroup *cwltypes.ResourceAlreadyExistsException
-	return errors.As(err, &alreadyGroup)
-}
-
-// bufferHandler mirrors slog records to stderr, buffer, and optional CloudWatch.
-type bufferHandler struct {
-	stderr  slog.Handler
-	buf     *logBuffer
-	shipCh  chan logEntry
-	metrics *Metrics
-	attrs   []slog.Attr
-	group   string
-}
-
-// NewBufferHandler tees slog to stderr and optional Logging.
-func NewBufferHandler(logging *Logging) slog.Handler {
-	h := &bufferHandler{
+// NewSlogHandler tees slog to stderr and, when logging is set, to CloudWatch.
+func NewSlogHandler(logging *Logging) slog.Handler {
+	h := &slogHandler{
 		stderr: slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		}),
 	}
 	if logging != nil {
-		h.buf = logging.buf
-		h.shipCh = logging.shipCh
+		h.telemetry = logging.telemetry
 		h.metrics = logging.metrics
 	}
 	return h
 }
 
-func (h *bufferHandler) Enabled(_ context.Context, level slog.Level) bool {
+func (h *slogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= slog.LevelInfo
 }
 
-func (h *bufferHandler) Handle(ctx context.Context, r slog.Record) error {
+func (h *slogHandler) Handle(ctx context.Context, r slog.Record) error {
 	_ = h.stderr.Handle(ctx, r)
 
-	if h.buf == nil {
+	if h.telemetry == nil {
 		return nil
 	}
 
@@ -394,7 +134,7 @@ func (h *bufferHandler) Handle(ctx context.Context, r slog.Record) error {
 		Timestamp: r.Time.UTC().Format(time.RFC3339Nano),
 		Level:     slogLevelToString(r.Level),
 		Message:   r.Message,
-		Source:    "supervisor",
+		Source:    "enclave",
 	}
 
 	attrs := make(map[string]any)
@@ -409,41 +149,41 @@ func (h *bufferHandler) Handle(ctx context.Context, r slog.Record) error {
 		entry.Attributes = attrs
 	}
 
-	h.buf.add(entry)
 	if h.metrics != nil {
-		h.metrics.Inc(h.metrics.LogEntries, "log_entries_total")
+		h.metrics.Inc(metricLogEntries)
 	}
-
-	if h.shipCh != nil {
-		select {
-		case h.shipCh <- entry:
-		default:
-		}
-	}
+	h.telemetry.Send(signalLogs, r.Time, entry)
 
 	return nil
 }
 
-func (h *bufferHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &bufferHandler{
-		stderr:  h.stderr.WithAttrs(attrs),
-		buf:     h.buf,
-		shipCh:  h.shipCh,
-		metrics: h.metrics,
-		attrs:   append(h.attrs, attrs...),
-		group:   h.group,
+func (h *slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &slogHandler{
+		stderr:    h.stderr.WithAttrs(attrs),
+		telemetry: h.telemetry,
+		metrics:   h.metrics,
+		attrs:     append(h.attrs, attrs...),
+		group:     h.group,
 	}
 }
 
-func (h *bufferHandler) WithGroup(name string) slog.Handler {
-	return &bufferHandler{
-		stderr:  h.stderr.WithGroup(name),
-		buf:     h.buf,
-		shipCh:  h.shipCh,
-		metrics: h.metrics,
-		attrs:   h.attrs,
-		group:   name,
+func (h *slogHandler) WithGroup(name string) slog.Handler {
+	return &slogHandler{
+		stderr:    h.stderr.WithGroup(name),
+		telemetry: h.telemetry,
+		metrics:   h.metrics,
+		attrs:     h.attrs,
+		group:     name,
 	}
+}
+
+// entryTime reads an RFC3339 timestamp, falling back to now when the app sent
+// one we cannot parse.
+func entryTime(ts string) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t
+	}
+	return time.Now()
 }
 
 // parseOTLPLogs decodes OTLP logs.

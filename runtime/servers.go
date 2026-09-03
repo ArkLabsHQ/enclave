@@ -43,11 +43,12 @@ var (
 
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
-	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ssm SSM) error
+	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ancestry Ancestry) error
 	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
 }
 
 type servers struct {
+	cfg     *Config
 	ext     *http.Server
 	int     *http.Server
 	sm      *http.ServeMux
@@ -62,12 +63,11 @@ func SetupHttpServers(
 	rt RuntimeState,
 	cfg Config,
 	nsm NSM,
-	metrics *Metrics,
-	logging *Logging,
-	tracing *Tracing,
+	telemetry *Telemetry,
 	hashes *AttestationHashes,
 	authToken string,
 ) Servers {
+	metrics := telemetry.Metrics
 	metricsMW := metricsMiddleware(metrics)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
@@ -78,20 +78,20 @@ func SetupHttpServers(
 	revProxy.Transport = upstreamTransport(cfg.UpstreamProtocol)
 	revProxy.FlushInterval = -1
 	revProxy.ModifyResponse = func(*http.Response) error {
-		metrics.Inc(metrics.AppProxiedRequests, "enclave_app_proxied_requests_total")
+		metrics.Inc(metricAppProxiedRequests)
 		return nil
 	}
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		metrics.Inc(metrics.AppProxiedErrors, "enclave_app_proxied_errors_total")
+		metrics.Inc(metricAppProxiedErrors)
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
 	sm := http.NewServeMux()
-	registerRuntimeV1Handlers(sm, "/v1/", metrics, logging, tracing, authToken)
+	registerRuntimeV1Handlers(sm, "/v1/", telemetry, authToken)
 	sm.Handle("GET /health", healthHandler(rt))
 
 	rm := http.NewServeMux()
-	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, metrics, logging, tracing, authToken)
+	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, telemetry, authToken)
 	rm.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
 
 	em := http.NewServeMux()
@@ -119,6 +119,7 @@ func SetupHttpServers(
 	}
 
 	return &servers{
+		cfg:     &cfg,
 		ext:     ext,
 		int:     int,
 		sm:      sm,
@@ -130,20 +131,27 @@ func SetupHttpServers(
 	}
 }
 
+// registerRuntimeV1Handlers mounts the OTLP ingest endpoints under prefix. Ingest
+// only: the runtime ships telemetry to CloudWatch and never reads it back, so a
+// compromised enclave has no history to serve.
 func registerRuntimeV1Handlers(
 	mux *http.ServeMux,
 	prefix string,
-	metrics *Metrics,
-	logging *Logging,
-	tracing *Tracing,
+	telemetry *Telemetry,
 	authToken string,
 ) {
-	mux.HandleFunc("POST "+prefix+"metrics", withTokenAuth(authToken, HandleMetricPost(metrics)))
-	mux.HandleFunc("GET "+prefix+"metrics", HandleMetricGet(metrics))
-	mux.HandleFunc("POST "+prefix+"logs", withTokenAuth(authToken, HandleLogsPost(logging)))
-	mux.HandleFunc("GET "+prefix+"logs", handleLogsGet(logging))
-	mux.HandleFunc("POST "+prefix+"traces", withTokenAuth(authToken, HandleTracingPost(tracing)))
-	mux.HandleFunc("GET "+prefix+"traces", HandleTracingGet(tracing))
+	mux.HandleFunc(
+		"POST "+prefix+"metrics",
+		withTokenAuth(authToken, HandleMetricPost(telemetry.Metrics)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"logs",
+		withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"traces",
+		withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)),
+	)
 }
 
 func (s *servers) Start(ctx context.Context, cfg Config) error {
@@ -189,18 +197,21 @@ type RuntimeInfo struct {
 	Version                  string           `json:"version"`
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
-	Metrics                  map[string]any   `json:"metrics"`
 	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
 	Migration                *MigrationStatus `json:"migration"`
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
+	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(
 	ctx context.Context,
 	migrator Migrator,
-	ssm SSM,
+	ancestry Ancestry,
 ) error {
+	if ancestry != nil {
+		ancestry.Start(ctx)
+	}
 	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -217,22 +228,22 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 				http.StatusInternalServerError)
 			return
 		}
-		cooldown, err := getMigrationCooldown()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to get migration cooldown: %v", err),
-				http.StatusInternalServerError)
-			return
+		// Reading the audit cannot block or fail, so it is safe this late in the
+		// handler and cannot make the endpoint slow or unavailable.
+		var ancestryInfo *AncestryInfo
+		if ancestry != nil {
+			ancestryInfo = ancestry.Snapshot()
 		}
 
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                  Version,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
-			Metrics:                  s.metrics.MetricsSnapshot(),
-			MigrationCooldownSeconds: int(cooldown.Seconds()),
+			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
-			KMSKeyLocked:             kmsKeyLocked(),
+			KMSKeyLocked:             s.cfg.KMSLocked,
+			Ancestry:                 ancestryInfo,
 		})
 	})
 
@@ -325,8 +336,11 @@ func migrationHTTPStatus(err error) int {
 		return http.StatusTooEarly
 	case errors.Is(err, errMigrationIntentAbsent),
 		errors.Is(err, errMigrationIntentAborted),
-		errors.Is(err, errMigrationIntentAlreadyRequested):
+		errors.Is(err, errMigrationIntentAlreadyRequested),
+		errors.Is(err, errMigrationAlreadyFinalised):
 		return http.StatusConflict
+	case errors.Is(err, errMigrationIntentSelfTarget):
+		return http.StatusBadRequest
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
 		return http.StatusServiceUnavailable
 	default:
@@ -347,9 +361,9 @@ func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
 				"status", sw.status,
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
-			metrics.Inc(metrics.HTTPRequests, "http_requests_total")
+			metrics.Inc(metricHTTPRequests)
 			if sw.status >= 400 {
-				metrics.Inc(metrics.HTTPErrors, "http_errors_total")
+				metrics.Inc(metricHTTPErrors)
 			}
 		})
 	}

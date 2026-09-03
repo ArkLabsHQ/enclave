@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,4 +53,35 @@ func TestDeploymentGenesisCommitsOnlyOnce(t *testing.T) {
 	committed, err := fx.genesis.Genesis(ctx)
 	require.NoError(t, err)
 	require.Equal(t, fx.source, committed.PCR0)
+}
+
+// The retention is resolved from the envelope, so what matters is that it
+// reaches the Object Lock rather than being computed and dropped.
+func TestGenesisRetentionComesFromTheEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		isDev bool
+	}{
+		{name: "production", isDev: false},
+		{name: "dev", isDev: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENCLAVE_DEV", strconv.FormatBool(tc.isDev))
+			fx := newMigrationIntentFixture(t)
+
+			_, err := fx.genesis.CommitGenesis(context.Background(), fx.source)
+			require.NoError(t, err)
+
+			fx.s3.mu.Lock()
+			stored := fx.s3.objects[deploymentGenesisKey][0]
+			fx.s3.mu.Unlock()
+			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
+			require.WithinDuration(
+				t,
+				time.Now().Add(testCfg.GenesisRetention),
+				stored.retainUntil,
+				10*time.Second,
+			)
+		})
+	}
 }

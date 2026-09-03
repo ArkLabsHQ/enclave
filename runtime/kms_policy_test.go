@@ -48,7 +48,8 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
       },
       "Action": [
         "kms:Encrypt",
-        "kms:GetKeyPolicy"
+        "kms:GetKeyPolicy",
+        "kms:DescribeKey"
       ],
       "Resource": "*"
     },
@@ -69,7 +70,7 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
 	require.JSONEq(t, want, got)
 }
 
-func TestBuildKMSPolicy_RecoveryMigrationGolden(t *testing.T) {
+func TestBuildKMSPolicy_RecoveryMultiPCR0Golden(t *testing.T) {
 	got := mustBuildKMSPolicy(
 		t,
 		testAssumedRoleARN,
@@ -108,7 +109,8 @@ func TestBuildKMSPolicy_RecoveryMigrationGolden(t *testing.T) {
       },
       "Action": [
         "kms:Encrypt",
-        "kms:GetKeyPolicy"
+        "kms:GetKeyPolicy",
+        "kms:DescribeKey"
       ],
       "Resource": "*"
     },
@@ -200,6 +202,32 @@ func TestVerifyKeyPolicyPosture_BuiltPolicies(t *testing.T) {
 	require.NoError(t, VerifyKeyPolicyPosture(migrationUnlocked, []string{otherPCR0, pcr0}, false))
 	require.NoError(t, VerifyKeyPolicyPosture(locked, []string{pcr0}, false))
 	require.Error(t, VerifyKeyPolicyPosture(unlocked, []string{pcr0}, true))
+}
+
+// Adding kms:DescribeKey to EnclaveOperations must not fork the fleet: a new
+// runtime has to keep adopting keys minted before the action existed, and an old
+// runtime has to keep adopting keys minted after it. Both inspectors read only
+// kms:Decrypt and kms:PutKeyPolicy, so neither ever sees DescribeKey.
+func TestVerifyKeyPolicyPostureIgnoresDescribeKey(t *testing.T) {
+	legacyOps := ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy"}, ppRole, nil)
+
+	for _, tc := range []struct {
+		name string
+		ops  map[string]any
+	}{
+		{"key minted before DescribeKey was granted", legacyOps},
+		{"key minted after DescribeKey was granted", ppOps()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := ppPolicy(t, ppDecryptGated(ppPCR0), tc.ops, ppDelete())
+
+			require.NoError(t, VerifyKeyPolicyPosture(policy, []string{ppPCR0}, true))
+
+			admitted, err := KeyPolicyAdmittedPCR0s(policy)
+			require.NoError(t, err)
+			require.True(t, admitted[ppPCR0])
+		})
+	}
 }
 
 func TestVerifyKeyPolicyPosture_Table(t *testing.T) {
@@ -622,7 +650,7 @@ func ppDecryptGated(pcr0 any) map[string]any {
 }
 
 func ppOps() map[string]any {
-	return ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy"}, ppRole, nil)
+	return ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}, ppRole, nil)
 }
 
 func ppDelete() map[string]any {

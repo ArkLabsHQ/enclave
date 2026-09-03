@@ -3,6 +3,7 @@ package runtime
 // Shared runtime helpers.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,6 +17,22 @@ import (
 	"github.com/hf/nsm"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
+
+func verifyAttestationUserData(
+	nsm NSM,
+	attestDocB64 string,
+	expectedPCRs map[uint]string,
+	expectedUserData []byte,
+) error {
+	userData, err := nsm.VerifyAttestation(attestDocB64, expectedPCRs)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(userData, expectedUserData) {
+		return fmt.Errorf("attested user data does not match expected user data")
+	}
+	return nil
+}
 
 // envMu serializes process env writes.
 var envMu sync.Mutex

@@ -3,12 +3,11 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -20,88 +19,6 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/proto"
 )
-
-func TestLogBuffer(t *testing.T) {
-	base := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
-
-	t.Run("evicts oldest", func(t *testing.T) {
-		buf := newLogBuffer(3)
-		buf.add(
-			logEntry{Timestamp: base.Add(time.Second).Format(time.RFC3339Nano), Message: "1"},
-			logEntry{Timestamp: base.Add(2 * time.Second).Format(time.RFC3339Nano), Message: "2"},
-			logEntry{Timestamp: base.Add(3 * time.Second).Format(time.RFC3339Nano), Message: "3"},
-			logEntry{Timestamp: base.Add(4 * time.Second).Format(time.RFC3339Nano), Message: "4"},
-		)
-
-		entries := buf.query(time.Time{}, "", 0)
-		require.Len(t, entries, 3)
-		require.Equal(t, "2", entries[0].Message)
-		require.Equal(t, "4", entries[2].Message)
-		require.Equal(t, 3, buf.len())
-	})
-
-	t.Run("filters", func(t *testing.T) {
-		buf := newLogBuffer(10)
-		buf.add(
-			logEntry{
-				Timestamp: base.Add(time.Second).Format(time.RFC3339Nano),
-				Level:     "debug",
-				Message:   "debug",
-			},
-			logEntry{
-				Timestamp: base.Add(2 * time.Second).Format(time.RFC3339Nano),
-				Level:     "info",
-				Message:   "info",
-			},
-			logEntry{
-				Timestamp: base.Add(3 * time.Second).Format(time.RFC3339Nano),
-				Level:     "warn",
-				Message:   "warn",
-			},
-			logEntry{
-				Timestamp: base.Add(4 * time.Second).Format(time.RFC3339Nano),
-				Level:     "error",
-				Message:   "error",
-			},
-		)
-
-		entries := buf.query(base.Add(time.Second), "info", 2)
-		require.Len(t, entries, 2)
-		require.Equal(t, "warn", entries[0].Message)
-		require.Equal(t, "error", entries[1].Message)
-	})
-
-	t.Run("empty returns slice", func(t *testing.T) {
-		entries := newLogBuffer(1).query(time.Time{}, "", 0)
-		require.NotNil(t, entries)
-		require.Empty(t, entries)
-	})
-
-	t.Run("concurrent", func(t *testing.T) {
-		buf := newLogBuffer(100)
-		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for j := 0; j < 50; j++ {
-					buf.add(logEntry{Message: "concurrent"})
-				}
-			}()
-		}
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for j := 0; j < 50; j++ {
-					_ = buf.query(time.Time{}, "", 10)
-				}
-			}()
-		}
-		wg.Wait()
-		require.Equal(t, 100, buf.len())
-	})
-}
 
 func TestParseOTLPLogs(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
@@ -156,33 +73,15 @@ func TestParseOTLPLogs(t *testing.T) {
 }
 
 func TestLogHandlers(t *testing.T) {
-	t.Run("get filters buffer", func(t *testing.T) {
-		logging := &Logging{buf: newLogBuffer(10)}
-		logging.buf.add(
-			logEntry{Level: "info", Message: "a", Source: "app"},
-			logEntry{Level: "error", Message: "b", Source: "app"},
-		)
+	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
-		w := httptest.NewRecorder()
-		handleLogsGet(
-			logging,
-		)(
-			w,
-			httptest.NewRequest(http.MethodGet, "/v1/logs?level=error", nil),
-		)
+	t.Run("post ships otlp", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
 
-		require.Equal(t, http.StatusOK, w.Code)
-		require.JSONEq(t, `[{
-			"id":"",
-			"timestamp":"",
-			"level":"error",
-			"message":"b",
-			"source":"app"
-		}]`, w.Body.String())
-	})
-
-	t.Run("post accepts otlp", func(t *testing.T) {
-		logging := &Logging{buf: newLogBuffer(10)}
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/v1/logs",
@@ -199,15 +98,19 @@ func TestLogHandlers(t *testing.T) {
 		req.Header.Set("Content-Type", "application/x-protobuf")
 		w := httptest.NewRecorder()
 
-		HandleLogsPost(logging)(w, req)
+		HandleLogsPost(telemetry.Logging)(w, req)
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		require.Equal(t, 1, logging.buf.len())
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
+		require.Len(t, put.LogEvents, 1)
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"test"`)
 	})
 
 	t.Run("post rejects unknown format", func(t *testing.T) {
-		logging := &Logging{buf: newLogBuffer(10)}
+		telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
+		logging := telemetry.Logging
 		req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader([]byte("{}")))
 		w := httptest.NewRecorder()
 
@@ -218,116 +121,88 @@ func TestLogHandlers(t *testing.T) {
 	})
 }
 
-func TestLoggingStartCloudWatchExport(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "test")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-	t.Setenv("ENCLAVE_LOG_CLOUDWATCH", "true")
+func TestLoggingShipsToCloudWatch(t *testing.T) {
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
-
-	t.Run("disabled noops", func(t *testing.T) {
-		cw := newFakeCloudWatchLogs()
-		logging := &Logging{buf: newLogBuffer(1), cw: cw}
-
-		require.NoError(t, logging.StartCloudWatchExport(context.Background()))
-		require.Empty(t, cw.groups)
-	})
-
-	t.Run("returns setup error", func(t *testing.T) {
-		sentinel := errors.New("create group failed")
-		cw := newFakeCloudWatchLogs()
-		cw.createLogGroupErr = sentinel
-		logging := NewLogging(nil, cw)
-
-		err := logging.StartCloudWatchExport(context.Background())
-		require.ErrorIs(t, err, sentinel)
-	})
-
-	t.Run("returns after starting exporter", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		logging := NewLogging(nil, newFakeCloudWatchLogs())
-
-		startCloudWatchExport(t, ctx, logging)
-	})
+	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 
 	t.Run("flushes full batch", func(t *testing.T) {
+		// Only the count threshold may flush here, or a slow run splits the batch.
+		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		logging := NewLogging(nil, cw)
-		startCloudWatchExport(t, ctx, logging)
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
 
-		for i := 0; i < 100; i++ {
-			logging.shipCh <- logEntry{
+		now := time.Now().UTC()
+		for i := 0; i < telemetryBatch; i++ {
+			ts := now.Add(-time.Duration(i) * time.Second)
+			telemetry.Send(signalLogs, ts, logEntry{
 				ID:        fmt.Sprintf("id-%03d", i),
-				Timestamp: time.Unix(int64(100-i), 0).UTC().Format(time.RFC3339Nano),
+				Timestamp: ts.Format(time.RFC3339Nano),
 				Level:     "info",
 				Message:   fmt.Sprintf("msg-%03d", i),
 				Source:    "app",
-			}
+			})
 		}
 
-		put := requireCloudWatchPut(t, cw)
-		require.Equal(t, "/enclave/test/app/logs", aws.ToString(put.LogGroupName))
-		require.Len(t, put.LogEvents, 100)
-		require.JSONEq(t, `{
-			"id":"id-099",
-			"timestamp":"1970-01-01T00:00:01Z",
-			"level":"info",
-			"message":"msg-099",
-			"source":"app"
-		}`, aws.ToString(put.LogEvents[0].Message))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
+		require.Len(t, put.LogEvents, telemetryBatch)
+		// The oldest event was sent last, so ordering put it first.
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
+			fmt.Sprintf(`"message":"msg-%03d"`, telemetryBatch-1))
 	})
 
-	t.Run("flushes on close", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+	t.Run("flushes on shutdown", func(t *testing.T) {
+		ctx := context.Background()
 		cw := newFakeCloudWatchLogs()
-		logging := NewLogging(nil, cw)
-		startCloudWatchExport(t, ctx, logging)
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
 
-		logging.shipCh <- logEntry{
+		now := time.Now().UTC()
+		telemetry.Send(signalLogs, now, logEntry{
 			ID:        "one",
-			Timestamp: time.Unix(1, 0).UTC().Format(time.RFC3339Nano),
+			Timestamp: now.Format(time.RFC3339Nano),
 			Level:     "warn",
 			Message:   "flush me",
 			Source:    "app",
-		}
-		close(logging.shipCh)
+		})
+		telemetry.Shutdown()
 
-		put := requireCloudWatchPut(t, cw)
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
 		require.Len(t, put.LogEvents, 1)
-		require.JSONEq(t, `{
-			"id":"one",
-			"timestamp":"1970-01-01T00:00:01Z",
-			"level":"warn",
-			"message":"flush me",
-			"source":"app"
-		}`, aws.ToString(put.LogEvents[0].Message))
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"flush me"`)
 	})
 }
 
-func TestBufferHandler(t *testing.T) {
-	t.Run("writes supervisor entry", func(t *testing.T) {
-		buf := newLogBuffer(10)
-		shipCh := make(chan logEntry, 1)
-		logger := slog.New(NewBufferHandler(&Logging{buf: buf, shipCh: shipCh})).
-			With("component", "test")
+func TestSlogHandler(t *testing.T) {
+	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
+
+	t.Run("ships the enclave own entry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
+		logger := slog.New(NewSlogHandler(telemetry.Logging)).With("component", "test")
 
 		logger.Warn("test message", "key", "value")
 
-		entries := buf.query(time.Time{}, "", 0)
-		require.Len(t, entries, 1)
-		require.Equal(t, "test message", entries[0].Message)
-		require.Equal(t, "warn", entries[0].Level)
-		require.Equal(t, "supervisor", entries[0].Source)
-		require.Equal(t, "test", entries[0].Attributes["component"])
-		require.Equal(t, "value", entries[0].Attributes["key"])
-		require.Equal(t, entries[0].ID, (<-shipCh).ID)
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		require.NotEmpty(t, put.LogEvents)
+		var entry logEntry
+		require.NoError(t,
+			json.Unmarshal([]byte(aws.ToString(put.LogEvents[0].Message)), &entry))
+		require.Equal(t, "test message", entry.Message)
+		require.Equal(t, "warn", entry.Level)
+		require.Equal(t, "enclave", entry.Source)
+		require.Equal(t, "test", entry.Attributes["component"])
+		require.Equal(t, "value", entry.Attributes["key"])
 	})
 
 	t.Run("nil logging", func(t *testing.T) {
-		handler := NewBufferHandler(nil)
+		handler := NewSlogHandler(nil)
 		require.NotPanics(t, func() {
 			err := handler.Handle(context.Background(), slog.Record{})
 			require.NoError(t, err)
@@ -370,7 +245,7 @@ func buildOTLPLogRequest(
 			},
 			ScopeLogs: []*logspb.ScopeLogs{{
 				LogRecords: []*logspb.LogRecord{{
-					TimeUnixNano:   uint64(time.Unix(1, 0).UnixNano()),
+					TimeUnixNano:   uint64(time.Now().UnixNano()),
 					SeverityNumber: severity,
 					Body:           stringValue(body),
 					Attributes: []*commonpb.KeyValue{{
@@ -386,14 +261,19 @@ func buildOTLPLogRequest(
 	return data
 }
 
-func startCloudWatchExport(t *testing.T, ctx context.Context, logging *Logging) {
+func startTelemetry(t *testing.T, ctx context.Context, telemetry *Telemetry) {
 	t.Helper()
+	before := slog.Default()
+	t.Cleanup(func() {
+		telemetry.Shutdown()
+		slog.SetDefault(before)
+	})
 	done := make(chan error, 1)
-	go func() { done <- logging.StartCloudWatchExport(ctx) }()
+	go func() { done <- telemetry.Start(ctx) }()
 	select {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		require.FailNow(t, "StartCloudWatchExport did not return")
+		require.FailNow(t, "Telemetry.Start did not return")
 	}
 }

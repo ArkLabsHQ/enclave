@@ -38,6 +38,10 @@ var (
 	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
+	errMigrationIntentSelfTarget       = errors.New(
+		"migration intent: target PCR0 is this enclave",
+	)
+	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
 )
 
 type migrationIntentV1 struct {
@@ -66,6 +70,7 @@ type migrationIntent struct {
 }
 
 type migrationIntentLog struct {
+	cfg       *Config
 	s3        S3API
 	nsm       NSM
 	bucket    string
@@ -73,26 +78,26 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-func migrationIntentBucketName(accountID string) string {
-	identity := getDeployment() + "\x00" + getAppName()
+func migrationIntentBucketName(cfg *Config, accountID string) string {
+	identity := cfg.Deployment + "\x00" + cfg.AppName
 	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }
 
-func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
+func newMigrationIntentLog(
+	cfg *Config, s3Client S3API, nsm NSM, bucket string,
+) (*migrationIntentLog, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("migration intent bucket is required")
 	}
-	retention, err := migrationIntentRetention()
-	if err != nil {
-		return nil, err
-	}
+	retention := cfg.IntentRetention
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build migration intent CBOR encoder: %w", err)
 	}
 	return &migrationIntentLog{
-		s3: s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
+		cfg: cfg,
+		s3:  s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
 	}, nil
 }
 
@@ -118,6 +123,11 @@ func (l *migrationIntentLog) Request(
 	targetPCR0, _, err := normalizePCR0(targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
+	}
+	// A self-targeted handoff would overwrite this enclave's own commit pointer
+	// and would satisfy the PCR31 check trivially.
+	if strings.EqualFold(targetPCR0, sourcePCR0) {
+		return nil, errMigrationIntentSelfTarget
 	}
 	head, _, err := l.deriveHead(ctx, sourcePCR0)
 	if err != nil {
@@ -332,7 +342,8 @@ func (l *migrationIntentLog) fetchIntent(
 			err,
 		)
 	}
-	if err := l.nsm.VerifyAttestation(
+	if err := verifyAttestationUserData(
+		l.nsm,
 		entry.Attestation,
 		map[uint]string{0: sourcePCR0},
 		payload,

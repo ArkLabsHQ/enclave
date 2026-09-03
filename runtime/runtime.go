@@ -19,9 +19,6 @@ import (
 type RuntimeState interface {
 	Ready() bool
 	NotifyReady()
-	NotifyHalt()
-	Halt() <-chan struct{}
-	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
@@ -36,7 +33,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -50,14 +47,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 
-	metrics := NewMetrics()
-	tracing := NewTracing(aws.CWL)
-
-	if err := tracing.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
+	telemetry := NewTelemetry(&cfg, aws.CWL)
+	if err := telemetry.Start(ctx); err != nil {
+		return err
 	}
 
-	ctx, initSpan := tracing.Span(ctx, "init")
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {
@@ -65,13 +62,6 @@ func Run(ctx context.Context, cfg Config) error {
 			initSpan.End()
 		}
 	}()
-
-	logging := NewLogging(metrics, aws.CWL)
-	slog.SetDefault(slog.New(NewBufferHandler(logging)))
-
-	if err := logging.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
-	}
 
 	hashes := &AttestationHashes{}
 
@@ -82,15 +72,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv()
+	nsm := nsmFromEnv(&cfg)
 
 	servers := SetupHttpServers(
 		rt,
 		cfg,
 		nsm,
-		metrics,
-		logging,
-		tracing,
+		telemetry,
 		hashes,
 		authToken,
 	)
@@ -100,7 +88,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	ssm := NewSSM(aws.SSM)
-	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
+	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
@@ -114,6 +102,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	migrator, err := NewMigrator(
+		&cfg,
 		nsm,
 		result.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
@@ -127,7 +116,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
+	ancestry := NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage)
+
+	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
@@ -143,7 +134,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
+	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
@@ -164,8 +155,8 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv() NSM {
-	return NewNSM(WithAttestationUnsigned(skipCOSEVerification()))
+func nsmFromEnv(cfg *Config) NSM {
+	return NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 }
 
 type appProcess interface {
@@ -235,10 +226,6 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		_ = child.Stop()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 
-	case <-rt.Halt():
-		slog.Info("received halt circuit-breaker")
-		return waitForRuntime(ctx, rt, child)
-
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
 			_ = child.Stop()
@@ -280,9 +267,6 @@ type runtimeState struct {
 	isReady         atomic.Bool
 	isExit          atomic.Bool
 	exitError       atomic.Value
-	rollbackHalt    atomic.Bool
-	haltOnce        sync.Once
-	haltCh          chan struct{}
 	tlsReadyOnce    sync.Once
 	tlsCertCallback TLSCertCallback
 	tlsReadyCh      chan struct{}
@@ -296,21 +280,6 @@ func (r *runtimeState) Ready() bool {
 
 func (r *runtimeState) NotifyReady() {
 	r.isReady.Store(true)
-}
-
-func (r *runtimeState) NotifyHalt() {
-	r.rollbackHalt.Store(true)
-	r.haltOnce.Do(func() {
-		close(r.haltCh)
-	})
-}
-
-func (r *runtimeState) Halt() <-chan struct{} {
-	return r.haltCh
-}
-
-func (r *runtimeState) Halted() bool {
-	return r.rollbackHalt.Load()
 }
 
 func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
@@ -364,7 +333,6 @@ func (r *runtimeState) ChildDone() <-chan error {
 
 func newRuntimeState() *runtimeState {
 	return &runtimeState{
-		haltCh:      make(chan struct{}),
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),

@@ -20,8 +20,6 @@ import (
 const (
 	deploymentGenesisKey      = "deployment-genesis"
 	deploymentGenesisSchemaV1 = "enclave.deployment_genesis.v1"
-
-	genesisArtifactRetention = 50 * 365 * 24 * time.Hour
 )
 
 var (
@@ -30,6 +28,7 @@ var (
 )
 
 type genesisLog struct {
+	cfg    *Config
 	s3     S3API
 	nsm    NSM
 	bucket string
@@ -40,6 +39,7 @@ type GenesisArtifact struct {
 	PCR0        string
 	PublishedAt time.Time
 	VersionID   string
+	Attestation string
 }
 
 type deploymentGenesisV1 struct {
@@ -54,7 +54,9 @@ type deploymentGenesisPayloadV1 struct {
 	PCR0       string `cbor:"pcr0"`
 }
 
-func newGenesisLog(s3Client S3API, nsm NSM, bucket string) (*genesisLog, error) {
+func newGenesisLog(
+	cfg *Config, s3Client S3API, nsm NSM, bucket string,
+) (*genesisLog, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("genesis bucket is required")
 	}
@@ -62,7 +64,9 @@ func newGenesisLog(s3Client S3API, nsm NSM, bucket string) (*genesisLog, error) 
 	if err != nil {
 		return nil, fmt.Errorf("build genesis CBOR encoder: %w", err)
 	}
-	return &genesisLog{s3: s3Client, nsm: nsm, bucket: bucket, enc: enc}, nil
+	return &genesisLog{
+		cfg: cfg, s3: s3Client, nsm: nsm, bucket: bucket, enc: enc,
+	}, nil
 }
 
 func (l *genesisLog) Genesis(ctx context.Context) (*GenesisArtifact, error) {
@@ -81,6 +85,7 @@ func (l *genesisLog) Genesis(ctx context.Context) (*GenesisArtifact, error) {
 				PCR0:        entry.PCR0,
 				PublishedAt: lastModified.UTC(),
 				VersionID:   versionID,
+				Attestation: entry.Attestation,
 			}
 			return true, nil
 		})
@@ -99,13 +104,9 @@ func (l *genesisLog) CommitGenesis(
 	if !isCanonicalPCR0(pcr0) {
 		return nil, fmt.Errorf("genesis PCR0 must be 96 lowercase hex characters")
 	}
-	payload, err := l.enc.Marshal(deploymentGenesisPayloadV1{
-		Schema:     deploymentGenesisSchemaV1,
-		BucketName: l.bucket,
-		PCR0:       pcr0,
-	})
+	payload, err := l.preImage(pcr0)
 	if err != nil {
-		return nil, fmt.Errorf("encode deployment genesis: %w", err)
+		return nil, err
 	}
 	doc, _, err := l.nsm.BuildAttestationDocument(WithUserData(payload))
 	if err != nil {
@@ -126,7 +127,7 @@ func (l *genesisLog) CommitGenesis(
 		ContentType:               aws.String("application/json"),
 		IfNoneMatch:               aws.String("*"),
 		ObjectLockMode:            s3types.ObjectLockModeCompliance,
-		ObjectLockRetainUntilDate: aws.Time(time.Now().Add(genesisArtifactRetention)),
+		ObjectLockRetainUntilDate: aws.Time(time.Now().Add(l.cfg.GenesisRetention)),
 	})
 	if err != nil {
 		if isPreconditionFailed(err) {
@@ -152,6 +153,22 @@ func (l *genesisLog) CommitGenesis(
 		)
 	}
 	return genesis, nil
+}
+
+// preImage is the user_data a genesis record is signed over: canonical CBOR
+// binding the schema, this bucket and the PCR0. The bucket is inside the
+// signature, so a record cannot be moved between deployments — which is what a
+// verifier relies on when it derives the bucket name itself.
+func (l *genesisLog) preImage(pcr0 string) ([]byte, error) {
+	payload, err := l.enc.Marshal(deploymentGenesisPayloadV1{
+		Schema:     deploymentGenesisSchemaV1,
+		BucketName: l.bucket,
+		PCR0:       pcr0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode deployment genesis: %w", err)
+	}
+	return payload, nil
 }
 
 // readGenesis returns one version if it is a well-formed genesis object. It does

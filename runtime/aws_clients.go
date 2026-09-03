@@ -39,6 +39,11 @@ type KMSAPI interface {
 		params *kms.GetKeyPolicyInput,
 		optFns ...func(*kms.Options),
 	) (*kms.GetKeyPolicyOutput, error)
+	DescribeKey(
+		ctx context.Context,
+		params *kms.DescribeKeyInput,
+		optFns ...func(*kms.Options),
+	) (*kms.DescribeKeyOutput, error)
 	CreateKey(
 		ctx context.Context,
 		params *kms.CreateKeyInput,

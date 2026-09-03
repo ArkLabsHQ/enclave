@@ -3,84 +3,51 @@ package runtime
 import (
 	"context"
 	"errors"
-	"net/url"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-func setValidEnvironment(t *testing.T) {
-	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1h")
-	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "24h")
-}
-
-func TestGetMigrationCooldown(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		value   string
-		want    time.Duration
-		wantErr bool
-	}{
-		{name: "unset"},
-		{name: "zero", value: "0s"},
-		{name: "positive", value: "2m", want: 2 * time.Minute},
-		{name: "malformed", value: "later", wantErr: true},
-		{name: "negative", value: "-1s", wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
-			got, err := getMigrationCooldown()
-			if tc.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, tc.want, got)
-		})
+func TestConfigValidate(t *testing.T) {
+	valid := func() *Config {
+		c := newTestConfig("prod", "myapp", false)
+		c.ExtPort, c.IntPort, c.HostProxyPort, c.FQDN = extPort, intPort, hostProxyPort, "localhost"
+		return c
 	}
-}
 
-func TestValidateEnvironment(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		key     string
-		value   string
+		mutate  func(*Config)
 		wantErr string
 	}{
-		{name: "all set"},
+		{name: "all set", mutate: func(*Config) {}},
 		{
-			name: "deployment missing", key: "ENCLAVE_DEPLOYMENT",
+			name:    "deployment missing",
+			mutate:  func(c *Config) { c.Deployment = "" },
 			wantErr: "ENCLAVE_DEPLOYMENT must be set",
 		},
 		{
-			name: "app name missing", key: "ENCLAVE_APP_NAME",
+			name:    "app name missing",
+			mutate:  func(c *Config) { c.AppName = "" },
 			wantErr: "ENCLAVE_APP_NAME must be set",
 		},
 		{
-			name: "deployment blank", key: "ENCLAVE_DEPLOYMENT", value: "   ",
-			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+			name:    "port missing",
+			mutate:  func(c *Config) { c.ExtPort = 0 },
+			wantErr: "config is missing port",
 		},
 		{
-			name: "cooldown invalid", key: "ENCLAVE_MIGRATION_COOLDOWN", value: "nope",
-			wantErr: "ENCLAVE_MIGRATION_COOLDOWN",
-		},
-		{
-			name: "retention missing", key: "ENCLAVE_MIGRATION_INTENT_RETENTION",
-			wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION",
+			name:    "FQDN missing",
+			mutate:  func(c *Config) { c.FQDN = "" },
+			wantErr: "config is missing FQDN",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setValidEnvironment(t)
-			if tc.key != "" {
-				t.Setenv(tc.key, tc.value)
-			}
+			c := valid()
+			tc.mutate(c)
 
-			err := validateEnvironment()
+			err := c.Validate()
 
 			if tc.wantErr == "" {
 				require.NoError(t, err)
@@ -91,24 +58,9 @@ func TestValidateEnvironment(t *testing.T) {
 	}
 }
 
-func TestConfigValidateRejectsInvalidMigrationCooldown(t *testing.T) {
-	setValidEnvironment(t)
-	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "invalid")
-	err := (&Config{
-		FQDN: "localhost", ExtPort: 443, IntPort: 8080, HostProxyPort: 1024,
-		AppWebSrv: &url.URL{Scheme: "http", Host: "127.0.0.1:7074"},
-	}).Validate()
-	require.ErrorContains(t, err, "ENCLAVE_MIGRATION_COOLDOWN")
-}
-
 func TestApplyEnvOverrides(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
-	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "1m")
-	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "10h")
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
-	t.Setenv("ENCLAVE_PREVIOUS_PCR0", "pcr0")
+	t.Setenv("ENCLAVE_DEV", "false")
 	t.Setenv("APPLY_FOO", "")
 	t.Setenv("APPLY_BAR", "")
 	t.Setenv("OTHER_PREFIX", "")
@@ -117,20 +69,20 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("SAFE_KEY", "")
 
 	ctx := context.Background()
-	path := func(key string) string { return "/prod/myapp/env/" + key }
+	path := func(key string) string { return "/prod/app/env/" + key }
 	ssmFor := func(params map[string]string) SSM { return NewSSM(&fakeSSM{params: params}) }
 
 	t.Run("no params", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, ssmFor(nil))
+		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(nil))
 		require.NoError(t, err)
 	})
 
 	t.Run("applies current prefix", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, ssmFor(map[string]string{
+		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
 			path("APPLY_FOO"):              "one",
 			path("APPLY_BAR"):              "two",
 			"/prod/other/env/OTHER_PREFIX": "wrong-app",
-			"/dev/myapp/env/OTHER_PREFIX":  "wrong-deploy",
+			"/dev/app/env/OTHER_PREFIX":    "wrong-deploy",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "one", os.Getenv("APPLY_FOO"))
@@ -139,7 +91,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("skips empty and nested keys", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, ssmFor(map[string]string{
+		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
 			path("VALID_KEY"):     "ok",
 			path("nested/IGNORE"): "bad",
 			path(""):              "empty",
@@ -150,29 +102,25 @@ func TestApplyEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, ssmFor(map[string]string{
-			path("ENCLAVE_DEPLOYMENT"):                 "dev",
-			path("ENCLAVE_APP_NAME"):                   "evil",
-			path("ENCLAVE_KMS_KEY_LOCKED"):             "false",
-			path("ENCLAVE_MIGRATION_COOLDOWN"):         "0s",
-			path("ENCLAVE_MIGRATION_INTENT_RETENTION"): "1s",
-			path("ENCLAVE_SECRETS_CONFIG"):             `[{"name":"evil"}]`,
-			path("ENCLAVE_PREVIOUS_PCR0"):              "evil-pcr0",
-			path("SAFE_KEY"):                           "ok",
+		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
+			path("ENCLAVE_DEPLOYMENT"):     "dev",
+			path("ENCLAVE_APP_NAME"):       "evil",
+			path("ENCLAVE_SECRETS_CONFIG"): `[{"name":"evil"}]`,
+			path("ENCLAVE_DEV"):            "true",
+			path("SAFE_KEY"):               "ok",
 		}))
 		require.NoError(t, err)
-		require.Equal(t, "prod", os.Getenv("ENCLAVE_DEPLOYMENT"))
-		require.Equal(t, "myapp", os.Getenv("ENCLAVE_APP_NAME"))
-		require.Equal(t, "true", os.Getenv("ENCLAVE_KMS_KEY_LOCKED"))
-		require.Equal(t, "1m", os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
-		require.Equal(t, "10h", os.Getenv("ENCLAVE_MIGRATION_INTENT_RETENTION"))
 		require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
-		require.Equal(t, "pcr0", os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
+		// ENCLAVE_DEV now selects the lock posture, both Object Lock retentions
+		// and the migration cooldown, so an overlay that could set it would hand
+		// back everything this refused elsewhere.
+		require.Equal(t, "false", os.Getenv("ENCLAVE_DEV"))
+		require.True(t, testCfg.KMSLocked)
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
 	})
 
 	t.Run("returns SSM errors", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, NewSSM(&fakeSSM{err: errors.New("access denied")}))
+		err := ApplyEnvOverrides(ctx, testCfg, NewSSM(&fakeSSM{err: errors.New("access denied")}))
 		require.Error(t, err)
 	})
 }

@@ -67,11 +67,12 @@ type Lease struct {
 
 func TryAcquireLease(
 	ctx context.Context,
+	cfg *Config,
 	s3api S3API,
 	bucket, name string,
 	ttl time.Duration,
 ) (*Lease, error) {
-	l := &Lease{s3: s3api, bucket: bucket, key: leaseObjectKey(name), ttl: ttl}
+	l := &Lease{s3: s3api, bucket: bucket, key: leaseObjectKey(cfg, name), ttl: ttl}
 	won, err := l.claim(ctx)
 	if err != nil || !won {
 		return nil, err
@@ -83,12 +84,13 @@ func TryAcquireLease(
 // AcquireLease blocks until the lease is held or ctx ends.
 func AcquireLease(
 	ctx context.Context,
+	cfg *Config,
 	s3api S3API,
 	bucket, name string,
 	ttl time.Duration,
 ) (*Lease, error) {
 	for {
-		lease, err := TryAcquireLease(ctx, s3api, bucket, name, ttl)
+		lease, err := TryAcquireLease(ctx, cfg, s3api, bucket, name, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -362,8 +364,8 @@ func (d leaseDocV1) lapsed(now time.Time) bool {
 }
 
 // leaseObjectKey namespaces locks inside the storage bucket.
-func leaseObjectKey(name string) string {
-	return fmt.Sprintf("%s/%s/lock/%s", getDeployment(), getAppName(), name)
+func leaseObjectKey(cfg *Config, name string) string {
+	return fmt.Sprintf("%s/%s/lock/%s", cfg.Deployment, cfg.AppName, name)
 }
 
 func backoff(ctx context.Context, attempt int) error {

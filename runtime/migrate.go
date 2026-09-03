@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
@@ -61,6 +60,7 @@ type Migrator interface {
 }
 
 type migrator struct {
+	cfg           *Config
 	mu            sync.Mutex
 	nsm           NSM
 	kms           PrimaryKMS
@@ -72,6 +72,7 @@ type migrator struct {
 }
 
 func NewMigrator(
+	cfg *Config,
 	nsm NSM,
 	kms PrimaryKMS,
 	ssm SSM,
@@ -81,11 +82,12 @@ func NewMigrator(
 	tlsKey crypto.Signer,
 	migrationIntentBucketName string,
 ) (Migrator, error) {
-	intent, err := newMigrationIntentLog(s3, nsm, migrationIntentBucketName)
+	intent, err := newMigrationIntentLog(cfg, s3, nsm, migrationIntentBucketName)
 	if err != nil {
 		return nil, err
 	}
 	return &migrator{
+		cfg:           cfg,
 		nsm:           nsm,
 		kms:           kms,
 		ssm:           ssm,
@@ -97,7 +99,13 @@ func NewMigrator(
 }
 
 func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
-	pcr0, err := m.ssm.MayGet(ctx, migrationPreviousPCR0Param())
+	own, err := m.nsm.PCR0()
+	if err != nil {
+		return nil, fmt.Errorf("could not read own PCR0 from NSM: %w", err)
+	}
+	ownPCR0 := hex.EncodeToString(own)
+
+	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(ownPCR0))
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +114,7 @@ func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, err
 		pcr0 = "genesis"
 	}
 
-	attest, err := m.ssm.MayGet(ctx, migrationPreviousPCR0AttestationParam())
+	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(ownPCR0))
 	if err != nil {
 		return nil, err
 	}
@@ -117,10 +125,7 @@ func (m *migrator) HandleMigrationRequest(
 	ctx context.Context,
 	action, targetPCR0 string,
 ) (*MigrationStatus, error) {
-	cooldown, err := getMigrationCooldown()
-	if err != nil {
-		return nil, err
-	}
+	cooldown := m.cfg.MigrationCooldown
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -146,10 +151,7 @@ func (m *migrator) HandleMigrationRequest(
 }
 
 func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
-	cooldown, err := getMigrationCooldown()
-	if err != nil {
-		return nil, err
-	}
+	cooldown := m.cfg.MigrationCooldown
 	sourcePCR0, err := m.sourcePCR0()
 	if err != nil {
 		return nil, err
@@ -244,16 +246,28 @@ func (m *migrator) CompleteMigration(
 		return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
 	}
 
-	targetPCR0Bytes, err := hex.DecodeString(status.TargetPCR0)
+	targetPCR0, targetPCR0Bytes, err := normalizePCR0(status.TargetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("migration intent has invalid target PCR0: %w", err)
+	}
+
+	existing, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read target KMS key ID: %w", err)
+	}
+	if existing != "" {
+		return nil, fmt.Errorf(
+			"%w: %s already has a committed generation",
+			errMigrationAlreadyFinalised,
+			m.cfg.kmsKeyIDParam(targetPCR0),
+		)
 	}
 
 	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
 		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
 
-	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, status.TargetPCR0)
+	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, targetPCR0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create migration key: %w", err)
 	}
@@ -268,7 +282,7 @@ func (m *migrator) CompleteMigration(
 		"created migration KMS key",
 		"key_id", migrationKMS.KeyID(),
 		"own_pcr0", prefix16(ownPCR0),
-		"new_pcr0", prefix16(status.TargetPCR0),
+		"new_pcr0", prefix16(targetPCR0),
 	)
 
 	exportedNames := make([]string, 0, len(m.staticSecrets))
@@ -284,16 +298,7 @@ func (m *migrator) CompleteMigration(
 			return nil, fmt.Errorf("failed to re-encrypt secret %s: %w", secret.Name, err)
 		}
 
-		plaintext, err := migrationKMS.Decrypt(ctx, ciphertextB64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt re-encrypted secret %s: %w", secret.Name, err)
-		}
-
-		if !bytes.Equal(plaintext, secretBytes) {
-			return nil, fmt.Errorf("roundtrip decrypt mismatch %s", secret.Name)
-		}
-
-		ciphertextParam := secretCiphertextParam(secret.Name, migrationKMS.KeyID())
+		ciphertextParam := m.cfg.secretCiphertextParam(secret.Name, migrationKMS.KeyID())
 		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
 			return nil, fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
 		}
@@ -301,7 +306,7 @@ func (m *migrator) CompleteMigration(
 		exportedNames = append(exportedNames, secret.Name)
 	}
 
-	dekCiphertext, err := m.dek.ExportKey(ctx, migrationKMS, m.ssm)
+	dekCiphertext, err := m.dek.ExportKey(ctx, m.cfg, migrationKMS, m.ssm)
 	if err != nil {
 		return nil, fmt.Errorf("DEK export failed: %w", err)
 	}
@@ -315,7 +320,7 @@ func (m *migrator) CompleteMigration(
 	}
 	if err := m.ssm.Set(
 		ctx,
-		tlsKeyCiphertextParam(migrationKMS.KeyID()),
+		m.cfg.tlsKeyCiphertextParam(migrationKMS.KeyID()),
 		tlsKeyCiphertext,
 	); err != nil {
 		return nil, fmt.Errorf("failed to store TLS key: %w", err)
@@ -328,28 +333,38 @@ func (m *migrator) CompleteMigration(
 
 	if err := m.ssm.Set(
 		ctx,
-		migrationPreviousPCR0AttestationParam(),
+		m.cfg.migrationPreviousPCR0AttestationParam(targetPCR0),
 		base64.StdEncoding.EncodeToString(attestDoc),
 		WithAdvancedTier(),
 	); err != nil {
 		return nil, fmt.Errorf(
-			"failed to set SSM param %s: %w", migrationPreviousPCR0AttestationParam(), err,
+			"failed to set SSM param %s: %w",
+			m.cfg.migrationPreviousPCR0AttestationParam(targetPCR0), err,
 		)
 	}
 
-	if err := m.ssm.Set(ctx, migrationPreviousPCR0Param(), ownPCR0); err != nil {
+	if err := m.ssm.Set(ctx, m.cfg.migrationPreviousPCR0Param(targetPCR0), ownPCR0); err != nil {
 		return nil, fmt.Errorf(
-			"failed to set SSM param %s: %w", migrationPreviousPCR0Param(), err,
+			"failed to set SSM param %s: %w", m.cfg.migrationPreviousPCR0Param(targetPCR0), err,
 		)
 	}
+	if err := m.ssm.Set(
+		ctx, m.cfg.migrationPreviousKMSKeyIDParam(targetPCR0), m.kms.KeyID(),
+	); err != nil {
+		return nil, fmt.Errorf("failed to store predecessor KMS key ID: %w", err)
+	}
 
-	// Write handoff receipt before flipping KMSKeyID.
+	// Write handoff receipt before committing KMSKeyID.
 	if err := WriteTransitionReceipt(
 		ctx,
+		m.cfg,
 		m.nsm,
 		m.ssm,
 		bootSnapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
+			ownerPCR0:                 targetPCR0,
+			predecessorPCR0:           ownPCR0,
+			predecessorKMSKeyID:       m.kms.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
 			tlsKeyCiphertext:          tlsKeyCiphertext,
@@ -361,14 +376,18 @@ func (m *migrator) CompleteMigration(
 		)
 	}
 
-	// Atomic commit: from here, all boots use the migration key.
-	if err := m.ssm.Set(ctx, kmsKeyIDParam(), migrationKMS.KeyID()); err != nil {
+	// Atomic commit: from here, the successor boots on the migration key.
+	if err := m.ssm.Set(ctx, m.cfg.kmsKeyIDParam(targetPCR0), migrationKMS.KeyID()); err != nil {
 		return nil, fmt.Errorf(
-			"failed to update current KMS key ID: %w", err,
+			"failed to commit successor KMS key ID: %w", err,
 		)
 	}
 
-	slog.Info("KMSKeyID updated to migration key", "key_id", migrationKMS.KeyID())
+	slog.Info(
+		"committed successor KMSKeyID",
+		"key_id", migrationKMS.KeyID(),
+		"target_pcr0", prefix16(targetPCR0),
+	)
 
 	return &CompleteMigrationResult{
 		PCR0:     ownPCR0,

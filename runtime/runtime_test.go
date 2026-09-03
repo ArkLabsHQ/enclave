@@ -19,19 +19,6 @@ func (a *fakeAppProcess) Stop() error {
 	return a.err
 }
 
-type observableRuntimeState struct {
-	*runtimeState
-	listenCalls chan struct{}
-}
-
-func (r *observableRuntimeState) ListenError() <-chan error {
-	select {
-	case r.listenCalls <- struct{}{}:
-	default:
-	}
-	return r.runtimeState.ListenError()
-}
-
 func TestSuperviseContextDoneStopsApp(t *testing.T) {
 	rt := newRuntimeState()
 	want := errors.New("stop failed")
@@ -86,36 +73,6 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	}
 	if !rt.UpstreamAppInfo().Exited {
 		t.Fatalf("UpstreamAppInfo().Exited = false, want true")
-	}
-}
-
-func TestSuperviseHaltWaitsForRuntime(t *testing.T) {
-	rt := &observableRuntimeState{
-		runtimeState: newRuntimeState(),
-		listenCalls:  make(chan struct{}, 2),
-	}
-	app := &fakeAppProcess{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	rt.NotifyHalt()
-
-	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app) }()
-
-	waitTestSignal(t, rt.listenCalls)
-	waitTestSignal(t, rt.listenCalls)
-	cancel()
-
-	if err := waitTestResult(t, done); err != nil {
-		t.Fatalf("supervise error = %v, want nil", err)
-	}
-	// The halt breaker leaves the app running, so shutdown must stop it.
-	if app.stops != 1 {
-		t.Fatalf("Stop calls = %d, want 1", app.stops)
-	}
-	if !rt.Halted() {
-		t.Fatalf("Halted() = false, want true")
 	}
 }
 

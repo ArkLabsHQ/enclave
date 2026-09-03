@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	kmscmd "github.com/aws/aws-sdk-go-v2/service/kms"
@@ -15,7 +16,16 @@ import (
 	"github.com/edgebitio/nitro-enclaves-sdk-go/crypto/cms"
 )
 
+const (
+	keyStateExists          = "exists"
+	keyStatePendingDeletion = "pending_deletion"
+	keyStateDeleted         = "deleted"
+	keyStateUnknown         = "unknown"
+	keyProbeTimeout         = 5 * time.Second
+)
+
 type kmsW struct {
+	cfg   *Config
 	nsm   NSM
 	kms   KMSAPI
 	sts   STSAPI
@@ -27,6 +37,12 @@ type DataKey struct {
 	Plaintext  []byte
 }
 
+type KeyStatus struct {
+	State        string
+	DeletionDate *time.Time
+	Reason       string
+}
+
 type KMS interface {
 	KeyID() string
 	GenerateDataKey(ctx context.Context) (*DataKey, error)
@@ -36,17 +52,24 @@ type KMS interface {
 
 type PrimaryKMS interface {
 	KMS
+	KeyAuditor
 	CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, error)
 }
 
+type KeyAuditor interface {
+	KeyStatus(ctx context.Context, keyID string) KeyStatus
+}
+
+// FetchOrCreatePrimaryKMS returns the key at keyID after proving its policy
+// admits this enclave's PCR0 and nothing else, or mints a genesis key when
+// keyID is empty. Every key — genesis or migration — admits exactly one PCR0.
 func FetchOrCreatePrimaryKMS(
 	ctx context.Context,
+	cfg *Config,
 	nsm NSM,
 	kms KMSAPI,
 	sts STSAPI,
 	keyID string,
-	prevPCR0 string,
-	migrationAttest string,
 ) (PrimaryKMS, error) {
 	curPCR0, err := nsm.PCR0()
 	if err != nil {
@@ -66,55 +89,10 @@ func FetchOrCreatePrimaryKMS(
 		if out.Policy == nil {
 			return nil, fmt.Errorf("KMS key policy empty: %s", keyID)
 		}
-		expectedPCR0s := []string{curPCR0Hex}
-		switch {
-		case prevPCR0 == "":
-			// genesis/current key
-		case !strings.EqualFold(prevPCR0, curPCR0Hex):
-			// normal migration successor boot
-			expectedPCR0s = append(expectedPCR0s, prevPCR0)
-		default:
-			// rollback-to-self: derive failed target from policy, prove PCR31 committed it
-			admitted, err := KeyPolicyAdmittedPCR0s(*out.Policy)
-			if err != nil {
-				return nil, err
-			}
-			if len(admitted) != 2 {
-				return nil, fmt.Errorf(
-					"rollback KMS policy must admit current PCR0 and one target PCR0",
-				)
-			}
-			if !admitted[curPCR0Hex] {
-				return nil, fmt.Errorf("rollback KMS policy does not admit current PCR0")
-			}
 
-			delete(admitted, curPCR0Hex)
-			otherPCR0 := ""
-			for k := range admitted {
-				otherPCR0 = k
-			}
-			if migrationAttest == "" {
-				return nil, fmt.Errorf("previous PCR0 attestation is required for rollback")
-			}
-			otherPCR0Bytes, err := hex.DecodeString(otherPCR0)
-			if err != nil {
-				return nil, fmt.Errorf("failed decode other admitted PCR0: %w", err)
-			}
-			// verify the rollback-from PCR0 was committed to in the migration attestation
-			if err := nsm.VerifyAttestation(migrationAttest, map[uint]string{
-				0:                 curPCR0Hex,
-				migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(otherPCR0Bytes)),
-			}, nil); err != nil {
-				return nil, fmt.Errorf(
-					"other admitted PCR0 does not match PCR31 in migration attestation: %w",
-					err,
-				)
-			}
-
-			expectedPCR0s = append(expectedPCR0s, otherPCR0)
-		}
-
-		if err := VerifyKeyPolicyPosture(*out.Policy, expectedPCR0s, kmsKeyLocked()); err != nil {
+		if err := VerifyKeyPolicyPosture(
+			*out.Policy, []string{curPCR0Hex}, cfg.KMSLocked,
+		); err != nil {
 			return nil, fmt.Errorf(
 				"KMS key %s policy posture mismatch (ours: %s...): %w",
 				keyID,
@@ -123,7 +101,7 @@ func FetchOrCreatePrimaryKMS(
 			)
 		}
 
-		return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
+		return &kmsW{cfg: cfg, nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
 	}
 
 	identity, err := sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
@@ -132,7 +110,7 @@ func FetchOrCreatePrimaryKMS(
 	}
 
 	recoveryAccount := ""
-	if !kmsKeyLocked() {
+	if !cfg.KMSLocked {
 		recoveryAccount = *identity.Arn
 	}
 
@@ -145,15 +123,15 @@ func FetchOrCreatePrimaryKMS(
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave genesis key for %s/%s", getDeployment(), getAppName())
+	description := fmt.Sprintf("enclave genesis key for %s/%s", cfg.Deployment, cfg.AppName)
 
 	createOut, err := kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
 		Policy:                         aws.String(policy),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
-			{TagKey: aws.String("AppName"), TagValue: aws.String(getAppName())},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(getDeployment())},
+			{TagKey: aws.String("AppName"), TagValue: aws.String(cfg.AppName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(cfg.Deployment)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 		},
 	})
@@ -165,7 +143,7 @@ func FetchOrCreatePrimaryKMS(
 
 	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", curPCR0Hex[:16])
 
-	return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
+	return &kmsW{cfg: cfg, nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
 }
 
 func (k *kmsW) KeyID() string {
@@ -249,7 +227,8 @@ func (k *kmsW) GenerateDataKey(ctx context.Context) (*DataKey, error) {
 	return &DataKey{Ciphertext: out.CiphertextBlob, Plaintext: plaintext}, nil
 }
 
-// CreateMigrationKMS creates a key locked to current and next PCR0.
+// CreateMigrationKMS creates the successor's key, locked to the successor PCR0
+// alone.
 // Non-strict mode keeps root recovery, matching the primary key.
 func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, error) {
 	identity, err := k.sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
@@ -257,34 +236,25 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		return nil, fmt.Errorf("sts get-caller-identity: %w", err)
 	}
 
-	curPCR0, err := k.nsm.PCR0()
-	if err != nil {
-		return nil, fmt.Errorf("could not read PCR0 from NSM")
-	}
-
 	recoveryAccount := ""
-	if !kmsKeyLocked() {
+	if !k.cfg.KMSLocked {
 		recoveryAccount = *identity.Arn
 	}
 
-	policy, err := BuildKMSPolicy(
-		*identity.Arn,
-		[]string{hex.EncodeToString(curPCR0), newPCR0},
-		recoveryAccount,
-	)
+	policy, err := BuildKMSPolicy(*identity.Arn, []string{newPCR0}, recoveryAccount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave migration key for %s/%s", getDeployment(), getAppName())
+	description := fmt.Sprintf("enclave migration key for %s/%s", k.cfg.Deployment, k.cfg.AppName)
 
 	out, err := k.kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
 		Policy:                         aws.String(policy),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
-			{TagKey: aws.String("AppName"), TagValue: aws.String(getAppName())},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(getDeployment())},
+			{TagKey: aws.String("AppName"), TagValue: aws.String(k.cfg.AppName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(k.cfg.Deployment)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 			{TagKey: aws.String("Purpose"), TagValue: aws.String("migration")},
 		},
@@ -293,5 +263,34 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		return nil, fmt.Errorf("migration kms create-key: %w", err)
 	}
 
-	return &kmsW{nsm: k.nsm, kms: k.kms, keyID: *out.KeyMetadata.KeyId}, nil
+	return &kmsW{
+		cfg: k.cfg, nsm: k.nsm, kms: k.kms, keyID: *out.KeyMetadata.KeyId,
+	}, nil
+}
+
+func (k *kmsW) KeyStatus(ctx context.Context, keyID string) KeyStatus {
+	if keyID == "" {
+		return KeyStatus{State: keyStateUnknown, Reason: "no KMS key ID to probe"}
+	}
+	ctx, cancel := context.WithTimeout(ctx, keyProbeTimeout)
+	defer cancel()
+
+	out, err := k.kms.DescribeKey(ctx, &kmscmd.DescribeKeyInput{KeyId: aws.String(keyID)})
+	if err != nil {
+		var notFound *kmstypes.NotFoundException
+		if errors.As(err, &notFound) {
+			return KeyStatus{State: keyStateDeleted}
+		}
+		return KeyStatus{State: keyStateUnknown, Reason: fmt.Sprintf("describe_key: %v", err)}
+	}
+	if out == nil || out.KeyMetadata == nil {
+		return KeyStatus{State: keyStateUnknown, Reason: "describe_key returned no key metadata"}
+	}
+	if out.KeyMetadata.KeyState == kmstypes.KeyStatePendingDeletion ||
+		out.KeyMetadata.KeyState == kmstypes.KeyStatePendingReplicaDeletion {
+		return KeyStatus{
+			State: keyStatePendingDeletion, DeletionDate: out.KeyMetadata.DeletionDate,
+		}
+	}
+	return KeyStatus{State: keyStateExists}
 }

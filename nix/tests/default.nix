@@ -12,7 +12,7 @@ let
     pname = "testapp";
     version = "0.1.0";
     src = ./test-app;
-    vendorHash = null;
+    vendorHash = "sha256-8FrG/O0buFies3nVPhnfLnG7mSUi9XjClpcQ7OBPmlg=";
     env.CGO_ENABLED = "0";
   };
 
@@ -200,11 +200,7 @@ let
     ENCLAVE_DEV = "true";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_AWS_REGION = "us-east-1";
-    ENCLAVE_KMS_KEY_LOCKED = "false";
-    ENCLAVE_MIGRATION_COOLDOWN = "2s";
-    ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
     ENCLAVE_NITRIDING_UPSTREAM = "h1";
-    ENCLAVE_LOG_CLOUDWATCH = "false";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";
@@ -216,6 +212,7 @@ let
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -230,13 +227,11 @@ let
     };
 
   blueEif = mkTestEif {
-    ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
   };
   bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
 
   greenEif = mkTestEif {
-    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
     ENCLAVE_TEST_SALT = "green";
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;

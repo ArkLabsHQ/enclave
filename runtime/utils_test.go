@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strconv"
@@ -253,6 +254,14 @@ type fakeKMS struct {
 	blobs        map[string][]byte
 	encryptErr   error
 	createKeyErr error
+
+	// Key-audit surface.
+	keyStates           map[string]*kmstypes.KeyMetadata
+	describeErr         error
+	describeNilMetadata bool
+	getKeyPolicyErr     error
+	describeCalls       int
+	policyCalls         int
 }
 
 func newFakeKMS() *fakeKMS { return &fakeKMS{keys: map[string]string{}, blobs: map[string][]byte{}} }
@@ -301,6 +310,9 @@ func (f *fakeKMS) Decrypt(
 	in *kms.DecryptInput,
 	_ ...func(*kms.Options),
 ) (*kms.DecryptOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	f.init()
 	plaintext, ok := f.blobs[string(in.CiphertextBlob)]
@@ -324,6 +336,9 @@ func (f *fakeKMS) GenerateDataKey(
 	in *kms.GenerateDataKeyInput,
 	_ ...func(*kms.Options),
 ) (*kms.GenerateDataKeyOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
 	n := int(aws.ToInt32(in.NumberOfBytes))
 	if n == 0 {
 		n = 32
@@ -353,6 +368,52 @@ func (f *fakeKMS) GenerateDataKey(
 	return out, nil
 }
 
+func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientInfo) error {
+	f.mu.Lock()
+	f.init()
+	policy, ok := f.keys[keyID]
+	f.mu.Unlock()
+	if !ok || policy == "" || recipient == nil {
+		return nil
+	}
+
+	admitted, err := KeyPolicyAdmittedPCR0s(policy)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	pcr0, err := fakeKMSAttestedPCR0(recipient.AttestationDocument)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	if !admitted[pcr0] {
+		return fmt.Errorf(
+			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
+		)
+	}
+	return nil
+}
+
+func fakeKMSAttestedPCR0(attestationDoc []byte) (string, error) {
+	var coseSign1 []cbor.RawMessage
+	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
+		return "", err
+	}
+	if len(coseSign1) < 3 {
+		return "", fmt.Errorf("invalid attestation document")
+	}
+	var payload []byte
+	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
+		return "", err
+	}
+	var doc struct {
+		PCRs map[uint][]byte `cbor:"pcrs"`
+	}
+	if err := cbor.Unmarshal(payload, &doc); err != nil {
+		return "", err
+	}
+	return strings.ToLower(hex.EncodeToString(doc.PCRs[0])), nil
+}
+
 func (f *fakeKMS) GetKeyPolicy(
 	_ context.Context,
 	in *kms.GetKeyPolicyInput,
@@ -361,11 +422,49 @@ func (f *fakeKMS) GetKeyPolicy(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
+	f.policyCalls++
+	if f.getKeyPolicyErr != nil {
+		return nil, f.getKeyPolicyErr
+	}
 	policy, ok := f.keys[aws.ToString(in.KeyId)]
 	if !ok {
-		return nil, fmt.Errorf("fake kms key not found")
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
 	}
 	return &kms.GetKeyPolicyOutput{Policy: aws.String(policy)}, nil
+}
+
+// DescribeKey reports keyStates when seeded, otherwise derives presence from the
+// key set: a known key is Enabled, an unknown one is gone.
+func (f *fakeKMS) DescribeKey(
+	_ context.Context,
+	in *kms.DescribeKeyInput,
+	_ ...func(*kms.Options),
+) (*kms.DescribeKeyOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.describeCalls++
+	if f.describeErr != nil {
+		return nil, f.describeErr
+	}
+	if f.describeNilMetadata {
+		return &kms.DescribeKeyOutput{}, nil
+	}
+	keyID := aws.ToString(in.KeyId)
+	if md, ok := f.keyStates[keyID]; ok {
+		return &kms.DescribeKeyOutput{KeyMetadata: md}, nil
+	}
+	if _, ok := f.keys[keyID]; !ok {
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
+	}
+	return &kms.DescribeKeyOutput{KeyMetadata: &kmstypes.KeyMetadata{
+		KeyId:    aws.String(keyID),
+		KeyState: kmstypes.KeyStateEnabled,
+	}}, nil
 }
 
 func (f *fakeKMS) CreateKey(
@@ -551,6 +650,10 @@ type fakeCloudWatchLogs struct {
 	retentionDays      []int32
 	puts               []*cloudwatchlogs.PutLogEventsInput
 	putCh              chan *cloudwatchlogs.PutLogEventsInput
+
+	// putBlock stalls PutLogEvents until closed, standing in for a CloudWatch
+	// that has stopped accepting writes.
+	putBlock chan struct{}
 }
 
 func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
@@ -601,8 +704,16 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	in *cloudwatchlogs.PutLogEventsInput,
 	_ ...func(*cloudwatchlogs.Options),
 ) (*cloudwatchlogs.PutLogEventsOutput, error) {
-	if f.putLogEventsErr != nil {
-		return nil, f.putLogEventsErr
+	f.mu.Lock()
+	putErr := f.putLogEventsErr
+	f.mu.Unlock()
+	if putErr != nil {
+		return nil, putErr
+	}
+	// The startup marker proves the stream is writable; blocking it would stall
+	// Start rather than the shipping this hook exists to stall.
+	if f.putBlock != nil && !isShipperMarker(in) {
+		<-f.putBlock
 	}
 	f.mu.Lock()
 	copyIn := *in
@@ -618,14 +729,36 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	return &cloudwatchlogs.PutLogEventsOutput{}, nil
 }
 
-func requireCloudWatchPut(t *testing.T, cw *fakeCloudWatchLogs) *cloudwatchlogs.PutLogEventsInput {
+// requireCloudWatchPutTo waits for a batch on one log group. The three signals
+// share a client, so a bare "next put" would race between them.
+func isShipperMarker(in *cloudwatchlogs.PutLogEventsInput) bool {
+	return len(in.LogEvents) == 1 &&
+		strings.Contains(aws.ToString(in.LogEvents[0].Message), "shipper_started")
+}
+
+func requireCloudWatchPutTo(
+	t *testing.T,
+	cw *fakeCloudWatchLogs,
+	group string,
+) *cloudwatchlogs.PutLogEventsInput {
 	t.Helper()
-	select {
-	case put := <-cw.putCh:
-		return put
-	case <-time.After(time.Second):
-		require.FailNow(t, "timed out waiting for PutLogEvents")
-		return nil
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case put := <-cw.putCh:
+			if aws.ToString(put.LogGroupName) != group {
+				continue
+			}
+			// Start writes a marker to prove the stream is writable; callers of
+			// this helper are waiting for their own events.
+			if isShipperMarker(put) {
+				continue
+			}
+			return put
+		case <-deadline:
+			require.FailNow(t, "timed out waiting for PutLogEvents on "+group)
+			return nil
+		}
 	}
 }
 

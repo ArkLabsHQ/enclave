@@ -21,7 +21,7 @@ const (
 	deploymentGenesisKey      = "deployment-genesis"
 	deploymentGenesisSchemaV1 = "enclave.deployment_genesis.v1"
 
-	genesisArtifactRetention = 50 * 365 * 24 * time.Hour
+	genesisArtifactRetention = 24 * time.Hour
 )
 
 var (

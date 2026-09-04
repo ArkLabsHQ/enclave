@@ -46,6 +46,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
+	ssm := NewSSM(aws.SSM)
+	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+		return fmt.Errorf("failed to apply env overrides: %w", err)
+	}
 
 	telemetry := NewTelemetry(&cfg, aws.CWL)
 	if err := telemetry.Start(ctx); err != nil {
@@ -87,7 +91,6 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
-	ssm := NewSSM(aws.SSM)
 	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
@@ -134,9 +137,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
-		return fmt.Errorf("failed to apply env overrides: %w", err)
-	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
 	// overriding established secret state
 	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
@@ -169,16 +169,15 @@ type execApp struct {
 }
 
 func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + envOr("APP_BINARY_NAME", "app")
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
+	appPath := "/app/" + getAppBinaryName()
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.Env = append(
 		os.Environ(),
-		"ENCLAVE_APP_PORT="+appPort,
-		"PORT="+appPort,
+		"ENCLAVE_APP_PORT="+cfg.AppPort,
+		"PORT="+cfg.AppPort,
 		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
 		"ENCLAVE_RUNTIME_TOKEN="+authToken,
 	)

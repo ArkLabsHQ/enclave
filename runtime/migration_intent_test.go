@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +31,12 @@ type migrationIntentFixture struct {
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
+	return newMigrationIntentFixtureWithConfig(t, testCfg)
+}
+
+func newMigrationIntentFixtureWithConfig(
+	t *testing.T, cfg *Config,
+) *migrationIntentFixture {
 	t.Helper()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
@@ -40,9 +45,9 @@ func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
 		verifyRoots: session.attestationSign.roots,
 	}}
 	s3f := newFakeS3()
-	log, err := newMigrationIntentLog(testCfg, s3f, nsm, migrationIntentTestBucket)
+	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
-	genesis, err := newGenesisLog(testCfg, s3f, nsm, migrationIntentTestBucket)
+	genesis, err := newGenesisLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
 	return &migrationIntentFixture{
 		log:     log,
@@ -204,8 +209,8 @@ func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
 		{name: "dev", isDev: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_DEV", strconv.FormatBool(tc.isDev))
-			fx := newMigrationIntentFixture(t)
+			cfg := newTestConfig("prod", "app", tc.isDev)
+			fx := newMigrationIntentFixtureWithConfig(t, cfg)
 
 			_, err := fx.log.Request(
 				context.Background(), fx.source, strings.Repeat("cd", 48),
@@ -218,7 +223,7 @@ func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
 			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
 			require.WithinDuration(
 				t,
-				time.Now().Add(testCfg.IntentRetention),
+				time.Now().Add(cfg.IntentRetention),
 				stored.retainUntil,
 				10*time.Second,
 			)

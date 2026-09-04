@@ -16,10 +16,9 @@ const (
 )
 
 type AncestorGeneration struct {
-	PCR0         string     `json:"pcr0"`
-	KeyID        string     `json:"key_id"`
-	State        string     `json:"state"`
-	DeletionDate *time.Time `json:"deletion_date,omitempty"`
+	PCR0  string `json:"pcr0"`
+	KeyID string `json:"key_id"`
+	State string `json:"state"`
 }
 
 type AncestryInfo struct {
@@ -123,15 +122,15 @@ func (a *ancestry) walkAncestors(ctx context.Context) ([]AncestorGeneration, boo
 		}
 		visited[identity] = true
 
-		status := a.keys.KeyStatus(ctx, current.predecessorKMSKeyID)
-		if status.State == keyStateUnknown {
+		state := a.keys.KeyState(ctx, current.predecessorKMSKeyID)
+		if state == keyStateUnknown {
 			slog.Warn("ancestor key state could not be read",
 				"pcr0", prefix16(current.predecessorPCR0),
-				"key_id", current.predecessorKMSKeyID, "reason", status.Reason)
+				"key_id", current.predecessorKMSKeyID)
 		}
 		generations = append(generations, AncestorGeneration{
 			PCR0: current.predecessorPCR0, KeyID: current.predecessorKMSKeyID,
-			State: status.State, DeletionDate: status.DeletionDate,
+			State: state,
 		})
 
 		previousPCR0, previousKeyID, err := a.loadVerifiedLineage(

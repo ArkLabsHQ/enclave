@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +16,9 @@ const (
 	devGenesisRetention  = 5 * time.Minute
 	devIntentRetention   = time.Minute
 	devMigrationCooldown = 2 * time.Second
+
+	defaultLogShipInterval  = 10 * time.Second
+	defaultLogRetentionDays = int32(30)
 )
 
 const (
@@ -43,6 +46,7 @@ type Config struct {
 	Deployment string
 	AppName    string
 	Dev        bool
+	AppPort    string
 
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
@@ -61,6 +65,8 @@ type Config struct {
 	GenesisRetention      time.Duration
 	IntentRetention       time.Duration
 	MigrationCooldown     time.Duration
+	LogShipInterval       time.Duration
+	LogRetentionDays      int32
 }
 
 // LoadConfig builds Config from ENCLAVE_* env vars.
@@ -75,6 +81,7 @@ func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		Deployment: getDeployment(),
 		AppName:    getAppName(),
+		AppPort:    appPort,
 
 		FQDN:             getFQDN(),
 		ExtPort:          extPort,
@@ -82,6 +89,8 @@ func LoadConfig() (*Config, error) {
 		HostProxyPort:    hostProxyPort,
 		AppWebSrv:        appWebSrv,
 		UpstreamProtocol: getUpstreamProtocol(),
+		LogShipInterval:  logShipInterval(),
+		LogRetentionDays: logRetentionDays(),
 	}
 	cfg.setSecurityConfig(IsDev())
 	return cfg, nil
@@ -100,6 +109,12 @@ func (c *Config) Validate() error {
 	}
 	if c.AppName == "" {
 		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	if c.AppPort == "" {
+		return fmt.Errorf("config is missing application process settings")
+	}
+	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
+		return fmt.Errorf("config has invalid telemetry timing")
 	}
 	return nil
 }
@@ -122,6 +137,7 @@ func (c *Config) lockSegment() string {
 func (c *Config) setSecurityConfig(dev bool) {
 	c.Dev = dev
 	c.KMSLocked = !dev
+	c.InsecureVerifySkipped = dev
 	c.VerifyClockSource = !dev
 
 	if dev {
@@ -133,6 +149,33 @@ func (c *Config) setSecurityConfig(dev bool) {
 	c.GenesisRetention = prodRetention
 	c.IntentRetention = prodRetention
 	c.MigrationCooldown = prodMigrationCooldown
+}
+
+func (c *Config) applyEnvOverride(name, value string) error {
+	switch name {
+	case "ENCLAVE_APP_PORT":
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err != nil || port == 0 {
+			return fmt.Errorf("invalid application port %q", value)
+		}
+		appWebSrv, err := url.Parse("http://127.0.0.1:" + value)
+		if err != nil {
+			return fmt.Errorf("parse app web srv url: %w", err)
+		}
+		c.AppPort = value
+		c.AppWebSrv = appWebSrv
+	case "ENCLAVE_FQDN":
+		c.FQDN = value
+	case "ENCLAVE_USE_ACME":
+		c.UseACME = strings.EqualFold(value, "true")
+	case "ENCLAVE_ACME_DIRECTORY":
+		c.ACMEDirectory = value
+	case "ENCLAVE_ACME_EMAIL":
+		c.ACMEEmail = value
+	case "ENCLAVE_ACME_CA":
+		c.ACMECA = value
+	}
+	return nil
 }
 
 func (c *Config) certBucketParam() string {
@@ -245,11 +288,4 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 
 func (c *Config) envVarOverridePath(name string) string {
 	return fmt.Sprintf("/%s/%s/env/%s", c.Deployment, c.AppName, name)
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

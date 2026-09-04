@@ -63,8 +63,6 @@ func TestParseOTLPSpans(t *testing.T) {
 }
 
 func TestTracingHandlers(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
-
 	t.Run("post ships otlp", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -91,16 +89,12 @@ func TestTracingHandlers(t *testing.T) {
 }
 
 func TestTracingShipsToCloudWatch(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
-
 	t.Run("flushes full batch", func(t *testing.T) {
 		// Only the count threshold may flush here, or a slow run splits the batch.
-		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(testCfg, cw)
+		telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 		startTelemetry(t, ctx, telemetry)
 
 		for i := 0; i < telemetryBatch; i++ {

@@ -16,19 +16,19 @@ func ancestryPCR0(n int) string { return fmt.Sprintf("%096x", n) }
 
 type stubAuditor struct {
 	mu     sync.Mutex
-	status KeyStatus
+	state  string
 	keys   []string
 	block  chan struct{}
 }
 
-func (s *stubAuditor) KeyStatus(_ context.Context, keyID string) KeyStatus {
+func (s *stubAuditor) KeyState(_ context.Context, keyID string) string {
 	if s.block != nil {
 		<-s.block
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.keys = append(s.keys, keyID)
-	return s.status
+	return s.state
 }
 
 func (s *stubAuditor) probes() int {
@@ -80,7 +80,7 @@ func testSnapshot(pcr0, keyID, prevPCR0, prevKeyID string) bootSnapshot {
 
 func TestAncestryWalksVerifiedStateRoots(t *testing.T) {
 	p0, p1, p2 := ancestryPCR0(1), ancestryPCR0(2), ancestryPCR0(3)
-	auditor := &stubAuditor{status: KeyStatus{State: keyStateExists}}
+	auditor := &stubAuditor{state: keyStateExists}
 	fx := newAncestryFixture(t, testSnapshot(p2, "key-2", p1, "key-1"), auditor)
 	fx.storeOriginReceipt(t, testSnapshot(p1, "key-1", p0, "key-0"))
 	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
@@ -147,7 +147,7 @@ func TestAncestryCycleIsIncomplete(t *testing.T) {
 
 func TestAncestrySnapshotDoesNotBlockOnRefresh(t *testing.T) {
 	p0, p1 := ancestryPCR0(1), ancestryPCR0(2)
-	auditor := &stubAuditor{status: KeyStatus{State: keyStateExists}, block: make(chan struct{})}
+	auditor := &stubAuditor{state: keyStateExists, block: make(chan struct{})}
 	fx := newAncestryFixture(t, testSnapshot(p1, "key-1", p0, "key-0"), auditor)
 	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
 	fx.a.kickRefresh()

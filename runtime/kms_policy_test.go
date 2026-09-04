@@ -204,32 +204,6 @@ func TestVerifyKeyPolicyPosture_BuiltPolicies(t *testing.T) {
 	require.Error(t, VerifyKeyPolicyPosture(unlocked, []string{pcr0}, true))
 }
 
-// Adding kms:DescribeKey to EnclaveOperations must not fork the fleet: a new
-// runtime has to keep adopting keys minted before the action existed, and an old
-// runtime has to keep adopting keys minted after it. Both inspectors read only
-// kms:Decrypt and kms:PutKeyPolicy, so neither ever sees DescribeKey.
-func TestVerifyKeyPolicyPostureIgnoresDescribeKey(t *testing.T) {
-	legacyOps := ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy"}, ppRole, nil)
-
-	for _, tc := range []struct {
-		name string
-		ops  map[string]any
-	}{
-		{"key minted before DescribeKey was granted", legacyOps},
-		{"key minted after DescribeKey was granted", ppOps()},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			policy := ppPolicy(t, ppDecryptGated(ppPCR0), tc.ops, ppDelete())
-
-			require.NoError(t, VerifyKeyPolicyPosture(policy, []string{ppPCR0}, true))
-
-			admitted, err := KeyPolicyAdmittedPCR0s(policy)
-			require.NoError(t, err)
-			require.True(t, admitted[ppPCR0])
-		})
-	}
-}
-
 func TestVerifyKeyPolicyPosture_Table(t *testing.T) {
 	lowerEffectDecrypt := ppStmt("allow", "kms:Decrypt", ppRole, ppPCR0Cond(ppPCR0))
 

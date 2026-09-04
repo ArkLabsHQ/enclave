@@ -32,7 +32,6 @@ func BuildKMSPolicy(roleARN string, pcr0Values []string, recoveryAccount string)
 			Sid:       "EnclaveOperations",
 			Effect:    "Allow",
 			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			// DescribeKey lets successors report whether this key was deleted.
 			Action:   []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
 			Resource: "*",
 		},

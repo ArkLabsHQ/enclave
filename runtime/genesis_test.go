@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -66,8 +65,8 @@ func TestGenesisRetentionComesFromTheEnvelope(t *testing.T) {
 		{name: "dev", isDev: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_DEV", strconv.FormatBool(tc.isDev))
-			fx := newMigrationIntentFixture(t)
+			cfg := newTestConfig("prod", "app", tc.isDev)
+			fx := newMigrationIntentFixtureWithConfig(t, cfg)
 
 			_, err := fx.genesis.CommitGenesis(context.Background(), fx.source)
 			require.NoError(t, err)
@@ -78,7 +77,7 @@ func TestGenesisRetentionComesFromTheEnvelope(t *testing.T) {
 			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
 			require.WithinDuration(
 				t,
-				time.Now().Add(testCfg.GenesisRetention),
+				time.Now().Add(cfg.GenesisRetention),
 				stored.retainUntil,
 				10*time.Second,
 			)

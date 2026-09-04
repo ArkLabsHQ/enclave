@@ -200,7 +200,7 @@ let
     ENCLAVE_DEV = "true";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_AWS_REGION = "us-east-1";
-    ENCLAVE_NITRIDING_UPSTREAM = "h1";
+    ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";

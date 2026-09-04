@@ -15,9 +15,6 @@ import (
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 )
 
-// signal identifies one of the three telemetry streams. They ship independently
-// so that a flood of one cannot starve another, which is why the queue state
-// below is per signal rather than shared.
 type signal int
 
 const (
@@ -69,8 +66,10 @@ type Telemetry struct {
 	Logging *Logging
 	Tracing *Tracing
 
-	cw      CloudWatchLogsAPI
-	streams [signalCount]*stream
+	cw            CloudWatchLogsAPI
+	streams       [signalCount]*stream
+	shipInterval  time.Duration
+	retentionDays int32
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -78,7 +77,9 @@ type Telemetry struct {
 
 // NewTelemetry wires the three signals in dependency order.
 func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
-	t := &Telemetry{cw: cw}
+	t := &Telemetry{
+		cw: cw, shipInterval: cfg.LogShipInterval, retentionDays: cfg.LogRetentionDays,
+	}
 
 	name := time.Now().UTC().Format("2006-01-02T15-04-05Z")
 	for sig := signal(0); sig < signalCount; sig++ {
@@ -174,7 +175,7 @@ func (t *Telemetry) dropN(sig signal, n int) {
 func (t *Telemetry) shipMetricSnapshots(ctx context.Context) {
 	defer t.wg.Done()
 
-	ticker := time.NewTicker(logShipInterval())
+	ticker := time.NewTicker(t.shipInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -190,7 +191,7 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 	defer t.wg.Done()
 
 	s := t.streams[sig]
-	ticker := time.NewTicker(logShipInterval())
+	ticker := time.NewTicker(t.shipInterval)
 	defer ticker.Stop()
 
 	var batch []cwltypes.InputLogEvent
@@ -317,7 +318,7 @@ func (t *Telemetry) ensureStream(ctx context.Context, sig signal) error {
 
 	_, err = t.cw.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
 		LogGroupName:    aws.String(s.group),
-		RetentionInDays: aws.Int32(logRetentionDays()),
+		RetentionInDays: aws.Int32(t.retentionDays),
 	})
 	if err != nil {
 		slog.Warn("failed to set log retention", "log_group", s.group, "error", err)
@@ -357,8 +358,12 @@ func rejectedCount(info *cwltypes.RejectedLogEventsInfo, sent int) int {
 	if info == nil {
 		return 0
 	}
-	lost := int(aws.ToInt32(info.TooOldLogEventEndIndex)) +
-		int(aws.ToInt32(info.ExpiredLogEventEndIndex))
+	// CloudWatch reports the too-old end index as exclusive, but the expired
+	// end index as inclusive.
+	lost := int(aws.ToInt32(info.TooOldLogEventEndIndex))
+	if idx := info.ExpiredLogEventEndIndex; idx != nil {
+		lost += int(*idx) + 1
+	}
 	if idx := info.TooNewLogEventStartIndex; idx != nil {
 		lost += sent - int(*idx)
 	}

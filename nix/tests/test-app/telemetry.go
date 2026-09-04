@@ -38,7 +38,7 @@ type telemetry struct {
 // the token it puts in the child's environment, so no other configuration is
 // needed.
 func startTelemetry(ctx context.Context) (*telemetry, error) {
-	endpoint := "127.0.0.1:" + envOr("ENCLAVE_PROXY_PORT", "8080")
+	endpoint := "127.0.0.1:" + envOrDefault("ENCLAVE_PROXY_PORT", "8080")
 	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
 	if token == "" {
 		return nil, fmt.Errorf("ENCLAVE_RUNTIME_TOKEN is not set")
@@ -48,8 +48,8 @@ func startTelemetry(ctx context.Context) (*telemetry, error) {
 	// Plain attributes rather than a semconv package: the keys are the contract
 	// the runtime reads, and pinning a semconv version here would only add churn.
 	res := resource.NewWithAttributes("",
-		attribute.String("service.name", envOr("ENCLAVE_APP_NAME", "testapp")),
-		attribute.String("deployment.environment", envOr("ENCLAVE_DEPLOYMENT", "dev")),
+		attribute.String("service.name", envOrDefault("ENCLAVE_APP_NAME", "testapp")),
+		attribute.String("deployment.environment", envOrDefault("ENCLAVE_DEPLOYMENT", "dev")),
 	)
 
 	t := &telemetry{}
@@ -135,9 +135,9 @@ func (t *telemetry) Shutdown(ctx context.Context) {
 	}
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return fallback
 }

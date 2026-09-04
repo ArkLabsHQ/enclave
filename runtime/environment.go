@@ -45,9 +45,14 @@ func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
 			continue
 		}
 
-		if err := os.Setenv(key, p.Value); err != nil {
+		nextCfg := *cfg
+		if err := nextCfg.applyEnvOverride(key, p.Value); err != nil {
+			return fmt.Errorf("apply env override %s: %w", key, err)
+		}
+		if err := safeSetenv(key, p.Value); err != nil {
 			return fmt.Errorf("setenv %s: %w", key, err)
 		}
+		*cfg = nextCfg
 		applied++
 	}
 
@@ -86,28 +91,34 @@ func getAppPort() string {
 	return envDefault("ENCLAVE_APP_PORT", "7074")
 }
 
+func getAppBinaryName() string {
+	return envDefault("APP_BINARY_NAME", "app")
+}
+
 func getFQDN() string {
-	return envDefault("ENCLAVE_NITRIDING_FQDN", "localhost")
+	return envDefault("ENCLAVE_FQDN", "localhost")
 }
 
 func getUpstreamProtocol() string {
-	return strings.ToLower(envDefault("ENCLAVE_NITRIDING_UPSTREAM", "auto"))
+	return strings.ToLower(envDefault("ENCLAVE_UPSTREAM", "auto"))
 }
 
 func logShipInterval() time.Duration {
-	if s := os.Getenv("ENCLAVE_LOG_SHIP_INTERVAL"); s != "" {
-		if d, err := time.ParseDuration(strings.TrimSpace(s)); err == nil && d > 0 {
-			return d
-		}
+	value := envDefault("ENCLAVE_LOG_SHIP_INTERVAL", defaultLogShipInterval.String())
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return defaultLogShipInterval
 	}
-	return 10 * time.Second
+	return interval
 }
 
 func logRetentionDays() int32 {
-	if s := os.Getenv("ENCLAVE_LOG_RETENTION_DAYS"); s != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
-			return int32(n)
-		}
+	value := envDefault(
+		"ENCLAVE_LOG_RETENTION_DAYS", strconv.FormatInt(int64(defaultLogRetentionDays), 10),
+	)
+	days, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || days <= 0 {
+		return defaultLogRetentionDays
 	}
-	return 30
+	return int32(days)
 }

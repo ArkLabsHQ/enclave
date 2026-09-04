@@ -253,8 +253,8 @@ measurement. A subset can be overridden at runtime from SSM.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
-| `ENCLAVE_NITRIDING_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
-| `ENCLAVE_NITRIDING_FQDN` | `localhost` | Hostname for the TLS certificate. |
+| `ENCLAVE_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
+| `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
 | `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
@@ -352,11 +352,11 @@ the application:
 
 | Parameter under `/<deployment>/<app>/env/` | Purpose |
 |---|---|
-| `ENCLAVE_NITRIDING_FQDN` | Certificate hostname. |
-| `ENCLAVE_NITRIDING_USE_ACME` | `true` switches from self-signed to ACME. |
-| `ENCLAVE_NITRIDING_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
-| `ENCLAVE_NITRIDING_ACME_EMAIL` | ACME account contact. |
-| `ENCLAVE_NITRIDING_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_FQDN` | Certificate hostname. |
+| `ENCLAVE_USE_ACME` | `true` switches from self-signed to ACME. |
+| `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
+| `ENCLAVE_ACME_EMAIL` | ACME account contact. |
+| `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
 
 The TLS key is generated at genesis, encrypted with KMS, and included in the
 state root. Renewed certificates reuse it. The certificate bucket stores the
@@ -454,7 +454,7 @@ it is the final verified state-origin receipt in the chain.
 | `state` | Meaning |
 |---|---|
 | `exists` | `DescribeKey` reports that the key is present and not scheduled for deletion. |
-| `pending_deletion` | Deletion is scheduled; `deletion_date` says when it completes. |
+| `pending_deletion` | Deletion is scheduled. |
 | `deleted` | KMS no longer knows the key. This generation can no longer decrypt anything. |
 | `unknown` | The state could not be read. The cause is logged, not published: the AWS error names role ARNs and account IDs, and this endpoint is unauthenticated. |
 
@@ -721,7 +721,7 @@ fails closed.
 
 `GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
 but does not perform public CA validation. Applications serving gRPC must set
-`ENCLAVE_NITRIDING_UPSTREAM=h2c`.
+`ENCLAVE_UPSTREAM=h2c`.
 
 ## Testing
 

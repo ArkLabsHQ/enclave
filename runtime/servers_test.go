@@ -519,8 +519,7 @@ func TestConfigureEnclaveInfoHandlerOmitsAncestryWhenUnset(t *testing.T) {
 	require.NotContains(t, rr.Body.String(), "ancestry")
 }
 
-// A blind audit must still serve, and must never let "we could not tell" render
-// as "the key is gone".
+// A blind audit must still serve.
 func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
 	s, migrator := enclaveInfoTestServer(t)
 	ancestry := &stubAncestry{snap: &AncestryInfo{

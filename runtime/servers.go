@@ -480,7 +480,7 @@ func (t *protocolSwitchTransport) RoundTrip(r *http.Request) (*http.Response, er
 }
 
 // upstreamTransport builds the reverse-proxy transport for the runtime->app
-// hop, selected by ENCLAVE_NITRIDING_UPSTREAM: "h2c" or "h1" pin a single
+// hop, selected by ENCLAVE_UPSTREAM: "h2c" or "h1" pin a single
 // protocol; "auto" (the default) matches the inbound protocol per request.
 // h2c is required for gRPC; h1 suits a plain HTTP/1.1 app.
 func upstreamTransport(mode string) http.RoundTripper {

@@ -21,7 +21,7 @@ const (
 	keyStatePendingDeletion = "pending_deletion"
 	keyStateDeleted         = "deleted"
 	keyStateUnknown         = "unknown"
-	keyProbeTimeout         = 5 * time.Second
+	keyStateProbeTimeout    = 5 * time.Minute
 )
 
 type kmsW struct {
@@ -35,12 +35,6 @@ type kmsW struct {
 type DataKey struct {
 	Ciphertext []byte
 	Plaintext  []byte
-}
-
-type KeyStatus struct {
-	State        string
-	DeletionDate *time.Time
-	Reason       string
 }
 
 type KMS interface {
@@ -57,12 +51,9 @@ type PrimaryKMS interface {
 }
 
 type KeyAuditor interface {
-	KeyStatus(ctx context.Context, keyID string) KeyStatus
+	KeyState(ctx context.Context, keyID string) string
 }
 
-// FetchOrCreatePrimaryKMS returns the key at keyID after proving its policy
-// admits this enclave's PCR0 and nothing else, or mints a genesis key when
-// keyID is empty. Every key — genesis or migration — admits exactly one PCR0.
 func FetchOrCreatePrimaryKMS(
 	ctx context.Context,
 	cfg *Config,
@@ -268,29 +259,27 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 	}, nil
 }
 
-func (k *kmsW) KeyStatus(ctx context.Context, keyID string) KeyStatus {
+func (k *kmsW) KeyState(ctx context.Context, keyID string) string {
 	if keyID == "" {
-		return KeyStatus{State: keyStateUnknown, Reason: "no KMS key ID to probe"}
+		return keyStateUnknown
 	}
-	ctx, cancel := context.WithTimeout(ctx, keyProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, keyStateProbeTimeout)
 	defer cancel()
 
 	out, err := k.kms.DescribeKey(ctx, &kmscmd.DescribeKeyInput{KeyId: aws.String(keyID)})
 	if err != nil {
 		var notFound *kmstypes.NotFoundException
 		if errors.As(err, &notFound) {
-			return KeyStatus{State: keyStateDeleted}
+			return keyStateDeleted
 		}
-		return KeyStatus{State: keyStateUnknown, Reason: fmt.Sprintf("describe_key: %v", err)}
+		return keyStateUnknown
 	}
 	if out == nil || out.KeyMetadata == nil {
-		return KeyStatus{State: keyStateUnknown, Reason: "describe_key returned no key metadata"}
+		return keyStateUnknown
 	}
 	if out.KeyMetadata.KeyState == kmstypes.KeyStatePendingDeletion ||
 		out.KeyMetadata.KeyState == kmstypes.KeyStatePendingReplicaDeletion {
-		return KeyStatus{
-			State: keyStatePendingDeletion, DeletionDate: out.KeyMetadata.DeletionDate,
-		}
+		return keyStatePendingDeletion
 	}
-	return KeyStatus{State: keyStateExists}
+	return keyStateExists
 }

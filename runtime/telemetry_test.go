@@ -32,8 +32,6 @@ func TestNewTelemetryWiresDropCountingThroughMetrics(t *testing.T) {
 }
 
 func TestTelemetryStartsAllThreeSignals(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
@@ -46,6 +44,7 @@ func TestTelemetryStartsAllThreeSignals(t *testing.T) {
 		"/enclave/prod/app/traces",
 		"/enclave/prod/app/metrics",
 	}, cw.groups)
+	require.Equal(t, []int32{30, 30, 30}, cw.retentionDays)
 }
 
 // A failure to start must surface rather than be logged into the sink that
@@ -83,11 +82,10 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 	t.Run("flushes a full batch in timestamp order", func(t *testing.T) {
 		// A ship interval long enough that only the count threshold can flush,
 		// so a slow run cannot split the batch and make this test lie.
-		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(testCfg, cw)
+		telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 		startTelemetry(t, ctx, telemetry)
 
 		// Sent newest first, so an unsorted batch would be rejected by CloudWatch.
@@ -106,7 +104,6 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 	})
 
 	t.Run("flushes a partial batch on the tick", func(t *testing.T) {
-		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		cw := newFakeCloudWatchLogs()
@@ -121,9 +118,8 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 	})
 
 	t.Run("keeps the event that crosses the byte boundary", func(t *testing.T) {
-		t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
 		cw := newFakeCloudWatchLogs()
-		telemetry := NewTelemetry(testCfg, cw)
+		telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 
 		before := slog.Default()
 		t.Cleanup(func() { slog.SetDefault(before) })
@@ -155,8 +151,6 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 // Send must never block. It is the reason slog and the request handlers can call
 // it, so this is the property to fail on if someone makes the send synchronous.
 func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h") // never flush on the tick
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
@@ -164,7 +158,7 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 	cw.putBlock = release
 	defer close(release)
 
-	telemetry := NewTelemetry(testCfg, cw)
+	telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 	startTelemetry(t, ctx, telemetry)
 
 	const overfill = telemetryQueue * 3
@@ -191,8 +185,6 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 }
 
 func TestMetricsShipSnapshot(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
@@ -268,8 +260,6 @@ func TestStartFailsWhenTheStreamIsNotWritable(t *testing.T) {
 // A batch AWS keeps refusing must not be retried forever: that would stall the
 // stream behind one poisoned event and hold its memory for the whole run.
 func TestFlushShedsAPoisonedBatchInsteadOfStalling(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "10ms")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
@@ -320,6 +310,10 @@ func TestRejectedCountReadsThePutResponse(t *testing.T) {
 	}, 10))
 
 	require.Equal(t, 4, rejectedCount(&cwltypes.RejectedLogEventsInfo{
+		ExpiredLogEventEndIndex: aws.Int32(3),
+	}, 10))
+
+	require.Equal(t, 4, rejectedCount(&cwltypes.RejectedLogEventsInfo{
 		TooNewLogEventStartIndex: aws.Int32(6),
 	}, 10))
 }
@@ -334,10 +328,8 @@ func TestSendShedsAnOversizedEvent(t *testing.T) {
 
 // Shutdown must wait for the pumps, or Run returning ends the process mid-write.
 func TestShutdownFlushesWhatIsStillQueued(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h") // only Shutdown can flush this
-
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(testCfg, cw)
+	telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 	startTelemetry(t, context.Background(), telemetry)
 
 	telemetry.Send(signalLogs, time.Now().UTC(), map[string]string{"msg": "last words"})
@@ -357,13 +349,11 @@ func TestShutdownFlushesWhatIsStillQueued(t *testing.T) {
 }
 
 func TestShutdownShedsAFinalBatchAfterRetryLimit(t *testing.T) {
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "1h")
-
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
 
 	cw := newFakeCloudWatchLogs()
-	telemetry := NewTelemetry(testCfg, cw)
+	telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 	require.NoError(t, telemetry.Start(context.Background()))
 
 	cw.mu.Lock()

@@ -3,13 +3,17 @@ package runtime
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-
 func newTestConfig(deployment, appName string, dev bool) *Config {
-	c := &Config{Deployment: deployment, AppName: appName}
+	c := &Config{
+		Deployment: deployment, AppName: appName,
+		AppPort:         "7074",
+		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
+	}
 	c.setSecurityConfig(dev)
 	return c
 }
@@ -20,6 +24,12 @@ func testConfig() *Config { return newTestConfig("prod", "app", false) }
 
 // testCfg is the package-wide default namespace for tests.
 var testCfg = testConfig()
+
+func testConfigWithLogShipInterval(interval time.Duration) *Config {
+	cfg := *testCfg
+	cfg.LogShipInterval = interval
+	return &cfg
+}
 
 func TestApplySecurityEnvelope(t *testing.T) {
 	prod := newTestConfig("prod", "app", false)
@@ -72,6 +82,30 @@ func TestIsDevParsing(t *testing.T) {
 			require.Equal(t, tc.want, IsDev())
 		})
 	}
+}
+
+func TestLoadConfigTelemetrySettings(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "app")
+	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
+	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, 250*time.Millisecond, cfg.LogShipInterval)
+	require.Equal(t, int32(7), cfg.LogRetentionDays)
+}
+
+func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "app")
+	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
+	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, defaultLogShipInterval, cfg.LogShipInterval)
+	require.Equal(t, defaultLogRetentionDays, cfg.LogRetentionDays)
 }
 
 // The lock posture is an IAM-enforceable boundary, so it must move exactly the

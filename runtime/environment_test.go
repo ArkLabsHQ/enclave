@@ -90,6 +90,36 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Empty(t, os.Getenv("OTHER_PREFIX"))
 	})
 
+	t.Run("updates mutable runtime config", func(t *testing.T) {
+		cfg := *testCfg
+		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
+			path("ENCLAVE_APP_PORT"):       "9090",
+			path("ENCLAVE_FQDN"):           "app.example.com",
+			path("ENCLAVE_USE_ACME"):       "TRUE",
+			path("ENCLAVE_ACME_DIRECTORY"): "https://acme.example.com/directory",
+			path("ENCLAVE_ACME_EMAIL"):     "ops@example.com",
+			path("ENCLAVE_ACME_CA"):        "test-ca",
+		}))
+		require.NoError(t, err)
+		require.Equal(t, "9090", cfg.AppPort)
+		require.Equal(t, "http://127.0.0.1:9090", cfg.AppWebSrv.String())
+		require.Equal(t, "app.example.com", cfg.FQDN)
+		require.True(t, cfg.UseACME)
+		require.Equal(t, "https://acme.example.com/directory", cfg.ACMEDirectory)
+		require.Equal(t, "ops@example.com", cfg.ACMEEmail)
+		require.Equal(t, "test-ca", cfg.ACMECA)
+	})
+
+	t.Run("rejects invalid application port", func(t *testing.T) {
+		cfg := *testCfg
+		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
+			path("ENCLAVE_APP_PORT"): "not-a-port",
+		}))
+
+		require.ErrorContains(t, err, "invalid application port")
+		require.Equal(t, testCfg.AppPort, cfg.AppPort)
+	})
+
 	t.Run("skips empty and nested keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
 			path("VALID_KEY"):     "ok",

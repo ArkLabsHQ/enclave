@@ -228,7 +228,7 @@ cloud(
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
-put_env("ENCLAVE_NITRIDING_FQDN", FQDN)
+put_env("ENCLAVE_FQDN", FQDN)
 
 BLUES = (blue, blue_peer)
 kms_keys_before_genesis = kms_key_count()
@@ -565,10 +565,10 @@ for node in BLUES:
 assert kms_key_count() == kms_keys_before_genesis + 2
 
 # ACME settings are loaded once at boot, so blue remains self-signed.
-put_env("ENCLAVE_NITRIDING_USE_ACME", "true")
-put_env("ENCLAVE_NITRIDING_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
-put_env("ENCLAVE_NITRIDING_ACME_EMAIL", f"acme-test@{FQDN}")
-put_env("ENCLAVE_NITRIDING_ACME_CA", aws.succeed("cat /etc/pebble/ca.crt"))
+put_env("ENCLAVE_USE_ACME", "true")
+put_env("ENCLAVE_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
+put_env("ENCLAVE_ACME_EMAIL", f"acme-test@{FQDN}")
+put_env("ENCLAVE_ACME_CA", aws.succeed("cat /etc/pebble/ca.crt"))
 
 green.start()
 green.wait_for_unit("multi-user.target")
@@ -789,7 +789,6 @@ green.wait_until_succeeds(
     "'.ancestry.complete == true "
     "and (.ancestry.generations | length) == 1 "
     "and .ancestry.generations[0].key_id == $key "
-    "and .ancestry.generations[0].state == \"pending_deletion\" "
-    "and .ancestry.generations[0].deletion_date != null'",
+    "and .ancestry.generations[0].state == \"pending_deletion\"'",
     timeout=60,
 )

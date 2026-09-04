@@ -63,10 +63,6 @@ func ConfigureTLS(
 	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
-		return nil, fmt.Errorf("failed to load TLS SSM overrides: %w", err)
-	}
-
 	if !cfg.UseACME {
 		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
 	}
@@ -137,50 +133,6 @@ func configureDNS01Cert(
 
 	slog.Info("serving fleet-shared certificate via DNS-01", "fqdn", cfg.FQDN, "zone", zoneID)
 	return manager.GetCertificate, nil
-}
-
-func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) error {
-	loadSSMOverride := func(name string, updateCfg func(val string)) error {
-		val, err := ssm.MayGet(ctx, cfg.envVarOverridePath(name))
-		if err != nil {
-			return err
-		}
-		if val != "" {
-			updateCfg(val)
-		}
-		return nil
-	}
-
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_FQDN",
-		func(val string) { cfg.FQDN = val },
-	); err != nil {
-		return err
-	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_USE_ACME", func(val string) {
-		cfg.UseACME = strings.EqualFold(val, "true")
-	}); err != nil {
-		return err
-	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_DIRECTORY", func(val string) {
-		cfg.ACMEDirectory = val
-	}); err != nil {
-		return err
-	}
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_ACME_EMAIL",
-		func(val string) { cfg.ACMEEmail = val },
-	); err != nil {
-		return err
-	}
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_ACME_CA",
-		func(val string) { cfg.ACMECA = val },
-	); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // configureSelfSigned shares one self-signed certificate across the fleet, so a
@@ -292,7 +244,7 @@ func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
 	if caPEM != "" {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, fmt.Errorf("ENCLAVE_NITRIDING_ACME_CA: no certificates parsed")
+			return nil, fmt.Errorf("ENCLAVE_ACME_CA: no certificates parsed")
 		}
 		client.HTTPClient = &http.Client{
 			Timeout: 90 * time.Second,

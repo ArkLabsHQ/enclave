@@ -15,10 +15,10 @@ import (
 func ancestryPCR0(n int) string { return fmt.Sprintf("%096x", n) }
 
 type stubAuditor struct {
-	mu     sync.Mutex
-	state  string
-	keys   []string
-	block  chan struct{}
+	mu    sync.Mutex
+	state string
+	keys  []string
+	block chan struct{}
 }
 
 func (s *stubAuditor) KeyState(_ context.Context, keyID string) string {

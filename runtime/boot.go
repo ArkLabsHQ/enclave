@@ -557,7 +557,11 @@ func (b *genesisBoot) buildSnapshot(
 		return bootSnapshot{}, fmt.Errorf("generate DEK: %w", err)
 	}
 	dekCiphertext := base64.StdEncoding.EncodeToString(dekData.Ciphertext)
-	if err := ssm.Set(ctx, state.cfg.storageDEKCiphertextParam(kms.KeyID()), dekCiphertext); err != nil {
+	if err := ssm.Set(
+		ctx,
+		state.cfg.storageDEKCiphertextParam(kms.KeyID()),
+		dekCiphertext,
+	); err != nil {
 		return bootSnapshot{}, fmt.Errorf("failed to store DEK: %w", err)
 	}
 

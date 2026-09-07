@@ -285,7 +285,3 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 		strings.ToLower(pcr0),
 	)
 }
-
-func (c *Config) envVarOverridePath(name string) string {
-	return fmt.Sprintf("/%s/%s/env/%s", c.Deployment, c.AppName, name)
-}

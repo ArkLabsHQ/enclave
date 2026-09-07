@@ -151,7 +151,8 @@ func TestMigratorPreviousPCR0Info(t *testing.T) {
 			kmsTestNSMWithPCR0(t, infoPCR0Bytes), nil, NewSSM(&fakeSSM{params: map[string]string{
 				testCfg.migrationPreviousPCR0Param(infoPCR0):            "abc123",
 				testCfg.migrationPreviousPCR0AttestationParam(infoPCR0): "attestation",
-			}}), newFakeS3(), nil, nil, newTestTLSKey(t), migrationIntentTestBucket)
+			}}), newFakeS3(), nil, nil, newTestTLSKey(t), migrationIntentTestBucket,
+		)
 		require.NoError(t, err)
 		info, err := m.PreviousPCR0Info(ctx)
 
@@ -323,7 +324,7 @@ func TestCompleteMigration(t *testing.T) {
 		)
 		require.NoError(t, err)
 		fx.m = m.(*migrator)
-	
+
 		fx.m.cfg = newTestConfig("prod", "app", false)
 		fx.m.cfg.MigrationCooldown = 0
 		return fx

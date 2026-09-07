@@ -199,7 +199,6 @@ func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
 	require.Nil(t, head, "a refused request must publish no intent")
 }
 
-
 func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

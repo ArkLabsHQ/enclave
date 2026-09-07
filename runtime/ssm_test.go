@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,8 +30,16 @@ func TestSSMSetWithoutOverwrite(t *testing.T) {
 	ssm := NewSSM(fake)
 
 	require.NoError(t, ssm.Set(ctx, "/app/key", "winner", WithoutOverwrite()))
-	require.Error(t, ssm.Set(ctx, "/app/key", "loser", WithoutOverwrite()))
+	err := ssm.Set(ctx, "/app/key", "loser", WithoutOverwrite())
+	require.Error(t, err)
 	require.Equal(t, "winner", fake.params["/app/key"])
+
+	// Set wraps with %w, so the typed cause survives. CompleteMigration relies
+	// on this to tell a lost create-only race from a storage failure.
+	var exists *ssmtypes.ParameterAlreadyExists
+	require.ErrorAs(t, err, &exists)
+	require.True(t, isParameterAlreadyExists(err))
+	require.False(t, isParameterAlreadyExists(errors.New("throttled")))
 }
 
 func TestSSMGet(t *testing.T) {

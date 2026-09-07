@@ -377,7 +377,19 @@ func (m *migrator) CompleteMigration(
 	}
 
 	// Atomic commit: from here, the successor boots on the migration key.
-	if err := m.ssm.Set(ctx, m.cfg.kmsKeyIDParam(targetPCR0), migrationKMS.KeyID()); err != nil {
+	if err := m.ssm.Set(
+		ctx,
+		m.cfg.kmsKeyIDParam(targetPCR0),
+		migrationKMS.KeyID(),
+		WithoutOverwrite(),
+	); err != nil {
+		if isParameterAlreadyExists(err) {
+			return nil, fmt.Errorf(
+				"%w: %s was committed by a concurrent finaliser",
+				errMigrationAlreadyFinalised,
+				m.cfg.kmsKeyIDParam(targetPCR0),
+			)
+		}
 		return nil, fmt.Errorf(
 			"failed to commit successor KMS key ID: %w", err,
 		)

@@ -286,7 +286,9 @@ func (b *Boot) determineMode(
 		return &resumeBoot{}, nil
 	}
 
-	state.migrationReceipt, err = b.ssm.MayGet(ctx, b.cfg.migrationStateOriginReceiptParam(keyID))
+	state.migrationReceipt, err = b.ssm.MayGet(
+		ctx, b.cfg.migrationStateOriginReceiptParam(keyID, ownPCR0),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
 	}
@@ -783,7 +785,8 @@ func WriteTransitionReceipt(
 		ssm,
 		root,
 		purposeMigrationTransition,
-		cfg.migrationStateOriginReceiptParam(snapshot.kmsKeyID),
+		cfg.migrationStateOriginReceiptParam(snapshot.kmsKeyID, snapshot.ownerPCR0),
+		WithoutOverwrite(),
 	)
 }
 
@@ -873,14 +876,20 @@ func writeStateReceipt(
 	ssm SSM,
 	stateRoot []byte,
 	purpose, param string,
+	opts ...SSMSetOption,
 ) error {
 	return writeReceipt(ctx, nsm, ssm, stateOriginPayloadV1{
 		Purpose: purpose, StateRoot: stateRoot,
-	}, param)
+	}, param, opts...)
 }
 
 func writeReceipt(
-	ctx context.Context, nsm NSM, ssm SSM, receipt stateOriginPayloadV1, param string,
+	ctx context.Context,
+	nsm NSM,
+	ssm SSM,
+	receipt stateOriginPayloadV1,
+	param string,
+	opts ...SSMSetOption,
 ) error {
 	payload, err := cbor.Marshal(receipt)
 	if err != nil {
@@ -893,7 +902,7 @@ func writeReceipt(
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(doc)
-	return ssm.Set(ctx, param, b64, WithAdvancedTier())
+	return ssm.Set(ctx, param, b64, append([]SSMSetOption{WithAdvancedTier()}, opts...)...)
 }
 
 // verifyStateReceipt checks receipt PCRs and user_data {purpose,state_root}.

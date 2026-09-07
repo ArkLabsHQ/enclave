@@ -125,7 +125,7 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	unscoped := func(c *Config) []string {
 		return []string{
 			c.stateOriginReceiptParam(keyID, pcr0),
-			c.migrationStateOriginReceiptParam(keyID),
+			c.migrationStateOriginReceiptParam(keyID, pcr0),
 			c.migrationPreviousPCR0Param(pcr0),
 			c.migrationPreviousPCR0AttestationParam(pcr0),
 		}

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -370,7 +371,12 @@ func TestCompleteMigration(t *testing.T) {
 		require.NotEmpty(t, fx.ssmf.params[testCfg.storageDEKCiphertextParam(migrationKeyID)])
 		require.NotEmpty(
 			t,
-			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID)],
+			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)],
+		)
+		require.Empty(
+			t,
+			fx.ssmf.params["/prod/app/MigrationStateOriginReceipt/"+migrationKeyID],
+			"the receipt must move to the PCR0-scoped path, not merely exist",
 		)
 		requireKMSCiphertextPlaintext(
 			t,
@@ -604,7 +610,7 @@ func TestCompleteMigration(t *testing.T) {
 	t.Run("fails when transition receipt write fails", func(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.ssmf.putErrs = map[string]error{
-				testCfg.migrationStateOriginReceiptParam(migrationKeyID): errors.New("set failed"),
+				testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0): errors.New("set failed"),
 			}
 		})
 		request(t, fx, newPCR0)
@@ -613,6 +619,117 @@ func TestCompleteMigration(t *testing.T) {
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to write migration-transition receipt")
+	})
+
+	// The create-only commit is what elects a winner among concurrent
+	// finalisers. The read guard above cannot: it is a separate round trip, so
+	// a peer can commit inside the window between the read and the write.
+	t.Run("loses the commit race to a concurrent finaliser", func(t *testing.T) {
+		fx := setup(t)
+		pointer := testCfg.kmsKeyIDParam(newPCR0)
+		fx.ssmf.beforePut = func(name string) {
+			if name == pointer {
+				// A peer predecessor commits its own generation after we passed
+				// the guard and just as our commit lands.
+				fx.ssmf.params[pointer] = "peer-key"
+			}
+		}
+		request(t, fx, newPCR0)
+
+		_, err := fx.m.CompleteMigration(ctx)
+
+		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
+		require.Equal(t, http.StatusConflict, migrationHTTPStatus(err))
+		require.Equal(
+			t, "peer-key", fx.ssmf.params[pointer],
+			"the loser must not overwrite the winner's committed generation",
+		)
+		// The loser's artifacts live under a key ID only it minted, so they are
+		// orphans rather than corruption: nothing enumerates that subtree.
+		require.NotEmpty(
+			t,
+			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)],
+		)
+	})
+
+	t.Run("transition receipt is immutable once written", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
+		require.NoError(t, err)
+
+		param := testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)
+		first := fx.ssmf.params[param]
+		require.NotEmpty(t, first)
+
+		err = WriteTransitionReceipt(ctx, testCfg, fx.m.nsm, fx.ssm, bootSnapshot{
+			kmsKeyID:            migrationKeyID,
+			ownerPCR0:           newPCR0,
+			predecessorPCR0:     oldPCR0Hex,
+			predecessorKMSKeyID: "old-key",
+			staticSecrets: map[StaticSecretMetadata]string{
+				secret.StaticSecretMetadata: fx.ssmf.params[testCfg.secretCiphertextParam(
+					"signing_key", migrationKeyID,
+				)],
+			},
+			storageDEK:                fx.ssmf.params[testCfg.storageDEKCiphertextParam(migrationKeyID)],
+			tlsKeyCiphertext:          fx.ssmf.params[testCfg.tlsKeyCiphertextParam(migrationKeyID)],
+			migrationIntentBucketName: migrationIntentBucketName,
+		})
+
+		require.Error(t, err)
+		require.True(t, isParameterAlreadyExists(err))
+		require.Equal(t, first, fx.ssmf.params[param], "a published receipt must not change")
+	})
+
+	// Keeping the key ID in the receipt path is what makes this recoverable:
+	// the retry mints a new key, so its receipt lands on a path that has never
+	// existed and the create-only write cannot collide with the dead attempt's.
+	t.Run("retries cleanly after the commit fails post-receipt", func(t *testing.T) {
+		fx := setup(t)
+		pointer := testCfg.kmsKeyIDParam(newPCR0)
+		fx.ssmf.putErrs = map[string]error{pointer: errors.New("throttled")}
+		request(t, fx, newPCR0)
+
+		_, err := fx.m.CompleteMigration(ctx)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
+		require.NotEmpty(
+			t,
+			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)],
+		)
+
+		fx.ssmf.putErrs = nil
+		_, err = fx.m.CompleteMigration(ctx)
+		require.NoError(t, err)
+
+		retryKeyID := fx.ssmf.params[pointer]
+		require.NotEmpty(t, retryKeyID)
+		require.NotEqual(
+			t, migrationKeyID, retryKeyID,
+			"the retry must commit a freshly minted key, not the dead attempt's",
+		)
+		require.NotEmpty(
+			t,
+			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(retryKeyID, newPCR0)],
+		)
+		require.NotEmpty(
+			t,
+			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)],
+			"the dead attempt's receipt survives as an unreachable orphan",
+		)
+
+		// The successor adopts the retry's generation and recovers its state.
+		newNSM := &nsmW{nsm: &fakeNSM{
+			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
+			verifyRoots: fx.session.attestationRoots,
+		}}
+		newBoot, err := NewBoot(testCfg, newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		require.NoError(t, err)
+		established, err := newBoot.Boot(ctx)
+		require.NoError(t, err)
+		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
 	})
 
 	t.Run("fails when KMSKeyID write fails", func(t *testing.T) {

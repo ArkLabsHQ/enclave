@@ -29,6 +29,11 @@ func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
 		"/prod/app/StateOriginReceipt/key-1/"+strings.ToLower(pcr0),
 		testCfg.stateOriginReceiptParam("key-1", pcr0),
 	)
+	require.Equal(
+		t,
+		"/prod/app/MigrationStateOriginReceipt/key-1/"+strings.ToLower(pcr0),
+		testCfg.migrationStateOriginReceiptParam("key-1", pcr0),
+	)
 }
 
 func TestLoadUnverifiedState(t *testing.T) {
@@ -49,7 +54,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 		return params
 	}
 	withMigration := func(params map[string]string) map[string]string {
-		params[testCfg.migrationStateOriginReceiptParam(keyID)] = "transition"
+		params[testCfg.migrationStateOriginReceiptParam(keyID, currentPCR0Hex)] = "transition"
 		params[testCfg.migrationPreviousPCR0Param(currentPCR0Hex)] = prevPCR0
 		params[testCfg.migrationPreviousKMSKeyIDParam(currentPCR0Hex)] = "previous-key"
 		params[testCfg.migrationPreviousPCR0AttestationParam(currentPCR0Hex)] = "attestation"
@@ -501,7 +506,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		stateReceipt := signedOriginReceipt(
 			t, map[uint][]byte{0: ownPCR0}, root, originSnapshot,
 		)
-		fake.params[testCfg.migrationStateOriginReceiptParam(keyID)] = transition.docB64
+		fake.params[testCfg.migrationStateOriginReceiptParam(keyID, hex.EncodeToString(ownPCR0))] = transition.docB64
 		fake.params[testCfg.migrationPreviousPCR0AttestationParam(hex.EncodeToString(ownPCR0))] = "previous-attestation"
 
 		session := &fakeNSMSession{}

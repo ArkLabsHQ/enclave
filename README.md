@@ -391,7 +391,7 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/L/TLSKey/Ciphertext/<keyID>` | runtime | Encrypted TLS key. |
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
-| `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
+| `/D/A/MigrationStateOriginReceipt/<keyID>/<pcr0>` | runtime | Predecessor's attestation over the successor's state. Written create-only. |
 | `/D/A/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
 | `/D/A/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Predecessor KMS key ID, committed into the successor's state root. |
 | `/D/A/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
@@ -400,6 +400,10 @@ Every runtime-written path is scoped by a key ID, a PCR0, or both, so nothing is
 ever overwritten. Each handoff therefore adds a generation rather than replacing
 one; prune retired generations only once you are certain you will never boot
 their PCR0 again.
+
+`KMSKeyID/<pcr0>` and both state-origin receipts are written create-only, so the
+storage layer refuses a replacement rather than relying on the writer to check
+first.
 
 Each state-origin receipt includes the generation's KMS key ID and its
 predecessor's PCR0 and KMS key ID. The audit follows those attested links without
@@ -600,6 +604,20 @@ The order is:
    already holds a value the request is refused with `409`, so a retry can never
    mint a second key and displace a generation the successor may already be
    running.
+
+   `KMSKeyID/<successor PCR0>` is written create-only, and that write is the
+   handoff's commitment point. It is what makes the refusal above hold between
+   independent enclaves rather than only within one process: if two predecessors
+   sharing a PCR0 finalise the same intent concurrently, exactly one write
+   succeeds and the other gets its `409`. Everything written earlier in the step
+   lives under a KMS key ID minted by that attempt alone, so a loser — or an
+   attempt that dies partway — leaves only unreachable orphans: one KMS key and
+   a few SSM parameters that nothing resolves. Retry is always safe, since the
+   next attempt mints a fresh key and writes a disjoint set of paths.
+
+   An abort recorded after this write has committed does not retract the
+   handoff. The intent log governs whether a migration may begin; the pointer is
+   what makes it real.
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that
    `KMSKeyID/<predecessor PCR0>` is unchanged. The first is the commit; the
    second is the guarantee that the predecessor is still intact.
@@ -626,6 +644,32 @@ Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
 `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
 different subtree, finds nothing, and fails to boot. A production image can
 therefore never adopt a deployment created by a dev image, or the reverse.
+
+### Upgrading across the PCR0-scoped receipt change
+
+The transition receipt moved from `MigrationStateOriginReceipt/<keyID>` to
+`MigrationStateOriginReceipt/<keyID>/<pcr0>`. There is no fallback read, so
+**predecessor and successor images must both carry the change, or neither.** A
+handoff that straddles it writes the receipt where the successor will not look,
+and the successor fails to boot with `predecessor artifacts present but no
+migration transition receipt`.
+
+This does not fail loudly on the predecessor: it commits `KMSKeyID/<successor
+PCR0>` and returns `200` before the successor ever reads. The refusal only
+appears when the successor boots, and a plain retry is then refused with `409`
+because the pointer is already committed.
+
+Complete or abort in-flight migrations before upgrading. To recover a handoff
+that already straddled the change, delete the successor's committed pointer and
+finalise again:
+
+```sh
+aws ssm delete-parameter --name "/<D>/<A>/<locked|unlocked>/KMSKeyID/<successor PCR0>"
+```
+
+This is safe only while the successor has never booted — that pointer is the one
+thing standing between a successor and its state. The retry mints a fresh key
+and writes a disjoint generation; the abandoned one is orphaned, not reused.
 
 ## Verifying an enclave
 

@@ -246,13 +246,17 @@ func (c *Config) stateOriginReceiptParam(keyID, pcr0 string) string {
 
 // migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
 // writes over a successor's state during a migration handoff. Scoped by the
-// successor key ID.
-func (c *Config) migrationStateOriginReceiptParam(keyID string) string {
+// successor key ID and the successor PCR0, and written create-only, so a
+// published handoff artifact is immutable. The key ID is minted fresh per
+// finalisation attempt, so this path is private to one attempt; the atomic
+// commitment point for a handoff is kmsKeyIDParam, not this receipt.
+func (c *Config) migrationStateOriginReceiptParam(keyID, pcr0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/MigrationStateOriginReceipt/%s",
+		"/%s/%s/MigrationStateOriginReceipt/%s/%s",
 		c.Deployment,
 		c.AppName,
 		keyID,
+		strings.ToLower(pcr0),
 	)
 }
 

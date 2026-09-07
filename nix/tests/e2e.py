@@ -27,6 +27,10 @@ def key_param(pcr0):
     return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
 
 
+def migration_receipt_param(key_id, pcr0):
+    return f"/dev/testapp/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
+
+
 def get_param(name):
     status, out = aws.execute(
         f"{CLOUD} ssm get-parameter --name {name} --query Parameter.Value --output text"
@@ -546,6 +550,36 @@ aws.succeed(
     '."kms:RecipientAttestation:PCR0"] | map(select(. != null)) | flatten '
     "| . == [$g]' /tmp/migration-key-policy.json"
 )
+
+# The handoff receipt lives at the PCR0-scoped path, not the legacy key-only one.
+# A create-only write onto it must be refused: that is exactly the collision a
+# competing predecessor would hit. (This does not prove an *overwriting* write
+# is refused — that is an IAM property, which LocalStack does not model.)
+receipt_param = migration_receipt_param(migration_key, GREEN_PCR0)
+assert get_param(receipt_param) not in ("", "UNSET", "None")
+assert get_param(f"/dev/testapp/MigrationStateOriginReceipt/{migration_key}") == ""
+receipt_before = get_param(receipt_param)
+create_only_status, _ = aws.execute(
+    f"{CLOUD} ssm put-parameter --name {receipt_param} "
+    "--type String --value tampered"
+)
+assert create_only_status != 0, "a create-only write must lose to the published receipt"
+assert get_param(receipt_param) == receipt_before
+
+# `blue_peer` shares BLUE_PCR0, so it shares the intent chain and can finalise
+# the same intent. The commit is create-only, so it must lose cleanly rather
+# than clobber the pointer green is about to boot on.
+peer_status, peer_output = blue_peer.execute(
+    "curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' "
+    f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
+    "http://127.0.0.1:8003/finalise-migration"
+)
+assert peer_status == 0, peer_output
+assert peer_output.strip() == "409", peer_output
+assert get_param(key_param(GREEN_PCR0)) == migration_key
+assert get_param(receipt_param) == receipt_before
+# The guard runs before any key is minted, so a loser must not leave an orphan.
+assert kms_key_count() == kms_keys_before_genesis + 2
 
 # The blue fleet outlives the handoff it performed. Only `blue` was asked to
 # finalise, so exactly one migration key exists; `blue_peer` keeps serving from

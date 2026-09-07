@@ -673,7 +673,7 @@ cert_etag_before = cert_etag()
 challenge_events_before = challenge_event_count()
 kms_keys_before = kms_key_count()
 assert cloud(
-    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
 ) == migration_key
 
 green_peer.start()
@@ -685,7 +685,7 @@ wait_healthy(green_peer)
 
 # Joining must resume the committed state, not perform genesis or issue a cert.
 assert cloud(
-    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
 ) == migration_key
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
@@ -738,7 +738,7 @@ assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
 assert cloud(
-    f"ssm get-parameter --name {key_param} --query Parameter.Value --output text"
+    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
 ) == migration_key
 assert kms_key_count() == kms_keys_before
 assert cert_etag() == cert_etag_before

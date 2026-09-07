@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -218,6 +219,33 @@ func migrationStatusAt(
 	return status
 }
 
+func (m *migrator) verifyIntent(
+	ctx context.Context, sourcePCR0, targetPCR0 string, sequence uint64,
+) error {
+	head, err := m.intent.Head(ctx, sourcePCR0)
+	if err != nil {
+		return fmt.Errorf("verify migration intent: %w", err)
+	}
+	if head == nil {
+		return fmt.Errorf("%w: intent disappeared before commit", errMigrationIntentAbsent)
+	}
+	if head.Action == migrationIntentAborted {
+		return fmt.Errorf("%w: aborted before commit", errMigrationIntentAborted)
+	}
+	if head.Sequence != sequence {
+		return fmt.Errorf(
+			"%w: intent advanced from sequence %d to %d before commit",
+			errMigrationIntentAborted, sequence, head.Sequence,
+		)
+	}
+	if !strings.EqualFold(head.TargetPCR0, targetPCR0) {
+		return fmt.Errorf(
+			"%w: intent target changed before commit", errMigrationIntentAborted,
+		)
+	}
+	return nil
+}
+
 // CompleteMigration exports state under a PCR0-locked migration key, then flips KMSKeyID.
 func (m *migrator) CompleteMigration(
 	ctx context.Context,
@@ -374,6 +402,10 @@ func (m *migrator) CompleteMigration(
 		return nil, fmt.Errorf(
 			"failed to write migration-transition receipt: %w", err,
 		)
+	}
+
+	if err := m.verifyIntent(ctx, ownPCR0, targetPCR0, status.Sequence); err != nil {
+		return nil, err
 	}
 
 	// Atomic commit: from here, the successor boots on the migration key.

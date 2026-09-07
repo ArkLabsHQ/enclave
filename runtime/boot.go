@@ -115,6 +115,7 @@ type bootMode interface {
 
 	// verifySnapshot proves the snapshot came from an enclave we accept.
 	verifySnapshot(
+		ctx context.Context,
 		state *bootState, nsm NSM, snapshot bootSnapshot, snapshotRoot []byte,
 	) error
 
@@ -137,7 +138,9 @@ type genesisBoot struct {
 
 type resumeBoot struct{}
 
-type migrationBoot struct{}
+type migrationBoot struct {
+	intent *migrationIntentLog
+}
 
 type Boot struct {
 	cfg    *Config
@@ -292,7 +295,13 @@ func (b *Boot) determineMode(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
 	}
-	return &migrationBoot{}, nil
+	intent, err := newMigrationIntentLog(
+		b.cfg, b.s3, b.nsm, state.snapshot.migrationIntentBucketName,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open migration intent log: %w", err)
+	}
+	return &migrationBoot{intent: intent}, nil
 }
 
 func (b *genesisBoot) verify(nsm NSM, state *bootState) error {
@@ -363,7 +372,9 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to build state root: %v", err)
 	}
-	if err := planned.mode.verifySnapshot(state, b.nsm, snapshot, snapshotRoot); err != nil {
+	if err := planned.mode.verifySnapshot(
+		ctx, state, b.nsm, snapshot, snapshotRoot,
+	); err != nil {
 		return bootResult{}, err
 	}
 
@@ -625,11 +636,14 @@ func (b *migrationBoot) buildSnapshot(
 }
 
 // Genesis has nothing to verify against: it is the origin.
-func (b *genesisBoot) verifySnapshot(*bootState, NSM, bootSnapshot, []byte) error {
+func (b *genesisBoot) verifySnapshot(
+	context.Context, *bootState, NSM, bootSnapshot, []byte,
+) error {
 	return nil
 }
 
 func (b *resumeBoot) verifySnapshot(
+	_ context.Context,
 	state *bootState, nsm NSM, snapshot bootSnapshot, snapshotRoot []byte,
 ) error {
 	if err := verifyOriginReceipt(
@@ -641,6 +655,7 @@ func (b *resumeBoot) verifySnapshot(
 }
 
 func (b *migrationBoot) verifySnapshot(
+	ctx context.Context,
 	state *bootState, nsm NSM, _ bootSnapshot, snapshotRoot []byte,
 ) error {
 	if err := verifyStateReceipt(
@@ -648,6 +663,33 @@ func (b *migrationBoot) verifySnapshot(
 		snapshotRoot, predecessorExpectedPCRs(state),
 	); err != nil {
 		return fmt.Errorf("invalid state-origin receipt: %w", err)
+	}
+
+	if b.intent == nil {
+		return fmt.Errorf("migration authorization: no intent log")
+	}
+	head, err := b.intent.Head(ctx, state.predecessorPCR0)
+	if err != nil {
+		return err
+	}
+	if head == nil {
+		return fmt.Errorf(
+			"%w: predecessor %s recorded no intent",
+			errMigrationIntentAbsent, prefix16(state.predecessorPCR0),
+		)
+	}
+	if head.Action != migrationIntentRequested {
+		return fmt.Errorf(
+			"%w: intent from %s is %s",
+			errMigrationIntentAborted, prefix16(state.predecessorPCR0), head.Action,
+		)
+	}
+	if !strings.EqualFold(head.TargetPCR0, hex.EncodeToString(state.currentPCR0)) {
+		return fmt.Errorf(
+			"%w: intent from %s targets %s, not this enclave",
+			errMigrationIntentAborted, prefix16(state.predecessorPCR0),
+			prefix16(head.TargetPCR0),
+		)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -262,6 +263,12 @@ func TestMigrationRequestValidate(t *testing.T) {
 	}
 }
 
+func migrationTestCfg() *Config {
+	cfg := newTestConfig("prod", "app", false)
+	cfg.MigrationCooldown = 0
+	return cfg
+}
+
 func TestCompleteMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
 	migrationIntentBucketName := migrationIntentBucketName(testCfg, fakeSTSAccountID)
@@ -326,8 +333,7 @@ func TestCompleteMigration(t *testing.T) {
 		require.NoError(t, err)
 		fx.m = m.(*migrator)
 
-		fx.m.cfg = newTestConfig("prod", "app", false)
-		fx.m.cfg.MigrationCooldown = 0
+		fx.m.cfg = migrationTestCfg()
 		return fx
 	}
 	request := func(t *testing.T, fx *startMigrationFixture, targetPCR0 string) {
@@ -393,7 +399,7 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		newBoot, err := NewBoot(testCfg, newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		newBoot, err := NewBoot(migrationTestCfg(), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
@@ -724,12 +730,86 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		newBoot, err := NewBoot(testCfg, newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		newBoot, err := NewBoot(migrationTestCfg(), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
 		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+	})
+
+	t.Run("refuses to commit when aborted during the handoff", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		receiptParam := testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)
+		fx.ssmf.beforePut = func(name string) {
+			if name != receiptParam {
+				return
+			}
+			// An operator aborts on a peer while this handoff is mid-flight.
+			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+			require.NoError(t, err)
+		}
+
+		_, err := fx.m.CompleteMigration(ctx)
+
+		require.ErrorIs(t, err, errMigrationIntentAborted)
+		require.Equal(t, http.StatusConflict, migrationHTTPStatus(err))
+		require.Empty(
+			t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)],
+			"an aborted handoff must leave the successor uncommitted",
+		)
+	})
+
+	t.Run("fails closed when the intent store is unreadable at commit", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		receiptParam := testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)
+		fx.ssmf.beforePut = func(name string) {
+			if name == receiptParam {
+				fx.s3f.listErr = errors.New("s3 unavailable")
+			}
+		}
+
+		_, err := fx.m.CompleteMigration(ctx)
+
+		require.Error(t, err)
+		require.ErrorContains(t, err, "verify migration intent")
+		require.Empty(t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	// Adoption is a one-time event. Once the successor has written its own
+	// state-origin receipt it resumes from that, so a later abort — which the
+	// log accepts at any time — cannot invalidate a running generation.
+	t.Run("successor restart is not revalidated against the intent log", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		_, err := fx.m.CompleteMigration(ctx)
+		require.NoError(t, err)
+
+		session := newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes})
+		successor := func(roots *x509.CertPool) (*Boot, error) {
+			return NewBoot(
+				migrationTestCfg(),
+				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
+				fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+			)
+		}
+		// Adopting verifies the predecessor's receipt; restarting verifies the
+		// successor's own, which this session signed during adoption.
+		first, err := successor(fx.session.attestationRoots)
+		require.NoError(t, err)
+		_, err = first.Boot(ctx)
+		require.NoError(t, err)
+
+		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex)
+		require.NoError(t, err)
+
+		restarted, err := successor(session.attestationRoots)
+		require.NoError(t, err)
+		established, err := restarted.Boot(ctx)
+		require.NoError(t, err, "a committed generation must survive a later abort")
+		require.Equal(t, dekKey, established.dek.(*dek).key)
 	})
 
 	t.Run("fails when KMSKeyID write fails", func(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/hf/nitrite"
 	"github.com/stretchr/testify/require"
 )
 
@@ -492,7 +493,37 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	wrongPCR0 := bytes.Repeat([]byte{0x77}, 48)
 	failedTargetPCR0 := bytes.Repeat([]byte{0x33}, 48)
 
-	run := func(t *testing.T, prevPCR0Hex string, verifiedPCRs map[uint][]byte) (*fakeSSM, []byte, *x509.CertPool, error) {
+	type intentSeed struct {
+		source         []byte
+		action, target string
+		sequence       uint64
+		publishedAt    time.Time
+	}
+	// Authorization is judged at boot, so seeds are placed relative to now.
+	// afterPlan breaks the intent store only once the boot has classified
+	// itself as a migration.
+	bootAt := time.Now()
+	var afterPlan func(*fakeS3)
+
+	seed := func(action, target string, sequence uint64, at time.Time) intentSeed {
+		return intentSeed{
+			source: prevPCR0, action: action, target: target,
+			sequence: sequence, publishedAt: at,
+		}
+	}
+	authorized := func(source []byte, target string) []intentSeed {
+		return []intentSeed{{
+			source: source, action: migrationIntentRequested, target: target,
+			sequence: 1, publishedAt: bootAt.Add(-time.Minute),
+		}}
+	}
+
+	run := func(
+		t *testing.T,
+		prevPCR0Hex string,
+		verifiedPCRs map[uint][]byte,
+		intents []intentSeed,
+	) (*fakeSSM, []byte, *x509.CertPool, error) {
 		t.Helper()
 		fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
 		fake.params[testCfg.migrationPreviousPCR0Param(hex.EncodeToString(ownPCR0))] = prevPCR0Hex
@@ -511,17 +542,33 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 
 		session := &fakeNSMSession{}
 		session.responses = append(session.responses, attestationDocumentResponse(stateReceipt.doc))
-		nsm := &nsmW{nsm: &fakeNSM{
+		nsmFake := &intentAwareNSM{fakeNSM: &fakeNSM{
 			session: session,
 			verifyResult: verifyDocResult(
 				verifiedPCRs,
 				receiptPayload(t, purposeMigrationTransition, root),
 			),
 		}}
+		nsm := &nsmW{nsm: nsmFake}
 		s3f := newFakeS3()
 		seedGenesisRecord(t, s3f, prevPCR0Hex)
+		// The predecessor named in SSM authorized this successor before handing
+		// over. Without it the handoff is unauthorized however well-formed the
+		// receipt is.
+		if len(intents) > 0 {
+			signer := newTestAttestationSigner(
+				t, bootAt.Add(-24*time.Hour), bootAt.Add(24*time.Hour),
+			)
+			for _, seed := range intents {
+				seedMigrationIntent(
+					t, s3f, nsmFake, signer, seed.source,
+					seed.action, seed.target, seed.sequence, seed.publishedAt,
+				)
+			}
+		}
+		cfg := migrationTestCfg()
 		boot := &Boot{
-			cfg: testCfg,
+			cfg: cfg,
 			nsm: seededGenesisNSM{NSM: fakePredecessorNSM{
 				NSM: nsm, doc: "previous-attestation",
 			}},
@@ -531,8 +578,11 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		if err != nil {
 			return fake, root, stateReceipt.roots, err
 		}
+		if afterPlan != nil {
+			afterPlan(s3f)
+		}
 
-		_, err = (&Boot{cfg: testCfg, nsm: nsm, ssm: ssm}).establish(
+		_, err = (&Boot{cfg: cfg, nsm: nsm, ssm: ssm}).establish(
 			ctx, planned, &stateOriginTestKMS{keyID: keyID},
 		)
 		return fake, root, stateReceipt.roots, err
@@ -542,7 +592,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		fake, root, roots, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
 			migrationPCRIndex: pcrExtendFromZero(ownPCR0),
-		})
+		}, authorized(prevPCR0, hex.EncodeToString(ownPCR0)))
 		require.NoError(t, err)
 		require.NoError(t, verifyOriginReceipt(
 			NewNSM(WithAttestationRoots(roots)),
@@ -560,8 +610,61 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		_, _, _, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
 			migrationPCRIndex: pcrExtendFromZero(wrongPCR0),
-		})
+		}, authorized(prevPCR0, hex.EncodeToString(ownPCR0)))
 		require.Error(t, err)
+	})
+
+	valid := map[uint][]byte{
+		0:                 prevPCR0,
+		migrationPCRIndex: pcrExtendFromZero(ownPCR0),
+	}
+	ownHex, prevHex := hex.EncodeToString(ownPCR0), hex.EncodeToString(prevPCR0)
+	otherHex := hex.EncodeToString(wrongPCR0)
+	authorize := func(t *testing.T, seeds ...intentSeed) error {
+		t.Helper()
+		_, _, _, err := run(t, prevHex, valid, seeds)
+		return err
+	}
+
+	t.Run("refuses when no intent was ever recorded", func(t *testing.T) {
+		err := authorize(t)
+		require.ErrorIs(t, err, errMigrationIntentAbsent)
+		require.ErrorContains(t, err, "recorded no intent")
+	})
+
+	t.Run("refuses an intent naming another successor", func(t *testing.T) {
+		err := authorize(t, seed(
+			migrationIntentRequested, otherHex, 1, bootAt.Add(-time.Hour),
+		))
+		require.ErrorIs(t, err, errMigrationIntentAborted)
+	})
+
+	// Authorization must still be live at boot: an abort revokes it, whether or
+	// not the predecessor had already finalised.
+	t.Run("refuses when a later abort revoked the authorization", func(t *testing.T) {
+		err := authorize(t,
+			seed(migrationIntentRequested, ownHex, 1, bootAt.Add(-3*time.Hour)),
+			seed(migrationIntentAborted, ownHex, 2, bootAt.Add(-2*time.Hour)),
+		)
+		require.ErrorIs(t, err, errMigrationIntentAborted)
+	})
+
+	t.Run("adopts when a re-request superseded an earlier abort", func(t *testing.T) {
+		require.NoError(t, authorize(t,
+			seed(migrationIntentRequested, ownHex, 1, bootAt.Add(-5*time.Hour)),
+			seed(migrationIntentAborted, ownHex, 2, bootAt.Add(-4*time.Hour)),
+			seed(migrationIntentRequested, ownHex, 3, bootAt.Add(-3*time.Hour)),
+		))
+	})
+
+	t.Run("fails closed when the intent store is unreadable", func(t *testing.T) {
+		afterPlan = func(s3f *fakeS3) { s3f.listErr = errors.New("s3 unavailable") }
+		defer func() { afterPlan = nil }()
+
+		err := authorize(t, seed(
+			migrationIntentRequested, ownHex, 1, bootAt.Add(-time.Hour),
+		))
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 	})
 
 	// Naming yourself as your own predecessor used to be allowed as a rollback and
@@ -571,7 +674,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
 			0:                 ownPCR0,
 			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
-		})
+		}, nil)
 		require.ErrorContains(t, err, "cannot be its own predecessor")
 	})
 }
@@ -766,6 +869,68 @@ func (f *genesisFixture) keyIDParam() string { return testCfg.kmsKeyIDParam(f.pc
 
 // seedGenesisRecord writes the record a completed genesis leaves behind. The
 // attestation is a placeholder: Genesis does not verify it.
+// seedMigrationIntent writes a genuinely signed intent record into the fake
+// log and registers its attestation for real verification, so a successor's
+// authorization check reads it exactly as it would a record a predecessor
+// published. publishedAt drives the cooldown and abort ordering the check
+// applies, so callers set it relative to the handoff they are modelling.
+// intentAwareNSM verifies seeded intent attestations for real while leaving
+// every other document to the canned result the receipt cases rely on.
+type intentAwareNSM struct {
+	*fakeNSM
+	roots map[string]*x509.CertPool
+}
+
+func (n *intentAwareNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
+	if roots, ok := n.roots[base64.StdEncoding.EncodeToString(doc)]; ok {
+		return (&awsNSM{roots: roots}).VerifyAttestationSig(doc)
+	}
+	return n.fakeNSM.VerifyAttestationSig(doc)
+}
+
+func seedMigrationIntent(
+	t *testing.T,
+	s3f *fakeS3,
+	fake *intentAwareNSM,
+	signer *testAttestationSigner,
+	sourcePCR0 []byte,
+	action, targetPCR0 string,
+	sequence uint64,
+	publishedAt time.Time,
+) {
+	t.Helper()
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	require.NoError(t, err)
+	payload, err := enc.Marshal(migrationIntentV1{
+		Schema:     migrationIntentSchemaV1,
+		BucketName: stateOriginTestMigrationIntentBucket(),
+		Sequence:   sequence,
+		Action:     action,
+		TargetPCR0: targetPCR0,
+	})
+	require.NoError(t, err)
+
+	attestation := signer.build(t, map[uint][]byte{0: sourcePCR0}, publishedAt, payload)
+	body, err := json.Marshal(migrationIntentObjectV1{
+		Schema:      migrationIntentSchemaV1,
+		Sequence:    sequence,
+		Action:      action,
+		TargetPCR0:  targetPCR0,
+		Attestation: attestation.docB64,
+	})
+	require.NoError(t, err)
+
+	if fake.roots == nil {
+		fake.roots = map[string]*x509.CertPool{}
+	}
+	fake.roots[attestation.docB64] = attestation.roots
+	s3f.putRawObjectAt(
+		migrationIntentObjectKey(hex.EncodeToString(sourcePCR0), sequence),
+		body,
+		publishedAt,
+	)
+}
+
 func seedGenesisRecord(t *testing.T, s3f *fakeS3, targetPCR0 string) {
 	t.Helper()
 	body, err := json.Marshal(deploymentGenesisV1{

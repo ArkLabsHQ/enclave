@@ -549,17 +549,17 @@ aws.succeed(
 
 # The blue fleet outlives the handoff it performed. Only `blue` was asked to
 # finalise, so exactly one migration key exists; `blue_peer` keeps serving from
-# state it established under the retired key. Both now report themselves as
-# their own predecessor, because finalise records the finalising PCR0 and the
-# fleet shares it — so "genesis" is no longer the expected value here.
+# state it established under the original key. The handoff writes predecessor
+# information only into green's scope, so both blue nodes retain their genesis
+# ancestry while reporting the migration intent targeting green.
 for node in BLUES:
     wait_healthy(node)
     assert secret_value(node) == blue_secret
     assert served_leaf_sha(node) == blue_leaf_sha
     node.wait_until_succeeds(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-        f"| jq -e --arg p '{BLUE_PCR0}' --arg t '{GREEN_PCR0}' "
-        "'.previous_pcr0 == $p and .migration.state == \"eligible\" "
+        f"| jq -e --arg t '{GREEN_PCR0}' "
+        "'.previous_pcr0 == \"genesis\" and .migration.state == \"eligible\" "
         "and .migration.target_pcr0 == $t'"
     )
 assert kms_key_count() == kms_keys_before_genesis + 2

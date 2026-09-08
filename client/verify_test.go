@@ -40,6 +40,8 @@ func TestVerifyRealAttestationDocument(t *testing.T) {
 	result, err := nitrite.Verify(doc, nitrite.VerifyOptions{
 		CurrentTime: time.Now(),
 	})
+	// Fixture chain expired (notAfter 2026-04-04); nitrite still returns the parsed
+	// document with SignatureOK. Chain validity is covered by the new regression tests.
 	require.NotNil(t, result, "nitrite.Verify failed: %v", err)
 	require.True(t, result.SignatureOK, "attestation signature not OK: %v", err)
 	require.NotNil(t, result.Document)
@@ -151,6 +153,8 @@ func buildSelfSignedAttestationDoc(
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	require.NoError(t, err)
 
+	// Second self-signed cert (same key as leaf), not a real intermediate CA. The
+	// CABundle cannot chain to the AWS Nitro root, which is what the tests need.
 	intermediateDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	require.NoError(t, err)
 

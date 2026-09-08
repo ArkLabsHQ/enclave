@@ -3,12 +3,16 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
@@ -159,12 +163,15 @@ type AWSClient struct {
 	STS     STSAPI
 	CWL     CloudWatchLogsAPI
 	Route53 Route53API
+
+	InstanceID string
 }
 
 // NewAWSClient constructs all SDK clients from a single shared aws.Config.
 // Returns an error if the IMDS-bridged config can't be loaded.
 func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 	cfg, err := loadAWSConfigWithIMDS(ctx)
+
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
@@ -175,6 +182,8 @@ func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 		STS:     newSTSClient(cfg),
 		CWL:     newCloudWatchLogsClient(cfg),
 		Route53: newRoute53Client(cfg),
+
+		InstanceID: resolveInstanceID(ctx, cfg),
 	}, nil
 }
 
@@ -234,6 +243,23 @@ func newCloudWatchLogsClient(cfg aws.Config) *cloudwatchlogs.Client {
 		})
 	}
 	return cloudwatchlogs.NewFromConfig(cfg)
+}
+
+func resolveInstanceID(ctx context.Context, cfg aws.Config) string {
+	out, err := imds.NewFromConfig(cfg).GetMetadata(
+		ctx, &imds.GetMetadataInput{Path: "instance-id"})
+	if err != nil {
+		slog.Warn("instance ID lookup: IMDS", "error", err)
+		return ""
+	}
+	defer func() { _ = out.Content.Close() }()
+
+	id, err := io.ReadAll(out.Content)
+	if err != nil {
+		slog.Warn("instance ID lookup: read IMDS response", "error", err)
+		return ""
+	}
+	return strings.TrimSpace(string(id))
 }
 
 // loadAWSConfigWithIMDS loads AWS config using SDK defaults.

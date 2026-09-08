@@ -13,6 +13,8 @@ func newTestConfig(deployment, appName string, dev bool) *Config {
 		Deployment: deployment, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
+		LogGroupPrefix: defaultLogGroupPrefix,
+		InstanceID:     "i-0e2ce2ce2ce2ce2ce",
 	}
 	c.setSecurityConfig(dev)
 	return c
@@ -89,11 +91,13 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
+	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "/ark/se7enz/emulator")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, 250*time.Millisecond, cfg.LogShipInterval)
 	require.Equal(t, int32(7), cfg.LogRetentionDays)
+	require.Equal(t, "/ark/se7enz/emulator/enclave", cfg.LogGroupPrefix)
 }
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
@@ -101,11 +105,49 @@ func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
+	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "   ")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, defaultLogShipInterval, cfg.LogShipInterval)
 	require.Equal(t, defaultLogRetentionDays, cfg.LogRetentionDays)
+	require.Equal(t, defaultLogGroupPrefix, cfg.LogGroupPrefix)
+}
+
+func TestNormalizeLogGroupPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "unset", raw: "", want: "/enclave"},
+		{name: "whitespace only", raw: "   ", want: "/enclave"},
+		{name: "root only", raw: "/", want: "/enclave"},
+		{name: "slashes only", raw: "///", want: "/enclave"},
+		{name: "leading segments", raw: "/ark/se7enz/emulator",
+			want: "/ark/se7enz/emulator/enclave"},
+		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing/enclave"},
+		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading/enclave"},
+		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded/enclave"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, normalizeLogGroupPrefix(tc.raw))
+		})
+	}
+}
+
+func TestConfigLogGroup(t *testing.T) {
+	cfg := newTestConfig("prod", "app", false)
+	require.Equal(t, "/enclave/prod/logs/app", cfg.logGroup(signalAppLogs))
+	require.Equal(t, "/enclave/prod/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
+	require.Equal(t, "/enclave/prod/traces/app", cfg.logGroup(signalAppTraces))
+	require.Equal(t,
+		"/enclave/prod/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
+	require.Equal(t, "/enclave/prod/metrics", cfg.logGroup(signalMetrics))
+
+	cfg.LogGroupPrefix = "/ark/se7enz/emulator/enclave"
+	require.Equal(t, "/ark/se7enz/emulator/enclave/prod/logs/supervisor",
+		cfg.logGroup(signalSupervisorLogs))
 }
 
 // The lock posture is an IAM-enforceable boundary, so it must move exactly the

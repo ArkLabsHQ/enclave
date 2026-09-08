@@ -163,6 +163,7 @@ func runKMSProxy(listenAddr string, upstream *url.URL) error {
 
 func runMockIMDS(listenAddr string) error {
 	const roleName = "test-enclave-role"
+	const instanceID = "i-0e2ce2ce2ce2ce2ce"
 
 	mux := http.NewServeMux()
 
@@ -172,6 +173,10 @@ func runMockIMDS(listenAddr string) error {
 
 	mux.HandleFunc("PUT /latest/api/token", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("mock-imds-token"))
+	})
+
+	mux.HandleFunc("GET /latest/meta-data/instance-id", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(instanceID))
 	})
 
 	mux.HandleFunc("GET /latest/meta-data/iam/security-credentials/", func(w http.ResponseWriter, _ *http.Request) {

@@ -122,3 +122,18 @@ func logRetentionDays() int32 {
 	}
 	return int32(days)
 }
+
+func logGroupPrefix() string {
+	return normalizeLogGroupPrefix(os.Getenv("ENCLAVE_LOG_GROUP_PREFIX"))
+}
+
+func normalizeLogGroupPrefix(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return defaultLogGroupPrefix
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	return trimmed + defaultLogGroupPrefix
+}

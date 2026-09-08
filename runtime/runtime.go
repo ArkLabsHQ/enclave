@@ -51,6 +51,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
+	cfg.InstanceID = aws.InstanceID
 	telemetry := NewTelemetry(&cfg, aws.CWL)
 	if err := telemetry.Start(ctx); err != nil {
 		return err

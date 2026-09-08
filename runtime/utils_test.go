@@ -649,6 +649,7 @@ type fakeCloudWatchLogs struct {
 	streams            []string
 	retentionDays      []int32
 	puts               []*cloudwatchlogs.PutLogEventsInput
+	putCalls           int
 	putCh              chan *cloudwatchlogs.PutLogEventsInput
 
 	// putBlock stalls PutLogEvents until closed, standing in for a CloudWatch
@@ -657,7 +658,7 @@ type fakeCloudWatchLogs struct {
 }
 
 func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
-	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 10)}
+	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 64)}
 }
 
 func (f *fakeCloudWatchLogs) CreateLogGroup(
@@ -706,6 +707,7 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 ) (*cloudwatchlogs.PutLogEventsOutput, error) {
 	f.mu.Lock()
 	putErr := f.putLogEventsErr
+	f.putCalls++
 	f.mu.Unlock()
 	if putErr != nil {
 		return nil, putErr
@@ -729,13 +731,13 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	return &cloudwatchlogs.PutLogEventsOutput{}, nil
 }
 
-// requireCloudWatchPutTo waits for a batch on one log group. The three signals
-// share a client, so a bare "next put" would race between them.
 func isShipperMarker(in *cloudwatchlogs.PutLogEventsInput) bool {
 	return len(in.LogEvents) == 1 &&
 		strings.Contains(aws.ToString(in.LogEvents[0].Message), "shipper_started")
 }
 
+// requireCloudWatchPutTo waits for a batch on one log group. The signals share a
+// client, so a bare "next put" would race between them.
 func requireCloudWatchPutTo(
 	t *testing.T,
 	cw *fakeCloudWatchLogs,

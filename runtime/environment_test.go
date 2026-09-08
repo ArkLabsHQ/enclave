@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -42,6 +43,21 @@ func TestConfigValidate(t *testing.T) {
 			mutate:  func(c *Config) { c.FQDN = "" },
 			wantErr: "config is missing FQDN",
 		},
+		{
+			name:    "log group prefix empty",
+			mutate:  func(c *Config) { c.LogGroupPrefix = "" },
+			wantErr: "ENCLAVE_LOG_GROUP_PREFIX must not be empty",
+		},
+		{
+			name:    "log group prefix has an illegal character",
+			mutate:  func(c *Config) { c.LogGroupPrefix = "/ark:se7enz" },
+			wantErr: "CloudWatch log group names allow only",
+		},
+		{
+			name:    "log group name too long",
+			mutate:  func(c *Config) { c.LogGroupPrefix = "/" + strings.Repeat("a", 512) },
+			wantErr: "CloudWatch allows 512",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := valid()
@@ -67,6 +83,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("VALID_KEY", "")
 	t.Setenv("nested/IGNORE", "")
 	t.Setenv("SAFE_KEY", "")
+	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "")
 
 	ctx := context.Background()
 	path := func(key string) string { return "/prod/app/env/" + key }
@@ -93,12 +110,13 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Run("updates mutable runtime config", func(t *testing.T) {
 		cfg := *testCfg
 		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_APP_PORT"):       "9090",
-			path("ENCLAVE_FQDN"):           "app.example.com",
-			path("ENCLAVE_USE_ACME"):       "TRUE",
-			path("ENCLAVE_ACME_DIRECTORY"): "https://acme.example.com/directory",
-			path("ENCLAVE_ACME_EMAIL"):     "ops@example.com",
-			path("ENCLAVE_ACME_CA"):        "test-ca",
+			path("ENCLAVE_APP_PORT"):         "9090",
+			path("ENCLAVE_FQDN"):             "app.example.com",
+			path("ENCLAVE_USE_ACME"):         "TRUE",
+			path("ENCLAVE_ACME_DIRECTORY"):   "https://acme.example.com/directory",
+			path("ENCLAVE_ACME_EMAIL"):       "ops@example.com",
+			path("ENCLAVE_ACME_CA"):          "test-ca",
+			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark/se7enz",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "9090", cfg.AppPort)
@@ -108,6 +126,17 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Equal(t, "https://acme.example.com/directory", cfg.ACMEDirectory)
 		require.Equal(t, "ops@example.com", cfg.ACMEEmail)
 		require.Equal(t, "test-ca", cfg.ACMECA)
+		require.Equal(t, "/ark/se7enz/enclave", cfg.LogGroupPrefix)
+	})
+
+	t.Run("rejects an unusable log group prefix", func(t *testing.T) {
+		cfg := *testCfg
+		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
+			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark:evil",
+		}))
+
+		require.ErrorContains(t, err, "apply env override ENCLAVE_LOG_GROUP_PREFIX")
+		require.Equal(t, testCfg.LogGroupPrefix, cfg.LogGroupPrefix)
 	})
 
 	t.Run("rejects invalid application port", func(t *testing.T) {

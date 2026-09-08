@@ -199,6 +199,7 @@ let
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
     ENCLAVE_APP_NAME = "testapp";
+    ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
     ENCLAVE_AWS_REGION = "us-east-1";
     ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [

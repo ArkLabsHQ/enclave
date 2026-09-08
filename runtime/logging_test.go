@@ -40,7 +40,32 @@ func TestParseOTLPLogs(t *testing.T) {
 		require.Equal(t, "info", entry.Level)
 		require.Equal(t, "app", entry.Source)
 		require.Equal(t, "val", entry.Attributes["key"])
-		require.Equal(t, "test", entry.Attributes["resource.service.name"])
+		require.Equal(t, "test", entry.Resource["resource.service.name"])
+		require.Equal(t, "test", shippedAttributes(t, entry)["resource.service.name"],
+			"resource attributes must still reach CloudWatch merged into attributes")
+	})
+
+	t.Run("records share one resource map", func(t *testing.T) {
+		entries, err := parseOTLPLogs(buildOTLPLogRecords(t, 3))
+		require.NoError(t, err)
+		require.Len(t, entries, 3)
+
+		entries[0].Resource["probe"] = "shared"
+		for i, entry := range entries {
+			require.Equal(t, "shared", entry.Resource["probe"],
+				"record %d must reference the same resource map, not a copy", i)
+		}
+	})
+
+	t.Run("rejects more records than the cap", func(t *testing.T) {
+		_, err := parseOTLPLogs(buildOTLPLogRecords(t, maxOTLPRecords+1))
+		require.ErrorIs(t, err, errTooManyRecords)
+	})
+
+	t.Run("accepts the cap exactly", func(t *testing.T) {
+		entries, err := parseOTLPLogs(buildOTLPLogRecords(t, maxOTLPRecords))
+		require.NoError(t, err)
+		require.Len(t, entries, maxOTLPRecords)
 	})
 
 	t.Run("severity", func(t *testing.T) {
@@ -72,6 +97,39 @@ func TestParseOTLPLogs(t *testing.T) {
 	})
 }
 
+func shippedAttributes(t *testing.T, payload any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var out struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &out))
+	return out.Attributes
+}
+
+func buildOTLPLogRecords(t *testing.T, records int) []byte {
+	t.Helper()
+	recs := make([]*logspb.LogRecord, 0, records)
+	for i := 0; i < records; i++ {
+		recs = append(recs, &logspb.LogRecord{
+			TimeUnixNano:   uint64(time.Now().UnixNano()),
+			SeverityNumber: logspb.SeverityNumber_SEVERITY_NUMBER_INFO,
+			Body:           stringValue("body"),
+		})
+	}
+	body, err := proto.Marshal(&collogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{{
+			Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: stringValue("test")},
+			}},
+			ScopeLogs: []*logspb.ScopeLogs{{LogRecords: recs}},
+		}},
+	})
+	require.NoError(t, err)
+	return body
+}
+
 func TestLogHandlers(t *testing.T) {
 	t.Run("post ships otlp", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -100,8 +158,8 @@ func TestLogHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
-		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		require.Equal(t, "/enclave/prod/logs/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"test"`)
 	})
@@ -117,6 +175,19 @@ func TestLogHandlers(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, w.Code)
 		require.JSONEq(t, `{"error":"unknown Log Format"}`, w.Body.String())
 	})
+
+	t.Run("post rejects too many records", func(t *testing.T) {
+		telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
+		req := httptest.NewRequest(http.MethodPost, "/v1/logs",
+			bytes.NewReader(buildOTLPLogRecords(t, maxOTLPRecords+1)))
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		w := httptest.NewRecorder()
+
+		HandleLogsPost(telemetry.Logging)(w, req)
+
+		require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+		require.Contains(t, w.Body.String(), "too many records")
+	})
 }
 
 func TestLoggingShipsToCloudWatch(t *testing.T) {
@@ -131,7 +202,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		now := time.Now().UTC()
 		for i := 0; i < telemetryBatch; i++ {
 			ts := now.Add(-time.Duration(i) * time.Second)
-			telemetry.Send(signalLogs, ts, logEntry{
+			telemetry.Send(signalAppLogs, ts, logEntry{
 				ID:        fmt.Sprintf("id-%03d", i),
 				Timestamp: ts.Format(time.RFC3339Nano),
 				Level:     "info",
@@ -140,8 +211,8 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
-		require.Equal(t, "/enclave/prod/app/logs", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		require.Equal(t, "/enclave/prod/logs/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest event was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -155,7 +226,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		startTelemetry(t, ctx, telemetry)
 
 		now := time.Now().UTC()
-		telemetry.Send(signalLogs, now, logEntry{
+		telemetry.Send(signalAppLogs, now, logEntry{
 			ID:        "one",
 			Timestamp: now.Format(time.RFC3339Nano),
 			Level:     "warn",
@@ -164,7 +235,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"flush me"`)
 	})
@@ -181,7 +252,7 @@ func TestSlogHandler(t *testing.T) {
 
 		logger.Warn("test message", "key", "value")
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/supervisor")
 		require.NotEmpty(t, put.LogEvents)
 		var entry logEntry
 		require.NoError(t,
@@ -191,6 +262,34 @@ func TestSlogHandler(t *testing.T) {
 		require.Equal(t, "enclave", entry.Source)
 		require.Equal(t, "test", entry.Attributes["component"])
 		require.Equal(t, "value", entry.Attributes["key"])
+
+		enclave := telemetry.Metrics.MetricsSnapshot()["enclave"].(map[string]int64)
+		require.Equal(t, int64(1), enclave[metricSupervisorLogEntries])
+		require.Zero(t, enclave[metricLogEntries],
+			"the app counter must not move for a supervisor record")
+	})
+
+	t.Run("keeps the supervisor out of the app group", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
+		logger := slog.New(NewSlogHandler(telemetry.Logging))
+
+		logger.Warn("supervisor only")
+
+		requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/supervisor")
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		for _, put := range cw.puts {
+			if aws.ToString(put.LogGroupName) != "/enclave/prod/logs/app" {
+				continue
+			}
+			for _, event := range put.LogEvents {
+				require.NotContains(t, aws.ToString(event.Message), "supervisor only")
+			}
+		}
 	})
 
 	t.Run("nil logging", func(t *testing.T) {

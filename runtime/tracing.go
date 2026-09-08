@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,7 +26,7 @@ type Tracing struct {
 	provider  *sdktrace.TracerProvider
 }
 
-// NewTracing wires the enclave's own spans through the same stream as app spans.
+// NewTracing wires the enclave's own spans to the supervisor trace stream.
 func NewTracing(telemetry *Telemetry) *Tracing {
 	t := &Tracing{telemetry: telemetry}
 
@@ -64,6 +65,23 @@ type spanEntry struct {
 	Status     string         `json:"status"` // "ok", "error", "unset"
 	Attributes map[string]any `json:"attributes,omitempty"`
 	Source     string         `json:"source"` // "app" or "enclave"
+	Resource   map[string]any `json:"-"`
+}
+
+func (e spanEntry) MarshalJSON() ([]byte, error) {
+	type alias spanEntry
+	out := alias(e)
+	if len(e.Resource) > 0 {
+		merged := make(map[string]any, len(e.Resource)+len(e.Attributes))
+		for k, v := range e.Resource {
+			merged[k] = v
+		}
+		for k, v := range e.Attributes {
+			merged[k] = v
+		}
+		out.Attributes = merged
+	}
+	return json.Marshal(out)
 }
 
 // HandleTracingPost accepts OTLP protobuf spans.
@@ -79,6 +97,10 @@ func HandleTracingPost(t *Tracing) http.HandlerFunc {
 		}
 
 		entries, err := parseOTLPSpans(data)
+		if errors.Is(err, errTooManyRecords) {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err != nil {
 			http.Error(
 				w,
@@ -89,7 +111,7 @@ func HandleTracingPost(t *Tracing) http.HandlerFunc {
 		}
 
 		for _, entry := range entries {
-			t.telemetry.Send(signalTraces, entryTime(entry.Start), entry)
+			t.telemetry.Send(signalAppTraces, entryTime(entry.Start), entry)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -105,7 +127,18 @@ func parseOTLPSpans(body []byte) ([]spanEntry, error) {
 		return nil, fmt.Errorf("unmarshal OTLP traces: %w", err)
 	}
 
-	var entries []spanEntry
+	total := 0
+	for _, rs := range req.ResourceSpans {
+		for _, ss := range rs.ScopeSpans {
+			total += len(ss.Spans)
+		}
+	}
+	if total > maxOTLPRecords {
+		return nil, fmt.Errorf("%w: %d spans, limit %d",
+			errTooManyRecords, total, maxOTLPRecords)
+	}
+
+	entries := make([]spanEntry, 0, total)
 	for _, rs := range req.ResourceSpans {
 		resourceAttrs := make(map[string]any)
 		if rs.Resource != nil {
@@ -124,10 +157,7 @@ func parseOTLPSpans(body []byte) ([]spanEntry, error) {
 }
 
 func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) spanEntry {
-	attrs := make(map[string]any, len(resourceAttrs)+len(span.Attributes))
-	for k, v := range resourceAttrs {
-		attrs[k] = v
-	}
+	attrs := make(map[string]any, len(span.Attributes))
 	for _, kv := range span.Attributes {
 		attrs[kv.Key] = anyValueToGo(kv.Value)
 	}
@@ -157,11 +187,12 @@ func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) spanEntry {
 		Status:     status,
 		Attributes: attrsResult,
 		Source:     "app",
+		Resource:   resourceAttrs,
 	}
 }
 
-// streamSpanExporter ships the enclave's own spans through the same stream the app's
-// spans take, so both halves of a trace land in one log group.
+// streamSpanExporter ships the enclave's own spans to their own log group. No
+// propagator carries trace context into the app, so no trace spans both sources.
 type streamSpanExporter struct {
 	telemetry *Telemetry
 }
@@ -169,7 +200,7 @@ type streamSpanExporter struct {
 func (e *streamSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
 	for _, s := range spans {
 		entry := readOnlySpanToEntry(s)
-		e.telemetry.Send(signalTraces, s.StartTime(), entry)
+		e.telemetry.Send(signalSupervisorTraces, s.StartTime(), entry)
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,6 +27,23 @@ type logEntry struct {
 	Message    string         `json:"message"`
 	Attributes map[string]any `json:"attributes,omitempty"`
 	Source     string         `json:"source"`
+	Resource   map[string]any `json:"-"`
+}
+
+func (e logEntry) MarshalJSON() ([]byte, error) {
+	type alias logEntry
+	out := alias(e)
+	if len(e.Resource) > 0 {
+		merged := make(map[string]any, len(e.Resource)+len(e.Attributes))
+		for k, v := range e.Resource {
+			merged[k] = v
+		}
+		for k, v := range e.Attributes {
+			merged[k] = v
+		}
+		out.Attributes = merged
+	}
+	return json.Marshal(out)
 }
 
 // generateLogID returns a short random log ID.
@@ -68,6 +86,10 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 		}
 
 		entries, err := parseOTLPLogs(data)
+		if errors.Is(err, errTooManyRecords) {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"parse OTLP: %s"}`, err), http.StatusBadRequest)
 			return
@@ -84,7 +106,7 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 			l.metrics.IncBy(metricLogEntries, int64(len(entries)))
 		}
 		for _, entry := range entries {
-			l.telemetry.Send(signalLogs, entryTime(entry.Timestamp), entry)
+			l.telemetry.Send(signalAppLogs, entryTime(entry.Timestamp), entry)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -150,9 +172,9 @@ func (h *slogHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	if h.metrics != nil {
-		h.metrics.Inc(metricLogEntries)
+		h.metrics.Inc(metricSupervisorLogEntries)
 	}
-	h.telemetry.Send(signalLogs, r.Time, entry)
+	h.telemetry.Send(signalSupervisorLogs, r.Time, entry)
 
 	return nil
 }
@@ -193,7 +215,18 @@ func parseOTLPLogs(body []byte) ([]logEntry, error) {
 		return nil, fmt.Errorf("unmarshal OTLP logs: %w", err)
 	}
 
-	var entries []logEntry
+	total := 0
+	for _, rl := range req.ResourceLogs {
+		for _, sl := range rl.ScopeLogs {
+			total += len(sl.LogRecords)
+		}
+	}
+	if total > maxOTLPRecords {
+		return nil, fmt.Errorf("%w: %d log records, limit %d",
+			errTooManyRecords, total, maxOTLPRecords)
+	}
+
+	entries := make([]logEntry, 0, total)
 	for _, rl := range req.ResourceLogs {
 		// Collect resource attributes (prefixed with "resource.").
 		resourceAttrs := make(map[string]any)
@@ -228,11 +261,7 @@ func logRecordToEntry(lr *logspb.LogRecord, resourceAttrs map[string]any) logEnt
 		message = anyValueToString(lr.Body)
 	}
 
-	// Merge resource and record attrs.
-	attrs := make(map[string]any, len(resourceAttrs)+len(lr.Attributes))
-	for k, v := range resourceAttrs {
-		attrs[k] = v
-	}
+	attrs := make(map[string]any, len(lr.Attributes))
 	for _, kv := range lr.Attributes {
 		attrs[kv.Key] = anyValueToGo(kv.Value)
 	}
@@ -254,6 +283,7 @@ func logRecordToEntry(lr *logspb.LogRecord, resourceAttrs map[string]any) logEnt
 		Message:    message,
 		Attributes: attrsResult,
 		Source:     "app",
+		Resource:   resourceAttrs,
 	}
 }
 

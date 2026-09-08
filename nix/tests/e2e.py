@@ -17,6 +17,7 @@ CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
+LOG_PREFIX = "/ark/e2e/enclave/dev"
 
 
 def cloud(command):
@@ -286,17 +287,19 @@ for node in BLUES:
     assert "WARNING" in out, out
 
 log_groups = cloud(
-    "logs describe-log-groups --log-group-name-prefix /enclave/dev/testapp "
+    f"logs describe-log-groups --log-group-name-prefix {LOG_PREFIX} "
     "--query 'logGroups[].logGroupName' --output text"
 ).split()
 assert sorted(log_groups) == [
-    "/enclave/dev/testapp/logs",
-    "/enclave/dev/testapp/metrics",
-    "/enclave/dev/testapp/traces",
+    f"{LOG_PREFIX}/logs/app",
+    f"{LOG_PREFIX}/logs/supervisor",
+    f"{LOG_PREFIX}/metrics",
+    f"{LOG_PREFIX}/traces/app",
+    f"{LOG_PREFIX}/traces/supervisor",
 ], log_groups
 
 shipped = cloud(
-    "logs describe-log-streams --log-group-name /enclave/dev/testapp/logs "
+    f"logs describe-log-streams --log-group-name {LOG_PREFIX}/logs/app "
     "--query 'logStreams[].storedBytes' --output text"
 )
 assert shipped not in ("", "None"), shipped
@@ -316,19 +319,27 @@ def wait_for_shipped(group, needle, timeout=90):
     deadline = time.time() + timeout
     while True:
         events = cloud(
-            f"logs filter-log-events --log-group-name /enclave/dev/testapp/{group} "
+            f"logs filter-log-events --log-group-name {LOG_PREFIX}/{group} "
             "--query 'events[].message' --output text"
         )
         if needle in events:
             return
         if time.time() > deadline:
-            raise Exception(f"{needle!r} never reached /enclave/dev/testapp/{group}")
+            raise Exception(f"{needle!r} never reached {LOG_PREFIX}/{group}")
         time.sleep(2)
 
 
-wait_for_shipped("logs", "handled health")
-wait_for_shipped("traces", '"name":"health"')
+wait_for_shipped("logs/app", "handled health")
+wait_for_shipped("traces/app", '"name":"health"')
 wait_for_shipped("metrics", "testapp_requests_total")
+wait_for_shipped("logs/supervisor", "child started")
+wait_for_shipped("traces/supervisor", '"name":"init"')
+
+app_events = cloud(
+    f"logs filter-log-events --log-group-name {LOG_PREFIX}/logs/app "
+    "--query 'events[].message' --output text"
+)
+assert '"source":"enclave"' not in app_events, app_events
 
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")

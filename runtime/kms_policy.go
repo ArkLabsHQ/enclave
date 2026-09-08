@@ -81,6 +81,7 @@ func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bo
 			Effect    string          `json:"Effect"`
 			Principal json.RawMessage `json:"Principal"`
 			Action    json.RawMessage `json:"Action"`
+			NotAction json.RawMessage `json:"NotAction"`
 			Condition map[string]any  `json:"Condition"`
 		} `json:"Statement"`
 	}
@@ -90,6 +91,9 @@ func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bo
 
 	admittedPCR0s := map[string]bool{}
 	for _, stmt := range policy.Statement {
+		if len(normalizePolicyStrings(stmt.NotAction)) > 0 {
+			return fmt.Errorf("policy uses NotAction, which is not supported")
+		}
 		if !strings.EqualFold(stmt.Effect, "Allow") {
 			continue
 		}
@@ -134,6 +138,7 @@ func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
 			Effect    string          `json:"Effect"`
 			Principal json.RawMessage `json:"Principal"`
 			Action    json.RawMessage `json:"Action"`
+			NotAction json.RawMessage `json:"NotAction"`
 			Condition map[string]any  `json:"Condition"`
 		} `json:"Statement"`
 	}
@@ -143,6 +148,9 @@ func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
 
 	admittedPCR0s := map[string]bool{}
 	for _, stmt := range policy.Statement {
+		if len(normalizePolicyStrings(stmt.NotAction)) > 0 {
+			return nil, fmt.Errorf("policy uses NotAction, which is not supported")
+		}
 		if !strings.EqualFold(stmt.Effect, "Allow") {
 			continue
 		}
@@ -302,14 +310,56 @@ func normalizePolicyStrings(raw json.RawMessage) []string {
 }
 
 // actionsGrant reports whether actions include want, treating the kms:* and *
-// wildcards as granting everything.
+// wildcards as granting everything and IAM partial wildcards as matching prefixes.
 func actionsGrant(actions []string, want string) bool {
 	for _, a := range actions {
-		if strings.EqualFold(a, want) || a == "kms:*" || a == "*" {
+		if iamActionMatches(a, want) {
 			return true
 		}
 	}
 	return false
+}
+
+func iamActionMatches(pattern, action string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	action = strings.ToLower(strings.TrimSpace(action))
+	if pattern == action {
+		return true
+	}
+	if pattern == "kms:*" || pattern == "*" {
+		return true
+	}
+	return iamWildcardMatch(pattern, action)
+}
+
+func iamWildcardMatch(pattern, value string) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case '*':
+			if len(pattern) == 1 {
+				return true
+			}
+			for i := 0; i <= len(value); i++ {
+				if iamWildcardMatch(pattern[1:], value[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(value) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			value = value[1:]
+		default:
+			if len(value) == 0 || pattern[0] != value[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			value = value[1:]
+		}
+	}
+	return len(value) == 0
 }
 
 // principalsAllRoot reports whether every AWS principal in a statement is an

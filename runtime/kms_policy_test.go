@@ -421,6 +421,47 @@ func TestVerifyKeyPolicyPosture_Table(t *testing.T) {
 			policy:        ppPolicy(t, ppRootRecovery(ppRoot)),
 			expectedPCR0s: []string{ppPCR0}, locked: false, wantErr: true, errSubstr: "PCR0 set",
 		},
+		{
+			name: "partial Decrypt wildcard without PCR0 condition",
+			policy: ppPolicy(
+				t,
+				ppDecryptGated(ppPCR0),
+				ppAllow("kms:Dec*", ppRole, nil),
+			),
+			expectedPCR0s: []string{ppPCR0},
+			locked:        true,
+			wantErr:       true,
+			errSubstr:     "without a RecipientAttestation:PCR0",
+		},
+		{
+			name: "partial PutKeyPolicy wildcard to role principal",
+			policy: ppPolicy(
+				t,
+				ppDecryptGated(ppPCR0),
+				ppAllow("kms:Put*", ppRole, nil),
+			),
+			expectedPCR0s: []string{ppPCR0},
+			locked:        false,
+			wantErr:       true,
+			errSubstr:     "non-root",
+		},
+		{
+			name: "NotAction statements are rejected",
+			policy: ppPolicy(
+				t,
+				ppDecryptGated(ppPCR0),
+				map[string]any{
+					"Effect":    "Allow",
+					"Principal": map[string]any{"AWS": ppRole},
+					"NotAction": []string{"kms:Encrypt"},
+					"Resource":  "*",
+				},
+			),
+			expectedPCR0s: []string{ppPCR0},
+			locked:        true,
+			wantErr:       true,
+			errSubstr:     "NotAction",
+		},
 	}
 
 	for _, tc := range cases {
@@ -489,6 +530,9 @@ func TestActionsGrant(t *testing.T) {
 		{"full wildcard", []string{"*"}, "kms:PutKeyPolicy", true},
 		{"empty", nil, "kms:Decrypt", false},
 		{"among many", []string{"kms:Encrypt", "kms:Decrypt"}, "kms:Decrypt", true},
+		{"partial decrypt wildcard", []string{"kms:Dec*"}, "kms:Decrypt", true},
+		{"partial put wildcard", []string{"kms:Put*"}, "kms:PutKeyPolicy", true},
+		{"question mark wildcard", []string{"kms:Decryp?"}, "kms:Decrypt", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

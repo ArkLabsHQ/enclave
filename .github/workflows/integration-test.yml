@@ -28,3 +28,6 @@ jobs:
 
       - name: Run integration test
         run: nix build .#checks.x86_64-linux.e2e --print-build-logs
+
+      - name: Run state-substitution regression test
+        run: nix build .#checks.x86_64-linux.state-substitution --print-build-logs

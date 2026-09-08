@@ -533,12 +533,32 @@ func TestActionsGrant(t *testing.T) {
 		{"partial decrypt wildcard", []string{"kms:Dec*"}, "kms:Decrypt", true},
 		{"partial put wildcard", []string{"kms:Put*"}, "kms:PutKeyPolicy", true},
 		{"question mark wildcard", []string{"kms:Decryp?"}, "kms:Decrypt", true},
+		{"partial decrypt wildcard does not grant Encrypt", []string{"kms:Dec*"}, "kms:Encrypt", false},
+		{"partial put wildcard does not grant Decrypt", []string{"kms:Put*"}, "kms:Decrypt", false},
+		{"question mark wildcard mismatched suffix", []string{"kms:Decryp?"}, "kms:DecrypX", false},
+		{"question mark wildcard length mismatch", []string{"kms:Decryp?"}, "kms:DecryptLong", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.grant, actionsGrant(tc.actions, tc.want))
 		})
 	}
+}
+
+func TestKeyPolicyAdmittedPCR0sRejectsNotAction(t *testing.T) {
+	policy := ppPolicy(
+		t,
+		ppDecryptGated(ppPCR0),
+		map[string]any{
+			"Effect":    "Allow",
+			"Principal": map[string]any{"AWS": ppRole},
+			"NotAction": []string{"kms:Encrypt"},
+			"Resource":  "*",
+		},
+	)
+
+	_, err := KeyPolicyAdmittedPCR0s(policy)
+	require.ErrorContains(t, err, "NotAction")
 }
 
 func TestPrincipalsAllRoot(t *testing.T) {

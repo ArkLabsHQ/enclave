@@ -19,6 +19,10 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
+	defaultLogGroupPrefix   = "/enclave"
+
+	logGroupNameChars  = "._-/#"
+	maxLogGroupNameLen = 512
 )
 
 const (
@@ -67,6 +71,8 @@ type Config struct {
 	MigrationCooldown     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
+	LogGroupPrefix        string
+	InstanceID            string
 }
 
 // LoadConfig builds Config from ENCLAVE_* env vars.
@@ -91,6 +97,7 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol: getUpstreamProtocol(),
 		LogShipInterval:  logShipInterval(),
 		LogRetentionDays: logRetentionDays(),
+		LogGroupPrefix:   logGroupPrefix(),
 	}
 	cfg.setSecurityConfig(IsDev())
 	return cfg, nil
@@ -116,7 +123,37 @@ func (c *Config) Validate() error {
 	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
+	return c.validateLogGroupPrefix()
+}
+
+func (c *Config) validateLogGroupPrefix() error {
+	if c.LogGroupPrefix == "" {
+		return fmt.Errorf(
+			"ENCLAVE_LOG_GROUP_PREFIX must not be empty: it heads every CloudWatch log group",
+		)
+	}
+	if strings.IndexFunc(c.LogGroupPrefix, invalidLogGroupRune) >= 0 {
+		return fmt.Errorf(
+			"ENCLAVE_LOG_GROUP_PREFIX %q: CloudWatch log group names allow only letters, "+
+				"digits and %s",
+			c.LogGroupPrefix, logGroupNameChars,
+		)
+	}
+	for sig := signal(0); sig < signalCount; sig++ {
+		if group := c.logGroup(sig); len(group) > maxLogGroupNameLen {
+			return fmt.Errorf("log group %q is %d characters: CloudWatch allows %d",
+				group, len(group), maxLogGroupNameLen)
+		}
+	}
 	return nil
+}
+
+func invalidLogGroupRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return false
+	}
+	return !strings.ContainsRune(logGroupNameChars, r)
 }
 
 func (c *Config) String() string {
@@ -174,8 +211,17 @@ func (c *Config) applyEnvOverride(name, value string) error {
 		c.ACMEEmail = value
 	case "ENCLAVE_ACME_CA":
 		c.ACMECA = value
+	case "ENCLAVE_LOG_GROUP_PREFIX":
+		c.LogGroupPrefix = normalizeLogGroupPrefix(value)
+		if err := c.validateLogGroupPrefix(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (c *Config) logGroup(sig signal) string {
+	return fmt.Sprintf("%s/%s/%s", c.LogGroupPrefix, c.Deployment, sig)
 }
 
 func (c *Config) certBucketParam() string {

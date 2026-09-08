@@ -33,7 +33,25 @@ func TestParseOTLPSpans(t *testing.T) {
 		require.Equal(t, "ok", entry.Status)
 		require.Equal(t, "app", entry.Source)
 		require.Equal(t, "val", entry.Attributes["test.attr"])
-		require.Equal(t, "test-svc", entry.Attributes["resource.service.name"])
+		require.Equal(t, "test-svc", entry.Resource["resource.service.name"])
+		require.Equal(t, "test-svc", shippedAttributes(t, entry)["resource.service.name"],
+			"resource attributes must still reach CloudWatch merged into attributes")
+	})
+
+	t.Run("rejects more spans than the cap", func(t *testing.T) {
+		spans := make([]*tracepb.Span, maxOTLPRecords+1)
+		for i := range spans {
+			spans[i] = &tracepb.Span{Name: "s"}
+		}
+		body, err := proto.Marshal(&coltracepb.ExportTraceServiceRequest{
+			ResourceSpans: []*tracepb.ResourceSpans{{
+				ScopeSpans: []*tracepb.ScopeSpans{{Spans: spans}},
+			}},
+		})
+		require.NoError(t, err)
+
+		_, err = parseOTLPSpans(body)
+		require.ErrorIs(t, err, errTooManyRecords)
 	})
 
 	t.Run("status", func(t *testing.T) {
@@ -81,8 +99,8 @@ func TestTracingHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
-		require.Equal(t, "/enclave/prod/app/traces", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/traces/app")
+		require.Equal(t, "/enclave/prod/traces/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"test"`)
 	})
@@ -99,7 +117,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 
 		for i := 0; i < telemetryBatch; i++ {
 			start := time.Now().UTC().Add(-time.Duration(i) * time.Second)
-			telemetry.Send(signalTraces, start, spanEntry{
+			telemetry.Send(signalAppTraces, start, spanEntry{
 				ID:      fmt.Sprintf("span-%03d", i),
 				TraceID: fmt.Sprintf("trace-%03d", i),
 				Name:    fmt.Sprintf("op-%03d", i),
@@ -110,8 +128,8 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
-		require.Equal(t, "/enclave/prod/app/traces", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/traces/app")
+		require.Equal(t, "/enclave/prod/traces/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest span was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -125,7 +143,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		startTelemetry(t, ctx, telemetry)
 
 		now := time.Now().UTC()
-		telemetry.Send(signalTraces, now, spanEntry{
+		telemetry.Send(signalAppTraces, now, spanEntry{
 			ID:      "one",
 			TraceID: "trace",
 			Name:    "flush me",
@@ -136,9 +154,25 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/traces")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/traces/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"flush me"`)
+	})
+
+	t.Run("ships the enclave own span to the supervisor group", func(t *testing.T) {
+		ctx := context.Background()
+		cw := newFakeCloudWatchLogs()
+		telemetry := NewTelemetry(testCfg, cw)
+		startTelemetry(t, ctx, telemetry)
+
+		_, span := telemetry.Tracing.Span(ctx, "boot")
+		span.End()
+		telemetry.Shutdown()
+
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/traces/supervisor")
+		require.NotEmpty(t, put.LogEvents)
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"boot"`)
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"source":"enclave"`)
 	})
 }
 

@@ -2,9 +2,13 @@ package runtime
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -216,4 +220,106 @@ func buildOTLPMetricRequest(t *testing.T, metric *metricspb.Metric) []byte {
 	data, err := proto.Marshal(req)
 	require.NoError(t, err)
 	return data
+}
+
+func fillAppMetrics(m *Metrics, nameLen int) int {
+	stored := 0
+	for i := 0; i < 100000; i++ {
+		name := fmt.Sprintf("%0*d", nameLen, i)
+		m.SetAppMetric(name, -1.7976931348623157e+308)
+		if _, ok := m.MetricsSnapshot()["app"].(map[string]float64)[name]; ok {
+			stored++
+		} else {
+			break
+		}
+	}
+	return stored
+}
+
+func TestSetAppMetricBoundsRetainedNames(t *testing.T) {
+	// The snapshot ships as one CloudWatch event, so the budget has to hold at
+	// every name length, not just the short ones.
+	t.Run("snapshot fits one event at every name length", func(t *testing.T) {
+		for _, nameLen := range []int{8, 20, 40, 64, 128, 256, 4096} {
+			m := NewMetrics()
+			stored := fillAppMetrics(m, nameLen)
+
+			raw, err := json.Marshal(m.MetricsSnapshot())
+			require.NoError(t, err)
+			require.Less(t, len(raw)+eventOverhead, maxEventBytes,
+				"nameLen=%d stored=%d produced a %d byte snapshot", nameLen, stored, len(raw))
+			require.Positive(t, m.Counter(metricAppMetricsDropped),
+				"nameLen=%d never reached the budget", nameLen)
+			t.Logf("nameLen=%-3d stored=%-5d snapshot=%.1f KiB",
+				nameLen, stored, float64(len(raw))/1024)
+		}
+	})
+
+	// json escaping expands < > & and control characters sixfold, so a budget
+	// charging raw name length would ship a snapshot several times the limit.
+	t.Run("charges names what they serialize to", func(t *testing.T) {
+		for _, ch := range []string{"a", "<", `"`, "\x01", "\u00e9"} {
+			m := NewMetrics()
+			for i := 0; i < 20000; i++ {
+				m.SetAppMetric(strings.Repeat(ch, 64)+fmt.Sprintf("%08d", i),
+					-math.MaxFloat64)
+			}
+
+			raw, err := json.Marshal(m.MetricsSnapshot())
+			require.NoError(t, err)
+			require.Less(t, len(raw)+eventOverhead, maxEventBytes,
+				"names of %q produced a %d byte snapshot", ch, len(raw))
+		}
+	})
+
+	t.Run("short names buy more of them", func(t *testing.T) {
+		short, long := NewMetrics(), NewMetrics()
+
+		require.Greater(t, fillAppMetrics(short, 20), fillAppMetrics(long, 256),
+			"the budget is serialized bytes, so short names must admit more entries")
+	})
+
+	t.Run("keeps updating names already stored", func(t *testing.T) {
+		m := NewMetrics()
+		fillAppMetrics(m, 20)
+		first := fmt.Sprintf("%020d", 0)
+
+		m.SetAppMetric(first, 42)
+		m.SetAppMetric("displaced_by_the_budget", 1)
+
+		app := m.MetricsSnapshot()["app"].(map[string]float64)
+		require.Equal(t, float64(42), app[first],
+			"a full budget must not stop existing metrics from reporting")
+		require.NotContains(t, app, "displaced_by_the_budget")
+	})
+
+	t.Run("refuses a name larger than the whole budget", func(t *testing.T) {
+		m := NewMetrics()
+		m.SetAppMetric(strings.Repeat("n", maxAppMetricBytes+1), 1)
+		m.SetAppMetric("app_requests_total", 1)
+
+		app := m.MetricsSnapshot()["app"].(map[string]float64)
+		require.Len(t, app, 1, "the budget alone must refuse a name it cannot afford")
+		require.Contains(t, app, "app_requests_total")
+		require.Equal(t, int64(1), m.Counter(metricAppMetricsDropped))
+	})
+
+	t.Run("stays bounded under concurrent ingestion", func(t *testing.T) {
+		m := NewMetrics()
+		var wg sync.WaitGroup
+		for w := 0; w < 8; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < 20000; i++ {
+					m.SetAppMetric(fmt.Sprintf("w%d_metric_%06d", w, i), float64(i))
+				}
+			}(w)
+		}
+		wg.Wait()
+
+		raw, err := json.Marshal(m.MetricsSnapshot())
+		require.NoError(t, err)
+		require.Less(t, len(raw)+eventOverhead, maxEventBytes)
+	})
 }

@@ -30,8 +30,9 @@ type Metrics struct {
 	counters map[string]int64
 
 	// App metrics received via OTLP.
-	appMu      sync.Mutex
-	appMetrics map[string]float64
+	appMu          sync.Mutex
+	appMetrics     map[string]float64
+	appMetricBytes int
 
 	// Runtime/proc metrics (updated periodically).
 	runtimeMu      sync.Mutex
@@ -45,6 +46,14 @@ const (
 	metricAppProxiedRequests = "enclave_app_proxied_requests_total"
 	metricAppProxiedErrors   = "enclave_app_proxied_errors_total"
 	metricLogEntries         = "enclave_log_entries_total"
+
+	metricSupervisorLogEntries = "enclave_supervisor_log_entries_total"
+	metricAppMetricsDropped    = "enclave_app_metrics_dropped_total"
+)
+
+const (
+	maxAppMetricBytes      = 192 << 10
+	appMetricEntryOverhead = 32
 )
 
 // NewMetrics starts runtime collection.
@@ -104,9 +113,26 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	}
 }
 
-// SetAppMetric stores a metric value received from the app via OTLP.
+// SetAppMetric stores a metric value received from the app via OTLP. Names past
+// the budget are refused; names already stored keep updating.
 func (m *Metrics) SetAppMetric(name string, value float64) {
 	m.appMu.Lock()
+	if _, known := m.appMetrics[name]; !known {
+		// json escaping can expand a name sixfold, so charge the encoded key.
+		key, err := json.Marshal(name)
+		if err != nil {
+			m.appMu.Unlock()
+			m.Inc(metricAppMetricsDropped)
+			return
+		}
+		cost := len(key) + appMetricEntryOverhead
+		if m.appMetricBytes+cost > maxAppMetricBytes {
+			m.appMu.Unlock()
+			m.Inc(metricAppMetricsDropped)
+			return
+		}
+		m.appMetricBytes += cost
+	}
 	m.appMetrics[name] = value
 	m.appMu.Unlock()
 }

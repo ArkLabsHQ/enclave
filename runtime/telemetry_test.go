@@ -31,7 +31,33 @@ func TestNewTelemetryWiresDropCountingThroughMetrics(t *testing.T) {
 	}
 }
 
-func TestTelemetryStartsAllThreeSignals(t *testing.T) {
+func TestEverySignalHasAUniqueName(t *testing.T) {
+	seen := make(map[string]bool, signalCount)
+	for sig := signal(0); sig < signalCount; sig++ {
+		name := sig.String()
+		require.NotEqual(t, "unknown", name, "signal %d has no name", int(sig))
+		require.False(t, seen[name], "signal name %q is used twice", name)
+		seen[name] = true
+	}
+	require.Equal(t, "unknown", signalCount.String(), "the sentinel must not name a stream")
+}
+
+func TestStartFailsWithoutAnInstanceID(t *testing.T) {
+	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
+
+	cfg := *testCfg
+	cfg.InstanceID = ""
+	cw := newFakeCloudWatchLogs()
+
+	err := NewTelemetry(&cfg, cw).Start(context.Background())
+
+	require.ErrorContains(t, err, "no instance ID from IMDS")
+	require.Empty(t, cw.groups, "an unusable stream name must fail before any group is created")
+	require.Same(t, before, slog.Default())
+}
+
+func TestTelemetryStartsEverySignal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cw := newFakeCloudWatchLogs()
@@ -40,15 +66,17 @@ func TestTelemetryStartsAllThreeSignals(t *testing.T) {
 	startTelemetry(t, ctx, telemetry)
 
 	require.ElementsMatch(t, []string{
-		"/enclave/prod/app/logs",
-		"/enclave/prod/app/traces",
-		"/enclave/prod/app/metrics",
+		"/enclave/prod/logs/app",
+		"/enclave/prod/logs/supervisor",
+		"/enclave/prod/traces/app",
+		"/enclave/prod/traces/supervisor",
+		"/enclave/prod/metrics",
 	}, cw.groups)
-	require.Equal(t, []int32{30, 30, 30}, cw.retentionDays)
+	require.Equal(t, []int32{30, 30, 30, 30, 30}, cw.retentionDays)
 }
 
 // A failure to start must surface rather than be logged into the sink that
-// failed, so slog is redirected only after all three are shipping.
+// failed, so slog is redirected only after all of them are shipping.
 func TestTelemetryLeavesSlogAloneWhenStartFails(t *testing.T) {
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
@@ -72,9 +100,11 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		startTelemetry(t, ctx, NewTelemetry(testCfg, cw))
 
 		require.ElementsMatch(t, []string{
-			"/enclave/prod/app/logs",
-			"/enclave/prod/app/traces",
-			"/enclave/prod/app/metrics",
+			"/enclave/prod/logs/app",
+			"/enclave/prod/logs/supervisor",
+			"/enclave/prod/traces/app",
+			"/enclave/prod/traces/supervisor",
+			"/enclave/prod/metrics",
 		}, cw.groups)
 		require.Len(t, cw.streams, int(signalCount))
 	})
@@ -90,12 +120,12 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 
 		// Sent newest first, so an unsorted batch would be rejected by CloudWatch.
 		for i := 0; i < telemetryBatch; i++ {
-			telemetry.Send(signalLogs,
+			telemetry.Send(signalAppLogs,
 				time.Now().UTC().Add(-time.Duration(i)*time.Second),
 				map[string]int{"seq": i})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
 		require.Len(t, put.LogEvents, telemetryBatch)
 		for i := 1; i < len(put.LogEvents); i++ {
 			require.LessOrEqual(t,
@@ -110,9 +140,9 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		telemetry := NewTelemetry(testCfg, cw)
 		startTelemetry(t, ctx, telemetry)
 
-		telemetry.Send(signalLogs, time.Now().UTC(), map[string]string{"msg": "alone"})
+		telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]string{"msg": "alone"})
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"alone"`)
 	})
@@ -127,10 +157,10 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 
 		payload := strings.Repeat("x", maxEventBytes-eventOverhead-2)
 		for i := 0; i < 5; i++ {
-			telemetry.Send(signalLogs, time.Now().UTC(), payload)
+			telemetry.Send(signalAppLogs, time.Now().UTC(), payload)
 		}
 
-		first := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/logs")
+		first := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
 		require.Len(t, first.LogEvents, 4)
 		telemetry.Shutdown()
 
@@ -138,13 +168,13 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		defer cw.mu.Unlock()
 		shipped := 0
 		for _, put := range cw.puts {
-			if aws.ToString(put.LogGroupName) == "/enclave/prod/app/logs" &&
+			if aws.ToString(put.LogGroupName) == "/enclave/prod/logs/app" &&
 				!isShipperMarker(put) {
 				shipped += len(put.LogEvents)
 			}
 		}
 		require.Equal(t, 5, shipped)
-		require.Zero(t, telemetry.Dropped(signalLogs))
+		require.Zero(t, telemetry.Dropped(signalAppLogs))
 	})
 }
 
@@ -166,7 +196,7 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < overfill; i++ {
-			telemetry.Send(signalLogs, time.Now().UTC(), map[string]int{"seq": i})
+			telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]int{"seq": i})
 		}
 	}()
 
@@ -176,11 +206,11 @@ func TestCloudWatchStreamDropsWithoutBlocking(t *testing.T) {
 		require.FailNow(t, "Send blocked behind a stalled CloudWatch")
 	}
 
-	require.Positive(t, telemetry.Dropped(signalLogs),
+	require.Positive(t, telemetry.Dropped(signalAppLogs),
 		"a full queue must drop rather than block")
 	enclave := telemetry.Metrics.MetricsSnapshot()["enclave"].(map[string]int64)
-	require.GreaterOrEqual(t, enclave[droppedMetric(signalLogs)],
-		telemetry.Dropped(signalLogs),
+	require.GreaterOrEqual(t, enclave[droppedMetric(signalAppLogs)],
+		telemetry.Dropped(signalAppLogs),
 		"drops must be visible in the only telemetry still being shipped")
 }
 
@@ -193,7 +223,7 @@ func TestMetricsShipSnapshot(t *testing.T) {
 	telemetry.Metrics.SetAppMetric("custom", 2)
 	startTelemetry(t, ctx, telemetry)
 
-	put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/metrics")
+	put := requireCloudWatchPutTo(t, cw, "/enclave/prod/metrics")
 
 	// One snapshot per tick, and a flush may carry more than one of them.
 	require.NotEmpty(t, put.LogEvents)
@@ -272,17 +302,45 @@ func TestFlushShedsAPoisonedBatchInsteadOfStalling(t *testing.T) {
 	cw.mu.Unlock()
 
 	for i := 0; i < telemetryBatch; i++ {
-		telemetry.Send(signalLogs, time.Now().UTC(), map[string]int{"seq": i})
+		telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]int{"seq": i})
 	}
 
 	require.Eventually(t, func() bool {
-		return telemetry.Dropped(signalLogs) >= int64(telemetryBatch)
+		return telemetry.Dropped(signalAppLogs) >= int64(telemetryBatch)
 	}, 5*time.Second, 20*time.Millisecond,
 		"a batch refused maxFlushAttempts times must be shed and counted")
 }
 
 // Events CloudWatch would reject on age are shed as they arrive, so one stale
 // event cannot take the whole batch with it.
+func TestFlushBacksOffInsteadOfRetryingOnEveryEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cw := newFakeCloudWatchLogs()
+	telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Minute), cw)
+	startTelemetry(t, ctx, telemetry)
+
+	cw.mu.Lock()
+	cw.putLogEventsErr = errors.New("CloudWatch unavailable")
+	cw.putCalls = 0
+	cw.mu.Unlock()
+
+	for i := 0; i < telemetryBatch*3; i++ {
+		telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]int{"seq": i})
+	}
+
+	require.Eventually(t, func() bool {
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		return cw.putCalls > 0
+	}, 5*time.Second, 10*time.Millisecond, "the first upload must be attempted")
+
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	require.Equal(t, 1, cw.putCalls,
+		"a failed upload must start a cooldown, not retry once per arriving event")
+}
+
 func TestSendShedsEventsCloudWatchWouldReject(t *testing.T) {
 	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -290,12 +348,12 @@ func TestSendShedsEventsCloudWatchWouldReject(t *testing.T) {
 	startTelemetry(t, ctx, telemetry)
 
 	now := time.Now().UTC()
-	telemetry.Send(signalLogs, now.Add(-15*24*time.Hour), "older than 14 days")
-	telemetry.Send(signalLogs, now.Add(3*time.Hour), "further ahead than 2 hours")
-	telemetry.Send(signalLogs, now, "acceptable")
+	telemetry.Send(signalAppLogs, now.Add(-15*24*time.Hour), "older than 14 days")
+	telemetry.Send(signalAppLogs, now.Add(3*time.Hour), "further ahead than 2 hours")
+	telemetry.Send(signalAppLogs, now, "acceptable")
 
 	require.Eventually(t, func() bool {
-		return telemetry.Dropped(signalLogs) == 2
+		return telemetry.Dropped(signalAppLogs) == 2
 	}, 5*time.Second, 20*time.Millisecond,
 		"both out-of-range events must be shed, and only those")
 }
@@ -321,9 +379,9 @@ func TestRejectedCountReadsThePutResponse(t *testing.T) {
 // An oversized event would reject every batch it joined, so it is shed at Send.
 func TestSendShedsAnOversizedEvent(t *testing.T) {
 	telemetry := NewTelemetry(testCfg, newFakeCloudWatchLogs())
-	telemetry.Send(signalLogs, time.Now(), strings.Repeat("x", maxEventBytes))
+	telemetry.Send(signalAppLogs, time.Now(), strings.Repeat("x", maxEventBytes))
 
-	require.Equal(t, int64(1), telemetry.Dropped(signalLogs))
+	require.Equal(t, int64(1), telemetry.Dropped(signalAppLogs))
 }
 
 // Shutdown must wait for the pumps, or Run returning ends the process mid-write.
@@ -332,7 +390,7 @@ func TestShutdownFlushesWhatIsStillQueued(t *testing.T) {
 	telemetry := NewTelemetry(testConfigWithLogShipInterval(time.Hour), cw)
 	startTelemetry(t, context.Background(), telemetry)
 
-	telemetry.Send(signalLogs, time.Now().UTC(), map[string]string{"msg": "last words"})
+	telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]string{"msg": "last words"})
 	telemetry.Shutdown()
 
 	cw.mu.Lock()
@@ -360,9 +418,9 @@ func TestShutdownShedsAFinalBatchAfterRetryLimit(t *testing.T) {
 	cw.putLogEventsErr = errors.New("CloudWatch unavailable")
 	cw.mu.Unlock()
 
-	telemetry.Send(signalLogs, time.Now().UTC(), "last event")
+	telemetry.Send(signalAppLogs, time.Now().UTC(), "last event")
 	telemetry.Shutdown()
 
-	require.Positive(t, telemetry.Dropped(signalLogs),
+	require.Positive(t, telemetry.Dropped(signalAppLogs),
 		"a final batch that exhausts its retries must be counted as lost")
 }

@@ -568,14 +568,22 @@ assert get_param(receipt_param) == receipt_before
 
 # `blue_peer` shares BLUE_PCR0, so it shares the intent chain and can finalise
 # the same intent. The commit is create-only, so it must lose cleanly rather
-# than clobber the pointer green is about to boot on.
-peer_status, peer_output = blue_peer.execute(
-    "curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' "
-    f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
-    "http://127.0.0.1:8003/finalise-migration"
-)
-assert peer_status == 0, peer_output
-assert peer_output.strip() == "409", peer_output
+# than clobber the pointer green is about to boot on.# The migration control vsock path answers intermittently on first contact —
+# blue's finalise loop above absorbs the same empty replies — so retry until a
+# real HTTP status comes back rather than reading a dropped connection as a
+# verdict.
+peer_code = ""
+for _ in range(30):
+    _, peer_output = blue_peer.execute(
+        "curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' "
+        f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
+        "http://127.0.0.1:8003/finalise-migration"
+    )
+    peer_code = peer_output.strip()
+    if peer_code not in ("", "000"):
+        break
+    time.sleep(1)
+assert peer_code == "409", peer_code
 assert get_param(key_param(GREEN_PCR0)) == migration_key
 assert get_param(receipt_param) == receipt_before
 # The guard runs before any key is minted, so a loser must not leave an orphan.

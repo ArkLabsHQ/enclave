@@ -616,7 +616,9 @@ func TestCompleteMigration(t *testing.T) {
 	t.Run("fails when transition receipt write fails", func(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.ssmf.putErrs = map[string]error{
-				testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0): errors.New("set failed"),
+				testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0): errors.New(
+					"set failed",
+				),
 			}
 		})
 		request(t, fx, newPCR0)

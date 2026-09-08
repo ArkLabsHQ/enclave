@@ -535,7 +535,7 @@ func TestActionsGrant(t *testing.T) {
 		{"question mark wildcard", []string{"kms:Decryp?"}, "kms:Decrypt", true},
 		{"partial decrypt wildcard does not grant Encrypt", []string{"kms:Dec*"}, "kms:Encrypt", false},
 		{"partial put wildcard does not grant Decrypt", []string{"kms:Put*"}, "kms:Decrypt", false},
-		{"question mark wildcard mismatched suffix", []string{"kms:Decryp?"}, "kms:DecrypX", false},
+		{"question mark wildcard does not match too-short string", []string{"kms:Decryp?"}, "kms:Decryp", false},
 		{"question mark wildcard length mismatch", []string{"kms:Decryp?"}, "kms:DecryptLong", false},
 	}
 	for _, tc := range cases {

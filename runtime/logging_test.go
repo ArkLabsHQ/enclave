@@ -386,6 +386,15 @@ func buildOTLPLogRequest(
 	return data
 }
 
+func TestNewLoggingReadsCloudWatchEnv(t *testing.T) {
+	logging := NewLogging(NewMetrics(), nil)
+	require.Nil(t, logging.shipCh)
+
+	t.Setenv("ENCLAVE_LOG_CLOUDWATCH", "true")
+	logging = NewLogging(NewMetrics(), nil)
+	require.NotNil(t, logging.shipCh)
+}
+
 func startCloudWatchExport(t *testing.T, ctx context.Context, logging *Logging) {
 	t.Helper()
 	done := make(chan error, 1)

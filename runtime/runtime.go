@@ -31,9 +31,14 @@ type RuntimeState interface {
 	ChildDone() <-chan error
 }
 
-func Run(ctx context.Context, cfg Config) error {
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
+func Run(ctx context.Context) error {
+	if err := validateEnvironment(); err != nil {
+		return fmt.Errorf("invalid environment: %w", err)
+	}
+
+	bootstrapCfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load runtime config: %w", err)
 	}
 
 	ctx, err := StartClockSyncer(ctx)
@@ -41,13 +46,26 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
 
-	if err := StartNetorking(ctx, cfg); err != nil {
+	if err := StartNetorking(ctx, bootstrapCfg); err != nil {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
 	aws, err := NewAWSClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
+	}
+
+	ssm := NewSSM(aws.SSM)
+	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
+		return fmt.Errorf("failed to apply env overrides: %w", err)
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("reload runtime config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
 	}
 
 	metrics := NewMetrics()
@@ -99,7 +117,6 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
-	ssm := NewSSM(aws.SSM)
 	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
@@ -143,9 +160,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
-		return fmt.Errorf("failed to apply env overrides: %w", err)
-	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
 	// overriding established secret state
 	if err := SetStaticSecretEnvVars(result.secrets); err != nil {

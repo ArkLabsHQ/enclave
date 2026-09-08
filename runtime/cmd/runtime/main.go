@@ -14,21 +14,10 @@ import (
 )
 
 func main() {
-	cfg, err := runtime.LoadConfig()
-	if err != nil {
-		slog.Error("load runtime config", "error", err)
-		os.Exit(1)
-	}
-
-	if cfg == nil {
-		slog.Error("load runtime config", "error", "nil config")
-		os.Exit(1)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := runtime.Run(ctx, *cfg); err != nil {
+	if err := runtime.Run(ctx); err != nil {
 		slog.Error("runtime failed", "error", err)
 		os.Exit(1)
 	}

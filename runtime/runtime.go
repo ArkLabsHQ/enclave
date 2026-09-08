@@ -46,7 +46,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
 
-	if err := StartNetorking(ctx, bootstrapCfg); err != nil {
+	if err := StartNetorking(ctx, *bootstrapCfg); err != nil {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
@@ -104,7 +104,7 @@ func Run(ctx context.Context) error {
 
 	servers := SetupHttpServers(
 		rt,
-		cfg,
+		*cfg,
 		nsm,
 		metrics,
 		logging,
@@ -113,7 +113,7 @@ func Run(ctx context.Context) error {
 		authToken,
 	)
 
-	if err := servers.Start(ctx, cfg); err != nil {
+	if err := servers.Start(ctx, *cfg); err != nil {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
@@ -153,7 +153,7 @@ func Run(ctx context.Context) error {
 	}
 
 	tlsCertCb, err := ConfigureTLS(
-		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
+		ctx, cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
@@ -166,7 +166,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("failed to set static secrets env vars: %w", err)
 	}
 
-	app, err := startApp(rt, cfg, authToken)
+	app, err := startApp(rt, *cfg, authToken)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}

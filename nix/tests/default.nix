@@ -524,36 +524,38 @@ let
     };
 in
 {
+  checks = {
+    eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      test -s ${blueEif}/image.eif
+      test -s ${greenEif}/image.eif
+      jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${blueEif}/pcr.json
+      jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${greenEif}/pcr.json
+      test ${lib.escapeShellArg bluePCR0} != ${lib.escapeShellArg greenPCR0}
+      touch $out
+    '';
+
+    e2e = pkgs.testers.runNixOSTest {
+      name = "enclave-runtime-e2e";
+      nodes = {
+        aws = awsNode;
+        blue = mkEnclaveNode blueEif;
+        blue_peer = mkEnclaveNode blueEif;
+        green = mkEnclaveNode greenEif;
+        green_peer = mkEnclaveNode greenEif;
+      };
+      testScript =
+        ''
+          BLUE_PCR0 = ${builtins.toJSON bluePCR0}
+          GREEN_PCR0 = ${builtins.toJSON greenPCR0}
+          AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
+        ''
+        + builtins.readFile ./e2e.py;
+    };
+  };
+
   # Exposed as packages by flake.nix so the reusable eif-build workflow can resolve
-  # them by name. They are already inputs to the eif-build check below, so listing
+  # them by name. They are already inputs to the eif-build check above, so listing
   # them here costs no extra build.
   eif-blue = blueEif;
   eif-green = greenEif;
-
-  eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
-    test -s ${blueEif}/image.eif
-    test -s ${greenEif}/image.eif
-    jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${blueEif}/pcr.json
-    jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${greenEif}/pcr.json
-    test ${lib.escapeShellArg bluePCR0} != ${lib.escapeShellArg greenPCR0}
-    touch $out
-  '';
-
-  e2e = pkgs.testers.runNixOSTest {
-    name = "enclave-runtime-e2e";
-    nodes = {
-      aws = awsNode;
-      blue = mkEnclaveNode blueEif;
-      blue_peer = mkEnclaveNode blueEif;
-      green = mkEnclaveNode greenEif;
-      green_peer = mkEnclaveNode greenEif;
-    };
-    testScript =
-      ''
-        BLUE_PCR0 = ${builtins.toJSON bluePCR0}
-        GREEN_PCR0 = ${builtins.toJSON greenPCR0}
-        AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
-      ''
-      + builtins.readFile ./e2e.py;
-  };
 }

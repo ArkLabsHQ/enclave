@@ -107,13 +107,13 @@
 
       checks = forSystems enclaveSystems (
         { pkgs, system, ... }:
-        import ./nix/tests {
+        (import ./nix/tests {
           inherit
             pkgs
             system
             self
             ;
-        }
+        }).checks
       );
 
       lib = {

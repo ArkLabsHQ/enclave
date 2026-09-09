@@ -16,10 +16,10 @@ import (
 // the migration cooldown and the clock-source assertion — and skips COSE
 // verification.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":     true,
-	"ENCLAVE_APP_NAME":       true,
-	"ENCLAVE_SECRETS_CONFIG": true,
-	"ENCLAVE_DEV":            true,
+	"ENCLAVE_DEPLOYMENT":         true,
+	"ENCLAVE_APP_NAME":           true,
+	"ENCLAVE_SECRETS_CONFIG":     true,
+	"ENCLAVE_DEV":                true,
 	"ENCLAVE_MIGRATION_COOLDOWN": true,
 }
 

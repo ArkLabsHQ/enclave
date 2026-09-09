@@ -10,12 +10,14 @@ import (
 )
 
 const (
-	prodRetention         = 10 * 365 * 24 * time.Hour
-	prodMigrationCooldown = 24 * time.Hour
+	prodRetention          = 10 * 365 * 24 * time.Hour
+	prodMigrationCooldown  = 24 * time.Hour
+	prodIntentWriteTimeout = 10 * time.Minute
 
-	devGenesisRetention  = 5 * time.Minute
-	devIntentRetention   = time.Minute
-	devMigrationCooldown = 2 * time.Second
+	devGenesisRetention   = 5 * time.Minute
+	devIntentRetention    = 10 * time.Minute
+	devMigrationCooldown  = 2 * time.Second
+	devIntentWriteTimeout = 2 * time.Minute
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
@@ -64,6 +66,7 @@ type Config struct {
 	VerifyClockSource     bool
 	GenesisRetention      time.Duration
 	IntentRetention       time.Duration
+	IntentWriteTimeout    time.Duration
 	MigrationCooldown     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
@@ -151,11 +154,13 @@ func (c *Config) setSecurityConfig(dev bool) {
 	if dev {
 		c.GenesisRetention = devGenesisRetention
 		c.IntentRetention = devIntentRetention
+		c.IntentWriteTimeout = devIntentWriteTimeout
 		c.MigrationCooldown = devMigrationCooldown
 		return
 	}
 	c.GenesisRetention = prodRetention
 	c.IntentRetention = prodRetention
+	c.IntentWriteTimeout = prodIntentWriteTimeout
 	c.MigrationCooldown = prodMigrationCooldown
 }
 
@@ -221,7 +226,8 @@ func (c *Config) secretCiphertextParam(secretName, keyID string) string {
 	)
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,
+// lock-scoped and key-scoped.
 func (c *Config) storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf(
 		"/%s/%s/%s/StorageDEK/Ciphertext/%s",

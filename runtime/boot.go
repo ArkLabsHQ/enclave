@@ -475,7 +475,7 @@ func (b *Boot) loadPredecessor(
 	havePCR0, haveKey, haveAttestation := pcr0 != "", keyID != "", attestation != ""
 	allPresent := havePCR0 && haveKey && haveAttestation
 	allAbsent := !havePCR0 && !haveKey && !haveAttestation
-	
+
 	if !allPresent && !allAbsent {
 		return "", "", "", fmt.Errorf(
 			"inconsistent migration predecessor artifacts "+

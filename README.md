@@ -244,7 +244,7 @@ measurement. A subset can be overridden at runtime from SSM.
 |---|---|---|
 | `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
-| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and one minute, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
+| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
 way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
@@ -268,11 +268,22 @@ silently break networking.
 
 ### Migration
 
-The cooldown between `/request-migration` and `/finalise-migration`, and the S3
-Object Lock retention on each migration intent record, are not configurable. They
-are 24 hours and ten years in production, two seconds and one minute under
-`ENCLAVE_DEV`. An operator who could shorten them could wait out the Object Lock
-and roll back undetected, so the measured image settles them.
+The S3 Object Lock retention on each migration intent record is not
+configurable: ten years in production, ten minutes under `ENCLAVE_DEV`. An
+operator who could shorten it could wait out the Object Lock and roll back
+undetected, so the measured image settles it. The cooldown between
+`/request-migration` and `/finalise-migration` is 24 hours in production and two
+seconds under `ENCLAVE_DEV`, and is the one setting here an operator may
+override, with `ENCLAVE_MIGRATION_COOLDOWN` baked into the image.
+
+A successor ignores any intent record that is not retained under compliance
+mode, and any whose retain-until date does not cover the configured retention.
+Governance mode is refused because a caller holding
+`s3:BypassGovernanceRetention` can delete such an object, so it proves nothing
+about what was published. The retention check allows for upload delay and for
+skew between the writer's clock and the `LastModified` S3 stamps, using a fixed
+security-profile budget: two minutes in development, ten in production. It has
+no environment-variable override.
 
 ### Clock
 

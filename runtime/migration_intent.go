@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -129,36 +131,32 @@ func (l *migrationIntentLog) Request(
 	if strings.EqualFold(targetPCR0, sourcePCR0) {
 		return nil, errMigrationIntentSelfTarget
 	}
-	head, _, err := l.deriveHead(ctx, sourcePCR0)
+	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	headSequence := uint64(0)
-	if head != nil {
-		if head.Action == migrationIntentRequested {
-			return nil, errMigrationIntentAlreadyRequested
-		}
-		headSequence = head.Sequence
+	if head != nil && (tie || head.Action == migrationIntentRequested) {
+		return nil, errMigrationIntentAlreadyRequested
 	}
-	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentRequested, targetPCR0)
 }
 
 func (l *migrationIntentLog) Abort(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, error) {
-	head, _, err := l.deriveHead(ctx, sourcePCR0)
+	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
 	if head == nil {
 		return nil, errMigrationIntentAbsent
 	}
-	if head.Action == migrationIntentAborted {
+	if !tie && head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
 
-	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, head.TargetPCR0)
 }
 
 func (l *migrationIntentLog) append(
@@ -195,7 +193,10 @@ func (l *migrationIntentLog) append(
 	if err != nil {
 		return nil, fmt.Errorf("encode migration intent object: %w", err)
 	}
-	out, err := l.s3.PutObject(ctx, &s3.PutObjectInput{
+	writeCtx, cancel := context.WithTimeout(ctx, l.writeTimeout())
+	defer cancel()
+
+	out, err := l.s3.PutObject(writeCtx, &s3.PutObjectInput{
 		Bucket:                    aws.String(l.bucket),
 		Key:                       aws.String(migrationIntentObjectKey(sourcePCR0, sequence)),
 		Body:                      bytes.NewReader(body),
@@ -238,11 +239,20 @@ func (l *migrationIntentLog) append(
 }
 
 func (l *migrationIntentLog) deriveHead(
+	ctx context.Context, sourcePCR0 string,
+) (*migrationIntent, bool, error) {
+	head, tie, _, err := l.scanIntents(ctx, sourcePCR0)
+	return head, tie, err
+}
+
+// scanIntents returns the active authorization separately from the highest
+// valid sequence, so ignored requests cannot occupy the next abort slot.
+func (l *migrationIntentLog) scanIntents(
 	ctx context.Context,
 	sourcePCR0 string,
-) (*migrationIntent, bool, error) {
-	var head *migrationIntent
-	var tie bool
+) (*migrationIntent, bool, uint64, error) {
+	heads := make(map[uint64]*migrationIntent)
+	ties := make(map[uint64]bool)
 	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
 		errMigrationIntentStoreUnavailable, "list migration intents",
 		func(key, versionID string, lastModified *time.Time) (bool, error) {
@@ -256,31 +266,79 @@ func (l *migrationIntentLog) deriveHead(
 			if err != nil || !valid {
 				return false, err
 			}
+			head := heads[sequence]
 			switch {
-			case head == nil || nextHead.Sequence > head.Sequence:
-				head = nextHead
-				tie = false
-			case nextHead.Sequence < head.Sequence:
-			case nextHead.PublishedAt.Before(head.PublishedAt):
-				head = nextHead
-				tie = false
+			case head == nil || nextHead.PublishedAt.Before(head.PublishedAt):
+				heads[sequence] = nextHead
+				ties[sequence] = false
 			case nextHead.PublishedAt.Equal(head.PublishedAt):
-				tie = true
+				ties[sequence] = true
 			}
 			return false, nil
 		})
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
-	return head, tie, nil
+	sequences := make([]uint64, 0, len(heads))
+	for sequence := range heads {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	var head *migrationIntent
+	var tie bool
+	var highest uint64
+	for _, sequence := range sequences {
+		highest = sequence
+		next := heads[sequence]
+		if ties[sequence] {
+			head, tie = next, true
+			continue
+		}
+		// An abort ends the pending request. Otherwise retain the earliest
+		// request, including expired requests, until an abort follows it.
+		aborts := next.Action == migrationIntentAborted
+		unauthorized := head == nil || head.Action == migrationIntentAborted
+		if aborts || (!tie && unauthorized) {
+			head, tie = next, false
+		}
+	}
+	return head, tie, highest, nil
+}
+
+// writeTimeout bounds upload delay and the corresponding read-side tolerance.
+func (l *migrationIntentLog) writeTimeout() time.Duration {
+	return l.cfg.IntentWriteTimeout
+}
+
+func (l *migrationIntentLog) compliesWithObjectLock(
+	key, versionID string, publishedAt time.Time, out *s3.GetObjectOutput,
+) bool {
+	if out.ObjectLockMode != s3types.ObjectLockModeCompliance {
+		slog.Warn("ignoring migration intent that is not retained under compliance mode",
+			"key", key, "version", versionID, "mode", string(out.ObjectLockMode))
+		return false
+	}
+
+	retainUntil := aws.ToTime(out.ObjectLockRetainUntilDate)
+	minimum := l.retention - l.writeTimeout()
+	minimumDeadline := publishedAt.Add(minimum)
+	if retainUntil.IsZero() || retainUntil.Before(minimumDeadline) {
+		slog.Warn("ignoring migration intent retained for less than the configured period",
+			"key", key, "version", versionID,
+			"retained_for", retainUntil.Sub(publishedAt), "minimum", minimum)
+		return false
+	}
+	return true
 }
 
 // readIntent returns one version if it is a well-formed record at the expected
-// sequence. It does not verify the attestation.
+// sequence, retained under the Object Lock the runtime writes. It does not
+// verify the attestation.
 func (l *migrationIntentLog) readIntent(
 	ctx context.Context,
 	key, versionID string,
 	sequence uint64,
+	publishedAt time.Time,
 ) (migrationIntentObjectV1, bool, error) {
 	var entry migrationIntentObjectV1
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
@@ -298,6 +356,9 @@ func (l *migrationIntentLog) readIntent(
 		)
 	}
 	defer func() { _ = out.Body.Close() }()
+	if !l.compliesWithObjectLock(key, versionID, publishedAt, out) {
+		return entry, false, nil
+	}
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
 		return entry, false, fmt.Errorf(
@@ -323,7 +384,7 @@ func (l *migrationIntentLog) fetchIntent(
 	sequence uint64,
 	publishedAt time.Time,
 ) (*migrationIntent, bool, error) {
-	entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
+	entry, valid, err := l.readIntent(ctx, key, versionID, sequence, publishedAt)
 	if err != nil || !valid {
 		return nil, false, err
 	}

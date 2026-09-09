@@ -201,3 +201,17 @@ func TestLoadConfigMigrationCooldown(t *testing.T) {
 		})
 	}
 }
+
+func TestSecurityProfileMigrationTimeouts(t *testing.T) {
+	for _, dev := range []bool{false, true} {
+		cfg := newTestConfig("test", "app", dev)
+		want := 10 * time.Minute
+		if dev {
+			want = 2 * time.Minute
+		}
+		require.Equal(t, want, cfg.IntentWriteTimeout)
+		require.Greater(t, cfg.IntentRetention, cfg.IntentWriteTimeout)
+		require.Greater(t, cfg.IntentRetention-cfg.IntentWriteTimeout, time.Minute,
+			"the retained window must stay well clear of the tolerance")
+	}
+}

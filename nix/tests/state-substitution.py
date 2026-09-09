@@ -6,6 +6,7 @@
 
 import base64
 import os
+from datetime import datetime
 
 import cbor2
 
@@ -156,11 +157,12 @@ def boot_enclave_node(node):
     wait_healthy(node)
 
 
-def expect_migration_rejection(node, key_id):
-    node.succeed("kill $(cat /run/enclave-qemu.pid)")
+def expect_migration_rejection(node, key_id, expected_error):
+    # The previous attempt may already have shut down after rejecting the state.
+    node.succeed("systemctl stop enclave-start")
     node.wait_until_fails("kill -0 $(cat /run/enclave-qemu.pid)", timeout=60)
     log_offset = int(node.succeed("wc -c < /var/log/enclave-console.log"))
-    node.succeed("systemctl restart enclave-start")
+    node.succeed("systemctl start enclave-start")
 
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
@@ -179,9 +181,9 @@ def expect_migration_rejection(node, key_id):
         failures = [event for event in events if event.get("msg") == "runtime failed"]
         if failures:
             error = failures[0].get("error", "")
-            # Require an authorization rejection; malformed fixtures, KMS
-            # failures, and unrelated startup errors must not pass this test.
-            assert "migration authorization: untrusted predecessor" in error, (
+            # Require the rejection specific to this attempt; unrelated startup
+            # errors must not pass either the retention or authorization check.
+            assert expected_error in error, (
                 f"B failed for an unexpected reason: {error}"
             )
             assert not any(
@@ -198,7 +200,7 @@ def expect_migration_rejection(node, key_id):
                 "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
                 "https://127.0.0.1/test/health"
             )
-            return
+            return events
         status, _ = node.execute(
             "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
             "https://127.0.0.1/health | jq -e '.status == \"ready\"'"
@@ -385,7 +387,7 @@ with subtest("Attempt state substitution through Z"):
     )
     put_param(migration_receipt_param(key_b, GREEN_PCR0), t_zb)
 
-    # Publish a valid Z -> B intent; Z is not an authorized predecessor.
+    # Reuse this Z -> B intent for both retention and authorization checks.
     z_intent_attestation = attestation_b64(
         {0: bytes.fromhex(Z_PCR0)}, intent_user_data(1, "requested", GREEN_PCR0)
     )
@@ -400,11 +402,6 @@ with subtest("Attempt state substitution through Z"):
         separators=(",", ":"),
     )
     aws.succeed(f"printf %s {shlex.quote(z_intent_body)} > /tmp/z-intent.json")
-    cloud(
-        f"s3api put-object --bucket {INTENT_BUCKET} "
-        f"--key migration-intent/{Z_PCR0}/00000000000000000001 "
-        "--body /tmp/z-intent.json"
-    )
 
     # A substituted DEK cannot open the old certificate cache, and the cached cert
     # would not match the substituted TLS key; point B at a fresh bucket so it
@@ -413,5 +410,38 @@ with subtest("Attempt state substitution through Z"):
 
 
 
-with subtest("B rejects the unauthorized migration from Z"):
-    expect_migration_rejection(green, key_b)
+with subtest("B rejects Z's intent without compliance retention"):
+    z_intent_key = f"migration-intent/{Z_PCR0}/00000000000000000001"
+    cloud(
+        f"s3api put-object --bucket {INTENT_BUCKET} --key {z_intent_key} "
+        "--body /tmp/z-intent.json"
+    )
+    events = expect_migration_rejection(green, key_b, "migration intent: absent")
+    assert any(
+        event.get("msg")
+        == "ignoring migration intent that is not retained under compliance mode"
+        and event.get("key") == z_intent_key
+        for event in events
+    ), "B did not reject Z's intent for missing compliance retention"
+
+
+with subtest("B rejects the unauthorized migration from Z with compliance retention"):
+    # Publish another version of the same intent with the runtime's dev retention.
+    # The unlocked version remains present and must be ignored by the reader.
+    retain_until = aws.succeed("date -u -d '+10 minutes' +%Y-%m-%dT%H:%M:%SZ").strip()
+    retained = json.loads(cloud(
+        f"s3api put-object --bucket {INTENT_BUCKET} --key {z_intent_key} "
+        "--body /tmp/z-intent.json --object-lock-mode COMPLIANCE "
+        f"--object-lock-retain-until-date {retain_until}"
+    ))
+    metadata = json.loads(cloud(
+        f"s3api get-object --bucket {INTENT_BUCKET} --key {z_intent_key} "
+        f"--version-id {shlex.quote(retained['VersionId'])} /tmp/z-intent-retained.json"
+    ))
+    assert metadata["ObjectLockMode"] == "COMPLIANCE"
+    assert datetime.fromisoformat(metadata["ObjectLockRetainUntilDate"]) == (
+        datetime.fromisoformat(retain_until)
+    ), "Z's intent did not retain the requested compliance deadline"
+    expect_migration_rejection(
+        green, key_b, "migration authorization: untrusted predecessor"
+    )

@@ -59,72 +59,52 @@ func TestVerifyRealAttestationDocument(t *testing.T) {
 	require.NotZero(t, result.Document.Timestamp)
 }
 
-func TestFetchAndVerifyAttestationRejectsUntrustedCertificateChain(t *testing.T) {
+func TestFetchAndVerifyAttestationRejectsInvalidCertificateChain(t *testing.T) {
 	pcr0 := strings.Repeat("ab", 48)
-	doc := buildSelfSignedAttestationDoc(t, pcr0, strings.Repeat("cd", 20), time.Time{}, time.Time{})
 
-	result, err := nitrite.Verify(doc, nitrite.VerifyOptions{CurrentTime: time.Now()})
-	require.Error(t, err)
-	require.NotNil(t, result)
-	require.True(t, result.SignatureOK)
+	tests := []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+	}{
+		{
+			name: "untrusted chain",
+		},
+		{
+			name:      "expired chain",
+			notBefore: time.Now().Add(-48 * time.Hour),
+			notAfter:  time.Now().Add(-24 * time.Hour),
+		},
+	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonceHex := r.URL.Query().Get("nonce")
-		nonce, err := hex.DecodeString(nonceHex)
-		require.NoError(t, err)
-		docWithNonce := buildSelfSignedAttestationDoc(t, pcr0, hex.EncodeToString(nonce), time.Time{}, time.Time{})
-		_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(docWithNonce)))
-	}))
-	defer srv.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := buildSelfSignedAttestationDoc(t, pcr0, strings.Repeat("cd", 20), tt.notBefore, tt.notAfter)
 
-	_, err = fetchAndVerifyAttestation(
-		context.Background(),
-		srv.Client(),
-		srv.URL,
-		pcr0,
-		false,
-	)
-	require.ErrorContains(t, err, "attestation verification:")
-}
+			result, err := nitrite.Verify(doc, nitrite.VerifyOptions{CurrentTime: time.Now()})
+			require.Error(t, err)
+			require.NotNil(t, result)
+			require.True(t, result.SignatureOK)
 
-func TestFetchAndVerifyAttestationRejectsExpiredCertificateChain(t *testing.T) {
-	pcr0 := strings.Repeat("ab", 48)
-	doc := buildSelfSignedAttestationDoc(
-		t,
-		pcr0,
-		strings.Repeat("cd", 20),
-		time.Now().Add(-48*time.Hour),
-		time.Now().Add(-24*time.Hour),
-	)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nonceHex := r.URL.Query().Get("nonce")
+				nonce, err := hex.DecodeString(nonceHex)
+				require.NoError(t, err)
+				docWithNonce := buildSelfSignedAttestationDoc(t, pcr0, hex.EncodeToString(nonce), tt.notBefore, tt.notAfter)
+				_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(docWithNonce)))
+			}))
+			defer srv.Close()
 
-	result, err := nitrite.Verify(doc, nitrite.VerifyOptions{CurrentTime: time.Now()})
-	require.Error(t, err)
-	require.NotNil(t, result)
-	require.True(t, result.SignatureOK)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonceHex := r.URL.Query().Get("nonce")
-		nonce, err := hex.DecodeString(nonceHex)
-		require.NoError(t, err)
-		expired := buildSelfSignedAttestationDoc(
-			t,
-			pcr0,
-			hex.EncodeToString(nonce),
-			time.Now().Add(-48*time.Hour),
-			time.Now().Add(-24*time.Hour),
-		)
-		_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(expired)))
-	}))
-	defer srv.Close()
-
-	_, err = fetchAndVerifyAttestation(
-		context.Background(),
-		srv.Client(),
-		srv.URL,
-		pcr0,
-		false,
-	)
-	require.ErrorContains(t, err, "attestation verification:")
+			_, err = fetchAndVerifyAttestation(
+				context.Background(),
+				srv.Client(),
+				srv.URL,
+				pcr0,
+				false,
+			)
+			require.ErrorContains(t, err, "attestation verification:")
+		})
+	}
 }
 
 func buildSelfSignedAttestationDoc(

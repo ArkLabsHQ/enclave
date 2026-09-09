@@ -1,0 +1,111 @@
+name: EIF build
+
+on:
+  workflow_call:
+    inputs:
+      environments:
+        description: >
+          JSON array of flake environment names, e.g. '["dev","se7enz"]'. One matrix leg
+          per entry, each building .#eif-<name>. JSON rather than a plain list because
+          strategy.matrix needs fromJSON.
+        type: string
+        required: true
+      app_name:
+        description: Used in artifact and asset names, and as the S3 key prefix when publishing.
+        type: string
+        required: true
+      version_flake_attr:
+        description: >
+          Flake attribute whose .version must equal a v-prefixed tag, e.g. "emulator".
+          Empty skips the check.
+        type: string
+        default: ''
+      upload_images:
+        description: >
+          Upload the images as artifacts. They are tens of megabytes each, so only ask
+          for this on runs that will publish.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: ${{ fromJSON(inputs.environments) }}
+
+    steps:
+      # Inside a reusable workflow this checks out the CALLER's repository and ref.
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # A v-prefixed tag must agree with the version the flake bakes into the binary,
+      # because that version is measured into PCR0. Any other tag is a throwaway build
+      # tag with no version to agree with, so it is not checked.
+      - name: Check tag matches flake version
+        if: inputs.version_flake_attr != '' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          ATTR: ${{ inputs.version_flake_attr }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          flake="$(nix eval --raw ".#${ATTR}.version")"
+          if [ "$tag" != "$flake" ]; then
+            echo "::error::tag v${tag} does not match flake version ${flake}"
+            exit 1
+          fi
+          echo "tag v${tag} matches the flake"
+
+      - name: Build the EIF
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: nix build ".#eif-${ENV_NAME}" --out-link result
+
+      # The measurement is the product, so every artefact is named after it. SHA256SUMS
+      # globs only the payload, so it cannot cover itself.
+      - name: Collect the measurement
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          mkdir -p out
+          pcr0="$(jq -r .PCR0 result/pcr.json)"
+
+          install -m644 result/image.eif "out/${APP_NAME}-${ENV_NAME}-${pcr0}.eif"
+          install -m644 result/pcr.json  "out/${APP_NAME}-${ENV_NAME}-${pcr0}.pcr.json"
+
+          (cd out && sha256sum "${APP_NAME}"-* > SHA256SUMS)
+
+          sha="$(sha256sum "out/${APP_NAME}-${ENV_NAME}-${pcr0}.eif" | cut -d' ' -f1)"
+
+          {
+            echo "### ${APP_NAME} / ${ENV_NAME}"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| PCR0 | \`${pcr0}\` |"
+            echo "| sha256 | \`${sha}\` |"
+            echo "| object name | \`${APP_NAME}/${pcr0}.eif\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the measurement
+        uses: actions/upload-artifact@v7
+        with:
+          name: measurement-${{ matrix.env }}
+          path: out/*.pcr.json
+          retention-days: 14
+
+      - name: Upload the image
+        if: inputs.upload_images
+        uses: actions/upload-artifact@v7
+        with:
+          name: eif-${{ matrix.env }}
+          path: out/
+          retention-days: 7

@@ -93,6 +93,14 @@ func LoadConfig() (*Config, error) {
 		LogRetentionDays: logRetentionDays(),
 	}
 	cfg.setSecurityConfig(IsDev())
+
+	cooldown, set, err := migrationCooldown()
+	if err != nil {
+		return nil, err
+	}
+	if set {
+		cfg.MigrationCooldown = cooldown
+	}
 	return cfg, nil
 }
 

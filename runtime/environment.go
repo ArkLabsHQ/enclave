@@ -20,6 +20,7 @@ var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_APP_NAME":       true,
 	"ENCLAVE_SECRETS_CONFIG": true,
 	"ENCLAVE_DEV":            true,
+	"ENCLAVE_MIGRATION_COOLDOWN": true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
@@ -121,4 +122,19 @@ func logRetentionDays() int32 {
 		return defaultLogRetentionDays
 	}
 	return int32(days)
+}
+
+func migrationCooldown() (time.Duration, bool, error) {
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
+	if v == "" {
+		return 0, false, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", v, err)
+	}
+	if d < 0 {
+		return 0, false, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+	}
+	return d, true, nil
 }

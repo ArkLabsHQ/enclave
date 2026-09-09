@@ -471,12 +471,18 @@ func (b *Boot) loadPredecessor(
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
-	if (pcr0 != "") != (keyID != "") || (pcr0 != "") != (attestation != "") {
+
+	havePCR0, haveKey, haveAttestation := pcr0 != "", keyID != "", attestation != ""
+	allPresent := havePCR0 && haveKey && haveAttestation
+	allAbsent := !havePCR0 && !haveKey && !haveAttestation
+	
+	if !allPresent && !allAbsent {
 		return "", "", "", fmt.Errorf(
-			"inconsistent migration predecessor artifacts (pcr0 present=%v, key present=%v, attestation present=%v)",
-			pcr0 != "",
-			keyID != "",
-			attestation != "",
+			"inconsistent migration predecessor artifacts "+
+				"(pcr0 present=%v, key present=%v, attestation present=%v)",
+			havePCR0,
+			haveKey,
+			haveAttestation,
 		)
 	}
 	return pcr0, keyID, attestation, nil
@@ -502,6 +508,7 @@ func (b *Boot) genesisCommitted(ctx context.Context, genesis *genesisLog) (strin
 	if artifact == nil {
 		return "", nil
 	}
+
 	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)))
 	if err != nil {
 		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)

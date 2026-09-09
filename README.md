@@ -244,7 +244,8 @@ measurement. A subset can be overridden at runtime from SSM.
 |---|---|---|
 | `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
-| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and one minute, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours. There is no way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
+| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and one minute, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
+way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
 
@@ -287,6 +288,7 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between `/request-migration` and `/finalise-migration`. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
 
@@ -338,13 +340,12 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Four names are refused, because they define the enclave's identity or security
+Five names are refused, because they define the enclave's identity or security
 posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
-`ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_DEV`. The list used to be
-nine: the lock posture, the migration cooldown, the intent retention and the
-clock-source assertion left it by ceasing to be configuration at all —
-`ENCLAVE_DEV` settles all four — and the predecessor PCR0 left it because the
-predecessor's own attestation carries the binding.
+`ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_DEV`,
+`ENCLAVE_MIGRATION_COOLDOWN`. The list used to be nine: the lock posture, the
+intent retention and the clock-source assertion left it by ceasing to be
+configuration at all — `ENCLAVE_DEV` settles them 
 
 Five TLS and ACME settings are read **only** from this overlay, never from the
 baked environment, because TLS is configured before the overlay is applied to

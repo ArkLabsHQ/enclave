@@ -141,3 +141,63 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	require.Equal(t, unscoped(locked), unscoped(unlocked),
 		"these paths must not be lock-scoped")
 }
+
+func TestLoadConfigMigrationCooldown(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_APP_NAME", "app")
+	}
+
+	t.Run("unset keeps the posture default", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, prodMigrationCooldown, cfg.MigrationCooldown)
+	})
+
+	t.Run("dev unset keeps the dev default", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_DEV", "true")
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, devMigrationCooldown, cfg.MigrationCooldown)
+	})
+
+	t.Run("override wins", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "48h")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, 48*time.Hour, cfg.MigrationCooldown)
+	})
+
+	// An explicit zero must stay distinct from an absent value, or "no cooldown"
+	// would silently read back as the 24 hour default.
+	t.Run("explicit zero is honoured", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "0s")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Zero(t, cfg.MigrationCooldown)
+	})
+
+	for _, tc := range []struct{ name, value, wantErr string }{
+		{"unparseable", "nope", "invalid ENCLAVE_MIGRATION_COOLDOWN"},
+		{"negative", "-1h", "must not be negative"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			base(t)
+			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
+
+			_, err := LoadConfig()
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}

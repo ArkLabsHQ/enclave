@@ -79,20 +79,34 @@ func TestFetchAndVerifyAttestationRejectsInvalidCertificateChain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			doc := buildSelfSignedAttestationDoc(t, pcr0, strings.Repeat("cd", 20), tt.notBefore, tt.notAfter)
+			doc := buildSelfSignedAttestationDoc(
+				t,
+				pcr0,
+				strings.Repeat("cd", 20),
+				tt.notBefore,
+				tt.notAfter,
+			)
 
 			result, err := nitrite.Verify(doc, nitrite.VerifyOptions{CurrentTime: time.Now()})
 			require.Error(t, err)
 			require.NotNil(t, result)
 			require.True(t, result.SignatureOK)
 
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				nonceHex := r.URL.Query().Get("nonce")
-				nonce, err := hex.DecodeString(nonceHex)
-				require.NoError(t, err)
-				docWithNonce := buildSelfSignedAttestationDoc(t, pcr0, hex.EncodeToString(nonce), tt.notBefore, tt.notAfter)
-				_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(docWithNonce)))
-			}))
+			srv := httptest.NewServer(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					nonceHex := r.URL.Query().Get("nonce")
+					nonce, err := hex.DecodeString(nonceHex)
+					require.NoError(t, err)
+					docWithNonce := buildSelfSignedAttestationDoc(
+						t,
+						pcr0,
+						hex.EncodeToString(nonce),
+						tt.notBefore,
+						tt.notAfter,
+					)
+					_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(docWithNonce)))
+				}),
+			)
 			defer srv.Close()
 
 			_, err = fetchAndVerifyAttestation(
@@ -124,10 +138,10 @@ func buildSelfSignedAttestationDoc(
 	require.NoError(t, err)
 
 	tmpl := &x509.Certificate{
-		SerialNumber:      big.NewInt(1),
-		Subject:           pkix.Name{CommonName: "untrusted.test"},
-		NotBefore:         notBefore,
-		NotAfter:          notAfter,
+		SerialNumber:       big.NewInt(1),
+		Subject:            pkix.Name{CommonName: "untrusted.test"},
+		NotBefore:          notBefore,
+		NotAfter:           notAfter,
 		SignatureAlgorithm: x509.ECDSAWithSHA384,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)

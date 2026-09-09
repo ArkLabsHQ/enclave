@@ -524,6 +524,12 @@ let
     };
 in
 {
+  # Exposed as packages by flake.nix so the reusable eif-build workflow can resolve
+  # them by name. They are already inputs to the eif-build check below, so listing
+  # them here costs no extra build.
+  eif-blue = blueEif;
+  eif-green = greenEif;
+
   eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
     test -s ${blueEif}/image.eif
     test -s ${greenEif}/image.eif

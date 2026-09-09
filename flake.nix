@@ -54,6 +54,12 @@
                 ];
                 tags = [ "netgo" ];
               });
+
+              # x86_64-linux only, like runtime: aarch64 EIFs measure correctly but
+              # cannot boot. Built from nix/tests/test-app, and exposed so this repo can
+              # exercise its own eif-build workflow against a real EIF.
+              eif-blue = (import ./nix/tests { inherit pkgs system self; }).eif-blue;
+              eif-green = (import ./nix/tests { inherit pkgs system self; }).eif-green;
             }
           ))
           (

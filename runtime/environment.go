@@ -11,16 +11,17 @@ import (
 )
 
 // nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM namespace or the managed-secret set. ENCLAVE_DEV additionally selects the
-// whole set of security settings — lock posture, both Object Lock retentions,
-// the migration cooldown and the clock-source assertion — and skips COSE
-// verification.
+// SSM namespace or the managed-secret set, or they decide the security posture.
+// ENCLAVE_DEV selects the lock posture and both Object Lock retentions and skips
+// COSE verification; the cooldown and the clock-source assertion are settable,
+// but only baked into the measured image, never from the overlay.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":         true,
-	"ENCLAVE_APP_NAME":           true,
-	"ENCLAVE_SECRETS_CONFIG":     true,
-	"ENCLAVE_DEV":                true,
-	"ENCLAVE_MIGRATION_COOLDOWN": true,
+	"ENCLAVE_DEPLOYMENT":          true,
+	"ENCLAVE_APP_NAME":            true,
+	"ENCLAVE_SECRETS_CONFIG":      true,
+	"ENCLAVE_DEV":                 true,
+	"ENCLAVE_MIGRATION_COOLDOWN":  true,
+	"ENCLAVE_VERIFY_CLOCK_SOURCE": true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
@@ -137,4 +138,17 @@ func migrationCooldown() (time.Duration, bool, error) {
 		return 0, false, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
 	}
 	return d, true, nil
+}
+
+
+func verifyClockSource() (bool, bool, error) {
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
+	if v == "" {
+		return false, false, nil
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, false, fmt.Errorf("invalid ENCLAVE_VERIFY_CLOCK_SOURCE %q: %w", v, err)
+	}
+	return enabled, true, nil
 }

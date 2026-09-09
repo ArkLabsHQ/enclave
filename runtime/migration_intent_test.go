@@ -761,7 +761,8 @@ func TestMigrationIntentRetentionBoundary(t *testing.T) {
 						ObjectLockMode:            s3types.ObjectLockModeCompliance,
 						ObjectLockRetainUntilDate: tc.deadline,
 					}
-					require.Equal(t, tc.want, log.compliesWithObjectLock("key", "version", published, out))
+					require.Equal(t, tc.want,
+						log.compliesWithObjectLock("key", "version", published, out))
 				})
 			}
 		})

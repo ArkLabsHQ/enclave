@@ -27,14 +27,14 @@ let
 
   ministack = pkgs.python3Packages.buildPythonApplication rec {
     pname = "ministack";
-    version = "1.4.6";
+    version = "1.4.16";
     pyproject = true;
 
     src = pkgs.fetchFromGitHub {
       owner = "ministackorg";
       repo = "ministack";
       tag = "v${version}";
-      hash = "sha256-6BUczgfnrSRcFpzmcStvOIIsULjqphGqqWPJZRQHNuU=";
+      hash = "sha256-hqvlrhi/JLV3JCDXsQPmsWA+um/q/GsB/zwtFodxxj0=";
     };
 
     build-system = with pkgs.python3Packages; [

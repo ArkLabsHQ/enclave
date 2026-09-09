@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -214,4 +215,47 @@ func TestSecurityProfileMigrationTimeouts(t *testing.T) {
 		require.Greater(t, cfg.IntentRetention-cfg.IntentWriteTimeout, time.Minute,
 			"the retained window must stay well clear of the tolerance")
 	}
+}
+
+func TestLoadConfigVerifyClockSource(t *testing.T) {
+	base := func(t *testing.T, dev bool) {
+		t.Helper()
+		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_APP_NAME", "app")
+		t.Setenv("ENCLAVE_DEV", strconv.FormatBool(dev))
+	}
+
+	t.Run("unset keeps the posture default", func(t *testing.T) {
+		for _, dev := range []bool{false, true} {
+			base(t, dev)
+			t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "")
+
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.Equal(t, !dev, cfg.VerifyClockSource)
+		}
+	})
+
+	// An explicit value must stay distinct from an absent one, or asking for the
+	// assertion in dev, or waiving it in prod, would silently do nothing.
+	t.Run("override wins in both postures", func(t *testing.T) {
+		for _, dev := range []bool{false, true} {
+			for _, want := range []bool{false, true} {
+				base(t, dev)
+				t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", strconv.FormatBool(want))
+
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				require.Equal(t, want, cfg.VerifyClockSource, "dev=%v want=%v", dev, want)
+			}
+		}
+	})
+
+	t.Run("rejects an unparseable value", func(t *testing.T) {
+		base(t, false)
+		t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "sometimes")
+
+		_, err := LoadConfig()
+		require.ErrorContains(t, err, "invalid ENCLAVE_VERIFY_CLOCK_SOURCE")
+	})
 }

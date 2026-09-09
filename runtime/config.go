@@ -104,6 +104,14 @@ func LoadConfig() (*Config, error) {
 	if set {
 		cfg.MigrationCooldown = cooldown
 	}
+
+	verify, set, err := verifyClockSource()
+	if err != nil {
+		return nil, err
+	}
+	if set {
+		cfg.VerifyClockSource = verify
+	}
 	return cfg, nil
 }
 

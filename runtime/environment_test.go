@@ -133,12 +133,13 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
-			path("ENCLAVE_DEPLOYMENT"):         "dev",
-			path("ENCLAVE_APP_NAME"):           "evil",
-			path("ENCLAVE_SECRETS_CONFIG"):     `[{"name":"evil"}]`,
-			path("ENCLAVE_DEV"):                "true",
-			path("ENCLAVE_MIGRATION_COOLDOWN"): "0s",
-			path("SAFE_KEY"):                   "ok",
+			path("ENCLAVE_DEPLOYMENT"):          "dev",
+			path("ENCLAVE_APP_NAME"):            "evil",
+			path("ENCLAVE_SECRETS_CONFIG"):      `[{"name":"evil"}]`,
+			path("ENCLAVE_DEV"):                 "true",
+			path("ENCLAVE_MIGRATION_COOLDOWN"):  "0s",
+			path("ENCLAVE_VERIFY_CLOCK_SOURCE"): "false",
+			path("SAFE_KEY"):                    "ok",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
@@ -148,6 +149,8 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Equal(t, "false", os.Getenv("ENCLAVE_DEV"))
 		require.Empty(t, os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"),
 			"the overlay must not be able to shorten the migration cooldown")
+		require.Empty(t, os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"),
+			"the overlay must not be able to waive the clock-source assertion")
 		require.True(t, testCfg.KMSLocked)
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
 	})

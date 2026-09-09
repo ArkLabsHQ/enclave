@@ -862,9 +862,18 @@ func TestAbortAdvancesPastIgnoredRequests(t *testing.T) {
 	ctx := context.Background()
 	target := strings.Repeat("cd", 48)
 	for sequence := uint64(1); sequence <= 3; sequence++ {
-		fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, sequence),
-			fx.object(t, sequence, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
-			time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second))
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, sequence),
+			fx.object(
+				t,
+				sequence,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			),
+			time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second),
+		)
 	}
 	head, err := fx.log.Head(ctx, fx.source)
 	require.NoError(t, err)

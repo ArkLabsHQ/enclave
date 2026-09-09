@@ -140,7 +140,6 @@ func migrationCooldown() (time.Duration, bool, error) {
 	return d, true, nil
 }
 
-
 func verifyClockSource() (bool, bool, error) {
 	v := strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
 	if v == "" {

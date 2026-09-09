@@ -1,0 +1,109 @@
+name: EIF publish
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment name. Selects the eif-<environment> artifact from this run.
+        type: string
+        required: true
+      app_name:
+        description: S3 key prefix. Must match the app_name given to eif-build.
+        type: string
+        required: true
+      bucket:
+        description: Destination bucket name.
+        type: string
+        required: true
+      region:
+        description: AWS region of the bucket.
+        type: string
+        required: true
+    secrets:
+      role_arn:
+        description: "ARN of the role to assume by OIDC. One role, declared explicitly, never secrets: inherit."
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: publish (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+
+    steps:
+      # No checkout: this job never needs source, only the built artefact.
+      - uses: actions/download-artifact@v8
+        with:
+          name: eif-${{ inputs.environment }}
+          path: eif
+
+      # Trusting an artefact rather than rebuilding is worth minutes on a runner with a
+      # cold /nix/store. The checksums are what make that safe, and they are verified
+      # before any credential is requested.
+      - name: Verify checksums
+        working-directory: eif
+        run: sha256sum -c SHA256SUMS
+
+      # An unset secret resolves to an empty string, which configure-aws-credentials
+      # reports as a malformed ARN. That reads like a broken workflow rather than a
+      # missing secret, so name the real problem first.
+      - name: Check the publish role is configured
+        env:
+          ROLE_ARN: ${{ secrets.role_arn }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::the caller passed an empty role_arn secret"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.role_arn }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Publish to S3
+        working-directory: eif
+        env:
+          BUCKET: ${{ inputs.bucket }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          pcr0="$(jq -r .PCR0 ./*.pcr.json)"
+          eif="$(ls ./*.eif)"
+          pcr="$(ls ./*.pcr.json)"
+          sha="$(sha256sum "$eif" | cut -d' ' -f1)"
+
+          # The object name is the measurement, so the same source always writes the
+          # same name and re-running is expected to be a no-op.
+          #
+          # The digest travels as user metadata rather than being read back from S3's
+          # own checksum: aws s3 cp uploads a large file as multipart, so the native
+          # checksum is a composite of part digests, not the digest of the file.
+          existing="$(aws s3api head-object --bucket "$BUCKET" --key "${APP_NAME}/${pcr0}.eif" \
+            --query 'Metadata.sha256' --output text 2>/dev/null || true)"
+
+          if [ -n "$existing" ] && [ "$existing" != "None" ]; then
+            if [ "$existing" = "$sha" ]; then
+              echo "${APP_NAME}/${pcr0}.eif is already published with the same bytes; nothing to do"
+              echo "already published: \`${APP_NAME}/${pcr0}.eif\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::${APP_NAME}/${pcr0}.eif exists with sha256 ${existing}, built ${sha}"
+            exit 1
+          fi
+
+          aws s3 cp "$eif" "s3://${BUCKET}/${APP_NAME}/${pcr0}.eif" --metadata "sha256=${sha}"
+          aws s3 cp "$pcr" "s3://${BUCKET}/${APP_NAME}/${pcr0}.pcr.json"
+
+          # The three fields ark-infra's modules/enclave refuses a slot without.
+          {
+            echo "## Published ${APP_NAME} / ${{ inputs.environment }}"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| eif_s3_uri | \`s3://${BUCKET}/${APP_NAME}/${pcr0}.eif\` |"
+            echo "| eif_pcr0 | \`${pcr0}\` |"
+            echo "| eif_sha256 | \`${sha}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

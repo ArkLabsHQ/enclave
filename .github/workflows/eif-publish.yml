@@ -69,11 +69,13 @@ jobs:
         env:
           BUCKET: ${{ inputs.bucket }}
           APP_NAME: ${{ inputs.app_name }}
+          ENV_NAME: ${{ inputs.environment }}
         run: |
           pcr0="$(jq -r .PCR0 ./*.pcr.json)"
           eif="$(ls ./*.eif)"
           pcr="$(ls ./*.pcr.json)"
           sha="$(sha256sum "$eif" | cut -d' ' -f1)"
+          key="${APP_NAME}/${pcr0}.eif"
 
           # The object name is the measurement, so the same source always writes the
           # same name and re-running is expected to be a no-op.
@@ -81,29 +83,56 @@ jobs:
           # The digest travels as user metadata rather than being read back from S3's
           # own checksum: aws s3 cp uploads a large file as multipart, so the native
           # checksum is a composite of part digests, not the digest of the file.
-          existing="$(aws s3api head-object --bucket "$BUCKET" --key "${APP_NAME}/${pcr0}.eif" \
-            --query 'Metadata.sha256' --output text 2>/dev/null || true)"
+          #
+          # A missing key must be told apart from a failed lookup. Swallowing every
+          # error would let a throttled or not-yet-propagated call look like "not
+          # published" and overwrite a differing measurement, which is the one thing
+          # this check exists to prevent. S3 answers 404 for a missing key only when
+          # the caller holds s3:ListBucket; without it every miss is a 403 and the two
+          # cannot be told apart. ark-infra's modules/github-oidc grants it for this.
+          set +e
+          existing="$(aws s3api head-object --bucket "$BUCKET" --key "$key" \
+            --query 'Metadata.sha256' --output text 2>head-object.err)"
+          rc=$?
+          set -e
 
-          if [ -n "$existing" ] && [ "$existing" != "None" ]; then
-            if [ "$existing" = "$sha" ]; then
-              echo "${APP_NAME}/${pcr0}.eif is already published with the same bytes; nothing to do"
-              echo "already published: \`${APP_NAME}/${pcr0}.eif\`" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::error::${APP_NAME}/${pcr0}.eif exists with sha256 ${existing}, built ${sha}"
+          if [ "$rc" -eq 0 ]; then
+            present=true
+          elif grep -q '(404)' head-object.err; then
+            present=false
+          else
+            echo "::error::head-object on ${key} failed for an unexpected reason"
+            cat head-object.err
             exit 1
           fi
 
-          aws s3 cp "$eif" "s3://${BUCKET}/${APP_NAME}/${pcr0}.eif" --metadata "sha256=${sha}"
-          aws s3 cp "$pcr" "s3://${BUCKET}/${APP_NAME}/${pcr0}.pcr.json"
+          if [ "$present" = true ]; then
+            if [ "$existing" = "$sha" ]; then
+              status="Already published"
+            elif [ "$existing" = "None" ]; then
+              echo "::error::${key} exists but carries no sha256 metadata; refusing to overwrite it"
+              exit 1
+            else
+              echo "::error::${key} exists with sha256 ${existing}, built ${sha}"
+              exit 1
+            fi
+          else
+            aws s3 cp "$eif" "s3://${BUCKET}/${key}" --metadata "sha256=${sha}"
+            aws s3 cp "$pcr" "s3://${BUCKET}/${APP_NAME}/${pcr0}.pcr.json"
+            status="Published"
+          fi
+
+          rm -f head-object.err
 
           # The three fields ark-infra's modules/enclave refuses a slot without.
+          # Printed on both paths: a no-op re-run is the common case, and the operator
+          # needs these values exactly as much then.
           {
-            echo "## Published ${APP_NAME} / ${{ inputs.environment }}"
+            echo "## ${status}: ${APP_NAME} / ${ENV_NAME}"
             echo
             echo "| field | value |"
             echo "|---|---|"
-            echo "| eif_s3_uri | \`s3://${BUCKET}/${APP_NAME}/${pcr0}.eif\` |"
+            echo "| eif_s3_uri | \`s3://${BUCKET}/${key}\` |"
             echo "| eif_pcr0 | \`${pcr0}\` |"
             echo "| eif_sha256 | \`${sha}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

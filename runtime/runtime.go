@@ -41,7 +41,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("load runtime config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err = StartClockSyncer(ctx)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}

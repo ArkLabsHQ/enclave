@@ -131,7 +131,10 @@ func TestParseOTLPLogs(t *testing.T) {
 		var req collogspb.ExportLogsServiceRequest
 		require.NoError(t, proto.Unmarshal(data, &req))
 		for i := 1; i < maxLogRecordsPerRequest+1; i++ {
-			req.ResourceLogs[0].ScopeLogs[0].LogRecords = append(req.ResourceLogs[0].ScopeLogs[0].LogRecords, req.ResourceLogs[0].ScopeLogs[0].LogRecords[0])
+			req.ResourceLogs[0].ScopeLogs[0].LogRecords = append(
+				req.ResourceLogs[0].ScopeLogs[0].LogRecords,
+				req.ResourceLogs[0].ScopeLogs[0].LogRecords[0],
+			)
 		}
 		data, err := proto.Marshal(&req)
 		require.NoError(t, err)

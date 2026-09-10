@@ -475,7 +475,9 @@ func parseOTLPLogs(body []byte) ([]logEntry, error) {
 		for _, sl := range rl.ScopeLogs {
 			for _, lr := range sl.LogRecords {
 				if entryCount >= maxLogRecordsPerRequest {
-					return nil, fmt.Errorf("OTLP log record limit exceeded: %d", maxLogRecordsPerRequest)
+					return nil, fmt.Errorf(
+						"OTLP log record limit exceeded: %d", maxLogRecordsPerRequest,
+					)
 				}
 				entry := logRecordToEntry(lr, resourceAttrs)
 				entries = append(entries, entry)

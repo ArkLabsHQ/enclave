@@ -13,8 +13,9 @@ import (
 // nonOverridableEnv lists vars the SSM env overlay must never set: they name the
 // SSM namespace or the managed-secret set, or they decide the security posture.
 // ENCLAVE_DEV selects the lock posture and both Object Lock retentions and skips
-// COSE verification; the cooldown and the clock-source assertion are settable,
-// but only baked into the measured image, never from the overlay.
+// COSE verification; the cooldown, the clock-source assertion and the
+// predecessor commitment are settable, but only baked into the measured image,
+// never from the overlay.
 var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEPLOYMENT":          true,
 	"ENCLAVE_APP_NAME":            true,
@@ -22,6 +23,7 @@ var nonOverridableEnv = map[string]bool{
 	"ENCLAVE_DEV":                 true,
 	"ENCLAVE_MIGRATION_COOLDOWN":  true,
 	"ENCLAVE_VERIFY_CLOCK_SOURCE": true,
+	"ENCLAVE_PREVIOUS_PCR0":       true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
@@ -87,6 +89,10 @@ func getDeployment() string {
 
 func getAppName() string {
 	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
+}
+
+func getPreviousPCR0() string {
+	return strings.TrimSpace(os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
 }
 
 func getAppPort() string {

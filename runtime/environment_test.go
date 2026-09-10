@@ -139,6 +139,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 			path("ENCLAVE_DEV"):                 "true",
 			path("ENCLAVE_MIGRATION_COOLDOWN"):  "0s",
 			path("ENCLAVE_VERIFY_CLOCK_SOURCE"): "false",
+			path("ENCLAVE_PREVIOUS_PCR0"):       "evil-pcr0",
 			path("SAFE_KEY"):                    "ok",
 		}))
 		require.NoError(t, err)
@@ -151,6 +152,8 @@ func TestApplyEnvOverrides(t *testing.T) {
 			"the overlay must not be able to shorten the migration cooldown")
 		require.Empty(t, os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"),
 			"the overlay must not be able to waive the clock-source assertion")
+		require.Empty(t, os.Getenv("ENCLAVE_PREVIOUS_PCR0"),
+			"the overlay must not be able to name a different predecessor")
 		require.True(t, testCfg.KMSLocked)
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
 	})

@@ -69,6 +69,7 @@ derivation.
           ENCLAVE_DEPLOYMENT = "prod";
           ENCLAVE_APP_NAME = "myapp";
           ENCLAVE_AWS_REGION = "eu-west-1";
+          ENCLAVE_PREVIOUS_PCR0 = "genesis";
         };
       };
     in
@@ -176,7 +177,7 @@ different keys even if a lease expires between verification and commit.
 |---|---|---|
 | genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
-| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
+| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Requires the predecessor named in SSM to be the one `ENCLAVE_PREVIOUS_PCR0` committed to in the EIF. Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
 | genesis object present and `KMSKeyID/<pcr0>` absent | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
 | genesis object absent and `KMSKeyID/<pcr0>` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
@@ -246,6 +247,7 @@ measurement. A subset can be overridden at runtime from SSM.
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
 | `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
 way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
+| `ENCLAVE_PREVIOUS_PCR0` | empty | The predecessor this image may adopt state from, or the literal `genesis` for an image that only ever genesises. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
 
@@ -351,12 +353,12 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Five names are refused, because they define the enclave's identity or security
-posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
-`ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_DEV`,
-`ENCLAVE_MIGRATION_COOLDOWN`. The list used to be nine: the lock posture, the
-intent retention and the clock-source assertion left it by ceasing to be
-configuration at all — `ENCLAVE_DEV` settles them 
+Seven names are refused, because they define the enclave's identity, its lineage
+or its security posture and can only be changed by rebuilding:
+`ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
+`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
+`ENCLAVE_PREVIOUS_PCR0`. The lock posture and the intent retention left the list
+by ceasing to be configuration at all — `ENCLAVE_DEV` settles them.
 
 Five TLS and ACME settings are read **only** from this overlay, never from the
 baked environment, because TLS is configured before the overlay is applied to
@@ -590,7 +592,9 @@ rollback path because there is nothing to roll back.
 
 The order is:
 
-1. Build the successor EIF and read its PCR0.
+1. Build the successor EIF with `ENCLAVE_PREVIOUS_PCR0` set to the predecessor's
+   PCR0, and read its own PCR0. The value is measured into PCR0, so the
+   successor's identity carries the predecessor it will accept.
 2. Prepare the successor host and routing, but do not boot the successor.
 3. Request the migration against the predecessor:
    ```sh
@@ -633,7 +637,8 @@ The order is:
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that
    `KMSKeyID/<predecessor PCR0>` is unchanged. The first is the commit; the
    second is the guarantee that the predecessor is still intact.
-7. Boot the successor. It verifies the predecessor attestation, the PCR31
+7. Boot the successor. It checks that the predecessor named in SSM is the one
+   its EIF committed to, then verifies the predecessor attestation, the PCR31
    commitment, the key policy, and the transition receipt before adopting the
    state.
 8. Confirm adoption on the successor's `/enclave/v1/info`:

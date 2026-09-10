@@ -139,7 +139,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 				seedGenesisRecord(t, s3f, currentPCR0Hex)
 			}
 			boot := &Boot{
-				cfg: testCfg,
+				cfg: testConfigWithPreviousPCR0(prevPCR0),
 				nsm: fakePredecessorNSM{
 					NSM: &nsmW{nsm: &fakeNSM{
 						verifyErr: errors.New("unexpected attestation verification"),
@@ -504,6 +504,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	// itself as a migration.
 	bootAt := time.Now()
 	var afterPlan func(*fakeS3)
+	var eifPredecessor string
 
 	seed := func(action, target string, sequence uint64, at time.Time) intentSeed {
 		return intentSeed{
@@ -567,6 +568,10 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			}
 		}
 		cfg := migrationTestCfg()
+		cfg.PreviousPCR0 = prevPCR0Hex
+		if eifPredecessor != "" {
+			cfg.PreviousPCR0 = eifPredecessor
+		}
 		boot := &Boot{
 			cfg: cfg,
 			nsm: seededGenesisNSM{NSM: fakePredecessorNSM{
@@ -665,6 +670,14 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			migrationIntentRequested, ownHex, 1, bootAt.Add(-time.Hour),
 		))
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+
+	t.Run("rejects a predecessor the EIF does not commit to", func(t *testing.T) {
+		eifPredecessor = otherHex
+		defer func() { eifPredecessor = "" }()
+
+		_, _, _, err := run(t, prevHex, valid, authorized(prevPCR0, ownHex))
+		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
 	})
 
 	// Naming yourself as your own predecessor used to be allowed as a rollback and

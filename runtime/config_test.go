@@ -26,6 +26,12 @@ func testConfig() *Config { return newTestConfig("prod", "app", false) }
 // testCfg is the package-wide default namespace for tests.
 var testCfg = testConfig()
 
+func testConfigWithPreviousPCR0(prev string) *Config {
+	cfg := *testCfg
+	cfg.PreviousPCR0 = prev
+	return &cfg
+}
+
 func testConfigWithLogShipInterval(interval time.Duration) *Config {
 	cfg := *testCfg
 	cfg.LogShipInterval = interval

@@ -45,10 +45,11 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment string
-	AppName    string
-	Dev        bool
-	AppPort    string
+	Deployment   string
+	AppName      string
+	Dev          bool
+	AppPort      string
+	PreviousPCR0 string
 
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
@@ -82,9 +83,10 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Deployment: getDeployment(),
-		AppName:    getAppName(),
-		AppPort:    appPort,
+		Deployment:   getDeployment(),
+		AppName:      getAppName(),
+		AppPort:      appPort,
+		PreviousPCR0: getPreviousPCR0(),
 
 		FQDN:             getFQDN(),
 		ExtPort:          extPort,

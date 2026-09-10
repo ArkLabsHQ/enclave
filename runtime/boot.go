@@ -342,6 +342,16 @@ func (b *migrationBoot) verify(nsm NSM, state *bootState) error {
 	if strings.EqualFold(state.predecessorPCR0, hex.EncodeToString(state.currentPCR0)) {
 		return fmt.Errorf("an enclave cannot be its own predecessor")
 	}
+	if state.cfg.PreviousPCR0 == "" {
+		return fmt.Errorf(
+			"ENCLAVE_PREVIOUS_PCR0 is required: this image commits to no predecessor",
+		)
+	}
+	if !strings.EqualFold(state.cfg.PreviousPCR0, state.predecessorPCR0) {
+		return fmt.Errorf(
+			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
+		)
+	}
 
 	return verifyAttestationUserData(
 		nsm,

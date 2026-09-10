@@ -227,11 +227,13 @@ let
     };
 
   blueEif = mkTestEif {
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
   };
   bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
 
   greenEif = mkTestEif {
+    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
     ENCLAVE_TEST_SALT = "green";
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;

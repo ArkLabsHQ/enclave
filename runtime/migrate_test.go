@@ -31,6 +31,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, nil))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        strings.Repeat("0", 96),
@@ -38,7 +39,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 			migrationReceipt:       "transition",
 		})
 
-		require.Error(t, err)
+		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
 	})
 
 	t.Run("attested PCR0 must match the claimed predecessor", func(t *testing.T) {
@@ -50,6 +51,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, nil))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(claimedPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        claimedPCR0,
@@ -67,6 +69,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, nil))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        prevPCR0,
@@ -84,6 +87,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, []byte("unexpected")))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        prevPCR0,
@@ -101,6 +105,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, nil))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        strings.ToUpper(prevPCR0),
@@ -111,6 +116,24 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("rejects a predecessor the EIF does not commit to at all", func(t *testing.T) {
+		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
+			0:                 prevPCR0Bytes,
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
+		}, nil))
+
+		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testCfg,
+			currentPCR0:            currentPCR0Bytes,
+			kmsKeyID:               "migration-key",
+			predecessorPCR0:        prevPCR0,
+			predecessorAttestation: attestation,
+			migrationReceipt:       "transition",
+		})
+
+		require.ErrorContains(t, err, "ENCLAVE_PREVIOUS_PCR0 is required")
+	})
+
 	t.Run("rejects self as predecessor", func(t *testing.T) {
 		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
 			0:                 currentPCR0Bytes,
@@ -118,6 +141,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		}, nil))
 
 		err := (&migrationBoot{}).verify(nsm, &bootState{
+			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
 			currentPCR0:            currentPCR0Bytes,
 			kmsKeyID:               "migration-key",
 			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
@@ -269,6 +293,12 @@ func migrationTestCfg() *Config {
 	return cfg
 }
 
+func successorTestCfg(prev string) *Config {
+	cfg := migrationTestCfg()
+	cfg.PreviousPCR0 = prev
+	return cfg
+}
+
 func TestCompleteMigration(t *testing.T) {
 	const migrationKeyID = "fake-kms-key-1"
 	migrationIntentBucketName := migrationIntentBucketName(testCfg, fakeSTSAccountID)
@@ -399,7 +429,9 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		newBoot, err := NewBoot(migrationTestCfg(), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		newBoot, err := NewBoot(
+			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
@@ -732,7 +764,9 @@ func TestCompleteMigration(t *testing.T) {
 			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
 			verifyRoots: fx.session.attestationRoots,
 		}}
-		newBoot, err := NewBoot(migrationTestCfg(), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f)
+		newBoot, err := NewBoot(
+			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
@@ -792,7 +826,7 @@ func TestCompleteMigration(t *testing.T) {
 		session := newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes})
 		successor := func(roots *x509.CertPool) (*Boot, error) {
 			return NewBoot(
-				migrationTestCfg(),
+				successorTestCfg(oldPCR0Hex),
 				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
 				fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
 			)

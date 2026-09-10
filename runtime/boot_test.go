@@ -505,6 +505,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	bootAt := time.Now()
 	var afterPlan func(*fakeS3)
 	var eifPredecessor string
+	var eifPredecessorSet bool
 
 	seed := func(action, target string, sequence uint64, at time.Time) intentSeed {
 		return intentSeed{
@@ -569,7 +570,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		}
 		cfg := migrationTestCfg()
 		cfg.PreviousPCR0 = prevPCR0Hex
-		if eifPredecessor != "" {
+		if eifPredecessorSet {
 			cfg.PreviousPCR0 = eifPredecessor
 		}
 		boot := &Boot{
@@ -673,11 +674,19 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	})
 
 	t.Run("rejects a predecessor the EIF does not commit to", func(t *testing.T) {
-		eifPredecessor = otherHex
-		defer func() { eifPredecessor = "" }()
+		eifPredecessor, eifPredecessorSet = otherHex, true
+		defer func() { eifPredecessorSet = false }()
 
 		_, _, _, err := run(t, prevHex, valid, authorized(prevPCR0, ownHex))
 		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
+	})
+
+	t.Run("rejects an image that commits to no predecessor", func(t *testing.T) {
+		eifPredecessor, eifPredecessorSet = "", true
+		defer func() { eifPredecessorSet = false }()
+
+		_, _, _, err := run(t, prevHex, valid, authorized(prevPCR0, ownHex))
+		require.ErrorContains(t, err, "ENCLAVE_PREVIOUS_PCR0 is required")
 	})
 
 	// Naming yourself as your own predecessor used to be allowed as a rollback and

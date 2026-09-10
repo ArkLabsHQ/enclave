@@ -443,5 +443,5 @@ with subtest("B rejects the unauthorized migration from Z with compliance retent
         datetime.fromisoformat(retain_until)
     ), "Z's intent did not retain the requested compliance deadline"
     expect_migration_rejection(
-        green, key_b, "migration authorization: untrusted predecessor"
+        green, key_b, "does not match previous PCR0 committed in the EIF"
     )

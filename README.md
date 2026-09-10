@@ -177,7 +177,7 @@ different keys even if a lease expires between verification and commit.
 |---|---|---|
 | genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
-| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Requires the predecessor named in SSM to be the one `ENCLAVE_PREVIOUS_PCR0` committed to in the EIF. Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
+| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, the transition receipt, the predecessor's migration intent, and last that the predecessor is the one `ENCLAVE_PREVIOUS_PCR0` committed to in the EIF — all before decrypting. Then writes its own state-origin receipt. |
 | genesis object present and `KMSKeyID/<pcr0>` absent | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
 | genesis object absent and `KMSKeyID/<pcr0>` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
@@ -637,10 +637,10 @@ The order is:
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that
    `KMSKeyID/<predecessor PCR0>` is unchanged. The first is the commit; the
    second is the guarantee that the predecessor is still intact.
-7. Boot the successor. It checks that the predecessor named in SSM is the one
-   its EIF committed to, then verifies the predecessor attestation, the PCR31
-   commitment, the key policy, and the transition receipt before adopting the
-   state.
+7. Boot the successor. It verifies the predecessor attestation, the PCR31
+   commitment, the key policy, the transition receipt, the predecessor's intent,
+   and last that the predecessor named in SSM is the one its EIF committed to,
+   before adopting the state.
 8. Confirm adoption on the successor's `/enclave/v1/info`:
    `previous_pcr0` equals the predecessor PCR0,
    `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals

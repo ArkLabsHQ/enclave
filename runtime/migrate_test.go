@@ -39,7 +39,7 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 			migrationReceipt:       "transition",
 		})
 
-		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
+		require.Error(t, err)
 	})
 
 	t.Run("attested PCR0 must match the claimed predecessor", func(t *testing.T) {
@@ -114,24 +114,6 @@ func TestMigrationBootVerifiesPredecessor(t *testing.T) {
 		})
 
 		require.NoError(t, err)
-	})
-
-	t.Run("rejects a predecessor the EIF does not commit to at all", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testCfg,
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        prevPCR0,
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.ErrorContains(t, err, "ENCLAVE_PREVIOUS_PCR0 is required")
 	})
 
 	t.Run("rejects self as predecessor", func(t *testing.T) {

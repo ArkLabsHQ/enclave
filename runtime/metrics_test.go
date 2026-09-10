@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,6 +69,21 @@ func TestMetricsAppMetrics(t *testing.T) {
 
 	app := metrics.MetricsSnapshot()["app"].(map[string]float64)
 	require.Equal(t, 99.0, app["custom_counter"])
+}
+
+func TestMetricsAppMetricBounds(t *testing.T) {
+	metrics := NewMetrics()
+	for i := 0; i < maxAppMetricNames; i++ {
+		metrics.SetAppMetric(fmt.Sprintf("metric_%d", i), 1)
+	}
+	metrics.SetAppMetric("new_metric", 2)
+	metrics.SetAppMetric("metric_0", 3)
+	metrics.SetAppMetric("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 4)
+
+	app := metrics.MetricsSnapshot()["app"].(map[string]float64)
+	require.Equal(t, 1000, len(app))
+	require.Equal(t, 3.0, app["metric_0"])
+	require.Equal(t, uint64(2), metrics.MetricsSnapshot()["app_dropped"])
 }
 
 func TestMetricsUpdateFromOTLP(t *testing.T) {

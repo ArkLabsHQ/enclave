@@ -39,13 +39,20 @@ type Metrics struct {
 	counters map[string]int64
 
 	// App metrics received via OTLP.
-	appMu      sync.Mutex
-	appMetrics map[string]float64
+	appMu          sync.Mutex
+	appMetrics     map[string]float64
+	appMetricDrops uint64
+	appMetricDrops uint64
 
 	// Runtime/proc metrics (updated periodically).
 	runtimeMu      sync.Mutex
 	runtimeMetrics map[string]float64
 }
+
+const (
+	maxAppMetricNames     = 1000
+	maxAppMetricNameBytes = 256
+)
 
 // NewMetrics registers counters and starts runtime collection.
 func NewMetrics() *Metrics {
@@ -126,6 +133,7 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	for k, v := range m.appMetrics {
 		app[k] = v
 	}
+	appMetricDrops := m.appMetricDrops
 	m.appMu.Unlock()
 
 	m.runtimeMu.Lock()
@@ -136,15 +144,22 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	m.runtimeMu.Unlock()
 
 	return map[string]any{
-		"supervisor": supervisor,
-		"app":        app,
-		"runtime":    rt,
+		"supervisor":  supervisor,
+		"app":         app,
+		"app_dropped": appMetricDrops,
+		"runtime":     rt,
 	}
 }
 
 // SetAppMetric stores a metric value received from the app via OTLP.
 func (m *Metrics) SetAppMetric(name string, value float64) {
 	m.appMu.Lock()
+	_, exists := m.appMetrics[name]
+	if len(name) > maxAppMetricNameBytes || (len(m.appMetrics) >= maxAppMetricNames && !exists) {
+		m.appMetricDrops++
+		m.appMu.Unlock()
+		return
+	}
 	m.appMetrics[name] = value
 	m.appMu.Unlock()
 }

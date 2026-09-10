@@ -42,7 +42,6 @@ type Metrics struct {
 	appMu          sync.Mutex
 	appMetrics     map[string]float64
 	appMetricDrops uint64
-	appMetricDrops uint64
 
 	// Runtime/proc metrics (updated periodically).
 	runtimeMu      sync.Mutex

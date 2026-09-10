@@ -141,10 +141,11 @@ func TestMetricHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{
-			"supervisor":{"http_requests_total":1},
-			"app":{"custom":2},
-			"runtime":{}
-		}`, w.Body.String())
+				"supervisor":{"http_requests_total":1},
+				"app":{"custom":2},
+				"app_dropped":0,
+				"runtime":{}
+			}`, w.Body.String())
 	})
 
 	t.Run("post accepts otlp", func(t *testing.T) {

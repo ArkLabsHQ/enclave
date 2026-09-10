@@ -19,19 +19,6 @@ func (a *fakeAppProcess) Stop() error {
 	return a.err
 }
 
-type observableRuntimeState struct {
-	*runtimeState
-	listenCalls chan struct{}
-}
-
-func (r *observableRuntimeState) ListenError() <-chan error {
-	select {
-	case r.listenCalls <- struct{}{}:
-	default:
-	}
-	return r.runtimeState.ListenError()
-}
-
 func TestSuperviseContextDoneStopsApp(t *testing.T) {
 	rt := newRuntimeState()
 	want := errors.New("stop failed")
@@ -89,68 +76,17 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	}
 }
 
-func TestSuperviseHaltWaitsForRuntime(t *testing.T) {
-	rt := &observableRuntimeState{
-		runtimeState: newRuntimeState(),
-		listenCalls:  make(chan struct{}, 2),
-	}
-	app := &fakeAppProcess{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	rt.NotifyHalt()
-
-	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app) }()
-
-	waitTestSignal(t, rt.listenCalls)
-	waitTestSignal(t, rt.listenCalls)
-	cancel()
-
-	if err := waitTestResult(t, done); err != nil {
-		t.Fatalf("supervise error = %v, want nil", err)
-	}
-	// The halt breaker leaves the app running, so shutdown must stop it.
-	if app.stops != 1 {
-		t.Fatalf("Stop calls = %d, want 1", app.stops)
-	}
-	if !rt.Halted() {
-		t.Fatalf("Halted() = false, want true")
-	}
-}
-
-func TestWaitForRuntimeStopsChildOnCauseCancel(t *testing.T) {
+func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {
 	rt := newRuntimeState()
-	app := &fakeAppProcess{}
 	want := errors.New("clock sync failed")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 
 	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(ctx, rt, app) }()
+	go func() { done <- waitForRuntime(ctx, rt) }()
 	cancel(want)
 
 	require.ErrorIs(t, waitTestResult(t, done), want)
-	require.Equal(t, 1, app.stops)
-}
-
-// A reaped child must never be stopped: stopApp waits on the unbuffered
-// ChildDone, which has already been delivered.
-func TestWaitForRuntimeSkipsStopAfterChildExit(t *testing.T) {
-	rt := newRuntimeState()
-	app := &fakeAppProcess{}
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-
-	go rt.NotifyChildExit(nil)
-	<-rt.ChildDone()
-
-	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(ctx, rt, app) }()
-	cancel(errors.New("halted"))
-
-	_ = waitTestResult(t, done)
-	require.Zero(t, app.stops)
 }
 
 func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
@@ -158,7 +94,7 @@ func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
 	want := errors.New("listener failed")
 
 	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(context.Background(), rt, &fakeAppProcess{}) }()
+	go func() { done <- waitForRuntime(context.Background(), rt) }()
 	rt.NotifyListenerError(want)
 
 	err := waitTestResult(t, done)

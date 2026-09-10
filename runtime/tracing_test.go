@@ -320,6 +320,35 @@ func TestTracingStartCloudWatchExport(t *testing.T) {
 			"source":"app"
 		}`, aws.ToString(put.LogEvents[0].Message))
 	})
+
+	t.Run("drops failed batch before next flush", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cw := newFakeCloudWatchLogs()
+		cw.putLogEventsErr = errors.New("throttled")
+		tracing := NewTracing(cw)
+		startTracingCloudWatchExport(t, ctx, tracing)
+
+		for i := 0; i < 100; i++ {
+			tracing.shipCh <- spanEntry{ID: fmt.Sprintf("failed-%03d", i), Start: time.Unix(int64(i), 0).UTC().Format(time.RFC3339Nano)}
+		}
+
+		select {
+		case <-cw.putAttempts:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for failed PutLogEvents")
+		}
+
+		cw.mu.Lock()
+		cw.putLogEventsErr = nil
+		cw.mu.Unlock()
+		tracing.shipCh <- spanEntry{ID: "only-one", Start: time.Unix(200, 0).UTC().Format(time.RFC3339Nano)}
+		close(tracing.shipCh)
+
+		put := requireCloudWatchPut(t, cw)
+		require.Len(t, put.LogEvents, 1)
+		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"id":"only-one"`)
+	})
 }
 
 func buildOTLPTraceRequest(t *testing.T, name string, statusCode tracepb.Status_StatusCode) []byte {

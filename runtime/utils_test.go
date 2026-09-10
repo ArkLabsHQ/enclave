@@ -551,10 +551,14 @@ type fakeCloudWatchLogs struct {
 	retentionDays      []int32
 	puts               []*cloudwatchlogs.PutLogEventsInput
 	putCh              chan *cloudwatchlogs.PutLogEventsInput
+	putAttempts        chan struct{}
 }
 
 func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
-	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 10)}
+	return &fakeCloudWatchLogs{
+		putCh:       make(chan *cloudwatchlogs.PutLogEventsInput, 10),
+		putAttempts: make(chan struct{}, 10),
+	}
 }
 
 func (f *fakeCloudWatchLogs) CreateLogGroup(
@@ -601,8 +605,17 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	in *cloudwatchlogs.PutLogEventsInput,
 	_ ...func(*cloudwatchlogs.Options),
 ) (*cloudwatchlogs.PutLogEventsOutput, error) {
-	if f.putLogEventsErr != nil {
-		return nil, f.putLogEventsErr
+	f.mu.Lock()
+	err := f.putLogEventsErr
+	f.mu.Unlock()
+	if f.putAttempts != nil {
+		select {
+		case f.putAttempts <- struct{}{}:
+		default:
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	f.mu.Lock()
 	copyIn := *in

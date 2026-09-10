@@ -76,6 +76,12 @@ jobs:
           APP_NAME: ${{ inputs.app_name }}
         run: |
           mkdir -p out
+
+          # Ensure jq -r doesn't print the string "null" when the PCR0 is missing.
+          if ! jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' result/pcr.json >/dev/null; then
+            echo "::error::.#eif-${ENV_NAME} produced a pcr.json without a 96-hex PCR0"
+            exit 1
+          fi
           pcr0="$(jq -r .PCR0 result/pcr.json)"
 
           install -m644 result/image.eif "out/${APP_NAME}-${ENV_NAME}-${pcr0}.eif"

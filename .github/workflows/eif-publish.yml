@@ -76,6 +76,7 @@ jobs:
           pcr="$(ls ./*.pcr.json)"
           sha="$(sha256sum "$eif" | cut -d' ' -f1)"
           key="${APP_NAME}/${pcr0}.eif"
+          pcr_key="${APP_NAME}/${pcr0}.pcr.json"
 
           # The object name is the measurement, so the same source always writes the
           # same name and re-running is expected to be a no-op.
@@ -92,17 +93,17 @@ jobs:
           # cannot be told apart. ark-infra's modules/github-oidc grants it for this.
           set +e
           existing="$(aws s3api head-object --bucket "$BUCKET" --key "$key" \
-            --query 'Metadata.sha256' --output text 2>head-object.err)"
+            --query 'Metadata.sha256' --output text 2>"$RUNNER_TEMP/head-object.err")"
           rc=$?
           set -e
 
           if [ "$rc" -eq 0 ]; then
             present=true
-          elif grep -q '(404)' head-object.err; then
+          elif grep -q '(404)' "$RUNNER_TEMP/head-object.err"; then
             present=false
           else
             echo "::error::head-object on ${key} failed for an unexpected reason"
-            cat head-object.err
+            cat "$RUNNER_TEMP/head-object.err"
             exit 1
           fi
 
@@ -117,12 +118,12 @@ jobs:
               exit 1
             fi
           else
+            # Push the measurement goes first, ensuring the pair is published together, even if the EIF
+            # isn't overwritten.
+            aws s3 cp "$pcr" "s3://${BUCKET}/${pcr_key}"
             aws s3 cp "$eif" "s3://${BUCKET}/${key}" --metadata "sha256=${sha}"
-            aws s3 cp "$pcr" "s3://${BUCKET}/${APP_NAME}/${pcr0}.pcr.json"
             status="Published"
           fi
-
-          rm -f head-object.err
 
           # The three fields ark-infra's modules/enclave refuses a slot without.
           # Printed on both paths: a no-op re-run is the common case, and the operator

@@ -709,7 +709,12 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	// not the predecessor had already finalised.
 	t.Run("refuses when a later abort revoked the authorization", func(t *testing.T) {
 		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
-			createIntentRecord(migrationIntentRequested, currentPCR0Hex, 1, bootAt.Add(-3*time.Hour)),
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				1,
+				bootAt.Add(-3*time.Hour),
+			),
 			createIntentRecord(migrationIntentAborted, currentPCR0Hex, 2, bootAt.Add(-2*time.Hour)),
 		})
 		require.ErrorIs(t, err, errMigrationIntentAborted)
@@ -717,9 +722,19 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 
 	t.Run("adopts when a re-request superseded an earlier abort", func(t *testing.T) {
 		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
-			createIntentRecord(migrationIntentRequested, currentPCR0Hex, 1, bootAt.Add(-5*time.Hour)),
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				1,
+				bootAt.Add(-5*time.Hour),
+			),
 			createIntentRecord(migrationIntentAborted, currentPCR0Hex, 2, bootAt.Add(-4*time.Hour)),
-			createIntentRecord(migrationIntentRequested, currentPCR0Hex, 3, bootAt.Add(-3*time.Hour)),
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				3,
+				bootAt.Add(-3*time.Hour),
+			),
 		})
 		require.NoError(t, err)
 	})
@@ -761,7 +776,12 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 		}
 		eifPredecessor, eifPredecessorSet = prevPCR0Hex, true
 		assertNoDecryptsOrWrites = true
-		_, _, _, err := planAndAdopt(t, otherPCR0Hex, zPCRs, createIntent(wrongPCR0, currentPCR0Hex))
+		_, _, _, err := planAndAdopt(
+			t,
+			otherPCR0Hex,
+			zPCRs,
+			createIntent(wrongPCR0, currentPCR0Hex),
+		)
 		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
 	})
 
@@ -1454,7 +1474,8 @@ func TestGenesisClaimsKMSKeyBeforeCommittingIntent(t *testing.T) {
 
 	require.ErrorContains(t, err, "key commit failed")
 	require.Empty(t, fx.ssmf.params[fx.keyIDParam()])
-	intent, loadErr := newGenesisLog(testCfg,
+	intent, loadErr := newGenesisLog(
+		testCfg,
 		fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket(),
 	)
 	require.NoError(t, loadErr)

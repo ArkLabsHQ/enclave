@@ -85,6 +85,7 @@ func (t *Tracing) StartCloudWatchExport(ctx context.Context) error {
 		})
 		if err != nil {
 			slog.Warn("span shipper: PutLogEvents failed", "error", err, "count", len(batch))
+			batch = nil
 			return
 		}
 		batch = nil

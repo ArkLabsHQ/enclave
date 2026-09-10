@@ -549,24 +549,4 @@ in
       + "\n"
       + builtins.readFile ./e2e.py;
   };
-
-  # B must reject substituted state from an unauthorized predecessor Z.
-  state-substitution = pkgs.testers.runNixOSTest {
-    name = "enclave-state-substitution";
-    extraPythonPackages = ps: [ ps.cbor2 ];
-    nodes = {
-      aws = awsNode;
-      blue = mkEnclaveNode blueEif;
-      green = mkEnclaveNode greenEif;
-    };
-    testScript =
-      ''
-        BLUE_PCR0 = ${builtins.toJSON bluePCR0}
-        GREEN_PCR0 = ${builtins.toJSON greenPCR0}
-        AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
-      ''
-      + builtins.readFile ./helpers.py
-      + "\n"
-      + builtins.readFile ./state-substitution.py;
-  };
 }

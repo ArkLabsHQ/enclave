@@ -151,6 +151,11 @@ type Logging struct {
 	cw      CloudWatchLogsAPI
 }
 
+const (
+	maxLogRecordsPerRequest = 1000
+	maxLogAttributes        = 100
+)
+
 // NewLogging builds logging; cw is used only when CloudWatch shipping is enabled.
 func NewLogging(metrics *Metrics, cw CloudWatchLogsAPI) *Logging {
 	buf := newLogBuffer(logBufferSize())
@@ -454,19 +459,27 @@ func parseOTLPLogs(body []byte) ([]logEntry, error) {
 	}
 
 	var entries []logEntry
+	entryCount := 0
 	for _, rl := range req.ResourceLogs {
 		// Collect resource attributes (prefixed with "resource.").
 		resourceAttrs := make(map[string]any)
 		if rl.Resource != nil {
 			for _, kv := range rl.Resource.Attributes {
+				if len(resourceAttrs) >= maxLogAttributes {
+					break
+				}
 				resourceAttrs["resource."+kv.Key] = anyValueToGo(kv.Value)
 			}
 		}
 
 		for _, sl := range rl.ScopeLogs {
 			for _, lr := range sl.LogRecords {
+				if entryCount >= maxLogRecordsPerRequest {
+					return nil, fmt.Errorf("OTLP log record limit exceeded: %d", maxLogRecordsPerRequest)
+				}
 				entry := logRecordToEntry(lr, resourceAttrs)
 				entries = append(entries, entry)
+				entryCount++
 			}
 		}
 	}
@@ -493,7 +506,10 @@ func logRecordToEntry(lr *logspb.LogRecord, resourceAttrs map[string]any) logEnt
 	for k, v := range resourceAttrs {
 		attrs[k] = v
 	}
-	for _, kv := range lr.Attributes {
+	for i, kv := range lr.Attributes {
+		if i >= maxLogAttributes {
+			break
+		}
 		attrs[kv.Key] = anyValueToGo(kv.Value)
 	}
 

@@ -126,6 +126,19 @@ func TestParseOTLPLogs(t *testing.T) {
 		require.Equal(t, "test", entry.Attributes["resource.service.name"])
 	})
 
+	t.Run("record limit", func(t *testing.T) {
+		data := buildOTLPLogRequest(t, logspb.SeverityNumber_SEVERITY_NUMBER_INFO, "test", "k", "v")
+		var req collogspb.ExportLogsServiceRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+		for i := 1; i < maxLogRecordsPerRequest+1; i++ {
+			req.ResourceLogs[0].ScopeLogs[0].LogRecords = append(req.ResourceLogs[0].ScopeLogs[0].LogRecords, req.ResourceLogs[0].ScopeLogs[0].LogRecords[0])
+		}
+		data, err := proto.Marshal(&req)
+		require.NoError(t, err)
+		_, err = parseOTLPLogs(data)
+		require.ErrorContains(t, err, "OTLP log record limit exceeded")
+	})
+
 	t.Run("severity", func(t *testing.T) {
 		cases := []struct {
 			name  string

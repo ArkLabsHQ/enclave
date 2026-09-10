@@ -838,12 +838,13 @@ func WriteTransitionReceipt(
 	if err != nil {
 		return fmt.Errorf("compute successor state_root: %w", err)
 	}
-	return writeStateReceipt(
+	return writeReceipt(
 		ctx,
 		nsm,
 		ssm,
-		root,
-		purposeMigrationTransition,
+		stateOriginPayloadV1{
+			Purpose: purposeMigrationTransition, StateRoot: root,
+		},
 		cfg.migrationStateOriginReceiptParam(snapshot.kmsKeyID, snapshot.ownerPCR0),
 		WithoutOverwrite(),
 	)
@@ -927,21 +928,8 @@ func stateRoot(cfg *Config, snapshot bootSnapshot) ([]byte, error) {
 	return out, nil
 }
 
-// writeStateReceipt attests over stateRoot and stores it at param. Advanced tier: an
+// writeReceipt attests over receipt and stores it at param. Advanced tier: an
 // attestation doc exceeds the 4 KB Standard-tier limit.
-func writeStateReceipt(
-	ctx context.Context,
-	nsm NSM,
-	ssm SSM,
-	stateRoot []byte,
-	purpose, param string,
-	opts ...SSMSetOption,
-) error {
-	return writeReceipt(ctx, nsm, ssm, stateOriginPayloadV1{
-		Purpose: purpose, StateRoot: stateRoot,
-	}, param, opts...)
-}
-
 func writeReceipt(
 	ctx context.Context,
 	nsm NSM,

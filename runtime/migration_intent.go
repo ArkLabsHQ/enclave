@@ -11,8 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -107,7 +108,7 @@ func (l *migrationIntentLog) Head(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, error) {
-	head, tie, err := l.deriveHead(ctx, sourcePCR0)
+	head, tie, _, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -220,12 +221,9 @@ func (l *migrationIntentLog) append(
 		)
 	}
 
-	head, tie, err := l.deriveHead(ctx, sourcePCR0)
+	head, err := l.Head(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
-	}
-	if tie {
-		return nil, errMigrationIntentAmbiguous
 	}
 	if head == nil || head.Sequence < sequence {
 		return nil, fmt.Errorf(
@@ -236,13 +234,6 @@ func (l *migrationIntentLog) append(
 	}
 
 	return head, nil
-}
-
-func (l *migrationIntentLog) deriveHead(
-	ctx context.Context, sourcePCR0 string,
-) (*migrationIntent, bool, error) {
-	head, tie, _, err := l.scanIntents(ctx, sourcePCR0)
-	return head, tie, err
 }
 
 // scanIntents returns the active authorization separately from the highest
@@ -279,15 +270,10 @@ func (l *migrationIntentLog) scanIntents(
 	if err != nil {
 		return nil, false, 0, err
 	}
-	sequences := make([]uint64, 0, len(heads))
-	for sequence := range heads {
-		sequences = append(sequences, sequence)
-	}
-	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
 	var head *migrationIntent
 	var tie bool
 	var highest uint64
-	for _, sequence := range sequences {
+	for _, sequence := range slices.Sorted(maps.Keys(heads)) {
 		highest = sequence
 		next := heads[sequence]
 		if ties[sequence] {

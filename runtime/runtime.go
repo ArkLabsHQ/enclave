@@ -76,7 +76,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv(&cfg)
+	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
@@ -155,10 +155,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv(cfg *Config) NSM {
-	return NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
-}
-
 type appProcess interface {
 	Stop() error
 }
@@ -219,7 +215,7 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		} else {
 			slog.Warn("upstream app exited cleanly; runtime stays alive")
 		}
-		return waitForRuntime(ctx, rt, child)
+		return waitForRuntime(ctx, rt)
 
 	case err := <-rt.ListenError():
 		_ = child.Stop()
@@ -235,29 +231,17 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 	}
 }
 
-// waitForRuntime keeps the runtime alive after the app is gone or halted, so
+// waitForRuntime keeps the runtime alive after the app has exited, so
 // health and migration endpoints still answer.
-func waitForRuntime(ctx context.Context, rt RuntimeState, child appProcess) error {
-	// Only stop a child that is still running: stopApp waits on ChildDone,
-	// which is unbuffered and delivered once, so stopping an already-reaped
-	// child would block forever.
-	stopChild := func() {
-		if !rt.UpstreamAppInfo().Exited {
-			_ = child.Stop()
-		}
-	}
-
+func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 	select {
 	case err := <-rt.ListenError():
-		stopChild()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
-			stopChild()
 			return fmt.Errorf("runtime halted: %w", cause)
 		}
 		slog.Info("shutting down")
-		stopChild()
 		return nil
 	}
 }

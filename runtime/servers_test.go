@@ -444,8 +444,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		testCfg.migrationPreviousPCR0AttestationParam(ownPCR0): "attestation",
 	}})
 	rt := newRuntimeState()
-	metrics := NewMetrics()
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt, metrics: metrics}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
 	})}}
@@ -571,10 +570,9 @@ func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
 	t.Helper()
 
 	s := &servers{
-		cfg:     testCfg,
-		rm:      http.NewServeMux(),
-		rt:      newRuntimeState(),
-		metrics: NewMetrics(),
+		cfg: testCfg,
+		rm:  http.NewServeMux(),
+		rt:  newRuntimeState(),
 	}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),

@@ -76,38 +76,17 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	}
 }
 
-func TestWaitForRuntimeStopsChildOnCauseCancel(t *testing.T) {
+func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {
 	rt := newRuntimeState()
-	app := &fakeAppProcess{}
 	want := errors.New("clock sync failed")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 
 	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(ctx, rt, app) }()
+	go func() { done <- waitForRuntime(ctx, rt) }()
 	cancel(want)
 
 	require.ErrorIs(t, waitTestResult(t, done), want)
-	require.Equal(t, 1, app.stops)
-}
-
-// A reaped child must never be stopped: stopApp waits on the unbuffered
-// ChildDone, which has already been delivered.
-func TestWaitForRuntimeSkipsStopAfterChildExit(t *testing.T) {
-	rt := newRuntimeState()
-	app := &fakeAppProcess{}
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-
-	go rt.NotifyChildExit(nil)
-	<-rt.ChildDone()
-
-	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(ctx, rt, app) }()
-	cancel(errors.New("halted"))
-
-	_ = waitTestResult(t, done)
-	require.Zero(t, app.stops)
 }
 
 func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
@@ -115,7 +94,7 @@ func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
 	want := errors.New("listener failed")
 
 	done := make(chan error, 1)
-	go func() { done <- waitForRuntime(context.Background(), rt, &fakeAppProcess{}) }()
+	go func() { done <- waitForRuntime(context.Background(), rt) }()
 	rt.NotifyListenerError(want)
 
 	err := waitTestResult(t, done)

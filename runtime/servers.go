@@ -48,15 +48,12 @@ type Servers interface {
 }
 
 type servers struct {
-	cfg     *Config
-	ext     *http.Server
-	int     *http.Server
-	sm      *http.ServeMux
-	rm      *http.ServeMux
-	im      *http.ServeMux
-	em      *http.ServeMux
-	rt      RuntimeState
-	metrics *Metrics
+	cfg *Config
+	ext *http.Server
+	int *http.Server
+	rm  *http.ServeMux
+	em  *http.ServeMux
+	rt  RuntimeState
 }
 
 func SetupHttpServers(
@@ -119,15 +116,12 @@ func SetupHttpServers(
 	}
 
 	return &servers{
-		cfg:     &cfg,
-		ext:     ext,
-		int:     int,
-		sm:      sm,
-		rm:      rm,
-		em:      em,
-		im:      im,
-		rt:      rt,
-		metrics: metrics,
+		cfg: &cfg,
+		ext: ext,
+		int: int,
+		rm:  rm,
+		em:  em,
+		rt:  rt,
 	}
 }
 

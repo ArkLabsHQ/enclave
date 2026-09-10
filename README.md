@@ -36,6 +36,7 @@ development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 | `cmd/enclave/` | The `enclave` CLI. |
 | `nix/` | `buildEif` function |
 | `nix/tests/` | EIF construction and full blue/green runtime checks. |
+| `.github/workflows/` | `eif-build.yml` and `eif-publish.yml`, reusable workflows an app repo calls to build and publish its EIF. |
 
 ## Quickstart
 
@@ -218,9 +219,32 @@ The flake also exposes these packages:
 |---|---|---|
 | `runtime` | `x86_64-linux` | The runtime executable embedded by `buildEif`. |
 | `cli`, `default` | Linux and Darwin | The `enclave` client CLI. |
+| `eif-blue`, `eif-green` | `x86_64-linux` | Test-app EIFs from `nix/tests/`. Exist so this repo can exercise `eif-build.yml` against a real image. |
 
 For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
 `nix build github:ArkLabsHQ/enclave#runtime` builds the standalone runtime.
+
+### CI
+
+`eif-build.yml` and `eif-publish.yml` are reusable workflows. An app repo calls
+them instead of writing its own pipeline:
+
+```yaml
+jobs:
+  build:
+    uses: ArkLabsHQ/enclave/.github/workflows/eif-build.yml@<sha>
+    with:
+      environments: '["dev"]'
+      app_name: myapp
+```
+
+The calling flake must expose `packages.<system>.eif-<env>` for each environment,
+each producing `image.eif` and `pcr.json`. `version_flake_attr` additionally
+requires an attribute carrying a `version`, asserted against a `v*` tag.
+
+`eif-publish.yml` must run in the same workflow run as `eif-build.yml`, and the
+**caller** must grant `permissions: id-token: write` — a called workflow cannot
+elevate it, which matters when the repos are in different organisations.
 
 ### Development shell
 

@@ -71,14 +71,28 @@ type Telemetry struct {
 	shipInterval  time.Duration
 	retentionDays int32
 
+	// Identity carried on every EMF document so the extracted metrics are
+	// attributable without a per-enclave dimension.
+	metricsNamespace  string
+	metricsDimensions map[string]string
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
 // NewTelemetry wires the three signals in dependency order.
 func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
+	namespace := cfg.MetricsNamespace
+	if namespace == "" {
+		namespace = defaultMetricsNamespace
+	}
 	t := &Telemetry{
 		cw: cw, shipInterval: cfg.LogShipInterval, retentionDays: cfg.LogRetentionDays,
+		metricsNamespace: namespace,
+		metricsDimensions: map[string]string{
+			"Deployment": cfg.Deployment,
+			"AppName":    cfg.AppName,
+		},
 	}
 
 	name := time.Now().UTC().Format("2006-01-02T15-04-05Z")
@@ -131,7 +145,9 @@ func (t *Telemetry) Shutdown() {
 	if t.Tracing != nil {
 		t.Tracing.Shutdown(shutdownCtx)
 	}
-	t.Send(signalMetrics, time.Now(), t.Metrics.MetricsSnapshot())
+	// The final interval is short, so its deltas cover less than a full tick.
+	// Shipping it keeps the last requests in the record rather than losing them.
+	t.sendMetrics(time.Now())
 
 	if t.cancel != nil {
 		t.cancel()
@@ -184,8 +200,23 @@ func (t *Telemetry) shipMetricSnapshots(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			t.Send(signalMetrics, now, t.Metrics.MetricsSnapshot())
+			t.sendMetrics(now)
 		}
+	}
+}
+
+// sendMetrics ships one interval as embedded metric format documents, which
+// CloudWatch extracts into real metrics. Counters carry the change since the
+// last call, so this must run once per interval.
+func (t *Telemetry) sendMetrics(now time.Time) {
+	events := buildEMFEvents(
+		t.metricsNamespace,
+		t.metricsDimensions,
+		t.Metrics.emfMetrics(),
+		now.UnixMilli(),
+	)
+	for _, event := range events {
+		t.Send(signalMetrics, now, event)
 	}
 }
 

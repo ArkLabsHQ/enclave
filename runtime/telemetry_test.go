@@ -195,18 +195,42 @@ func TestMetricsShipSnapshot(t *testing.T) {
 
 	put := requireCloudWatchPutTo(t, cw, "/enclave/prod/app/metrics")
 
-	// One snapshot per tick, and a flush may carry more than one of them.
+	// One document per tick, and a flush may carry more than one of them.
 	require.NotEmpty(t, put.LogEvents)
-	var snapshot struct {
-		Enclave map[string]int64   `json:"enclave"`
-		App     map[string]float64 `json:"app"`
-		Runtime map[string]float64 `json:"runtime"`
-	}
+	var doc map[string]any
 	require.NoError(t,
-		json.Unmarshal([]byte(aws.ToString(put.LogEvents[0].Message)), &snapshot))
-	require.Equal(t, int64(1), snapshot.Enclave[metricHTTPRequests])
-	require.Equal(t, 2.0, snapshot.App["custom"])
-	require.NotNil(t, snapshot.Runtime)
+		json.Unmarshal([]byte(aws.ToString(put.LogEvents[0].Message)), &doc))
+
+	meta, ok := doc["_aws"].(map[string]any)
+	require.True(t, ok, "CloudWatch only extracts metrics from an _aws node")
+	directives, ok := meta["CloudWatchMetrics"].([]any)
+	require.True(t, ok)
+	require.Len(t, directives, 1)
+	directive := directives[0].(map[string]any)
+
+	require.Equal(t, defaultMetricsNamespace, directive["Namespace"])
+
+	// Dimensions must be declared and resolvable, or the document is rejected.
+	sets := directive["Dimensions"].([]any)
+	require.Len(t, sets, 1)
+	var keys []string
+	for _, key := range sets[0].([]any) {
+		keys = append(keys, key.(string))
+	}
+	require.ElementsMatch(t, []string{"AppName", "Deployment"}, keys)
+	require.Equal(t, "prod", doc["Deployment"])
+	require.Equal(t, "app", doc["AppName"])
+
+	// Declared names must resolve to numeric root members.
+	declared := map[string]bool{}
+	for _, def := range directive["Metrics"].([]any) {
+		name := def.(map[string]any)["Name"].(string)
+		declared[name] = true
+		require.IsType(t, float64(0), doc[name], "%s must be a numeric target", name)
+	}
+	require.True(t, declared[metricHTTPRequests], "enclave counters must ship")
+	require.Equal(t, float64(1), doc[metricHTTPRequests])
+	require.Equal(t, 2.0, doc["app_custom"], "app metrics keep their own prefix")
 }
 
 // The read-back endpoints went with the buffers they read. Cheap to assert, and

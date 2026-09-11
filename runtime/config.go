@@ -21,6 +21,7 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
+	defaultMetricsNamespace = "Enclave"
 )
 
 const (
@@ -71,6 +72,7 @@ type Config struct {
 	MigrationCooldown     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
+	MetricsNamespace      string
 }
 
 // LoadConfig builds Config from ENCLAVE_* env vars.
@@ -96,6 +98,7 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol: getUpstreamProtocol(),
 		LogShipInterval:  logShipInterval(),
 		LogRetentionDays: logRetentionDays(),
+		MetricsNamespace: envDefault("ENCLAVE_METRICS_NAMESPACE", defaultMetricsNamespace),
 	}
 	cfg.setSecurityConfig(IsDev())
 

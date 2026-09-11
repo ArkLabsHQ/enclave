@@ -31,11 +31,6 @@ const (
 	// intPort is the loopback API listener, handed to the application as
 	// ENCLAVE_PROXY_PORT so it does not have to assume the value.
 	intPort = 8080
-
-	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
-	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
-	// alone silently breaks all networking.
-	hostProxyPort = 1024
 )
 
 // Config holds runtime HTTP/network settings, the enclave's identity, and the
@@ -54,7 +49,6 @@ type Config struct {
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
 	IntPort          uint16   // Internal loopback HTTP listener.
-	HostProxyPort    uint32   // Vsock port the host-side gvproxy listens on.
 	UseACME          bool     // Use ACME instead of self-signed TLS.
 	ACMEDirectory    string   // ACME dir override: "letsencrypt-staging" or https:// URL.
 	ACMEEmail        string   // Optional ACME account contact email.
@@ -91,7 +85,6 @@ func LoadConfig() (*Config, error) {
 		FQDN:             getFQDN(),
 		ExtPort:          extPort,
 		IntPort:          intPort,
-		HostProxyPort:    hostProxyPort,
 		AppWebSrv:        appWebSrv,
 		UpstreamProtocol: getUpstreamProtocol(),
 		LogShipInterval:  logShipInterval(),
@@ -119,7 +112,7 @@ func LoadConfig() (*Config, error) {
 
 // Validate rejects an unusable config before any state is touched.
 func (c *Config) Validate() error {
-	if c.ExtPort == 0 || c.IntPort == 0 || c.HostProxyPort == 0 {
+	if c.ExtPort == 0 || c.IntPort == 0 {
 		return fmt.Errorf("config is missing port")
 	}
 	if c.FQDN == "" {

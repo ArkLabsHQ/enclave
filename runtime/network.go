@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -14,14 +15,26 @@ import (
 	"github.com/mdlayher/vsock"
 )
 
-// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
 const (
-	viproxyDefaultIn  = "127.0.0.1:80"
-	viproxyDefaultOut = "3:8002"
-	imdsEndpointEnv   = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
+	// vsockCIDAny is VMADDR_CID_ANY, the wildcard for binding, not a guest CID.
+	vsockCIDAny uint32 = math.MaxUint32
+
+	// Shared host vsock services; derived gvproxy ports must avoid these.
+	hostIMDSPort      = 8002
+	hostHeartbeatPort = 9000
+
+	viproxyDefaultIn = "127.0.0.1:80"
+	imdsEndpointEnv  = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
 )
 
-func StartNetorking(ctx context.Context, cfg Config) error {
+func StartNetorking(ctx context.Context) error {
+	cid, err := networkingCID(vsock.ContextID)
+	if err != nil {
+		return err
+	}
+	slog.Info("discovered enclave networking", "enclave_cid", cid,
+		"host_vsock_endpoint", fmt.Sprintf("%d:%d", nitriding.ParentCID, cid))
+
 	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
 	if err := os.WriteFile(
 		"/etc/resolv.conf",
@@ -45,9 +58,34 @@ func StartNetorking(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	go nitriding.RunNetworking(ctx, cfg.HostProxyPort)
+	go nitriding.RunNetworking(ctx, cid)
 
 	return nil
+}
+
+// The launcher assigns both the enclave CID and its dedicated host gvproxy
+// port. Discover this before networking or AWS access; it is not measured config.
+func networkingCID(contextID func() (uint32, error)) (uint32, error) {
+	cid, err := contextID()
+	if err != nil {
+		return 0, fmt.Errorf(
+			"read enclave CID for networking: check /dev/vsock and the host launch assignment: %w",
+			err,
+		)
+	}
+	if cid <= nitriding.ParentCID || cid == vsockCIDAny {
+		return 0, fmt.Errorf(
+			"enclave CID %d is reserved: assign a guest CID and matching host gvproxy listener",
+			cid,
+		)
+	}
+	if cid == hostIMDSPort || cid == hostHeartbeatPort {
+		return 0, fmt.Errorf(
+			"enclave CID %d conflicts with a shared host vsock service: choose another CID and matching gvproxy listener",
+			cid,
+		)
+	}
+	return cid, nil
 }
 
 // startViproxy launches the in-process IMDS forwarder unless disabled via
@@ -65,7 +103,8 @@ func startViproxy() error {
 	if err != nil {
 		return fmt.Errorf("parse IN addr: %w", err)
 	}
-	out, err := parseViproxyAddr(envDefault("ENCLAVE_VIPROXY_OUT_ADDRS", viproxyDefaultOut))
+	defaultOut := fmt.Sprintf("%d:%d", nitriding.ParentCID, hostIMDSPort)
+	out, err := parseViproxyAddr(envDefault("ENCLAVE_VIPROXY_OUT_ADDRS", defaultOut))
 	if err != nil {
 		return fmt.Errorf("parse OUT addr: %w", err)
 	}

@@ -38,7 +38,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
 
-	if err := StartNetorking(ctx, cfg); err != nil {
+	if err := StartNetorking(ctx); err != nil {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 

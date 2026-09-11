@@ -12,7 +12,7 @@ import (
 func TestConfigValidate(t *testing.T) {
 	valid := func() *Config {
 		c := newTestConfig("prod", "myapp", false)
-		c.ExtPort, c.IntPort, c.HostProxyPort, c.FQDN = extPort, intPort, hostProxyPort, "localhost"
+		c.ExtPort, c.IntPort, c.FQDN = extPort, intPort, "localhost"
 		return c
 	}
 

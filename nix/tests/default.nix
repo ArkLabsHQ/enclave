@@ -193,7 +193,7 @@ let
     ThreadingHTTPServer(("0.0.0.0", 4570), Handler).serve_forever()
   '';
 
-  # The fixed four-node topology makes the AWS node's test-VLAN address stable.
+  # The AWS node sorts first in both topologies, keeping its VLAN address stable.
   # Using it directly avoids depending on gvproxy forwarding /etc/hosts entries.
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
@@ -238,176 +238,38 @@ let
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
 
-  mkEnclaveNode =
-    eif:
-    { pkgs, lib, ... }:
-    let
-      runtimeDir = "vhost-vsock-enclave";
-      vsockSocket = "/run/${runtimeDir}/vhost.socket";
-      pidfile = "/run/enclave-qemu.pid";
-      consoleLog = "/var/log/enclave-console.log";
-      qemu = pkgs.qemu_test.override { brlttySupport = false; };
-      runEnclave = pkgs.writeShellScript "run-enclave-qemu" ''
-        set -eu
-        for _ in $(seq 1 50); do
-          [ -S ${vsockSocket} ] && break
-          sleep 0.2
-        done
-        exec ${qemu}/bin/qemu-system-x86_64 \
-          -M nitro-enclave,vsock=c,id=enclave \
-          -kernel ${eif}/image.eif \
-          -m 2048M \
-          -smp 2 \
-          -enable-kvm \
-          -cpu host \
-          -display none \
-          -chardev file,id=console,path=${consoleLog},append=on \
-          -serial chardev:console \
-          -no-reboot \
-          -daemonize \
-          -pidfile ${pidfile} \
-          -chardev socket,id=c,path=${vsockSocket}
-      '';
-    in
-    {
-      documentation.enable = false;
-      boot.enableContainers = false;
-      system.tools.nixos-rebuild.enable = false;
-      system.tools.nixos-generate-config.enable = false;
-      boot.loader.grub.enable = lib.mkForce false;
+  mkEnclaveHost = import ./enclave-host.nix { inherit self; };
+  mkEnclaveNode = eif: mkEnclaveHost { enclave = { inherit eif; }; };
 
-      # The inner enclave QEMU takes 2048M; 3072 leaves the node headroom while
-      # keeping four enclave nodes inside a developer machine's free memory.
-      virtualisation.memorySize = 3072;
-      virtualisation.cores = 2;
-      virtualisation.qemu.options = [ "-cpu host,migratable=off,+invtsc" ];
-
-      boot.kernelModules = [ "vsock_loopback" ];
-      # ptp_kvm needs the intermediate VM's KVM clock-pairing hypercall.
-      boot.kernelParams = lib.mkAfter [
-        "clocksource=tsc"
-        "tsc=reliable"
-      ];
-
-      environment.systemPackages = [
-        pkgs.curl
-        pkgs.jq
-        pkgs.openssl
-        self.packages.${pkgs.stdenv.hostPlatform.system}.cli
-      ];
-      networking.firewall.allowedTCPPorts = [ 443 ];
-
-      environment.etc."gvproxy/config.yml".source =
-        (pkgs.formats.yaml { }).generate "gvproxy-config.yml"
-          {
-            stack.forwards.":443" = "192.168.127.2:443";
-          };
-
-      systemd.services.vhost-device-vsock = {
-        description = "vhost-user-vsock backend for enclave QEMU";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "systemd-modules-load.service" ];
-        wants = [ "systemd-modules-load.service" ];
-        serviceConfig = {
-          Type = "simple";
-          RuntimeDirectory = runtimeDir;
-          ExecStart = "${pkgs.vhost-device-vsock}/bin/vhost-device-vsock --vm guest-cid=16,socket=${vsockSocket},forward-cid=1,forward-listen=8003,tx-buffer-size=65536,queue-size=1024";
-          Restart = "always";
-          RestartSec = 2;
-        };
-      };
-
-      systemd.services.enclave-heartbeat = {
-        description = "Enclave boot heartbeat responder";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "systemd-modules-load.service" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:9000,fork EXEC:${pkgs.coreutils}/bin/cat";
-          Restart = "always";
-          RestartSec = 2;
-        };
-      };
-
-      systemd.services.gvproxy = {
-        description = "gvproxy L2 vsock network for enclave";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.gvproxy}/bin/gvproxy --listen vsock://:1024 --config /etc/gvproxy/config.yml";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
-      systemd.services.imds-proxy = {
-        description = "IMDS proxy";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:8002,fork TCP:169.254.169.254:80";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
-      systemd.services.migration-proxy = {
-        description = "Migration control proxy";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8003,bind=127.0.0.1,fork,reuseaddr VSOCK-CONNECT:1:8003";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
-      systemd.services.mock-imds-forward = {
-        description = "Test IMDS endpoint";
-        wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" ];
-        after = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStartPre = "${pkgs.iproute2}/bin/ip address replace 169.254.169.254/32 dev lo";
-          ExecStart = "${pkgs.socat}/bin/socat TCP4-LISTEN:80,bind=169.254.169.254,reuseaddr,fork TCP4:aws:1338";
-          Restart = "on-failure";
-        };
-      };
-
-      systemd.services.enclave-start = {
-        description = "Launch enclave QEMU";
-        wantedBy = [ "multi-user.target" ];
-        after = [
-          "gvproxy.service"
-          "imds-proxy.service"
-          "mock-imds-forward.service"
-          "vhost-device-vsock.service"
-          "enclave-heartbeat.service"
-        ];
-        requires = [
-          "mock-imds-forward.service"
-          "vhost-device-vsock.service"
-          "enclave-heartbeat.service"
-        ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          ExecStart = runEnclave;
-        };
-        path = [
-          pkgs.coreutils
-          qemu
-          pkgs.util-linux
-        ];
-      };
+  appOneEif = mkTestEif {
+    ENCLAVE_APP_NAME = "appOne";
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
+  };
+  appOnePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${appOneEif}/pcr.json")).PCR0;
+  appTwoEif = mkTestEif {
+    ENCLAVE_APP_NAME = "appTwo";
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
+  };
+  appTwoPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${appTwoEif}/pcr.json")).PCR0;
+  successorEif = mkTestEif {
+    ENCLAVE_APP_NAME = "appTwo";
+    ENCLAVE_PREVIOUS_PCR0 = appTwoPCR0;
+  };
+  successorPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${successorEif}/pcr.json")).PCR0;
+  multiInstances = {
+    appOne = {
+      eif = appOneEif;
+      cid = 1024;
+      publicPort = 8443;
+      controlPort = 18003;
     };
+    appTwo = {
+      eif = appTwoEif;
+      cid = 1025;
+      publicPort = 9443;
+      controlPort = 18004;
+    };
+  };
 
   awsNode =
     { pkgs, nodes, ... }:
@@ -548,5 +410,32 @@ in
       + builtins.readFile ./helpers.py
       + "\n"
       + builtins.readFile ./e2e.py;
+  };
+
+  e2e-multi-enclave = pkgs.testers.runNixOSTest {
+    name = "enclave-runtime-e2e-multi-enclave";
+    nodes = {
+      aws = awsNode;
+      blue = mkEnclaveHost multiInstances;
+      green = mkEnclaveHost (
+        multiInstances
+        // {
+          appTwo = multiInstances.appTwo // {
+            eif = successorEif;
+            autoStart = false;
+          };
+        }
+      );
+    };
+    testScript =
+      ''
+        APP_ONE_PCR0 = ${builtins.toJSON appOnePCR0}
+        APP_TWO_PCR0 = ${builtins.toJSON appTwoPCR0}
+        SUCCESSOR_PCR0 = ${builtins.toJSON successorPCR0}
+        AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
+      ''
+      + builtins.readFile ./helpers.py
+      + "\n"
+      + builtins.readFile ./multi-enclave.py;
   };
 }

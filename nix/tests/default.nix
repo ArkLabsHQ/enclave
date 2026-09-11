@@ -12,7 +12,7 @@ let
     pname = "testapp";
     version = "0.1.0";
     src = ./test-app;
-    vendorHash = null;
+    vendorHash = "sha256-8FrG/O0buFies3nVPhnfLnG7mSUi9XjClpcQ7OBPmlg=";
     env.CGO_ENABLED = "0";
   };
 
@@ -27,14 +27,14 @@ let
 
   ministack = pkgs.python3Packages.buildPythonApplication rec {
     pname = "ministack";
-    version = "1.4.6";
+    version = "1.4.16";
     pyproject = true;
 
     src = pkgs.fetchFromGitHub {
       owner = "ministackorg";
       repo = "ministack";
       tag = "v${version}";
-      hash = "sha256-6BUczgfnrSRcFpzmcStvOIIsULjqphGqqWPJZRQHNuU=";
+      hash = "sha256-hqvlrhi/JLV3JCDXsQPmsWA+um/q/GsB/zwtFodxxj0=";
     };
 
     build-system = with pkgs.python3Packages; [
@@ -200,11 +200,7 @@ let
     ENCLAVE_DEV = "true";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_AWS_REGION = "us-east-1";
-    ENCLAVE_KMS_KEY_LOCKED = "false";
-    ENCLAVE_MIGRATION_COOLDOWN = "2s";
-    ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
-    ENCLAVE_NITRIDING_UPSTREAM = "h1";
-    ENCLAVE_LOG_CLOUDWATCH = "false";
+    ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";
@@ -216,6 +212,7 @@ let
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -549,6 +546,8 @@ in
           GREEN_PCR0 = ${builtins.toJSON greenPCR0}
           AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
         ''
+        + builtins.readFile ./helpers.py
+        + "\n"
         + builtins.readFile ./e2e.py;
     };
   };

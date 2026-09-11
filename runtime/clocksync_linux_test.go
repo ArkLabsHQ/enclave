@@ -220,18 +220,16 @@ func TestAdjustCommitsStateOnlyOnSuccess(t *testing.T) {
 
 func TestClockPollInterval(t *testing.T) {
 	cases := []struct {
-		name            string
-		dev, deployment string
-		want            time.Duration
+		name string
+		dev  bool
+		want time.Duration
 	}{
-		{"dev polls fast", "true", "prod", 5 * time.Second},
-		{"prod polls every 5min", "", "prod", 5 * time.Minute},
+		{"dev polls fast", true, 5 * time.Second},
+		{"prod polls every 5min", false, 5 * time.Minute},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_DEV", c.dev)
-			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
-			require.Equal(t, c.want, clockPollInterval())
+			require.Equal(t, c.want, clockPollInterval(newTestConfig("prod", "app", c.dev)))
 		})
 	}
 }
@@ -310,7 +308,7 @@ func TestNewClockSyncer(t *testing.T) {
 	t.Run("open failure is fatal", func(t *testing.T) {
 		openPTPDevice = func() (*os.File, error) { return nil, errors.New("no device") }
 		clockGettime, clockSettime = ok, ok
-		cs, err := newClockSyncer()
+		cs, err := newClockSyncer(clockSyncPollInterval)
 		require.ErrorContains(t, err, "open")
 		require.Nil(t, cs)
 	})
@@ -319,7 +317,7 @@ func TestNewClockSyncer(t *testing.T) {
 		f := realFile(t)
 		openPTPDevice = func() (*os.File, error) { return f, nil }
 		clockGettime, clockSettime = fail("EOPNOTSUPP"), ok
-		cs, err := newClockSyncer()
+		cs, err := newClockSyncer(clockSyncPollInterval)
 		require.ErrorContains(t, err, "read PTP clock")
 		require.Nil(t, cs)
 	})
@@ -328,7 +326,7 @@ func TestNewClockSyncer(t *testing.T) {
 		f := realFile(t)
 		openPTPDevice = func() (*os.File, error) { return f, nil }
 		clockGettime, clockSettime = ok, fail("EPERM")
-		cs, err := newClockSyncer()
+		cs, err := newClockSyncer(clockSyncPollInterval)
 		require.ErrorContains(t, err, "initial hard-step")
 		require.Nil(t, cs)
 	})
@@ -337,7 +335,7 @@ func TestNewClockSyncer(t *testing.T) {
 		f := realFile(t)
 		openPTPDevice = func() (*os.File, error) { return f, nil }
 		clockGettime, clockSettime = ok, ok
-		cs, err := newClockSyncer()
+		cs, err := newClockSyncer(clockSyncPollInterval)
 		require.NoError(t, err)
 		require.NotNil(t, cs)
 		require.Equal(t, clockSyncRetryInterval, cs.retryInterval)

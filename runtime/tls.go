@@ -63,15 +63,11 @@ func ConfigureTLS(
 	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	if err := loadTLSConfigOverridesFromSSM(ctx, ssm, cfg); err != nil {
-		return nil, fmt.Errorf("failed to load TLS SSM overrides: %w", err)
-	}
-
 	if !cfg.UseACME {
 		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
 	}
 
-	zoneID, err := ssm.MayGet(ctx, route53ZoneIDParam())
+	zoneID, err := ssm.MayGet(ctx, cfg.route53ZoneIDParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Route53 zone ID: %w", err)
 	}
@@ -80,7 +76,7 @@ func ConfigureTLS(
 		// ACME and silently got an untrusted certificate finds out from clients.
 		return nil, fmt.Errorf(
 			"ACME is enabled but %s is unset; DNS-01 is the only supported challenge "+
-				"and needs a Route53 hosted zone", route53ZoneIDParam(),
+				"and needs a Route53 hosted zone", cfg.route53ZoneIDParam(),
 		)
 	}
 	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, hashes)
@@ -97,16 +93,16 @@ func configureDNS01Cert(
 	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	certBucket, err := ssm.MustGet(ctx, certBucketParam())
+	certBucket, err := ssm.MustGet(ctx, cfg.certBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
 	}
-	leaseBucket, err := ssm.MustGet(ctx, leaseBucketParam())
+	leaseBucket, err := ssm.MustGet(ctx, cfg.leaseBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}
 
-	store := newCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
+	store := newCertStore(cfg, s3, dek, tlsKey, certBucket, cfg.FQDN)
 
 	accountKey, err := store.LoadOrCreateAccountKey(ctx)
 	if err != nil {
@@ -127,7 +123,7 @@ func configureDNS01Cert(
 	}
 
 	manager, err := newCertManager(
-		ctx, store, issuer,
+		ctx, cfg, store, issuer,
 		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
 	)
 	if err != nil {
@@ -137,50 +133,6 @@ func configureDNS01Cert(
 
 	slog.Info("serving fleet-shared certificate via DNS-01", "fqdn", cfg.FQDN, "zone", zoneID)
 	return manager.GetCertificate, nil
-}
-
-func loadTLSConfigOverridesFromSSM(ctx context.Context, ssm SSM, cfg *Config) error {
-	loadSSMOverride := func(name string, updateCfg func(val string)) error {
-		val, err := ssm.MayGet(ctx, envVarOverridePath(name))
-		if err != nil {
-			return err
-		}
-		if val != "" {
-			updateCfg(val)
-		}
-		return nil
-	}
-
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_FQDN",
-		func(val string) { cfg.FQDN = val },
-	); err != nil {
-		return err
-	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_USE_ACME", func(val string) {
-		cfg.UseACME = strings.EqualFold(val, "true")
-	}); err != nil {
-		return err
-	}
-	if err := loadSSMOverride("ENCLAVE_NITRIDING_ACME_DIRECTORY", func(val string) {
-		cfg.ACMEDirectory = val
-	}); err != nil {
-		return err
-	}
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_ACME_EMAIL",
-		func(val string) { cfg.ACMEEmail = val },
-	); err != nil {
-		return err
-	}
-	if err := loadSSMOverride(
-		"ENCLAVE_NITRIDING_ACME_CA",
-		func(val string) { cfg.ACMECA = val },
-	); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // configureSelfSigned shares one self-signed certificate across the fleet, so a
@@ -194,24 +146,24 @@ func configureSelfSigned(
 	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	certBucket, err := ssm.MayGet(ctx, certBucketParam())
+	certBucket, err := ssm.MayGet(ctx, cfg.certBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
 	}
-	leaseBucket, err := ssm.MayGet(ctx, leaseBucketParam())
+	leaseBucket, err := ssm.MayGet(ctx, cfg.leaseBucketParam())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}
 	if certBucket == "" || leaseBucket == "" {
 		return nil, fmt.Errorf(
 			"the shared certificate store needs both %s and %s",
-			certBucketParam(), leaseBucketParam(),
+			cfg.certBucketParam(), cfg.leaseBucketParam(),
 		)
 	}
 
-	store := newSelfSignedCertStore(s3, dek, tlsKey, certBucket, cfg.FQDN)
+	store := newSelfSignedCertStore(cfg, s3, dek, tlsKey, certBucket, cfg.FQDN)
 	manager, err := newCertManager(
-		ctx, store, selfSignedIssuer{},
+		ctx, cfg, store, selfSignedIssuer{},
 		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
 	)
 	if err != nil {
@@ -292,7 +244,7 @@ func acmeClientForDirectory(directory, caPEM string) (*acme.Client, error) {
 	if caPEM != "" {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, fmt.Errorf("ENCLAVE_NITRIDING_ACME_CA: no certificates parsed")
+			return nil, fmt.Errorf("ENCLAVE_ACME_CA: no certificates parsed")
 		}
 		client.HTTPClient = &http.Client{
 			Timeout: 90 * time.Second,

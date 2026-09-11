@@ -10,7 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +41,10 @@ var (
 	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
+	errMigrationIntentSelfTarget       = errors.New(
+		"migration intent: target PCR0 is this enclave",
+	)
+	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
 )
 
 type migrationIntentV1 struct {
@@ -66,6 +73,7 @@ type migrationIntent struct {
 }
 
 type migrationIntentLog struct {
+	cfg       *Config
 	s3        S3API
 	nsm       NSM
 	bucket    string
@@ -73,26 +81,26 @@ type migrationIntentLog struct {
 	retention time.Duration
 }
 
-func migrationIntentBucketName(accountID string) string {
-	identity := getDeployment() + "\x00" + getAppName()
+func migrationIntentBucketName(cfg *Config, accountID string) string {
+	identity := cfg.Deployment + "\x00" + cfg.AppName
 	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }
 
-func newMigrationIntentLog(s3Client S3API, nsm NSM, bucket string) (*migrationIntentLog, error) {
+func newMigrationIntentLog(
+	cfg *Config, s3Client S3API, nsm NSM, bucket string,
+) (*migrationIntentLog, error) {
 	if strings.TrimSpace(bucket) == "" {
 		return nil, fmt.Errorf("migration intent bucket is required")
 	}
-	retention, err := migrationIntentRetention()
-	if err != nil {
-		return nil, err
-	}
+	retention := cfg.IntentRetention
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build migration intent CBOR encoder: %w", err)
 	}
 	return &migrationIntentLog{
-		s3: s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
+		cfg: cfg,
+		s3:  s3Client, nsm: nsm, bucket: bucket, enc: enc, retention: retention,
 	}, nil
 }
 
@@ -100,7 +108,7 @@ func (l *migrationIntentLog) Head(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, error) {
-	head, tie, err := l.deriveHead(ctx, sourcePCR0)
+	head, tie, _, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
@@ -119,36 +127,37 @@ func (l *migrationIntentLog) Request(
 	if err != nil {
 		return nil, fmt.Errorf("target PCR0: %w", err)
 	}
-	head, _, err := l.deriveHead(ctx, sourcePCR0)
+	// A self-targeted handoff would overwrite this enclave's own commit pointer
+	// and would satisfy the PCR31 check trivially.
+	if strings.EqualFold(targetPCR0, sourcePCR0) {
+		return nil, errMigrationIntentSelfTarget
+	}
+	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	headSequence := uint64(0)
-	if head != nil {
-		if head.Action == migrationIntentRequested {
-			return nil, errMigrationIntentAlreadyRequested
-		}
-		headSequence = head.Sequence
+	if head != nil && (tie || head.Action == migrationIntentRequested) {
+		return nil, errMigrationIntentAlreadyRequested
 	}
-	return l.append(ctx, sourcePCR0, headSequence, migrationIntentRequested, targetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentRequested, targetPCR0)
 }
 
 func (l *migrationIntentLog) Abort(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, error) {
-	head, _, err := l.deriveHead(ctx, sourcePCR0)
+	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
 	if head == nil {
 		return nil, errMigrationIntentAbsent
 	}
-	if head.Action == migrationIntentAborted {
+	if !tie && head.Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
 
-	return l.append(ctx, sourcePCR0, head.Sequence, migrationIntentAborted, head.TargetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, head.TargetPCR0)
 }
 
 func (l *migrationIntentLog) append(
@@ -185,7 +194,10 @@ func (l *migrationIntentLog) append(
 	if err != nil {
 		return nil, fmt.Errorf("encode migration intent object: %w", err)
 	}
-	out, err := l.s3.PutObject(ctx, &s3.PutObjectInput{
+	writeCtx, cancel := context.WithTimeout(ctx, l.writeTimeout())
+	defer cancel()
+
+	out, err := l.s3.PutObject(writeCtx, &s3.PutObjectInput{
 		Bucket:                    aws.String(l.bucket),
 		Key:                       aws.String(migrationIntentObjectKey(sourcePCR0, sequence)),
 		Body:                      bytes.NewReader(body),
@@ -209,12 +221,9 @@ func (l *migrationIntentLog) append(
 		)
 	}
 
-	head, tie, err := l.deriveHead(ctx, sourcePCR0)
+	head, err := l.Head(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
-	}
-	if tie {
-		return nil, errMigrationIntentAmbiguous
 	}
 	if head == nil || head.Sequence < sequence {
 		return nil, fmt.Errorf(
@@ -227,12 +236,14 @@ func (l *migrationIntentLog) append(
 	return head, nil
 }
 
-func (l *migrationIntentLog) deriveHead(
+// scanIntents returns the active authorization separately from the highest
+// valid sequence, so ignored requests cannot occupy the next abort slot.
+func (l *migrationIntentLog) scanIntents(
 	ctx context.Context,
 	sourcePCR0 string,
-) (*migrationIntent, bool, error) {
-	var head *migrationIntent
-	var tie bool
+) (*migrationIntent, bool, uint64, error) {
+	heads := make(map[uint64]*migrationIntent)
+	ties := make(map[uint64]bool)
 	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
 		errMigrationIntentStoreUnavailable, "list migration intents",
 		func(key, versionID string, lastModified *time.Time) (bool, error) {
@@ -246,31 +257,74 @@ func (l *migrationIntentLog) deriveHead(
 			if err != nil || !valid {
 				return false, err
 			}
+			head := heads[sequence]
 			switch {
-			case head == nil || nextHead.Sequence > head.Sequence:
-				head = nextHead
-				tie = false
-			case nextHead.Sequence < head.Sequence:
-			case nextHead.PublishedAt.Before(head.PublishedAt):
-				head = nextHead
-				tie = false
+			case head == nil || nextHead.PublishedAt.Before(head.PublishedAt):
+				heads[sequence] = nextHead
+				ties[sequence] = false
 			case nextHead.PublishedAt.Equal(head.PublishedAt):
-				tie = true
+				ties[sequence] = true
 			}
 			return false, nil
 		})
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
-	return head, tie, nil
+	var head *migrationIntent
+	var tie bool
+	var highest uint64
+	for _, sequence := range slices.Sorted(maps.Keys(heads)) {
+		highest = sequence
+		next := heads[sequence]
+		if ties[sequence] {
+			head, tie = next, true
+			continue
+		}
+		// An abort ends the pending request. Otherwise retain the earliest
+		// request, including expired requests, until an abort follows it.
+		aborts := next.Action == migrationIntentAborted
+		unauthorized := head == nil || head.Action == migrationIntentAborted
+		if aborts || (!tie && unauthorized) {
+			head, tie = next, false
+		}
+	}
+	return head, tie, highest, nil
+}
+
+// writeTimeout bounds upload delay and the corresponding read-side tolerance.
+func (l *migrationIntentLog) writeTimeout() time.Duration {
+	return l.cfg.IntentWriteTimeout
+}
+
+func (l *migrationIntentLog) compliesWithObjectLock(
+	key, versionID string, publishedAt time.Time, out *s3.GetObjectOutput,
+) bool {
+	if out.ObjectLockMode != s3types.ObjectLockModeCompliance {
+		slog.Warn("ignoring migration intent that is not retained under compliance mode",
+			"key", key, "version", versionID, "mode", string(out.ObjectLockMode))
+		return false
+	}
+
+	retainUntil := aws.ToTime(out.ObjectLockRetainUntilDate)
+	minimum := l.retention - l.writeTimeout()
+	minimumDeadline := publishedAt.Add(minimum)
+	if retainUntil.IsZero() || retainUntil.Before(minimumDeadline) {
+		slog.Warn("ignoring migration intent retained for less than the configured period",
+			"key", key, "version", versionID,
+			"retained_for", retainUntil.Sub(publishedAt), "minimum", minimum)
+		return false
+	}
+	return true
 }
 
 // readIntent returns one version if it is a well-formed record at the expected
-// sequence. It does not verify the attestation.
+// sequence, retained under the Object Lock the runtime writes. It does not
+// verify the attestation.
 func (l *migrationIntentLog) readIntent(
 	ctx context.Context,
 	key, versionID string,
 	sequence uint64,
+	publishedAt time.Time,
 ) (migrationIntentObjectV1, bool, error) {
 	var entry migrationIntentObjectV1
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
@@ -288,6 +342,9 @@ func (l *migrationIntentLog) readIntent(
 		)
 	}
 	defer func() { _ = out.Body.Close() }()
+	if !l.compliesWithObjectLock(key, versionID, publishedAt, out) {
+		return entry, false, nil
+	}
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
 		return entry, false, fmt.Errorf(
@@ -313,7 +370,7 @@ func (l *migrationIntentLog) fetchIntent(
 	sequence uint64,
 	publishedAt time.Time,
 ) (*migrationIntent, bool, error) {
-	entry, valid, err := l.readIntent(ctx, key, versionID, sequence)
+	entry, valid, err := l.readIntent(ctx, key, versionID, sequence, publishedAt)
 	if err != nil || !valid {
 		return nil, false, err
 	}
@@ -332,7 +389,8 @@ func (l *migrationIntentLog) fetchIntent(
 			err,
 		)
 	}
-	if err := l.nsm.VerifyAttestation(
+	if err := verifyAttestationUserData(
+		l.nsm,
 		entry.Attestation,
 		map[uint]string{0: sourcePCR0},
 		payload,

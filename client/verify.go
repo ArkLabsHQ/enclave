@@ -97,12 +97,7 @@ func fetchAndVerifyAttestation(
 			CurrentTime: time.Now(),
 		})
 		if err != nil {
-			if result != nil && result.SignatureOK {
-				// Signature is valid but certificate may have expired — proceed
-				// with a warning since we still trust the attestation.
-			} else {
-				return nil, fmt.Errorf("attestation verification: %w", err)
-			}
+			return nil, fmt.Errorf("attestation verification: %w", err)
 		}
 	}
 

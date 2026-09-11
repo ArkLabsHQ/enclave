@@ -3,12 +3,11 @@ package runtime
 // Shared runtime helpers.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,14 +16,20 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
-// envMu serializes process env writes.
-var envMu sync.Mutex
-
-// safeSetenv wraps os.Setenv under envMu to prevent concurrent env mutations.
-func safeSetenv(key, value string) error {
-	envMu.Lock()
-	defer envMu.Unlock()
-	return os.Setenv(key, value)
+func verifyAttestationUserData(
+	nsm NSM,
+	attestDocB64 string,
+	expectedPCRs map[uint]string,
+	expectedUserData []byte,
+) error {
+	result, err := nsm.VerifyAttestationDocument(attestDocB64, expectedPCRs)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(result.Document.UserData, expectedUserData) {
+		return fmt.Errorf("attested user data does not match expected user data")
+	}
+	return nil
 }
 
 // generateRuntimeToken returns a 32-byte hex bearer token.

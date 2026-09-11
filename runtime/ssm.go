@@ -46,6 +46,11 @@ func WithoutOverwrite() SSMSetOption {
 	}
 }
 
+func isParameterAlreadyExists(err error) bool {
+	var exists *ssmtypes.ParameterAlreadyExists
+	return errors.As(err, &exists)
+}
+
 func NewSSM(ssm SSMAPI) SSM {
 	return &ssmW{ssm: ssm}
 }

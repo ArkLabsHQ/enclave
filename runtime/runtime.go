@@ -16,12 +16,18 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
+// Runtime status moves from candidate to starting to ready.
+const (
+	runtimeStatusCandidate = "candidate"
+	runtimeStatusStarting  = "starting"
+	runtimeStatusReady     = "ready"
+)
+
 type RuntimeState interface {
+	Status() string
+	NotifyStarting()
 	Ready() bool
 	NotifyReady()
-	NotifyHalt()
-	Halt() <-chan struct{}
-	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
@@ -36,7 +42,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -45,19 +51,24 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
-	aws, err := NewAWSClient(ctx)
+	aws, err := NewAWSClient(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
-
-	metrics := NewMetrics()
-	tracing := NewTracing(aws.CWL)
-
-	if err := tracing.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
+	ssm := NewSSM(aws.SSM)
+	if err := cfg.ApplySSMOverlay(ctx, ssm); err != nil {
+		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
-	ctx, initSpan := tracing.Span(ctx, "init")
+	cfg.InstanceID = aws.InstanceID
+	telemetry := NewTelemetry(&cfg, aws.CWL)
+	if err := telemetry.Start(ctx); err != nil {
+		return err
+	}
+
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {
@@ -65,13 +76,6 @@ func Run(ctx context.Context, cfg Config) error {
 			initSpan.End()
 		}
 	}()
-
-	logging := NewLogging(metrics, aws.CWL)
-	slog.SetDefault(slog.New(NewBufferHandler(logging)))
-
-	if err := logging.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
-	}
 
 	hashes := &AttestationHashes{}
 
@@ -82,15 +86,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv()
+	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
 		cfg,
 		nsm,
-		metrics,
-		logging,
-		tracing,
+		telemetry,
 		hashes,
 		authToken,
 	)
@@ -99,41 +101,56 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
-	ssm := NewSSM(aws.SSM)
-	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
-	if err != nil {
-		return fmt.Errorf("failed to establish state: %w", err)
-	}
-	result, err := boot.Boot(ctx)
+	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
-		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
+	migrationIntentBucket, err := boot.migrationIntentBucket(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to resolve migration intent bucket: %w", err)
 	}
 
 	migrator, err := NewMigrator(
+		&cfg,
 		nsm,
-		result.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
 		aws.S3,
-		result.dek,
-		result.secrets,
-		result.tlsKey,
-		result.migrationIntentBucketName,
+		migrationIntentBucket,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
+	if err := servers.ConfigureEnclaveInfoHandler(migrator); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
-	if err := servers.StartMigrationControlServer(ctx, migrator); err != nil {
-		return fmt.Errorf("failed to start migration control server: %w", err)
+	candidateCertCb, err := candidateCertCallback(cfg.FQDN)
+	if err != nil {
+		return fmt.Errorf("failed to configure candidate TLS: %w", err)
 	}
+	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
+
+	// Candidates wait here until their predecessor commits the handoff.
+	if err := migrator.AwaitCandidateHandoff(ctx); err != nil {
+		return fmt.Errorf("failed to await migration handoff: %w", err)
+	}
+
+	result, err := boot.Boot(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to establish state: %w", err)
+	}
+
+	rt.NotifyStarting()
+
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
+		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
+	}
+
+	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
+
+	go migrator.RunPredecessorHandoff(ctx, result.kms, result.dek, result.secrets, result.tlsKey)
 
 	tlsCertCb, err := ConfigureTLS(
 		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
@@ -143,16 +160,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
-		return fmt.Errorf("failed to apply env overrides: %w", err)
-	}
-	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
-	// overriding established secret state
-	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
-		return fmt.Errorf("failed to set static secrets env vars: %w", err)
-	}
-
-	app, err := startApp(rt, cfg, authToken)
+	app, err := startApp(rt, cfg, appEnv(cfg, authToken, result.secrets))
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
@@ -164,10 +172,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv() NSM {
-	return NewNSM(WithAttestationUnsigned(skipCOSEVerification()))
-}
-
 type appProcess interface {
 	Stop() error
 }
@@ -177,20 +181,32 @@ type execApp struct {
 	cmd *exec.Cmd
 }
 
-func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + envOr("APP_BINARY_NAME", "app")
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
+func appEnv(cfg Config, authToken string, secrets []StaticSecret) []string {
+	env := os.Environ()
+	// exec.Cmd.Env keeps the last value for duplicate keys, so append overrides.
+	for key, value := range cfg.ChildEnv {
+		env = append(env, key+"="+value)
+	}
+	// Static secrets take precedence over SSM overrides.
+	for _, secret := range secrets {
+		env = append(env, secret.EnvVar+"="+secret.Plaintext)
+	}
+	return append(
+		env,
+		"ENCLAVE_APP_PORT="+cfg.AppPort,
+		"PORT="+cfg.AppPort,
+		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
+		"ENCLAVE_RUNTIME_TOKEN="+authToken,
+	)
+}
+
+func startApp(rt RuntimeState, cfg Config, env []string) (appProcess, error) {
+	appPath := "/app/" + cfg.AppBinaryName
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = append(
-		os.Environ(),
-		"ENCLAVE_APP_PORT="+appPort,
-		"PORT="+appPort,
-		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-		"ENCLAVE_RUNTIME_TOKEN="+authToken,
-	)
+	child.Env = env
 
 	if err := child.Start(); err != nil {
 		return nil, fmt.Errorf("start child %s: %w", appPath, err)
@@ -229,15 +245,11 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		} else {
 			slog.Warn("upstream app exited cleanly; runtime stays alive")
 		}
-		return waitForRuntime(ctx, rt, child)
+		return waitForRuntime(ctx, rt)
 
 	case err := <-rt.ListenError():
 		_ = child.Stop()
 		return fmt.Errorf("HTTP listener failed: %w", err)
-
-	case <-rt.Halt():
-		slog.Info("received halt circuit-breaker")
-		return waitForRuntime(ctx, rt, child)
 
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
@@ -249,68 +261,48 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 	}
 }
 
-// waitForRuntime keeps the runtime alive after the app is gone or halted, so
+// waitForRuntime keeps the runtime alive after the app has exited, so
 // health and migration endpoints still answer.
-func waitForRuntime(ctx context.Context, rt RuntimeState, child appProcess) error {
-	// Only stop a child that is still running: stopApp waits on ChildDone,
-	// which is unbuffered and delivered once, so stopping an already-reaped
-	// child would block forever.
-	stopChild := func() {
-		if !rt.UpstreamAppInfo().Exited {
-			_ = child.Stop()
-		}
-	}
-
+func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 	select {
 	case err := <-rt.ListenError():
-		stopChild()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
-			stopChild()
 			return fmt.Errorf("runtime halted: %w", cause)
 		}
 		slog.Info("shutting down")
-		stopChild()
 		return nil
 	}
 }
 
 type runtimeState struct {
-	isReady         atomic.Bool
+	status          atomic.Value // one of the runtimeStatus constants
 	isExit          atomic.Bool
 	exitError       atomic.Value
-	rollbackHalt    atomic.Bool
-	haltOnce        sync.Once
-	haltCh          chan struct{}
 	tlsReadyOnce    sync.Once
+	tlsMu           sync.RWMutex
 	tlsCertCallback TLSCertCallback
 	tlsReadyCh      chan struct{}
 	listenErrCh     chan error
 	childDoneCh     chan error
 }
 
+func (r *runtimeState) Status() string {
+	return r.status.Load().(string)
+}
+
+// NotifyStarting records that enclave state is available.
+func (r *runtimeState) NotifyStarting() {
+	r.status.CompareAndSwap(runtimeStatusCandidate, runtimeStatusStarting)
+}
+
 func (r *runtimeState) Ready() bool {
-	return r.isReady.Load()
+	return r.Status() == runtimeStatusReady
 }
 
 func (r *runtimeState) NotifyReady() {
-	r.isReady.Store(true)
-}
-
-func (r *runtimeState) NotifyHalt() {
-	r.rollbackHalt.Store(true)
-	r.haltOnce.Do(func() {
-		close(r.haltCh)
-	})
-}
-
-func (r *runtimeState) Halt() <-chan struct{} {
-	return r.haltCh
-}
-
-func (r *runtimeState) Halted() bool {
-	return r.rollbackHalt.Load()
+	r.status.Store(runtimeStatusReady)
 }
 
 func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
@@ -326,16 +318,23 @@ func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
 	}
 }
 
+// SetTLSCertCallback replaces the certificate source. Run calls it twice: a
+// throwaway certificate while the enclave is a candidate, then the real one once
+// state is established. Every call swaps the callback, which each handshake reads
+// afresh; only the first unblocks handshakes waiting for one, so it is not a Once.
 func (r *runtimeState) SetTLSCertCallback(cb TLSCertCallback) {
-	r.tlsReadyOnce.Do(func() {
-		r.tlsCertCallback = cb
-		close(r.tlsReadyCh)
-	})
+	r.tlsMu.Lock()
+	r.tlsCertCallback = cb
+	r.tlsMu.Unlock()
+
+	r.tlsReadyOnce.Do(func() { close(r.tlsReadyCh) })
 }
 
 func (r *runtimeState) GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error) {
 	select {
 	case <-r.tlsReadyCh:
+		r.tlsMu.RLock()
+		defer r.tlsMu.RUnlock()
 		return r.tlsCertCallback, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -363,10 +362,11 @@ func (r *runtimeState) ChildDone() <-chan error {
 }
 
 func newRuntimeState() *runtimeState {
-	return &runtimeState{
-		haltCh:      make(chan struct{}),
+	r := &runtimeState{
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),
 	}
+	r.status.Store(runtimeStatusCandidate)
+	return r
 }

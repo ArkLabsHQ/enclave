@@ -41,6 +41,7 @@ type certBundle struct {
 }
 
 type certStore struct {
+	cfg    *Config
 	s3     S3API
 	dek    DEK
 	key    crypto.Signer
@@ -54,9 +55,12 @@ const (
 	selfSignedStoragePrefix = "data/self-signed/"
 )
 
-func newCertStore(s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string) *certStore {
+func newCertStore(
+	cfg *Config, s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string,
+) *certStore {
 	return &certStore{
-		s3: s3api, dek: dek, key: key, bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
+		cfg: cfg, s3: s3api, dek: dek, key: key,
+		bucket: bucket, fqdn: fqdn, prefix: acmeStoragePrefix,
 	}
 }
 
@@ -64,9 +68,9 @@ func newCertStore(s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string) 
 // one. Nothing in a stored bundle records who issued it, so a shared key would
 // let an ACME manager adopt a self-signed certificate and never order.
 func newSelfSignedCertStore(
-	s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string,
+	cfg *Config, s3api S3API, dek DEK, key crypto.Signer, bucket, fqdn string,
 ) *certStore {
-	store := newCertStore(s3api, dek, key, bucket, fqdn)
+	store := newCertStore(cfg, s3api, dek, key, bucket, fqdn)
 	store.prefix = selfSignedStoragePrefix
 	return store
 }
@@ -152,11 +156,11 @@ func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, 
 }
 
 func (c *certStore) certObjectKey() string {
-	return objectKeyFor(c.prefix, c.fqdn+"/cert")
+	return objectKeyFor(c.cfg, c.prefix, c.fqdn+"/cert")
 }
 
 func (c *certStore) accountObjectKey() string {
-	return objectKeyFor(acmeStoragePrefix, "account.key")
+	return objectKeyFor(c.cfg, acmeStoragePrefix, "account.key")
 }
 
 // loadAccountKey returns the fleet-shared ACME account key, or nil if unset.
@@ -274,6 +278,6 @@ func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
 	return nil
 }
 
-func objectKeyFor(prefix, name string) string {
-	return getDeployment() + "/" + getAppName() + "/" + prefix + name
+func objectKeyFor(cfg *Config, prefix, name string) string {
+	return cfg.Deployment + "/" + cfg.AppName + "/" + prefix + name
 }

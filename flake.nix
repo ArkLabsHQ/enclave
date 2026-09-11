@@ -44,7 +44,7 @@
                 version = "0.1.0";
                 src = ./runtime;
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-npi7g0YtHbxtOeYHOQ8aExneTUU65jsWYCpFrS51hxU=";
+                vendorHash = "sha256-pH8Zenr0PwCWW1V/uvMY/BycokHdlq38uIUiHiYLSrk=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"

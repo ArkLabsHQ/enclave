@@ -12,7 +12,7 @@ let
     pname = "testapp";
     version = "0.1.0";
     src = ./test-app;
-    vendorHash = null;
+    vendorHash = "sha256-8FrG/O0buFies3nVPhnfLnG7mSUi9XjClpcQ7OBPmlg=";
     env.CGO_ENABLED = "0";
   };
 
@@ -27,14 +27,14 @@ let
 
   ministack = pkgs.python3Packages.buildPythonApplication rec {
     pname = "ministack";
-    version = "1.4.6";
+    version = "1.4.16";
     pyproject = true;
 
     src = pkgs.fetchFromGitHub {
       owner = "ministackorg";
       repo = "ministack";
       tag = "v${version}";
-      hash = "sha256-6BUczgfnrSRcFpzmcStvOIIsULjqphGqqWPJZRQHNuU=";
+      hash = "sha256-hqvlrhi/JLV3JCDXsQPmsWA+um/q/GsB/zwtFodxxj0=";
     };
 
     build-system = with pkgs.python3Packages; [
@@ -198,13 +198,13 @@ let
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
-    ENCLAVE_APP_NAME = "testapp";
-    ENCLAVE_AWS_REGION = "us-east-1";
-    ENCLAVE_KMS_KEY_LOCKED = "false";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
+    ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
     ENCLAVE_MIGRATION_COOLDOWN = "2s";
-    ENCLAVE_MIGRATION_INTENT_RETENTION = "1h";
-    ENCLAVE_NITRIDING_UPSTREAM = "h1";
-    ENCLAVE_LOG_CLOUDWATCH = "false";
+    ENCLAVE_APP_NAME = "testapp";
+    ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
+    ENCLAVE_AWS_REGION = "us-east-1";
+    ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";
@@ -216,6 +216,7 @@ let
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -226,6 +227,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 
@@ -353,19 +355,6 @@ let
         serviceConfig = {
           Type = "simple";
           ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:8002,fork TCP:169.254.169.254:80";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
-      systemd.services.migration-proxy = {
-        description = "Migration control proxy";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8003,bind=127.0.0.1,fork,reuseaddr VSOCK-CONNECT:1:8003";
           Restart = "always";
           RestartSec = 5;
         };
@@ -549,6 +538,8 @@ in
           GREEN_PCR0 = ${builtins.toJSON greenPCR0}
           AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
         ''
+        + builtins.readFile ./helpers.py
+        + "\n"
         + builtins.readFile ./e2e.py;
     };
   };

@@ -56,18 +56,7 @@ const (
 
 	clockSyncRetryInterval  = 10 * time.Second
 	clockSyncFailureTimeout = 10 * time.Minute
-
-	// 5 min matches Evervault's /dev/ptp0 sync cadence:
-	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
-	clockSyncPollInterval = 5 * time.Minute
 )
-
-func clockPollInterval() time.Duration {
-	if IsDev() {
-		return 5 * time.Second
-	}
-	return clockSyncPollInterval
-}
 
 // offsetMeasurement is one PHC/REALTIME comparison.
 type offsetMeasurement struct {
@@ -108,8 +97,8 @@ type clockSyncer struct {
 	lastXMonoNs int64
 }
 
-func StartClockSyncer(ctx context.Context) (context.Context, error) {
-	if verifyClockSourceEnabled() {
+func StartClockSyncer(ctx context.Context, cfg *Config) (context.Context, error) {
+	if cfg.VerifyClockSource {
 		data, err := os.ReadFile(clockSourcePath)
 		if err != nil {
 			return nil, fmt.Errorf("read current clocksource: %w", err)
@@ -123,7 +112,7 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 		}
 	}
 
-	cs, err := newClockSyncer()
+	cs, err := newClockSyncer(cfg.ClockSyncInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +124,7 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 	return runCtx, nil
 }
 
-func newClockSyncer() (*clockSyncer, error) {
+func newClockSyncer(pollInterval time.Duration) (*clockSyncer, error) {
 	file, err := openPTPDevice()
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", ptpDevicePath, err)
@@ -171,7 +160,7 @@ func newClockSyncer() (*clockSyncer, error) {
 		file:           file,
 		fd:             int(file.Fd()),
 		lastXMonoNs:    unix.TimespecToNsec(mono),
-		interval:       clockPollInterval(),
+		interval:       pollInterval,
 		retryInterval:  clockSyncRetryInterval,
 		failureTimeout: clockSyncFailureTimeout,
 		cfg:            defaultServoConfig(),

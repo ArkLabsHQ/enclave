@@ -47,11 +47,10 @@ func WithUserData(userData []byte) BuildAttestationOption {
 }
 
 type NSM interface {
-	VerifyAttestation(
+	VerifyAttestationDocument(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
-		expectedUserData []byte,
-	) error
+	) (*nitrite.Result, error)
 	BuildAttestationDocument(opts ...BuildAttestationOption) ([]byte, *rsa.PrivateKey, error)
 	LockPCR(index uint) error
 	ExtendPCR(index uint, data []byte) error
@@ -93,38 +92,35 @@ func NewNSM(opts ...VerifyAttestationOption) NSM {
 	return &nsmW{nsm: &awsNSM{unsigned: vao.unsigned, roots: vao.roots}}
 }
 
-func (n *nsmW) VerifyAttestation(
+// VerifyAttestationDocument checks the document's signature chain and that it
+// carries expectedPCRs, and returns the verified document.
+func (n *nsmW) VerifyAttestationDocument(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,
-	expectedUserData []byte,
-) error {
+) (*nitrite.Result, error) {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
-		return fmt.Errorf("decode attestation base64: %w", err)
+		return nil, fmt.Errorf("decode attestation base64: %w", err)
 	}
 
 	result, err := n.nsm.VerifyAttestationSig(attestDoc)
 	if err != nil {
-		return fmt.Errorf("verify predecessor attestation: %w", err)
+		return nil, fmt.Errorf("verify predecessor attestation: %w", err)
 	}
 
 	for index, expected := range expectedPCRs {
 		attestedPCR, ok := result.Document.PCRs[index]
 		if !ok {
-			return fmt.Errorf("PCR%d not found in attestation document", index)
+			return nil, fmt.Errorf("PCR%d not found in attestation document", index)
 		}
 		attestedPCRHex := hex.EncodeToString(attestedPCR)
 		if !strings.EqualFold(attestedPCRHex, expected) {
-			return fmt.Errorf("attested PCR%d does not match expected: %s != %s",
+			return nil, fmt.Errorf("attested PCR%d does not match expected: %s != %s",
 				index, attestedPCRHex, expected)
 		}
 	}
 
-	if !bytes.Equal(result.Document.UserData, expectedUserData) {
-		return fmt.Errorf("attested user data does not match expected user data")
-	}
-
-	return nil
+	return result, nil
 }
 
 func (n *nsmW) BuildAttestationDocument(
@@ -405,8 +401,7 @@ func (n *awsNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
 	}
 
 	if n.unsigned {
-		slog.Warn("INSECURE: skipping COSE signature verification of attestation document",
-			"deployment", getDeployment())
+		slog.Warn("INSECURE: skipping COSE signature verification of attestation document")
 		return &nitrite.Result{
 			Document:    &document,
 			Protected:   envelope.Protected,

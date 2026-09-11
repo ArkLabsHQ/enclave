@@ -3,18 +3,13 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
-	"strconv"
-	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -24,109 +19,42 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Tracing owns the span buffer and optional CloudWatch shipper.
+// Tracing accepts application spans and ships them to CloudWatch. Like Logging
+// it keeps no queryable history.
 type Tracing struct {
-	buf    *spanBuffer
-	shipCh chan spanEntry
-	cw     CloudWatchLogsAPI
+	telemetry *Telemetry
+	provider  *sdktrace.TracerProvider
 }
 
-// NewTracing sends supervisor spans to the local span buffer.
-func NewTracing(cw CloudWatchLogsAPI) *Tracing {
-	t := &Tracing{
-		buf: newSpanBuffer(spanBufferSize()),
-	}
+// NewTracing wires the enclave's own spans to the supervisor trace stream.
+func NewTracing(telemetry *Telemetry) *Tracing {
+	t := &Tracing{telemetry: telemetry}
 
-	if cloudwatchLogsEnabled() {
-		t.cw = cw
-		t.shipCh = make(chan spanEntry, 1000)
-	}
-
-	exporter := &bufferSpanExporter{buf: t.buf, shipCh: t.shipCh}
-	otel.SetTracerProvider(sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+	t.provider = sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(&streamSpanExporter{telemetry: telemetry}),
 		sdktrace.WithResource(nil),
-	))
+	)
+	otel.SetTracerProvider(t.provider)
 
 	return t
+}
+
+// Shutdown flushes the SDK's batcher. Spans sit in it until then, so without
+// this the last spans of a run never reach the exporter at all.
+func (t *Tracing) Shutdown(ctx context.Context) {
+	if t.provider == nil {
+		return
+	}
+	if err := t.provider.Shutdown(ctx); err != nil {
+		slog.Warn("tracer provider shutdown", "error", err)
+	}
 }
 
 func (t *Tracing) Span(ctx context.Context, name string) (context.Context, trace.Span) {
 	return otel.GetTracerProvider().Tracer("runtime").Start(ctx, name)
 }
 
-// StartCloudWatchExport ships span batches to CloudWatch; no-op when disabled.
-func (t *Tracing) StartCloudWatchExport(ctx context.Context) error {
-	if t.shipCh == nil {
-		return nil
-	}
-	deployment := getDeployment()
-	appName := getAppName()
-	logGroup := fmt.Sprintf("/enclave/%s/%s/traces", deployment, appName)
-	logStream := time.Now().UTC().Format("2006-01-02T15-04-05Z")
-
-	if err := ensureLogGroupAndStream(ctx, t.cw, logGroup, logStream); err != nil {
-		return err
-	}
-
-	var batch []cwltypes.InputLogEvent
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		sort.Slice(batch, func(i, j int) bool {
-			return *batch[i].Timestamp < *batch[j].Timestamp
-		})
-		_, err := t.cw.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
-			LogGroupName:  aws.String(logGroup),
-			LogStreamName: aws.String(logStream),
-			LogEvents:     batch,
-		})
-		if err != nil {
-			slog.Warn("span shipper: PutLogEvents failed", "error", err, "count", len(batch))
-			return
-		}
-		batch = nil
-	}
-
-	go func() {
-		ticker := time.NewTicker(logShipInterval())
-		defer ticker.Stop()
-		slog.Info("span shipper started", "log_group", logGroup, "log_stream", logStream)
-
-		for {
-			select {
-			case <-ctx.Done():
-				flush()
-				return
-			case entry, ok := <-t.shipCh:
-				if !ok {
-					flush()
-					return
-				}
-				msg, _ := json.Marshal(entry)
-				ts := time.Now().UnixMilli()
-				if tt, err := time.Parse(time.RFC3339Nano, entry.Start); err == nil {
-					ts = tt.UnixMilli()
-				}
-				batch = append(batch, cwltypes.InputLogEvent{
-					Message:   aws.String(string(msg)),
-					Timestamp: aws.Int64(ts),
-				})
-				if len(batch) >= 100 {
-					flush()
-				}
-			case <-ticker.C:
-				flush()
-			}
-		}
-	}()
-
-	return nil
-}
-
-// spanEntry is a single trace span from the app or supervisor.
+// spanEntry is a single trace span from the enclave or the app.
 type spanEntry struct {
 	ID         string         `json:"id"`
 	TraceID    string         `json:"trace_id"`
@@ -136,74 +64,24 @@ type spanEntry struct {
 	End        string         `json:"end"`
 	Status     string         `json:"status"` // "ok", "error", "unset"
 	Attributes map[string]any `json:"attributes,omitempty"`
-	Source     string         `json:"source"` // "app" or "supervisor"
+	Source     string         `json:"source"` // "app" or "enclave"
+	Resource   map[string]any `json:"-"`
 }
 
-// spanBuffer is a bounded ring buffer for span entries.
-type spanBuffer struct {
-	mu      sync.Mutex
-	entries []spanEntry
-	cap     int
-	head    int
-	count   int
-}
-
-func newSpanBuffer(capacity int) *spanBuffer {
-	if capacity <= 0 {
-		capacity = 1000
-	}
-	return &spanBuffer{
-		entries: make([]spanEntry, capacity),
-		cap:     capacity,
-	}
-}
-
-// add appends spans, evicting oldest.
-func (sb *spanBuffer) add(entries ...spanEntry) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	for _, e := range entries {
-		sb.entries[sb.head] = e
-		sb.head = (sb.head + 1) % sb.cap
-		if sb.count < sb.cap {
-			sb.count++
+func (e spanEntry) MarshalJSON() ([]byte, error) {
+	type alias spanEntry
+	out := alias(e)
+	if len(e.Resource) > 0 {
+		merged := make(map[string]any, len(e.Resource)+len(e.Attributes))
+		for k, v := range e.Resource {
+			merged[k] = v
 		}
-	}
-}
-
-// query filters spans oldest-first.
-func (sb *spanBuffer) query(since time.Time, service string, limit int) []spanEntry {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-
-	start := 0
-	if sb.count == sb.cap {
-		start = sb.head
-	}
-
-	result := make([]spanEntry, 0, sb.count)
-	for i := 0; i < sb.count; i++ {
-		idx := (start + i) % sb.cap
-		e := sb.entries[idx]
-
-		if !since.IsZero() {
-			if t, err := time.Parse(time.RFC3339Nano, e.Start); err == nil {
-				if t.Before(since) {
-					continue
-				}
-			}
+		for k, v := range e.Attributes {
+			merged[k] = v
 		}
-
-		if service != "" && e.Source != service {
-			continue
-		}
-
-		result = append(result, e)
-		if limit > 0 && len(result) >= limit {
-			break
-		}
+		out.Attributes = merged
 	}
-	return result
+	return json.Marshal(out)
 }
 
 // HandleTracingPost accepts OTLP protobuf spans.
@@ -219,60 +97,26 @@ func HandleTracingPost(t *Tracing) http.HandlerFunc {
 		}
 
 		entries, err := parseOTLPSpans(data)
+		if errors.Is(err, errTooManyRecords) {
+			http.Error(w, jsonError(err.Error()), http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err != nil {
 			http.Error(
 				w,
-				fmt.Sprintf(`{"error":"parse OTLP traces: %s"}`, err),
+				jsonError("parse OTLP traces: "+err.Error()),
 				http.StatusBadRequest,
 			)
 			return
 		}
 
-		t.buf.add(entries...)
-
-		if t.shipCh != nil {
-			for _, entry := range entries {
-				select {
-				case t.shipCh <- entry:
-				default:
-				}
-			}
+		for _, entry := range entries {
+			t.telemetry.Send(signalAppTraces, entryTime(entry.Start), entry)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]int{"accepted": len(entries)})
-	}
-}
-
-// HandleTracingGet returns buffered spans.
-// GET /enclave/v1/traces externally; GET /v1/traces on the internal listener.
-func HandleTracingGet(t *Tracing) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var since time.Time
-		if s := r.URL.Query().Get("since"); s != "" {
-			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				since = t
-			} else if t, err := time.Parse(time.RFC3339, s); err == nil {
-				since = t
-			}
-		}
-
-		service := r.URL.Query().Get("service")
-		limit := 0
-		if l := r.URL.Query().Get("limit"); l != "" {
-			if n, err := strconv.Atoi(l); err == nil && n > 0 {
-				limit = n
-			}
-		}
-
-		entries := t.buf.query(since, service, limit)
-		if entries == nil {
-			entries = []spanEntry{}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(entries)
 	}
 }
 
@@ -283,7 +127,18 @@ func parseOTLPSpans(body []byte) ([]spanEntry, error) {
 		return nil, fmt.Errorf("unmarshal OTLP traces: %w", err)
 	}
 
-	var entries []spanEntry
+	total := 0
+	for _, rs := range req.ResourceSpans {
+		for _, ss := range rs.ScopeSpans {
+			total += len(ss.Spans)
+		}
+	}
+	if total > maxOTLPRecords {
+		return nil, fmt.Errorf("%w: %d spans, limit %d",
+			errTooManyRecords, total, maxOTLPRecords)
+	}
+
+	entries := make([]spanEntry, 0, total)
 	for _, rs := range req.ResourceSpans {
 		resourceAttrs := make(map[string]any)
 		if rs.Resource != nil {
@@ -302,10 +157,7 @@ func parseOTLPSpans(body []byte) ([]spanEntry, error) {
 }
 
 func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) spanEntry {
-	attrs := make(map[string]any, len(resourceAttrs)+len(span.Attributes))
-	for k, v := range resourceAttrs {
-		attrs[k] = v
-	}
+	attrs := make(map[string]any, len(span.Attributes))
 	for _, kv := range span.Attributes {
 		attrs[kv.Key] = anyValueToGo(kv.Value)
 	}
@@ -335,30 +187,25 @@ func spanToEntry(span *tracepb.Span, resourceAttrs map[string]any) spanEntry {
 		Status:     status,
 		Attributes: attrsResult,
 		Source:     "app",
+		Resource:   resourceAttrs,
 	}
 }
 
-// bufferSpanExporter writes supervisor spans to the local buffer.
-type bufferSpanExporter struct {
-	buf    *spanBuffer
-	shipCh chan spanEntry
+// streamSpanExporter ships the enclave's own spans to their own log group. No
+// propagator carries trace context into the app, so no trace spans both sources.
+type streamSpanExporter struct {
+	telemetry *Telemetry
 }
 
-func (e *bufferSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+func (e *streamSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
 	for _, s := range spans {
 		entry := readOnlySpanToEntry(s)
-		e.buf.add(entry)
-		if e.shipCh != nil {
-			select {
-			case e.shipCh <- entry:
-			default:
-			}
-		}
+		e.telemetry.Send(signalSupervisorTraces, s.StartTime(), entry)
 	}
 	return nil
 }
 
-func (e *bufferSpanExporter) Shutdown(_ context.Context) error {
+func (e *streamSpanExporter) Shutdown(_ context.Context) error {
 	return nil
 }
 
@@ -394,6 +241,6 @@ func readOnlySpanToEntry(s sdktrace.ReadOnlySpan) spanEntry {
 		End:        s.EndTime().UTC().Format(time.RFC3339Nano),
 		Status:     status,
 		Attributes: attrsResult,
-		Source:     "supervisor",
+		Source:     "enclave",
 	}
 }

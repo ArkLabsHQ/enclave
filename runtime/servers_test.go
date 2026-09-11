@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,45 +16,28 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
 )
 
-type migrationControlCall struct {
-	action     string
-	targetPCR0 string
-}
-
 type migrationControlMigrator struct {
-	requestStatus *MigrationStatus
-	requestErr    error
-	requestCalls  []migrationControlCall
-	complete      *CompleteMigrationResult
-	completeErr   error
-	previous      *PreviousPCR0Info
-	previousErr   error
-	status        *MigrationStatus
-	statusErr     error
+	previous     *PreviousPCR0Info
+	previousErr  error
+	status       *MigrationStatus
+	statusErr    error
+	candidate    *CandidateInfo
+	candidateErr error
 }
 
-func (m *migrationControlMigrator) HandleMigrationRequest(
-	_ context.Context,
-	action, targetPCR0 string,
-) (*MigrationStatus, error) {
-	m.requestCalls = append(
-		m.requestCalls,
-		migrationControlCall{action: action, targetPCR0: targetPCR0},
-	)
-	return m.requestStatus, m.requestErr
+func (m *migrationControlMigrator) RunPredecessorHandoff(
+	context.Context, PrimaryKMS, DEK, []StaticSecret, crypto.Signer,
+) {
 }
 
-func (m *migrationControlMigrator) CompleteMigration(
-	_ context.Context,
-) (*CompleteMigrationResult, error) {
-	return m.complete, m.completeErr
-}
+func (m *migrationControlMigrator) AwaitCandidateHandoff(context.Context) error { return nil }
 
 func (m *migrationControlMigrator) PreviousPCR0Info(context.Context) (*PreviousPCR0Info, error) {
 	return m.previous, m.previousErr
@@ -63,40 +47,13 @@ func (m *migrationControlMigrator) MigrationStatus(context.Context) (*MigrationS
 	return m.status, m.statusErr
 }
 
-type blockingListener struct {
-	acceptStarted chan struct{}
-	closed        chan struct{}
+func (m *migrationControlMigrator) CandidateInfo(context.Context) (*CandidateInfo, error) {
+	return m.candidate, m.candidateErr
 }
 
-func newBlockingListener() *blockingListener {
-	return &blockingListener{acceptStarted: make(chan struct{}, 1), closed: make(chan struct{})}
+func (m *migrationControlMigrator) MigrationIntentBucket() string {
+	return migrationIntentTestBucket
 }
-
-func (l *blockingListener) Accept() (net.Conn, error) {
-	select {
-	case l.acceptStarted <- struct{}{}:
-	default:
-	}
-	<-l.closed
-	return nil, net.ErrClosed
-}
-
-func (l *blockingListener) Close() error {
-	select {
-	case <-l.closed:
-	default:
-		close(l.closed)
-	}
-	return nil
-}
-
-func (l *blockingListener) Addr() net.Addr { return &net.TCPAddr{} }
-
-type failingListener struct{ err error }
-
-func (l failingListener) Accept() (net.Conn, error) { return nil, l.err }
-func (failingListener) Close() error                { return nil }
-func (failingListener) Addr() net.Addr              { return &net.TCPAddr{} }
 
 func TestServersStartReturnsBindErrors(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
@@ -105,6 +62,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 
 	t.Run("private", func(t *testing.T) {
 		s := &servers{
+			cfg: testCfg,
 			int: &http.Server{Addr: occupied.Addr().String()},
 			ext: &http.Server{},
 			rt:  newRuntimeState(),
@@ -120,6 +78,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 			defer func() { _ = ipv6.Close() }()
 		}
 		s := &servers{
+			cfg: testCfg,
 			int: &http.Server{Addr: "127.0.0.1:0"},
 			ext: &http.Server{},
 			rt:  newRuntimeState(),
@@ -290,206 +249,216 @@ func TestAttestationHandler(t *testing.T) {
 	})
 }
 
-func TestMigrationControlHandler(t *testing.T) {
-	targetPCR0 := strings.Repeat("ab", 48)
-
-	t.Run("request", func(t *testing.T) {
-		status := &MigrationStatus{State: migrationStateCoolingDown, TargetPCR0: targetPCR0}
-		migrator := &migrationControlMigrator{requestStatus: status}
-		body, err := json.Marshal(MigrationRequest{
-			Action: migrationIntentRequested, TargetPCR0: targetPCR0,
-		})
-		require.NoError(t, err)
-
-		rr := httptest.NewRecorder()
-		migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-			http.MethodPost, migrationRequestPath, bytes.NewReader(body),
-		))
-
-		require.Equal(t, http.StatusOK, rr.Code)
-		require.JSONEq(
-			t,
-			`{"state":"cooling_down","target_pcr0":"`+targetPCR0+`","remaining_seconds":0}`,
-			rr.Body.String(),
-		)
-		require.Equal(t, []migrationControlCall{{
-			action: migrationIntentRequested, targetPCR0: targetPCR0,
-		}}, migrator.requestCalls)
-	})
-
-	t.Run("finalise", func(t *testing.T) {
-		result := &CompleteMigrationResult{
-			PCR0: strings.Repeat("cd", 48), Exported: []string{"secret"},
-		}
-		migrator := &migrationControlMigrator{complete: result}
-
-		rr := httptest.NewRecorder()
-		migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-			http.MethodPost, migrationFinalisationPath, nil,
-		))
-
-		require.Equal(t, http.StatusOK, rr.Code)
-		want, err := json.Marshal(result)
-		require.NoError(t, err)
-		require.JSONEq(t, string(want), rr.Body.String())
-	})
-}
-
-func TestMigrationControlHandlerMapsErrors(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-		code int
-	}{
-		{name: "cooldown active", err: errMigrationCooldownActive, code: http.StatusTooEarly},
-		{name: "intent absent", err: errMigrationIntentAbsent, code: http.StatusConflict},
-		{name: "intent aborted", err: errMigrationIntentAborted, code: http.StatusConflict},
-		{name: "intent already requested", err: errMigrationIntentAlreadyRequested, code: http.StatusConflict},
-		{name: "store unavailable", err: errMigrationIntentStoreUnavailable, code: http.StatusServiceUnavailable},
-		{name: "unexpected", err: errors.New("unexpected"), code: http.StatusInternalServerError},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			migrator := &migrationControlMigrator{
-				completeErr: fmt.Errorf("wrapped migration error: %w", tc.err),
-			}
-			rr := httptest.NewRecorder()
-			migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-				http.MethodPost, migrationFinalisationPath, nil,
-			))
-
-			require.Equal(t, tc.code, rr.Code)
-			require.Contains(t, rr.Body.String(), tc.err.Error())
-		})
-	}
-}
-
-func TestMigrationControlHandlerRejectsInvalidRequests(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		path string
-		body string
-	}{
-		{name: "malformed request", path: migrationRequestPath, body: "{"},
-		{name: "missing request target", path: migrationRequestPath, body: `{"action":"requested"}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			migrator := &migrationControlMigrator{}
-			rr := httptest.NewRecorder()
-			migrationControlHandler(migrator).ServeHTTP(rr, httptest.NewRequest(
-				http.MethodPost, tc.path, strings.NewReader(tc.body),
-			))
-
-			require.Equal(t, http.StatusBadRequest, rr.Code)
-			require.Empty(t, migrator.requestCalls)
-		})
-	}
-}
-
-func TestMigrationControlHandlerExposesOnlyControlRoutes(t *testing.T) {
-	handler := migrationControlHandler(&migrationControlMigrator{})
-	for _, tc := range []struct {
-		method string
-		path   string
-		code   int
-	}{
-		{method: http.MethodGet, path: migrationRequestPath, code: http.StatusMethodNotAllowed},
-		{method: http.MethodGet, path: migrationFinalisationPath, code: http.StatusMethodNotAllowed},
-		{method: http.MethodGet, path: "/enclave/v1/info", code: http.StatusNotFound},
-		{method: http.MethodGet, path: "/health", code: http.StatusNotFound},
-		{method: http.MethodPost, path: "/unknown", code: http.StatusNotFound},
-	} {
-		rr := httptest.NewRecorder()
-		handler.ServeHTTP(rr, httptest.NewRequest(tc.method, tc.path, nil))
-		require.Equal(t, tc.code, rr.Code, "%s %s", tc.method, tc.path)
-	}
-}
-
-func TestMigrationControlServerLifecycle(t *testing.T) {
-	t.Run("closes listener with context", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		listener := newBlockingListener()
-		rt := newRuntimeState()
-		s := &servers{rt: rt}
-		s.serveMigrationControl(ctx, &migrationControlMigrator{}, listener)
-
-		waitTestSignal(t, listener.acceptStarted)
-		cancel()
-		waitTestSignal(t, listener.closed)
-	})
-
-	t.Run("reports listener failure", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		rt := newRuntimeState()
-		s := &servers{rt: rt}
-		s.serveMigrationControl(
-			ctx,
-			&migrationControlMigrator{},
-			failingListener{err: errors.New("accept failed")},
-		)
-
-		err := waitTestResult(t, rt.ListenError())
-		require.ErrorContains(t, err, "accept failed")
-	})
-}
-
 func TestConfigureEnclaveInfoHandler(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "2m")
-	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", "87600h")
-	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
-
 	ctx := context.Background()
+	ownPCR0 := strings.Repeat("ab", 48)
 	ssm := NewSSM(&fakeSSM{params: map[string]string{
-		migrationPreviousPCR0Param():            "previous",
-		migrationPreviousPCR0AttestationParam(): "attestation",
+		testCfg.migrationPreviousPCR0Param(ownPCR0):            "previous",
+		testCfg.migrationPreviousPCR0AttestationParam(ownPCR0): "attestation",
 	}})
 	rt := newRuntimeState()
-	metrics := NewMetrics()
-	s := &servers{rm: http.NewServeMux(), rt: rt, metrics: metrics}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
 	})}}
-	migrator, err := NewMigrator(
-		nsm, nil, ssm, newFakeS3(), nil, nil,
-		newTestTLSKey(t), migrationIntentTestBucket,
-	)
+	migrator, err := NewMigrator(testCfg, nsm, ssm, newFakeS3(), migrationIntentTestBucket)
 	require.NoError(t, err)
 
-	err = s.ConfigureEnclaveInfoHandler(ctx, migrator, ssm)
-	require.NoError(t, err)
+	ancestry := &stubAncestry{snap: &AncestryInfo{
+		Generations: []AncestorGeneration{{
+			PCR0:  strings.Repeat("cd", 48),
+			KeyID: "key-1",
+			State: keyStateDeleted,
+		}},
+		Complete:  true,
+		CheckedAt: &ancestryTestCheckedAt,
+	}}
+
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+
+	serve := func(t *testing.T) []byte {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+		return rr.Body.Bytes()
+	}
+	want := func(t *testing.T, status string, ancestryInfo *AncestryInfo) string {
+		t.Helper()
+		body, err := json.Marshal(RuntimeInfo{
+			Version:                  Version,
+			Status:                   status,
+			PreviousPCR0:             "previous",
+			PreviousPCR0Attestation:  "attestation",
+			MigrationCooldownSeconds: int(testCfg.MigrationCooldown.Seconds()),
+			MigrationIntentBucket:    migrationIntentTestBucket,
+			Migration: &MigrationStatus{
+				State: migrationStateNone, SourcePCR0: strings.Repeat("ab", 48),
+			},
+			UpstreamApp:  rt.UpstreamAppInfo(),
+			KMSKeyLocked: testCfg.KMSLocked,
+			Ancestry:     ancestryInfo,
+		})
+		require.NoError(t, err)
+		return string(body)
+	}
+
+	// Candidates have no lineage to audit.
+	require.JSONEq(t, want(t, runtimeStatusCandidate, nil), string(serve(t)))
+
+	rt.NotifyStarting()
+	s.SetAncestry(ctx, ancestry)
+	require.True(t, ancestry.started, "setting the audit must start its refresh lifecycle")
+	require.JSONEq(t, want(t, runtimeStatusStarting, ancestry.snap), string(serve(t)))
+
+	rt.NotifyReady()
+	body := serve(t)
+	require.JSONEq(t, want(t, runtimeStatusReady, ancestry.snap), string(body))
+
+	var got map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.NotContains(t, got, "attestation_pubkey")
+}
+
+func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
+	requestedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	rt := newRuntimeState()
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
+	inbound := &CandidateInfo{
+		AwaitingHandoffFrom: strings.Repeat("ab", 48), RequestedAt: &requestedAt,
+	}
+	migrator := &migrationControlMigrator{
+		previous:  &PreviousPCR0Info{PCR0: "genesis"},
+		status:    &MigrationStatus{State: migrationStateNone},
+		candidate: inbound,
+	}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+
+	serve := func(t *testing.T) RuntimeInfo {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+		var got RuntimeInfo
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+		return got
+	}
+
+	got := serve(t)
+	require.Equal(t, runtimeStatusCandidate, got.Status)
+	require.Equal(t, inbound, got.Candidate)
+
+	// A candidate that cannot read the intent log is still a candidate.
+	migrator.candidate, migrator.candidateErr = nil, errors.New("s3 unavailable")
+	got = serve(t)
+	require.Equal(t, runtimeStatusCandidate, got.Status)
+	require.Nil(t, got.Candidate)
+
+	// Only candidates report inbound handoffs.
+	migrator.candidate, migrator.candidateErr = inbound, nil
+	rt.NotifyStarting()
+	got = serve(t)
+	require.Equal(t, runtimeStatusStarting, got.Status)
+	require.Nil(t, got.Candidate, "only a candidate reports an inbound handoff")
+}
+
+var ancestryTestCheckedAt = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+type stubAncestry struct {
+	snap    *AncestryInfo
+	started bool
+}
+
+func (s *stubAncestry) Start(context.Context) { s.started = true }
+
+func (s *stubAncestry) Snapshot() *AncestryInfo { return s.snap }
+
+// A caller that wires no audit must get no audit block, rather than an empty one
+// that reads as "every ancestor key is accounted for".
+func TestConfigureEnclaveInfoHandlerOmitsAncestryWhenUnset(t *testing.T) {
+	s, migrator := enclaveInfoTestServer(t)
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status: got %d, want %d", rr.Code, http.StatusOK)
-	}
-	want, err := json.Marshal(RuntimeInfo{
-		Version:                  Version,
-		PreviousPCR0:             "previous",
-		PreviousPCR0Attestation:  "attestation",
-		Metrics:                  metrics.MetricsSnapshot(),
-		MigrationCooldownSeconds: 120,
-		Migration: &MigrationStatus{
-			State: migrationStateNone, SourcePCR0: strings.Repeat("ab", 48),
-		},
-		UpstreamApp:  rt.UpstreamAppInfo(),
-		KMSKeyLocked: true,
-	})
-	require.NoError(t, err)
-	require.JSONEq(t, string(want), rr.Body.String())
-	var got map[string]json.RawMessage
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.NotContains(t, rr.Body.String(), "ancestry")
+}
+
+// A blind audit must still serve.
+func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
+	s, migrator := enclaveInfoTestServer(t)
+	ancestry := &stubAncestry{snap: &AncestryInfo{
+		Generations: []AncestorGeneration{{
+			PCR0:  strings.Repeat("cd", 48),
+			KeyID: "key-1",
+			State: keyStateUnknown,
+		}},
+		CheckedAt: &ancestryTestCheckedAt,
+	}}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+	s.SetAncestry(context.Background(), ancestry)
+
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), `"state":"unknown"`)
+	require.NotContains(t, rr.Body.String(), keyStateDeleted)
+}
+
+// A KMS that answers nothing must cost the endpoint nothing.
+func TestConfigureEnclaveInfoHandlerSurvivesABlindAudit(t *testing.T) {
+	s, migrator := enclaveInfoTestServer(t)
+	kms := newFakeKMS()
+	kms.describeErr = errors.New("kms unreachable")
+	p0, p1, p2 := ancestryPCR0(1), ancestryPCR0(2), ancestryPCR0(3)
+	fx := newAncestryFixture(
+		t, testSnapshot(p2, "key-2", p1, "key-1"), &kmsW{cfg: testCfg, kms: kms},
+	)
+	fx.storeOriginReceipt(t, testSnapshot(p1, "key-1", p0, "key-0"))
+	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
+	ancestry := fx.a
+	ancestry.refresh(context.Background())
+
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+	s.SetAncestry(context.Background(), ancestry)
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var got RuntimeInfo
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
-	require.NotContains(t, got, "attestation_pubkey")
+	require.Len(t, got.Ancestry.Generations, 2)
+	for _, gen := range got.Ancestry.Generations {
+		require.Equal(t, keyStateUnknown, gen.State)
+	}
+}
+
+func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
+	t.Helper()
+
+	s := &servers{
+		cfg: testCfg,
+		rm:  http.NewServeMux(),
+		rt:  newRuntimeState(),
+	}
+	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
+		0: bytes.Repeat([]byte{0xab}, 48),
+	})}}
+	migrator, err := NewMigrator(
+		testCfg, nsm, NewSSM(&fakeSSM{}), newFakeS3(), migrationIntentTestBucket,
+	)
+	require.NoError(t, err)
+	return s, migrator
 }
 
 func TestConfigureEnclaveInfoHandlerFailsClosedOnStatusError(t *testing.T) {
 	statusErr := fmt.Errorf("S3 unavailable: %w", errMigrationIntentStoreUnavailable)
-	s := &servers{rm: http.NewServeMux()}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux()}
 	migrator := &migrationControlMigrator{statusErr: statusErr}
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
@@ -527,26 +496,34 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	metrics := NewMetrics()
-
+	rt := newRuntimeState()
 	s := SetupHttpServers(
-		newRuntimeState(),
+		rt,
 		Config{AppWebSrv: appURL},
 		&nsmW{},
-		metrics,
-		NewLogging(metrics, nil),
-		NewTracing(nil),
+		NewTelemetry(testCfg, nil),
 		&AttestationHashes{},
 		"token",
 	).(*servers)
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(
-		context.Background(),
-		&migrationControlMigrator{
-			previous: &PreviousPCR0Info{},
-			status:   &MigrationStatus{},
-		},
-		nil,
-	))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
+		previous: &PreviousPCR0Info{},
+		status:   &MigrationStatus{},
+	}))
+
+	unavailable := func(t *testing.T) {
+		nonce := strings.Repeat("ab", nonceNumDigits/2)
+		for _, path := range []string{"/anything", "/enclave/attestation?nonce=" + nonce} {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			require.Equal(t, http.StatusServiceUnavailable, rr.Code, path)
+		}
+		require.Empty(t, proxied, "nothing may be proxied before the app starts")
+	}
+	t.Run("a candidate serves no application and no attestation", unavailable)
+	rt.NotifyStarting()
+	t.Run("nor does a starting runtime", unavailable)
+
+	rt.NotifyReady()
 
 	t.Run("application routes reach the proxy", func(t *testing.T) {
 		for _, route := range []struct {
@@ -575,9 +552,13 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			status int
 		}{
 			{http.MethodGet, "/enclave/v1/info", http.StatusOK},
-			{http.MethodGet, "/enclave/v1/metrics", http.StatusOK},
-			{http.MethodGet, "/enclave/v1/logs", http.StatusOK},
-			{http.MethodGet, "/enclave/v1/traces", http.StatusOK},
+			// A ready request still requires a nonce.
+			{http.MethodGet, "/enclave/attestation", http.StatusBadRequest},
+			// Telemetry is ingest-only: it ships to CloudWatch and is never read
+			// back, so a compromised enclave has no history to serve.
+			{http.MethodGet, "/enclave/v1/metrics", http.StatusMethodNotAllowed},
+			{http.MethodGet, "/enclave/v1/logs", http.StatusMethodNotAllowed},
+			{http.MethodGet, "/enclave/v1/traces", http.StatusMethodNotAllowed},
 			{http.MethodPost, "/enclave/v1/metrics", http.StatusUnauthorized},
 			{http.MethodPost, "/enclave/v1/logs", http.StatusUnauthorized},
 			{http.MethodPost, "/enclave/v1/traces", http.StatusUnauthorized},

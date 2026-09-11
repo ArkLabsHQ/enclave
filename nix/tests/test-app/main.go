@@ -1,4 +1,7 @@
-// Minimal stdlib-only app for observing runtime env and testing clock recovery.
+// Test application for the e2e: it observes the runtime environment, exercises
+// clock recovery, and ships OTLP telemetry through the runtime's ingest
+// endpoints with the stock OpenTelemetry exporters.
+//
 // It is exec'd as a root child with CAP_SYS_TIME, so /test/clock can call
 // syscall.Settimeofday without adding a shell or other packages to the EIF.
 // offset_ms exists for sub-threshold (<100ms) skews that exercise the clock
@@ -6,17 +9,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
 	maxOffsetS  = 10
 	maxOffsetMs = 10_000
+
+	signingKeyEnv = "E2E_SIGNING_KEY"
 )
 
 type clockSample struct {
@@ -117,6 +128,34 @@ func handleClockSet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func observe(t *telemetry, route string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := t.tracer.Start(r.Context(), route)
+		defer span.End()
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next(rec, r.WithContext(ctx))
+
+		attrs := []attribute.KeyValue{
+			attribute.String("route", route),
+			attribute.Int("status", rec.status),
+		}
+		span.SetAttributes(attrs...)
+		t.requests.Add(ctx, 1, metric.WithAttributes(attrs...))
+		t.Log(ctx, otellog.SeverityInfo, "handled "+route, attrs...)
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -124,14 +163,39 @@ func main() {
 	}
 	addr := "127.0.0.1:" + port
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /test/health", handleHealth)
-	mux.HandleFunc("GET /test/env/{name}", handleEnv)
-	mux.HandleFunc("GET /test/clock", handleClockGet)
-	mux.HandleFunc("POST /test/clock", handleClockSet)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
+	tel, err := startTelemetry(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testapp: telemetry: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tel.Shutdown(flushCtx)
+	}()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /test/health", observe(tel, "health", handleHealth))
+	mux.HandleFunc("GET /test/env/{name}", observe(tel, "env", handleEnv))
+	mux.HandleFunc("GET /test/clock", observe(tel, "clock_get", handleClockGet))
+	mux.HandleFunc("POST /test/clock", observe(tel, "clock_set", handleClockSet))
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	tel.Log(ctx, otellog.SeverityInfo, "testapp started",
+		attribute.String("addr", addr))
 	fmt.Fprintf(os.Stderr, "testapp: serving on %s\n", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "testapp: %v\n", err)
 		os.Exit(1)
 	}

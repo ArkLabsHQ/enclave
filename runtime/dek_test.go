@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"testing"
@@ -85,4 +86,23 @@ func TestDEKOpenRejectsInvalidBlob(t *testing.T) {
 
 func testDEK() *dek {
 	return &dek{key: bytes.Repeat([]byte{0x42}, 32)}
+}
+
+func TestDEKExportKeyStoresExactlyWhatItReturns(t *testing.T) {
+	d := testDEK()
+	kmsf := newFakeKMS()
+	successor := &kmsW{
+		cfg:   testCfg,
+		nsm:   kmsTestNSMWithRecipient(t),
+		kms:   kmsf,
+		keyID: "successor-key",
+	}
+	ssmf := &fakeSSM{}
+
+	ciphertext, err := d.ExportKey(context.Background(), testCfg, successor, NewSSM(ssmf))
+
+	require.NoError(t, err)
+	require.NotEmpty(t, ciphertext)
+
+	require.Equal(t, ciphertext, ssmf.params[testCfg.storageDEKCiphertextParam("successor-key")])
 }

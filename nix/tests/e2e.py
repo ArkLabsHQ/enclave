@@ -225,11 +225,7 @@ def wait_for_shipped(group, needle, timeout=90):
 
 wait_for_shipped("logs", "handled health")
 wait_for_shipped("traces", '"name":"health"')
-# The app counter arrives as a cumulative OTLP sum, so the first shipping
-# interval only seeds its baseline and the delta appears from the second on.
 wait_for_shipped("metrics", "app_testapp_requests_total")
-# Without the extraction node CloudWatch stores the line as plain text and
-# creates no metric, which is the whole point of shipping EMF.
 wait_for_shipped("metrics", '"CloudWatchMetrics"')
 
 genesis_key = get_param(key_param(BLUE_PCR0))

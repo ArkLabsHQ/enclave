@@ -21,8 +21,6 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
-	// defaultMetricsNamespace is the CloudWatch namespace the extracted metrics
-	// appear under.
 	defaultMetricsNamespace = "Enclave"
 )
 

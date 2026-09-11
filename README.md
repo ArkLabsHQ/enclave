@@ -335,6 +335,31 @@ underscores. An app counter's first interval only establishes a baseline and
 ships nothing, so a late-connecting app cannot report its lifetime total as one
 spike. Past 100 metrics an interval splits across several documents.
 
+The `runtime_` prefix covers two scopes. `runtime_cpu_*` and `runtime_mem_*`
+come from `/proc` and describe the whole enclave, the application included.
+Everything else under that prefix — goroutines, heap, `sys_bytes`, `gc_*` — comes
+from the Go runtime and describes the enclave framework process alone, so it does
+not account for the application's memory.
+
+Counters materialise on first use rather than being registered at boot, so a
+metric that has never happened is absent rather than zero. On a healthy enclave
+`enclave_http_errors_total` and the `enclave_telemetry_*_dropped_total` counters
+never appear at all. Alarms on them need `notBreaching` for missing data, or they
+sit in `INSUFFICIENT_DATA` indefinitely.
+
+CPU utilisation has no single metric. Build it with metric math over the `SUM` of
+every `runtime_cpu_*` counter, which is why all eight are published:
+
+```
+100 * (user + nice + system + irq + softirq + steal) / (user + nice + system + idle + iowait + irq + softirq + steal)
+```
+
+The result is normalised across cores and is the enclave's utilisation of the
+vCPUs assigned to it, not the parent instance's. Memory follows the same shape:
+`100 * (mem_total_kb - mem_available_kb) / mem_total_kb`. Use `mem_available_kb`
+rather than `mem_free_kb`, which excludes reclaimable cache and reads alarmingly
+low on a healthy enclave.
+
 Events timestamped more than an hour from now, either direction, are dropped on
 arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS
 requires. The narrow timestamp window keeps normally produced batches well

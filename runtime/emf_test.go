@@ -85,6 +85,7 @@ func TestRuntimeKind(t *testing.T) {
 	counters := []string{
 		"gc_pause_total_ns", "gc_num_gc",
 		"cpu_user", "cpu_nice", "cpu_system", "cpu_idle",
+		"cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
 	}
 	for _, name := range counters {
 		t.Run(name+" accumulates", func(t *testing.T) {

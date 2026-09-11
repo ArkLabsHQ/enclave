@@ -219,7 +219,22 @@ func readProcCPU() (map[string]float64, error) {
 	if !scanner.Scan() {
 		return nil, fmt.Errorf("empty /proc/stat")
 	}
-	line := scanner.Text()
+	return parseProcCPU(scanner.Text())
+}
+
+// procCPUFields names the aggregate "cpu" line in order. Every one of them is a
+// slice of elapsed time, so utilisation is only correct when all are summed.
+// guest and guest_nice follow steal but are deliberately absent: the kernel
+// already counts them inside user and nice, and reading them would double up.
+var procCPUFields = []string{
+	"cpu_user", "cpu_nice", "cpu_system", "cpu_idle",
+	"cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
+}
+
+// parseProcCPU reads the aggregate CPU line of /proc/stat. It takes however
+// many counters the running kernel publishes, so an older one reporting fewer
+// still yields what it has.
+func parseProcCPU(line string) (map[string]float64, error) {
 	if !strings.HasPrefix(line, "cpu ") {
 		return nil, fmt.Errorf("unexpected /proc/stat format")
 	}
@@ -229,9 +244,11 @@ func readProcCPU() (map[string]float64, error) {
 		return nil, fmt.Errorf("too few fields in /proc/stat")
 	}
 
-	result := make(map[string]float64)
-	names := []string{"cpu_user", "cpu_nice", "cpu_system", "cpu_idle"}
-	for i, name := range names {
+	result := make(map[string]float64, len(procCPUFields))
+	for i, name := range procCPUFields {
+		if i+1 >= len(fields) {
+			break
+		}
 		if v, err := strconv.ParseFloat(fields[i+1], 64); err == nil {
 			result[name] = v
 		}

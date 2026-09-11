@@ -155,6 +155,60 @@ func TestReadProcCPU(t *testing.T) {
 	require.Contains(t, result, "cpu_idle")
 }
 
+func TestParseProcCPU(t *testing.T) {
+	t.Run("reads every field needed to account for elapsed time", func(t *testing.T) {
+		// user nice system idle iowait irq softirq steal guest guest_nice
+		line := "cpu  100 200 300 400 500 600 700 800 900 1000"
+
+		got, err := parseProcCPU(line)
+
+		require.NoError(t, err)
+		require.Equal(t, map[string]float64{
+			"cpu_user":    100,
+			"cpu_nice":    200,
+			"cpu_system":  300,
+			"cpu_idle":    400,
+			"cpu_iowait":  500,
+			"cpu_irq":     600,
+			"cpu_softirq": 700,
+			"cpu_steal":   800,
+		}, got)
+	})
+
+	t.Run("omits guest, already counted inside user and nice", func(t *testing.T) {
+		line := "cpu  100 200 300 400 500 600 700 800 900 1000"
+
+		got, err := parseProcCPU(line)
+
+		require.NoError(t, err)
+		require.NotContains(t, got, "cpu_guest")
+		require.NotContains(t, got, "cpu_guest_nice")
+	})
+
+	t.Run("takes what an older kernel offers without failing", func(t *testing.T) {
+		line := "cpu  100 200 300 400"
+
+		got, err := parseProcCPU(line)
+
+		require.NoError(t, err)
+		require.Len(t, got, 4)
+		require.Equal(t, float64(400), got["cpu_idle"])
+	})
+
+	t.Run("rejects a line too short to be useful", func(t *testing.T) {
+		_, err := parseProcCPU("cpu  100 200")
+
+		require.Error(t, err)
+	})
+
+	t.Run("rejects a line that is not the aggregate", func(t *testing.T) {
+		// cpu0 is one core. Reading it as the total would understate usage.
+		_, err := parseProcCPU("cpu0 100 200 300 400")
+
+		require.Error(t, err)
+	})
+}
+
 func TestReadProcMeminfo(t *testing.T) {
 	if _, err := os.Stat("/proc/meminfo"); err != nil {
 		t.Skipf("/proc/meminfo unavailable: %v", err)

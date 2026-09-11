@@ -203,6 +203,10 @@ var runtimeCounters = map[string]bool{
 	"cpu_nice":          true,
 	"cpu_system":        true,
 	"cpu_idle":          true,
+	"cpu_iowait":        true,
+	"cpu_irq":           true,
+	"cpu_softirq":       true,
+	"cpu_steal":         true,
 }
 
 // runtimeKind classifies a runtime or /proc reading. Unknown names default to

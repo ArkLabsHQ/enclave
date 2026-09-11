@@ -29,13 +29,16 @@ type Metrics struct {
 	mu       sync.Mutex
 	counters map[string]int64
 
-	// App metrics received via OTLP.
+	// App metrics received via OTLP, each keeping the semantics it arrived with.
 	appMu      sync.Mutex
-	appMetrics map[string]float64
+	appMetrics map[string]appMetricValue
 
 	// Runtime/proc metrics (updated periodically).
 	runtimeMu      sync.Mutex
 	runtimeMetrics map[string]float64
+
+	// Baselines for the per-interval deltas shipped to CloudWatch.
+	deltas *deltaTracker
 }
 
 // Enclave counter names, as they appear in the snapshot.
@@ -51,8 +54,9 @@ const (
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		counters:       make(map[string]int64),
-		appMetrics:     make(map[string]float64),
+		appMetrics:     make(map[string]appMetricValue),
 		runtimeMetrics: make(map[string]float64),
+		deltas:         newDeltaTracker(),
 	}
 	go m.collectRuntime()
 	return m
@@ -86,7 +90,7 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	m.appMu.Lock()
 	app := make(map[string]float64, len(m.appMetrics))
 	for k, v := range m.appMetrics {
-		app[k] = v
+		app[k] = v.value
 	}
 	m.appMu.Unlock()
 
@@ -104,11 +108,23 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	}
 }
 
-// SetAppMetric stores a metric value received from the app via OTLP.
+// SetAppMetric stores a sampled metric value received from the app.
 func (m *Metrics) SetAppMetric(name string, value float64) {
+	m.setAppMetric(name, value, appMetricValue{kind: kindGauge})
+}
+
+// setAppMetric stores an app reading under the semantics it arrived with.
+// Pre-aggregated values accumulate across posts because each one reports a
+// separate slice of time; everything else reports a level and overwrites.
+func (m *Metrics) setAppMetric(name string, value float64, semantics appMetricValue) {
 	m.appMu.Lock()
-	m.appMetrics[name] = value
-	m.appMu.Unlock()
+	defer m.appMu.Unlock()
+
+	semantics.value = value
+	if semantics.preAggregated {
+		semantics.value += m.appMetrics[name].value
+	}
+	m.appMetrics[name] = semantics
 }
 
 // collectRuntime periodically collects Go runtime and /proc metrics.
@@ -158,23 +174,30 @@ func (m *Metrics) updateFromOTLPMetrics(body []byte) (int, error) {
 				name := metric.Name
 				switch data := metric.Data.(type) {
 				case *metricspb.Metric_Sum:
+					// Only a monotonic sum is a counter. An up-down counter
+					// reports a level, so it is sampled like a gauge.
+					semantics := appMetricValue{kind: kindGauge}
+					if data.Sum.IsMonotonic {
+						semantics = sumSemantics(data.Sum.AggregationTemporality)
+					}
 					for _, dp := range data.Sum.DataPoints {
-						val := dataPointValue(dp)
-						m.SetAppMetric(name, val)
+						m.setAppMetric(name, dataPointValue(dp), semantics)
 						count++
 					}
 				case *metricspb.Metric_Gauge:
 					for _, dp := range data.Gauge.DataPoints {
-						val := dataPointValue(dp)
-						m.SetAppMetric(name, val)
+						m.setAppMetric(
+							name, dataPointValue(dp), appMetricValue{kind: kindGauge},
+						)
 						count++
 					}
 				case *metricspb.Metric_Histogram:
+					semantics := sumSemantics(data.Histogram.AggregationTemporality)
 					for _, dp := range data.Histogram.DataPoints {
 						if dp.Sum != nil {
-							m.SetAppMetric(name+"_sum", *dp.Sum)
+							m.setAppMetric(name+"_sum", *dp.Sum, semantics)
 						}
-						m.SetAppMetric(name+"_count", float64(dp.Count))
+						m.setAppMetric(name+"_count", float64(dp.Count), semantics)
 						count++
 					}
 				}

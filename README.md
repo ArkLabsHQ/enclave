@@ -302,11 +302,38 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between `/request-migration` and `/finalise-migration`. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
-| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
+| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics interval. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_METRICS_NAMESPACE` | `Enclave` | CloudWatch namespace the extracted metrics appear under. |
 
 Log groups are `/enclave/<deployment>/<app>/logs`,
 `/enclave/<deployment>/<app>/traces` and `/enclave/<deployment>/<app>/metrics`.
+
+#### Metrics
+
+Metrics ship in CloudWatch [embedded metric
+format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html),
+so CloudWatch extracts them into real metrics that can be graphed and alarmed
+on. This needs no extra infrastructure and no extra IAM: EMF is extracted from
+any Standard-class log group written with `logs:PutLogEvents`, which the
+`CloudWatchLogsAccess` statement already grants. Do not pre-create the telemetry
+log groups in the Infrequent Access class, which does not support extraction and
+cannot be changed after creation.
+
+Every document carries the `Deployment` and `AppName` dimensions. A fleet shares
+one series per metric, which is what makes the delta below correct to aggregate.
+
+**Counters ship the change over the interval, not a running total.** Graph them
+with `SUM`, which gives the per-minute rate and sums correctly across a fleet.
+Sampled values — goroutines, heap and memory readings, OTLP gauges and up-down
+counters — are levels, so they ship as-is and should be read with `AVG` or `MAX`.
+
+Names are flattened, because EMF reads only the document root: the enclave's own
+counters keep their `enclave_` prefix, runtime and `/proc` readings take
+`runtime_`, and everything from the app takes `app_`. Dots in OTLP names become
+underscores. An app counter's first interval only establishes a baseline and
+ships nothing, so a late-connecting app cannot report its lifetime total as one
+spike. Past 100 metrics an interval splits across several documents.
 
 Events timestamped more than an hour from now, either direction, are dropped on
 arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS

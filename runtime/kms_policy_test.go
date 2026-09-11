@@ -616,6 +616,17 @@ func TestKeyPolicyAdmittedPCR0sRejectsNotPrincipal(t *testing.T) {
 	require.ErrorContains(t, err, "NotPrincipal")
 }
 
+func TestKeyPolicyAdmittedPCR0sRejectsNonRootPutKeyPolicy(t *testing.T) {
+	policy := ppPolicy(
+		t,
+		ppDecryptGated(ppPCR0),
+		ppAllow("kms:PutKeyPolicy", ppRole, nil),
+	)
+
+	_, err := KeyPolicyAdmittedPCR0s(policy)
+	require.ErrorContains(t, err, "non-root")
+}
+
 func TestPrincipalsAllRoot(t *testing.T) {
 	cases := []struct {
 		name string

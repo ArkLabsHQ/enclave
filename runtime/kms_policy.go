@@ -70,76 +70,60 @@ func BuildKMSPolicy(roleARN string, pcr0Values []string, recoveryAccount string)
 // VerifyKeyPolicyPosture checks Decrypt PCR0 gates and PutKeyPolicy posture.
 // Action wildcards are treated as granting both.
 func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bool) error {
-	if policyJSON == "" {
-		return fmt.Errorf("empty KMS key policy")
-	}
 	if len(expectedPCR0s) == 0 {
 		return fmt.Errorf("empty expected PCR0 set")
 	}
-	var policy struct {
-		Statement []struct {
-			Effect    string          `json:"Effect"`
-			Principal json.RawMessage `json:"Principal"`
-			Action    json.RawMessage `json:"Action"`
-			NotAction json.RawMessage `json:"NotAction"`
-			Condition map[string]any  `json:"Condition"`
-		} `json:"Statement"`
+	parsed, err := parseKMSPolicy(policyJSON)
+	if err != nil {
+		return err
 	}
-	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
-		return fmt.Errorf("parse KMS key policy: %w", err)
+	if locked && parsed.hasPutKeyPolicy {
+		return fmt.Errorf(
+			"policy grants kms:PutKeyPolicy but ENCLAVE_KMS_KEY_LOCKED is set (policy must be immutable)",
+		)
 	}
-
-	admittedPCR0s := map[string]bool{}
-	for _, stmt := range policy.Statement {
-		if len(normalizePolicyStrings(stmt.NotAction)) > 0 {
-			return fmt.Errorf("policy uses NotAction, which is not supported")
-		}
-		if !strings.EqualFold(stmt.Effect, "Allow") {
-			continue
-		}
-		actions := normalizePolicyStrings(stmt.Action)
-
-		if actionsGrant(actions, "kms:Decrypt") {
-			pcr0s, ok := pcr0ConditionValues(stmt.Condition)
-			if !ok {
-				return fmt.Errorf(
-					"policy grants kms:Decrypt without a RecipientAttestation:PCR0 condition",
-				)
-			}
-			for _, pcr0 := range pcr0s {
-				admittedPCR0s[strings.ToLower(pcr0)] = true
-			}
-		}
-
-		if actionsGrant(actions, "kms:PutKeyPolicy") {
-			if locked {
-				return fmt.Errorf(
-					"policy grants kms:PutKeyPolicy but ENCLAVE_KMS_KEY_LOCKED is set (policy must be immutable)",
-				)
-			}
-			if !principalsAllRoot(stmt.Principal) {
-				return fmt.Errorf("policy grants kms:PutKeyPolicy to a non-root principal")
-			}
-		}
+	if parsed.hasNonRootPutKeyPolicy {
+		return fmt.Errorf("policy grants kms:PutKeyPolicy to a non-root principal")
 	}
-	if !samePCR0Set(admittedPCR0s, expectedPCR0s) {
+	if !samePCR0Set(parsed.admittedPCR0s, expectedPCR0s) {
 		return fmt.Errorf("policy PCR0 set does not match expected PCR0 set")
 	}
 	return nil
 }
 
 func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
+	parsed, err := parseKMSPolicy(policyJSON)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.hasNonRootPutKeyPolicy {
+		return nil, fmt.Errorf("policy grants kms:PutKeyPolicy to a non-root principal")
+	}
+	if len(parsed.admittedPCR0s) <= 0 {
+		return nil, fmt.Errorf("policy does not grant kms:Decrypt to any RecipientAttestation:PCR0")
+	}
+	return parsed.admittedPCR0s, nil
+}
+
+type parsedKMSPolicy struct {
+	admittedPCR0s          map[string]bool
+	hasPutKeyPolicy        bool
+	hasNonRootPutKeyPolicy bool
+}
+
+func parseKMSPolicy(policyJSON string) (*parsedKMSPolicy, error) {
 	if policyJSON == "" {
 		return nil, fmt.Errorf("empty KMS key policy")
 	}
 
 	var policy struct {
 		Statement []struct {
-			Effect    string          `json:"Effect"`
-			Principal json.RawMessage `json:"Principal"`
-			Action    json.RawMessage `json:"Action"`
-			NotAction json.RawMessage `json:"NotAction"`
-			Condition map[string]any  `json:"Condition"`
+			Effect       string          `json:"Effect"`
+			Principal    json.RawMessage `json:"Principal"`
+			NotPrincipal json.RawMessage `json:"NotPrincipal"`
+			Action       json.RawMessage `json:"Action"`
+			NotAction    json.RawMessage `json:"NotAction"`
+			Condition    map[string]any  `json:"Condition"`
 		} `json:"Statement"`
 	}
 	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
@@ -147,9 +131,15 @@ func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
 	}
 
 	admittedPCR0s := map[string]bool{}
+	hasPutKeyPolicy := false
+	hasNonRootPutKeyPolicy := false
+
 	for _, stmt := range policy.Statement {
-		if len(normalizePolicyStrings(stmt.NotAction)) > 0 {
+		if raw := strings.TrimSpace(string(stmt.NotAction)); len(raw) > 0 && raw != "null" {
 			return nil, fmt.Errorf("policy uses NotAction, which is not supported")
+		}
+		if raw := strings.TrimSpace(string(stmt.NotPrincipal)); len(raw) > 0 && raw != "null" {
+			return nil, fmt.Errorf("policy uses NotPrincipal, which is not supported")
 		}
 		if !strings.EqualFold(stmt.Effect, "Allow") {
 			continue
@@ -167,13 +157,20 @@ func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
 				admittedPCR0s[strings.ToLower(pcr0)] = true
 			}
 		}
+
+		if actionsGrant(actions, "kms:PutKeyPolicy") {
+			hasPutKeyPolicy = true
+			if !principalsAllRoot(stmt.Principal) {
+				hasNonRootPutKeyPolicy = true
+			}
+		}
 	}
 
-	if len(admittedPCR0s) <= 0 {
-		return nil, fmt.Errorf("policy does not grant kms:Decrypt to any RecipientAttestation:PCR0")
-	}
-
-	return admittedPCR0s, nil
+	return &parsedKMSPolicy{
+		admittedPCR0s:          admittedPCR0s,
+		hasPutKeyPolicy:        hasPutKeyPolicy,
+		hasNonRootPutKeyPolicy: hasNonRootPutKeyPolicy,
+	}, nil
 }
 
 type kmsPolicyDocument struct {

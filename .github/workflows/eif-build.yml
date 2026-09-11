@@ -11,7 +11,9 @@ on:
         type: string
         required: true
       app_name:
-        description: Used in artifact and asset names, and as the S3 key prefix when publishing.
+        description: >-
+          Used in artifact and asset names, and as the first S3 key segment when
+          publishing, which writes <app_name>/<environment>/<pcr0>.eif.
         type: string
         required: true
       version_flake_attr:

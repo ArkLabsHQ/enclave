@@ -4,11 +4,15 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: Environment name. Selects the eif-<environment> artifact from this run.
+        description: >-
+          Environment name. Selects the eif-<environment> artifact from this run, and is
+          the second S3 key segment.
         type: string
         required: true
       app_name:
-        description: S3 key prefix. Must match the app_name given to eif-build.
+        description: >-
+          First S3 key segment, giving <app_name>/<environment>/<pcr0>.eif. Must match the
+          app_name given to eif-build.
         type: string
         required: true
       bucket:
@@ -75,8 +79,8 @@ jobs:
           eif="$(ls ./*.eif)"
           pcr="$(ls ./*.pcr.json)"
           sha="$(sha256sum "$eif" | cut -d' ' -f1)"
-          key="${APP_NAME}/${pcr0}.eif"
-          pcr_key="${APP_NAME}/${pcr0}.pcr.json"
+          key="${APP_NAME}/${ENV_NAME}/${pcr0}.eif"
+          pcr_key="${APP_NAME}/${ENV_NAME}/${pcr0}.pcr.json"
 
           # The object name is the measurement, so the same source always writes the
           # same name and re-running is expected to be a no-op.

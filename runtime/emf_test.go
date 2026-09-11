@@ -136,7 +136,11 @@ func TestSanitizeMetricName(t *testing.T) {
 	})
 
 	t.Run("an already-valid name is untouched", func(t *testing.T) {
-		require.Equal(t, "enclave_http_requests_total", sanitizeMetricName("enclave_http_requests_total"))
+		require.Equal(
+			t,
+			"enclave_http_requests_total",
+			sanitizeMetricName("enclave_http_requests_total"),
+		)
 	})
 }
 
@@ -180,21 +184,30 @@ func TestBuildEMFEvents(t *testing.T) {
 		require.Equal(t, float64(42), events[0]["runtime_goroutines"])
 	})
 
-	t.Run("every dimension key is declared and present as a string root member", func(t *testing.T) {
-		events := buildEMFEvents("Enclave", dims, []emfMetric{
-			{Name: "a", Unit: "Count", Value: 1},
-		}, 1)
+	t.Run(
+		"every dimension key is declared and present as a string root member",
+		func(t *testing.T) {
+			events := buildEMFEvents("Enclave", dims, []emfMetric{
+				{Name: "a", Unit: "Count", Value: 1},
+			}, 1)
 
-		d := directive(t, events[0])
-		sets, ok := d["Dimensions"].([][]string)
-		require.True(t, ok, "Dimensions must be an array of DimensionSets")
-		require.Len(t, sets, 1)
-		require.ElementsMatch(t, []string{"AppName", "Deployment"}, sets[0])
+			d := directive(t, events[0])
+			sets, ok := d["Dimensions"].([][]string)
+			require.True(t, ok, "Dimensions must be an array of DimensionSets")
+			require.Len(t, sets, 1)
+			require.ElementsMatch(t, []string{"AppName", "Deployment"}, sets[0])
 
-		for _, key := range sets[0] {
-			require.Equal(t, dims[key], events[0][key], "dimension %s must be a string root member", key)
-		}
-	})
+			for _, key := range sets[0] {
+				require.Equal(
+					t,
+					dims[key],
+					events[0][key],
+					"dimension %s must be a string root member",
+					key,
+				)
+			}
+		},
+	)
 
 	t.Run("dimension keys are ordered so documents are stable", func(t *testing.T) {
 		first := directive(t, buildEMFEvents("Enclave", dims, []emfMetric{{Name: "a"}}, 1)[0])
@@ -316,14 +329,16 @@ func TestEMFMetricsApp(t *testing.T) {
 	t.Run("a cumulative counter seeds silently then ships deltas", func(t *testing.T) {
 		metrics := NewMetrics()
 		_, err := metrics.updateFromOTLPMetrics(
-			buildOTLPSum(t, "requests", 5000, monotonic, cumulative))
+			buildOTLPSum(t, "requests", 5000, monotonic, cumulative),
+		)
 		require.NoError(t, err)
 
 		_, found := findMetric(metrics.emfMetrics(), "app_requests")
 		require.False(t, found, "the first observation must not ship its lifetime total")
 
 		_, err = metrics.updateFromOTLPMetrics(
-			buildOTLPSum(t, "requests", 5012, monotonic, cumulative))
+			buildOTLPSum(t, "requests", 5012, monotonic, cumulative),
+		)
 		require.NoError(t, err)
 
 		got, ok := findMetric(metrics.emfMetrics(), "app_requests")
@@ -335,7 +350,8 @@ func TestEMFMetricsApp(t *testing.T) {
 		metrics := NewMetrics()
 		for _, v := range []int64{3, 4, 5} {
 			_, err := metrics.updateFromOTLPMetrics(
-				buildOTLPSum(t, "requests", v, monotonic, deltaTemporality))
+				buildOTLPSum(t, "requests", v, monotonic, deltaTemporality),
+			)
 			require.NoError(t, err)
 		}
 
@@ -363,7 +379,8 @@ func TestEMFMetricsApp(t *testing.T) {
 	t.Run("a non-monotonic sum is treated as a gauge", func(t *testing.T) {
 		metrics := NewMetrics()
 		_, err := metrics.updateFromOTLPMetrics(
-			buildOTLPSum(t, "queue_depth", 9, upDown, cumulative))
+			buildOTLPSum(t, "queue_depth", 9, upDown, cumulative),
+		)
 		require.NoError(t, err)
 
 		got, ok := findMetric(metrics.emfMetrics(), "app_queue_depth")

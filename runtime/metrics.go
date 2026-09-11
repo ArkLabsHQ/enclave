@@ -2,11 +2,9 @@ package runtime
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"runtime"
@@ -15,26 +13,19 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/protobuf/proto"
 )
 
-// Metrics holds OTEL metric instruments for the enclave supervisor.
+// Metrics collects the enclave's own counters, the app's OTLP metrics and the
+// process's own /proc readings into the snapshot that ships to CloudWatch.
+//
+// No OTel meter: the runtime never configures a MeterProvider, so instruments
+// created here would write to the no-op default while the map below is what
+// actually ships. The OTLP protos are still used to decode what the app sends.
 type Metrics struct {
-	// Supervisor counters.
-	HTTPRequests       metric.Int64Counter
-	HTTPErrors         metric.Int64Counter
-	AppProxiedRequests metric.Int64Counter // user-app proxy requests
-	AppProxiedErrors   metric.Int64Counter // failures dialing or talking to the user app
-	KMSOperations      metric.Int64Counter
-	KMSErrors          metric.Int64Counter
-	LogEntries         metric.Int64Counter
-
-	// Snapshot state: accumulated values for JSON export.
+	// The enclave's own counters, accumulated for the snapshot.
 	mu       sync.Mutex
 	counters map[string]int64
 
@@ -47,77 +38,48 @@ type Metrics struct {
 	runtimeMetrics map[string]float64
 }
 
-// NewMetrics registers counters and starts runtime collection.
+// Enclave counter names, as they appear in the snapshot.
+const (
+	metricHTTPRequests       = "enclave_http_requests_total"
+	metricHTTPErrors         = "enclave_http_errors_total"
+	metricAppProxiedRequests = "enclave_app_proxied_requests_total"
+	metricAppProxiedErrors   = "enclave_app_proxied_errors_total"
+	metricLogEntries         = "enclave_log_entries_total"
+)
+
+// NewMetrics starts runtime collection.
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		counters:       make(map[string]int64),
 		appMetrics:     make(map[string]float64),
 		runtimeMetrics: make(map[string]float64),
 	}
-	meter := otel.Meter("runtime")
-	m.HTTPRequests = newCounter(
-		meter,
-		"enclave_http_requests_total",
-		"Total HTTP requests handled by the enclave supervisor.",
-	)
-	m.HTTPErrors = newCounter(
-		meter,
-		"enclave_http_errors_total",
-		"Total HTTP responses with status 4xx or 5xx.",
-	)
-	m.AppProxiedRequests = newCounter(
-		meter,
-		"enclave_app_proxied_requests_total",
-		"Total requests forwarded to the user app via the reverse proxy.",
-	)
-	m.AppProxiedErrors = newCounter(
-		meter,
-		"enclave_app_proxied_errors_total",
-		"Total failures forwarding requests to the user app (dial / connect errors).",
-	)
-	m.KMSOperations = newCounter(
-		meter,
-		"enclave_kms_operations_total",
-		"Total KMS Decrypt operations attempted.",
-	)
-	m.KMSErrors = newCounter(meter, "enclave_kms_errors_total", "Total failed KMS operations.")
-	m.LogEntries = newCounter(meter, "enclave_log_entries_total", "Total log entries accepted.")
 	go m.collectRuntime()
 	return m
 }
 
-// newCounter registers an OTEL counter.
-func newCounter(meter metric.Meter, name, desc string) metric.Int64Counter {
-	c, err := meter.Int64Counter(name, metric.WithDescription(desc))
-	if err != nil {
-		slog.Warn("failed to create metric counter", "name", name, "error", err)
-		c, _ = meter.Int64Counter(name) // fallback
-	}
-	return c
-}
+// Inc increments an enclave counter by 1.
+func (m *Metrics) Inc(name string) { m.IncBy(name, 1) }
 
-// Inc increments a counter by 1 and tracks it in the snapshot map.
-func (m *Metrics) Inc(c metric.Int64Counter, name string) {
-	c.Add(context.Background(), 1, metric.WithAttributes(attribute.String("source", "supervisor")))
-	m.mu.Lock()
-	m.counters[name]++
-	m.mu.Unlock()
-}
-
-// IncBy increments a counter by n and tracks it in the snapshot map.
-func (m *Metrics) IncBy(c metric.Int64Counter, name string, n int64) {
-	c.Add(context.Background(), n, metric.WithAttributes(attribute.String("source", "supervisor")))
+// IncBy increments an enclave counter by n.
+func (m *Metrics) IncBy(name string, n int64) {
 	m.mu.Lock()
 	m.counters[name] += n
 	m.mu.Unlock()
 }
 
+func (m *Metrics) Counter(name string) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.counters[name]
+}
+
 // MetricsSnapshot returns a structured snapshot of all metrics.
 func (m *Metrics) MetricsSnapshot() map[string]any {
 	m.mu.Lock()
-	supervisor := make(map[string]int64, len(m.counters))
+	enclave := make(map[string]int64, len(m.counters))
 	for k, v := range m.counters {
-		supervisor[k] = v
+		enclave[k] = v
 	}
 	m.mu.Unlock()
 
@@ -136,9 +98,9 @@ func (m *Metrics) MetricsSnapshot() map[string]any {
 	m.runtimeMu.Unlock()
 
 	return map[string]any{
-		"supervisor": supervisor,
-		"app":        app,
-		"runtime":    rt,
+		"enclave": enclave,
+		"app":     app,
+		"runtime": rt,
 	}
 }
 
@@ -284,15 +246,6 @@ func readProcMeminfo() (map[string]float64, error) {
 		}
 	}
 	return result, nil
-}
-
-// HandleMetricGet returns a JSON snapshot of all metrics.
-// GET /enclave/v1/metrics externally; GET /v1/metrics on the internal listener.
-func HandleMetricGet(metrics *Metrics) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(metrics.MetricsSnapshot())
-	}
 }
 
 // HandleMetricPost accepts OTLP protobuf metrics.

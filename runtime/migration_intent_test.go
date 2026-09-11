@@ -31,17 +31,13 @@ type migrationIntentFixture struct {
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
-	return newMigrationIntentFixtureWithRetention(t, "87600h")
+	return newMigrationIntentFixtureWithConfig(t, testCfg)
 }
 
-func newMigrationIntentFixtureWithRetention(
-	t *testing.T,
-	retention string,
+func newMigrationIntentFixtureWithConfig(
+	t *testing.T, cfg *Config,
 ) *migrationIntentFixture {
 	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "intent")
-	t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", retention)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{
@@ -49,9 +45,9 @@ func newMigrationIntentFixtureWithRetention(
 		verifyRoots: session.attestationSign.roots,
 	}}
 	s3f := newFakeS3()
-	log, err := newMigrationIntentLog(s3f, nsm, migrationIntentTestBucket)
+	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
-	genesis, err := newGenesisLog(s3f, nsm, migrationIntentTestBucket)
+	genesis, err := newGenesisLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
 	return &migrationIntentFixture{
 		log:     log,
@@ -139,10 +135,10 @@ func TestMigrationIntentObjectKey(t *testing.T) {
 }
 
 func TestMigrationIntentAppend(t *testing.T) {
-	fx := newMigrationIntentFixtureWithRetention(t, "24h")
+	fx := newMigrationIntentFixture(t)
 	targetA := strings.Repeat("cd", 48)
 	targetB := strings.Repeat("ef", 48)
-	empty := newMigrationIntentFixtureWithRetention(t, "24h")
+	empty := newMigrationIntentFixture(t)
 	_, err := empty.log.Abort(context.Background(), empty.source)
 	require.ErrorIs(t, err, errMigrationIntentAbsent)
 
@@ -159,11 +155,18 @@ func TestMigrationIntentAppend(t *testing.T) {
 	stored := fx.s3.objects[key][0]
 	fx.s3.mu.Unlock()
 	require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
-	require.WithinDuration(t, time.Now().Add(24*time.Hour), stored.retainUntil, time.Second)
+	require.WithinDuration(
+		t,
+		time.Now().Add(testCfg.IntentRetention),
+		stored.retainUntil,
+		time.Second,
+	)
 	entry, err := decodeMigrationIntentObject(stored.body)
 	require.NoError(t, err)
-	require.NoError(t, fx.nsm.VerifyAttestation(entry.Attestation, map[uint]string{0: fx.source},
-		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket)))
+	require.NoError(t, verifyAttestationUserData(
+		fx.nsm, entry.Attestation, map[uint]string{0: fx.source},
+		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket),
+	))
 
 	_, err = fx.log.Request(context.Background(), fx.source, targetB)
 	require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
@@ -183,23 +186,127 @@ func TestMigrationIntentAppend(t *testing.T) {
 	require.Equal(t, targetB, head.TargetPCR0)
 }
 
-func TestMigrationIntentRetentionConfig(t *testing.T) {
+func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+
+	// A self-targeted handoff would overwrite this enclave's own commit pointer
+	// and satisfy the PCR31 check trivially.
+	_, err := fx.log.Request(context.Background(), fx.source, strings.ToUpper(fx.source))
+
+	require.ErrorIs(t, err, errMigrationIntentSelfTarget)
+	head, err := fx.log.Head(context.Background(), fx.source)
+	require.NoError(t, err)
+	require.Nil(t, head, "a refused request must publish no intent")
+}
+
+func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		value   string
-		wantErr string
+		name  string
+		isDev bool
 	}{
-		{name: "missing", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must not be empty"},
-		{name: "invalid", value: "later", wantErr: `invalid ENCLAVE_MIGRATION_INTENT_RETENTION "later"`},
-		{name: "zero", value: "0s", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
-		{name: "negative", value: "-1h", wantErr: "ENCLAVE_MIGRATION_INTENT_RETENTION must be positive"},
+		{name: "production", isDev: false},
+		{name: "dev", isDev: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_MIGRATION_INTENT_RETENTION", tc.value)
-			_, err := newMigrationIntentLog(newFakeS3(), nil, migrationIntentTestBucket)
-			require.ErrorContains(t, err, tc.wantErr)
+			cfg := newTestConfig("prod", "app", tc.isDev)
+			fx := newMigrationIntentFixtureWithConfig(t, cfg)
+
+			_, err := fx.log.Request(
+				context.Background(), fx.source, strings.Repeat("cd", 48),
+			)
+			require.NoError(t, err)
+
+			fx.s3.mu.Lock()
+			stored := fx.s3.objects[migrationIntentObjectKey(fx.source, 1)][0]
+			fx.s3.mu.Unlock()
+			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
+			require.WithinDuration(
+				t,
+				time.Now().Add(cfg.IntentRetention),
+				stored.retainUntil,
+				10*time.Second,
+			)
 		})
 	}
+}
+
+// The log is append-only only because published intents cannot be deleted or
+// rewritten. A version whose Object Lock does not prove that must not count.
+func TestMigrationIntentIgnoresVersionsWithoutComplianceRetention(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	published := time.Now().Add(-time.Hour)
+
+	for _, tc := range []struct {
+		name        string
+		lockMode    s3types.ObjectLockMode
+		retainUntil time.Time
+	}{
+		{
+			name:        "governance mode can be bypassed",
+			lockMode:    s3types.ObjectLockModeGovernance,
+			retainUntil: published.Add(prodRetention),
+		},
+		{
+			name:        "no lock at all",
+			lockMode:    "",
+			retainUntil: published.Add(prodRetention),
+		},
+		{
+			name:     "no retain-until date",
+			lockMode: s3types.ObjectLockModeCompliance,
+		},
+		{
+			name:        "expires far sooner than the configured retention",
+			lockMode:    s3types.ObjectLockModeCompliance,
+			retainUntil: published.Add(time.Minute),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			fx.s3.putRawObjectLockedAt(
+				migrationIntentObjectKey(fx.source, 1),
+				fx.object(t, 1, migrationIntentRequested, target,
+					migrationIntentTestBucket, fx.pcr0),
+				published, tc.lockMode, tc.retainUntil,
+			)
+
+			head, err := fx.log.Head(context.Background(), fx.source)
+
+			require.NoError(t, err, "one unlocked object must not break the log")
+			require.Nil(t, head, "an intent that is not immutably retained must not count")
+		})
+	}
+}
+
+// A hostile writer publishing an unlocked version alongside the genuine one must
+// not be able to displace it, nor to hide it.
+func TestMigrationIntentPrefersTheRetainedVersion(t *testing.T) {
+	genuineTarget := strings.Repeat("cd", 48)
+	forgedTarget := strings.Repeat("ef", 48)
+	published := time.Now().Add(-time.Hour)
+	key := migrationIntentObjectKey(strings.Repeat("ab", 48), 1)
+
+	fx := newMigrationIntentFixture(t)
+	// The forged version is written first, so "earliest wins" alone would take it.
+	fx.s3.putRawObjectLockedAt(
+		key,
+		fx.object(t, 1, migrationIntentRequested, forgedTarget,
+			migrationIntentTestBucket, fx.pcr0),
+		published.Add(-time.Minute), s3types.ObjectLockModeGovernance, published.Add(prodRetention),
+	)
+	fx.s3.putRawObjectAt(
+		key,
+		fx.object(t, 1, migrationIntentRequested, genuineTarget,
+			migrationIntentTestBucket, fx.pcr0),
+		published,
+	)
+
+	head, err := fx.log.Head(context.Background(), fx.source)
+
+	require.NoError(t, err)
+	require.NotNil(t, head)
+	require.Equal(t, genuineTarget, head.TargetPCR0,
+		"the earliest version must be picked from those actually retained")
 }
 
 func TestMigrationIntentCanonicalHead(t *testing.T) {
@@ -577,7 +684,7 @@ func TestMigrationIntentPagination(t *testing.T) {
 
 	head, err := fx.log.Head(context.Background(), fx.source)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), head.Sequence)
+	require.Equal(t, uint64(1), head.Sequence)
 	require.Equal(t, 1, paged.page)
 }
 
@@ -602,38 +709,180 @@ func mustMigrationIntentPayload(
 var _ S3API = (*migrationIntentPagedS3)(nil)
 
 func TestMigrationIntentBucketNameDerivation(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "wallet")
-	name := migrationIntentBucketName("123456789012")
+	const account = "123456789012"
+	nameFor := func(deployment, app string) string {
+		return migrationIntentBucketName(newTestConfig(deployment, app, false), account)
+	}
+	name := nameFor("prod", "wallet")
 
 	require.Regexp(t, `^enclave-123456789012-[0-9a-f]{16}-migration-intents$`, name)
 	require.LessOrEqual(t, len(name), 63, "S3 bucket names cap at 63 characters")
-	require.Equal(t, name, migrationIntentBucketName("123456789012"), "must be stable")
+	require.Equal(t, name, nameFor("prod", "wallet"), "must be stable")
 
 	// The account is what keeps two accounts off the same globally unique name.
-	require.NotEqual(t, name, migrationIntentBucketName("210987654321"))
+	require.NotEqual(t, name, migrationIntentBucketName(
+		newTestConfig("prod", "wallet", false), "210987654321",
+	))
 
-	t.Run("distinct per application", func(t *testing.T) {
-		t.Setenv("ENCLAVE_APP_NAME", "vault")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
-	})
+	require.NotEqual(t, name, nameFor("prod", "vault"), "distinct per application")
+	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per deployment")
 
-	t.Run("distinct per deployment", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "staging")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
-	})
+	// The NUL separator is what stops "prodwal"+"let" colliding with
+	// "prod"+"wallet".
+	require.NotEqual(t, name, nameFor("prodwal", "let"))
 
 	t.Run("survives names S3 would reject", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "Prod_EU_West")
-		t.Setenv("ENCLAVE_APP_NAME", strings.Repeat("long", 40))
-		long := migrationIntentBucketName("123456789012")
+		long := nameFor("Prod_EU_West", strings.Repeat("long", 40))
 		require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, long)
 		require.LessOrEqual(t, len(long), 63)
 	})
+}
 
-	t.Run("separator prevents identity collisions", func(t *testing.T) {
-		t.Setenv("ENCLAVE_DEPLOYMENT", "prodwal")
-		t.Setenv("ENCLAVE_APP_NAME", "let")
-		require.NotEqual(t, name, migrationIntentBucketName("123456789012"))
-	})
+func TestMigrationIntentRetentionBoundary(t *testing.T) {
+	published := time.Now().UTC()
+	for _, retention := range []time.Duration{devIntentRetention, prodRetention} {
+		t.Run(retention.String(), func(t *testing.T) {
+			cfg := newTestConfig("prod", "app", retention == devIntentRetention)
+			log := &migrationIntentLog{retention: retention, cfg: cfg}
+			for _, tc := range []struct {
+				name     string
+				deadline *time.Time
+				want     bool
+			}{
+				{"missing", nil, false},
+				{"below tolerated minimum", aws.Time(published.Add(retention - log.writeTimeout() - time.Nanosecond)), false},
+				{"tolerated minimum", aws.Time(published.Add(retention - log.writeTimeout())), true},
+				{"within tolerance", aws.Time(published.Add(retention - time.Nanosecond)), true},
+				{"exact minimum", aws.Time(published.Add(retention)), true},
+				{"longer", aws.Time(published.Add(retention + time.Second)), true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					out := &s3.GetObjectOutput{
+						ObjectLockMode:            s3types.ObjectLockModeCompliance,
+						ObjectLockRetainUntilDate: tc.deadline,
+					}
+					require.Equal(t, tc.want,
+						log.compliesWithObjectLock("key", "version", published, out))
+				})
+			}
+		})
+	}
+}
+
+func TestMigrationIntentWriteTimeout(t *testing.T) {
+	require.Equal(t, 10*time.Minute,
+		(&migrationIntentLog{cfg: newTestConfig("prod", "app", false)}).writeTimeout())
+	require.Equal(t, 2*time.Minute,
+		(&migrationIntentLog{cfg: newTestConfig("dev", "app", true)}).writeTimeout())
+}
+
+func TestEarliestUnabortedIntentRemainsAuthoritative(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	ctx := context.Background()
+	base := time.Now().Add(-prodRetention - time.Hour)
+	target := strings.Repeat("cd", 48)
+	put := func(sequence uint64, action string, published time.Time) {
+		fx.s3.putRawObjectLockedAt(migrationIntentObjectKey(fx.source, sequence),
+			fx.object(t, sequence, action, target, migrationIntentTestBucket, fx.pcr0),
+			published, s3types.ObjectLockModeCompliance, published.Add(prodRetention))
+	}
+	put(1, migrationIntentRequested, base)
+	put(2, migrationIntentRequested, time.Now())
+	head, err := fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), head.Sequence,
+		"a later request must not hide the earliest unaborted authorization")
+	m := &migrator{intent: fx.log}
+	require.NoError(t, m.verifyIntent(ctx, fx.source, target, 1))
+	put(3, migrationIntentAborted, base.Add(time.Minute))
+	head, err = fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, migrationIntentAborted, head.Action, "expired aborts must remain visible")
+	put(4, migrationIntentRequested, time.Now())
+	head, err = fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head.Sequence)
+	require.NoError(t, m.verifyIntent(ctx, fx.source, target, 4))
+}
+
+// Every append must land above every sequence already published. Writing at the
+// active head's sequence instead would add a second version to a key that
+// already exists, where the earliest-version rule would then bury it.
+func TestAppendAlwaysAdvancesBeyondEverySequence(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+
+	highestSequence := func(t *testing.T, fx *migrationIntentFixture) uint64 {
+		t.Helper()
+		fx.s3.mu.Lock()
+		defer fx.s3.mu.Unlock()
+		var highest uint64
+		for key := range fx.s3.objects {
+			if _, sequence, ok := parseMigrationIntentObjectKey(key); ok {
+				highest = max(highest, sequence)
+			}
+		}
+		return highest
+	}
+
+	for _, action := range []string{migrationIntentRequested, migrationIntentAborted} {
+		t.Run("after "+action, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			ctx := context.Background()
+			// Three open requests: the head stays at 1 while the log reaches 3.
+			for sequence := uint64(1); sequence <= 3; sequence++ {
+				fx.s3.putRawObjectAt(
+					migrationIntentObjectKey(fx.source, sequence),
+					fx.object(t, sequence, action, target,
+						migrationIntentTestBucket, fx.pcr0),
+					time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second),
+				)
+			}
+			before := highestSequence(t, fx)
+			require.Equal(t, uint64(3), before)
+
+			var head *migrationIntent
+			var err error
+			if action == migrationIntentRequested {
+				head, err = fx.log.Abort(ctx, fx.source)
+			} else {
+				head, err = fx.log.Request(ctx, fx.source, target)
+			}
+
+			require.NoError(t, err)
+			require.Greater(t, head.Sequence, before,
+				"an append must not reuse a sequence that already has an object")
+			require.Len(t, fx.s3.objects[migrationIntentObjectKey(fx.source, head.Sequence)], 1,
+				"the new sequence must be a fresh key, not another version of an old one")
+		})
+	}
+}
+
+func TestAbortAdvancesPastIgnoredRequests(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	ctx := context.Background()
+	target := strings.Repeat("cd", 48)
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, sequence),
+			fx.object(
+				t,
+				sequence,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			),
+			time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second),
+		)
+	}
+	head, err := fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), head.Sequence)
+	head, err = fx.log.Abort(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head.Sequence)
+	require.Equal(t, migrationIntentAborted, head.Action)
+	head, err = fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), head.Sequence)
 }

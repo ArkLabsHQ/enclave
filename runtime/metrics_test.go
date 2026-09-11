@@ -18,20 +18,20 @@ func TestMetricsCounters(t *testing.T) {
 	t.Run("inc", func(t *testing.T) {
 		metrics := NewMetrics()
 
-		metrics.Inc(metrics.HTTPRequests, "http_requests_total")
-		metrics.Inc(metrics.HTTPRequests, "http_requests_total")
+		metrics.Inc(metricHTTPRequests)
+		metrics.Inc(metricHTTPRequests)
 
-		supervisor := metrics.MetricsSnapshot()["supervisor"].(map[string]int64)
-		require.Equal(t, int64(2), supervisor["http_requests_total"])
+		enclave := metrics.MetricsSnapshot()["enclave"].(map[string]int64)
+		require.Equal(t, int64(2), enclave[metricHTTPRequests])
 	})
 
 	t.Run("inc by", func(t *testing.T) {
 		metrics := NewMetrics()
 
-		metrics.IncBy(metrics.LogEntries, "log_entries_total", 5)
+		metrics.IncBy(metricLogEntries, 5)
 
-		supervisor := metrics.MetricsSnapshot()["supervisor"].(map[string]int64)
-		require.Equal(t, int64(5), supervisor["log_entries_total"])
+		enclave := metrics.MetricsSnapshot()["enclave"].(map[string]int64)
+		require.Equal(t, int64(5), enclave[metricLogEntries])
 	})
 
 	t.Run("concurrent inc", func(t *testing.T) {
@@ -42,20 +42,20 @@ func TestMetricsCounters(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				metrics.Inc(metrics.HTTPRequests, "http_requests_total")
+				metrics.Inc(metricHTTPRequests)
 			}()
 		}
 		wg.Wait()
 
-		supervisor := metrics.MetricsSnapshot()["supervisor"].(map[string]int64)
-		require.Equal(t, int64(100), supervisor["http_requests_total"])
+		enclave := metrics.MetricsSnapshot()["enclave"].(map[string]int64)
+		require.Equal(t, int64(100), enclave[metricHTTPRequests])
 	})
 }
 
 func TestMetricsSnapshot(t *testing.T) {
 	snap := NewMetrics().MetricsSnapshot()
 
-	require.IsType(t, map[string]int64{}, snap["supervisor"])
+	require.IsType(t, map[string]int64{}, snap["enclave"])
 	require.IsType(t, map[string]float64{}, snap["app"])
 	require.IsType(t, map[string]float64{}, snap["runtime"])
 }
@@ -115,22 +115,6 @@ func TestMetricsUpdateFromOTLP(t *testing.T) {
 }
 
 func TestMetricHandlers(t *testing.T) {
-	t.Run("get returns snapshot", func(t *testing.T) {
-		metrics := NewMetrics()
-		metrics.Inc(metrics.HTTPRequests, "http_requests_total")
-		metrics.SetAppMetric("custom", 2)
-		w := httptest.NewRecorder()
-
-		HandleMetricGet(metrics)(w, httptest.NewRequest(http.MethodGet, "/v1/metrics", nil))
-
-		require.Equal(t, http.StatusOK, w.Code)
-		require.JSONEq(t, `{
-			"supervisor":{"http_requests_total":1},
-			"app":{"custom":2},
-			"runtime":{}
-		}`, w.Body.String())
-	})
-
 	t.Run("post accepts otlp", func(t *testing.T) {
 		metrics := NewMetrics()
 		req := httptest.NewRequest(

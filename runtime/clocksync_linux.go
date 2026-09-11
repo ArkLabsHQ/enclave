@@ -62,8 +62,8 @@ const (
 	clockSyncPollInterval = 5 * time.Minute
 )
 
-func clockPollInterval() time.Duration {
-	if IsDev() {
+func clockPollInterval(cfg *Config) time.Duration {
+	if cfg.Dev {
 		return 5 * time.Second
 	}
 	return clockSyncPollInterval
@@ -108,8 +108,8 @@ type clockSyncer struct {
 	lastXMonoNs int64
 }
 
-func StartClockSyncer(ctx context.Context) (context.Context, error) {
-	if verifyClockSourceEnabled() {
+func StartClockSyncer(ctx context.Context, cfg *Config) (context.Context, error) {
+	if cfg.VerifyClockSource {
 		data, err := os.ReadFile(clockSourcePath)
 		if err != nil {
 			return nil, fmt.Errorf("read current clocksource: %w", err)
@@ -123,7 +123,7 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 		}
 	}
 
-	cs, err := newClockSyncer()
+	cs, err := newClockSyncer(clockPollInterval(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +135,7 @@ func StartClockSyncer(ctx context.Context) (context.Context, error) {
 	return runCtx, nil
 }
 
-func newClockSyncer() (*clockSyncer, error) {
+func newClockSyncer(pollInterval time.Duration) (*clockSyncer, error) {
 	file, err := openPTPDevice()
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", ptpDevicePath, err)
@@ -171,7 +171,7 @@ func newClockSyncer() (*clockSyncer, error) {
 		file:           file,
 		fd:             int(file.Fd()),
 		lastXMonoNs:    unix.TimespecToNsec(mono),
-		interval:       clockPollInterval(),
+		interval:       pollInterval,
 		retryInterval:  clockSyncRetryInterval,
 		failureTimeout: clockSyncFailureTimeout,
 		cfg:            defaultServoConfig(),

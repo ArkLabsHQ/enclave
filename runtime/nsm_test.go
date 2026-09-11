@@ -84,7 +84,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation("not base64", map[uint]string{}, nil)
+		_, err := nsm.VerifyAttestation("not base64", map[uint]string{})
 
 		require.Error(t, err)
 		require.Empty(t, fake.verifyDocs)
@@ -94,7 +94,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyErr: errors.New("verify failed")}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation(docB64, map[uint]string{}, nil)
+		_, err := nsm.VerifyAttestation(docB64, map[uint]string{})
 
 		require.Error(t, err)
 		require.Equal(t, [][]byte{doc}, fake.verifyDocs)
@@ -104,16 +104,21 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation(docB64, map[uint]string{0: hex.EncodeToString(pcr0)}, userData)
+		got, err := nsm.VerifyAttestation(
+			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
+		)
 
 		require.NoError(t, err)
+		require.Equal(t, userData, got)
 	})
 
 	t.Run("missing PCR", func(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{1: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation(docB64, map[uint]string{0: hex.EncodeToString(pcr0)}, userData)
+		_, err := nsm.VerifyAttestation(
+			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
+		)
 
 		require.Error(t, err)
 	})
@@ -122,10 +127,9 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation(
+		_, err := nsm.VerifyAttestation(
 			docB64,
 			map[uint]string{0: hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))},
-			userData,
 		)
 
 		require.Error(t, err)
@@ -135,10 +139,8 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		err := nsm.VerifyAttestation(
-			docB64,
-			map[uint]string{0: hex.EncodeToString(pcr0)},
-			[]byte("wrong"),
+		err := verifyAttestationUserData(
+			nsm, docB64, map[uint]string{0: hex.EncodeToString(pcr0)}, []byte("wrong"),
 		)
 
 		require.Error(t, err)

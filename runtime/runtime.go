@@ -19,9 +19,6 @@ import (
 type RuntimeState interface {
 	Ready() bool
 	NotifyReady()
-	NotifyHalt()
-	Halt() <-chan struct{}
-	Halted() bool
 	UpstreamAppInfo() UpstreamAppInfo
 	SetTLSCertCallback(cb TLSCertCallback)
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
@@ -36,7 +33,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -49,15 +46,19 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
-
-	metrics := NewMetrics()
-	tracing := NewTracing(aws.CWL)
-
-	if err := tracing.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
+	ssm := NewSSM(aws.SSM)
+	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
-	ctx, initSpan := tracing.Span(ctx, "init")
+	telemetry := NewTelemetry(&cfg, aws.CWL)
+	if err := telemetry.Start(ctx); err != nil {
+		return err
+	}
+
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {
@@ -65,13 +66,6 @@ func Run(ctx context.Context, cfg Config) error {
 			initSpan.End()
 		}
 	}()
-
-	logging := NewLogging(metrics, aws.CWL)
-	slog.SetDefault(slog.New(NewBufferHandler(logging)))
-
-	if err := logging.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
-	}
 
 	hashes := &AttestationHashes{}
 
@@ -82,15 +76,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv()
+	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
 		cfg,
 		nsm,
-		metrics,
-		logging,
-		tracing,
+		telemetry,
 		hashes,
 		authToken,
 	)
@@ -99,8 +91,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
-	ssm := NewSSM(aws.SSM)
-	boot, err := NewBoot(nsm, aws.KMS, aws.STS, ssm, aws.S3)
+	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
@@ -114,6 +105,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	migrator, err := NewMigrator(
+		&cfg,
 		nsm,
 		result.kms,
 		NewSSMTTLCache(ssm, time.Second*5),
@@ -127,7 +119,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
+	ancestry := NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage)
+
+	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
@@ -143,9 +137,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
-		return fmt.Errorf("failed to apply env overrides: %w", err)
-	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
 	// overriding established secret state
 	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
@@ -164,10 +155,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv() NSM {
-	return NewNSM(WithAttestationUnsigned(skipCOSEVerification()))
-}
-
 type appProcess interface {
 	Stop() error
 }
@@ -178,16 +165,15 @@ type execApp struct {
 }
 
 func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + envOr("APP_BINARY_NAME", "app")
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
+	appPath := "/app/" + getAppBinaryName()
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.Env = append(
 		os.Environ(),
-		"ENCLAVE_APP_PORT="+appPort,
-		"PORT="+appPort,
+		"ENCLAVE_APP_PORT="+cfg.AppPort,
+		"PORT="+cfg.AppPort,
 		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
 		"ENCLAVE_RUNTIME_TOKEN="+authToken,
 	)
@@ -229,15 +215,11 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		} else {
 			slog.Warn("upstream app exited cleanly; runtime stays alive")
 		}
-		return waitForRuntime(ctx, rt, child)
+		return waitForRuntime(ctx, rt)
 
 	case err := <-rt.ListenError():
 		_ = child.Stop()
 		return fmt.Errorf("HTTP listener failed: %w", err)
-
-	case <-rt.Halt():
-		slog.Info("received halt circuit-breaker")
-		return waitForRuntime(ctx, rt, child)
 
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
@@ -249,29 +231,17 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 	}
 }
 
-// waitForRuntime keeps the runtime alive after the app is gone or halted, so
+// waitForRuntime keeps the runtime alive after the app has exited, so
 // health and migration endpoints still answer.
-func waitForRuntime(ctx context.Context, rt RuntimeState, child appProcess) error {
-	// Only stop a child that is still running: stopApp waits on ChildDone,
-	// which is unbuffered and delivered once, so stopping an already-reaped
-	// child would block forever.
-	stopChild := func() {
-		if !rt.UpstreamAppInfo().Exited {
-			_ = child.Stop()
-		}
-	}
-
+func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 	select {
 	case err := <-rt.ListenError():
-		stopChild()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
-			stopChild()
 			return fmt.Errorf("runtime halted: %w", cause)
 		}
 		slog.Info("shutting down")
-		stopChild()
 		return nil
 	}
 }
@@ -280,9 +250,6 @@ type runtimeState struct {
 	isReady         atomic.Bool
 	isExit          atomic.Bool
 	exitError       atomic.Value
-	rollbackHalt    atomic.Bool
-	haltOnce        sync.Once
-	haltCh          chan struct{}
 	tlsReadyOnce    sync.Once
 	tlsCertCallback TLSCertCallback
 	tlsReadyCh      chan struct{}
@@ -296,21 +263,6 @@ func (r *runtimeState) Ready() bool {
 
 func (r *runtimeState) NotifyReady() {
 	r.isReady.Store(true)
-}
-
-func (r *runtimeState) NotifyHalt() {
-	r.rollbackHalt.Store(true)
-	r.haltOnce.Do(func() {
-		close(r.haltCh)
-	})
-}
-
-func (r *runtimeState) Halt() <-chan struct{} {
-	return r.haltCh
-}
-
-func (r *runtimeState) Halted() bool {
-	return r.rollbackHalt.Load()
 }
 
 func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
@@ -364,7 +316,6 @@ func (r *runtimeState) ChildDone() <-chan error {
 
 func newRuntimeState() *runtimeState {
 	return &runtimeState{
-		haltCh:      make(chan struct{}),
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),

@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -33,29 +32,25 @@ type dek struct {
 type DEK interface {
 	Seal(plaintext, aad []byte) ([]byte, error)
 	Open(blob, aad []byte) ([]byte, error)
-	ExportKey(ctx context.Context, kms KMS, ssm SSM) (string, error)
+	ExportKey(ctx context.Context, cfg *Config, kms KMS, ssm SSM) (string, error)
 }
 
-// ExportKey stores this DEK encrypted under kms, then verifies round-trip.
-func (d *dek) ExportKey(ctx context.Context, kms KMS, ssm SSM) (string, error) {
+// ExportKey stores this DEK encrypted under kms. There is no round-trip check:
+// kms is the successor's key, whose policy admits the successor's PCR0 alone, so
+// the caller cannot decrypt what it just wrote. The successor verifies instead,
+// via the transition receipt's commitment to this ciphertext.
+func (d *dek) ExportKey(
+	ctx context.Context, cfg *Config, kms KMS, ssm SSM,
+) (string, error) {
 	ciphertextB64, err := kms.Encrypt(ctx, d.key)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt DEK under provided KMS: %w", err)
 	}
 
-	dekParam := storageDEKCiphertextParam(kms.KeyID())
+	dekParam := cfg.storageDEKCiphertextParam(kms.KeyID())
 
 	if err := ssm.Set(ctx, dekParam, ciphertextB64); err != nil {
 		return "", fmt.Errorf("encrypt DEK with migration key: %w", err)
-	}
-
-	decrypted, err := kms.Decrypt(ctx, ciphertextB64)
-	if err != nil {
-		return "", fmt.Errorf("verify DEK re-encryption: %w", err)
-	}
-
-	if !bytes.Equal(decrypted, d.key) {
-		return "", fmt.Errorf("verify DEK re-encryption: plaintext mismatch")
 	}
 
 	return ciphertextB64, nil

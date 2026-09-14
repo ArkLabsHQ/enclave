@@ -41,8 +41,13 @@ func NewKMSPolicy(callerARN, pcr0, recoveryARN string) (*KMSPolicy, error) {
 	condition.StringEqualsIgnoreCase.PCR0 = policyStrings{strings.ToLower(pcr0)}
 
 	policy := &KMSPolicy{
-		Version:    kmsPolicyVersion,
-		attested:   newKMSPolicyStatement("EnclaveAttestedOperations", role, attestedActions, condition),
+		Version: kmsPolicyVersion,
+		attested: newKMSPolicyStatement(
+			"EnclaveAttestedOperations",
+			role,
+			attestedActions,
+			condition,
+		),
 		operations: newKMSPolicyStatement("EnclaveOperations", role, operationsActions, nil),
 		deletion:   newKMSPolicyStatement("AllowKeyDeletion", role, deletionActions, nil),
 	}
@@ -51,7 +56,12 @@ func NewKMSPolicy(callerARN, pcr0, recoveryARN string) (*KMSPolicy, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid recovery account ARN: %w", err)
 		}
-		policy.recovery = newKMSPolicyStatement("RootRecovery", "arn:aws:iam::"+account+":root", recoveryActions, nil)
+		policy.recovery = newKMSPolicyStatement(
+			"RootRecovery",
+			"arn:aws:iam::"+account+":root",
+			recoveryActions,
+			nil,
+		)
 	}
 	return policy, nil
 }
@@ -238,7 +248,10 @@ func (stmt *kmsPolicyStatement) verifyStatement(want *kmsPolicyStatement) error 
 	if stmt.Condition == nil {
 		return fmt.Errorf("missing attestation condition")
 	}
-	if !sameActions(stmt.Condition.StringEqualsIgnoreCase.PCR0, want.Condition.StringEqualsIgnoreCase.PCR0) {
+	if !sameActions(
+		stmt.Condition.StringEqualsIgnoreCase.PCR0,
+		want.Condition.StringEqualsIgnoreCase.PCR0,
+	) {
 		return fmt.Errorf("PCR0 does not match")
 	}
 	return nil
@@ -253,16 +266,16 @@ func (stmt *kmsPolicyStatement) normalize() error {
 		}
 	}
 	if err := stmt.Action.normalize(true); err != nil {
-		return fmt.Errorf("Action: %w", err)
+		return fmt.Errorf("action: %w", err)
 	}
 	if err := stmt.Resource.normalize(false); err != nil {
-		return fmt.Errorf("Resource: %w", err)
+		return fmt.Errorf("resource: %w", err)
 	}
 	if len(stmt.Resource) != 1 {
 		return fmt.Errorf("expected one resource per statement")
 	}
 	if err := stmt.Principal.AWS.normalize(false); err != nil {
-		return fmt.Errorf("Principal: %w", err)
+		return fmt.Errorf("principal: %w", err)
 	}
 	if len(stmt.Principal.AWS) != 1 {
 		return fmt.Errorf("expected one principal per statement")
@@ -319,7 +332,11 @@ func (values *policyStrings) normalize(foldCase bool) error {
 	return nil
 }
 
-func newKMSPolicyStatement(sid, principal string, actions []string, condition *kmsPolicyConditions) *kmsPolicyStatement {
+func newKMSPolicyStatement(
+	sid, principal string,
+	actions []string,
+	condition *kmsPolicyConditions,
+) *kmsPolicyStatement {
 	stmt := &kmsPolicyStatement{
 		Sid:       sid,
 		Effect:    "Allow",

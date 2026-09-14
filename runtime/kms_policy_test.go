@@ -315,9 +315,17 @@ func TestKMSPolicyActionIsolation(t *testing.T) {
 	fresh, err := NewKMSPolicy(testRoleARN, "abc123", testRecoveryRootARN)
 	require.NoError(t, err)
 	require.Equal(t, policyStrings{"kms:Decrypt", "kms:GenerateDataKey"}, fresh.attested.Action)
-	require.Equal(t, policyStrings{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}, fresh.operations.Action)
+	require.Equal(
+		t,
+		policyStrings{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
+		fresh.operations.Action,
+	)
 	require.Equal(t, policyStrings{"kms:ScheduleKeyDeletion"}, fresh.deletion.Action)
-	require.Equal(t, policyStrings{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"}, fresh.recovery.Action)
+	require.Equal(
+		t,
+		policyStrings{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"},
+		fresh.recovery.Action,
+	)
 	require.NoError(t, fresh.Verify(testRoleARN, "abc123", false))
 }
 
@@ -352,7 +360,11 @@ func TestKMSPolicyUnsupportedStoredVersion(t *testing.T) {
 	policy.Version = "2008-10-17"
 	_, err = policy.Encode()
 	require.ErrorContains(t, err, "unsupported policy version")
-	require.ErrorContains(t, policy.Verify(testRoleARN, "abc123", true), "unsupported policy version")
+	require.ErrorContains(
+		t,
+		policy.Verify(testRoleARN, "abc123", true),
+		"unsupported policy version",
+	)
 }
 
 func TestKMSPolicyStructure(t *testing.T) {
@@ -367,17 +379,30 @@ func TestKMSPolicyStructure(t *testing.T) {
 			d["Statement"] = append(s, ppStmt("Deny", "kms:Decrypt", ppRole, nil))
 		}},
 		{"missing statement", func(d map[string]any, s []any) { d["Statement"] = s[:2] }},
-		{"duplicate statement", func(d map[string]any, s []any) { d["Statement"] = append(s, s[0]) }},
-		{"changed principal", func(_ map[string]any, s []any) { s[1].(map[string]any)["Principal"] = map[string]any{"AWS": ppRoot} }},
-		{"wildcard principal", func(_ map[string]any, s []any) { s[0].(map[string]any)["Principal"] = map[string]any{"AWS": "*"} }},
+		{
+			"duplicate statement",
+			func(d map[string]any, s []any) { d["Statement"] = append(s, s[0]) },
+		},
+		{
+			"changed principal",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["Principal"] = map[string]any{"AWS": ppRoot} },
+		},
+		{
+			"wildcard principal",
+			func(_ map[string]any, s []any) { s[0].(map[string]any)["Principal"] = map[string]any{"AWS": "*"} },
+		},
 		{"wildcard in all role principals", func(_ map[string]any, s []any) {
 			for _, value := range s {
-				value.(map[string]any)["Principal"] = map[string]any{"AWS": "arn:aws:iam::111122223333:role/*"}
+				value.(map[string]any)["Principal"] = map[string]any{
+					"AWS": "arn:aws:iam::111122223333:role/*",
+				}
 			}
 		}},
 		{"STS principal in all role statements", func(_ map[string]any, s []any) {
 			for _, value := range s {
-				value.(map[string]any)["Principal"] = map[string]any{"AWS": "arn:aws:sts::111122223333:assumed-role/enclave/session"}
+				value.(map[string]any)["Principal"] = map[string]any{
+					"AWS": "arn:aws:sts::111122223333:assumed-role/enclave/session",
+				}
 			}
 		}},
 		{"second conditional statement", func(_ map[string]any, s []any) {
@@ -386,24 +411,58 @@ func TestKMSPolicyStructure(t *testing.T) {
 		{"extra principal", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Principal"] = map[string]any{"AWS": []string{ppRole, ppRoot}}
 		}},
-		{"missing condition", func(_ map[string]any, s []any) { delete(s[0].(map[string]any), "Condition") }},
+		{
+			"missing condition",
+			func(_ map[string]any, s []any) { delete(s[0].(map[string]any), "Condition") },
+		},
 		{"extra condition", func(_ map[string]any, s []any) {
-			s[0].(map[string]any)["Condition"].(map[string]any)["Bool"] = map[string]any{"aws:SecureTransport": "true"}
+			s[0].(map[string]any)["Condition"].(map[string]any)["Bool"] = map[string]any{
+				"aws:SecureTransport": "true",
+			}
 		}},
 		{"changed operator", func(_ map[string]any, s []any) {
-			s[0].(map[string]any)["Condition"] = map[string]any{"StringEquals": map[string]any{"kms:RecipientAttestation:PCR0": ppPCR0}}
+			s[0].(map[string]any)["Condition"] = map[string]any{
+				"StringEquals": map[string]any{"kms:RecipientAttestation:PCR0": ppPCR0},
+			}
 		}},
-		{"extra resource", func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = []string{"*", "other"} }},
-		{"changed resource", func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = "other" }},
-		{"missing data key action", func(_ map[string]any, s []any) { s[0].(map[string]any)["Action"] = "kms:Decrypt" }},
-		{"NotAction", func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = "kms:Decrypt" }},
-		{"null NotAction", func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = nil }},
-		{"NotPrincipal", func(_ map[string]any, s []any) { s[1].(map[string]any)["NotPrincipal"] = map[string]any{"AWS": ppRoot} }},
+		{
+			"extra resource",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = []string{"*", "other"} },
+		},
+		{
+			"changed resource",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = "other" },
+		},
+		{
+			"missing data key action",
+			func(_ map[string]any, s []any) { s[0].(map[string]any)["Action"] = "kms:Decrypt" },
+		},
+		{
+			"NotAction",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = "kms:Decrypt" },
+		},
+		{
+			"null NotAction",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = nil },
+		},
+		{
+			"NotPrincipal",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotPrincipal"] = map[string]any{"AWS": ppRoot} },
+		},
 		{"unknown field", func(d map[string]any, _ []any) { d["Unknown"] = true }},
 		{"wrong version", func(d map[string]any, _ []any) { d["Version"] = "2008-10-17" }},
-		{"empty action", func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{} }},
-		{"null action entry", func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{nil} }},
-		{"empty PCR0", func(_ map[string]any, s []any) { s[0].(map[string]any)["Condition"] = ppPCR0Cond("") }},
+		{
+			"empty action",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{} },
+		},
+		{
+			"null action entry",
+			func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{nil} },
+		},
+		{
+			"empty PCR0",
+			func(_ map[string]any, s []any) { s[0].(map[string]any)["Condition"] = ppPCR0Cond("") },
+		},
 		{"two PCR0s", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Condition"] = ppPCR0Cond([]string{ppPCR0, ppOther})
 		}},
@@ -411,7 +470,10 @@ func TestKMSPolicyStructure(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var doc map[string]any
-			require.NoError(t, json.Unmarshal([]byte(mustBuildKMSPolicy(t, ppRole, ppPCR0, "")), &doc))
+			require.NoError(
+				t,
+				json.Unmarshal([]byte(mustBuildKMSPolicy(t, ppRole, ppPCR0, "")), &doc),
+			)
 			tc.mutate(doc, doc["Statement"].([]any))
 			raw, err := json.Marshal(doc)
 			require.NoError(t, err)
@@ -420,24 +482,46 @@ func TestKMSPolicyStructure(t *testing.T) {
 	}
 	for _, action := range []string{"kms:Dec*", "kms:Put*", "kms:Decryp?", "KMS:*", "*", "kms:CreateGrant"} {
 		for _, array := range []bool{false, true} {
-			t.Run(action+map[bool]string{false: "/string", true: "/array"}[array], func(t *testing.T) {
-				var value any = action
-				if array {
-					value = []string{action}
-				}
-				raw := ppPolicy(t, ppAllow([]string{"kms:Decrypt", "kms:GenerateDataKey"}, ppRole, ppPCR0Cond(ppPCR0)), ppOps(), ppDelete(), ppAllow(value, ppRoot, nil))
-				require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false))
-			})
+			t.Run(
+				action+map[bool]string{false: "/string", true: "/array"}[array],
+				func(t *testing.T) {
+					var value any = action
+					if array {
+						value = []string{action}
+					}
+					raw := ppPolicy(
+						t,
+						ppAllow(
+							[]string{"kms:Decrypt", "kms:GenerateDataKey"},
+							ppRole,
+							ppPCR0Cond(ppPCR0),
+						),
+						ppOps(),
+						ppDelete(),
+						ppAllow(value, ppRoot, nil),
+					)
+					require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false))
+				},
+			)
 		}
 	}
 }
 
 func TestKMSPolicyNormalization(t *testing.T) {
-	raw := ppPolicy(t,
+	raw := ppPolicy(
+		t,
 		ppRootRecovery([]string{ppRoot}),
 		ppDelete(),
-		ppAllow([]string{"KMS:DescribeKey", "kms:GetKeyPolicy", "kms:Encrypt", "kms:Encrypt"}, []string{ppRole}, nil),
-		ppAllow([]string{"kms:GenerateDataKey", "KMS:Decrypt"}, ppRole, ppPCR0Cond([]string{strings.ToUpper(ppPCR0), ppPCR0})),
+		ppAllow(
+			[]string{"KMS:DescribeKey", "kms:GetKeyPolicy", "kms:Encrypt", "kms:Encrypt"},
+			[]string{ppRole},
+			nil,
+		),
+		ppAllow(
+			[]string{"kms:GenerateDataKey", "KMS:Decrypt"},
+			ppRole,
+			ppPCR0Cond([]string{strings.ToUpper(ppPCR0), ppPCR0}),
+		),
 	)
 	policy := mustDecodeKMSPolicy(t, raw)
 	require.Equal(t, ppPCR0, policy.attested.Condition.StringEqualsIgnoreCase.PCR0[0])
@@ -476,10 +560,21 @@ func TestKMSPolicyIdentity(t *testing.T) {
 	raw := mustBuildKMSPolicy(t, ppRole, ppPCR0, ppRoot)
 	policy := mustDecodeKMSPolicy(t, raw)
 	require.NoError(t, policy.Verify(ppRole, ppPCR0, false))
-	require.NoError(t, policy.Verify("arn:aws:sts::111122223333:assumed-role/enclave/session", ppPCR0, false))
-	require.ErrorContains(t, policy.Verify("arn:aws:iam::111122223333:role/other", ppPCR0, false), "caller identity")
+	require.NoError(
+		t,
+		policy.Verify("arn:aws:sts::111122223333:assumed-role/enclave/session", ppPCR0, false),
+	)
+	require.ErrorContains(
+		t,
+		policy.Verify("arn:aws:iam::111122223333:role/other", ppPCR0, false),
+		"caller identity",
+	)
 	otherRecovery := mustBuildKMSPolicy(t, ppRole, ppPCR0, "arn:aws:iam::000000000000:root")
-	require.ErrorContains(t, verifyKMSPolicy(otherRecovery, ppRole, ppPCR0, false), "caller account")
+	require.ErrorContains(
+		t,
+		verifyKMSPolicy(otherRecovery, ppRole, ppPCR0, false),
+		"caller account",
+	)
 }
 
 func TestKMSPolicyRepresentation(t *testing.T) {
@@ -518,7 +613,10 @@ func TestFakeKMSRejectsMissingAttestationCondition(t *testing.T) {
 	fake.putKey("key-no-condition", raw)
 	doc, _, err := kmsTestNSMWithRecipient(t).BuildAttestationDocument(WithPublicKey())
 	require.NoError(t, err)
-	err = fake.authorizeAttested("key-no-condition", &kmstypes.RecipientInfo{AttestationDocument: doc})
+	err = fake.authorizeAttested(
+		"key-no-condition",
+		&kmstypes.RecipientInfo{AttestationDocument: doc},
+	)
 	require.ErrorContains(t, err, "AccessDeniedException")
 	require.ErrorContains(t, err, "lacks an attestation condition")
 }

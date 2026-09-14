@@ -88,7 +88,12 @@ func FetchOrCreatePrimaryKMS(
 		if identity == nil || identity.Arn == nil {
 			return nil, fmt.Errorf("missing caller identity ARN")
 		}
-		if _, err := ParseAndVerifyKMSPolicy(*out.Policy, *identity.Arn, curPCR0Hex, cfg.KMSLocked); err != nil {
+		if _, err := ParseAndVerifyKMSPolicy(
+			*out.Policy,
+			*identity.Arn,
+			curPCR0Hex,
+			cfg.KMSLocked,
+		); err != nil {
 			return nil, fmt.Errorf(
 				"KMS key %s policy posture mismatch (ours: %s...): %w",
 				keyID,

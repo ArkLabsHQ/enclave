@@ -410,7 +410,14 @@ func TestCompleteMigration(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
+			successorTestCfg(
+				oldPCR0Hex,
+			),
+			newNSM,
+			fx.kmsf,
+			&fakeSTS{arn: testRoleARN},
+			fx.ssm,
+			fx.s3f,
 		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
@@ -427,7 +434,10 @@ func TestCompleteMigration(t *testing.T) {
 			t,
 			fx.ssmf.params[testCfg.stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)],
 		)
-		require.Error(t, verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true))
+		require.Error(
+			t,
+			verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true),
+		)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 	})
 
@@ -743,7 +753,14 @@ func TestCompleteMigration(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
+			successorTestCfg(
+				oldPCR0Hex,
+			),
+			newNSM,
+			fx.kmsf,
+			&fakeSTS{arn: testRoleARN},
+			fx.ssm,
+			fx.s3f,
 		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)

@@ -81,9 +81,14 @@ func FetchOrCreatePrimaryKMS(
 			return nil, fmt.Errorf("KMS key policy empty: %s", keyID)
 		}
 
-		if err := VerifyKeyPolicyPosture(
-			*out.Policy, []string{curPCR0Hex}, cfg.KMSLocked,
-		); err != nil {
+		identity, err := sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
+		if err != nil {
+			return nil, fmt.Errorf("sts get-caller-identity: %w", err)
+		}
+		if identity == nil || identity.Arn == nil {
+			return nil, fmt.Errorf("missing caller identity ARN")
+		}
+		if _, err := ParseAndVerifyKMSPolicy(*out.Policy, *identity.Arn, curPCR0Hex, cfg.KMSLocked); err != nil {
 			return nil, fmt.Errorf(
 				"KMS key %s policy posture mismatch (ours: %s...): %w",
 				keyID,
@@ -105,11 +110,11 @@ func FetchOrCreatePrimaryKMS(
 		recoveryAccount = *identity.Arn
 	}
 
-	policy, err := BuildKMSPolicy(
-		*identity.Arn,
-		[]string{curPCR0Hex},
-		recoveryAccount,
-	)
+	policy, err := NewKMSPolicy(*identity.Arn, curPCR0Hex, recoveryAccount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
+	}
+	policyJSON, err := policy.Encode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
@@ -118,7 +123,7 @@ func FetchOrCreatePrimaryKMS(
 
 	createOut, err := kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
-		Policy:                         aws.String(policy),
+		Policy:                         aws.String(policyJSON),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
 			{TagKey: aws.String("AppName"), TagValue: aws.String(cfg.AppName)},
@@ -232,7 +237,11 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		recoveryAccount = *identity.Arn
 	}
 
-	policy, err := BuildKMSPolicy(*identity.Arn, []string{newPCR0}, recoveryAccount)
+	policy, err := NewKMSPolicy(*identity.Arn, newPCR0, recoveryAccount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
+	}
+	policyJSON, err := policy.Encode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
@@ -241,7 +250,7 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 
 	out, err := k.kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
-		Policy:                         aws.String(policy),
+		Policy:                         aws.String(policyJSON),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
 			{TagKey: aws.String("AppName"), TagValue: aws.String(k.cfg.AppName)},

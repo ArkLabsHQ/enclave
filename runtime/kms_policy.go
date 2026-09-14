@@ -1,193 +1,403 @@
 package runtime
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 )
 
-// BuildKMSPolicy gates Decrypt/GenerateDataKey on PCR0.
-// Optional root recovery can mutate policy post-creation.
-func BuildKMSPolicy(roleARN string, pcr0Values []string, recoveryAccount string) (string, error) {
-	roleARN, err := assumedRoleARNToRoleARN(roleARN)
+const kmsPolicyVersion = "2012-10-17"
+
+var (
+	attestedActions   = []string{"kms:Decrypt", "kms:GenerateDataKey"}
+	operationsActions = []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}
+	deletionActions   = []string{"kms:ScheduleKeyDeletion"}
+	recoveryActions   = []string{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"}
+)
+
+// KMSPolicy gates Decrypt and GenerateDataKey on one PCR0, with optional root recovery.
+type KMSPolicy struct {
+	Version    string
+	attested   *kmsPolicyStatement
+	operations *kmsPolicyStatement
+	deletion   *kmsPolicyStatement
+	recovery   *kmsPolicyStatement // nil when locked
+}
+
+// NewKMSPolicy builds a caller-role policy; empty recoveryARN disables recovery.
+func NewKMSPolicy(callerARN, pcr0, recoveryARN string) (*KMSPolicy, error) {
+	role, err := assumedRoleARNToRoleARN(callerARN)
 	if err != nil {
-		return "", fmt.Errorf("invalid role ARN: %w", err)
+		return nil, fmt.Errorf("invalid role ARN: %w", err)
+	}
+	if strings.TrimSpace(pcr0) == "" {
+		return nil, fmt.Errorf("empty PCR0")
 	}
 
-	statements := []kmsPolicyStatement{
-		{
-			Sid:       "EnclaveAttestedOperations",
-			Effect:    "Allow",
-			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			Action:    []string{"kms:Decrypt", "kms:GenerateDataKey"},
-			Resource:  "*",
-			Condition: &kmsPolicyConditions{
-				StringEqualsIgnoreCase: map[string][]string{
-					"kms:RecipientAttestation:PCR0": pcr0Values,
-				},
-			},
-		},
-		{
-			Sid:       "EnclaveOperations",
-			Effect:    "Allow",
-			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			Action:    []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
-			Resource:  "*",
-		},
-		{
-			Sid:       "AllowKeyDeletion",
-			Effect:    "Allow",
-			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			Action:    []string{"kms:ScheduleKeyDeletion"},
-			Resource:  "*",
-		},
-	}
+	condition := &kmsPolicyConditions{}
+	condition.StringEqualsIgnoreCase.PCR0 = policyStrings{strings.ToLower(pcr0)}
 
-	if recoveryAccount != "" {
-		recoveryAccount, err := arnAccount(recoveryAccount)
+	policy := &KMSPolicy{
+		Version:    kmsPolicyVersion,
+		attested:   newKMSPolicyStatement("EnclaveAttestedOperations", role, attestedActions, condition),
+		operations: newKMSPolicyStatement("EnclaveOperations", role, operationsActions, nil),
+		deletion:   newKMSPolicyStatement("AllowKeyDeletion", role, deletionActions, nil),
+	}
+	if recoveryARN != "" {
+		account, err := arnAccount(recoveryARN)
 		if err != nil {
-			return "", fmt.Errorf("invalid recovery account ARN: %w", err)
+			return nil, fmt.Errorf("invalid recovery account ARN: %w", err)
 		}
-
-		statements = append(statements, kmsPolicyStatement{
-			Sid:       "RootRecovery",
-			Effect:    "Allow",
-			Principal: kmsPolicyPrincipal{AWS: "arn:aws:iam::" + recoveryAccount + ":root"},
-			Action:    []string{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"},
-			Resource:  "*",
-		})
+		policy.recovery = newKMSPolicyStatement("RootRecovery", "arn:aws:iam::"+account+":root", recoveryActions, nil)
 	}
+	return policy, nil
+}
 
-	policy, _ := json.Marshal(kmsPolicyDocument{
-		Version:   "2012-10-17",
-		Statement: statements,
-	})
+// ParseAndVerifyKMSPolicy checks expected permissions; requireLocked forbids recovery.
+func ParseAndVerifyKMSPolicy(raw, callerARN, pcr0 string, requireLocked bool) (*KMSPolicy, error) {
+	recoveryARN := ""
+	if !requireLocked {
+		recoveryARN = callerARN
+	}
+	want, err := NewKMSPolicy(callerARN, pcr0, recoveryARN)
+	if err != nil {
+		return nil, err
+	}
+	return decodeKMSPolicy(raw, want, requireLocked)
+}
 
+func decodeKMSPolicy(raw string, want *KMSPolicy, requireLocked bool) (*KMSPolicy, error) {
+	version, statements, err := decodeKMSPolicyDocument(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse KMS key policy: %w", err)
+	}
+	policy := &KMSPolicy{Version: version}
+	for i, rawStatement := range statements {
+		checker := json.NewDecoder(bytes.NewReader(rawStatement))
+		if err := validatePolicyJSONSyntax(checker); err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(rawStatement))
+		decoder.DisallowUnknownFields()
+		stmt := &kmsPolicyStatement{}
+		if err := decoder.Decode(stmt); err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		if err := stmt.normalize(); err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		var slot **kmsPolicyStatement
+		switch {
+		case sameActions(stmt.Action, attestedActions):
+			if want != nil {
+				if err := stmt.verifyStatement(want.attested); err != nil {
+					return nil, fmt.Errorf("attested statement: %w", err)
+				}
+			}
+			slot = &policy.attested
+		case sameActions(stmt.Action, operationsActions):
+			if want != nil {
+				if err := stmt.verifyStatement(want.operations); err != nil {
+					return nil, fmt.Errorf("operations statement: %w", err)
+				}
+			}
+			slot = &policy.operations
+		case sameActions(stmt.Action, deletionActions):
+			if want != nil {
+				if err := stmt.verifyStatement(want.deletion); err != nil {
+					return nil, fmt.Errorf("deletion statement: %w", err)
+				}
+			}
+			slot = &policy.deletion
+		case sameActions(stmt.Action, recoveryActions):
+			if requireLocked {
+				return nil, fmt.Errorf("locked policy cannot permit recovery")
+			}
+			if want != nil {
+				if err := stmt.verifyStatement(want.recovery); err != nil {
+					return nil, fmt.Errorf("recovery statement: %w", err)
+				}
+			}
+			slot = &policy.recovery
+		default:
+			return nil, fmt.Errorf("unexpected statement with actions %v", stmt.Action)
+		}
+		if *slot != nil {
+			return nil, fmt.Errorf("duplicate statement with actions %v", stmt.Action)
+		}
+		*slot = stmt
+	}
+	if err := policy.validateStructure(); err != nil {
+		return nil, err
+	}
+	return policy, nil
+}
+
+// Locked reports whether root recovery is absent, without verifying permissions.
+func (p *KMSPolicy) Locked() bool {
+	return p.recovery == nil
+}
+
+// Encode returns the KMS policy JSON.
+func (p *KMSPolicy) Encode() (string, error) {
+	if err := p.validateStructure(); err != nil {
+		return "", err
+	}
+	doc := struct {
+		Version   string                `json:"Version"`
+		Statement []*kmsPolicyStatement `json:"Statement"`
+	}{
+		Version:   p.Version,
+		Statement: []*kmsPolicyStatement{p.attested, p.operations, p.deletion},
+	}
+	if !p.Locked() {
+		doc.Statement = append(doc.Statement, p.recovery)
+	}
+	policy, err := json.Marshal(doc)
+	if err != nil {
+		return "", err
+	}
 	return string(policy), nil
 }
 
-// VerifyKeyPolicyPosture checks Decrypt PCR0 gates and PutKeyPolicy posture.
-// Action wildcards are treated as granting both.
-func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bool) error {
-	if policyJSON == "" {
-		return fmt.Errorf("empty KMS key policy")
+// Verify checks caller and PCR0 permissions; requireLocked forbids recovery.
+func (p *KMSPolicy) Verify(callerARN, pcr0 string, requireLocked bool) error {
+	if err := p.validateStructure(); err != nil {
+		return err
 	}
-	if len(expectedPCR0s) == 0 {
-		return fmt.Errorf("empty expected PCR0 set")
+	raw, err := p.Encode()
+	if err != nil {
+		return err
 	}
-	var policy struct {
-		Statement []struct {
-			Effect    string          `json:"Effect"`
-			Principal json.RawMessage `json:"Principal"`
-			Action    json.RawMessage `json:"Action"`
-			Condition map[string]any  `json:"Condition"`
-		} `json:"Statement"`
-	}
-	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
-		return fmt.Errorf("parse KMS key policy: %w", err)
-	}
+	_, err = ParseAndVerifyKMSPolicy(raw, callerARN, pcr0, requireLocked)
+	return err
+}
 
-	admittedPCR0s := map[string]bool{}
-	for _, stmt := range policy.Statement {
-		if !strings.EqualFold(stmt.Effect, "Allow") {
-			continue
-		}
-		actions := normalizePolicyStrings(stmt.Action)
-
-		if actionsGrant(actions, "kms:Decrypt") {
-			pcr0s, ok := pcr0ConditionValues(stmt.Condition)
-			if !ok {
-				return fmt.Errorf(
-					"policy grants kms:Decrypt without a RecipientAttestation:PCR0 condition",
-				)
-			}
-			for _, pcr0 := range pcr0s {
-				admittedPCR0s[strings.ToLower(pcr0)] = true
-			}
-		}
-
-		if actionsGrant(actions, "kms:PutKeyPolicy") {
-			if locked {
-				return fmt.Errorf(
-					"policy grants kms:PutKeyPolicy but the key is locked (policy must be immutable)",
-				)
-			}
-			if !principalsAllRoot(stmt.Principal) {
-				return fmt.Errorf("policy grants kms:PutKeyPolicy to a non-root principal")
-			}
-		}
+func (p *KMSPolicy) validateStructure() error {
+	if p == nil {
+		return fmt.Errorf("nil KMS policy")
 	}
-	if !samePCR0Set(admittedPCR0s, expectedPCR0s) {
-		return fmt.Errorf("policy PCR0 set does not match expected PCR0 set")
+	if p.Version != kmsPolicyVersion {
+		return fmt.Errorf("unsupported policy version %q", p.Version)
+	}
+	for _, slot := range []struct {
+		name      string
+		statement *kmsPolicyStatement
+	}{
+		{"attested operations", p.attested},
+		{"enclave operations", p.operations},
+		{"key deletion", p.deletion},
+	} {
+		if slot.statement == nil {
+			return fmt.Errorf("missing %s statement", slot.name)
+		}
 	}
 	return nil
 }
 
-func KeyPolicyAdmittedPCR0s(policyJSON string) (map[string]bool, error) {
-	if policyJSON == "" {
-		return nil, fmt.Errorf("empty KMS key policy")
-	}
-
-	var policy struct {
-		Statement []struct {
-			Effect    string          `json:"Effect"`
-			Principal json.RawMessage `json:"Principal"`
-			Action    json.RawMessage `json:"Action"`
-			Condition map[string]any  `json:"Condition"`
-		} `json:"Statement"`
-	}
-	if err := json.Unmarshal([]byte(policyJSON), &policy); err != nil {
-		return nil, fmt.Errorf("parse KMS key policy: %w", err)
-	}
-
-	admittedPCR0s := map[string]bool{}
-	for _, stmt := range policy.Statement {
-		if !strings.EqualFold(stmt.Effect, "Allow") {
-			continue
-		}
-		actions := normalizePolicyStrings(stmt.Action)
-
-		if actionsGrant(actions, "kms:Decrypt") {
-			pcr0s, ok := pcr0ConditionValues(stmt.Condition)
-			if !ok {
-				return nil, fmt.Errorf(
-					"policy grants kms:Decrypt without a RecipientAttestation:PCR0 condition",
-				)
-			}
-			for _, pcr0 := range pcr0s {
-				admittedPCR0s[strings.ToLower(pcr0)] = true
-			}
-		}
-	}
-
-	if len(admittedPCR0s) <= 0 {
-		return nil, fmt.Errorf("policy does not grant kms:Decrypt to any RecipientAttestation:PCR0")
-	}
-
-	return admittedPCR0s, nil
-}
-
-type kmsPolicyDocument struct {
-	Version   string               `json:"Version"`
-	Statement []kmsPolicyStatement `json:"Statement"`
-}
-
 type kmsPolicyStatement struct {
-	Sid       string               `json:"Sid"`
-	Effect    string               `json:"Effect"`
-	Principal kmsPolicyPrincipal   `json:"Principal"`
-	Action    []string             `json:"Action"`
-	Resource  string               `json:"Resource"`
+	Sid       string `json:"Sid"`
+	Effect    string `json:"Effect"`
+	Principal struct {
+		AWS policyStrings `json:"AWS"`
+	} `json:"Principal"`
+	Action    policyStrings        `json:"Action"`
+	Resource  policyStrings        `json:"Resource"`
 	Condition *kmsPolicyConditions `json:"Condition,omitempty"`
 }
 
-type kmsPolicyPrincipal struct {
-	AWS string `json:"AWS"`
+type kmsPolicyConditions struct {
+	StringEqualsIgnoreCase struct {
+		PCR0 policyStrings `json:"kms:RecipientAttestation:PCR0"`
+	} `json:"StringEqualsIgnoreCase"`
 }
 
-type kmsPolicyConditions struct {
-	StringEqualsIgnoreCase map[string][]string `json:"StringEqualsIgnoreCase"`
+// verifyStatement compares permissions, ignoring Sid.
+func (stmt *kmsPolicyStatement) verifyStatement(want *kmsPolicyStatement) error {
+	if stmt.Effect != want.Effect {
+		return fmt.Errorf("effect does not match")
+	}
+	if !slices.Equal(stmt.Principal.AWS, want.Principal.AWS) {
+		return fmt.Errorf("principal does not match caller identity or caller account")
+	}
+	if !sameActions(stmt.Action, want.Action) {
+		return fmt.Errorf("actions do not match")
+	}
+	if !slices.Equal(stmt.Resource, want.Resource) {
+		return fmt.Errorf("resource does not match")
+	}
+	if want.Condition == nil {
+		if stmt.Condition != nil {
+			return fmt.Errorf("unexpected condition")
+		}
+		return nil
+	}
+	if stmt.Condition == nil {
+		return fmt.Errorf("missing attestation condition")
+	}
+	if !sameActions(stmt.Condition.StringEqualsIgnoreCase.PCR0, want.Condition.StringEqualsIgnoreCase.PCR0) {
+		return fmt.Errorf("PCR0 does not match")
+	}
+	return nil
+}
+
+func (stmt *kmsPolicyStatement) normalize() error {
+	for _, action := range stmt.Action {
+		for i := 0; i < len(action); i++ {
+			if action[i] >= 0x80 {
+				return fmt.Errorf("non-ASCII action %q is unsupported", action)
+			}
+		}
+	}
+	if err := stmt.Action.normalize(true); err != nil {
+		return fmt.Errorf("Action: %w", err)
+	}
+	if err := stmt.Resource.normalize(false); err != nil {
+		return fmt.Errorf("Resource: %w", err)
+	}
+	if len(stmt.Resource) != 1 {
+		return fmt.Errorf("expected one resource per statement")
+	}
+	if err := stmt.Principal.AWS.normalize(false); err != nil {
+		return fmt.Errorf("Principal: %w", err)
+	}
+	if len(stmt.Principal.AWS) != 1 {
+		return fmt.Errorf("expected one principal per statement")
+	}
+	for _, action := range stmt.Action {
+		if strings.ContainsAny(action, "*?") {
+			return fmt.Errorf("wildcard action %q is unsupported", action)
+		}
+	}
+	if strings.ContainsAny(stmt.Principal.AWS[0], "*?") {
+		return fmt.Errorf("wildcard principal is unsupported")
+	}
+	if stmt.Condition != nil {
+		if err := stmt.Condition.StringEqualsIgnoreCase.PCR0.normalize(true); err != nil {
+			return fmt.Errorf("PCR0: %w", err)
+		}
+		if len(stmt.Condition.StringEqualsIgnoreCase.PCR0) != 1 {
+			return fmt.Errorf("expected exactly one PCR0")
+		}
+	}
+	return nil
+}
+
+type policyStrings []string
+
+func (values *policyStrings) UnmarshalJSON(raw []byte) error {
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		*values = policyStrings{single}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return fmt.Errorf("expected a string or string array: %w", err)
+	}
+	*values = many
+	return nil
+}
+
+func (values *policyStrings) normalize(foldCase bool) error {
+	if len(*values) == 0 {
+		return fmt.Errorf("empty or missing string set")
+	}
+	for i, value := range *values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("empty string value")
+		}
+		if foldCase {
+			(*values)[i] = strings.ToLower(value)
+		}
+	}
+	slices.Sort(*values)
+	*values = slices.Compact(*values)
+	return nil
+}
+
+func newKMSPolicyStatement(sid, principal string, actions []string, condition *kmsPolicyConditions) *kmsPolicyStatement {
+	stmt := &kmsPolicyStatement{
+		Sid:       sid,
+		Effect:    "Allow",
+		Action:    slices.Clone(actions),
+		Resource:  policyStrings{"*"},
+		Condition: condition,
+	}
+	stmt.Principal.AWS = policyStrings{principal}
+	return stmt
+}
+
+// decodeKMSPolicyDocument validates the envelope and returns raw statements.
+func decodeKMSPolicyDocument(raw string) (string, []json.RawMessage, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return "", nil, err
+	}
+	if token != json.Delim('{') {
+		return "", nil, fmt.Errorf("expected policy object")
+	}
+	var version string
+	var statements []json.RawMessage
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", nil, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return "", nil, fmt.Errorf("invalid object key")
+		}
+		if seen[key] {
+			return "", nil, fmt.Errorf("duplicate JSON key %q", key)
+		}
+		seen[key] = true
+		if key != "Version" && key != "Statement" {
+			return "", nil, fmt.Errorf("unsupported policy field %q", key)
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", nil, err
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return "", nil, fmt.Errorf("null policy values are unsupported")
+		}
+		switch key {
+		case "Version":
+			if err := json.Unmarshal(value, &version); err != nil {
+				return "", nil, err
+			}
+		case "Statement":
+			if err := json.Unmarshal(value, &statements); err != nil {
+				return "", nil, err
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return "", nil, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return "", nil, fmt.Errorf("unexpected trailing JSON")
+	}
+	return version, statements, nil
+}
+
+// sameActions compares duplicate-free action sets, ignoring case.
+func sameActions(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, action := range want {
+		if !slices.ContainsFunc(got, func(g string) bool { return strings.EqualFold(g, action) }) {
+			return false
+		}
+	}
+	return true
 }
 
 // assumedRoleARNToRoleARN maps STS assumed-role ARNs to IAM role ARNs; IAM ARNs pass through.
@@ -226,110 +436,47 @@ func arnAccount(arn string) (string, error) {
 	return parts[4], nil
 }
 
-// pcr0ConditionValues returns the exact PCR0 values from the KMS attestation
-// condition this runtime builds. AWS policies may encode the value as either a
-// string or an array of strings; any other shape is rejected.
-func pcr0ConditionValues(cond map[string]any) ([]string, bool) {
-	ops, ok := cond["StringEqualsIgnoreCase"].(map[string]any)
+// validatePolicyJSONSyntax rejects duplicate keys, nulls, and unsupported field names.
+func validatePolicyJSONSyntax(d *json.Decoder) error {
+	token, err := d.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		return fmt.Errorf("null policy values are unsupported")
+	}
+	delim, ok := token.(json.Delim)
 	if !ok {
-		return nil, false
-	}
-	val, ok := ops["kms:RecipientAttestation:PCR0"]
-	if !ok {
-		return nil, false
-	}
-
-	switch v := val.(type) {
-	case string:
-		if v == "" {
-			return nil, false
-		}
-		return []string{v}, true
-	case []any:
-		values := make([]string, 0, len(v))
-		for _, item := range v {
-			s, ok := item.(string)
-			if !ok || s == "" {
-				return nil, false
-			}
-			values = append(values, s)
-		}
-		return values, len(values) > 0
-	case []string:
-		if slices.Contains(v, "") {
-			return nil, false
-		}
-		return v, len(v) > 0
-	default:
-		return nil, false
-	}
-}
-
-func samePCR0Set(admitted map[string]bool, expected []string) bool {
-	want := make(map[string]bool, len(expected))
-	for _, pcr0 := range expected {
-		if pcr0 == "" {
-			return false
-		}
-		want[strings.ToLower(pcr0)] = true
-	}
-	if len(admitted) != len(want) {
-		return false
-	}
-	for pcr0 := range want {
-		if !admitted[pcr0] {
-			return false
-		}
-	}
-	return true
-}
-
-// normalizePolicyStrings decodes an IAM Action/Principal-AWS field, which may be
-// a single JSON string or an array of strings, into a slice.
-func normalizePolicyStrings(raw json.RawMessage) []string {
-	if len(raw) == 0 {
 		return nil
 	}
-	var single string
-	if err := json.Unmarshal(raw, &single); err == nil {
-		return []string{single}
-	}
-	var many []string
-	if err := json.Unmarshal(raw, &many); err == nil {
-		return many
-	}
-	return nil
-}
-
-// actionsGrant reports whether actions include want, treating the kms:* and *
-// wildcards as granting everything.
-func actionsGrant(actions []string, want string) bool {
-	for _, a := range actions {
-		if strings.EqualFold(a, want) || a == "kms:*" || a == "*" {
-			return true
+	keys := map[string]bool{}
+	for d.More() {
+		if delim == '{' {
+			token, err := d.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := token.(string)
+			if !ok {
+				return fmt.Errorf("invalid object key")
+			}
+			if keys[key] {
+				return fmt.Errorf("duplicate JSON key %q", key)
+			}
+			keys[key] = true
+			// Require exact field names; encoding/json also accepts case variants.
+			switch key {
+			case "Version", "Statement", "Sid", "Effect", "Principal", "AWS",
+				"Action", "Resource", "Condition", "StringEqualsIgnoreCase",
+				"kms:RecipientAttestation:PCR0":
+			default:
+				return fmt.Errorf("unsupported policy field %q", key)
+			}
+		}
+		if err := validatePolicyJSONSyntax(d); err != nil {
+			return err
 		}
 	}
-	return false
-}
-
-// principalsAllRoot reports whether every AWS principal in a statement is an
-// account-root ARN (…:root). Returns false for a missing, wildcard, or
-// non-root principal.
-func principalsAllRoot(raw json.RawMessage) bool {
-	var p struct {
-		AWS json.RawMessage `json:"AWS"`
-	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return false
-	}
-	arns := normalizePolicyStrings(p.AWS)
-	if len(arns) == 0 {
-		return false
-	}
-	for _, a := range arns {
-		if !strings.HasSuffix(a, ":root") {
-			return false
-		}
-	}
-	return true
+	_, err = d.Token()
+	return err
 }

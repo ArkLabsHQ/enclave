@@ -402,9 +402,7 @@ func TestCompleteMigration(t *testing.T) {
 			fx.ssmf.params[testCfg.secretCiphertextParam("signing_key", migrationKeyID)],
 			secretPlaintext,
 		)
-		require.NoError(t, VerifyKeyPolicyPosture(
-			fx.kmsf.keyPolicy(migrationKeyID), []string{newPCR0}, true,
-		))
+		requireKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), newPCR0, true)
 		require.NotNil(t, fx.session.attestationRoots)
 
 		newNSM := &nsmW{nsm: &fakeNSM{
@@ -412,7 +410,7 @@ func TestCompleteMigration(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
 		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
@@ -429,9 +427,7 @@ func TestCompleteMigration(t *testing.T) {
 			t,
 			fx.ssmf.params[testCfg.stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)],
 		)
-		require.Error(t, VerifyKeyPolicyPosture(
-			fx.kmsf.keyPolicy(migrationKeyID), []string{oldPCR0Hex}, true,
-		))
+		require.Error(t, verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true))
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 	})
 
@@ -747,7 +743,7 @@ func TestCompleteMigration(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+			successorTestCfg(oldPCR0Hex), newNSM, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
 		)
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
@@ -810,7 +806,7 @@ func TestCompleteMigration(t *testing.T) {
 			return NewBoot(
 				successorTestCfg(oldPCR0Hex),
 				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
-				fx.kmsf, &fakeSTS{}, fx.ssm, fx.s3f,
+				fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
 			)
 		}
 		// Adopting verifies the predecessor's receipt; restarting verifies the

@@ -377,15 +377,18 @@ func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientI
 		return nil
 	}
 
-	admitted, err := KeyPolicyAdmittedPCR0s(policy)
+	decoded, err := decodeKMSPolicy(policy, nil, false)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
+	}
+	if decoded.attested.Condition == nil {
+		return fmt.Errorf("AccessDeniedException: key %s lacks an attestation condition", keyID)
 	}
 	pcr0, err := fakeKMSAttestedPCR0(recipient.AttestationDocument)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
 	}
-	if !admitted[pcr0] {
+	if !strings.EqualFold(decoded.attested.Condition.StringEqualsIgnoreCase.PCR0[0], pcr0) {
 		return fmt.Errorf(
 			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
 		)

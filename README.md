@@ -183,8 +183,7 @@ different keys even if a lease expires between verification and commit.
 | genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
 | `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, the transition receipt, the predecessor's migration intent, and last that the predecessor is the one `ENCLAVE_PREVIOUS_PCR0` committed to in the EIF — all before decrypting. Then writes its own state-origin receipt. |
-| genesis object present, `KMSKeyID/<pcr0>` absent, and `ENCLAVE_PREVIOUS_PCR0` names a predecessor | remains candidate | Waits, indefinitely, for that predecessor to commit to it. |
-| genesis object present, `KMSKeyID/<pcr0>` absent, and `ENCLAVE_PREVIOUS_PCR0` is `genesis` or empty | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
+| genesis object present and `KMSKeyID/<pcr0>` absent | remains candidate | Waits, indefinitely, for a predecessor to commit to it. An enclave whose key claim was deleted waits here too, and resumes once the parameter is restored. |
 | genesis object absent and `KMSKeyID/<pcr0>` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
 A candidate serves an ephemeral self-signed certificate so it stays observable.
@@ -260,7 +259,7 @@ measurement. A subset can be overridden at runtime from SSM.
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
 | `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
 way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
-| `ENCLAVE_PREVIOUS_PCR0` | empty | The predecessor this image may adopt state from, or the literal `genesis` for an image that only ever genesises. An image naming a predecessor boots as a candidate once the deployment exists. Measured and not SSM-overridable. |
+| `ENCLAVE_PREVIOUS_PCR0` | empty | The predecessor this image may adopt state from, or the literal `genesis` for an image that only ever genesises. Measured and not SSM-overridable. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
 
@@ -959,9 +958,11 @@ leaf to the exact hash carried in `user_data`.
 rewrites it as its atomic commit, and genesis claims it create-only. A
 declaratively managed value would fight the runtime and could roll a live
 deployment back to a key that no longer decrypts anything. Once the
-`deployment-genesis` object exists, deleting the parameter cannot fork the
-state — the boot fails instead of creating a second generation — but it still
-stops the deployment booting until it is restored. Genesis claims the parameter
+`deployment-genesis` object exists, deleting the parameter cannot re-open
+genesis: the enclave waits as a candidate instead. It still stops that PCR0
+booting until the parameter is restored, or until a predecessor whose intent
+still names it commits again, which mints a new generation carrying the same
+secrets. Genesis claims the parameter
 before writing that object, so a crash between the two leaves a window in which
 deleting the parameter does re-open genesis.
 

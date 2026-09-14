@@ -1566,58 +1566,95 @@ func TestIntentBucketIsMeasuredNotReadFromSSM(t *testing.T) {
 	require.NotContains(t, fx.ssmf.calls, "/prod/state-origin/MigrationIntentBucketName")
 }
 
-// A successor booted before its predecessor commits is a candidate: it waits,
-// and must neither mint a key nor fall through to genesis.
-func TestBootAwaitsHandoffAsACandidate(t *testing.T) {
+// handoffPredecessorPCR0 created the deployment the candidate fixtures join.
+var handoffPredecessorPCR0 = strings.Repeat("ab", 48)
+
+// newCandidateBoot is a successor started in a deployment its predecessor has
+// already created, before anything is committed for the successor's own PCR0.
+func newCandidateBoot(t *testing.T) (*genesisFixture, *Boot) {
+	t.Helper()
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
+	seedGenesisRecord(t, fx.s3f, handoffPredecessorPCR0)
+	fx.nsm = seededGenesisNSM{NSM: fx.nsm}
+	fx.ssmf.params[testCfg.kmsKeyIDParam(handoffPredecessorPCR0)] = "predecessor-key"
+
+	boot, err := NewBoot(
+		testConfigWithPreviousPCR0(handoffPredecessorPCR0),
+		fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f,
+	)
+	require.NoError(t, err)
+	return fx, boot
+}
+
+func contextFor(t *testing.T, timeout time.Duration) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// A successor started before its predecessor commits waits as a candidate, so
+// Boot never runs early enough to mint a key or to fail closed.
+func TestAwaitHandoffHoldsASuccessorUntilTheCommit(t *testing.T) {
 	setStateOriginTestEnv(t)
-	ctx := context.Background()
-	predecessorPCR0 := strings.Repeat("ab", 48)
+	fx, boot := newCandidateBoot(t)
 
-	for _, tc := range []struct {
-		name         string
-		previousPCR0 string
-		wantErr      error
-		wantContains string
-	}{
-		{
-			name: "an image naming a predecessor waits", previousPCR0: predecessorPCR0,
-			wantErr: errAwaitingHandoff,
-		},
-		{
-			name: "a genesis image is misconfigured", previousPCR0: "genesis",
-			wantContains: "deployment genesis is recorded but",
-		},
-		{
-			name:         "an image naming nobody is misconfigured",
-			wantContains: "deployment genesis is recorded but",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
-			seedGenesisRecord(t, fx.s3f, predecessorPCR0)
-			fx.ssmf.params[testCfg.kmsKeyIDParam(predecessorPCR0)] = "predecessor-key"
+	_, err := boot.AwaitHandoff(contextFor(t, 50*time.Millisecond))
 
-			boot, err := NewBoot(
-				testConfigWithPreviousPCR0(tc.previousPCR0),
-				seededGenesisNSM{NSM: fx.nsm}, fx.kmsf, fx.sts, fx.ssm, fx.s3f,
-			)
-			require.NoError(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Empty(t, fx.kmsf.keys, "no key may be minted while awaiting a handoff")
+	require.Empty(t, fx.ssmf.params[fx.keyIDParam()])
+}
 
-			_, err = boot.Boot(ctx)
+// A key that appears between two polls ends the wait, and Boot then establishes
+// state from it.
+func TestAwaitHandoffBootsOnceTheKeyIsCommitted(t *testing.T) {
+	setStateOriginTestEnv(t)
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
+	established, err := fx.establish(context.Background())
+	require.NoError(t, err)
+	committed := fx.ssmf.params[fx.keyIDParam()]
 
-			if tc.wantErr != nil {
-				require.ErrorIs(t, err, tc.wantErr)
-			} else {
-				require.NotErrorIs(t, err, errAwaitingHandoff)
-				require.ErrorContains(t, err, tc.wantContains)
-			}
-			require.Empty(t, fx.ssmf.params[fx.keyIDParam()])
-			require.Empty(t, fx.kmsf.keys, "no key may be minted while awaiting a handoff")
-			require.Equal(
-				t, "predecessor-key", fx.ssmf.params[testCfg.kmsKeyIDParam(predecessorPCR0)],
-			)
-		})
-	}
+	fx.ssmf.getSeq = map[string][]string{fx.keyIDParam(): {"", committed}}
+	boot, err := NewBoot(testCfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
+	require.NoError(t, err)
+
+	result, err := boot.AwaitHandoff(contextFor(t, 5*time.Second))
+
+	require.NoError(t, err)
+	require.Equal(t, committed, result.kms.KeyID())
+	require.Equal(t, established.dek.(*dek).key, result.dek.(*dek).key)
+}
+
+// With no genesis record there is nobody to hand over from, so AwaitHandoff goes
+// straight to Boot, which creates the deployment.
+func TestAwaitHandoffLeavesAFreshDeploymentToBoot(t *testing.T) {
+	setStateOriginTestEnv(t)
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
+	boot, err := NewBoot(testCfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
+	require.NoError(t, err)
+
+	result, err := boot.AwaitHandoff(contextFor(t, 5*time.Second))
+
+	require.NoError(t, err)
+	require.Equal(t, fx.ssmf.params[fx.keyIDParam()], result.kms.KeyID())
+}
+
+// The predecessor writes the pointer last, so a candidate polling mid-commit sees
+// the artifacts beside it half-written. It must keep waiting rather than die on
+// them, and once the pointer exists Boot still rejects the partial set.
+func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
+	setStateOriginTestEnv(t)
+	fx, boot := newCandidateBoot(t)
+	attestation := testCfg.migrationPreviousPCR0AttestationParam(fx.pcr0Hex)
+	fx.ssmf.params[attestation] = "handoff-in-progress"
+
+	_, err := boot.AwaitHandoff(contextFor(t, 50*time.Millisecond))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	fx.ssmf.params[fx.keyIDParam()] = "successor-key"
+	_, err = boot.AwaitHandoff(contextFor(t, 5*time.Second))
+	require.ErrorContains(t, err, "inconsistent migration predecessor artifacts")
 }
 
 // The intent log is host-writable, so a record naming this enclave proves
@@ -1646,54 +1683,45 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	_, err = boot.Boot(ctx)
+	_, err = boot.AwaitHandoff(contextFor(t, 50*time.Millisecond))
 
-	require.ErrorIs(t, err, errAwaitingHandoff)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-// A deployment whose state cannot be read is broken, not pending: the boot must
-// die rather than spin forever looking like a candidate.
+// A deployment whose state cannot be read is broken, not pending: the candidate
+// must die rather than spin forever looking like one.
 func TestAwaitHandoffDoesNotRetryFatalErrors(t *testing.T) {
 	setStateOriginTestEnv(t)
-	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
-	fx.sts.err = errors.New("sts unavailable")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	for _, tc := range []struct {
+		name string
+		fail func(*genesisFixture)
+		want string
+	}{
+		{
+			name: "commit pointer unreadable",
+			fail: func(fx *genesisFixture) { fx.ssmf.err = errors.New("ssm unavailable") },
+			want: "ssm unavailable",
+		},
+		{
+			name: "account identity unreadable",
+			fail: func(fx *genesisFixture) { fx.sts.err = errors.New("sts unavailable") },
+			want: "sts unavailable",
+		},
+		{
+			name: "genesis record unreadable",
+			fail: func(fx *genesisFixture) { fx.s3f.listErr = errors.New("s3 unavailable") },
+			want: "s3 unavailable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx, boot := newCandidateBoot(t)
+			tc.fail(fx)
 
-	boot, err := NewBoot(
-		testConfigWithPreviousPCR0(strings.Repeat("99", 48)),
-		fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f,
-	)
-	require.NoError(t, err)
+			_, err := boot.AwaitHandoff(contextFor(t, 5*time.Second))
 
-	_, err = boot.AwaitHandoff(ctx)
-
-	require.ErrorContains(t, err, "sts unavailable")
-	require.NotErrorIs(t, err, context.DeadlineExceeded)
-}
-
-func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
-	setStateOriginTestEnv(t)
-	source := strings.Repeat("ab", 48)
-	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
-	seedGenesisRecord(t, fx.s3f, source)
-	fx.ssmf.params[testCfg.kmsKeyIDParam(source)] = "predecessor-key"
-	fx.ssmf.params[testCfg.migrationPreviousPCR0AttestationParam(fx.pcr0Hex)] = "handoff-in-progress"
-	boot, err := NewBoot(
-		testConfigWithPreviousPCR0(source),
-		seededGenesisNSM{NSM: fx.nsm},
-		fx.kmsf,
-		fx.sts,
-		fx.ssm,
-		fx.s3f,
-	)
-	require.NoError(t, err)
-	_, err = boot.Boot(context.Background())
-	require.ErrorIs(t, err, errAwaitingHandoff)
-	// Once committed, partial artifacts must still fail validation.
-	fx.ssmf.params[testCfg.kmsKeyIDParam(fx.pcr0Hex)] = "successor-key"
-	_, err = boot.Boot(context.Background())
-	require.Error(t, err)
-	require.NotErrorIs(t, err, errAwaitingHandoff)
+			require.ErrorContains(t, err, tc.want)
+			require.NotErrorIs(t, err, context.DeadlineExceeded)
+		})
+	}
 }

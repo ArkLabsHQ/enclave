@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -50,11 +49,6 @@ const (
 	handoffPollMin = time.Second
 	handoffPollMax = 30 * time.Second
 )
-
-// errAwaitingHandoff means this enclave holds no state and is not permitted to
-// create the deployment: it is a candidate, and must wait for a predecessor to
-// commit to it. Distinct from every other boot failure, which stays fatal.
-var errAwaitingHandoff = errors.New("awaiting migration handoff")
 
 // bootResult is the boot machine's terminal state
 type bootResult struct {
@@ -216,31 +210,57 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 	return b.establish(ctx, planned, kms)
 }
 
-// AwaitHandoff boots, waiting rather than failing while this enclave is a
-// candidate. Only errAwaitingHandoff waits; every other failure is fatal, so a
-// genuinely broken enclave still dies loudly instead of hanging. There is
-// deliberately no timeout: a candidate legitimately sits until a predecessor
-// migrates to it, and giving up would only force a fresh challenge exchange
-// after a needless restart.
+// AwaitHandoff boots, holding the enclave as a candidate while the deployment
+// exists but nothing is committed at KMSKeyID/<pcr0> yet. The wait sits in
+// front of Boot and plans nothing: once it ends, Boot sees exactly the state it
+// would have seen had this enclave been started after the commit. Every read
+// failure is fatal, so a genuinely broken enclave still dies loudly instead of
+// hanging. There is deliberately no timeout: a candidate legitimately sits until
+// a predecessor migrates to it, and giving up would only force a fresh challenge
+// exchange after a needless restart.
 func (b *Boot) AwaitHandoff(ctx context.Context) (bootResult, error) {
-	backoff := handoffPollMin
-	for {
-		result, err := b.Boot(ctx)
-		if !errors.Is(err, errAwaitingHandoff) {
-			return result, err
-		}
+	// The predecessor writes this pointer last, so the handoff artifacts beside
+	// it may still be half-written while it is absent. Nothing else in this
+	// enclave's scope is read until it exists.
+	pointer := b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0))
+	keyID, err := b.ssm.MayGet(ctx, pointer)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+	}
+	if keyID != "" {
+		return b.Boot(ctx)
+	}
 
-		if backoff == handoffPollMin {
-			slog.Info("candidate: awaiting migration handoff")
-		}
+	// A deployment with no genesis record has nobody to hand over from; whether
+	// to create it is Boot's decision.
+	bucket, err := b.migrationIntentBucket(ctx)
+	if err != nil {
+		return bootResult{}, err
+	}
+	genesis, err := newGenesisLog(b.cfg, b.s3, b.nsm, bucket)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("failed to open deployment genesis log: %w", err)
+	}
+	artifact, err := genesis.Genesis(ctx)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("failed to read deployment genesis: %w", err)
+	}
+	if artifact == nil {
+		return b.Boot(ctx)
+	}
 
+	slog.Info("candidate: awaiting migration handoff", "pointer", pointer)
+	for backoff := handoffPollMin; keyID == ""; backoff = min(backoff*2, handoffPollMax) {
 		select {
 		case <-ctx.Done():
 			return bootResult{}, ctx.Err()
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, handoffPollMax)
+		if keyID, err = b.ssm.MayGet(ctx, pointer); err != nil {
+			return bootResult{}, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+		}
 	}
+	return b.Boot(ctx)
 }
 
 // plan decides, once, which of the three boots this is.
@@ -261,10 +281,17 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 		return nil, fmt.Errorf("failed to open deployment genesis log: %w", err)
 	}
 
+	predecessorPCR0, predecessorKMSKeyID, predecessorAttestation, err := b.loadPredecessor(ctx)
+	if err != nil {
+		return nil, err
+	}
 	state := bootState{
-		cfg:         b.cfg,
-		currentPCR0: append([]byte(nil), b.pcr0...),
-		metadata:    metadata,
+		cfg:                    b.cfg,
+		currentPCR0:            append([]byte(nil), b.pcr0...),
+		metadata:               metadata,
+		predecessorPCR0:        predecessorPCR0,
+		predecessorKMSKeyID:    predecessorKMSKeyID,
+		predecessorAttestation: predecessorAttestation,
 		snapshot: bootSnapshot{
 			ownerPCR0:                 hex.EncodeToString(b.pcr0),
 			migrationIntentBucketName: migrationIntentBucketName,
@@ -296,28 +323,15 @@ func (b *Boot) determineMode(
 
 	state.kmsKeyID = keyID
 
-	if genesisArtifact != nil && keyID == "" {
-		// The deployment exists but nothing is committed for this PCR0 yet. An
-		// image that names a predecessor is a candidate and waits for it to
-		// commit; any other image here is misconfigured.
-		if b.cfg.PreviousPCR0 != "" && b.cfg.PreviousPCR0 != "genesis" {
-			return nil, errAwaitingHandoff
-		}
+	if genesisArtifact == nil {
+		return &genesisBoot{genesis: genesis}, nil
+	}
+
+	if keyID == "" {
 		return nil, fmt.Errorf(
 			"deployment genesis is recorded but %s holds no key",
 			b.cfg.kmsKeyIDParam(ownPCR0),
 		)
-	}
-
-	// Read predecessor artifacts only after checking the handoff commit.
-	state.predecessorPCR0, state.predecessorKMSKeyID, state.predecessorAttestation, err = b.loadPredecessor(
-		ctx,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if genesisArtifact == nil {
-		return &genesisBoot{genesis: genesis}, nil
 	}
 
 	state.bootReceipt, err = b.ssm.MayGet(ctx, b.cfg.stateOriginReceiptParam(keyID, ownPCR0))

@@ -7,16 +7,14 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
 )
 
 func TestFetchOrCreatePrimaryKMS(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "kms")
-	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	pcr0Hex := hex.EncodeToString(pcr0)
@@ -28,6 +26,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 
 		got, err := FetchOrCreatePrimaryKMS(
 			ctx,
+			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
@@ -47,6 +46,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
+			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
@@ -68,6 +68,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
+			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{},
@@ -82,6 +83,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 
 		got, err := FetchOrCreatePrimaryKMS(
 			ctx,
+			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
 			&fakeSTS{arn: testRoleARN},
@@ -102,7 +104,12 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 func TestKMSRecipientOperations(t *testing.T) {
 	ctx := context.Background()
 	newKMS := func(t *testing.T) *kmsW {
-		return &kmsW{nsm: kmsTestNSMWithRecipient(t), kms: newFakeKMS(), keyID: "key-crypto"}
+		return &kmsW{
+			cfg:   testCfg,
+			nsm:   kmsTestNSMWithRecipient(t),
+			kms:   newFakeKMS(),
+			keyID: "key-crypto",
+		}
 	}
 
 	t.Run("encrypt decrypt round trip", func(t *testing.T) {
@@ -146,15 +153,12 @@ func TestKMSRecipientOperations(t *testing.T) {
 }
 
 func TestCreateMigrationKMS(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "kms")
-	t.Setenv("ENCLAVE_KMS_KEY_LOCKED", "true")
-
 	ctx := context.Background()
 	curPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	newPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
 	kmsf := newFakeKMS()
 	primary := &kmsW{
+		cfg:   testCfg,
 		nsm:   kmsTestNSMWithPCR0(t, curPCR0),
 		kms:   kmsf,
 		sts:   &fakeSTS{arn: testRoleARN},
@@ -202,4 +206,78 @@ func kmsTestNSMWithRecipient(t *testing.T) NSM {
 			), nil
 		},
 	}}}
+}
+
+func TestKeyState(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     kmstypes.KeyState
+		wantState string
+	}{
+		{"enabled", kmstypes.KeyStateEnabled, keyStateExists},
+		{"disabled", kmstypes.KeyStateDisabled, keyStateExists},
+		{"creating", kmstypes.KeyStateCreating, keyStateExists},
+		{"updating", kmstypes.KeyStateUpdating, keyStateExists},
+		{"unavailable", kmstypes.KeyStateUnavailable, keyStateExists},
+		{"pending import", kmstypes.KeyStatePendingImport, keyStateExists},
+		{"pending deletion", kmstypes.KeyStatePendingDeletion, keyStatePendingDeletion},
+		{
+			"pending replica deletion", kmstypes.KeyStatePendingReplicaDeletion,
+			keyStatePendingDeletion,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeKMS()
+			fake.keyStates = map[string]*kmstypes.KeyMetadata{
+				"key-1": {
+					KeyId: aws.String("key-1"), KeyState: tc.state,
+				},
+			}
+
+			got := (&kmsW{cfg: testCfg, kms: fake}).KeyState(context.Background(), "key-1")
+
+			require.Equal(t, tc.wantState, got)
+			require.Equal(t, 1, fake.describeCalls)
+		})
+	}
+}
+
+func TestKeyStateDeleted(t *testing.T) {
+	fake := newFakeKMS()
+
+	got := (&kmsW{cfg: testCfg, kms: fake}).KeyState(context.Background(), "gone")
+
+	require.Equal(t, keyStateDeleted, got)
+	require.Equal(t, 1, fake.describeCalls)
+}
+
+func TestKeyStateUnknown(t *testing.T) {
+	t.Run("missing metadata", func(t *testing.T) {
+		fake := newFakeKMS()
+		fake.putKey("key-1", "{}")
+		fake.describeNilMetadata = true
+
+		got := (&kmsW{cfg: testCfg, kms: fake}).KeyState(context.Background(), "key-1")
+
+		require.Equal(t, keyStateUnknown, got)
+	})
+
+	t.Run("describe error", func(t *testing.T) {
+		fake := newFakeKMS()
+		fake.describeErr = &kmstypes.KMSInvalidStateException{Message: aws.String("bad state")}
+
+		got := (&kmsW{cfg: testCfg, kms: fake}).KeyState(context.Background(), "key-1")
+
+		require.Equal(t, keyStateUnknown, got)
+	})
+
+	t.Run("empty key ID", func(t *testing.T) {
+		fake := newFakeKMS()
+
+		got := (&kmsW{cfg: testCfg, kms: fake}).KeyState(context.Background(), "")
+
+		require.Equal(t, keyStateUnknown, got)
+		require.Zero(t, fake.describeCalls)
+	})
 }

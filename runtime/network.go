@@ -37,7 +37,7 @@ func StartNetorking(ctx context.Context, cfg Config) error {
 	}
 
 	if nitriding.InEnclave() {
-		if err := nitriding.SetFdLimit(cfg.FdCur, cfg.FdMax); err != nil {
+		if err := nitriding.SetFdLimit(0, 0); err != nil {
 			slog.Warn("set fd limit", "error", err)
 		}
 		if err := nitriding.ConfigureLoIface(); err != nil {

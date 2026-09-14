@@ -10,9 +10,8 @@ The repository exports `lib.buildEif` for constructing enclave images, packages
 the runtime and client CLI, provides a  development shell, and includes NixOS tests
 that exercise the runtime against an AWS emulator under nested KVM.
 
-Supported systems for the runtime, enclave images, and checks are `x86_64-linux`
-and `aarch64-linux`. The CLI and client library additionally build on
-`aarch64-darwin` and `x86_64-darwin`.
+The runtime, enclave images, and checks support `x86_64-linux`. The CLI and
+development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 
 ## Contents
 
@@ -98,7 +97,7 @@ Provide the resulting EIF to a Nitro-capable host that satisfies the
 client:
 
 ```sh
-nix run github:ArkLabsHQ/enclave -- curl /v1/enclave-info \
+nix run github:ArkLabsHQ/enclave -- curl /enclave/v1/info \
   --base-url https://enclave.example.com \
   --expected-pcr0 "$(jq -r .PCR0 result/pcr.json)"
 ```
@@ -158,31 +157,47 @@ under a KMS key that only the measured enclave can use.
 - Because the pointer is PCR0-scoped, a handoff writes only into the successor's
   scope. The predecessor's own pointer, key, and ciphertexts are never touched,
   so it stays able to serve and to reboot for as long as you keep it.
+- At genesis, an immutable, attested `deployment-genesis` object naming the
+  creating enclave's PCR0 is the final commit record. Before writing it, genesis
+  claims its own `KMSKeyID/<pcr0>` with a create-only write.
+- Genesis is not a migration intent. It shares the bucket with the migration
+  intent log and nothing else: it is deployment-wide rather than scoped to one
+  PCR0, it never forms a sequence, and it is written once and never revised.
 
 ### Boot paths
 
 Every enclave boots into **candidate**: NSM, attestation and the migration
 control path are up, but there is no canonical state, no static secrets and no
 application. It leaves candidate only by obtaining state. A genesis or resuming
-enclave passes through in a single SSM read; a successor stays until its
-predecessor commits.
+enclave passes straight through; a successor stays until its predecessor
+commits.
+
+Whether a deployment already exists is decided by the Object-Locked
+`deployment-genesis` object, not by SSM alone. That key is fixed and
+identity-independent, so any enclave's genesis vetoes every later one. The
+preceding create-only SSM write prevents two enclaves from claiming
+different keys even if a lease expires between verification and commit.
 
 | Condition | Path | Behaviour |
 |---|---|---|
+| genesis object absent and `KMSKeyID/<pcr0>` absent | genesis | Requires no predecessor artifacts. Creates the key and snapshot, writes the receipt, claims `KMSKeyID/<pcr0>` without overwrite, then conditionally creates the immutable genesis object. |
 | `KMSKeyID/<pcr0>` present and a state-origin receipt exists for this PCR0 | resume | Verifies its own receipt, decrypts state, writes nothing. |
-| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies that the recorded predecessor is the one baked into its own measurement, that predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, and the transition receipt before decrypting. Then writes its own state-origin receipt. |
-| `KMSKeyID/<pcr0>` absent and `ENCLAVE_PREVIOUS_PCR0=genesis` | genesis | Requires no predecessor artifacts. Creates the key, generates the DEK and secrets, writes a state-origin receipt, then commits `KMSKeyID/<pcr0>`. |
-| `KMSKeyID/<pcr0>` absent and `ENCLAVE_PREVIOUS_PCR0` names a predecessor | remains candidate | Waits, indefinitely, for that predecessor to commit to it. |
+| `KMSKeyID/<pcr0>` present, no receipt for this PCR0, but a migration transition receipt and predecessor artifacts exist | adopt | Verifies the predecessor's attestation, the PCR31 commitment to its own PCR0, the KMS key policy, the transition receipt, the predecessor's migration intent, and last that the predecessor is the one `ENCLAVE_PREVIOUS_PCR0` committed to in the EIF — all before decrypting. Then writes its own state-origin receipt. |
+| genesis object present, `KMSKeyID/<pcr0>` absent, and `ENCLAVE_PREVIOUS_PCR0` names a predecessor | remains candidate | Waits, indefinitely, for that predecessor to commit to it. |
+| genesis object present, `KMSKeyID/<pcr0>` absent, and `ENCLAVE_PREVIOUS_PCR0` is `genesis` or empty | fatal | The committed key claim was deleted; recovery is deliberately not automatic. |
+| genesis object absent and `KMSKeyID/<pcr0>` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
-A candidate serves a self-signed certificate so it stays observable, reports
-`status: "candidate"` on `/v1/enclave-info`, and answers `503` on `/health` and
-on any application path. It promotes in place when its commit pointer appears —
-no restart, and no action by the host.
+A candidate serves an ephemeral self-signed certificate so it stays observable.
+That certificate is not the persisted TLS key and is not bound into the
+attestation, so no client can pin a candidate. It reports `status: "candidate"`
+on `/enclave/v1/info`, and answers `503` on `/health` and on any application
+path. It promotes in place when its commit pointer appears — no restart, and no
+action by the host.
 
 Boot order is fixed and every step is fatal: clock synchronisation against
-`/dev/ptp0`, networking, AWS clients, telemetry, attestation signer, HTTP
-servers, state establishment, PCR extension, TLS, SSM
-environment overlay, static secret export, then exec of the application.
+`/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
+establishment, PCR extension, TLS, SSM environment overlay, static secret export,
+then exec of the application.
 
 ## Nix API
 
@@ -196,7 +211,7 @@ Arguments:
 
 ```nix
 {
-  pkgs,                  # package set
+  pkgs,                  # x86_64-linux package set
   app,                   # package; executable selected with pkgs.lib.getExe
   env,                   # environment baked into the measurement
   extraPackages ? [ ],   # additional packages in the enclave rootfs
@@ -209,6 +224,8 @@ Produces a derivation containing `image.eif` and `pcr.json`.
   `app.meta.mainProgram` when it differs from the package name. The executable
   is copied under `/app`, and `APP_BINARY_NAME` is injected automatically.
 - `env` is part of the measurement. Changing any value changes PCR0.
+  `buildEif` does not currently validate runtime configuration; missing or invalid
+  required values fail when the EIF boots.
 - The rootfs contains the system CA store and nothing else by default. The
   runtime never shells out. Applications that need `/bin/sh` or other utilities
   must request them: `extraPackages = [ pkgs.busybox ]`.
@@ -219,7 +236,7 @@ The flake also exposes these packages:
 
 | Package | Systems | Purpose |
 |---|---|---|
-| `runtime` | Linux | The runtime executable embedded by `buildEif`. |
+| `runtime` | `x86_64-linux` | The runtime executable embedded by `buildEif`. |
 | `cli`, `default` | Linux and Darwin | The `enclave` client CLI. |
 
 For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
@@ -239,10 +256,11 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_DEPLOYMENT` | `dev` | First SSM path segment. The value `dev` disables COSE signature verification of attestation documents. See [Security notes](#security-notes). |
-| `ENCLAVE_APP_NAME` | `app` | Second SSM path segment. |
-| `ENCLAVE_PREVIOUS_PCR0` | none | Required. Either the literal `genesis`, or the predecessor's PCR0 when adopting migrated state. Unset fails the boot. Measured and not SSM-overridable. |
-| `ENCLAVE_KMS_KEY_LOCKED` | `false` | When `true`, the KMS key policy omits the root recovery principal and the SSM namespace segment becomes `locked` instead of `unlocked`. |
+| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
+| `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
+| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
+way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
+| `ENCLAVE_PREVIOUS_PCR0` | empty | The predecessor this image may adopt state from, or the literal `genesis` for an image that only ever genesises. An image naming a predecessor boots as a candidate once the deployment exists. Measured and not SSM-overridable. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
 
@@ -250,29 +268,44 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_NITRIDING_EXT_PORT` | `443` | External TLS listener. |
-| `ENCLAVE_NITRIDING_INT_PORT` | `8080` | Internal loopback API listener. |
 | `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
-| `ENCLAVE_NITRIDING_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
-| `ENCLAVE_NITRIDING_FQDN` | `localhost` | Hostname for the TLS certificate. |
-| `ENCLAVE_NITRIDING_HOST_PROXY_PORT` | `1024` | Host vsock port where gvproxy listens. |
-| `ENCLAVE_NITRIDING_DEBUG` | `false` | Reported by `GET /enclave/config`. |
+| `ENCLAVE_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
+| `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
 | `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
 | `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
 
+The external TLS listener (443), the internal loopback listener (8080) and the
+host vsock port gvproxy listens on (1024) are fixed. The last of those is
+hardcoded on the host side too, so a value only the enclave knew about would
+silently break networking.
+
 ### Migration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `ENCLAVE_MIGRATION_COOLDOWN` | `0` | Minimum interval between a candidate's attestation being adopted and the handoff committing. The window in which an abort can be written. A negative or unparseable value fails the boot. |
-| `ENCLAVE_MIGRATION_INTENT_RETENTION` | `87600h` (10 years) | S3 Object Lock retention applied to each migration intent record. |
+The S3 Object Lock retention on each migration intent record is not
+configurable: ten years in production, ten minutes under `ENCLAVE_DEV`. An
+operator who could shorten it could wait out the Object Lock and roll back
+undetected, so the measured image settles it. The cooldown between a candidate's
+attestation being adopted and the handoff committing — the window in which an
+abort can be written — is 24 hours in production and two seconds under
+`ENCLAVE_DEV`, and is the one setting here an operator may override, with
+`ENCLAVE_MIGRATION_COOLDOWN` baked into the image.
+
+A successor ignores any intent record that is not retained under compliance
+mode, and any whose retain-until date does not cover the configured retention.
+Governance mode is refused because a caller holding
+`s3:BypassGovernanceRetention` can delete such an object, so it proves nothing
+about what was published. The retention check allows for upload delay and for
+skew between the writer's clock and the `LastModified` S3 stamps, using a fixed
+security-profile budget: two minutes in development, ten in production. It has
+no environment-variable override.
 
 ### Clock
 
-| Variable | Default | Purpose |
-|---|---|---|
+Production fails the boot unless the system clock source is `kvm-clock`. Under
+`ENCLAVE_DEV` the assertion is skipped, because the QEMU harness boots without
+the paravirtualized clock.
 
 The runtime hard-steps the clock onto the PTP hardware clock at startup, then
 runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
@@ -282,14 +315,18 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_LOG_CLOUDWATCH` | `false` | Ship logs and traces to CloudWatch Logs. |
-| `ENCLAVE_LOG_BUFFER_SIZE` | `1000` | In-memory log ring buffer capacity. |
-| `ENCLAVE_SPAN_BUFFER_SIZE` | `1000` | In-memory span ring buffer capacity. |
-| `ENCLAVE_LOG_SHIP_INTERVAL` | `5s` | Flush cadence. Batches also flush at 100 events. |
+| `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
+| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
 
-Log groups are `/enclave/<deployment>/<app>/logs` and
-`/enclave/<deployment>/<app>/traces`.
+Log groups are `/enclave/<deployment>/<app>/logs`,
+`/enclave/<deployment>/<app>/traces` and `/enclave/<deployment>/<app>/metrics`.
+
+Events timestamped more than an hour from now, either direction, are dropped on
+arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS
+requires. The narrow timestamp window keeps normally produced batches well
+inside the 24-hour span `PutLogEvents` rejects wholesale. An application that
+deliberately ships backdated telemetry will lose it.
 
 ### AWS endpoint overrides
 
@@ -330,11 +367,12 @@ Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Seven names are refused, because they define the enclave's identity or security
-posture and can only be changed by rebuilding: `ENCLAVE_DEPLOYMENT`,
-`ENCLAVE_APP_NAME`, `ENCLAVE_KMS_KEY_LOCKED`,
-`ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_MIGRATION_INTENT_RETENTION`,
-`ENCLAVE_SECRETS_CONFIG`, `ENCLAVE_PREVIOUS_PCR0`.
+Seven names are refused, because they define the enclave's identity, its lineage
+or its security posture and can only be changed by rebuilding:
+`ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
+`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
+`ENCLAVE_PREVIOUS_PCR0`. The lock posture and the intent retention left the list
+by ceasing to be configuration at all — `ENCLAVE_DEV` settles them.
 
 Five TLS and ACME settings are read **only** from this overlay, never from the
 baked environment, because TLS is configured before the overlay is applied to
@@ -342,14 +380,15 @@ the application:
 
 | Parameter under `/<deployment>/<app>/env/` | Purpose |
 |---|---|
-| `ENCLAVE_NITRIDING_FQDN` | Certificate hostname. |
-| `ENCLAVE_NITRIDING_USE_ACME` | `true` switches from self-signed to ACME. |
-| `ENCLAVE_NITRIDING_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
-| `ENCLAVE_NITRIDING_ACME_EMAIL` | ACME account contact. |
-| `ENCLAVE_NITRIDING_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_FQDN` | Certificate hostname. |
+| `ENCLAVE_USE_ACME` | `true` switches from self-signed to ACME. |
+| `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
+| `ENCLAVE_ACME_EMAIL` | ACME account contact. |
+| `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
 
-With ACME enabled the certificate cache is stored in the TLS cache bucket,
-encrypted under the storage DEK.
+The TLS key is generated at genesis, encrypted with KMS, and included in the
+state root. Renewed certificates reuse it. The certificate bucket stores the
+certificate and, when ACME is enabled, the ACME account key.
 
 ### Application process environment
 
@@ -372,18 +411,20 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 
 | Path | Written by | Purpose |
 |---|---|---|
-| `/D/A/TLSCacheBucketName` | operator | ACME certificate cache bucket. |
-| `/D/A/MigrationIntentBucketName` | operator | Object-Locked intent log bucket. |
+| `/D/A/CertBucketName` | operator | Shared certificate and ACME account-key bucket. |
+| `/D/A/LeaseBucketName` | operator | Ephemeral coordination lease bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
 | `/D/A/L/KMSKeyID/<pcr0>` | runtime | Atomic commit point for the enclave measuring `<pcr0>`. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
+| `/D/A/L/TLSKey/Ciphertext/<keyID>` | runtime | Encrypted TLS key. |
 | `/D/A/L/<secret>/Ciphertext/<keyID>` | runtime | Encrypted static secret. |
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
-| `/D/A/MigrationStateOriginReceipt/<keyID>` | runtime | Predecessor's attestation over the successor's state. |
+| `/D/A/MigrationStateOriginReceipt/<keyID>/<pcr0>` | runtime | Predecessor's attestation over the successor's state. Written create-only. |
 | `/D/A/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge published by a predecessor, rotated every minute. |
 | `/D/A/SuccessorAttestation/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
 | `/D/A/MigrationAbort/<sourcePCR0>` | operator | Naming the pending target PCR0 cancels the handoff during the cooldown. |
 | `/D/A/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
+| `/D/A/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Predecessor KMS key ID, committed into the successor's state root. |
 | `/D/A/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
 
 Every runtime-written path is scoped by a key ID, a PCR0, or both, so nothing is
@@ -391,40 +432,87 @@ ever overwritten. Each handoff therefore adds a generation rather than replacing
 one; prune retired generations only once you are certain you will never boot
 their PCR0 again.
 
+`KMSKeyID/<pcr0>` and both state-origin receipts are written create-only, so the
+storage layer refuses a replacement rather than relying on the writer to check
+first.
+
+Each state-origin receipt includes the generation's KMS key ID and its
+predecessor's PCR0 and KMS key ID. The audit follows those attested links without
+loading the generations' ciphertexts.
+
 ## HTTP API
 
 ### External listener, TCP :443
 
-TLS 1.2 minimum. Every non-gRPC response carries `X-Attestation-Signature` and
-`X-Attestation-Pubkey`, a BIP-340 Schnorr signature over the SHA-256 of the
-response body. `/v1/*` responses also carry permissive CORS headers.
+TLS 1.2 minimum. HTTP and gRPC clients authenticate the enclave by verifying its
+PCRs and pinning the live TLS public key to the PublicKey hash in the attestation document.
+`/enclave/*` responses also carry permissive CORS headers, and an `OPTIONS`
+preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. |
-| GET | `/enclave` | none | Human-readable index. |
-| GET | `/enclave/config` | none | Effective runtime configuration as JSON. |
-| GET | `/v1/enclave-info` | none | Version, PCR0, predecessor PCR0 and attestation, attestation public key, migration status, application status. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` or `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
-| GET | `/v1/enclave-metrics` | none | Metric snapshot. |
-| GET | `/v1/enclave-logs` | none | Buffered logs. Accepts `since`, `level`, `limit`. |
-| GET | `/v1/enclave-traces` | none | Buffered spans. Accepts `since`, `limit`, `service`. |
-| POST | `/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
-| POST | `/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
-| POST | `/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
-| any | everything else | none | Reverse-proxied to the application. |
+| POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
+| POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
+| POST | `/enclave/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
+| any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
+
+Telemetry is ingest-only. It ships to CloudWatch and is never read back through
+the runtime, so a compromised enclave has no history to serve.
 
 Bearer endpoints expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`.
+
+The complete `/enclave` namespace is reserved for runtime APIs. Unknown
+non-preflight paths beneath it return the runtime's `404` response, and no
+request in that namespace is proxied to the application. A request to the bare
+`/enclave` is redirected to `/enclave/`, which then returns that `404`.
 
 `/health` reports ready as soon as the application process has been started,
 which is marginally before it binds its port. Readiness probes should target an
 application endpoint.
 
+#### Ancestor-key audit
+
+Each generation mints its own KMS key and migration is strictly additive, so a
+retired generation keeps a key that can still decrypt state until an operator
+deletes it. The `ancestry` block of `/enclave/v1/info` reports what became of
+those keys, newest first.
+
+`complete` is true only when every state-origin receipt verifies and the walk
+reaches a receipt with no predecessor. Missing, altered, malformed or
+cyclic state makes it false and `reason` explains the failure without exposing
+the underlying AWS error. The genesis generation is not repeated separately:
+it is the final verified state-origin receipt in the chain.
+
+| `state` | Meaning |
+|---|---|
+| `exists` | `DescribeKey` reports that the key is present and not scheduled for deletion. |
+| `pending_deletion` | Deletion is scheduled. |
+| `deleted` | KMS no longer knows the key. This generation can no longer decrypt anything. |
+| `unknown` | The state could not be read. The cause is logged, not published: the AWS error names role ARNs and account IDs, and this endpoint is unauthenticated. |
+
+`unknown` never means deleted. Only KMS reporting the key as absent produces
+`deleted`, so a permissions failure or a KMS outage can never be read as proof
+that a retired generation was retired.
+
+The block is a cached snapshot, rebuilt once at boot and then daily: `checked_at`
+is when it was built, and is `null` before the first probe completes. Reading it
+never calls SSM or KMS, so the endpoint cannot be made slow or unavailable by
+either.
+
+The chain has no length cap. A corrupt chain still terminates: a repeated
+PCR0/key identity stops the walk and is reported through `complete` and
+`reason`.
+
 ### Internal listener, TCP 127.0.0.1:8080
 
-Serves `/v1/*` and `/health` only, with the same handlers and authentication.
+Serves `/v1/metrics`, `/v1/logs`, `/v1/traces`, and `/health` only, with the
+same handlers and authentication. The HTTP method selects metric, log, and trace
+ingest (POST) or readback (GET).
 This is the endpoint advertised to the application through
-`ENCLAVE_PROXY_PORT`. It does not serve `/v1/enclave-info`, the `/enclave/*`
+`ENCLAVE_PROXY_PORT`. It does not serve `/enclave/v1/info`, the `/enclave/*`
 endpoints, or the application proxy.
 
 ## Deployment
@@ -447,36 +535,49 @@ interfaces.
 
 ### AWS requirements
 
-Create a private S3 bucket for the ACME cache and a separate private S3 bucket
-for migration intents. The intent bucket must have versioning and Object Lock
-enabled when it is created; the runtime applies retention to each intent object.
-Write their names to these SSM parameters:
+Create a private S3 bucket for shared certificate state and write its name to
+`/<deployment>/<app>/CertBucketName`. Create a separate private S3 bucket for
+ephemeral coordination leases and write its name to
+`/<deployment>/<app>/LeaseBucketName`.
+
+The migration intent bucket is **not** configured. Its name is derived, so no
+parameter a host can rewrite decides where deployment state is looked for:
 
 ```text
-/<deployment>/<app>/TLSCacheBucketName
-/<deployment>/<app>/MigrationIntentBucketName
+enclave-<account-id>-<sha256(deployment \x00 app)[:8]>-migration-intents
 ```
+
+Provisioning must create exactly that bucket, with versioning and Object Lock
+enabled at creation, before the enclave first boots; the runtime only reads and
+writes it. The digest keeps its name inside S3's 63-character limit and its
+character rules whatever the deployment and application are called, and the
+account ID keeps two AWS accounts off the same globally unique name.
 
 AWS credentials delivered through IMDS must allow:
 
 | Statement | Permissions |
 |---|---|
-| `S3TLSCacheReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the TLS cache bucket. |
-| `S3MigrationIntentLogObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the intent log bucket. |
+| `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
+| `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
-| `KMSAccess` | `CreateKey`, `TagResource`. |
+| `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | When CloudWatch logging is enabled: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents`, `PutRetentionPolicy`, `FilterLogEvents`, `DescribeLogStreams` on `/enclave/*`. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/enclave/*`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned
 policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
+`DescribeKey` is read-only metadata and grants nothing over ciphertext. It exists
+so a running enclave can report whether its ancestors' keys have been deleted;
+host credentials still cannot read enclave state with it.
+
 `/<deployment>/<app>/<locked|unlocked>/KMSKeyID/<pcr0>` is owned exclusively by
-the runtime. Do not pre-create or declaratively manage it: the runtime writes it
-last to commit genesis and migration transitions, and a pre-existing value makes
-the runtime refuse to finalise a handoff onto that PCR0.
+the runtime. Do not pre-create or declaratively manage it. Genesis claims it
+create-only, immediately before writing the `deployment-genesis` object;
+migration finalisation writes it last, as the atomic commit. A pre-existing value
+makes the runtime refuse to finalise a handoff onto that PCR0.
 
 ## Blue/green migration
 
@@ -509,6 +610,10 @@ If two candidates answer the same challenge the predecessor records nothing and
 keeps serving: an ambiguous round is nobody's intent. Remove the extra candidate
 and the next round proceeds.
 
+Predecessor replicas sharing a PCR0 share one challenge parameter and one intent
+chain. Whichever replica's challenge a candidate answered records the intent;
+every replica then drives the same intent to its commit.
+
 Nothing here is reversible and nothing needs to be. The predecessor keeps its own
 key, ciphertexts, and commit pointer throughout, so if the successor turns out to
 be bad you keep serving from the predecessor and never shift traffic. There is no
@@ -525,9 +630,9 @@ The order is:
 3. The predecessor adopts it. It verifies the document's signature and chain,
    that its nonce is the challenge it published, and that its `user_data` claims
    this deployment; it then takes the target PCR0 **from the document** and
-   writes an Object-Locked record to the intent log.
+   writes an Object-Locked record to the intent log. It cannot be deleted.
 
-   Confirm it is the successor you meant: `/v1/enclave-info` on the predecessor
+   Confirm it is the successor you meant: `/enclave/v1/info` on the predecessor
    reports `migration.target_pcr0`. The candidate reports the same handoff as
    `candidate.awaiting_handoff_from` — informational only, since the intent log
    is host-writable.
@@ -540,31 +645,84 @@ The order is:
    static secret under it, writes its post-PCR31 attestation and the transition
    receipt, then writes `KMSKeyID/<successor PCR0>` last.
 
-   Committing is not a no-op if repeated: a second run would mint another key and
-   try to repoint the successor at it. The final `KMSKeyID` write is therefore an
-   atomic create-only SSM operation. When predecessor replicas race, exactly one
-   can commit; every loser observes an already-finalised migration and cannot
-   displace the generation the successor may already be running.
+   Committing is not idempotent by design. If `KMSKeyID/<successor PCR0>`
+   already holds a value the predecessor refuses to commit again, so a retry can
+   never mint a second key and displace a generation the successor may already
+   be running.
+
+   `KMSKeyID/<successor PCR0>` is written create-only, and that write is the
+   handoff's commitment point. It is what makes the refusal above hold between
+   independent enclaves rather than only within one process: when predecessor
+   replicas sharing a PCR0 commit the same intent concurrently, exactly one write
+   succeeds and every loser observes an already-finalised migration. Everything
+   written earlier in the step lives under a KMS key ID minted by that attempt
+   alone, so a loser — or an attempt that dies partway — leaves only unreachable
+   orphans: one KMS key and a few SSM parameters that nothing resolves. Retry is
+   always safe, since the next attempt mints a fresh key and writes a disjoint
+   set of paths.
+
+   An abort recorded after this write has committed does not retract the
+   handoff. The intent log governs whether a migration may begin; the pointer is
+   what makes it real.
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that
    `KMSKeyID/<predecessor PCR0>` is unchanged. The first is the commit; the
    second is the guarantee that the predecessor is still intact.
-7. The successor promotes itself. It notices its commit pointer, checks that the
-   recorded predecessor matches the PCR0 baked into its own measurement, verifies
-   that predecessor's attestation, the PCR31 commitment to its own PCR0, the key
-   policy and the transition receipt, then adopts the state — in the same
-   process, without a restart and without the host doing anything.
-8. Confirm adoption on the successor's `/v1/enclave-info`: `status` is `ready`,
-    `previous_pcr0` equals the predecessor PCR0,
-    `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
-    the successor's own PCR0.
+7. The successor promotes itself. It notices its commit pointer, then verifies
+   the predecessor attestation, the PCR31 commitment, the key policy, the
+   transition receipt, the predecessor's intent, and last that the predecessor
+   named in SSM is the one its EIF committed to, before adopting the state — in
+   the same process, without a restart and without the host doing anything.
+8. Confirm adoption on the successor's `/enclave/v1/info`: `status` is `ready`,
+   `previous_pcr0` equals the predecessor PCR0,
+   `previous_pcr0_attestation` is non-empty, and `migration.source_pcr0` equals
+   the successor's own PCR0.
 9. Shift client traffic using the deployment system's normal routing mechanism.
 10. Keep both enclaves healthy for the soak period, then retire the predecessor.
     Its key and SSM generation stay live; leave them alone unless you are certain
     you will never boot that PCR0 again.
+11. If you do retire a generation's key, schedule its deletion out of band, then
+    poll the successor's `/enclave/v1/info` until that generation reports
+    `state: "deleted"` in the `ancestry` block. Responses on that route are
+    signed by the attestation-bound key, so that reading is the receipt that the
+    retired generation can no longer decrypt anything. Preserve its state-origin
+    receipt until the audit has verified the deletion; a missing receipt makes
+    the ancestry incomplete rather than proving retirement.
 
-Lock posture must not change across a handoff. `ENCLAVE_KMS_KEY_LOCKED` selects
-the `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
-different subtree, finds nothing, and fails to boot.
+Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
+`locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
+different subtree, finds nothing, and fails to boot. A production image can
+therefore never adopt a deployment created by a dev image, or the reverse.
+
+### Upgrading across the PCR0-scoped receipt change
+
+The transition receipt moved from `MigrationStateOriginReceipt/<keyID>` to
+`MigrationStateOriginReceipt/<keyID>/<pcr0>`. There is no fallback read, so
+**predecessor and successor images must both carry the change, or neither.** A
+handoff that straddles it writes the receipt where the successor will not look,
+and the successor fails to promote with `predecessor artifacts present but no
+migration transition receipt`.
+
+The same holds for the autonomous handoff itself. A predecessor that predates it
+never publishes a challenge, so a successor that has it waits as a candidate
+indefinitely; a predecessor that has it never hears from a successor that
+predates it.
+
+A straddled receipt does not fail loudly on the predecessor: it commits
+`KMSKeyID/<successor PCR0>` before the successor ever reads. The refusal only
+appears when the successor promotes, and the predecessor then declines to commit
+again because the pointer is already committed.
+
+Complete or abort in-flight migrations before upgrading. To recover a handoff
+that already straddled the change, delete the successor's committed pointer; the
+predecessor's intent is still eligible, so it commits again on its next round:
+
+```sh
+aws ssm delete-parameter --name "/<D>/<A>/<locked|unlocked>/KMSKeyID/<successor PCR0>"
+```
+
+This is safe only while the successor has never promoted — that pointer is the
+one thing standing between a successor and its state. The retry mints a fresh key
+and writes a disjoint generation; the abandoned one is orphaned, not reused.
 
 ## Verifying an enclave
 
@@ -589,12 +747,12 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, TLS pin, key binding, and response signature are still verified. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
 # Runtime and migration status.
-enclave curl /v1/enclave-info \
+enclave curl /enclave/v1/info \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 
 # Authenticated POST.
@@ -603,8 +761,8 @@ enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 ```
 
-The CLI exits non-zero if the response signature is missing or invalid, and if
-the HTTP status is 400 or above.
+The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
+status is 400 or above.
 
 ### Go client
 
@@ -625,11 +783,6 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Do, Get, and Post report signature failure through this field rather than
-// returning an error. Callers must check it.
-if !resp.SignatureVerified {
-    log.Fatal("enclave response signature missing or invalid")
-}
 if resp.StatusCode >= 400 {
     log.Fatalf("HTTP %d: %s", resp.StatusCode, resp.Body)
 }
@@ -637,7 +790,7 @@ if resp.StatusCode >= 400 {
 
 Methods: `Get`, `Post`, `Do`, `VerifyAttestation`, `GRPCConn`. Package
 functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
-`FetchManifest`, `VerifyManifestProvenance`.
+`FetchManifest`.
 
 | Option | Default | Effect |
 |---|---|---|
@@ -645,10 +798,8 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
-| `SkipKeyBinding` | `false` | Skips signing-key binding, and therefore response signature verification. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
 | `InsecureTLS` | unset | Removes the certificate pin entirely. |
-| `VerifyProvenance` | `false` | For `NewFromManifest`, checks that a GitHub attestation is registered for the manifest digest. |
 
 What is verified on the first request, and cached for `CacheTTL`:
 
@@ -657,20 +808,17 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| TLS leaf certificate SHA-256 matches the value in the attestation `user_data` | on | `InsecureTLS` |
+| `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
-| Attestation public key hashes to the `user_data` signing key hash | on | `SkipKeyBinding` |
-| Per-response Schnorr signature over the body | on | `SkipKeyBinding` |
 
 The certificate pin is installed from the attestation document before any
 request carrying data is made, so a request issued before verification completes
 fails closed.
 
-`GRPCConn` pins the leaf certificate but does not perform public CA validation
-and carries no per-response signature, because gRPC bypasses the response
-signing middleware. Applications serving gRPC must set
-`ENCLAVE_NITRIDING_UPSTREAM=h2c`.
+`GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
+but does not perform public CA validation. Applications serving gRPC must set
+`ENCLAVE_UPSTREAM=h2c`.
 
 ## Testing
 
@@ -680,7 +828,7 @@ nix flake check
 
 | Check | Purpose |
 |---|---|
-| `eif-build` | Portable check that builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
+| `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
 | `e2e` | x86-only runtime lifecycle across ordinary `aws`, `blue`, and `green` NixOS nodes: direct AWS setup, genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
 
 Unit tests are not flake checks. Run them with `make test`, or
@@ -689,8 +837,8 @@ available.
 
 ### Requirements
 
-`eif-build` runs on `x86_64-linux` and `aarch64-linux`. `e2e` is
-`x86_64-linux` only because QEMU's `nitro-enclave` machine type is x86_64 only.
+Both checks run on `x86_64-linux` only. The `e2e` check uses QEMU's
+x86_64-only `nitro-enclave` machine type.
 
 The e2e check needs a builder with:
 
@@ -735,10 +883,12 @@ AWS APIs, then controls node startup according to the runtime migration order.
 It does not simulate a deployment system, host image lifecycle, or traffic
 cutover.
 
-The test EIF sets `ENCLAVE_DEPLOYMENT=dev`, because QEMU's emulated NSM produces
-no AWS certificate chain, and `ENCLAVE_DEV=true`, which shortens the clock-sync
-poll interval from five minutes to five seconds. Neither changes the logic being
-tested.
+The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace. It separately
+sets `ENCLAVE_DEV=true` because QEMU's emulated NSM produces no AWS certificate
+chain and the harness has no paravirtualized clock. That one flag also gives the
+suite the short Object Lock retentions and two-second cooldown it needs to
+exercise a handoff in seconds rather than years; it is only for local testing
+against the emulator.
 
 ### Troubleshooting
 
@@ -768,28 +918,81 @@ should not be retried.
 
 ## Security notes
 
-**`ENCLAVE_DEPLOYMENT` defaults to `dev`, and `dev` disables COSE signature
-verification.** In that mode the runtime decodes attestation documents but does
-not verify their signature or validate the certificate chain against the AWS
-Nitro root. It logs `INSECURE: skipping COSE signature verification of
-attestation document` at startup. PCR comparison and `user_data` checks still
-apply. Always set `ENCLAVE_DEPLOYMENT` explicitly for anything other than local
-testing. The value is baked into the measurement and cannot be overridden from
-SSM.
+**`ENCLAVE_DEV=true` selects the insecure security envelope.** It disables COSE
+signature verification, skips the `kvm-clock` assertion, leaves the KMS key
+policy amendable with its root recovery principal, and cuts both S3 Object Lock
+retentions to minutes and the migration cooldown to seconds — so a dev
+deployment's migration anchor can be waited out almost immediately. In that mode
+the runtime decodes attestation documents but does not verify their signature or
+validate the certificate chain against the AWS Nitro root. It logs `INSECURE:
+skipping COSE signature verification of attestation document` at startup. PCR
+comparison and `user_data` checks still apply. Only set `ENCLAVE_DEV=true` for
+local testing against emulated NSM. `ENCLAVE_DEPLOYMENT` is required but only
+selects the SSM namespace; values such as `dev` and `prod` do not control
+verification. Both settings are baked into the measurement and cannot be
+overridden from SSM.
+
+**CloudWatch is a hard boot dependency.** Each stream is created *and written to*
+before the application starts, and a failure aborts the boot. The write matters:
+creating a log group proves nothing about being able to put events into it, so a
+role missing `logs:PutLogEvents` would otherwise boot clean and lose everything
+silently. An enclave whose telemetry goes
+nowhere cannot be audited, so it does not run. The trade is that a CloudWatch
+outage or a missing `CloudWatchLogsAccess` statement becomes an availability
+outage rather than a silent gap in the record.
+
+**Telemetry is not readable from the enclave.** Logs and spans are shipped and
+forgotten; there is no queryable history and no endpoint that reads one back. The runtime's
+IAM statement is write-only for the same reason, so a host that compromises the
+enclave recovers neither a buffered window of application logs nor the ability to
+query what was already shipped.
 
 **Clients must pin PCR0.** `client.New` refuses to construct a client without
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is
 running, not that it is running your code.
 
-**Callers must check `Response.SignatureVerified`.** `Get`, `Post`, and `Do`
-return successfully when the response signature is absent or invalid, and report
-it through that field. The CLI treats it as a fatal error; library consumers
-should do the same.
+**HTTP and gRPC trust the attested TLS channel.** The client verifies the Nitro
+attestation and PCRs before sending application requests, then pins the live TLS
+leaf to the exact hash carried in `user_data`.
 
-**Never manage `KMSKeyID/<pcr0>` with deployment tooling.** The runtime writes it
-as the final step of every state transition. A declaratively managed value would
-fight the runtime, could point an enclave at a key that no longer decrypts
-anything, and will make the runtime refuse to finalise a handoff onto that PCR0.
+**Never manage `KMSKeyID/<pcr0>` with deployment tooling.** Migration finalisation
+rewrites it as its atomic commit, and genesis claims it create-only. A
+declaratively managed value would fight the runtime and could roll a live
+deployment back to a key that no longer decrypts anything. Once the
+`deployment-genesis` object exists, deleting the parameter cannot fork the
+state — the boot fails instead of creating a second generation — but it still
+stops the deployment booting until it is restored. Genesis claims the parameter
+before writing that object, so a crash between the two leaves a window in which
+deleting the parameter does re-open genesis.
+
+**Genesis is committed exactly once.** Every contender first performs a
+create-only SSM key claim. Only that winner writes the `deployment-genesis`
+object, itself a create-only put under Object Lock, so a second write is
+rejected rather than layered on top. Its attestation binds the creating
+enclave's PCR0 and the bucket. Boot lists that one key's versions rather than
+reading it directly, because Object Lock cannot stop a delete marker hiding the
+object, and it reads them unverified: a record it cannot verify still vetoes a
+genesis, because treating it as absent would fail open. The contents are
+therefore advisory — presence is the only thing boot trusts.
+
+**The intent bucket is on the boot path.** An unreachable or unwritable bucket
+now fails the boot rather than only blocking migration. That is the intended
+trade: an enclave that cannot check whether the deployment exists must not guess.
+
+**Seed the genesis object before adopting this on any existing deployment.** No
+runtime before this change wrote one, so *every* deployment created earlier
+lacks it — migrated or not. Create the derived bucket and write a
+`deployment-genesis` object naming the running PCR0 into it before upgrading.
+Without the bucket the boot fails reading the store; with an empty one it
+reaches the genesis path, finds its committed `KMSKeyID/<pcr0>`, and fails there.
+
+Existing intent records cannot be carried across. Each record's `bucket_name` is
+part of its attested pre-image, so one copied into the derived bucket no longer
+verifies and is skipped without an error — migration history restarts. The seeded
+record is unverifiable for the same reason, since only an enclave of that PCR0
+could sign one. That is enough for the genesis check, which is unverified by
+design, but the record never appears as a migration head, so the first real
+handoff is written at sequence 1 beside it.
 
 **Host credentials cannot read enclave state.** They grant `kms:CreateKey` but
 not `Decrypt`, `Encrypt`, or `GenerateDataKey`. Those are authorised by the

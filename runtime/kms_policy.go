@@ -32,7 +32,7 @@ func BuildKMSPolicy(roleARN string, pcr0Values []string, recoveryAccount string)
 			Sid:       "EnclaveOperations",
 			Effect:    "Allow",
 			Principal: kmsPolicyPrincipal{AWS: roleARN},
-			Action:    []string{"kms:Encrypt", "kms:GetKeyPolicy"},
+			Action:    []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
 			Resource:  "*",
 		},
 		{
@@ -110,7 +110,7 @@ func VerifyKeyPolicyPosture(policyJSON string, expectedPCR0s []string, locked bo
 		if actionsGrant(actions, "kms:PutKeyPolicy") {
 			if locked {
 				return fmt.Errorf(
-					"policy grants kms:PutKeyPolicy but ENCLAVE_KMS_KEY_LOCKED is set (policy must be immutable)",
+					"policy grants kms:PutKeyPolicy but the key is locked (policy must be immutable)",
 				)
 			}
 			if !principalsAllRoot(stmt.Principal) {

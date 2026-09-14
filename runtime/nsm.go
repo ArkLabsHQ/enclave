@@ -50,12 +50,10 @@ type NSM interface {
 	VerifyAttestation(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
-		expectedUserData []byte,
-	) error
+	) ([]byte, error)
 	VerifyAttestationDocument(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
-		expectedUserData []byte,
 	) (*nitrite.Result, error)
 	BuildAttestationDocument(opts ...BuildAttestationOption) ([]byte, *rsa.PrivateKey, error)
 	LockPCR(index uint) error
@@ -101,16 +99,19 @@ func NewNSM(opts ...VerifyAttestationOption) NSM {
 func (n *nsmW) VerifyAttestation(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,
-	expectedUserData []byte,
-) error {
-	_, err := n.VerifyAttestationDocument(attestDocB64, expectedPCRs, expectedUserData)
-	return err
+) ([]byte, error) {
+	result, err := n.VerifyAttestationDocument(attestDocB64, expectedPCRs)
+	if err != nil {
+		return nil, err
+	}
+	return result.Document.UserData, nil
 }
 
+// VerifyAttestationDocument is VerifyAttestation for callers that need more of
+// the document than its user data, such as the nonce or an unconstrained PCR.
 func (n *nsmW) VerifyAttestationDocument(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,
-	expectedUserData []byte,
 ) (*nitrite.Result, error) {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
@@ -132,10 +133,6 @@ func (n *nsmW) VerifyAttestationDocument(
 			return nil, fmt.Errorf("attested PCR%d does not match expected: %s != %s",
 				index, attestedPCRHex, expected)
 		}
-	}
-
-	if !bytes.Equal(result.Document.UserData, expectedUserData) {
-		return nil, fmt.Errorf("attested user data does not match expected user data")
 	}
 
 	return result, nil
@@ -419,8 +416,7 @@ func (n *awsNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
 	}
 
 	if n.unsigned {
-		slog.Warn("INSECURE: skipping COSE signature verification of attestation document",
-			"deployment", getDeployment())
+		slog.Warn("INSECURE: skipping COSE signature verification of attestation document")
 		return &nitrite.Result{
 			Document:    &document,
 			Protected:   envelope.Protected,

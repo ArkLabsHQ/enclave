@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	kmscmd "github.com/aws/aws-sdk-go-v2/service/kms"
@@ -14,7 +16,16 @@ import (
 	"github.com/edgebitio/nitro-enclaves-sdk-go/crypto/cms"
 )
 
+const (
+	keyStateExists          = "exists"
+	keyStatePendingDeletion = "pending_deletion"
+	keyStateDeleted         = "deleted"
+	keyStateUnknown         = "unknown"
+	keyStateProbeTimeout    = 5 * time.Minute
+)
+
 type kmsW struct {
+	cfg   *Config
 	nsm   NSM
 	kms   KMSAPI
 	sts   STSAPI
@@ -35,14 +46,17 @@ type KMS interface {
 
 type PrimaryKMS interface {
 	KMS
+	KeyAuditor
 	CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, error)
 }
 
-// FetchOrCreatePrimaryKMS returns the key at keyID after proving its policy
-// admits this enclave's PCR0 and nothing else, or mints a genesis key when
-// keyID is empty. Every key — genesis or migration — admits exactly one PCR0.
+type KeyAuditor interface {
+	KeyState(ctx context.Context, keyID string) string
+}
+
 func FetchOrCreatePrimaryKMS(
 	ctx context.Context,
+	cfg *Config,
 	nsm NSM,
 	kms KMSAPI,
 	sts STSAPI,
@@ -68,7 +82,7 @@ func FetchOrCreatePrimaryKMS(
 		}
 
 		if err := VerifyKeyPolicyPosture(
-			*out.Policy, []string{curPCR0Hex}, kmsKeyLocked(),
+			*out.Policy, []string{curPCR0Hex}, cfg.KMSLocked,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"KMS key %s policy posture mismatch (ours: %s...): %w",
@@ -78,7 +92,7 @@ func FetchOrCreatePrimaryKMS(
 			)
 		}
 
-		return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
+		return &kmsW{cfg: cfg, nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
 	}
 
 	identity, err := sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
@@ -87,7 +101,7 @@ func FetchOrCreatePrimaryKMS(
 	}
 
 	recoveryAccount := ""
-	if !kmsKeyLocked() {
+	if !cfg.KMSLocked {
 		recoveryAccount = *identity.Arn
 	}
 
@@ -100,15 +114,15 @@ func FetchOrCreatePrimaryKMS(
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave genesis key for %s/%s", getDeployment(), getAppName())
+	description := fmt.Sprintf("enclave genesis key for %s/%s", cfg.Deployment, cfg.AppName)
 
 	createOut, err := kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
 		Policy:                         aws.String(policy),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
-			{TagKey: aws.String("AppName"), TagValue: aws.String(getAppName())},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(getDeployment())},
+			{TagKey: aws.String("AppName"), TagValue: aws.String(cfg.AppName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(cfg.Deployment)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 		},
 	})
@@ -120,7 +134,7 @@ func FetchOrCreatePrimaryKMS(
 
 	slog.Info("created primary KMS key", "key_id", keyID, "pcr0", curPCR0Hex[:16])
 
-	return &kmsW{nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
+	return &kmsW{cfg: cfg, nsm: nsm, kms: kms, sts: sts, keyID: keyID}, nil
 }
 
 func (k *kmsW) KeyID() string {
@@ -214,7 +228,7 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 	}
 
 	recoveryAccount := ""
-	if !kmsKeyLocked() {
+	if !k.cfg.KMSLocked {
 		recoveryAccount = *identity.Arn
 	}
 
@@ -223,15 +237,15 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave migration key for %s/%s", getDeployment(), getAppName())
+	description := fmt.Sprintf("enclave migration key for %s/%s", k.cfg.Deployment, k.cfg.AppName)
 
 	out, err := k.kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
 		Policy:                         aws.String(policy),
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
-			{TagKey: aws.String("AppName"), TagValue: aws.String(getAppName())},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(getDeployment())},
+			{TagKey: aws.String("AppName"), TagValue: aws.String(k.cfg.AppName)},
+			{TagKey: aws.String("Deployment"), TagValue: aws.String(k.cfg.Deployment)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 			{TagKey: aws.String("Purpose"), TagValue: aws.String("migration")},
 		},
@@ -240,5 +254,32 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		return nil, fmt.Errorf("migration kms create-key: %w", err)
 	}
 
-	return &kmsW{nsm: k.nsm, kms: k.kms, keyID: *out.KeyMetadata.KeyId}, nil
+	return &kmsW{
+		cfg: k.cfg, nsm: k.nsm, kms: k.kms, keyID: *out.KeyMetadata.KeyId,
+	}, nil
+}
+
+func (k *kmsW) KeyState(ctx context.Context, keyID string) string {
+	if keyID == "" {
+		return keyStateUnknown
+	}
+	ctx, cancel := context.WithTimeout(ctx, keyStateProbeTimeout)
+	defer cancel()
+
+	out, err := k.kms.DescribeKey(ctx, &kmscmd.DescribeKeyInput{KeyId: aws.String(keyID)})
+	if err != nil {
+		var notFound *kmstypes.NotFoundException
+		if errors.As(err, &notFound) {
+			return keyStateDeleted
+		}
+		return keyStateUnknown
+	}
+	if out == nil || out.KeyMetadata == nil {
+		return keyStateUnknown
+	}
+	if out.KeyMetadata.KeyState == kmstypes.KeyStatePendingDeletion ||
+		out.KeyMetadata.KeyState == kmstypes.KeyStatePendingReplicaDeletion {
+		return keyStatePendingDeletion
+	}
+	return keyStateExists
 }

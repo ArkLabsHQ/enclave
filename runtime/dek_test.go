@@ -89,18 +89,20 @@ func testDEK() *dek {
 }
 
 func TestDEKExportKeyStoresExactlyWhatItReturns(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "myapp")
-
 	d := testDEK()
 	kmsf := newFakeKMS()
-	successor := &kmsW{nsm: kmsTestNSMWithRecipient(t), kms: kmsf, keyID: "successor-key"}
+	successor := &kmsW{
+		cfg:   testCfg,
+		nsm:   kmsTestNSMWithRecipient(t),
+		kms:   kmsf,
+		keyID: "successor-key",
+	}
 	ssmf := &fakeSSM{}
 
-	ciphertext, err := d.ExportKey(context.Background(), successor, NewSSM(ssmf))
+	ciphertext, err := d.ExportKey(context.Background(), testCfg, successor, NewSSM(ssmf))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, ciphertext)
 
-	require.Equal(t, ciphertext, ssmf.params[storageDEKCiphertextParam("successor-key")])
+	require.Equal(t, ciphertext, ssmf.params[testCfg.storageDEKCiphertextParam("successor-key")])
 }

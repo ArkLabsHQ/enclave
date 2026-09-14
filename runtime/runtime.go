@@ -33,7 +33,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx)
+	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -46,15 +46,19 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
-
-	metrics := NewMetrics()
-	tracing := NewTracing(aws.CWL)
-
-	if err := tracing.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start tracing cloud watch export: %w", err)
+	ssm := NewSSM(aws.SSM)
+	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
-	ctx, initSpan := tracing.Span(ctx, "init")
+	telemetry := NewTelemetry(&cfg, aws.CWL)
+	if err := telemetry.Start(ctx); err != nil {
+		return err
+	}
+
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {
@@ -63,21 +67,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	logging := NewLogging(metrics, aws.CWL)
-	slog.SetDefault(slog.New(NewBufferHandler(logging)))
-
-	if err := logging.StartCloudWatchExport(ctx); err != nil {
-		return fmt.Errorf("failed to start logging cloud watch export: %w", err)
-	}
-
-	hashes := NewAttestationHashes()
-
-	attestationSigner, err := NewAttestedSigner()
-	if err != nil {
-		return fmt.Errorf("failed to create attestation signer: %w", err)
-	}
-
-	hashes.SetSigningKeyHash(attestationSigner.PubkeyHash())
+	hashes := &AttestationHashes{}
 
 	authToken, err := generateRuntimeToken()
 	if err != nil {
@@ -86,16 +76,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt := newRuntimeState()
 
-	nsm := nsmFromEnv()
+	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
 		cfg,
 		nsm,
-		metrics,
-		logging,
-		tracing,
-		attestationSigner,
+		telemetry,
 		hashes,
 		authToken,
 	)
@@ -104,14 +91,18 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
-	ssm := NewSSM(aws.SSM)
-
-	migrationIntentBucket, err := ssm.MustGet(ctx, migrationIntentBucketParam())
+	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
-		return fmt.Errorf("failed to get migration intent bucket name: %w", err)
+		return fmt.Errorf("failed to establish state: %w", err)
+	}
+
+	migrationIntentBucket, err := boot.migrationIntentBucket(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to resolve migration intent bucket: %w", err)
 	}
 
 	migrator, err := NewMigrator(
+		&cfg,
 		nsm,
 		NewSSMTTLCache(ssm, time.Second*5),
 		aws.S3,
@@ -121,7 +112,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ssm); err != nil {
+	ancestry := &deferredAncestry{}
+	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
 
@@ -129,37 +121,37 @@ func Run(ctx context.Context, cfg Config) error {
 	// gets migrated to simply keeps answering; nothing else happens.
 	go migrator.RunCandidateAttestation(ctx)
 
-	candidateCertCb, err := configureSelfSignedCert(&cfg, hashes)
+	candidateCertCb, err := candidateCertCallback(cfg.FQDN)
 	if err != nil {
 		return fmt.Errorf("failed to configure candidate TLS: %w", err)
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
 
-	verified, err := establishStateAwaitingHandoff(ctx, nsm, aws.KMS, aws.STS, ssm)
+	result, err := boot.AwaitHandoff(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, verified.secrets); err != nil {
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
-	migrator.Promote(verified.kms, verified.dek, verified.secrets)
+	migrator.Promote(result.kms, result.dek, result.secrets, result.tlsKey)
+	ancestry.Resolve(NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
 
 	go migrator.RunMigrationControl(ctx)
 
-	tlsCertCb, err := ConfigureTLS(ctx, &cfg, aws.S3, verified.dek, ssm, hashes)
+	tlsCertCb, err := ConfigureTLS(
+		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	if err := ApplyEnvOverrides(ctx, ssm); err != nil {
-		return fmt.Errorf("failed to apply env overrides: %w", err)
-	}
 	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
-	// overriding verified secret state
-	if err := SetStaticSecretEnvVars(verified.secrets); err != nil {
+	// overriding established secret state
+	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
 		return fmt.Errorf("failed to set static secrets env vars: %w", err)
 	}
 
@@ -175,10 +167,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return supervise(ctx, rt, app)
 }
 
-func nsmFromEnv() NSM {
-	return NewNSM(WithAttestationUnsigned(skipCOSEVerification()))
-}
-
 type appProcess interface {
 	Stop() error
 }
@@ -189,16 +177,15 @@ type execApp struct {
 }
 
 func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + envOr("APP_BINARY_NAME", "app")
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
+	appPath := "/app/" + getAppBinaryName()
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.Env = append(
 		os.Environ(),
-		"ENCLAVE_APP_PORT="+appPort,
-		"PORT="+appPort,
+		"ENCLAVE_APP_PORT="+cfg.AppPort,
+		"PORT="+cfg.AppPort,
 		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
 		"ENCLAVE_RUNTIME_TOKEN="+authToken,
 	)
@@ -240,7 +227,7 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 		} else {
 			slog.Warn("upstream app exited cleanly; runtime stays alive")
 		}
-		return waitForRuntime(ctx, rt, child)
+		return waitForRuntime(ctx, rt)
 
 	case err := <-rt.ListenError():
 		_ = child.Stop()
@@ -256,29 +243,17 @@ func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
 	}
 }
 
-// waitForRuntime keeps the runtime alive after the app is gone or halted, so
+// waitForRuntime keeps the runtime alive after the app has exited, so
 // health and migration endpoints still answer.
-func waitForRuntime(ctx context.Context, rt RuntimeState, child appProcess) error {
-	// Only stop a child that is still running: stopApp waits on ChildDone,
-	// which is unbuffered and delivered once, so stopping an already-reaped
-	// child would block forever.
-	stopChild := func() {
-		if !rt.UpstreamAppInfo().Exited {
-			_ = child.Stop()
-		}
-	}
-
+func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 	select {
 	case err := <-rt.ListenError():
-		stopChild()
 		return fmt.Errorf("HTTP listener failed: %w", err)
 	case <-ctx.Done():
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
-			stopChild()
 			return fmt.Errorf("runtime halted: %w", cause)
 		}
 		slog.Info("shutting down")
-		stopChild()
 		return nil
 	}
 }
@@ -316,6 +291,8 @@ func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
 	}
 }
 
+// SetTLSCertCallback installs the certificate source. It may be called again:
+// a candidate serves a placeholder until promotion supplies the real one.
 func (r *runtimeState) SetTLSCertCallback(cb TLSCertCallback) {
 	r.tlsMu.Lock()
 	r.tlsCertCallback = cb

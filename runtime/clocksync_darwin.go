@@ -2,8 +2,6 @@ package runtime
 
 import "context"
 
-func StartClockSyncer(ctx context.Context) (context.Context, error) {
-	// squash unused lint on darwin
-	_ = verifyClockSourceEnabled()
+func StartClockSyncer(ctx context.Context, _ *Config) (context.Context, error) {
 	return ctx, nil
 }

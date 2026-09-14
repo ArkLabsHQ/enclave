@@ -2,30 +2,13 @@ package runtime
 
 import (
 	"context"
-	"fmt"
-	"sync"
+	"errors"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/stretchr/testify/require"
 )
-
-type atomicPutSSM struct {
-	fakeSSM
-	mu sync.Mutex
-}
-
-func (f *atomicPutSSM) PutParameter(
-	ctx context.Context,
-	in *ssm.PutParameterInput,
-	opts ...func(*ssm.Options),
-) (*ssm.PutParameterOutput, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.fakeSSM.PutParameter(ctx, in, opts...)
-}
 
 func TestSSMSetAndGet(t *testing.T) {
 	ctx := context.Background()
@@ -41,42 +24,22 @@ func TestSSMSetAndGet(t *testing.T) {
 	}
 }
 
-func TestSSMSetIfAbsentIsAtomic(t *testing.T) {
+func TestSSMSetWithoutOverwrite(t *testing.T) {
 	ctx := context.Background()
-	api := &atomicPutSSM{}
-	store := NewSSM(api)
+	fake := &fakeSSM{}
+	ssm := NewSSM(fake)
 
-	const contenders = 32
-	results := make(chan bool, contenders)
-	errs := make(chan error, contenders)
-	var wg sync.WaitGroup
-	for i := range contenders {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			created, err := store.SetIfAbsent(ctx, "/app/commit", fmt.Sprintf("key-%d", i))
-			results <- created
-			errs <- err
-		}()
-	}
-	wg.Wait()
-	close(results)
-	close(errs)
+	require.NoError(t, ssm.Set(ctx, "/app/key", "winner", WithoutOverwrite()))
+	err := ssm.Set(ctx, "/app/key", "loser", WithoutOverwrite())
+	require.Error(t, err)
+	require.Equal(t, "winner", fake.params["/app/key"])
 
-	winners := 0
-	for err := range errs {
-		require.NoError(t, err)
-	}
-	for created := range results {
-		if created {
-			winners++
-		}
-	}
-	require.Equal(t, 1, winners)
-
-	got, err := store.MustGet(ctx, "/app/commit")
-	require.NoError(t, err)
-	require.Contains(t, got, "key-")
+	// Set wraps with %w, so the typed cause survives. CompleteMigration relies
+	// on this to tell a lost create-only race from a storage failure.
+	var exists *ssmtypes.ParameterAlreadyExists
+	require.ErrorAs(t, err, &exists)
+	require.True(t, isParameterAlreadyExists(err))
+	require.False(t, isParameterAlreadyExists(errors.New("throttled")))
 }
 
 func TestSSMGet(t *testing.T) {

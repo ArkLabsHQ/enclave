@@ -48,7 +48,8 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
       },
       "Action": [
         "kms:Encrypt",
-        "kms:GetKeyPolicy"
+        "kms:GetKeyPolicy",
+        "kms:DescribeKey"
       ],
       "Resource": "*"
     },
@@ -108,7 +109,8 @@ func TestBuildKMSPolicy_RecoveryMultiPCR0Golden(t *testing.T) {
       },
       "Action": [
         "kms:Encrypt",
-        "kms:GetKeyPolicy"
+        "kms:GetKeyPolicy",
+        "kms:DescribeKey"
       ],
       "Resource": "*"
     },
@@ -622,7 +624,7 @@ func ppDecryptGated(pcr0 any) map[string]any {
 }
 
 func ppOps() map[string]any {
-	return ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy"}, ppRole, nil)
+	return ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}, ppRole, nil)
 }
 
 func ppDelete() map[string]any {

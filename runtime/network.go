@@ -27,7 +27,7 @@ const (
 	imdsEndpointEnv  = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
 )
 
-func StartNetorking(ctx context.Context) error {
+func StartNetworking(ctx context.Context) error {
 	cid, err := networkingCID(vsock.ContextID)
 	if err != nil {
 		return err

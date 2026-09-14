@@ -182,6 +182,8 @@ assert lib.assertMsg (lib.length (lib.unique cids) == lib.length cids) "duplicat
 assert lib.assertMsg (lib.all (
   cid:
   builtins.isInt cid
+  # CIDs 4–1023 are valid; the README recommends 1024+ for the derived
+  # gvproxy port as an operational preference, not a CID validity rule.
   && cid > 3
   && cid < 4294967295
   && !(builtins.elem cid [

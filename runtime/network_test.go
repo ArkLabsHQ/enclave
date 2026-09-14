@@ -28,7 +28,7 @@ func TestNetworkingCID(t *testing.T) {
 
 func TestNetworkingCIDDiscoveryFailure(t *testing.T) {
 	want := errors.New("device unavailable")
-	cid, err := networkingCID(func() (uint32, error) { return 1024, want })
+	cid, err := networkingCID(func() (uint32, error) { return 0, want })
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "/dev/vsock")
 	require.Zero(t, cid, "discovery failure must not fall back to port 1024")

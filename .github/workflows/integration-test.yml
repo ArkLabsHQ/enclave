@@ -26,5 +26,9 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
+      # Sequential: each nested-KVM test needs most of this runner's RAM.
       - name: Run integration test
         run: nix build .#checks.x86_64-linux.e2e --print-build-logs
+
+      - name: Run multi-enclave integration test
+        run: nix build .#checks.x86_64-linux.e2e-multi-enclave --print-build-logs

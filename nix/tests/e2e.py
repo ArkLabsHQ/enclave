@@ -8,51 +8,8 @@ SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 
 
-def put_env(name, value):
-    cloud(
-        f"ssm put-parameter --name /dev/testapp/env/{name} "
-        f"--type String --value {shlex.quote(value)}"
-    )
-
-
-def served_leaf(node, x509_args):
-    return node.succeed(
-        f"openssl s_client -connect 127.0.0.1:443 -servername {FQDN} "
-        f"</dev/null 2>/dev/null | openssl x509 {x509_args}"
-    ).strip()
-
-
-def served_leaf_sha(node):
-    return node.succeed(
-        f"openssl s_client -connect 127.0.0.1:443 -servername {FQDN} "
-        "</dev/null 2>/dev/null | openssl x509 -outform DER "
-        "| sha256sum | cut -d' ' -f1"
-    ).strip()
-
-
-def console_has(node, needle):
-    status, _ = node.execute(
-        "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
-        f"| grep -F {shlex.quote(needle)} >/dev/null"
-    )
-    return status == 0
-
-
 def console_owners(nodes, needle):
     return [n.name for n in nodes if console_has(n, needle)]
-
-
-def enclave_curl(node, pcr0, path="/health"):
-    # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
-    # 39-byte TLS binding, and live certificate pinning remain checked.
-    return node.execute(
-        f"enclave curl {path} --base-url https://127.0.0.1 "
-        f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify 2>&1"
-    )
-
-
-def kms_key_count():
-    return int(cloud("kms list-keys --query 'length(Keys)' --output text"))
 
 
 def cert_etag():
@@ -79,12 +36,6 @@ def challenge_record_count(zone_id):
             "&& Type=='TXT'])\" --output text"
         )
     )
-
-
-def env_value(node, name):
-    return node.succeed(
-        f"curl -skf --http1.1 https://127.0.0.1/test/env/{name} | jq -r .value"
-    ).strip()
 
 
 aws.start()

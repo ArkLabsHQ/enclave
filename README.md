@@ -126,7 +126,7 @@ interfaces are documented under [Deployment](#deployment).
 
 | Endpoint | Direction | Purpose |
 |---|---|---|
-| vsock CID 3:1024 | enclave to host | gvproxy L2 network |
+| vsock CID 3:\<enclave CID\> | enclave to host | Dedicated gvproxy L2 network |
 | vsock CID 3:8002 | enclave to host | IMDS forwarding |
 | vsock CID 3:9000 | EIF init to host | boot heartbeat |
 | vsock :8003 | host to enclave | migration control HTTP |
@@ -263,10 +263,12 @@ way to ask for any other combination. For local testing against emulated NSM onl
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
 | `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
 
-The external TLS listener (443), the internal loopback listener (8080) and the
-host vsock port gvproxy listens on (1024) are fixed. The last of those is
-hardcoded on the host side too, so a value only the enclave knew about would
-silently break networking.
+The external TLS listener (443) and internal loopback listener (8080) are fixed.
+At networking startup, the runtime reads its CID from `/dev/vsock` and connects
+to host vsock `3:<CID>`. The launcher must assign that CID to the enclave and
+use the same number for its dedicated gvproxy listener. This transport address
+is discovered before AWS clients and the SSM overlay; it is not runtime config
+or application identity. Discovery failure or a reserved assignment stops boot.
 
 ### Migration
 
@@ -521,17 +523,70 @@ interfaces.
 
 ### Host requirements
 
-- Launch the EIF with AWS Nitro Enclaves and allocate sufficient CPU and memory.
+- Launch each EIF with AWS Nitro Enclaves using an explicit `--enclave-cid`.
+  Allocate sufficient enclave CPUs and memory, leaving capacity for the host.
 - Make `/dev/nsm` and `/dev/ptp0` available inside the enclave.
-- Run gvproxy at host CID 3, vsock port 1024, with outbound connectivity to the
-  configured AWS endpoints and any application dependencies.
+- Run one gvproxy per enclave at host CID 3, with its listener port equal to
+  that enclave's CID and outbound access to AWS and application dependencies.
 - Forward IMDS from host CID 3, vsock port 8002, to the host's instance metadata
   service so the runtime can obtain AWS credentials.
-- Answer the EIF boot heartbeat at host CID 3, vsock port 9000.
+- Answer the EIF boot heartbeat at host CID 3, vsock port 9000. The shared IMDS
+  and heartbeat responders must accept concurrent connections.
 - Expose the enclave's migration control listener on vsock port 8003 only to
   trusted operators.
-- Route intended client traffic to the enclave's TLS listener, TCP port 443 by
-  default.
+- Route intended client traffic to each enclave's TLS listener, TCP port 443.
+  Permit only the intended public host ports through security groups and the
+  host firewall; keep operator forwards bound to localhost or a trusted control plane.
+
+### Multiple enclaves on one host
+
+A host can run this layout independently on blue and green:
+
+| Instance | CID / host gvproxy vsock port | Host HTTPS forward | Local operator forward |
+|---|---|---|---|
+| appOne | 1024 | `0.0.0.0:8443` → enclave TCP 443 | `127.0.0.1:18003` → vsock `1024:8003` |
+| appTwo | 1025 | `0.0.0.0:9443` → enclave TCP 443 | `127.0.0.1:18004` → vsock `1025:8003` |
+
+For example, launch appOne with `nitro-cli run-enclave --enclave-name appOne
+--enclave-cid 1024 --eif-path appOne.eif --cpu-count 2 --memory 2048`, and run its
+gvproxy with `--listen vsock://:1024`. Its gvproxy configuration forwards
+`0.0.0.0:8443` to `192.168.127.2:443`. appTwo uses its own gvproxy configuration
+and `--listen vsock://:1025`. Both networks can use the same guest IP, MAC,
+gateway, DNS address, and TAP name because each enclave has its own kernel.
+
+Allocate unique CIDs on each host, preferably from 1024 upward. Do not use
+reserved CIDs 0–3 or 4294967295, shared host service ports 8002 and 9000, or any
+other host vsock listener's port. CIDs and derived ports are uint32 values; the
+TCP limit of 65535 does not apply. Public and operator TCP bindings must also
+be unique. Each instance's launcher, gvproxy, operator bridge, configuration,
+sockets, PID files, and logs need separate names and lifecycle management.
+Stopping or restarting appOne must target only appOne. Keep IMDS and heartbeat
+at host scope. The control API on guest port 8003 is unauthenticated.
+
+The initial runtime upgrade changes EIF measurements. Once built with CID
+discovery, the exact same EIF can move between host slots without changing
+PCR0. Older EIFs still require host gvproxy port 1024; assigning them another
+CID does not retrofit this behavior. Deployment/app names and migration
+commitments remain measured identity and retain their existing validation.
+
+### DNS-01 and shared certificate storage
+
+DNS-01 validates TXT records independently of the host IP or public TCP port.
+appOne and appTwo can share a Route53 zone while using distinct FQDNs such as
+`appone.enclave.test` and `apptwo.enclave.test`. Configure ACME through each
+application's SSM overlay before boot.
+
+Certificate/account objects and issuance leases are scoped by deployment/app.
+Replicas must share their application's FQDN, certificate and lease buckets,
+Route53 zone, and ACME settings. Different applications can share those buckets
+because their object prefixes are separate. Migration preserves the storage
+DEK and TLS private key, so the successor can reuse the encrypted ACME account
+and valid certificate. A new PCR0 alone does not require another order.
+
+Different applications or deployments using the same challenge name are not
+coordinated by the application-scoped lease. Route53 UPSERT replaces TXT values,
+so concurrent orders can overwrite each other's challenges. Use distinct FQDNs;
+overlapping challenge names need a separate certificate-coordination change.
 
 ### AWS requirements
 
@@ -793,7 +848,8 @@ nix flake check
 | Check | Purpose |
 |---|---|
 | `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
-| `e2e` | x86-only runtime lifecycle across ordinary `aws`, `blue`, and `green` NixOS nodes: direct AWS setup, genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
+| `e2e` | AWS fixture plus two blue and two green single-enclave hosts: concurrent genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
+| `e2e-multi-enclave` | Two enclaves per blue/green host: independent DNS-01, an exact-EIF appOne replica, appTwo migration, isolated control/network lifecycles, and cutover before blue retirement. |
 
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
@@ -801,8 +857,20 @@ available.
 
 ### Requirements
 
-Both checks run on `x86_64-linux` only. The `e2e` check uses QEMU's
-x86_64-only `nitro-enclave` machine type.
+All checks run on `x86_64-linux` only. Both E2E checks use QEMU's
+x86_64-only `nitro-enclave` machine type. Run them separately with:
+
+```sh
+nix build .#checks.x86_64-linux.eif-build --print-build-logs
+nix build .#checks.x86_64-linux.e2e --print-build-logs
+nix build .#checks.x86_64-linux.e2e-multi-enclave --print-build-logs
+```
+
+CI runs the E2E checks sequentially on the existing 8-vCPU runner. The original
+check allocates 14 GiB across five outer VMs; the multi-enclave check allocates
+12 GiB across three. Each multi-enclave host has 5 GiB RAM and four vCPUs for
+two inner guests of 2 GiB/two vCPUs each. Leave additional RAM for the test
+driver and builds; do not run both checks concurrently on a 16 GiB machine.
 
 The e2e check needs a builder with:
 
@@ -818,7 +886,8 @@ therefore force `clocksource=tsc`; NixOS test instrumentation otherwise appends
 `clocksource=acpi_pm`, and the kernel honours the last value on the command line.
 Without this the enclave has no `/dev/ptp0` and boot fails before networking.
 
-After the cache is warm the full e2e test takes roughly four minutes.
+Measured VM test runtime on the development builder was about 6 minutes 20
+seconds for `e2e` and 9 minutes for `e2e-multi-enclave`, excluding builds.
 
 ### Reading test output
 
@@ -837,15 +906,25 @@ nix flake check --print-build-logs 2>&1 |
 
 ### E2E boundaries
 
-The e2e test uses three ordinary NixOS test nodes. `aws` runs the AWS emulator,
-the attestation-aware KMS `Recipient` proxy, IMDS, and ACME fixtures. `blue` and
-`green` launch measured EIFs with QEMU's `nitro-enclave` machine and
-`vhost-device-vsock`.
+Both E2E checks share the AWS emulator, attestation-aware KMS `Recipient` proxy,
+IMDS, and Pebble ACME fixtures on `aws`. Enclave hosts launch measured EIFs with
+QEMU's `nitro-enclave` machine and `vhost-device-vsock`. The multi-enclave test
+builds exactly three application EIFs: appOne on both hosts, appTwo's predecessor on
+blue, and appTwo's successor committing to that predecessor on green.
+
+Each guest has a separate Unix-socket backend. Operator bridges perform the
+backend's `CONNECT 8003` handshake; guest-to-host Unix sockets bridge back to
+real host vsock listeners for gvproxy, IMDS, and heartbeat. The pinned backend
+assumes parent CID 2 in Unix-socket mode, so the fixture adjusts that constant
+to Nitro CID 3. This adapter lives entirely in the test harness. See the
+[backend protocols](https://github.com/rust-vmm/vhost-device/blob/main/vhost-device-vsock/README.md).
 
 The test driver creates the required buckets and SSM parameters directly through
 AWS APIs, then controls node startup according to the runtime migration order.
-It does not simulate a deployment system, host image lifecycle, or traffic
-cutover.
+The multi-enclave scenario uses a test-owned route map to move both client
+routes to green, then stops blue. These checks do not provision production
+hosts. An EC2 smoke test is still required to validate the external launcher
+and real Nitro transport.
 
 The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace. It separately
 sets `ENCLAVE_DEV=true` because QEMU's emulated NSM produces no AWS certificate
@@ -857,7 +936,11 @@ against the emulator.
 ### Troubleshooting
 
 **The enclave does not start.** Inspect the QEMU launcher and enclave console on
-the affected blue or green node.
+the affected blue or green node. For multi-enclave failures, inspect
+`enclave-start-appOne`, `gvproxy-appOne`, `vhost-device-vsock-appOne`,
+`migration-proxy-appOne`, `vsock-bridge-appOne-*`, and
+`/var/log/enclave-appOne-console.log` (substitute `appTwo` for that instance).
+The test also prints per-host/per-instance diagnostics on failure.
 
 **`starting clock sync failed: open /dev/ptp0`.** Nested KVM, invariant TSC
 exposure, or the clocksource. Confirm the guest's kernel command line ends with
@@ -874,11 +957,11 @@ curl -fsS http://169.254.169.254/latest/meta-data/
 application process started. Check an application endpoint directly and read the
 enclave console for application errors.
 
-**`/request-migration` returns an empty reply under QEMU.** `vhost-device-vsock`
-0.3 occasionally drops a forwarded host-to-guest connection before it reaches
-the enclave. Retry. This affects the emulated transport only; production uses
-Nitro AF_VSOCK. A genuine validation failure returns an HTTP status and body and
-should not be retried.
+**Control access fails under QEMU.** Inspect the instance's `migration-proxy`
+and `vhost-device-vsock` units. The test bridge must complete `CONNECT 8003` and
+consume `OK 8003` before forwarding HTTP. A running TCP bridge alone does not
+mean the guest is ready. Production control access uses Nitro AF_VSOCK directly.
+A validation failure returns an HTTP status and body and should not be retried.
 
 ## Security notes
 

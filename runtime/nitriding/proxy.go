@@ -23,7 +23,7 @@ var (
 )
 
 // RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
-// on failure. hostProxyPort is the vsock port gvproxy listens on (typically 1024).
+// on failure. hostProxyPort is the enclave's CID, also used by its host gvproxy.
 func RunNetworking(ctx context.Context, hostProxyPort uint32) {
 	var err error
 	for {
@@ -48,7 +48,7 @@ func setupNetworking(ctx context.Context, hostProxyPort uint32) error {
 	defer elog.Println("Tearing down networking between host and enclave.")
 
 	// Establish connection with the proxy running on the EC2 host.
-	endpoint := fmt.Sprintf("vsock://%d:%d/connect", parentCID, hostProxyPort)
+	endpoint := fmt.Sprintf("vsock://%d:%d/connect", ParentCID, hostProxyPort)
 	conn, path, err := transport.Dial(endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to connect to host: %w", err)

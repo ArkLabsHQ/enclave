@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -804,16 +805,16 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		m := fx.predecessor
 		m.pcr0 = strings.Repeat("ab", 48)
 		m.promoted.Store(true)
-		m.challenge.Store(nil)
+		var challenge *migrationChallenge
 		if issued != nil {
-			m.challenge.Store(&migrationChallenge{nonce: issued, issuedAt: time.Now()})
+			challenge = &migrationChallenge{Nonce: hex.EncodeToString(issued), IssuedAt: time.Now()}
 		}
 		m.ssm = NewSSM(&fakeSSM{params: map[string]string{
 			m.cfg.migrationResponseParam(m.pcr0, fx.targetPCR0): doc,
 		}})
 		responses, err := m.ssm.ListParams(ctx, m.cfg.migrationResponseParam(m.pcr0, ""))
 		require.NoError(t, err)
-		target, err := m.verifyChallengeResponses(ctx, responses)
+		target, err := m.verifyChallengeResponses(ctx, challenge, responses)
 		require.NoError(t, err)
 		return target
 	}
@@ -930,31 +931,59 @@ func TestChallengeRotationRetiresOldAnswers(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 
 	own := m.pcr0
-	require.NoError(t, m.mayPublishChallenge(ctx))
-	stale, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(own))
+	challenge, err := m.mayPublishChallenge(ctx)
 	require.NoError(t, err)
-
 	candidate := successorMigrator(t, m.cfg, fx.signer, mustDecodeHex(t, target))
-	doc, err := successorAttestation(candidate, mustDecodeHex(t, stale))
+	doc, err := successorAttestation(candidate, mustDecodeHex(t, challenge.Nonce))
 	require.NoError(t, err)
 
-	// Force rotation, as the control loop does once the challenge ages out.
-	challenge := m.challenge.Load()
-	m.challenge.Store(&migrationChallenge{
-		nonce: challenge.nonce, issuedAt: time.Now().Add(-2 * migrationChallengeRotate),
-	})
-	require.NoError(t, m.mayPublishChallenge(ctx))
+	challenge.IssuedAt = time.Now().Add(-2 * migrationChallengeRotate)
+	encoded, err := json.Marshal(challenge)
+	require.NoError(t, err)
+	require.NoError(t, m.ssm.Set(ctx, m.cfg.migrationChallengeParam(own), string(encoded)))
+	_, err = m.mayPublishChallenge(ctx)
+	require.NoError(t, err)
 
 	// The answer to the retired challenge is now inert, so no intent is recorded.
 	require.NoError(t, m.ssm.Set(
 		ctx, m.cfg.migrationResponseParam(own, target), doc, WithAdvancedTier(),
 	))
-	require.NoError(t, m.advanceMigration(ctx))
+	require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 	status, err := m.MigrationStatus(ctx)
 	require.NoError(t, err)
 	require.Equal(t, migrationStateNone, status.State)
 	require.Empty(t, fx.s3.objects, "a stale answer must publish no intent")
+}
+
+func TestMigrationLeaseAdmitsOnePredecessorReplica(t *testing.T) {
+	ctx := context.Background()
+	cfg := migrationTestCfg()
+	pcr0 := strings.Repeat("ab", 48)
+	s3f := newFakeS3()
+	ssm := NewSSM(&fakeSSM{params: map[string]string{cfg.leaseBucketParam(): testLeaseBucket}})
+	first := &migrator{cfg: cfg, pcr0: pcr0, s3: s3f, ssm: ssm}
+	second := &migrator{cfg: cfg, pcr0: pcr0, s3: s3f, ssm: ssm}
+
+	firstLease, err := first.tryAcquireMigrationLease(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, firstLease)
+	challenge, err := first.mayPublishChallenge(ctx)
+	require.NoError(t, err)
+
+	secondLease, err := second.tryAcquireMigrationLease(ctx)
+	require.NoError(t, err)
+	require.Nil(t, secondLease)
+
+	require.NoError(t, firstLease.Release(ctx))
+	secondLease, err = second.tryAcquireMigrationLease(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, secondLease)
+	t.Cleanup(func() { _ = secondLease.Release(context.Background()) })
+	shared, err := second.mayPublishChallenge(ctx)
+	require.NoError(t, err)
+	require.Equal(t, challenge.Nonce, shared.Nonce)
+	require.True(t, challenge.IssuedAt.Equal(shared.IssuedAt))
 }
 
 func TestMayRecordMigrationTakesTheFirstValidAnswer(t *testing.T) {
@@ -968,10 +997,9 @@ func TestMayRecordMigrationTakesTheFirstValidAnswer(t *testing.T) {
 		}
 		m.promoted.Store(true)
 		own := m.pcr0
-		require.NoError(t, m.mayPublishChallenge(ctx))
-		challenge, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(own))
+		challenge, err := m.mayPublishChallenge(ctx)
 		require.NoError(t, err)
-		return m, fx, own, mustDecodeHex(t, challenge)
+		return m, fx, own, mustDecodeHex(t, challenge.Nonce)
 	}
 	answer := func(
 		t *testing.T, m *migrator, fx *migrationIntentFixture,
@@ -992,7 +1020,7 @@ func TestMayRecordMigrationTakesTheFirstValidAnswer(t *testing.T) {
 		answer(t, m, fx, own, strings.Repeat("ee", 48), bytes.Repeat([]byte{0x22}, 32))
 		answer(t, m, fx, own, live, challenge)
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
@@ -1006,7 +1034,7 @@ func TestMayRecordMigrationTakesTheFirstValidAnswer(t *testing.T) {
 			answer(t, m, fx, own, target, challenge)
 		}
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
@@ -1157,14 +1185,14 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		m, ssmf, session := setup(t)
 
 		// Round one publishes a challenge; nobody has answered yet.
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		require.Empty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 
 		answer(t, m, session, newPCR0)
 
 		// Round two records the migration, round three hands off once eligible.
-		require.NoError(t, m.advanceMigration(ctx))
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)],
 			"the successor's commit pointer must appear")
@@ -1175,14 +1203,14 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	t.Run("an operator abort stops the commit", func(t *testing.T) {
 		m, ssmf, session := setup(t)
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		answer(t, m, session, newPCR0)
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		// Written before the cooldown elapses; this is the only operator control.
 		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		require.Empty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)],
 			"an aborted handoff must not commit")
@@ -1192,10 +1220,10 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 
 		// The parameter stays: a new answer gets the candidate adopted again, and
 		// aborted again before it can commit.
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		answer(t, m, session, newPCR0)
-		require.NoError(t, m.advanceMigration(ctx))
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		require.Empty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 		status, err = m.MigrationStatus(ctx)
@@ -1207,15 +1235,15 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		m, ssmf, session := setup(t)
 		m.cfg.MigrationCooldown = 2 * time.Minute
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		answer(t, m, session, newPCR0)
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
 		require.Equal(t, migrationStateCoolingDown, status.State)
 
 		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		status, err = m.MigrationStatus(ctx)
 		require.NoError(t, err)
@@ -1225,16 +1253,16 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	t.Run("an abort after the commit is not recorded", func(t *testing.T) {
 		m, ssmf, session := setup(t)
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		answer(t, m, session, newPCR0)
-		require.NoError(t, m.advanceMigration(ctx))
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 
 		// Too late: the successor holds the state, so the log must not claim the
 		// handoff was aborted.
 		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
@@ -1244,14 +1272,14 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	t.Run("an abort naming a different target does not apply", func(t *testing.T) {
 		m, ssmf, session := setup(t)
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		answer(t, m, session, newPCR0)
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		abort := m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
 		ssmf.params[abort] = strings.Repeat("ee", 48)
 
-		require.NoError(t, m.advanceMigration(ctx))
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 	})
@@ -1282,14 +1310,12 @@ func TestCandidateAnswersPublishedChallenges(t *testing.T) {
 		cfg: m.cfg, nsm: fx.nsm, pcr0: predecessor, ssm: m.ssm,
 	}
 	issuer.promoted.Store(true)
-	issuer.challenge.Store(&migrationChallenge{
-		nonce: mustDecodeHex(t, strings.Repeat("ab", 32)), issuedAt: time.Now(),
-	})
+	challenge := &migrationChallenge{Nonce: strings.Repeat("ab", 32), IssuedAt: time.Now()}
 	responses, err := issuer.ssm.ListParams(
 		ctx, issuer.cfg.migrationResponseParam(issuer.pcr0, ""),
 	)
 	require.NoError(t, err)
-	target, err := issuer.verifyChallengeResponses(ctx, responses)
+	target, err := issuer.verifyChallengeResponses(ctx, challenge, responses)
 	require.NoError(t, err)
 	require.Equal(t, fx.source, target)
 
@@ -1392,22 +1418,29 @@ func requestMigrationTo(
 	t.Helper()
 
 	own := m.pcr0
-	require.NoError(t, m.mayPublishChallenge(ctx))
-
-	challenge, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(own))
+	challenge, err := m.mayPublishChallenge(ctx)
 	require.NoError(t, err)
 
 	candidate := successorMigrator(t, m.cfg, predecessorSigner, mustDecodeHex(t, targetPCR0))
-	doc, err := successorAttestation(candidate, mustDecodeHex(t, challenge))
+	doc, err := successorAttestation(candidate, mustDecodeHex(t, challenge.Nonce))
 	require.NoError(t, err)
 	require.NoError(t, m.ssm.Set(
 		ctx, m.cfg.migrationResponseParam(own, targetPCR0), doc, WithAdvancedTier(),
 	))
 
-	if err := m.advanceMigration(ctx); err != nil {
+	if err := advanceMigrationForTest(t, ctx, m); err != nil {
 		return nil, err
 	}
 	return m.MigrationStatus(ctx)
+}
+
+func advanceMigrationForTest(t *testing.T, ctx context.Context, m *migrator) error {
+	t.Helper()
+	m.s3 = newFakeS3()
+	if err := m.ssm.Set(ctx, m.cfg.leaseBucketParam(), testLeaseBucket); err != nil {
+		return err
+	}
+	return m.advanceMigration(ctx)
 }
 
 func mustDecodeHex(t *testing.T, s string) []byte {
@@ -1537,14 +1570,12 @@ func TestAwaitCandidateHandoffWaitsAndAnswersItsPredecessor(t *testing.T) {
 		cfg: m.cfg, nsm: m.nsm, pcr0: handoffPredecessorPCR0, ssm: m.ssm,
 	}
 	issuer.promoted.Store(true)
-	issuer.challenge.Store(&migrationChallenge{
-		nonce: mustDecodeHex(t, challenge), issuedAt: time.Now(),
-	})
+	issued := &migrationChallenge{Nonce: challenge, IssuedAt: time.Now()}
 	responses, err := issuer.ssm.ListParams(
 		context.Background(), issuer.cfg.migrationResponseParam(issuer.pcr0, ""),
 	)
 	require.NoError(t, err)
-	target, err := issuer.verifyChallengeResponses(context.Background(), responses)
+	target, err := issuer.verifyChallengeResponses(context.Background(), issued, responses)
 	require.NoError(t, err)
 	require.Equal(t, fx.pcr0Hex, target)
 

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -56,8 +57,8 @@ type MigrationStatus struct {
 }
 
 type migrationChallenge struct {
-	nonce    []byte
-	issuedAt time.Time
+	Nonce    string    `json:"nonce"`
+	IssuedAt time.Time `json:"issued_at"`
 }
 
 const (
@@ -92,8 +93,8 @@ type migrator struct {
 	genesis       *genesisLog
 	promoted      atomic.Bool
 
-	challenge         atomic.Pointer[migrationChallenge]
 	answeredChallenge string
+	s3                S3API
 }
 
 // NewMigrator initializes migration before enclave state is available.
@@ -140,6 +141,7 @@ func newMigrator(
 		ssm:     ssm,
 		intent:  intent,
 		genesis: genesis,
+		s3:      s3,
 	}, nil
 }
 
@@ -229,11 +231,9 @@ func (m *migrator) RunPredecessorHandoff(
 
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
-
 	for {
 		if err := m.advanceMigration(ctx); err != nil &&
 			!errors.Is(err, errMigrationIntentAbsent) {
-			// Handoff failures must not stop a serving enclave.
 			slog.Warn("predecessor handoff", "error", err)
 		}
 
@@ -315,19 +315,17 @@ func (m *migrator) verifyIntent(
 	return nil
 }
 
-func (m *migrator) issueMigrationChallenge() (string, error) {
-	challenge := make([]byte, 32)
-	if _, err := secureRandom(challenge); err != nil {
-		return "", fmt.Errorf("generate migration challenge: %w", err)
-	}
-
-	m.challenge.Store(&migrationChallenge{nonce: challenge, issuedAt: time.Now()})
-
-	return hex.EncodeToString(challenge), nil
-}
-
 // advanceMigration advances the predecessor state machine once.
 func (m *migrator) advanceMigration(ctx context.Context) error {
+	lease, err := m.tryAcquireMigrationLease(ctx)
+	if err != nil {
+		return err
+	}
+	if lease == nil {
+		return nil
+	}
+	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+
 	if !m.promoted.Load() {
 		return errMigrationCandidate
 	}
@@ -355,8 +353,8 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 		return nil
 	}
 
-	// With no pending intent, publish a challenge and inspect its answers.
-	if err := m.mayPublishChallenge(ctx); err != nil {
+	challenge, err := m.mayPublishChallenge(ctx)
+	if err != nil {
 		return err
 	}
 
@@ -368,55 +366,82 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 		return nil
 	}
 
-	target, err := m.verifyChallengeResponses(ctx, responses)
+	target, err := m.verifyChallengeResponses(ctx, challenge, responses)
 	if err != nil {
 		return err
 	}
-
 	if target == "" {
 		return nil
 	}
 
+	if err := lease.Verify(ctx); err != nil {
+		return fmt.Errorf("verify migration lease: %w", err)
+	}
 	if _, err := m.intent.Request(ctx, m.pcr0, target); err != nil {
 		return err
 	}
-	// Retire this challenge after recording its intent.
-	m.challenge.Store(nil)
-
 	slog.Info("migration intent recorded from candidate attestation",
 		"target_pcr0", prefix16(target))
-
 	return nil
 }
 
+func (m *migrator) tryAcquireMigrationLease(ctx context.Context) (*Lease, error) {
+	bucket, err := m.ssm.MustGet(ctx, m.cfg.leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("read lease bucket: %w", err)
+	}
+	lease, err := TryAcquireLease(
+		ctx, m.cfg, m.s3, bucket, "migration-"+strings.ToLower(m.pcr0), leaseTTL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("acquire migration lease: %w", err)
+	}
+	return lease, nil
+}
+
 // mayPublishChallenge creates or rotates the live nonce.
-func (m *migrator) mayPublishChallenge(ctx context.Context) error {
-	challenge := m.challenge.Load()
-	fresh := challenge != nil && time.Since(challenge.issuedAt) < migrationChallengeRotate
-	if fresh {
-		return nil
+func (m *migrator) mayPublishChallenge(ctx context.Context) (*migrationChallenge, error) {
+	param := m.cfg.migrationChallengeParam(m.pcr0)
+	published, err := m.ssm.MayGet(ctx, param)
+	if err != nil {
+		return nil, fmt.Errorf("read migration challenge: %w", err)
+	}
+	var challenge migrationChallenge
+	if json.Unmarshal([]byte(published), &challenge) == nil {
+		age := time.Since(challenge.IssuedAt)
+		if challenge.Nonce != "" && age >= 0 && age < migrationChallengeRotate {
+			return &challenge, nil
+		}
 	}
 
-	newChallenge, err := m.issueMigrationChallenge()
+	nonce := make([]byte, 32)
+	if _, err := secureRandom(nonce); err != nil {
+		return nil, fmt.Errorf("generate migration challenge: %w", err)
+	}
+	challenge = migrationChallenge{Nonce: hex.EncodeToString(nonce), IssuedAt: time.Now()}
+	encoded, err := json.Marshal(challenge)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("encode migration challenge: %w", err)
 	}
-	if err := m.ssm.Set(ctx, m.cfg.migrationChallengeParam(m.pcr0), newChallenge); err != nil {
-		return fmt.Errorf("publish migration challenge: %w", err)
+	if err := m.ssm.Set(ctx, param, string(encoded)); err != nil {
+		return nil, fmt.Errorf("publish migration challenge: %w", err)
 	}
-	return nil
+	return &challenge, nil
 }
 
 // verifyChallengeResponses returns the first candidate answering the live challenge.
 func (m *migrator) verifyChallengeResponses(
 	ctx context.Context,
+	challenge *migrationChallenge,
 	responses []Param,
 ) (string, error) {
-	challenge := m.challenge.Load()
 	if challenge == nil {
 		return "", nil
 	}
-	issued := challenge.nonce
+	issued, err := hex.DecodeString(challenge.Nonce)
+	if err != nil || len(issued) == 0 {
+		return "", errors.New("invalid migration challenge")
+	}
 
 	expectedPayload, err := successorClaimPayload(m.cfg)
 	if err != nil {
@@ -695,12 +720,15 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read migration challenge: %w", err)
 	}
-	// Answer each challenge once.
-	if publishedChallenge == m.answeredChallenge {
+	challenge, err := decodeMigrationChallenge(publishedChallenge)
+	if err != nil {
 		return nil
 	}
-	challenge, err := hex.DecodeString(publishedChallenge)
-	if err != nil || len(challenge) == 0 {
+	if challenge.Nonce == m.answeredChallenge {
+		return nil
+	}
+	nonce, err := hex.DecodeString(challenge.Nonce)
+	if err != nil || len(nonce) == 0 {
 		return nil
 	}
 
@@ -709,7 +737,7 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attest successor claim: %w", err)
 	}
-	doc, _, err := m.nsm.BuildAttestationDocument(WithNonce(challenge), WithUserData(payload))
+	doc, _, err := m.nsm.BuildAttestationDocument(WithNonce(nonce), WithUserData(payload))
 	if err != nil {
 		return fmt.Errorf("attest successor claim: %w", err)
 	}
@@ -720,8 +748,19 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf("publish successor attestation: %w", err)
 	}
-	m.answeredChallenge = publishedChallenge
+	m.answeredChallenge = challenge.Nonce
 	return nil
+}
+
+func decodeMigrationChallenge(value string) (*migrationChallenge, error) {
+	var challenge migrationChallenge
+	if err := json.Unmarshal([]byte(value), &challenge); err == nil && challenge.Nonce != "" {
+		return &challenge, nil
+	}
+	if nonce, err := hex.DecodeString(value); err == nil && len(nonce) > 0 {
+		return &migrationChallenge{Nonce: value}, nil
+	}
+	return nil, errors.New("invalid migration challenge")
 }
 
 func successorClaimPayload(cfg *Config) ([]byte, error) {

@@ -100,7 +100,7 @@ jobs:
             echo "|---|---|"
             echo "| PCR0 | \`${pcr0}\` |"
             echo "| sha256 | \`${sha}\` |"
-            echo "| object name | \`${APP_NAME}/${pcr0}.eif\` |"
+            echo "| object name | \`${APP_NAME}/${ENV_NAME}/${pcr0}.eif\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the measurement

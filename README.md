@@ -166,11 +166,18 @@ under a KMS key that only the measured enclave can use.
 
 ### Boot paths
 
-Every enclave boots into **candidate**: NSM, attestation and the migration
-control path are up, but there is no canonical state, no static secrets and no
-application. It leaves candidate only by obtaining state. A genesis or resuming
-enclave passes straight through; a successor stays until its predecessor
-commits.
+Every enclave boots into **candidate**. Its servers, telemetry, NSM,
+`/enclave/v1/info` and the candidate side of the migration protocol are up, but
+it holds no state: no static secret is in its environment, no application runs,
+and it serves neither application requests nor `/enclave/attestation`. It leaves
+candidate only by obtaining state. A genesis or resuming enclave passes straight
+through; a successor waits, answering its predecessor's challenges, until the
+predecessor commits.
+
+It then moves to **starting** while it extends its PCRs, configures TLS (under
+ACME this includes DNS-01 issuance and can take minutes) and exports its static
+secrets, and to **ready** once the application has started. `status` on
+`/enclave/v1/info` only ever moves forward.
 
 Whether a deployment already exists is decided by the Object-Locked
 `deployment-genesis` object, not by SSM alone. That key is fixed and
@@ -187,16 +194,18 @@ different keys even if a lease expires between verification and commit.
 | genesis object absent and `KMSKeyID/<pcr0>` present | fatal | Genesis was interrupted after claiming its key but before its final immutable commit. |
 
 A candidate serves an ephemeral self-signed certificate so it stays observable.
-That certificate is not the persisted TLS key and is not bound into the
+That certificate is not the persisted TLS key and is not bound into any
 attestation, so no client can pin a candidate. It reports `status: "candidate"`
-on `/enclave/v1/info`, and answers `503` on `/health` and on any application
-path. It promotes in place when its commit pointer appears — no restart, and no
-action by the host.
+on `/enclave/v1/info`, and answers `503` on `/health`, `/enclave/attestation` and
+any application path until it is ready. It promotes in place when its commit
+pointer appears — no restart, and no action by the host.
 
 Boot order is fixed and every step is fatal: clock synchronisation against
-`/dev/ptp0`, networking, AWS clients, telemetry, HTTP servers, state
-establishment, PCR extension, TLS, SSM environment overlay, static secret export,
-then exec of the application.
+`/dev/ptp0`, networking, AWS clients, SSM environment overlay, telemetry, HTTP
+servers and `/enclave/v1/info`; then, as a candidate, the wait for a handoff and
+state establishment; then, starting, PCR extension, the predecessor side of the
+migration protocol, TLS, static secret export and exec of the application, at
+which point the enclave is ready.
 
 ## Nix API
 
@@ -420,8 +429,8 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/StateOriginReceipt/<keyID>/<pcr0>` | runtime | Attested proof of which enclave established this state. |
 | `/D/A/MigrationStateOriginReceipt/<keyID>/<pcr0>` | runtime | Predecessor's attestation over the successor's state. Written create-only. |
 | `/D/A/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge published by a predecessor, rotated every minute. |
-| `/D/A/SuccessorAttestation/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
-| `/D/A/MigrationAbort/<sourcePCR0>` | operator | Naming the pending target PCR0 cancels the handoff during the cooldown. |
+| `/D/A/MigrationResponse/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
+| `/D/A/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. The predecessor records the abort in the intent log as soon as it sees it. |
 | `/D/A/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
 | `/D/A/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Predecessor KMS key ID, committed into the successor's state root. |
 | `/D/A/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
@@ -450,8 +459,8 @@ preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. |
-| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` or `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
 | POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
@@ -605,9 +614,10 @@ The predecessor verifies that the answering enclave is real, is measured for thi
 deployment, and answered the challenge it published minutes ago; it cannot verify
 that the image is the one an operator intended.
 
-If two candidates answer the same challenge the predecessor records nothing and
-keeps serving: an ambiguous round is nobody's intent. Remove the extra candidate
-and the next round proceeds.
+If more than one candidate answers the same challenge, the predecessor adopts the
+first verified answer. Each answer is bound to the deployment, challenge, and
+candidate PCR0. Run one candidate at a time when deterministic selection matters;
+the selected PCR0 can be inspected and aborted during the cooldown.
 
 Predecessor replicas sharing a PCR0 share one challenge parameter and one intent
 chain. Whichever replica's challenge a candidate answered records the intent;
@@ -624,8 +634,8 @@ The order is:
    predecessor's PCR0, so the successor's own measurement commits to the
    enclave it will adopt from.
 2. Boot the successor. It comes up as a candidate: it holds no state, serves no
-   application, and answers any challenge it finds under
-   `/<deployment>/<app>/MigrationChallenge/`.
+   application or attestation, and answers the challenge its predecessor
+   publishes at `/<deployment>/<app>/MigrationChallenge/<predecessor PCR0>`.
 3. The predecessor adopts it. It verifies the document's signature and chain,
    that its nonce is the challenge it published, and that its `user_data` claims
    this deployment; it then takes the target PCR0 **from the document** and
@@ -636,8 +646,10 @@ The order is:
    `candidate.awaiting_handoff_from` — informational only, since the intent log
    is host-writable.
 4. The cooldown runs. This is the abort window: writing the pending target PCR0
-   to `/<deployment>/<app>/MigrationAbort/<predecessor PCR0>` cancels the
-   handoff. It is the only operator control in the protocol.
+   to `/<deployment>/<app>/MigrationResponse/<predecessor PCR0>/abort` cancels
+   the handoff. The predecessor records the abort in the intent log as soon as
+   it sees it. It is the only operator control in the protocol. Stop the aborted
+   candidate too, or each new answer it sends is adopted and aborted again.
 5. The predecessor commits, on its own, once the intent is eligible and no abort
    names the target. It commits the successor's PCR0 into its own PCR31, creates
    a KMS key admitting the successor's PCR0 alone, re-encrypts the DEK and every
@@ -660,7 +672,8 @@ The order is:
    always safe, since the next attempt mints a fresh key and writes a disjoint
    set of paths.
 
-   An abort recorded after this write has committed does not retract the
+   An abort that arrives after this write is too late: the predecessor does not
+   record it, and one a racing replica records anyway does not retract the
    handoff. The intent log governs whether a migration may begin; the pointer is
    what makes it real.
 6. Confirm `KMSKeyID/<successor PCR0>` now exists, and that

@@ -365,7 +365,7 @@ green.wait_for_unit("mock-imds-forward.service")
 green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green.wait_for_unit("enclave-start.service")
 
-# A candidate holds no canonical state and serves no application.
+# Candidates serve neither the app nor attestation.
 green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.status == \"candidate\"'",
@@ -377,6 +377,11 @@ secret_status, _ = green.execute(
     "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY"
 )
 assert secret_status != 0, "a candidate must serve no application request"
+attestation_code = green.succeed(
+    "curl -sk -o /dev/null -w '%{http_code}' --http1.1 "
+    f"'https://127.0.0.1/enclave/attestation?nonce={'ab' * 20}'"
+).strip()
+assert attestation_code == "503", attestation_code
 
 # A blue records an intent naming green, derived from green's attestation. No
 # operator wrote that PCR0 anywhere. The blues share one intent chain, so both
@@ -490,10 +495,10 @@ aws.wait_until_succeeds(
     timeout=900,
 )
 wait_healthy(green)
-green.wait_until_succeeds(
+# Health and status share one lifecycle.
+green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    "| jq -e '.status == \"ready\"'",
-    timeout=180,
+    "| jq -e '.status == \"ready\"'"
 )
 assert secret_value(green) == blue_secret
 green.succeed(

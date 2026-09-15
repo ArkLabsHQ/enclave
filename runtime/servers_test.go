@@ -30,11 +30,14 @@ type migrationControlMigrator struct {
 	statusErr    error
 	candidate    *CandidateInfo
 	candidateErr error
-	notReady     bool
 }
 
-func (m *migrationControlMigrator) RunMigrationControl(context.Context)     {}
-func (m *migrationControlMigrator) RunCandidateAttestation(context.Context) {}
+func (m *migrationControlMigrator) RunPredecessorHandoff(
+	context.Context, PrimaryKMS, DEK, []StaticSecret, crypto.Signer,
+) {
+}
+
+func (m *migrationControlMigrator) AwaitCandidateHandoff(context.Context) error { return nil }
 
 func (m *migrationControlMigrator) PreviousPCR0Info(context.Context) (*PreviousPCR0Info, error) {
 	return m.previous, m.previousErr
@@ -46,12 +49,6 @@ func (m *migrationControlMigrator) MigrationStatus(context.Context) (*MigrationS
 
 func (m *migrationControlMigrator) CandidateInfo(context.Context) (*CandidateInfo, error) {
 	return m.candidate, m.candidateErr
-}
-
-func (m *migrationControlMigrator) Ready() bool { return !m.notReady }
-
-func (m *migrationControlMigrator) Promote(PrimaryKMS, DEK, []StaticSecret, crypto.Signer) {
-	m.notReady = false
 }
 
 func TestServersStartReturnsBindErrors(t *testing.T) {
@@ -273,9 +270,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		CheckedAt: &ancestryTestCheckedAt,
 	}}
 
-	err = s.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry)
-	require.NoError(t, err)
-	require.True(t, ancestry.started, "the handler must own the audit's refresh lifecycle")
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	serve := func(t *testing.T) []byte {
 		t.Helper()
@@ -284,7 +279,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 		require.Equal(t, http.StatusOK, rr.Code)
 		return rr.Body.Bytes()
 	}
-	want := func(t *testing.T, status string) string {
+	want := func(t *testing.T, status string, ancestryInfo *AncestryInfo) string {
 		t.Helper()
 		body, err := json.Marshal(RuntimeInfo{
 			Version:                  Version,
@@ -297,20 +292,23 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 			},
 			UpstreamApp:  rt.UpstreamAppInfo(),
 			KMSKeyLocked: testCfg.KMSLocked,
-			Ancestry:     ancestry.snap,
+			Ancestry:     ancestryInfo,
 		})
 		require.NoError(t, err)
 		return string(body)
 	}
 
-	// Built with no key material, so it is still awaiting a handoff.
-	require.JSONEq(t, want(t, runtimeStatusCandidate), string(serve(t)))
+	// Candidates have no lineage to audit.
+	require.JSONEq(t, want(t, runtimeStatusCandidate, nil), string(serve(t)))
 
-	// Promotion is visible on the same handler: it is registered once, before
-	// state exists, and the migrator is filled in underneath it.
-	migrator.Promote(&kmsW{keyID: "key"}, nil, nil, nil)
+	rt.NotifyStarting()
+	s.SetAncestry(ctx, ancestry)
+	require.True(t, ancestry.started, "setting the audit must start its refresh lifecycle")
+	require.JSONEq(t, want(t, runtimeStatusStarting, ancestry.snap), string(serve(t)))
+
+	rt.NotifyReady()
 	body := serve(t)
-	require.JSONEq(t, want(t, runtimeStatusReady), string(body))
+	require.JSONEq(t, want(t, runtimeStatusReady, ancestry.snap), string(body))
 
 	var got map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(body, &got))
@@ -319,16 +317,17 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
 	requestedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
-	migrator := &migrationControlMigrator{
-		previous: &PreviousPCR0Info{PCR0: "genesis"},
-		status:   &MigrationStatus{State: migrationStateNone},
-		candidate: &CandidateInfo{
-			AwaitingHandoffFrom: strings.Repeat("ab", 48), RequestedAt: &requestedAt,
-		},
-		notReady: true,
+	rt := newRuntimeState()
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
+	inbound := &CandidateInfo{
+		AwaitingHandoffFrom: strings.Repeat("ab", 48), RequestedAt: &requestedAt,
 	}
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
+	migrator := &migrationControlMigrator{
+		previous:  &PreviousPCR0Info{PCR0: "genesis"},
+		status:    &MigrationStatus{State: migrationStateNone},
+		candidate: inbound,
+	}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	serve := func(t *testing.T) RuntimeInfo {
 		t.Helper()
@@ -342,7 +341,7 @@ func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
 
 	got := serve(t)
 	require.Equal(t, runtimeStatusCandidate, got.Status)
-	require.Equal(t, migrator.candidate, got.Candidate)
+	require.Equal(t, inbound, got.Candidate)
 
 	// A candidate that cannot read the intent log is still a candidate.
 	migrator.candidate, migrator.candidateErr = nil, errors.New("s3 unavailable")
@@ -350,10 +349,12 @@ func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
 	require.Equal(t, runtimeStatusCandidate, got.Status)
 	require.Nil(t, got.Candidate)
 
-	migrator.notReady = false
+	// Only candidates report inbound handoffs.
+	migrator.candidate, migrator.candidateErr = inbound, nil
+	rt.NotifyStarting()
 	got = serve(t)
-	require.Equal(t, runtimeStatusReady, got.Status)
-	require.Nil(t, got.Candidate, "a ready enclave reports no inbound handoff")
+	require.Equal(t, runtimeStatusStarting, got.Status)
+	require.Nil(t, got.Candidate, "only a candidate reports an inbound handoff")
 }
 
 var ancestryTestCheckedAt = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
@@ -371,7 +372,7 @@ func (s *stubAncestry) Snapshot() *AncestryInfo { return s.snap }
 // that reads as "every ancestor key is accounted for".
 func TestConfigureEnclaveInfoHandlerOmitsAncestryWhenUnset(t *testing.T) {
 	s, migrator := enclaveInfoTestServer(t)
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
@@ -391,7 +392,8 @@ func TestConfigureEnclaveInfoHandlerServesUnknownAncestry(t *testing.T) {
 		}},
 		CheckedAt: &ancestryTestCheckedAt,
 	}}
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, ancestry))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+	s.SetAncestry(context.Background(), ancestry)
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
@@ -415,7 +417,8 @@ func TestConfigureEnclaveInfoHandlerSurvivesABlindAudit(t *testing.T) {
 	ancestry := fx.a
 	ancestry.refresh(context.Background())
 
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, ancestry))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
+	s.SetAncestry(context.Background(), ancestry)
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
 
@@ -450,7 +453,7 @@ func TestConfigureEnclaveInfoHandlerFailsClosedOnStatusError(t *testing.T) {
 	statusErr := fmt.Errorf("S3 unavailable: %w", errMigrationIntentStoreUnavailable)
 	s := &servers{cfg: testCfg, rm: http.NewServeMux()}
 	migrator := &migrationControlMigrator{statusErr: statusErr}
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(context.Background(), migrator, nil))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(migrator))
 
 	rr := httptest.NewRecorder()
 	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
@@ -497,21 +500,23 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		&AttestationHashes{},
 		"token",
 	).(*servers)
-	require.NoError(t, s.ConfigureEnclaveInfoHandler(
-		context.Background(),
-		&migrationControlMigrator{
-			previous: &PreviousPCR0Info{},
-			status:   &MigrationStatus{},
-		},
-		nil,
-	))
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
+		previous: &PreviousPCR0Info{},
+		status:   &MigrationStatus{},
+	}))
 
-	t.Run("a candidate serves no application route", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/anything", nil))
-		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	unavailable := func(t *testing.T) {
+		nonce := strings.Repeat("ab", nonceNumDigits/2)
+		for _, path := range []string{"/anything", "/enclave/attestation?nonce=" + nonce} {
+			rr := httptest.NewRecorder()
+			s.em.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			require.Equal(t, http.StatusServiceUnavailable, rr.Code, path)
+		}
 		require.Empty(t, proxied, "nothing may be proxied before the app starts")
-	})
+	}
+	t.Run("a candidate serves no application and no attestation", unavailable)
+	rt.NotifyStarting()
+	t.Run("nor does a starting runtime", unavailable)
 
 	rt.NotifyReady()
 
@@ -542,6 +547,8 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			status int
 		}{
 			{http.MethodGet, "/enclave/v1/info", http.StatusOK},
+			// A ready request still requires a nonce.
+			{http.MethodGet, "/enclave/attestation", http.StatusBadRequest},
 			// Telemetry is ingest-only: it ships to CloudWatch and is never read
 			// back, so a compromised enclave has no history to serve.
 			{http.MethodGet, "/enclave/v1/metrics", http.StatusMethodNotAllowed},

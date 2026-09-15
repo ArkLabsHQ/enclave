@@ -48,9 +48,6 @@ var (
 	errMigrationCandidate        = errors.New(
 		"migration: this enclave is a candidate and holds no state to hand off",
 	)
-	errMigrationSuccessorAmbiguous = errors.New(
-		"migration: more than one candidate answered the challenge",
-	)
 )
 
 type migrationIntentV1 struct {
@@ -164,47 +161,6 @@ func (l *migrationIntentLog) Abort(
 	}
 
 	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, head.TargetPCR0)
-}
-
-// InboundIntent returns the newest pending request, from any source, naming
-// targetPCR0. It is informational only: the intent log is host-writable, so a
-// record naming this enclave proves nothing and must never end candidacy.
-func (l *migrationIntentLog) InboundIntent(
-	ctx context.Context,
-	targetPCR0 string,
-) (*migrationIntent, error) {
-	sources := map[string]bool{}
-	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix,
-		errMigrationIntentStoreUnavailable, "list migration intent sources",
-		func(key, _ string, _ *time.Time) (bool, error) {
-			source, _, ok := parseMigrationIntentObjectKey(key)
-			if ok && !strings.EqualFold(source, targetPCR0) {
-				sources[source] = true
-			}
-			return false, nil
-		})
-	if err != nil {
-		return nil, err
-	}
-
-	var newest *migrationIntent
-	for _, source := range slices.Sorted(maps.Keys(sources)) {
-		head, tie, _, err := l.scanIntents(ctx, source)
-		if err != nil {
-			return nil, err
-		}
-		if head == nil || tie || head.Action != migrationIntentRequested {
-			continue
-		}
-		if !strings.EqualFold(head.TargetPCR0, targetPCR0) {
-			continue
-		}
-		if newest == nil || head.PublishedAt.After(newest.PublishedAt) {
-			newest = head
-		}
-	}
-
-	return newest, nil
 }
 
 func (l *migrationIntentLog) append(

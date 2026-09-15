@@ -113,3 +113,21 @@ func waitTestResult(t *testing.T, ch <-chan error) error {
 		return nil
 	}
 }
+
+func TestRuntimeStateLifecycleOnlyMovesForward(t *testing.T) {
+	rt := newRuntimeState()
+	require.Equal(t, runtimeStatusCandidate, rt.Status())
+	require.False(t, rt.Ready())
+
+	rt.NotifyStarting()
+	require.Equal(t, runtimeStatusStarting, rt.Status())
+	require.False(t, rt.Ready())
+
+	rt.NotifyReady()
+	require.Equal(t, runtimeStatusReady, rt.Status())
+	require.True(t, rt.Ready())
+
+	// Ready is terminal.
+	rt.NotifyStarting()
+	require.Equal(t, runtimeStatusReady, rt.Status())
+}

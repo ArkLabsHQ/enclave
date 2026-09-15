@@ -16,7 +16,16 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
+// Runtime status moves from candidate to starting to ready.
+const (
+	runtimeStatusCandidate = "candidate"
+	runtimeStatusStarting  = "starting"
+	runtimeStatusReady     = "ready"
+)
+
 type RuntimeState interface {
+	Status() string
+	NotifyStarting()
 	Ready() bool
 	NotifyReady()
 	UpstreamAppInfo() UpstreamAppInfo
@@ -112,14 +121,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
-	ancestry := &deferredAncestry{}
-	if err := servers.ConfigureEnclaveInfoHandler(ctx, migrator, ancestry); err != nil {
+	if err := servers.ConfigureEnclaveInfoHandler(migrator); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
-
-	// Answer any predecessor's challenge while we wait. A candidate that never
-	// gets migrated to simply keeps answering; nothing else happens.
-	go migrator.RunCandidateAttestation(ctx)
 
 	candidateCertCb, err := candidateCertCallback(cfg.FQDN)
 	if err != nil {
@@ -127,19 +131,25 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
 
-	result, err := boot.AwaitHandoff(ctx)
+	// Candidates wait here until their predecessor commits the handoff.
+	if err := migrator.AwaitCandidateHandoff(ctx); err != nil {
+		return fmt.Errorf("failed to await migration handoff: %w", err)
+	}
+
+	result, err := boot.Boot(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
 	}
+
+	rt.NotifyStarting()
 
 	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
-	migrator.Promote(result.kms, result.dek, result.secrets, result.tlsKey)
-	ancestry.Resolve(NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
+	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
 
-	go migrator.RunMigrationControl(ctx)
+	go migrator.RunPredecessorHandoff(ctx, result.kms, result.dek, result.secrets, result.tlsKey)
 
 	tlsCertCb, err := ConfigureTLS(
 		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
@@ -259,7 +269,7 @@ func waitForRuntime(ctx context.Context, rt RuntimeState) error {
 }
 
 type runtimeState struct {
-	isReady         atomic.Bool
+	status          atomic.Value // one of the runtimeStatus constants
 	isExit          atomic.Bool
 	exitError       atomic.Value
 	tlsReadyOnce    sync.Once
@@ -270,12 +280,21 @@ type runtimeState struct {
 	childDoneCh     chan error
 }
 
+func (r *runtimeState) Status() string {
+	return r.status.Load().(string)
+}
+
+// NotifyStarting records that enclave state is available.
+func (r *runtimeState) NotifyStarting() {
+	r.status.CompareAndSwap(runtimeStatusCandidate, runtimeStatusStarting)
+}
+
 func (r *runtimeState) Ready() bool {
-	return r.isReady.Load()
+	return r.Status() == runtimeStatusReady
 }
 
 func (r *runtimeState) NotifyReady() {
-	r.isReady.Store(true)
+	r.status.Store(runtimeStatusReady)
 }
 
 func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
@@ -291,8 +310,7 @@ func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
 	}
 }
 
-// SetTLSCertCallback installs the certificate source. It may be called again:
-// a candidate serves a placeholder until promotion supplies the real one.
+// SetTLSCertCallback replaces the certificate source.
 func (r *runtimeState) SetTLSCertCallback(cb TLSCertCallback) {
 	r.tlsMu.Lock()
 	r.tlsCertCallback = cb
@@ -333,9 +351,11 @@ func (r *runtimeState) ChildDone() <-chan error {
 }
 
 func newRuntimeState() *runtimeState {
-	return &runtimeState{
+	r := &runtimeState{
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),
 		childDoneCh: make(chan error),
 	}
+	r.status.Store(runtimeStatusCandidate)
+	return r
 }

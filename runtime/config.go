@@ -21,6 +21,11 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
+
+	migrationPollInterval    = 5 * time.Second
+	migrationChallengeRotate = time.Minute
+
+	migrationAbortResponse = "abort"
 )
 
 const (
@@ -316,37 +321,18 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 
 // migrationChallengeParam: the live challenge published by a predecessor.
 func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
-	return c.migrationChallengePrefix() + strings.ToLower(sourcePCR0)
-}
-
-func (c *Config) migrationChallengePrefix() string {
-	return fmt.Sprintf("/%s/%s/MigrationChallenge/", c.Deployment, c.AppName)
-}
-
-// successorAttestationParam: a candidate's answer to sourcePCR0's challenge.
-// Advanced tier: an attestation document exceeds the 4 KB Standard-tier limit.
-func (c *Config) successorAttestationParam(sourcePCR0, candidatePCR0 string) string {
-	return c.successorAttestationPrefix(sourcePCR0) + strings.ToLower(candidatePCR0)
-}
-
-// successorAttestationPrefix: the answers to one predecessor's challenge. Its
-// children are one level deep, so ListParams enumerates the candidates.
-func (c *Config) successorAttestationPrefix(sourcePCR0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/SuccessorAttestation/%s/",
-		c.Deployment,
-		c.AppName,
-		strings.ToLower(sourcePCR0),
+		"/%s/%s/MigrationChallenge/%s", c.Deployment, c.AppName, strings.ToLower(sourcePCR0),
 	)
 }
 
-// migrationAbortParam: operator-written. Naming the pending target PCR0 stops the
-// handoff before it commits. This is the only operator control in the protocol.
-func (c *Config) migrationAbortParam(sourcePCR0 string) string {
+// migrationResponseParam identifies a candidate or operator response.
+func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
 	return fmt.Sprintf(
-		"/%s/%s/MigrationAbort/%s",
+		"/%s/%s/MigrationResponse/%s/%s",
 		c.Deployment,
 		c.AppName,
 		strings.ToLower(sourcePCR0),
+		strings.ToLower(responder),
 	)
 }

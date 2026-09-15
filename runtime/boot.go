@@ -45,11 +45,6 @@ const (
 	migrationIntentBucketArtifact = "migration-intent-bucket"
 )
 
-const (
-	handoffPollMin = time.Second
-	handoffPollMax = 30 * time.Second
-)
-
 // bootResult is the boot machine's terminal state
 type bootResult struct {
 	kms     PrimaryKMS
@@ -208,59 +203,6 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 		return bootResult{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
 	return b.establish(ctx, planned, kms)
-}
-
-// AwaitHandoff boots, holding the enclave as a candidate while the deployment
-// exists but nothing is committed at KMSKeyID/<pcr0> yet. The wait sits in
-// front of Boot and plans nothing: once it ends, Boot sees exactly the state it
-// would have seen had this enclave been started after the commit. Every read
-// failure is fatal, so a genuinely broken enclave still dies loudly instead of
-// hanging. There is deliberately no timeout: a candidate legitimately sits until
-// a predecessor migrates to it, and giving up would only force a fresh challenge
-// exchange after a needless restart.
-func (b *Boot) AwaitHandoff(ctx context.Context) (bootResult, error) {
-	// The predecessor writes this pointer last, so the handoff artifacts beside
-	// it may still be half-written while it is absent. Nothing else in this
-	// enclave's scope is read until it exists.
-	pointer := b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0))
-	keyID, err := b.ssm.MayGet(ctx, pointer)
-	if err != nil {
-		return bootResult{}, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
-	}
-	if keyID != "" {
-		return b.Boot(ctx)
-	}
-
-	// A deployment with no genesis record has nobody to hand over from; whether
-	// to create it is Boot's decision.
-	bucket, err := b.migrationIntentBucket(ctx)
-	if err != nil {
-		return bootResult{}, err
-	}
-	genesis, err := newGenesisLog(b.cfg, b.s3, b.nsm, bucket)
-	if err != nil {
-		return bootResult{}, fmt.Errorf("failed to open deployment genesis log: %w", err)
-	}
-	artifact, err := genesis.Genesis(ctx)
-	if err != nil {
-		return bootResult{}, fmt.Errorf("failed to read deployment genesis: %w", err)
-	}
-	if artifact == nil {
-		return b.Boot(ctx)
-	}
-
-	slog.Info("candidate: awaiting migration handoff", "pointer", pointer)
-	for backoff := handoffPollMin; keyID == ""; backoff = min(backoff*2, handoffPollMax) {
-		select {
-		case <-ctx.Done():
-			return bootResult{}, ctx.Err()
-		case <-time.After(backoff):
-		}
-		if keyID, err = b.ssm.MayGet(ctx, pointer); err != nil {
-			return bootResult{}, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
-		}
-	}
-	return b.Boot(ctx)
 }
 
 // plan decides, once, which of the three boots this is.

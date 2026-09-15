@@ -59,45 +59,6 @@ type ancestry struct {
 	refreshing bool
 }
 
-// deferredAncestry stands in for the audit while this enclave is a candidate:
-// there is no authenticated lineage to walk until boot establishes state, so it
-// reports none until Resolve supplies the real audit.
-type deferredAncestry struct {
-	mu    sync.Mutex
-	ctx   context.Context
-	inner Ancestry
-}
-
-func (d *deferredAncestry) Start(ctx context.Context) {
-	d.mu.Lock()
-	d.ctx = ctx
-	inner := d.inner
-	d.mu.Unlock()
-	if inner != nil {
-		inner.Start(ctx)
-	}
-}
-
-func (d *deferredAncestry) Resolve(inner Ancestry) {
-	d.mu.Lock()
-	d.inner = inner
-	ctx := d.ctx
-	d.mu.Unlock()
-	if ctx != nil {
-		inner.Start(ctx)
-	}
-}
-
-func (d *deferredAncestry) Snapshot() *AncestryInfo {
-	d.mu.Lock()
-	inner := d.inner
-	d.mu.Unlock()
-	if inner == nil {
-		return nil
-	}
-	return inner.Snapshot()
-}
-
 func (a *ancestry) Start(ctx context.Context) {
 	a.mu.Lock()
 	a.ctx = ctx

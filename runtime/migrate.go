@@ -13,6 +13,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -24,10 +25,12 @@ const (
 	successorClaimSchemaV1 = "enclave.successor_claim.v1"
 )
 
-// successorClaimV1 binds a candidate attestation to its deployment.
+// successorClaimV1 binds an attestation to its state namespace.
 type successorClaimV1 struct {
 	Schema     string `cbor:"schema"`
 	Deployment string `cbor:"deployment"`
+	AppName    string `cbor:"app_name"`
+	Lock       string `cbor:"lock"`
 }
 
 // CandidateInfo is reported by an enclave still awaiting a handoff.
@@ -50,6 +53,11 @@ type MigrationStatus struct {
 	PublishedAt      *time.Time `json:"published_at,omitempty"`
 	EligibleAt       *time.Time `json:"eligible_at,omitempty"`
 	RemainingSeconds int        `json:"remaining_seconds"`
+}
+
+type migrationChallenge struct {
+	nonce    []byte
+	issuedAt time.Time
 }
 
 const (
@@ -82,11 +90,10 @@ type migrator struct {
 	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
 	genesis       *genesisLog
-	promoted      bool // set once RunPredecessorHandoff holds state to hand off
+	promoted      atomic.Bool
 
-	challenge   []byte
-	challengeAt time.Time
-	answered    string // the challenge respondToChallenge last published an answer to
+	challenge         atomic.Pointer[migrationChallenge]
+	answeredChallenge string
 }
 
 // NewMigrator initializes migration before enclave state is available.
@@ -217,8 +224,8 @@ func (m *migrator) RunPredecessorHandoff(
 ) {
 	m.mu.Lock()
 	m.kms, m.dek, m.staticSecrets, m.tlsKey = kms, dek, secrets, tlsKey
-	m.promoted = true
 	m.mu.Unlock()
+	m.promoted.Store(true)
 
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
@@ -241,8 +248,8 @@ func (m *migrator) RunPredecessorHandoff(
 // AwaitCandidateHandoff waits for the predecessor's atomic commit. It returns
 // immediately for an existing generation or a fresh deployment.
 func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
-	pointer := m.cfg.kmsKeyIDParam(m.pcr0)
-	keyID, err := m.ssm.MayGet(ctx, pointer)
+	kmsIdParam := m.cfg.kmsKeyIDParam(m.pcr0)
+	keyID, err := m.ssm.MayGet(ctx, kmsIdParam)
 	if err != nil {
 		return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
@@ -262,7 +269,7 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 		return nil
 	}
 
-	slog.Info("candidate: awaiting migration handoff", "pointer", pointer)
+	slog.Info("candidate: awaiting migration handoff", "pointer", kmsIdParam)
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
 	for keyID == "" {
@@ -274,7 +281,7 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		if keyID, err = m.ssm.MayGet(ctx, pointer); err != nil {
+		if keyID, err = m.ssm.MayGet(ctx, kmsIdParam); err != nil {
 			return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 		}
 	}
@@ -314,31 +321,34 @@ func (m *migrator) issueMigrationChallenge() (string, error) {
 		return "", fmt.Errorf("generate migration challenge: %w", err)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.challenge = challenge
-	m.challengeAt = time.Now()
+	m.challenge.Store(&migrationChallenge{nonce: challenge, issuedAt: time.Now()})
 
 	return hex.EncodeToString(challenge), nil
 }
 
 // advanceMigration advances the predecessor state machine once.
 func (m *migrator) advanceMigration(ctx context.Context) error {
+	if !m.promoted.Load() {
+		return errMigrationCandidate
+	}
+
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
 		return err
 	}
 
-	switch status.State {
-	case migrationStateCoolingDown:
-		_, err := m.mayAbortMigration(ctx, status.TargetPCR0)
-		return err
-	case migrationStateEligible:
+	pending := status.State == migrationStateCoolingDown || status.State == migrationStateEligible
+	if pending {
 		aborted, err := m.mayAbortMigration(ctx, status.TargetPCR0)
 		if err != nil || aborted {
 			return err
 		}
+	}
 
+	switch status.State {
+	case migrationStateCoolingDown:
+		return nil
+	case migrationStateEligible:
 		if err := m.handOffToSuccessor(ctx); !errors.Is(err, errMigrationAlreadyFinalised) {
 			return err
 		}
@@ -350,7 +360,15 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 		return err
 	}
 
-	target, err := m.verifyChallenge(ctx)
+	responses, err := m.ssm.ListParams(ctx, m.cfg.migrationResponseParam(m.pcr0, ""))
+	if err != nil {
+		return fmt.Errorf("list migration responses: %w", err)
+	}
+	if len(responses) == 0 {
+		return nil
+	}
+
+	target, err := m.verifyChallengeResponses(ctx, responses)
 	if err != nil {
 		return err
 	}
@@ -363,7 +381,7 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 		return err
 	}
 	// Retire this challenge after recording its intent.
-	m.challenge = nil
+	m.challenge.Store(nil)
 
 	slog.Info("migration intent recorded from candidate attestation",
 		"target_pcr0", prefix16(target))
@@ -373,106 +391,96 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 
 // mayPublishChallenge creates or rotates the live nonce.
 func (m *migrator) mayPublishChallenge(ctx context.Context) error {
-	m.mu.Lock()
-	fresh := len(m.challenge) > 0 && time.Since(m.challengeAt) < migrationChallengeRotate
-	m.mu.Unlock()
+	challenge := m.challenge.Load()
+	fresh := challenge != nil && time.Since(challenge.issuedAt) < migrationChallengeRotate
 	if fresh {
 		return nil
 	}
 
-	challenge, err := m.issueMigrationChallenge()
+	newChallenge, err := m.issueMigrationChallenge()
 	if err != nil {
 		return err
 	}
-	if err := m.ssm.Set(ctx, m.cfg.migrationChallengeParam(m.pcr0), challenge); err != nil {
+	if err := m.ssm.Set(ctx, m.cfg.migrationChallengeParam(m.pcr0), newChallenge); err != nil {
 		return fmt.Errorf("publish migration challenge: %w", err)
 	}
 	return nil
 }
 
-// verifyChallenge returns the first candidate answering the live challenge.
-func (m *migrator) verifyChallenge(ctx context.Context) (string, error) {
-	responses, err := m.ssm.ListParams(ctx, m.cfg.migrationResponseParam(m.pcr0, ""))
-	if err != nil {
-		return "", fmt.Errorf("list migration responses: %w", err)
-	}
-	if len(responses) == 0 {
+// verifyChallengeResponses returns the first candidate answering the live challenge.
+func (m *migrator) verifyChallengeResponses(
+	ctx context.Context,
+	responses []Param,
+) (string, error) {
+	challenge := m.challenge.Load()
+	if challenge == nil {
 		return "", nil
 	}
+	issued := challenge.nonce
 
-	m.mu.Lock()
-	issued := append([]byte(nil), m.challenge...)
-	m.mu.Unlock()
-	if len(issued) == 0 {
-		return "", nil
-	}
-
-	expected, err := successorClaimPayload(m.cfg.Deployment)
+	expectedPayload, err := successorClaimPayload(m.cfg)
 	if err != nil {
 		return "", err
 	}
 
-	// Invalid answers cannot block a valid candidate.
-	target := ""
+	reject := func(response Param, err error) {
+		slog.Warn("ignoring successor attestation", "param", response.Name, "error", err)
+	}
 	for _, response := range responses {
-		// Learn PCR0 from the signed document.
 		doc, err := m.nsm.VerifyAttestationDocument(response.Value, nil)
-		attested := ""
-		switch {
-		case err != nil:
-			err = fmt.Errorf("verify successor attestation: %w", err)
-		case !bytes.Equal(doc.Document.UserData, expected):
-			err = errors.New("attested user data does not match expected user data")
-		case !bytes.Equal(doc.Document.Nonce, issued):
-			err = errors.New("successor attestation does not answer the issued challenge")
-		case len(doc.Document.PCRs[0]) == 0:
-			err = errors.New("successor attestation has no PCR0")
-		default:
-			attested, _, err = normalizePCR0(hex.EncodeToString(doc.Document.PCRs[0]))
-			if err != nil {
-				err = fmt.Errorf("successor PCR0 %w", err)
-			}
-		}
 		if err != nil {
-			slog.Warn("ignoring successor attestation", "param", response.Name, "error", err)
+			reject(response, fmt.Errorf("verify successor attestation: %w", err))
 			continue
 		}
-		if !strings.EqualFold(attested, m.pcr0) {
-			target = attested
-			break
+		if !bytes.Equal(doc.Document.UserData, expectedPayload) {
+			reject(response, errors.New("attested user data does not match expected user data"))
+			continue
 		}
-	}
-	if target == "" {
-		return "", nil
-	}
+		if !bytes.Equal(doc.Document.Nonce, issued) {
+			reject(
+				response,
+				errors.New("successor attestation does not answer the issued challenge"),
+			)
+			continue
+		}
+		if len(doc.Document.PCRs[0]) == 0 {
+			reject(response, errors.New("successor attestation has no PCR0"))
+			continue
+		}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.promoted {
-		return target, errMigrationCandidate
+		attested, _, err := normalizePCR0(hex.EncodeToString(doc.Document.PCRs[0]))
+		if err != nil {
+			reject(response, fmt.Errorf("successor PCR0 %w", err))
+			continue
+		}
+		if strings.EqualFold(attested, m.pcr0) {
+			continue
+		}
+
+		return attested, nil
 	}
-	return target, nil
+	return "", nil
 }
 
 // mayAbortMigration records a matching abort before the handoff commits.
 func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bool, error) {
 	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
-	abort, err := m.ssm.MayGet(ctx, abortParam)
+	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
 	if err != nil {
 		return false, fmt.Errorf("read migration abort: %w", err)
 	}
-	if abort == "" || !strings.EqualFold(abort, targetPCR0) {
+	if abortedPCR0 == "" || !strings.EqualFold(abortedPCR0, targetPCR0) {
 		return false, nil
 	}
 
 	// Serialize the abort check with commit.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	committed, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
 	if err != nil {
 		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
 	}
-	if committed != "" {
+	if targetKmsID != "" {
 		slog.Warn("ignoring migration abort: the handoff has already committed",
 			"target_pcr0", prefix16(targetPCR0))
 		return false, nil
@@ -486,10 +494,6 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 
 // eligibleHandOff returns an eligible intent. The caller holds m.mu.
 func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error) {
-	if !m.promoted {
-		return nil, errMigrationCandidate
-	}
-
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve migration intent: %w", err)
@@ -526,11 +530,11 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		return fmt.Errorf("migration intent has invalid target PCR0: %w", err)
 	}
 
-	existing, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
 	if err != nil {
 		return fmt.Errorf("failed to read target KMS key ID: %w", err)
 	}
-	if existing != "" {
+	if targetKmsID != "" {
 		return fmt.Errorf(
 			"%w: %s already has a committed generation",
 			errMigrationAlreadyFinalised,
@@ -687,21 +691,21 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 		return nil
 	}
 
-	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
+	publishedChallenge, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
 	if err != nil {
 		return fmt.Errorf("read migration challenge: %w", err)
 	}
 	// Answer each challenge once.
-	if published == m.answered {
+	if publishedChallenge == m.answeredChallenge {
 		return nil
 	}
-	challenge, err := hex.DecodeString(published)
+	challenge, err := hex.DecodeString(publishedChallenge)
 	if err != nil || len(challenge) == 0 {
 		return nil
 	}
 
 	// Bind the answer to the challenge nonce.
-	payload, err := successorClaimPayload(m.cfg.Deployment)
+	payload, err := successorClaimPayload(m.cfg)
 	if err != nil {
 		return fmt.Errorf("attest successor claim: %w", err)
 	}
@@ -716,18 +720,20 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf("publish successor attestation: %w", err)
 	}
-	m.answered = published
+	m.answeredChallenge = publishedChallenge
 	return nil
 }
 
-func successorClaimPayload(deployment string) ([]byte, error) {
+func successorClaimPayload(cfg *Config) ([]byte, error) {
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build canonical CBOR encoder: %w", err)
 	}
 	payload, err := enc.Marshal(successorClaimV1{
 		Schema:     successorClaimSchemaV1,
-		Deployment: deployment,
+		Deployment: cfg.Deployment,
+		AppName:    cfg.AppName,
+		Lock:       cfg.lockSegment(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("serialize successor claim: %w", err)

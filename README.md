@@ -610,14 +610,14 @@ predecessor                                candidate
 This is the authority boundary. The host decides when a candidate exists and can
 stop one, but it cannot forge a measurement, replay an old answer, or write the
 commit pointer. What it can still choose is *which* image to run as a candidate.
-The predecessor verifies that the answering enclave is real, is measured for this
-deployment, and answered the challenge it published minutes ago; it cannot verify
-that the image is the one an operator intended.
+The predecessor verifies that the answering enclave is real, claims the same
+deployment, app, and lock posture, and answered its live challenge. It cannot
+verify that the image is the one an operator intended.
 
 If more than one candidate answers the same challenge, the predecessor adopts the
-first verified answer. Each answer is bound to the deployment, challenge, and
-candidate PCR0. Run one candidate at a time when deterministic selection matters;
-the selected PCR0 can be inspected and aborted during the cooldown.
+first verified answer. Each answer is bound to the state namespace, challenge,
+and candidate PCR0. Run one candidate at a time when deterministic selection
+matters; the selected PCR0 can be inspected and aborted during the cooldown.
 
 Predecessor replicas sharing a PCR0 share one challenge parameter and one intent
 chain. Whichever replica's challenge a candidate answered records the intent;
@@ -638,8 +638,9 @@ The order is:
    publishes at `/<deployment>/<app>/MigrationChallenge/<predecessor PCR0>`.
 3. The predecessor adopts it. It verifies the document's signature and chain,
    that its nonce is the challenge it published, and that its `user_data` claims
-   this deployment; it then takes the target PCR0 **from the document** and
-   writes an Object-Locked record to the intent log. It cannot be deleted.
+   the same deployment, app, and lock posture; it then takes the target PCR0
+   **from the document** and writes an Object-Locked record to the intent log.
+   It cannot be deleted.
 
    Confirm it is the successor you meant: `/enclave/v1/info` on the predecessor
    reports `migration.target_pcr0`. The candidate reports the same handoff as

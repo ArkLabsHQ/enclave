@@ -310,7 +310,10 @@ func (r *runtimeState) UpstreamAppInfo() UpstreamAppInfo {
 	}
 }
 
-// SetTLSCertCallback replaces the certificate source.
+// SetTLSCertCallback replaces the certificate source. Run calls it twice: a
+// throwaway certificate while the enclave is a candidate, then the real one once
+// state is established. Every call swaps the callback, which each handshake reads
+// afresh; only the first unblocks handshakes waiting for one, so it is not a Once.
 func (r *runtimeState) SetTLSCertCallback(cb TLSCertCallback) {
 	r.tlsMu.Lock()
 	r.tlsCertCallback = cb

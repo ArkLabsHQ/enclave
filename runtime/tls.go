@@ -177,10 +177,7 @@ func configureSelfSigned(
 	return manager.GetCertificate, nil
 }
 
-// candidateCertCallback serves an ephemeral self-signed certificate so a
-// candidate stays observable before it holds state. Its key is deliberately not
-// the persisted fleet TLS key — a candidate has not decrypted it — and it is not
-// recorded in the attestation hashes, so no client can pin a candidate.
+// candidateCertCallback keeps a stateless candidate observable over TLS.
 func candidateCertCallback(fqdn string) (TLSCertCallback, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

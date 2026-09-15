@@ -47,10 +47,6 @@ func WithUserData(userData []byte) BuildAttestationOption {
 }
 
 type NSM interface {
-	VerifyAttestation(
-		attestDocB64 string,
-		expectedPCRs map[uint]string,
-	) ([]byte, error)
 	VerifyAttestationDocument(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
@@ -96,19 +92,8 @@ func NewNSM(opts ...VerifyAttestationOption) NSM {
 	return &nsmW{nsm: &awsNSM{unsigned: vao.unsigned, roots: vao.roots}}
 }
 
-func (n *nsmW) VerifyAttestation(
-	attestDocB64 string,
-	expectedPCRs map[uint]string,
-) ([]byte, error) {
-	result, err := n.VerifyAttestationDocument(attestDocB64, expectedPCRs)
-	if err != nil {
-		return nil, err
-	}
-	return result.Document.UserData, nil
-}
-
-// VerifyAttestationDocument is VerifyAttestation for callers that need more of
-// the document than its user data, such as the nonce or an unconstrained PCR.
+// VerifyAttestationDocument checks the document's signature chain and that it
+// carries expectedPCRs, and returns the verified document.
 func (n *nsmW) VerifyAttestationDocument(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,

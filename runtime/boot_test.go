@@ -1355,13 +1355,13 @@ type seededGenesisNSM struct {
 	NSM
 }
 
-func (n seededGenesisNSM) VerifyAttestation(
+func (n seededGenesisNSM) VerifyAttestationDocument(
 	doc string, pcrs map[uint]string,
-) ([]byte, error) {
+) (*nitrite.Result, error) {
 	if doc == seededGenesisAttestation {
-		return nil, nil
+		return &nitrite.Result{Document: &nitrite.Document{}}, nil
 	}
-	return n.NSM.VerifyAttestation(doc, pcrs)
+	return n.NSM.VerifyAttestationDocument(doc, pcrs)
 }
 
 type fakePredecessorNSM struct {
@@ -1369,13 +1369,13 @@ type fakePredecessorNSM struct {
 	doc string
 }
 
-func (n fakePredecessorNSM) VerifyAttestation(
+func (n fakePredecessorNSM) VerifyAttestationDocument(
 	doc string, pcrs map[uint]string,
-) ([]byte, error) {
+) (*nitrite.Result, error) {
 	if doc == n.doc {
-		return nil, nil
+		return &nitrite.Result{Document: &nitrite.Document{}}, nil
 	}
-	return n.NSM.VerifyAttestation(doc, pcrs)
+	return n.NSM.VerifyAttestationDocument(doc, pcrs)
 }
 
 func TestDeletingKMSKeyIDFailsClosed(t *testing.T) {

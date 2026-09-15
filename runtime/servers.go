@@ -102,16 +102,14 @@ func SetupHttpServers(
 
 	rm := http.NewServeMux()
 	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, telemetry, authToken)
-	// Attestation binds the served TLS key, which is only the fleet key once the
-	// runtime is ready; before that it would attest an all-zero hash.
+
 	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, hashes)))
 
 	em := http.NewServeMux()
 	em.Handle(enclavePrefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
-	// A candidate has no application behind the proxy. Say so, rather than
-	// letting every unmatched path 502 against a process that was never started.
+
 	em.Handle("/", whenReady(rt, revProxy))
 
 	im := http.NewServeMux()

@@ -74,7 +74,7 @@ func TestAWSNSMVerifyAttestationSig(t *testing.T) {
 	})
 }
 
-func TestNSMVerifyAttestation(t *testing.T) {
+func TestNSMVerifyAttestationDocument(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	userData := []byte("expected user data")
 	doc := []byte("attestation doc")
@@ -84,7 +84,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation("not base64", map[uint]string{})
+		_, err := nsm.VerifyAttestationDocument("not base64", map[uint]string{})
 
 		require.Error(t, err)
 		require.Empty(t, fake.verifyDocs)
@@ -94,7 +94,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyErr: errors.New("verify failed")}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(docB64, map[uint]string{})
+		_, err := nsm.VerifyAttestationDocument(docB64, map[uint]string{})
 
 		require.Error(t, err)
 		require.Equal(t, [][]byte{doc}, fake.verifyDocs)
@@ -104,19 +104,19 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		got, err := nsm.VerifyAttestation(
+		got, err := nsm.VerifyAttestationDocument(
 			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
 		)
 
 		require.NoError(t, err)
-		require.Equal(t, userData, got)
+		require.Equal(t, userData, got.Document.UserData)
 	})
 
 	t.Run("missing PCR", func(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{1: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(
+		_, err := nsm.VerifyAttestationDocument(
 			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
 		)
 
@@ -127,7 +127,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(
+		_, err := nsm.VerifyAttestationDocument(
 			docB64,
 			map[uint]string{0: hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))},
 		)

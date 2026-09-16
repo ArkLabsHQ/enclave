@@ -953,6 +953,44 @@ func TestChallengeRotationRetiresOldAnswers(t *testing.T) {
 	require.Empty(t, fx.s3.objects, "a stale answer must publish no intent")
 }
 
+func TestFailedChallengeRotationRecordsNoIntent(t *testing.T) {
+	ctx := context.Background()
+	fx := newMigrationIntentFixture(t)
+	ssmf := &fakeSSM{}
+	m := &migrator{
+		cfg: migrationTestCfg(), nsm: fx.nsm, pcr0: fx.source, intent: fx.log,
+		ssm: NewSSM(ssmf),
+	}
+	target := strings.Repeat("cd", 48)
+
+	challenge, err := m.mayPublishChallenge(ctx)
+	require.NoError(t, err)
+	candidate := successorMigrator(t, m.cfg, fx.signer, mustDecodeHex(t, target))
+	answer, err := successorAttestation(candidate, challenge.Nonce)
+	require.NoError(t, err)
+	require.NoError(t, m.ssm.Set(
+		ctx, m.cfg.migrationResponseParam(m.pcr0, target), answer, WithAdvancedTier(),
+	))
+
+	ssmf.putErrs = map[string]error{
+		m.cfg.migrationChallengeParam(m.pcr0): errors.New("throttled"),
+	}
+	require.Error(t, advanceMigrationForTest(t, ctx, m))
+
+	// An intent recorded here would outlive its still-live challenge.
+	status, err := m.MigrationStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, migrationStateNone, status.State)
+	require.Empty(t, fx.s3.objects)
+
+	// The answer still matches the unrotated challenge, so the next round adopts it.
+	ssmf.putErrs = nil
+	require.NoError(t, advanceMigrationForTest(t, ctx, m))
+	status, err = m.MigrationStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, target, status.TargetPCR0)
+}
+
 func TestPredecessorIgnoresChallengeFromAnotherMeasurement(t *testing.T) {
 	ctx := context.Background()
 	fx := newMigrationIntentFixture(t)

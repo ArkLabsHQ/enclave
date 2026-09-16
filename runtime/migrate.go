@@ -368,16 +368,16 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 	if err := lease.Verify(ctx); err != nil {
 		return fmt.Errorf("verify migration lease: %w", err)
 	}
+	// Retire this challenge before recording, so a failed rotation cannot leave
+	// its answers live to re-adopt a target after an abort.
+	if _, err := m.issueMigrationChallenge(ctx); err != nil {
+		return err
+	}
 	if _, err := m.intent.Request(ctx, m.pcr0, target); err != nil {
 		return err
 	}
 	slog.Info("migration intent recorded from candidate attestation",
 		"target_pcr0", prefix16(target))
-
-	// Retire this challenge so its answers cannot re-adopt a target after an abort.
-	if _, err := m.issueMigrationChallenge(ctx); err != nil {
-		return err
-	}
 	return nil
 }
 

@@ -45,9 +45,6 @@ var (
 		"migration intent: target PCR0 is this enclave",
 	)
 	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
-	errMigrationCandidate        = errors.New(
-		"migration: this enclave is a candidate and holds no state to hand off",
-	)
 )
 
 type migrationIntentV1 struct {

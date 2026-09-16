@@ -986,6 +986,7 @@ type genesisFixture struct {
 	s3f     *fakeS3
 	kmsf    *fakeKMS
 	sts     *fakeSTS
+	signer  *testAttestationSigner
 	pcr0Hex string
 }
 
@@ -1089,6 +1090,7 @@ func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 		s3f:     newFakeS3(),
 		kmsf:    newFakeKMS(),
 		sts:     &fakeSTS{arn: testRoleARN},
+		signer:  session.attestationSign,
 	}
 }
 

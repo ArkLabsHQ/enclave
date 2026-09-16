@@ -7,14 +7,11 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -22,12 +19,13 @@ import (
 
 // migrationPCRIndex stores the successor-PCR0 handoff commitment.
 const (
-	migrationPCRIndex      = 31
-	successorClaimSchemaV1 = "enclave.successor_claim.v1"
+	migrationPCRIndex          = 31
+	successorClaimSchemaV1     = "enclave.successor_claim.v1"
+	migrationChallengeSchemaV1 = "enclave.migration_challenge.v1"
 )
 
-// successorClaimV1 binds an attestation to its state namespace.
-type successorClaimV1 struct {
+// migrationClaimV1 binds an attestation to its state namespace.
+type migrationClaimV1 struct {
 	Schema     string `cbor:"schema"`
 	Deployment string `cbor:"deployment"`
 	AppName    string `cbor:"app_name"`
@@ -56,9 +54,11 @@ type MigrationStatus struct {
 	RemainingSeconds int        `json:"remaining_seconds"`
 }
 
+// migrationChallenge is the verified content of a predecessor's challenge
+// attestation. Both fields are signed by the NSM, so SSM cannot alter them.
 type migrationChallenge struct {
-	Nonce    string    `json:"nonce"`
-	IssuedAt time.Time `json:"issued_at"`
+	Nonce    []byte
+	IssuedAt time.Time
 }
 
 const (
@@ -81,7 +81,6 @@ type Migrator interface {
 
 type migrator struct {
 	cfg           *Config
-	mu            sync.Mutex
 	nsm           NSM
 	pcr0          string // hex; read from the NSM once, in newMigrator
 	kms           PrimaryKMS
@@ -91,7 +90,6 @@ type migrator struct {
 	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
 	genesis       *genesisLog
-	promoted      atomic.Bool
 
 	answeredChallenge string
 	s3                S3API
@@ -224,10 +222,7 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 func (m *migrator) RunPredecessorHandoff(
 	ctx context.Context, kms PrimaryKMS, dek DEK, secrets []StaticSecret, tlsKey crypto.Signer,
 ) {
-	m.mu.Lock()
 	m.kms, m.dek, m.staticSecrets, m.tlsKey = kms, dek, secrets, tlsKey
-	m.mu.Unlock()
-	m.promoted.Store(true)
 
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
@@ -326,10 +321,6 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 	}
 	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
-	if !m.promoted.Load() {
-		return errMigrationCandidate
-	}
-
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
 		return err
@@ -411,31 +402,68 @@ func (m *migrator) mayPublishChallenge(ctx context.Context) (*migrationChallenge
 	if err != nil {
 		return nil, fmt.Errorf("read migration challenge: %w", err)
 	}
-	var challenge migrationChallenge
-	if json.Unmarshal([]byte(published), &challenge) == nil {
-		age := time.Since(challenge.IssuedAt)
-		if challenge.Nonce != "" && age >= 0 && age < migrationChallengeRotate {
-			return &challenge, nil
+	if published != "" {
+		challenge, err := m.verifyMigrationChallenge(published, m.pcr0)
+		if err == nil && time.Since(challenge.IssuedAt) < migrationChallengeRotate {
+			return challenge, nil
+		}
+		if err != nil {
+			slog.Warn("replacing migration challenge", "error", err)
 		}
 	}
 	return m.issueMigrationChallenge(ctx)
 }
 
-// issueMigrationChallenge publishes a fresh nonce, retiring the previous one.
+// issueMigrationChallenge publishes a fresh attested nonce, retiring the previous one.
 func (m *migrator) issueMigrationChallenge(ctx context.Context) (*migrationChallenge, error) {
 	nonce := make([]byte, 32)
 	if _, err := secureRandom(nonce); err != nil {
 		return nil, fmt.Errorf("generate migration challenge: %w", err)
 	}
-	challenge := migrationChallenge{Nonce: hex.EncodeToString(nonce), IssuedAt: time.Now()}
-	encoded, err := json.Marshal(challenge)
+	payload, err := m.attestationPayload(migrationChallengeSchemaV1)
 	if err != nil {
-		return nil, fmt.Errorf("encode migration challenge: %w", err)
+		return nil, fmt.Errorf("attest migration challenge: %w", err)
 	}
-	if err := m.ssm.Set(ctx, m.cfg.migrationChallengeParam(m.pcr0), string(encoded)); err != nil {
+	doc, _, err := m.nsm.BuildAttestationDocument(WithNonce(nonce), WithUserData(payload))
+	if err != nil {
+		return nil, fmt.Errorf("attest migration challenge: %w", err)
+	}
+	published := base64.StdEncoding.EncodeToString(doc)
+	challenge, err := m.verifyMigrationChallenge(published, m.pcr0)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ssm.Set(
+		ctx, m.cfg.migrationChallengeParam(m.pcr0), published, WithAdvancedTier(),
+	); err != nil {
 		return nil, fmt.Errorf("publish migration challenge: %w", err)
 	}
-	return &challenge, nil
+	return challenge, nil
+}
+
+// verifyMigrationChallenge returns the nonce and issue time of a challenge
+// attested by an enclave measuring issuerPCR0 for this state namespace.
+func (m *migrator) verifyMigrationChallenge(
+	published, issuerPCR0 string,
+) (*migrationChallenge, error) {
+	doc, err := m.nsm.VerifyAttestationDocument(published, map[uint]string{0: issuerPCR0})
+	if err != nil {
+		return nil, fmt.Errorf("verify migration challenge: %w", err)
+	}
+	expectedPayload, err := m.attestationPayload(migrationChallengeSchemaV1)
+	if err != nil {
+		return nil, fmt.Errorf("verify migration challenge: %w", err)
+	}
+	if !bytes.Equal(doc.Document.UserData, expectedPayload) {
+		return nil, errors.New("migration challenge is not bound to this state namespace")
+	}
+	if len(doc.Document.Nonce) == 0 {
+		return nil, errors.New("migration challenge has no nonce")
+	}
+	return &migrationChallenge{
+		Nonce:    doc.Document.Nonce,
+		IssuedAt: time.UnixMilli(int64(doc.Document.Timestamp)),
+	}, nil
 }
 
 // verifyChallengeResponses returns the first candidate answering the live challenge.
@@ -447,12 +475,12 @@ func (m *migrator) verifyChallengeResponses(
 	if challenge == nil {
 		return "", nil
 	}
-	issued, err := hex.DecodeString(challenge.Nonce)
-	if err != nil || len(issued) == 0 {
+	issued := challenge.Nonce
+	if len(issued) == 0 {
 		return "", errors.New("invalid migration challenge")
 	}
 
-	expectedPayload, err := successorClaimPayload(m.cfg)
+	expectedPayload, err := m.attestationPayload(successorClaimSchemaV1)
 	if err != nil {
 		return "", err
 	}
@@ -507,9 +535,6 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 		return false, nil
 	}
 
-	// Serialize the abort check with commit.
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
 	if err != nil {
 		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
@@ -526,7 +551,7 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 	return true, nil
 }
 
-// eligibleHandOff returns an eligible intent. The caller holds m.mu.
+// eligibleHandOff returns an eligible intent.
 func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error) {
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
@@ -551,9 +576,6 @@ func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error
 
 // handOffToSuccessor exports state, then commits the target generation.
 func (m *migrator) handOffToSuccessor(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	status, err := m.eligibleHandOff(ctx)
 	if err != nil {
 		return err
@@ -725,28 +747,27 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 		return nil
 	}
 
-	publishedChallenge, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
+	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
 	if err != nil {
 		return fmt.Errorf("read migration challenge: %w", err)
 	}
-	challenge, err := decodeMigrationChallenge(publishedChallenge)
+	if published == "" || published == m.answeredChallenge {
+		return nil
+	}
+	// Answer only challenges attested by the predecessor itself.
+	challenge, err := m.verifyMigrationChallenge(published, predecessor)
 	if err != nil {
-		return nil
-	}
-	if challenge.Nonce == m.answeredChallenge {
-		return nil
-	}
-	nonce, err := hex.DecodeString(challenge.Nonce)
-	if err != nil || len(nonce) == 0 {
-		return nil
+		return err
 	}
 
 	// Bind the answer to the challenge nonce.
-	payload, err := successorClaimPayload(m.cfg)
+	payload, err := m.attestationPayload(successorClaimSchemaV1)
 	if err != nil {
 		return fmt.Errorf("attest successor claim: %w", err)
 	}
-	doc, _, err := m.nsm.BuildAttestationDocument(WithNonce(nonce), WithUserData(payload))
+	doc, _, err := m.nsm.BuildAttestationDocument(
+		WithNonce(challenge.Nonce), WithUserData(payload),
+	)
 	if err != nil {
 		return fmt.Errorf("attest successor claim: %w", err)
 	}
@@ -757,34 +778,25 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf("publish successor attestation: %w", err)
 	}
-	m.answeredChallenge = challenge.Nonce
+	m.answeredChallenge = published
 	return nil
 }
 
-func decodeMigrationChallenge(value string) (*migrationChallenge, error) {
-	var challenge migrationChallenge
-	if err := json.Unmarshal([]byte(value), &challenge); err == nil && challenge.Nonce != "" {
-		return &challenge, nil
-	}
-	if nonce, err := hex.DecodeString(value); err == nil && len(nonce) > 0 {
-		return &migrationChallenge{Nonce: value}, nil
-	}
-	return nil, errors.New("invalid migration challenge")
-}
-
-func successorClaimPayload(cfg *Config) ([]byte, error) {
+// attestationPayload encodes the state namespace under schema, so attestations
+// made for one purpose or deployment cannot stand in for another.
+func (m *migrator) attestationPayload(schema string) ([]byte, error) {
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build canonical CBOR encoder: %w", err)
 	}
-	payload, err := enc.Marshal(successorClaimV1{
-		Schema:     successorClaimSchemaV1,
-		Deployment: cfg.Deployment,
-		AppName:    cfg.AppName,
-		Lock:       cfg.lockSegment(),
+	payload, err := enc.Marshal(migrationClaimV1{
+		Schema:     schema,
+		Deployment: m.cfg.Deployment,
+		AppName:    m.cfg.AppName,
+		Lock:       m.cfg.lockSegment(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("serialize successor claim: %w", err)
+		return nil, fmt.Errorf("serialize attestation payload: %w", err)
 	}
 	return payload, nil
 }

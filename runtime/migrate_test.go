@@ -1169,12 +1169,14 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	// Standing in for a candidate publishing its answer to the live challenge.
 	answer := func(t *testing.T, m *migrator, session *fakeNSMSession, target string) {
 		t.Helper()
-		challenge, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(oldPCR0Hex))
+		published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(oldPCR0Hex))
 		require.NoError(t, err)
-		require.NotEmpty(t, challenge, "predecessor must publish a challenge")
+		require.NotEmpty(t, published, "predecessor must publish a challenge")
+		challenge, err := decodeMigrationChallenge(published)
+		require.NoError(t, err)
 
 		candidate := successorMigrator(t, m.cfg, session.attestationSign, mustDecodeHex(t, target))
-		doc, err := successorAttestation(candidate, mustDecodeHex(t, challenge))
+		doc, err := successorAttestation(candidate, mustDecodeHex(t, challenge.Nonce))
 		require.NoError(t, err)
 		require.NoError(t, m.ssm.Set(
 			ctx, m.cfg.migrationResponseParam(oldPCR0Hex, target), doc, WithAdvancedTier(),

@@ -382,6 +382,11 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 	}
 	slog.Info("migration intent recorded from candidate attestation",
 		"target_pcr0", prefix16(target))
+
+	// Retire this challenge so its answers cannot re-adopt a target after an abort.
+	if _, err := m.issueMigrationChallenge(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -413,17 +418,21 @@ func (m *migrator) mayPublishChallenge(ctx context.Context) (*migrationChallenge
 			return &challenge, nil
 		}
 	}
+	return m.issueMigrationChallenge(ctx)
+}
 
+// issueMigrationChallenge publishes a fresh nonce, retiring the previous one.
+func (m *migrator) issueMigrationChallenge(ctx context.Context) (*migrationChallenge, error) {
 	nonce := make([]byte, 32)
 	if _, err := secureRandom(nonce); err != nil {
 		return nil, fmt.Errorf("generate migration challenge: %w", err)
 	}
-	challenge = migrationChallenge{Nonce: hex.EncodeToString(nonce), IssuedAt: time.Now()}
+	challenge := migrationChallenge{Nonce: hex.EncodeToString(nonce), IssuedAt: time.Now()}
 	encoded, err := json.Marshal(challenge)
 	if err != nil {
 		return nil, fmt.Errorf("encode migration challenge: %w", err)
 	}
-	if err := m.ssm.Set(ctx, param, string(encoded)); err != nil {
+	if err := m.ssm.Set(ctx, m.cfg.migrationChallengeParam(m.pcr0), string(encoded)); err != nil {
 		return nil, fmt.Errorf("publish migration challenge: %w", err)
 	}
 	return &challenge, nil

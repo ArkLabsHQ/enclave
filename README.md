@@ -88,9 +88,10 @@ nix build .#eif
 cat result/pcr.json          # {"PCR0":"...","PCR1":"...","PCR2":"..."}
 ```
 
-`PCR0` is the identity of the enclave. It is what the KMS key policy is
-conditioned on and what clients pin. It changes whenever the runtime, the
-application, or the baked environment changes.
+`PCR0` is the enclave image measurement. KMS key policies are conditioned on it,
+and clients check it when verifying a bootstrap attestation. It changes whenever
+the runtime, application, or baked environment changes. The retained TLS
+public-key fingerprint identifies the deployment across accepted image changes.
 
 Provide the resulting EIF to a Nitro-capable host that satisfies the
 [deployment requirements](#deployment). Once it is running, verify it from a
@@ -793,9 +794,12 @@ and writes a disjoint generation; the abandoned one is orphaned, not reused.
 
 ## Verifying an enclave
 
-An enclave is only meaningful if clients verify it. Both the CLI and the library
-prove, before returning any response body, that they are talking to an enclave
-running the expected measured image.
+An enclave is only meaningful if clients verify it. The CLI and library verify
+the bootstrap enclave's measured image, then authenticate application traffic
+with the deployment's attested TLS public key. PCR0 identifies the bootstrap
+image; the shared TLS key identifies the deployment, including its replicas and
+accepted successors. A pinned application connection proves possession of that
+key, not the individual serving replica's current PCR0.
 
 ### CLI
 
@@ -862,11 +866,44 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | Option | Default | Effect |
 |---|---|---|
 | `ExpectedPCR0` | required | `New` fails without it. |
+| `ExpectedTLSKeyHash` | empty | Expected nonzero SHA-256 of the TLS public key's DER SubjectPublicKeyInfo, as 64 hex characters, compared case-insensitively. Empty retains the first fully verified fingerprint for the client's lifetime. |
 | `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
-| `InsecureTLS` | unset | Removes the certificate pin entirely. |
+| `InsecureTLS` | unset | Removes HTTP certificate pinning. Incompatible with `ExpectedTLSKeyHash` and `StrictTLS`; HTTPS is still required. |
+
+Persist the verified fingerprint in caller-managed storage and supply it on
+subsequent runs. This also preserves deployment identity when you explicitly
+accept a successor image's PCR0:
+
+```go
+verified, err := c.VerifyAttestation(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+if err := os.WriteFile("deployment-tls-key.sha256", []byte(verified.TLSKeyHash), 0600); err != nil {
+    log.Fatal(err)
+}
+
+// On a subsequent run, use the saved fingerprint with the accepted image.
+savedHash, err := os.ReadFile("deployment-tls-key.sha256")
+if err != nil {
+    log.Fatal(err)
+}
+c, err = client.New("https://enclave.example.com", client.Options{
+    ExpectedPCR0:       acceptedPCR0,
+    ExpectedTLSKeyHash: strings.TrimSpace(string(savedHash)),
+})
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+Omitting the fingerprint establishes trust on first successful verification;
+PCR0 alone does not distinguish deployments of the same image. After enrollment,
+load the saved value before creating a client. Do not replace it by enrolling
+again on every run. The CLI currently establishes first-use trust per invocation.
 
 What is verified on the first request, and cached for `CacheTTL`:
 
@@ -875,16 +912,25 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
+| Attested TLS fingerprint matches the supplied or previously retained fingerprint | always after first use | nothing |
 | `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
 
-The certificate pin is installed from the attestation document before any
-request carrying data is made, so a request issued before verification completes
-fails closed.
+All attestation, nonce, PCR, and fingerprint checks complete before the verified
+state and its pin become active together. Failed verification leaves the prior
+state unchanged. Cache refreshes and reconnects cannot replace the retained key;
+certificate renewal with the same public key continues to work.
+
+Base URLs, application requests, and redirects must use HTTPS. HTTP requests and
+downgrade redirects are rejected before application headers or bodies are sent,
+including redirects that replay POST bodies. `PinnedHTTPClient` enforces the
+same HTTPS requirement. Insecure testing options do not permit plaintext HTTP.
 
 `GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
-but does not perform public CA validation. Applications serving gRPC must set
+retaining the deployment fingerprint on reconnects. Caller dial options cannot
+override its pinned credentials. It does not perform public CA validation.
+Applications serving gRPC must set
 `ENCLAVE_UPSTREAM=h2c`.
 
 ## Testing
@@ -1018,9 +1064,13 @@ query what was already shipped.
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is
 running, not that it is running your code.
 
-**HTTP and gRPC trust the attested TLS channel.** The client verifies the Nitro
-attestation and PCRs before sending application requests, then pins the live TLS
-leaf to the exact hash carried in `user_data`.
+**HTTP and gRPC retain deployment identity.** The client verifies the Nitro
+bootstrap attestation and PCRs before sending application requests, then pins
+the live TLS public key to the fingerprint carried in `user_data`. That key is
+shared across deployment replicas and migrations; it does not independently
+attest each serving replica's image. Persist `AttestationResult.TLSKeyHash` and
+supply `ExpectedTLSKeyHash` to preserve identity across client lifetimes, even
+when accepting a successor PCR0. Application HTTP traffic always requires HTTPS.
 
 **Never manage `KMSKeyID/<pcr0>` with deployment tooling.** Migration finalisation
 rewrites it as its atomic commit, and genesis claims it create-only. A

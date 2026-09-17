@@ -264,7 +264,7 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
+| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment and a segment of every CloudWatch log group, so only letters, digits and `._-/#`; anything else fails validation at boot. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
 | `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
 way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
@@ -326,9 +326,63 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 | `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_LOG_GROUP_PREFIX` | none | Optional segments placed before the deployment: `/ark/se7enz/emulator` yields `/ark/se7enz/emulator/<deployment>/enclave/...`. The value is cleaned as a path: a missing leading `/` is added, repeated and trailing `/` collapse, and `.` and `..` segments resolve. Anything CloudWatch would refuse fails the boot. Settable from the SSM overlay. |
 
-Log groups are `/enclave/<deployment>/<app>/logs`,
-`/enclave/<deployment>/<app>/traces` and `/enclave/<deployment>/<app>/metrics`.
+Log groups are named `<prefix>/<deployment>/enclave/<signal>/<source>`, where
+`<prefix>` is `ENCLAVE_LOG_GROUP_PREFIX` and is empty by default:
+
+| Log group | Holds |
+|---|---|
+| `<prefix>/<deployment>/enclave/logs/app` | The application's OTLP log ingest. |
+| `<prefix>/<deployment>/enclave/logs/supervisor` | The runtime's own records. |
+| `<prefix>/<deployment>/enclave/traces/app` | The application's OTLP spans. |
+| `<prefix>/<deployment>/enclave/traces/supervisor` | The runtime's own spans. |
+| `<prefix>/<deployment>/enclave/metrics` | The periodic snapshot, covering both. |
+
+The nesting is what makes both sources reachable at once: a
+`--log-group-name-prefix <prefix>/<deployment>/enclave/logs` query returns app and
+supervisor together, and CloudWatch Logs Insights accepts both groups in one query.
+Metrics are not split because the snapshot is a single document describing the whole
+enclave.
+
+Within each group the stream is named for the EC2 instance hosting the enclave, read
+from IMDS at startup. One stream per instance, shared by every batch and every signal,
+so a restart appends to the stream it was already writing instead of opening a new one,
+and each instance in a fleet stays separable. The instance ID survives reboots and
+stop/start, so only replacing the instance starts a new stream. IMDS is therefore a
+boot dependency: the runtime refuses to start, naming the IMDS failure, when it cannot
+read an instance ID, because without one there is no stream to ship to.
+
+The group path carries no `<app>` segment: `ENCLAVE_APP_NAME` still namespaces all SSM
+state, but not the log groups. Two applications sharing one deployment therefore share
+these groups unless `ENCLAVE_LOG_GROUP_PREFIX` distinguishes them.
+
+**Changed:** the runtime's own records used to share `/enclave/<deployment>/<app>/logs`
+and `.../traces` with the application's, distinguished only by each record's `source`
+field. Every group name has changed, and so have the counters that describe them.
+Alarms and dashboards keyed on the old names stop matching until they are updated:
+
+| Before | After |
+|---|---|
+| `enclave_log_entries_total`, every record | `enclave_log_entries_total`, application records only, plus `enclave_supervisor_log_entries_total` for the runtime's |
+| `enclave_telemetry_logs_dropped_total` | `enclave_telemetry_logs_app_dropped_total` and `enclave_telemetry_logs_supervisor_dropped_total` |
+| `enclave_telemetry_traces_dropped_total` | `enclave_telemetry_traces_app_dropped_total` and `enclave_telemetry_traces_supervisor_dropped_total` |
+| `enclave_telemetry_metrics_dropped_total` | unchanged |
+
+`stderr` is unaffected: it still carries every runtime record, unbatched.
+
+The app's OTLP metric names are retained for the life of the enclave, so they are
+bounded by a 192 KiB budget of serialized size rather than by a name count: each
+name is charged the length of its JSON-encoded key, so escaping is paid for, plus
+a fixed allowance for the colon, comma and value that follow it. That admits roughly 4000
+twenty-byte names, 690 of 256 bytes, or a single name too large to afford at all,
+and keeps the snapshot inside the 256 KiB event limit at every name length. Past the budget new names are refused while names already
+stored keep updating, and every refusal is counted in
+`enclave_app_metrics_dropped_total`. The bound matters because the snapshot ships
+as a single event: an unbounded map would eventually exceed that limit and
+silently end all metrics shipping, the enclave's own counters included. OTLP log
+and span uploads are separately capped at 10000 records per request, answered
+with `413` above that.
 
 Events timestamped more than an hour from now, either direction, are dropped on
 arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS
@@ -570,7 +624,7 @@ AWS credentials delivered through IMDS must allow:
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/enclave/*`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/*` (`/<deployment>/enclave/*` by default). A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned

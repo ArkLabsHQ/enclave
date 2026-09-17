@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -129,6 +130,14 @@ func logRetentionDays() int32 {
 		return defaultLogRetentionDays
 	}
 	return int32(days)
+}
+
+func logGroupPrefix() string {
+	return normalizeLogGroupPrefix(os.Getenv("ENCLAVE_LOG_GROUP_PREFIX"))
+}
+
+func normalizeLogGroupPrefix(raw string) string {
+	return path.Join("/", strings.TrimSpace(raw))
 }
 
 func migrationCooldown() (time.Duration, bool, error) {

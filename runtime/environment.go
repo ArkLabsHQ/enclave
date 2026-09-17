@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -136,14 +137,7 @@ func logGroupPrefix() string {
 }
 
 func normalizeLogGroupPrefix(raw string) string {
-	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if trimmed == "" {
-		return defaultLogGroupPrefix
-	}
-	if !strings.HasPrefix(trimmed, "/") {
-		trimmed = "/" + trimmed
-	}
-	return trimmed + defaultLogGroupPrefix
+	return path.Join("/", strings.TrimSpace(raw))
 }
 
 func migrationCooldown() (time.Duration, bool, error) {

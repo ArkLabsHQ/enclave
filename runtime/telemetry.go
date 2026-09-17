@@ -36,7 +36,7 @@ var signalNames = [signalCount]string{
 }
 
 func (s signal) String() string {
-	if s < 0 || s >= signalCount || signalNames[s] == "" {
+	if s < 0 || s >= signalCount {
 		return "unknown"
 	}
 	return signalNames[s]

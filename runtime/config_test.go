@@ -14,7 +14,7 @@ func newTestConfig(deployment, appName string, dev bool) *Config {
 		Deployment: deployment, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
-		LogGroupPrefix: defaultLogGroupPrefix,
+		LogGroupPrefix: "/",
 		InstanceID:     "i-0e2ce2ce2ce2ce2ce",
 	}
 	c.setSecurityConfig(dev)
@@ -104,7 +104,7 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 250*time.Millisecond, cfg.LogShipInterval)
 	require.Equal(t, int32(7), cfg.LogRetentionDays)
-	require.Equal(t, "/ark/se7enz/emulator/enclave", cfg.LogGroupPrefix)
+	require.Equal(t, "/ark/se7enz/emulator", cfg.LogGroupPrefix)
 }
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
@@ -118,7 +118,7 @@ func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, defaultLogShipInterval, cfg.LogShipInterval)
 	require.Equal(t, defaultLogRetentionDays, cfg.LogRetentionDays)
-	require.Equal(t, defaultLogGroupPrefix, cfg.LogGroupPrefix)
+	require.Equal(t, "/", cfg.LogGroupPrefix)
 }
 
 func TestNormalizeLogGroupPrefix(t *testing.T) {
@@ -127,17 +127,19 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 		raw  string
 		want string
 	}{
-		{name: "unset", raw: "", want: "/enclave"},
-		{name: "whitespace only", raw: "   ", want: "/enclave"},
-		{name: "root only", raw: "/", want: "/enclave"},
-		{name: "slashes only", raw: "///", want: "/enclave"},
+		{name: "unset", raw: "", want: "/"},
+		{name: "whitespace only", raw: "   ", want: "/"},
+		{name: "root only", raw: "/", want: "/"},
+		{name: "slashes only", raw: "///", want: "/"},
 		{
 			name: "leading segments", raw: "/ark/se7enz/emulator",
-			want: "/ark/se7enz/emulator/enclave",
+			want: "/ark/se7enz/emulator",
 		},
-		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing/enclave"},
-		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading/enclave"},
-		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded/enclave"},
+		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing"},
+		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading"},
+		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded"},
+		{name: "doubled slash collapses", raw: "/ark//doubled", want: "/ark/doubled"},
+		{name: "dot segments resolve", raw: "/ark/./x/../y", want: "/ark/y"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, normalizeLogGroupPrefix(tc.raw))
@@ -147,15 +149,15 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 
 func TestConfigLogGroup(t *testing.T) {
 	cfg := newTestConfig("prod", "app", false)
-	require.Equal(t, "/enclave/prod/logs/app", cfg.logGroup(signalAppLogs))
-	require.Equal(t, "/enclave/prod/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
-	require.Equal(t, "/enclave/prod/traces/app", cfg.logGroup(signalAppTraces))
+	require.Equal(t, "/prod/enclave/logs/app", cfg.logGroup(signalAppLogs))
+	require.Equal(t, "/prod/enclave/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
+	require.Equal(t, "/prod/enclave/traces/app", cfg.logGroup(signalAppTraces))
 	require.Equal(t,
-		"/enclave/prod/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
-	require.Equal(t, "/enclave/prod/metrics", cfg.logGroup(signalMetrics))
+		"/prod/enclave/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
+	require.Equal(t, "/prod/enclave/metrics", cfg.logGroup(signalMetrics))
 
-	cfg.LogGroupPrefix = "/ark/se7enz/emulator/enclave"
-	require.Equal(t, "/ark/se7enz/emulator/enclave/prod/logs/supervisor",
+	cfg.LogGroupPrefix = "/ark/se7enz/emulator"
+	require.Equal(t, "/ark/se7enz/emulator/prod/enclave/logs/supervisor",
 		cfg.logGroup(signalSupervisorLogs))
 }
 

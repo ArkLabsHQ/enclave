@@ -326,21 +326,21 @@ another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 | `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
-| `ENCLAVE_LOG_GROUP_PREFIX` | none | Segment(s) placed **before** the `/enclave` root, which is always present: `/ark/se7enz/emulator` yields `/ark/se7enz/emulator/enclave/...`. A missing leading `/` is added and a trailing `/` stripped; anything CloudWatch would refuse fails the boot. Settable from the SSM overlay. |
+| `ENCLAVE_LOG_GROUP_PREFIX` | none | Optional segments placed before the deployment: `/ark/se7enz/emulator` yields `/ark/se7enz/emulator/<deployment>/enclave/...`. The value is cleaned as a path: a missing leading `/` is added, repeated and trailing `/` collapse, and `.` and `..` segments resolve. Anything CloudWatch would refuse fails the boot. Settable from the SSM overlay. |
 
-Log groups are named `<prefix>/enclave/<deployment>/<signal>/<source>`, where
+Log groups are named `<prefix>/<deployment>/enclave/<signal>/<source>`, where
 `<prefix>` is `ENCLAVE_LOG_GROUP_PREFIX` and is empty by default:
 
 | Log group | Holds |
 |---|---|
-| `<prefix>/enclave/<deployment>/logs/app` | The application's OTLP log ingest. |
-| `<prefix>/enclave/<deployment>/logs/supervisor` | The runtime's own records. |
-| `<prefix>/enclave/<deployment>/traces/app` | The application's OTLP spans. |
-| `<prefix>/enclave/<deployment>/traces/supervisor` | The runtime's own spans. |
-| `<prefix>/enclave/<deployment>/metrics` | The periodic snapshot, covering both. |
+| `<prefix>/<deployment>/enclave/logs/app` | The application's OTLP log ingest. |
+| `<prefix>/<deployment>/enclave/logs/supervisor` | The runtime's own records. |
+| `<prefix>/<deployment>/enclave/traces/app` | The application's OTLP spans. |
+| `<prefix>/<deployment>/enclave/traces/supervisor` | The runtime's own spans. |
+| `<prefix>/<deployment>/enclave/metrics` | The periodic snapshot, covering both. |
 
 The nesting is what makes both sources reachable at once: a
-`--log-group-name-prefix <prefix>/enclave/<deployment>/logs` query returns app and
+`--log-group-name-prefix <prefix>/<deployment>/enclave/logs` query returns app and
 supervisor together, and CloudWatch Logs Insights accepts both groups in one query.
 Metrics are not split because the snapshot is a single document describing the whole
 enclave.
@@ -350,7 +350,8 @@ from IMDS at startup. One stream per instance, shared by every batch and every s
 so a restart appends to the stream it was already writing instead of opening a new one,
 and each instance in a fleet stays separable. The instance ID survives reboots and
 stop/start, so only replacing the instance starts a new stream. IMDS is therefore a
-boot dependency: without it there is no stream name and `CreateLogStream` fails.
+boot dependency: the runtime refuses to start, naming the IMDS failure, when it cannot
+read an instance ID, because without one there is no stream to ship to.
 
 The group path carries no `<app>` segment: `ENCLAVE_APP_NAME` still namespaces all SSM
 state, but not the log groups. Two applications sharing one deployment therefore share
@@ -616,7 +617,7 @@ AWS credentials delivered through IMDS must allow:
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/enclave/*` (`/enclave/*` by default). A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/*` (`/<deployment>/enclave/*` by default). A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned

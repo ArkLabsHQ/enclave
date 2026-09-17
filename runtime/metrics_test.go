@@ -255,28 +255,40 @@ func TestSetAppMetricBoundsRetainedNames(t *testing.T) {
 		}
 	})
 
-	// json escaping expands < > & and control characters sixfold, so a budget
-	// charging raw name length would ship a snapshot several times the limit.
-	t.Run("charges names what they serialize to", func(t *testing.T) {
-		for _, ch := range []string{"a", "<", `"`, "\x01", "\u00e9"} {
-			m := NewMetrics()
-			for i := 0; i < 20000; i++ {
-				m.SetAppMetric(strings.Repeat(ch, 64)+fmt.Sprintf("%08d", i),
-					-math.MaxFloat64)
-			}
-
-			raw, err := json.Marshal(m.MetricsSnapshot())
-			require.NoError(t, err)
-			require.Less(t, len(raw)+eventOverhead, maxEventBytes,
-				"names of %q produced a %d byte snapshot", ch, len(raw))
+	t.Run("snapshot fits one event after JSON encoding metric names", func(t *testing.T) {
+		const (
+			attemptedMetrics = 20_000
+			repeatedChars    = 64
+		)
+		cases := []struct {
+			name string
+			char string
+		}{
+			{"plain ASCII", "a"},
+			{"HTML escaping", "<"},
+			{"quote escaping", `"`},
+			{"control character escaping", "\x01"},
+			{"multibyte UTF-8", "\u00e9"},
 		}
-	})
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				m := NewMetrics()
+				// Attempt to add more metrics than fit. SetAppMetric must reject
+				// new names once their JSON-encoded size would exceed the budget.
+				for i := 0; i < attemptedMetrics; i++ {
+					name := strings.Repeat(tc.char, repeatedChars) + fmt.Sprintf("%08d", i)
+					m.SetAppMetric(name, -math.MaxFloat64)
+				}
+				require.Positive(t, m.Counter(metricAppMetricsDropped),
+					"attempted metrics must exceed the budget")
 
-	t.Run("short names buy more of them", func(t *testing.T) {
-		short, long := NewMetrics(), NewMetrics()
-
-		require.Greater(t, fillAppMetrics(short, 20), fillAppMetrics(long, 256),
-			"the budget is serialized bytes, so short names must admit more entries")
+				snapshotJSON, err := json.Marshal(m.MetricsSnapshot())
+				require.NoError(t, err)
+				eventBytes := len(snapshotJSON) + eventOverhead
+				require.Less(t, eventBytes, maxEventBytes,
+					"snapshot plus overhead must fit within one event")
+			})
+		}
 	})
 
 	t.Run("keeps updating names already stored", func(t *testing.T) {

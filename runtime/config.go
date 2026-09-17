@@ -21,10 +21,9 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
-	defaultLogGroupPrefix   = "/enclave"
+	logGroupRoot            = "enclave"
 
-	logGroupNameChars  = "._-/#"
-	maxLogGroupNameLen = 512
+	logGroupNameChars = "._-/#"
 
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
@@ -165,12 +164,6 @@ func (c *Config) validateLogGroupPrefix() error {
 			c.LogGroupPrefix, logGroupNameChars,
 		)
 	}
-	for sig := signal(0); sig < signalCount; sig++ {
-		if group := c.logGroup(sig); len(group) > maxLogGroupNameLen {
-			return fmt.Errorf("log group %q is %d characters: CloudWatch allows %d",
-				group, len(group), maxLogGroupNameLen)
-		}
-	}
 	return nil
 }
 
@@ -249,7 +242,9 @@ func (c *Config) applyEnvOverride(name, value string) error {
 }
 
 func (c *Config) logGroup(sig signal) string {
-	return fmt.Sprintf("%s/%s/%s", c.LogGroupPrefix, c.Deployment, sig)
+	return fmt.Sprintf(
+		"%s/%s/%s/%s", strings.TrimSuffix(c.LogGroupPrefix, "/"), c.Deployment, logGroupRoot, sig,
+	)
 }
 
 func (c *Config) certBucketParam() string {

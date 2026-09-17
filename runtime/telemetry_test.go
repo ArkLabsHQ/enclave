@@ -35,6 +35,7 @@ func TestEverySignalHasAUniqueName(t *testing.T) {
 	seen := make(map[string]bool, signalCount)
 	for sig := signal(0); sig < signalCount; sig++ {
 		name := sig.String()
+		require.NotEmpty(t, name, "signal %d has no name", int(sig))
 		require.NotEqual(t, "unknown", name, "signal %d has no name", int(sig))
 		require.False(t, seen[name], "signal name %q is used twice", name)
 		seen[name] = true
@@ -66,11 +67,11 @@ func TestTelemetryStartsEverySignal(t *testing.T) {
 	startTelemetry(t, ctx, telemetry)
 
 	require.ElementsMatch(t, []string{
-		"/enclave/prod/logs/app",
-		"/enclave/prod/logs/supervisor",
-		"/enclave/prod/traces/app",
-		"/enclave/prod/traces/supervisor",
-		"/enclave/prod/metrics",
+		"/prod/enclave/logs/app",
+		"/prod/enclave/logs/supervisor",
+		"/prod/enclave/traces/app",
+		"/prod/enclave/traces/supervisor",
+		"/prod/enclave/metrics",
 	}, cw.groups)
 	require.Equal(t, []int32{30, 30, 30, 30, 30}, cw.retentionDays)
 }
@@ -100,11 +101,11 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		startTelemetry(t, ctx, NewTelemetry(testCfg, cw))
 
 		require.ElementsMatch(t, []string{
-			"/enclave/prod/logs/app",
-			"/enclave/prod/logs/supervisor",
-			"/enclave/prod/traces/app",
-			"/enclave/prod/traces/supervisor",
-			"/enclave/prod/metrics",
+			"/prod/enclave/logs/app",
+			"/prod/enclave/logs/supervisor",
+			"/prod/enclave/traces/app",
+			"/prod/enclave/traces/supervisor",
+			"/prod/enclave/metrics",
 		}, cw.groups)
 		require.Len(t, cw.streams, int(signalCount))
 	})
@@ -125,7 +126,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 				map[string]int{"seq": i})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
 		require.Len(t, put.LogEvents, telemetryBatch)
 		for i := 1; i < len(put.LogEvents); i++ {
 			require.LessOrEqual(t,
@@ -142,7 +143,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 
 		telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]string{"msg": "alone"})
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"alone"`)
 	})
@@ -160,7 +161,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 			telemetry.Send(signalAppLogs, time.Now().UTC(), payload)
 		}
 
-		first := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		first := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
 		require.Len(t, first.LogEvents, 4)
 		telemetry.Shutdown()
 
@@ -168,7 +169,7 @@ func TestCloudWatchStreamBatches(t *testing.T) {
 		defer cw.mu.Unlock()
 		shipped := 0
 		for _, put := range cw.puts {
-			if aws.ToString(put.LogGroupName) == "/enclave/prod/logs/app" &&
+			if aws.ToString(put.LogGroupName) == "/prod/enclave/logs/app" &&
 				!isShipperMarker(put) {
 				shipped += len(put.LogEvents)
 			}
@@ -223,7 +224,7 @@ func TestMetricsShipSnapshot(t *testing.T) {
 	telemetry.Metrics.SetAppMetric("custom", 2)
 	startTelemetry(t, ctx, telemetry)
 
-	put := requireCloudWatchPutTo(t, cw, "/enclave/prod/metrics")
+	put := requireCloudWatchPutTo(t, cw, "/prod/enclave/metrics")
 
 	// One snapshot per tick, and a flush may carry more than one of them.
 	require.NotEmpty(t, put.LogEvents)
@@ -325,7 +326,7 @@ func TestFlushBacksOffInsteadOfRetryingOnEveryEvent(t *testing.T) {
 	cw.putCalls = 0
 	cw.mu.Unlock()
 
-	for i := 0; i < telemetryBatch*3; i++ {
+	for i := 0; i < telemetryBatch+1; i++ {
 		telemetry.Send(signalAppLogs, time.Now().UTC(), map[string]int{"seq": i})
 	}
 

@@ -158,8 +158,8 @@ func TestLogHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
-		require.Equal(t, "/enclave/prod/logs/app", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
+		require.Equal(t, "/prod/enclave/logs/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"test"`)
 	})
@@ -211,8 +211,8 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
-		require.Equal(t, "/enclave/prod/logs/app", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
+		require.Equal(t, "/prod/enclave/logs/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest event was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -235,7 +235,7 @@ func TestLoggingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/app")
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"message":"flush me"`)
 	})
@@ -252,7 +252,7 @@ func TestSlogHandler(t *testing.T) {
 
 		logger.Warn("test message", "key", "value")
 
-		put := requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/supervisor")
+		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/supervisor")
 		require.NotEmpty(t, put.LogEvents)
 		var entry logEntry
 		require.NoError(t,
@@ -279,11 +279,11 @@ func TestSlogHandler(t *testing.T) {
 
 		logger.Warn("supervisor only")
 
-		requireCloudWatchPutTo(t, cw, "/enclave/prod/logs/supervisor")
+		requireCloudWatchPutTo(t, cw, "/prod/enclave/logs/supervisor")
 		cw.mu.Lock()
 		defer cw.mu.Unlock()
 		for _, put := range cw.puts {
-			if aws.ToString(put.LogGroupName) != "/enclave/prod/logs/app" {
+			if aws.ToString(put.LogGroupName) != "/prod/enclave/logs/app" {
 				continue
 			}
 			for _, event := range put.LogEvents {

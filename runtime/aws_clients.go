@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -168,11 +167,17 @@ type AWSClient struct {
 }
 
 // NewAWSClient constructs all SDK clients from a single shared aws.Config.
-// Returns an error if the IMDS-bridged config can't be loaded.
+// Returns an error if the IMDS-bridged config can't be loaded or IMDS does not
+// name the instance: that ID names every CloudWatch log stream, so a boot
+// without it has nowhere to ship telemetry.
 func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 	cfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	instanceID, err := resolveInstanceID(ctx, imds.NewFromConfig(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("resolve instance ID: %w", err)
 	}
 	return &AWSClient{
 		KMS:     newKMSClient(cfg),
@@ -182,7 +187,7 @@ func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 		CWL:     newCloudWatchLogsClient(cfg),
 		Route53: newRoute53Client(cfg),
 
-		InstanceID: resolveInstanceID(ctx, cfg),
+		InstanceID: instanceID,
 	}, nil
 }
 
@@ -244,22 +249,31 @@ func newCloudWatchLogsClient(cfg aws.Config) *cloudwatchlogs.Client {
 	return cloudwatchlogs.NewFromConfig(cfg)
 }
 
-func resolveInstanceID(ctx context.Context, cfg aws.Config) string {
-	out, err := imds.NewFromConfig(cfg).GetMetadata(
-		ctx, &imds.GetMetadataInput{Path: "instance-id"},
-	)
+// imdsMetadataAPI is the subset of *imds.Client used to name the instance.
+type imdsMetadataAPI interface {
+	GetMetadata(
+		ctx context.Context,
+		params *imds.GetMetadataInput,
+		optFns ...func(*imds.Options),
+	) (*imds.GetMetadataOutput, error)
+}
+
+func resolveInstanceID(ctx context.Context, client imdsMetadataAPI) (string, error) {
+	out, err := client.GetMetadata(ctx, &imds.GetMetadataInput{Path: "instance-id"})
 	if err != nil {
-		slog.Warn("instance ID lookup: IMDS", "error", err)
-		return ""
+		return "", fmt.Errorf("IMDS instance-id lookup: %w", err)
 	}
 	defer func() { _ = out.Content.Close() }()
 
-	id, err := io.ReadAll(out.Content)
+	raw, err := io.ReadAll(out.Content)
 	if err != nil {
-		slog.Warn("instance ID lookup: read IMDS response", "error", err)
-		return ""
+		return "", fmt.Errorf("read IMDS instance-id response: %w", err)
 	}
-	return strings.TrimSpace(string(id))
+	id := strings.TrimSpace(string(raw))
+	if id == "" {
+		return "", fmt.Errorf("IMDS returned an empty instance-id")
+	}
+	return id, nil
 }
 
 // loadAWSConfigWithIMDS loads AWS config using SDK defaults.

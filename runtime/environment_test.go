@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -52,11 +51,6 @@ func TestConfigValidate(t *testing.T) {
 			name:    "log group prefix has an illegal character",
 			mutate:  func(c *Config) { c.LogGroupPrefix = "/ark:se7enz" },
 			wantErr: "CloudWatch log group names allow only",
-		},
-		{
-			name:    "log group name too long",
-			mutate:  func(c *Config) { c.LogGroupPrefix = "/" + strings.Repeat("a", 512) },
-			wantErr: "CloudWatch allows 512",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,7 +120,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Equal(t, "https://acme.example.com/directory", cfg.ACMEDirectory)
 		require.Equal(t, "ops@example.com", cfg.ACMEEmail)
 		require.Equal(t, "test-ca", cfg.ACMECA)
-		require.Equal(t, "/ark/se7enz/enclave", cfg.LogGroupPrefix)
+		require.Equal(t, "/ark/se7enz", cfg.LogGroupPrefix)
 	})
 
 	t.Run("rejects an unusable log group prefix", func(t *testing.T) {

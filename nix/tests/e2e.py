@@ -6,7 +6,7 @@ CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
-LOG_PREFIX = "/ark/e2e/enclave/dev"
+LOG_PREFIX = "/ark/e2e/dev/enclave"
 
 
 def put_env(name, value):

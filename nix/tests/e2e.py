@@ -228,7 +228,8 @@ def wait_for_shipped(group, needle, timeout=90):
 
 wait_for_shipped("logs/app", "handled health")
 wait_for_shipped("traces/app", '"name":"health"')
-wait_for_shipped("metrics", "testapp_requests_total")
+wait_for_shipped("metrics", "app_testapp_requests_total")
+wait_for_shipped("metrics", '"CloudWatchMetrics"')
 wait_for_shipped("logs/supervisor", "child started")
 wait_for_shipped("traces/supervisor", '"name":"init"')
 

@@ -139,6 +139,13 @@ func (c *Config) Validate() error {
 	if c.Deployment == "" {
 		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
 	}
+	if strings.IndexFunc(c.Deployment, invalidLogGroupRune) >= 0 {
+		return fmt.Errorf(
+			"ENCLAVE_DEPLOYMENT %q: it names every CloudWatch log group, which allow only "+
+				"letters, digits and %s",
+			c.Deployment, logGroupNameChars,
+		)
+	}
 	if c.AppName == "" {
 		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
 	}

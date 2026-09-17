@@ -98,13 +98,13 @@ func HandleTracingPost(t *Tracing) http.HandlerFunc {
 
 		entries, err := parseOTLPSpans(data)
 		if errors.Is(err, errTooManyRecords) {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusRequestEntityTooLarge)
+			http.Error(w, jsonError(err.Error()), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if err != nil {
 			http.Error(
 				w,
-				fmt.Sprintf(`{"error":"parse OTLP traces: %s"}`, err),
+				jsonError("parse OTLP traces: "+err.Error()),
 				http.StatusBadRequest,
 			)
 			return

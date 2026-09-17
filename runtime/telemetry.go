@@ -405,6 +405,16 @@ func eventBytes(e cwltypes.InputLogEvent) int {
 	return len(aws.ToString(e.Message)) + eventOverhead
 }
 
+// jsonError renders {"error": msg} with the message encoded, so a quote or
+// backslash in an error cannot break the body.
+func jsonError(msg string) string {
+	body, err := json.Marshal(map[string]string{"error": msg})
+	if err != nil {
+		return `{"error":"internal error"}`
+	}
+	return string(body)
+}
+
 func droppedMetric(sig signal) string {
 	return fmt.Sprintf(
 		"enclave_telemetry_%s_dropped_total", strings.ReplaceAll(sig.String(), "/", "_"))

@@ -28,6 +28,11 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "ENCLAVE_DEPLOYMENT must be set",
 		},
 		{
+			name:    "deployment has a character CloudWatch refuses",
+			mutate:  func(c *Config) { c.Deployment = "dev:us" },
+			wantErr: "names every CloudWatch log group",
+		},
+		{
 			name:    "app name missing",
 			mutate:  func(c *Config) { c.AppName = "" },
 			wantErr: "ENCLAVE_APP_NAME must be set",

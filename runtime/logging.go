@@ -87,11 +87,11 @@ func HandleLogsPost(l *Logging) http.HandlerFunc {
 
 		entries, err := parseOTLPLogs(data)
 		if errors.Is(err, errTooManyRecords) {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusRequestEntityTooLarge)
+			http.Error(w, jsonError(err.Error()), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"parse OTLP: %s"}`, err), http.StatusBadRequest)
+			http.Error(w, jsonError("parse OTLP: "+err.Error()), http.StatusBadRequest)
 			return
 		}
 

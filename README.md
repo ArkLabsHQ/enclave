@@ -264,7 +264,7 @@ measurement. A subset can be overridden at runtime from SSM.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment. |
+| `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment and a segment of every CloudWatch log group, so only letters, digits and `._-/#`; anything else fails validation at boot. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
 | `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
 way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
@@ -359,10 +359,17 @@ these groups unless `ENCLAVE_LOG_GROUP_PREFIX` distinguishes them.
 
 **Changed:** the runtime's own records used to share `/enclave/<deployment>/<app>/logs`
 and `.../traces` with the application's, distinguished only by each record's `source`
-field. Every group name has changed. `enclave_log_entries_total` now counts application
-entries only, with `enclave_supervisor_log_entries_total` counting the runtime's, and
-the `enclave_telemetry_*_dropped_total` counters gain a source segment. `stderr` is
-unaffected: it still carries every runtime record, unbatched.
+field. Every group name has changed, and so have the counters that describe them.
+Alarms and dashboards keyed on the old names stop matching until they are updated:
+
+| Before | After |
+|---|---|
+| `enclave_log_entries_total`, every record | `enclave_log_entries_total`, application records only, plus `enclave_supervisor_log_entries_total` for the runtime's |
+| `enclave_telemetry_logs_dropped_total` | `enclave_telemetry_logs_app_dropped_total` and `enclave_telemetry_logs_supervisor_dropped_total` |
+| `enclave_telemetry_traces_dropped_total` | `enclave_telemetry_traces_app_dropped_total` and `enclave_telemetry_traces_supervisor_dropped_total` |
+| `enclave_telemetry_metrics_dropped_total` | unchanged |
+
+`stderr` is unaffected: it still carries every runtime record, unbatched.
 
 The app's OTLP metric names are retained for the life of the enclave, so they are
 bounded by a 192 KiB budget of serialized size rather than by a name count: each

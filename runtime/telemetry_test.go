@@ -43,6 +43,14 @@ func TestEverySignalHasAUniqueName(t *testing.T) {
 	require.Equal(t, "unknown", signalCount.String(), "the sentinel must not name a stream")
 }
 
+func TestJSONErrorEncodesTheMessage(t *testing.T) {
+	body := jsonError(`quote " backslash \ and <angle>`)
+
+	var decoded map[string]string
+	require.NoError(t, json.Unmarshal([]byte(body), &decoded))
+	require.Equal(t, `quote " backslash \ and <angle>`, decoded["error"])
+}
+
 func TestStartFailsWithoutAnInstanceID(t *testing.T) {
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })

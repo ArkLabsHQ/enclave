@@ -290,7 +290,7 @@ func HandleMetricPost(metrics *Metrics) http.HandlerFunc {
 		if err != nil {
 			http.Error(
 				w,
-				fmt.Sprintf(`{"error":"parse OTLP metrics: %s"}`, err),
+				jsonError("parse OTLP metrics: "+err.Error()),
 				http.StatusBadRequest,
 			)
 			return

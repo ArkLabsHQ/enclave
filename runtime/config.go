@@ -22,6 +22,14 @@ const (
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
 	defaultMetricsNamespace = "Enclave"
+	logGroupRoot            = "enclave"
+
+	logGroupNameChars = "._-/#"
+
+	migrationPollInterval    = 5 * time.Second
+	migrationChallengeRotate = time.Minute
+
+	migrationAbortResponse = "abort"
 )
 
 const (
@@ -73,6 +81,8 @@ type Config struct {
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
 	MetricsNamespace      string
+	LogGroupPrefix        string
+	InstanceID            string
 }
 
 // LoadConfig builds Config from ENCLAVE_* env vars.
@@ -99,6 +109,7 @@ func LoadConfig() (*Config, error) {
 		LogShipInterval:  logShipInterval(),
 		LogRetentionDays: logRetentionDays(),
 		MetricsNamespace: envDefault("ENCLAVE_METRICS_NAMESPACE", defaultMetricsNamespace),
+		LogGroupPrefix:   logGroupPrefix(),
 	}
 	cfg.setSecurityConfig(IsDev())
 
@@ -131,6 +142,13 @@ func (c *Config) Validate() error {
 	if c.Deployment == "" {
 		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
 	}
+	if strings.IndexFunc(c.Deployment, invalidLogGroupRune) >= 0 {
+		return fmt.Errorf(
+			"ENCLAVE_DEPLOYMENT %q: it names every CloudWatch log group, which allow only "+
+				"letters, digits and %s",
+			c.Deployment, logGroupNameChars,
+		)
+	}
 	if c.AppName == "" {
 		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
 	}
@@ -140,7 +158,31 @@ func (c *Config) Validate() error {
 	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
+	return c.validateLogGroupPrefix()
+}
+
+func (c *Config) validateLogGroupPrefix() error {
+	if c.LogGroupPrefix == "" {
+		return fmt.Errorf(
+			"ENCLAVE_LOG_GROUP_PREFIX must not be empty: it heads every CloudWatch log group",
+		)
+	}
+	if strings.IndexFunc(c.LogGroupPrefix, invalidLogGroupRune) >= 0 {
+		return fmt.Errorf(
+			"ENCLAVE_LOG_GROUP_PREFIX %q: CloudWatch log group names allow only letters, "+
+				"digits and %s",
+			c.LogGroupPrefix, logGroupNameChars,
+		)
+	}
 	return nil
+}
+
+func invalidLogGroupRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return false
+	}
+	return !strings.ContainsRune(logGroupNameChars, r)
 }
 
 func (c *Config) String() string {
@@ -200,8 +242,19 @@ func (c *Config) applyEnvOverride(name, value string) error {
 		c.ACMEEmail = value
 	case "ENCLAVE_ACME_CA":
 		c.ACMECA = value
+	case "ENCLAVE_LOG_GROUP_PREFIX":
+		c.LogGroupPrefix = normalizeLogGroupPrefix(value)
+		if err := c.validateLogGroupPrefix(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (c *Config) logGroup(sig signal) string {
+	return fmt.Sprintf(
+		"%s/%s/%s/%s", strings.TrimSuffix(c.LogGroupPrefix, "/"), c.Deployment, logGroupRoot, sig,
+	)
 }
 
 func (c *Config) certBucketParam() string {
@@ -314,5 +367,23 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 		c.Deployment,
 		c.AppName,
 		strings.ToLower(pcr0),
+	)
+}
+
+// migrationChallengeParam: the live challenge published by a predecessor.
+func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationChallenge/%s", c.Deployment, c.AppName, strings.ToLower(sourcePCR0),
+	)
+}
+
+// migrationResponseParam identifies a candidate or operator response.
+func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationResponse/%s/%s",
+		c.Deployment,
+		c.AppName,
+		strings.ToLower(sourcePCR0),
+		strings.ToLower(responder),
 	)
 }

@@ -377,15 +377,18 @@ func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientI
 		return nil
 	}
 
-	admitted, err := KeyPolicyAdmittedPCR0s(policy)
+	decoded, err := decodeKMSPolicy(policy, nil, false)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
+	}
+	if decoded.attested.Condition == nil {
+		return fmt.Errorf("AccessDeniedException: key %s lacks an attestation condition", keyID)
 	}
 	pcr0, err := fakeKMSAttestedPCR0(recipient.AttestationDocument)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
 	}
-	if !admitted[pcr0] {
+	if !strings.EqualFold(decoded.attested.Condition.StringEqualsIgnoreCase.PCR0[0], pcr0) {
 		return fmt.Errorf(
 			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
 		)
@@ -649,6 +652,7 @@ type fakeCloudWatchLogs struct {
 	streams            []string
 	retentionDays      []int32
 	puts               []*cloudwatchlogs.PutLogEventsInput
+	putCalls           int
 	putCh              chan *cloudwatchlogs.PutLogEventsInput
 
 	// putBlock stalls PutLogEvents until closed, standing in for a CloudWatch
@@ -657,7 +661,7 @@ type fakeCloudWatchLogs struct {
 }
 
 func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
-	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 10)}
+	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 64)}
 }
 
 func (f *fakeCloudWatchLogs) CreateLogGroup(
@@ -706,6 +710,7 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 ) (*cloudwatchlogs.PutLogEventsOutput, error) {
 	f.mu.Lock()
 	putErr := f.putLogEventsErr
+	f.putCalls++
 	f.mu.Unlock()
 	if putErr != nil {
 		return nil, putErr
@@ -729,13 +734,13 @@ func (f *fakeCloudWatchLogs) PutLogEvents(
 	return &cloudwatchlogs.PutLogEventsOutput{}, nil
 }
 
-// requireCloudWatchPutTo waits for a batch on one log group. The three signals
-// share a client, so a bare "next put" would race between them.
 func isShipperMarker(in *cloudwatchlogs.PutLogEventsInput) bool {
 	return len(in.LogEvents) == 1 &&
 		strings.Contains(aws.ToString(in.LogEvents[0].Message), "shipper_started")
 }
 
+// requireCloudWatchPutTo waits for a batch on one log group. The signals share a
+// client, so a bare "next put" would race between them.
 func requireCloudWatchPutTo(
 	t *testing.T,
 	cw *fakeCloudWatchLogs,

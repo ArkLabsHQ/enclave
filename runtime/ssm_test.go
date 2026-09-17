@@ -34,8 +34,7 @@ func TestSSMSetWithoutOverwrite(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, "winner", fake.params["/app/key"])
 
-	// Set wraps with %w, so the typed cause survives. CompleteMigration relies
-	// on this to tell a lost create-only race from a storage failure.
+	// Preserve the typed cause used to detect a lost commit race.
 	var exists *ssmtypes.ParameterAlreadyExists
 	require.ErrorAs(t, err, &exists)
 	require.True(t, isParameterAlreadyExists(err))

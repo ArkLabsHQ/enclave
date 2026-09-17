@@ -3,12 +3,15 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
@@ -159,14 +162,22 @@ type AWSClient struct {
 	STS     STSAPI
 	CWL     CloudWatchLogsAPI
 	Route53 Route53API
+
+	InstanceID string
 }
 
 // NewAWSClient constructs all SDK clients from a single shared aws.Config.
-// Returns an error if the IMDS-bridged config can't be loaded.
+// Returns an error if the IMDS-bridged config can't be loaded or IMDS does not
+// name the instance: that ID names every CloudWatch log stream, so a boot
+// without it has nowhere to ship telemetry.
 func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 	cfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	instanceID, err := resolveInstanceID(ctx, imds.NewFromConfig(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("resolve instance ID: %w", err)
 	}
 	return &AWSClient{
 		KMS:     newKMSClient(cfg),
@@ -175,6 +186,8 @@ func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 		STS:     newSTSClient(cfg),
 		CWL:     newCloudWatchLogsClient(cfg),
 		Route53: newRoute53Client(cfg),
+
+		InstanceID: instanceID,
 	}, nil
 }
 
@@ -234,6 +247,33 @@ func newCloudWatchLogsClient(cfg aws.Config) *cloudwatchlogs.Client {
 		})
 	}
 	return cloudwatchlogs.NewFromConfig(cfg)
+}
+
+// imdsMetadataAPI is the subset of *imds.Client used to name the instance.
+type imdsMetadataAPI interface {
+	GetMetadata(
+		ctx context.Context,
+		params *imds.GetMetadataInput,
+		optFns ...func(*imds.Options),
+	) (*imds.GetMetadataOutput, error)
+}
+
+func resolveInstanceID(ctx context.Context, client imdsMetadataAPI) (string, error) {
+	out, err := client.GetMetadata(ctx, &imds.GetMetadataInput{Path: "instance-id"})
+	if err != nil {
+		return "", fmt.Errorf("IMDS instance-id lookup: %w", err)
+	}
+	defer func() { _ = out.Content.Close() }()
+
+	raw, err := io.ReadAll(out.Content)
+	if err != nil {
+		return "", fmt.Errorf("read IMDS instance-id response: %w", err)
+	}
+	id := strings.TrimSpace(string(raw))
+	if id == "" {
+		return "", fmt.Errorf("IMDS returned an empty instance-id")
+	}
+	return id, nil
 }
 
 // loadAWSConfigWithIMDS loads AWS config using SDK defaults.

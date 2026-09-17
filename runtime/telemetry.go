@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,22 +19,27 @@ import (
 type signal int
 
 const (
-	signalLogs signal = iota
-	signalTraces
+	signalAppLogs signal = iota
+	signalSupervisorLogs
+	signalAppTraces
+	signalSupervisorTraces
 	signalMetrics
 	signalCount
 )
 
+var signalNames = [signalCount]string{
+	signalAppLogs:          "logs/app",
+	signalSupervisorLogs:   "logs/supervisor",
+	signalAppTraces:        "traces/app",
+	signalSupervisorTraces: "traces/supervisor",
+	signalMetrics:          "metrics",
+}
+
 func (s signal) String() string {
-	switch s {
-	case signalLogs:
-		return "logs"
-	case signalTraces:
-		return "traces"
-	case signalMetrics:
-		return "metrics"
+	if s < 0 || s >= signalCount {
+		return "unknown"
 	}
-	return "unknown"
+	return signalNames[s]
 }
 
 const (
@@ -53,6 +59,13 @@ const (
 	maxEventFuture = time.Hour
 
 	maxFlushAttempts = 3
+	maxOTLPRecords   = 10_000
+	maxFlushBackoff  = 5 * time.Minute
+)
+
+var (
+	errFlushBackoff   = errors.New("cloudwatch flush waiting out backoff")
+	errTooManyRecords = errors.New("too many records in one request")
 )
 
 type stream struct {
@@ -80,7 +93,7 @@ type Telemetry struct {
 	wg     sync.WaitGroup
 }
 
-// NewTelemetry wires the three signals in dependency order.
+// NewTelemetry wires every signal in dependency order.
 func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
 	namespace := cfg.MetricsNamespace
 	if namespace == "" {
@@ -95,13 +108,10 @@ func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
 		},
 	}
 
-	name := time.Now().UTC().Format("2006-01-02T15-04-05Z")
 	for sig := signal(0); sig < signalCount; sig++ {
 		t.streams[sig] = &stream{
-			group: fmt.Sprintf(
-				"/enclave/%s/%s/%s", cfg.Deployment, cfg.AppName, sig,
-			),
-			name:   name,
+			group:  cfg.logGroup(sig),
+			name:   cfg.InstanceID,
 			events: make(chan cwltypes.InputLogEvent, telemetryQueue),
 		}
 	}
@@ -115,6 +125,10 @@ func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
 func (t *Telemetry) Start(ctx context.Context) error {
 	if t.cw == nil {
 		return fmt.Errorf("telemetry: no CloudWatch Logs client")
+	}
+	if t.streams[0].name == "" {
+		return fmt.Errorf(
+			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream")
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
 		if err := t.ensureStream(ctx, sig); err != nil {
@@ -231,6 +245,8 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 	pending := 0  // bytes held, against the PutLogEvents size limit
 	failures := 0 // consecutive flush failures for this batch
 	reported := int64(0)
+	backoff := time.Duration(0)
+	var retryAt time.Time
 
 	fits := func(size int) bool { return pending+size <= maxBatchBytes }
 
@@ -254,6 +270,9 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 		if len(batch) == 0 {
 			return nil
 		}
+		if time.Now().Before(retryAt) {
+			return errFlushBackoff
+		}
 		sort.Slice(batch, func(i, j int) bool {
 			return *batch[i].Timestamp < *batch[j].Timestamp
 		})
@@ -265,8 +284,10 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 		})
 		if err != nil {
 			failures++
+			backoff = min(max(backoff*2, t.shipInterval), maxFlushBackoff)
+			retryAt = time.Now().Add(backoff)
 			slog.Warn("cloudwatch shipper: PutLogEvents failed", "signal", sig.String(),
-				"error", err, "count", len(batch), "attempt", failures)
+				"error", err, "count", len(batch), "attempt", failures, "retry_in", backoff)
 			if failures >= maxFlushAttempts {
 				dropBatch()
 				return nil
@@ -279,6 +300,7 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 			slog.Warn("cloudwatch rejected events", "signal", sig.String(), "count", lost)
 		}
 		batch, pending, failures = nil, 0, 0
+		backoff, retryAt = 0, time.Time{}
 		return nil
 	}
 
@@ -317,10 +339,11 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 				}
 			}
 			for len(batch) > 0 {
-				if err := flush(final); err == nil {
+				err := flush(final)
+				if err == nil {
 					break
 				}
-				if final.Err() != nil {
+				if errors.Is(err, errFlushBackoff) || final.Err() != nil {
 					dropBatch()
 					break
 				}
@@ -413,6 +436,17 @@ func eventBytes(e cwltypes.InputLogEvent) int {
 	return len(aws.ToString(e.Message)) + eventOverhead
 }
 
+// jsonError renders {"error": msg} with the message encoded, so a quote or
+// backslash in an error cannot break the body.
+func jsonError(msg string) string {
+	body, err := json.Marshal(map[string]string{"error": msg})
+	if err != nil {
+		return `{"error":"internal error"}`
+	}
+	return string(body)
+}
+
 func droppedMetric(sig signal) string {
-	return fmt.Sprintf("enclave_telemetry_%s_dropped_total", sig)
+	return fmt.Sprintf(
+		"enclave_telemetry_%s_dropped_total", strings.ReplaceAll(sig.String(), "/", "_"))
 }

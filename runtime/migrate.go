@@ -1,30 +1,41 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // migrationPCRIndex stores the successor-PCR0 handoff commitment.
-const migrationPCRIndex = 31
+const (
+	migrationPCRIndex          = 31
+	successorClaimSchemaV1     = "enclave.successor_claim.v1"
+	migrationChallengeSchemaV1 = "enclave.migration_challenge.v1"
+)
 
-type MigrationRequest struct {
-	Action     string `json:"action"`
-	TargetPCR0 string `json:"target_pcr0,omitempty"`
+// migrationClaimV1 binds an attestation to its state namespace.
+type migrationClaimV1 struct {
+	Schema     string `cbor:"schema"`
+	Deployment string `cbor:"deployment"`
+	AppName    string `cbor:"app_name"`
+	Lock       string `cbor:"lock"`
 }
 
-type CompleteMigrationResult struct {
-	PCR0     string   `json:"pcr0"`
-	Exported []string `json:"exported"`
+// CandidateInfo is reported by an enclave still awaiting a handoff.
+type CandidateInfo struct {
+	AwaitingHandoffFrom string     `json:"awaiting_handoff_from,omitempty"`
+	RequestedAt         *time.Time `json:"requested_at,omitempty"`
 }
 
 type PreviousPCR0Info struct {
@@ -43,6 +54,13 @@ type MigrationStatus struct {
 	RemainingSeconds int        `json:"remaining_seconds"`
 }
 
+// migrationChallenge is the verified content of a predecessor's challenge
+// attestation. Both fields are signed by the NSM, so SSM cannot alter them.
+type migrationChallenge struct {
+	Nonce    []byte
+	IssuedAt time.Time
+}
+
 const (
 	migrationStateNone        = "none"
 	migrationStateCoolingDown = "cooling_down"
@@ -51,62 +69,82 @@ const (
 )
 
 type Migrator interface {
-	HandleMigrationRequest(
-		ctx context.Context,
-		action, targetPCR0 string,
-	) (*MigrationStatus, error)
-	CompleteMigration(ctx context.Context) (*CompleteMigrationResult, error)
+	RunPredecessorHandoff(
+		ctx context.Context, kms PrimaryKMS, dek DEK, secrets []StaticSecret, tlsKey crypto.Signer,
+	)
+	AwaitCandidateHandoff(ctx context.Context) error
+
 	PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error)
 	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
+	CandidateInfo(ctx context.Context) (*CandidateInfo, error)
 }
 
 type migrator struct {
 	cfg           *Config
-	mu            sync.Mutex
 	nsm           NSM
+	pcr0          string // hex; read from the NSM once, in newMigrator
 	kms           PrimaryKMS
 	ssm           SSM
 	dek           DEK
 	staticSecrets []StaticSecret
 	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
+	genesis       *genesisLog
+
+	answeredChallenge string
+	s3                S3API
 }
 
+// NewMigrator initializes migration before enclave state is available.
 func NewMigrator(
 	cfg *Config,
 	nsm NSM,
-	kms PrimaryKMS,
 	ssm SSM,
 	s3 S3API,
-	dek DEK,
-	secrets []StaticSecret,
-	tlsKey crypto.Signer,
 	migrationIntentBucketName string,
 ) (Migrator, error) {
+	m, err := newMigrator(cfg, nsm, ssm, s3, migrationIntentBucketName)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func newMigrator(
+	cfg *Config,
+	nsm NSM,
+	ssm SSM,
+	s3 S3API,
+	migrationIntentBucketName string,
+) (*migrator, error) {
+	pcr0, err := nsm.PCR0()
+	if err != nil {
+		return nil, fmt.Errorf("read PCR0: %w", err)
+	}
+	if len(pcr0) != 48 {
+		return nil, fmt.Errorf("PCR0 must be 48 bytes, got %d", len(pcr0))
+	}
 	intent, err := newMigrationIntentLog(cfg, s3, nsm, migrationIntentBucketName)
 	if err != nil {
 		return nil, err
 	}
+	genesis, err := newGenesisLog(cfg, s3, nsm, migrationIntentBucketName)
+	if err != nil {
+		return nil, err
+	}
 	return &migrator{
-		cfg:           cfg,
-		nsm:           nsm,
-		kms:           kms,
-		ssm:           ssm,
-		dek:           dek,
-		staticSecrets: secrets,
-		tlsKey:        tlsKey,
-		intent:        intent,
+		cfg:     cfg,
+		nsm:     nsm,
+		pcr0:    hex.EncodeToString(pcr0),
+		ssm:     ssm,
+		intent:  intent,
+		genesis: genesis,
+		s3:      s3,
 	}, nil
 }
 
 func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
-	own, err := m.nsm.PCR0()
-	if err != nil {
-		return nil, fmt.Errorf("could not read own PCR0 from NSM: %w", err)
-	}
-	ownPCR0 := hex.EncodeToString(own)
-
-	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(ownPCR0))
+	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(m.pcr0))
 	if err != nil {
 		return nil, err
 	}
@@ -115,108 +153,134 @@ func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, err
 		pcr0 = "genesis"
 	}
 
-	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(ownPCR0))
+	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(m.pcr0))
 	if err != nil {
 		return nil, err
 	}
 	return &PreviousPCR0Info{PCR0: pcr0, Attestation: attest}, nil
 }
 
-func (m *migrator) HandleMigrationRequest(
-	ctx context.Context,
-	action, targetPCR0 string,
-) (*MigrationStatus, error) {
-	cooldown := m.cfg.MigrationCooldown
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	sourcePCR0, err := m.sourcePCR0()
-	if err != nil {
+func (m *migrator) CandidateInfo(ctx context.Context) (*CandidateInfo, error) {
+	// Report only the configured predecessor's handoff.
+	head, err := m.intent.Head(ctx, strings.ToLower(m.cfg.PreviousPCR0))
+	if err != nil || head == nil || head.Action != migrationIntentRequested ||
+		!strings.EqualFold(head.TargetPCR0, m.pcr0) {
 		return nil, err
 	}
 
-	var intentHead *migrationIntent
-	switch action {
-	case migrationIntentRequested:
-		intentHead, err = m.intent.Request(ctx, sourcePCR0, targetPCR0)
-	case migrationIntentAborted:
-		intentHead, err = m.intent.Abort(ctx, sourcePCR0)
-	default:
-		return nil, fmt.Errorf("unknown migration action %q", action)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return migrationStatusAt(intentHead, cooldown, time.Now()), nil
+	publishedAt := head.PublishedAt
+	return &CandidateInfo{
+		AwaitingHandoffFrom: head.SourcePCR0,
+		RequestedAt:         &publishedAt,
+	}, nil
 }
 
 func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
-	cooldown := m.cfg.MigrationCooldown
-	sourcePCR0, err := m.sourcePCR0()
+	head, err := m.intent.Head(ctx, m.pcr0)
 	if err != nil {
 		return nil, err
 	}
-	head, err := m.intent.Head(ctx, sourcePCR0)
-	if err != nil {
-		return nil, err
-	}
-	status := migrationStatusAt(head, cooldown, time.Now())
 	if head == nil {
-		status.SourcePCR0 = sourcePCR0
-	}
-	return status, nil
-}
-
-func (m *migrator) sourcePCR0() (string, error) {
-	pcr0, err := m.nsm.PCR0()
-	if err != nil {
-		return "", fmt.Errorf("read source PCR0: %w", err)
-	}
-	if len(pcr0) != 48 {
-		return "", fmt.Errorf("source PCR0 must be 48 bytes, got %d", len(pcr0))
+		return &MigrationStatus{State: migrationStateNone, SourcePCR0: m.pcr0}, nil
 	}
 
-	return hex.EncodeToString(pcr0), nil
-}
-
-func migrationStatusAt(
-	head *migrationIntent,
-	cooldown time.Duration,
-	now time.Time,
-) *MigrationStatus {
-	if head == nil {
-		return &MigrationStatus{State: migrationStateNone}
-	}
-	publishedAt := head.PublishedAt
 	status := &MigrationStatus{
 		SourcePCR0:  head.SourcePCR0,
 		TargetPCR0:  head.TargetPCR0,
 		Sequence:    head.Sequence,
 		Action:      head.Action,
-		PublishedAt: &publishedAt,
+		PublishedAt: &head.PublishedAt,
 	}
 	if head.Action == migrationIntentAborted {
 		status.State = migrationStateAborted
-		return status
+		return status, nil
 	}
 
-	if cooldown == 0 {
-		status.State = migrationStateEligible
-		status.EligibleAt = &head.PublishedAt
-		return status
-	}
-
-	eligibleAt := head.PublishedAt.Add(cooldown)
+	eligibleAt := head.PublishedAt.Add(m.cfg.MigrationCooldown)
 	status.EligibleAt = &eligibleAt
-	remaining := eligibleAt.Sub(now)
-	if remaining <= 0 {
+	remaining := time.Until(eligibleAt)
+	// Zero cooldown ignores clock skew.
+	if m.cfg.MigrationCooldown == 0 || remaining <= 0 {
 		status.State = migrationStateEligible
-		return status
+		return status, nil
 	}
 	status.State = migrationStateCoolingDown
 	status.RemainingSeconds = int(math.Ceil(remaining.Seconds()))
-	return status
+	return status, nil
+}
+
+// Migration is coordinated through SSM; candidates attest their own PCR0.
+//
+//	predecessor                              candidate
+//	  publish challenge  -------------->  read it
+//	  read answers       <--------------  publish attestation
+//	  verify, record intent
+//	  ... cooldown ...
+//	  commit KMSKeyID/<target>  ------->  promote
+//
+
+func (m *migrator) RunPredecessorHandoff(
+	ctx context.Context, kms PrimaryKMS, dek DEK, secrets []StaticSecret, tlsKey crypto.Signer,
+) {
+	m.kms, m.dek, m.staticSecrets, m.tlsKey = kms, dek, secrets, tlsKey
+
+	ticker := time.NewTicker(migrationPollInterval)
+	defer ticker.Stop()
+	for {
+		if err := m.advanceMigration(ctx); err != nil &&
+			!errors.Is(err, errMigrationIntentAbsent) {
+			slog.Warn("predecessor handoff", "error", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// AwaitCandidateHandoff waits for the predecessor's atomic commit. It returns
+// immediately for an existing generation or a fresh deployment.
+func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
+	kmsIdParam := m.cfg.kmsKeyIDParam(m.pcr0)
+	keyID, err := m.ssm.MayGet(ctx, kmsIdParam)
+	if err != nil {
+		return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+	}
+	if keyID != "" {
+		return nil
+	}
+
+	artifact, err := m.genesis.Genesis(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read deployment genesis: %w", err)
+	}
+	if artifact == nil {
+		return nil
+	}
+
+	if artifact.PCR0 == m.pcr0 {
+		return nil
+	}
+
+	slog.Info("candidate: awaiting migration handoff", "pointer", kmsIdParam)
+	ticker := time.NewTicker(migrationPollInterval)
+	defer ticker.Stop()
+	for keyID == "" {
+		if err := m.respondToChallenge(ctx); err != nil {
+			slog.Warn("candidate handoff", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		if keyID, err = m.ssm.MayGet(ctx, kmsIdParam); err != nil {
+			return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+		}
+	}
+	return nil
 }
 
 func (m *migrator) verifyIntent(
@@ -246,45 +310,288 @@ func (m *migrator) verifyIntent(
 	return nil
 }
 
-// CompleteMigration exports state under a PCR0-locked migration key, then flips KMSKeyID.
-func (m *migrator) CompleteMigration(
-	ctx context.Context,
-) (*CompleteMigrationResult, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// advanceMigration advances the predecessor state machine once.
+func (m *migrator) advanceMigration(ctx context.Context) error {
+	lease, err := m.tryAcquireMigrationLease(ctx)
+	if err != nil {
+		return err
+	}
+	if lease == nil {
+		return nil
+	}
+	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
 
+	status, err := m.MigrationStatus(ctx)
+	if err != nil {
+		return err
+	}
+
+	pending := status.State == migrationStateCoolingDown || status.State == migrationStateEligible
+	if pending {
+		aborted, err := m.mayAbortMigration(ctx, status.TargetPCR0)
+		if err != nil || aborted {
+			return err
+		}
+	}
+
+	switch status.State {
+	case migrationStateCoolingDown:
+		return nil
+	case migrationStateEligible:
+		if err := m.handOffToSuccessor(ctx); !errors.Is(err, errMigrationAlreadyFinalised) {
+			return err
+		}
+		return nil
+	}
+
+	challenge, err := m.mayPublishChallenge(ctx)
+	if err != nil {
+		return err
+	}
+
+	responses, err := m.ssm.ListParams(ctx, m.cfg.migrationResponseParam(m.pcr0, ""))
+	if err != nil {
+		return fmt.Errorf("list migration responses: %w", err)
+	}
+	if len(responses) == 0 {
+		return nil
+	}
+
+	target, err := m.verifyChallengeResponses(ctx, challenge, responses)
+	if err != nil {
+		return err
+	}
+	if target == "" {
+		return nil
+	}
+
+	if err := lease.Verify(ctx); err != nil {
+		return fmt.Errorf("verify migration lease: %w", err)
+	}
+	// Retire this challenge before recording, so a failed rotation cannot leave
+	// its answers live to re-adopt a target after an abort.
+	if _, err := m.issueMigrationChallenge(ctx); err != nil {
+		return err
+	}
+	if _, err := m.intent.Request(ctx, m.pcr0, target); err != nil {
+		return err
+	}
+	slog.Info("migration intent recorded from candidate attestation",
+		"target_pcr0", prefix16(target))
+	return nil
+}
+
+func (m *migrator) tryAcquireMigrationLease(ctx context.Context) (*Lease, error) {
+	bucket, err := m.ssm.MustGet(ctx, m.cfg.leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("read lease bucket: %w", err)
+	}
+	lease, err := TryAcquireLease(
+		ctx, m.cfg, m.s3, bucket, "migration-"+strings.ToLower(m.pcr0), leaseTTL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("acquire migration lease: %w", err)
+	}
+	return lease, nil
+}
+
+// mayPublishChallenge creates or rotates the live nonce.
+func (m *migrator) mayPublishChallenge(ctx context.Context) (*migrationChallenge, error) {
+	param := m.cfg.migrationChallengeParam(m.pcr0)
+	published, err := m.ssm.MayGet(ctx, param)
+	if err != nil {
+		return nil, fmt.Errorf("read migration challenge: %w", err)
+	}
+	if published != "" {
+		challenge, err := m.verifyMigrationChallenge(published, m.pcr0)
+		if err == nil && time.Since(challenge.IssuedAt) < migrationChallengeRotate {
+			return challenge, nil
+		}
+		if err != nil {
+			slog.Warn("replacing migration challenge", "error", err)
+		}
+	}
+	return m.issueMigrationChallenge(ctx)
+}
+
+// issueMigrationChallenge publishes a fresh attested nonce, retiring the previous one.
+func (m *migrator) issueMigrationChallenge(ctx context.Context) (*migrationChallenge, error) {
+	nonce := make([]byte, 32)
+	if _, err := secureRandom(nonce); err != nil {
+		return nil, fmt.Errorf("generate migration challenge: %w", err)
+	}
+	payload, err := m.attestationPayload(migrationChallengeSchemaV1)
+	if err != nil {
+		return nil, fmt.Errorf("attest migration challenge: %w", err)
+	}
+	doc, _, err := m.nsm.BuildAttestationDocument(WithNonce(nonce), WithUserData(payload))
+	if err != nil {
+		return nil, fmt.Errorf("attest migration challenge: %w", err)
+	}
+	published := base64.StdEncoding.EncodeToString(doc)
+	challenge, err := m.verifyMigrationChallenge(published, m.pcr0)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ssm.Set(
+		ctx, m.cfg.migrationChallengeParam(m.pcr0), published, WithAdvancedTier(),
+	); err != nil {
+		return nil, fmt.Errorf("publish migration challenge: %w", err)
+	}
+	return challenge, nil
+}
+
+// verifyMigrationChallenge returns the nonce and issue time of a challenge
+// attested by an enclave measuring issuerPCR0 for this state namespace.
+func (m *migrator) verifyMigrationChallenge(
+	published, issuerPCR0 string,
+) (*migrationChallenge, error) {
+	doc, err := m.nsm.VerifyAttestationDocument(published, map[uint]string{0: issuerPCR0})
+	if err != nil {
+		return nil, fmt.Errorf("verify migration challenge: %w", err)
+	}
+	expectedPayload, err := m.attestationPayload(migrationChallengeSchemaV1)
+	if err != nil {
+		return nil, fmt.Errorf("verify migration challenge: %w", err)
+	}
+	if !bytes.Equal(doc.Document.UserData, expectedPayload) {
+		return nil, errors.New("migration challenge is not bound to this state namespace")
+	}
+	if len(doc.Document.Nonce) == 0 {
+		return nil, errors.New("migration challenge has no nonce")
+	}
+	return &migrationChallenge{
+		Nonce:    doc.Document.Nonce,
+		IssuedAt: time.UnixMilli(int64(doc.Document.Timestamp)),
+	}, nil
+}
+
+// verifyChallengeResponses returns the first candidate answering the live challenge.
+func (m *migrator) verifyChallengeResponses(
+	ctx context.Context,
+	challenge *migrationChallenge,
+	responses []Param,
+) (string, error) {
+	if challenge == nil {
+		return "", nil
+	}
+	issued := challenge.Nonce
+	if len(issued) == 0 {
+		return "", errors.New("invalid migration challenge")
+	}
+
+	expectedPayload, err := m.attestationPayload(successorClaimSchemaV1)
+	if err != nil {
+		return "", err
+	}
+
+	reject := func(response Param, err error) {
+		slog.Warn("ignoring successor attestation", "param", response.Name, "error", err)
+	}
+	for _, response := range responses {
+		doc, err := m.nsm.VerifyAttestationDocument(response.Value, nil)
+		if err != nil {
+			reject(response, fmt.Errorf("verify successor attestation: %w", err))
+			continue
+		}
+		if !bytes.Equal(doc.Document.UserData, expectedPayload) {
+			reject(response, errors.New("attested user data does not match expected user data"))
+			continue
+		}
+		if !bytes.Equal(doc.Document.Nonce, issued) {
+			reject(
+				response,
+				errors.New("successor attestation does not answer the issued challenge"),
+			)
+			continue
+		}
+		if len(doc.Document.PCRs[0]) == 0 {
+			reject(response, errors.New("successor attestation has no PCR0"))
+			continue
+		}
+
+		attested, _, err := normalizePCR0(hex.EncodeToString(doc.Document.PCRs[0]))
+		if err != nil {
+			reject(response, fmt.Errorf("successor PCR0 %w", err))
+			continue
+		}
+		if strings.EqualFold(attested, m.pcr0) {
+			continue
+		}
+
+		return attested, nil
+	}
+	return "", nil
+}
+
+// mayAbortMigration records a matching abort before the handoff commits.
+func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bool, error) {
+	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
+	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
+	if err != nil {
+		return false, fmt.Errorf("read migration abort: %w", err)
+	}
+	if abortedPCR0 == "" || !strings.EqualFold(abortedPCR0, targetPCR0) {
+		return false, nil
+	}
+
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	if err != nil {
+		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
+	}
+	if targetKmsID != "" {
+		slog.Warn("ignoring migration abort: the handoff has already committed",
+			"target_pcr0", prefix16(targetPCR0))
+		return false, nil
+	}
+	if _, err := m.intent.Abort(ctx, m.pcr0); err != nil {
+		return false, err
+	}
+	slog.Warn("migration aborted by operator", "target_pcr0", prefix16(targetPCR0))
+	return true, nil
+}
+
+// eligibleHandOff returns an eligible intent.
+func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error) {
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve migration intent: %w", err)
 	}
 	switch status.State {
+	case migrationStateEligible:
+		return status, nil
 	case migrationStateNone:
 		return nil, errMigrationIntentAbsent
 	case migrationStateAborted:
 		return nil, errMigrationIntentAborted
-	}
-	if status.State == migrationStateCoolingDown {
+	case migrationStateCoolingDown:
 		return nil, fmt.Errorf(
 			"%w: %d seconds remaining",
 			errMigrationCooldownActive,
 			status.RemainingSeconds,
 		)
 	}
-	if status.State != migrationStateEligible {
-		return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
+	return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
+}
+
+// handOffToSuccessor exports state, then commits the target generation.
+func (m *migrator) handOffToSuccessor(ctx context.Context) error {
+	status, err := m.eligibleHandOff(ctx)
+	if err != nil {
+		return err
 	}
 
 	targetPCR0, targetPCR0Bytes, err := normalizePCR0(status.TargetPCR0)
 	if err != nil {
-		return nil, fmt.Errorf("migration intent has invalid target PCR0: %w", err)
+		return fmt.Errorf("migration intent has invalid target PCR0: %w", err)
 	}
 
-	existing, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read target KMS key ID: %w", err)
+		return fmt.Errorf("failed to read target KMS key ID: %w", err)
 	}
-	if existing != "" {
-		return nil, fmt.Errorf(
+	if targetKmsID != "" {
+		return fmt.Errorf(
 			"%w: %s already has a committed generation",
 			errMigrationAlreadyFinalised,
 			m.cfg.kmsKeyIDParam(targetPCR0),
@@ -292,71 +599,63 @@ func (m *migrator) CompleteMigration(
 	}
 
 	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
-		return nil, fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
+		return fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
 
 	migrationKMS, err := m.kms.CreateMigrationKMS(ctx, targetPCR0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create migration key: %w", err)
+		return fmt.Errorf("failed to create migration key: %w", err)
 	}
-
-	pcr0, err := m.nsm.PCR0()
-	if err != nil {
-		return nil, fmt.Errorf("could not read own PCR0 from NSM")
-	}
-	ownPCR0 := hex.EncodeToString(pcr0)
 
 	slog.Info(
 		"created migration KMS key",
 		"key_id", migrationKMS.KeyID(),
-		"own_pcr0", prefix16(ownPCR0),
+		"own_pcr0", prefix16(m.pcr0),
 		"new_pcr0", prefix16(targetPCR0),
 	)
 
-	exportedNames := make([]string, 0, len(m.staticSecrets))
 	transitionSecrets := make(map[StaticSecretMetadata]string, len(m.staticSecrets))
 	for _, secret := range m.staticSecrets {
 		secretBytes, err := hex.DecodeString(secret.Plaintext)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode secret %s hex: %w", secret.Name, err)
+			return fmt.Errorf("failed to decode secret %s hex: %w", secret.Name, err)
 		}
 
 		ciphertextB64, err := migrationKMS.Encrypt(ctx, secretBytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to re-encrypt secret %s: %w", secret.Name, err)
+			return fmt.Errorf("failed to re-encrypt secret %s: %w", secret.Name, err)
 		}
 
 		ciphertextParam := m.cfg.secretCiphertextParam(secret.Name, migrationKMS.KeyID())
 		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
-			return nil, fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
+			return fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
 		}
 		transitionSecrets[secret.StaticSecretMetadata] = ciphertextB64
-		exportedNames = append(exportedNames, secret.Name)
 	}
 
 	dekCiphertext, err := m.dek.ExportKey(ctx, m.cfg, migrationKMS, m.ssm)
 	if err != nil {
-		return nil, fmt.Errorf("DEK export failed: %w", err)
+		return fmt.Errorf("DEK export failed: %w", err)
 	}
 	tlsKey, err := x509.MarshalPKCS8PrivateKey(m.tlsKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal TLS key: %w", err)
+		return fmt.Errorf("failed to marshal TLS key: %w", err)
 	}
 	tlsKeyCiphertext, err := migrationKMS.Encrypt(ctx, tlsKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to re-encrypt TLS key: %w", err)
+		return fmt.Errorf("failed to re-encrypt TLS key: %w", err)
 	}
 	if err := m.ssm.Set(
 		ctx,
 		m.cfg.tlsKeyCiphertextParam(migrationKMS.KeyID()),
 		tlsKeyCiphertext,
 	); err != nil {
-		return nil, fmt.Errorf("failed to store TLS key: %w", err)
+		return fmt.Errorf("failed to store TLS key: %w", err)
 	}
 
 	attestDoc, _, err := m.nsm.BuildAttestationDocument()
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate attestation document: %w", err)
+		return fmt.Errorf("failed to generate attestation document: %w", err)
 	}
 
 	if err := m.ssm.Set(
@@ -365,21 +664,21 @@ func (m *migrator) CompleteMigration(
 		base64.StdEncoding.EncodeToString(attestDoc),
 		WithAdvancedTier(),
 	); err != nil {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"failed to set SSM param %s: %w",
 			m.cfg.migrationPreviousPCR0AttestationParam(targetPCR0), err,
 		)
 	}
 
-	if err := m.ssm.Set(ctx, m.cfg.migrationPreviousPCR0Param(targetPCR0), ownPCR0); err != nil {
-		return nil, fmt.Errorf(
+	if err := m.ssm.Set(ctx, m.cfg.migrationPreviousPCR0Param(targetPCR0), m.pcr0); err != nil {
+		return fmt.Errorf(
 			"failed to set SSM param %s: %w", m.cfg.migrationPreviousPCR0Param(targetPCR0), err,
 		)
 	}
 	if err := m.ssm.Set(
 		ctx, m.cfg.migrationPreviousKMSKeyIDParam(targetPCR0), m.kms.KeyID(),
 	); err != nil {
-		return nil, fmt.Errorf("failed to store predecessor KMS key ID: %w", err)
+		return fmt.Errorf("failed to store predecessor KMS key ID: %w", err)
 	}
 
 	// Write handoff receipt before committing KMSKeyID.
@@ -391,7 +690,7 @@ func (m *migrator) CompleteMigration(
 		bootSnapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
 			ownerPCR0:                 targetPCR0,
-			predecessorPCR0:           ownPCR0,
+			predecessorPCR0:           m.pcr0,
 			predecessorKMSKeyID:       m.kms.KeyID(),
 			staticSecrets:             transitionSecrets,
 			storageDEK:                dekCiphertext,
@@ -399,13 +698,13 @@ func (m *migrator) CompleteMigration(
 			migrationIntentBucketName: m.intent.bucket,
 		},
 	); err != nil {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"failed to write migration-transition receipt: %w", err,
 		)
 	}
 
-	if err := m.verifyIntent(ctx, ownPCR0, targetPCR0, status.Sequence); err != nil {
-		return nil, err
+	if err := m.verifyIntent(ctx, m.pcr0, targetPCR0, status.Sequence); err != nil {
+		return err
 	}
 
 	// Atomic commit: from here, the successor boots on the migration key.
@@ -416,13 +715,13 @@ func (m *migrator) CompleteMigration(
 		WithoutOverwrite(),
 	); err != nil {
 		if isParameterAlreadyExists(err) {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"%w: %s was committed by a concurrent finaliser",
 				errMigrationAlreadyFinalised,
 				m.cfg.kmsKeyIDParam(targetPCR0),
 			)
 		}
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"failed to commit successor KMS key ID: %w", err,
 		)
 	}
@@ -431,24 +730,73 @@ func (m *migrator) CompleteMigration(
 		"committed successor KMSKeyID",
 		"key_id", migrationKMS.KeyID(),
 		"target_pcr0", prefix16(targetPCR0),
+		"exported", len(transitionSecrets),
 	)
-
-	return &CompleteMigrationResult{
-		PCR0:     ownPCR0,
-		Exported: exportedNames,
-	}, nil
+	return nil
 }
 
-func (r MigrationRequest) Validate() error {
-	switch r.Action {
-	case migrationIntentRequested:
-		if _, _, err := normalizePCR0(r.TargetPCR0); err != nil {
-			return fmt.Errorf("target_pcr0 %w", err)
-		}
-	case migrationIntentAborted:
-		return nil
-	default:
-		return fmt.Errorf("unknown migration action %q", r.Action)
+func (m *migrator) respondToChallenge(ctx context.Context) error {
+	predecessor := m.cfg.PreviousPCR0
+
+	// Restarting an established generation must not offer another handoff.
+	keyID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(m.pcr0))
+	if err != nil {
+		return fmt.Errorf("read candidate KMS key ID: %w", err)
 	}
+	if keyID != "" {
+		return nil
+	}
+
+	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
+	if err != nil {
+		return fmt.Errorf("read migration challenge: %w", err)
+	}
+	if published == "" || published == m.answeredChallenge {
+		return nil
+	}
+	// Answer only challenges attested by the predecessor itself.
+	challenge, err := m.verifyMigrationChallenge(published, predecessor)
+	if err != nil {
+		return err
+	}
+
+	// Bind the answer to the challenge nonce.
+	payload, err := m.attestationPayload(successorClaimSchemaV1)
+	if err != nil {
+		return fmt.Errorf("attest successor claim: %w", err)
+	}
+	doc, _, err := m.nsm.BuildAttestationDocument(
+		WithNonce(challenge.Nonce), WithUserData(payload),
+	)
+	if err != nil {
+		return fmt.Errorf("attest successor claim: %w", err)
+	}
+
+	if err := m.ssm.Set(
+		ctx, m.cfg.migrationResponseParam(predecessor, m.pcr0),
+		base64.StdEncoding.EncodeToString(doc), WithAdvancedTier(),
+	); err != nil {
+		return fmt.Errorf("publish successor attestation: %w", err)
+	}
+	m.answeredChallenge = published
 	return nil
+}
+
+// attestationPayload encodes the state namespace under schema, so attestations
+// made for one purpose or deployment cannot stand in for another.
+func (m *migrator) attestationPayload(schema string) ([]byte, error) {
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	if err != nil {
+		return nil, fmt.Errorf("build canonical CBOR encoder: %w", err)
+	}
+	payload, err := enc.Marshal(migrationClaimV1{
+		Schema:     schema,
+		Deployment: m.cfg.Deployment,
+		AppName:    m.cfg.AppName,
+		Lock:       m.cfg.lockSegment(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("serialize attestation payload: %w", err)
+	}
+	return payload, nil
 }

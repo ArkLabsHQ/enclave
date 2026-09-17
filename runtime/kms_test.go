@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,7 +19,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	pcr0Hex := hex.EncodeToString(pcr0)
-	policy := mustBuildKMSPolicy(t, testRoleARN, []string{pcr0Hex}, "")
+	policy := mustBuildKMSPolicy(t, testRoleARN, pcr0Hex, "")
 
 	t.Run("existing key accepted", func(t *testing.T) {
 		kmsf := newFakeKMS()
@@ -29,7 +30,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
-			&fakeSTS{},
+			&fakeSTS{arn: testRoleARN},
 			"key-existing",
 		)
 
@@ -39,17 +40,31 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 		}
 	})
 
+	t.Run("existing policy must match caller identity", func(t *testing.T) {
+		for _, role := range []string{
+			"arn:aws:iam::123456789012:role/other",
+			"arn:aws:iam::000000000000:role/ec2",
+		} {
+			kmsf := newFakeKMS()
+			kmsf.putKey("key-existing", mustBuildKMSPolicy(t, role, pcr0Hex, ""))
+			_, err := FetchOrCreatePrimaryKMS(ctx, testCfg,
+				kmsTestNSMWithPCR0(t, pcr0), kmsf,
+				&fakeSTS{arn: testRoleARN}, "key-existing")
+			require.ErrorContains(t, err, "caller identity")
+		}
+	})
+
 	t.Run("stale policy rejected", func(t *testing.T) {
 		kmsf := newFakeKMS()
 		stalePCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
-		kmsf.putKey("key-stale", mustBuildKMSPolicy(t, testRoleARN, []string{stalePCR0}, ""))
+		kmsf.putKey("key-stale", mustBuildKMSPolicy(t, testRoleARN, stalePCR0, ""))
 
 		_, err := FetchOrCreatePrimaryKMS(
 			ctx,
 			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
-			&fakeSTS{},
+			&fakeSTS{arn: testRoleARN},
 			"key-stale",
 		)
 
@@ -59,11 +74,9 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 	t.Run("multi-PCR0 policy rejected", func(t *testing.T) {
 		otherPCR0 := hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))
 		kmsf := newFakeKMS()
-		kmsf.putKey("key-dual", mustBuildKMSPolicy(
-			t,
-			testRoleARN,
-			[]string{pcr0Hex, otherPCR0},
-			"",
+		kmsf.putKey("key-dual", strings.Replace(
+			mustBuildKMSPolicy(t, testRoleARN, pcr0Hex, ""),
+			`"`+pcr0Hex+`"`, `"`+pcr0Hex+`","`+otherPCR0+`"`, 1,
 		))
 
 		_, err := FetchOrCreatePrimaryKMS(
@@ -71,7 +84,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 			testCfg,
 			kmsTestNSMWithPCR0(t, pcr0),
 			kmsf,
-			&fakeSTS{},
+			&fakeSTS{arn: testRoleARN},
 			"key-dual",
 		)
 
@@ -94,10 +107,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 		if got.KeyID() == "" {
 			t.Fatalf("created key ID is empty")
 		}
-		require.NoError(
-			t,
-			VerifyKeyPolicyPosture(kmsf.keyPolicy(got.KeyID()), []string{pcr0Hex}, true),
-		)
+		requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), pcr0Hex, true)
 	})
 }
 
@@ -171,17 +181,10 @@ func TestCreateMigrationKMS(t *testing.T) {
 	if got.KeyID() == "" || got.KeyID() == "primary" {
 		t.Fatalf("migration key ID = %q", got.KeyID())
 	}
-	require.NoError(
-		t,
-		VerifyKeyPolicyPosture(kmsf.keyPolicy(got.KeyID()), []string{newPCR0}, true),
-	)
+	requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), newPCR0, true)
 	require.Error(
 		t,
-		VerifyKeyPolicyPosture(
-			kmsf.keyPolicy(got.KeyID()),
-			[]string{hex.EncodeToString(curPCR0)},
-			true,
-		),
+		verifyKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), hex.EncodeToString(curPCR0), true),
 		"migration key must not admit the predecessor",
 	)
 }

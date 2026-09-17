@@ -1,42 +1,12 @@
 # default.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
+# default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
-import hashlib
-import json
-import shlex
-import time
-
-CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
-AWS_ACCOUNT_ID = "000000000000"
-FQDN = "enclave.test"
-CERT_BUCKET = "enclave-e2e-certificates"
-LEASE_BUCKET = "enclave-e2e-leases"
-INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
-INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/enclave/dev"
-
-
-def cloud(command):
-    return aws.succeed(f"{CLOUD} {command}").strip()
-
-
-def key_param(pcr0):
-    return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
-
-
-def migration_receipt_param(key_id, pcr0):
-    return f"/dev/testapp/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
-
-
-def get_param(name):
-    status, out = aws.execute(
-        f"{CLOUD} ssm get-parameter --name {name} --query Parameter.Value --output text"
-    )
-    return out.strip() if status == 0 else ""
 
 
 def put_env(name, value):
@@ -116,79 +86,6 @@ def env_value(node, name):
     return node.succeed(
         f"curl -skf --http1.1 https://127.0.0.1/test/env/{name} | jq -r .value"
     ).strip()
-
-
-def print_enclave_diagnostics(node):
-    print(
-        node.execute(
-            "echo '=== qemu ==='; "
-            "if [ -s /run/enclave-qemu.pid ]; then "
-            "pid=$(cat /run/enclave-qemu.pid); "
-            "echo pid=$pid; "
-            'if kill -0 "$pid" 2>/dev/null; then echo alive=yes; else echo alive=no; fi; '
-            "else echo pidfile=missing; fi; "
-            "ls -l /dev/kvm; "
-            "ps -eo pid,ppid,stat,pcpu,comm,args | grep '[q]emu-system' || true"
-        )[1]
-    )
-    print(
-        node.execute(
-            "systemctl status vhost-device-vsock enclave-heartbeat gvproxy "
-            "imds-proxy migration-proxy mock-imds-forward enclave-start "
-            "--no-pager 2>&1"
-        )[1]
-    )
-    print(
-        node.execute(
-            "journalctl -u vhost-device-vsock -u enclave-heartbeat -u gvproxy "
-            "-u imds-proxy -u migration-proxy -u mock-imds-forward "
-            "-u enclave-start --no-pager -n 150 2>&1"
-        )[1]
-    )
-    print(
-        node.execute(
-            "echo '=== enclave console ==='; "
-            "if [ -e /var/log/enclave-console.log ]; then "
-            "echo bytes=$(wc -c </var/log/enclave-console.log); "
-            "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
-            "| tail -n 160; "
-            "echo '=== enclave console hex tail ==='; "
-            "tail -c 256 /var/log/enclave-console.log | od -An -tx1; "
-            "else echo missing; fi"
-        )[1]
-    )
-
-
-def wait_healthy(node):
-    try:
-        node.wait_until_succeeds(
-            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            'https://127.0.0.1/health | jq -e ".status == \\"ready\\""',
-            timeout=900,
-        )
-        node.wait_until_succeeds(
-            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            'https://127.0.0.1/test/health | jq -e ".status == \\"ok\\""',
-            timeout=300,
-        )
-    except Exception:
-        print_enclave_diagnostics(node)
-        print(
-            aws.execute(
-                "journalctl -u ministack -u awsmocks --no-pager -n 100"
-            )[1]
-        )
-        raise
-
-
-def secret_value(node):
-    value = node.succeed(
-        "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY "
-        "| jq -r .value"
-    ).strip()
-    assert len(value) == 64, value
-    assert all(c in "0123456789abcdef" for c in value), value
-    return value
 
 
 aws.start()
@@ -343,7 +240,7 @@ assert '"source":"enclave"' not in app_events, app_events
 
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")
-# Green's commit pointer is created by blue at finalise; it must not exist yet.
+# Green's commit pointer is created by a blue when it commits; not yet.
 assert get_param(key_param(GREEN_PCR0)) == ""
 
 # Once present, the Object-Locked deployment-genesis object decides that the
@@ -460,31 +357,52 @@ assert hardsteps_after_sub == hardsteps_before_sub, (
 )
 wait_healthy(blue)
 
-# Green remains off until blue has atomically committed the handoff.
-migration_request_output = ""
-for _ in range(30):
-    migration_status, migration_request_output = blue.execute(
-        "rm -f /tmp/request-migration.json; "
-        "curl --fail-with-body -sS -H 'Content-Type: application/json' "
-        f"--data '{{\"action\":\"requested\",\"target_pcr0\":\"{GREEN_PCR0}\"}}' "
-        "--output /tmp/request-migration.json "
-        "http://127.0.0.1:8003/request-migration"
-    )
-    valid_status, _ = blue.execute(
-        f"jq -e --arg p '{GREEN_PCR0}' "
-        "'.target_pcr0 == $p and "
-        "(.state == \"cooling_down\" or .state == \"eligible\")' "
-        "/tmp/request-migration.json"
-    )
-    if migration_status == 0 and valid_status == 0:
-        break
-    time.sleep(1)
-else:
-    print(migration_request_output)
-    print(blue.execute("cat /tmp/request-migration.json 2>/dev/null || true")[1])
-    print_enclave_diagnostics(blue)
-    raise Exception("request-migration did not succeed")
+# ACME settings are read when the runtime starts. The blues are already up and
+# stay self-signed; green reads these as it boots and applies them once it
+# promotes.
+put_env("ENCLAVE_USE_ACME", "true")
+put_env("ENCLAVE_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
+put_env("ENCLAVE_ACME_EMAIL", f"acme-test@{FQDN}")
+put_env("ENCLAVE_ACME_CA", aws.succeed("cat /etc/pebble/ca.crt"))
 
+kms_keys_before_handoff = kms_key_count()
+
+# Booting a candidate is the whole trigger: there is no admin endpoint and no
+# request to send. The blues publish a challenge over SSM, green answers it, and
+# a blue commits once the cooldown elapses.
+green.start()
+green.wait_for_unit("multi-user.target")
+green.wait_for_unit("mock-imds-forward.service")
+green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
+green.wait_for_unit("enclave-start.service")
+
+# Candidates serve neither the app nor attestation.
+green.wait_until_succeeds(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    "| jq -e '.status == \"candidate\"'",
+    timeout=900,
+)
+health_status, _ = green.execute("curl -skf --http1.1 https://127.0.0.1/health")
+assert health_status != 0, "a candidate must not report healthy"
+secret_status, _ = green.execute(
+    "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY"
+)
+assert secret_status != 0, "a candidate must serve no application request"
+attestation_code = green.succeed(
+    "curl -sk -o /dev/null -w '%{http_code}' --http1.1 "
+    f"'https://127.0.0.1/enclave/attestation?nonce={'ab' * 20}'"
+).strip()
+assert attestation_code == "503", attestation_code
+
+# A blue records an intent naming green, derived from green's attestation. No
+# operator wrote that PCR0 anywhere. The blues share one intent chain, so both
+# report it whichever of them adopted green's answer.
+for node in BLUES:
+    node.wait_until_succeeds(
+        "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+        f"| jq -e --arg p '{GREEN_PCR0}' '.migration.target_pcr0 == $p'",
+        timeout=180,
+    )
 assert (
     int(
         cloud(
@@ -494,58 +412,32 @@ assert (
     )
     >= 1
 )
-blue.wait_until_succeeds(
+
+# Green can see who is offering it the handoff, while still a candidate.
+green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    "| jq -e '.migration.state == \"eligible\"'",
+    f"| jq -e --arg b '{BLUE_PCR0}' "
+    "'.candidate.awaiting_handoff_from == $b'",
     timeout=120,
 )
 
-finalise_response_valid = False
+# A blue commits on its own once eligible.
 migration_key = ""
-finalise_output = ""
-committed = False
-for attempt in range(30):
-    if not committed:
-        finalise_status, finalise_output = blue.execute(
-            "rm -f /tmp/finalise-migration.json; "
-            "curl --fail-with-body -sS -H 'Content-Type: application/json' "
-            f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
-            "--output /tmp/finalise-migration.json "
-            "http://127.0.0.1:8003/finalise-migration"
-        )
-        response_status, _ = blue.execute(
-            f"jq -e --arg p '{BLUE_PCR0}' "
-            "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
-            "/tmp/finalise-migration.json"
-        )
-        if finalise_status == 0 and response_status == 0:
-            finalise_response_valid = True
-        # Finalising is not idempotent: once it commits, a retry is a 409. Stop
-        # POSTing and just wait for the pointer to be readable.
-        committed = finalise_status == 0
-    if committed or attempt % 3 == 2:
-        migration_key = get_param(key_param(GREEN_PCR0))
-        if migration_key != "":
-            break
+for _ in range(120):
+    migration_key = get_param(key_param(GREEN_PCR0))
+    if migration_key not in ("", "UNSET", "None"):
+        break
     time.sleep(1)
 else:
-    print(finalise_output)
-    print(blue.execute("cat /tmp/finalise-migration.json 2>/dev/null || true")[1])
-    print_enclave_diagnostics(blue)
-    raise Exception("finalise-migration did not commit")
+    for node in BLUES:
+        print_enclave_diagnostics(node)
+    raise Exception("no blue committed the handoff")
 
-if finalise_response_valid:
-    blue.succeed(
-        f"jq -e --arg p '{BLUE_PCR0}' "
-        "'.pcr0 == $p and (.exported | index(\"e2e-signing-key\"))' "
-        "/tmp/finalise-migration.json"
-    )
-assert migration_key not in ("", "UNSET", "None")
 assert migration_key != genesis_key
 # The handoff writes only into green's scope: blue's pointer is untouched, which
 # is what lets blue keep serving and reboot without any rollback machinery.
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
-# Blue is genesis-born, so its own lineage is unchanged by having finalised.
+# Blue is genesis-born, so its own lineage is unchanged by handing off.
 blue.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.previous_pcr0 == \"genesis\"'"
@@ -577,34 +469,19 @@ create_only_status, _ = aws.execute(
 assert create_only_status != 0, "a create-only write must lose to the published receipt"
 assert get_param(receipt_param) == receipt_before
 
-# `blue_peer` shares BLUE_PCR0, so it shares the intent chain and can finalise
-# the same intent. The commit is create-only, so it must lose cleanly rather
-# than clobber the pointer green is about to boot on.# The migration control vsock path answers intermittently on first contact —
-# blue's finalise loop above absorbs the same empty replies — so retry until a
-# real HTTP status comes back rather than reading a dropped connection as a
-# verdict.
-peer_code = ""
-for _ in range(30):
-    _, peer_output = blue_peer.execute(
-        "curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' "
-        f"--data '{{\"new_pcr0\":\"{GREEN_PCR0}\"}}' "
-        "http://127.0.0.1:8003/finalise-migration"
-    )
-    peer_code = peer_output.strip()
-    if peer_code not in ("", "000"):
-        break
-    time.sleep(1)
-assert peer_code == "409", peer_code
+# `blue_peer` shares BLUE_PCR0, so both blues run the control loop against the
+# same intent chain and both reach the commit. The create-only write elects
+# exactly one; the other observes an already-finalised migration and must not
+# displace the pointer green is about to adopt.
+assert len(console_owners(BLUES, "committed successor KMSKeyID")) == 1
 assert get_param(key_param(GREEN_PCR0)) == migration_key
 assert get_param(receipt_param) == receipt_before
-# The guard runs before any key is minted, so a loser must not leave an orphan.
-assert kms_key_count() == kms_keys_before_genesis + 2
 
-# The blue fleet outlives the handoff it performed. Only `blue` was asked to
-# finalise, so exactly one migration key exists; `blue_peer` keeps serving from
-# state it established under the original key. The handoff writes predecessor
-# information only into green's scope, so both blue nodes retain their genesis
-# ancestry while reporting the migration intent targeting green.
+# The blue fleet outlives the handoff it performed. Exactly one generation is
+# committed for green; `blue_peer` keeps serving from state it established under
+# the original key. The handoff writes predecessor information only into green's
+# scope, so both blue nodes retain their genesis ancestry while reporting the
+# migration intent targeting green.
 for node in BLUES:
     wait_healthy(node)
     assert secret_value(node) == blue_secret
@@ -615,25 +492,25 @@ for node in BLUES:
         "'.previous_pcr0 == \"genesis\" and .migration.state == \"eligible\" "
         "and .migration.target_pcr0 == $t'"
     )
-assert kms_key_count() == kms_keys_before_genesis + 2
+# A replica that raced past the pointer guard mints a key before losing the
+# commit. It is an orphan, never referenced, but it does exist.
+assert kms_key_count() in (
+    kms_keys_before_handoff + 1,
+    kms_keys_before_handoff + 2,
+), (kms_key_count(), kms_keys_before_handoff)
 
-# ACME settings are loaded once at boot, so blue remains self-signed.
-put_env("ENCLAVE_USE_ACME", "true")
-put_env("ENCLAVE_ACME_DIRECTORY", f"https://{AWS_NODE_IP}:14000/dir")
-put_env("ENCLAVE_ACME_EMAIL", f"acme-test@{FQDN}")
-put_env("ENCLAVE_ACME_CA", aws.succeed("cat /etc/pebble/ca.crt"))
-
-green.start()
-green.wait_for_unit("multi-user.target")
-green.wait_for_unit("mock-imds-forward.service")
-green.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
-green.wait_for_unit("enclave-start.service")
-# DNS-01 issuance is part of boot, not triggered by the first TLS request.
+# Green promotes in-process the moment a blue commits: no restart, and the host
+# does nothing. Its real TLS configuration, with DNS-01 issuance, is applied then.
 aws.wait_until_succeeds(
     "test -s /var/lib/route53-dns-proxy/events",
     timeout=900,
 )
 wait_healthy(green)
+# Health and status share one lifecycle.
+green.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    "| jq -e '.status == \"ready\"'"
+)
 assert secret_value(green) == blue_secret
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "

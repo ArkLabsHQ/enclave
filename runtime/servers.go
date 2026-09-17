@@ -15,20 +15,17 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
-	"github.com/mdlayher/vsock"
 	"golang.org/x/net/http2"
 )
 
 const (
-	nonceNumDigits            = 40 // 20-byte nonce, hex-encoded
-	migrationControlPort      = 8003
-	migrationRequestPath      = "/request-migration"
-	migrationFinalisationPath = "/finalise-migration"
-	enclavePrefix             = "/enclave/"
-	externalRuntimeV1Prefix   = enclavePrefix + "v1/"
+	nonceNumDigits          = 40 // 20-byte nonce, hex-encoded
+	enclavePrefix           = "/enclave/"
+	externalRuntimeV1Prefix = enclavePrefix + "v1/"
 )
 
 var (
@@ -41,22 +38,35 @@ var (
 	errFailedAttestation = "failed to obtain attestation document from hypervisor"
 )
 
+// RuntimeInfo is the JSON body returned by GET /enclave/v1/info.
+type RuntimeInfo struct {
+	Version                  string           `json:"version"`
+	Status                   string           `json:"status"`
+	Candidate                *CandidateInfo   `json:"candidate,omitempty"`
+	PreviousPCR0             string           `json:"previous_pcr0"`
+	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
+	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
+	Migration                *MigrationStatus `json:"migration"`
+	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
+	KMSKeyLocked             bool             `json:"kms_key_locked"`
+	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
+}
+
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
-	ConfigureEnclaveInfoHandler(ctx context.Context, migrator Migrator, ancestry Ancestry) error
-	StartMigrationControlServer(ctx context.Context, migrator Migrator) error
+	ConfigureEnclaveInfoHandler(migrator Migrator) error
+	SetAncestry(ctx context.Context, ancestry Ancestry)
 }
 
 type servers struct {
-	cfg     *Config
-	ext     *http.Server
-	int     *http.Server
-	sm      *http.ServeMux
-	rm      *http.ServeMux
-	im      *http.ServeMux
-	em      *http.ServeMux
-	rt      RuntimeState
-	metrics *Metrics
+	cfg *Config
+	ext *http.Server
+	int *http.Server
+	rm  *http.ServeMux
+	em  *http.ServeMux
+	rt  RuntimeState
+
+	ancestry atomic.Value // Ancestry, set once state is established
 }
 
 func SetupHttpServers(
@@ -92,13 +102,15 @@ func SetupHttpServers(
 
 	rm := http.NewServeMux()
 	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, telemetry, authToken)
-	rm.HandleFunc("GET /enclave/attestation", attestationHandler(nsm, hashes))
+
+	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, hashes)))
 
 	em := http.NewServeMux()
 	em.Handle(enclavePrefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
-	em.Handle("/", revProxy)
+
+	em.Handle("/", whenReady(rt, revProxy))
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
@@ -119,39 +131,13 @@ func SetupHttpServers(
 	}
 
 	return &servers{
-		cfg:     &cfg,
-		ext:     ext,
-		int:     int,
-		sm:      sm,
-		rm:      rm,
-		em:      em,
-		im:      im,
-		rt:      rt,
-		metrics: metrics,
+		cfg: &cfg,
+		ext: ext,
+		int: int,
+		rm:  rm,
+		em:  em,
+		rt:  rt,
 	}
-}
-
-// registerRuntimeV1Handlers mounts the OTLP ingest endpoints under prefix. Ingest
-// only: the runtime ships telemetry to CloudWatch and never reads it back, so a
-// compromised enclave has no history to serve.
-func registerRuntimeV1Handlers(
-	mux *http.ServeMux,
-	prefix string,
-	telemetry *Telemetry,
-	authToken string,
-) {
-	mux.HandleFunc(
-		"POST "+prefix+"metrics",
-		withTokenAuth(authToken, HandleMetricPost(telemetry.Metrics)),
-	)
-	mux.HandleFunc(
-		"POST "+prefix+"logs",
-		withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)),
-	)
-	mux.HandleFunc(
-		"POST "+prefix+"traces",
-		withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)),
-	)
 }
 
 func (s *servers) Start(ctx context.Context, cfg Config) error {
@@ -192,26 +178,36 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// RuntimeInfo is the JSON body returned by GET /enclave/v1/info.
-type RuntimeInfo struct {
-	Version                  string           `json:"version"`
-	PreviousPCR0             string           `json:"previous_pcr0"`
-	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
-	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
-	Migration                *MigrationStatus `json:"migration"`
-	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
-	KMSKeyLocked             bool             `json:"kms_key_locked"`
-	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
+// registerRuntimeV1Handlers mounts the OTLP ingest endpoints under prefix. Ingest
+// only: the runtime ships telemetry to CloudWatch and never reads it back, so a
+// compromised enclave has no history to serve.
+func registerRuntimeV1Handlers(
+	mux *http.ServeMux,
+	prefix string,
+	telemetry *Telemetry,
+	authToken string,
+) {
+	mux.HandleFunc(
+		"POST "+prefix+"metrics",
+		withTokenAuth(authToken, HandleMetricPost(telemetry.Metrics)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"logs",
+		withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)),
+	)
+	mux.HandleFunc(
+		"POST "+prefix+"traces",
+		withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)),
+	)
 }
 
-func (s *servers) ConfigureEnclaveInfoHandler(
-	ctx context.Context,
-	migrator Migrator,
-	ancestry Ancestry,
-) error {
-	if ancestry != nil {
-		ancestry.Start(ctx)
-	}
+// SetAncestry starts the audit after boot establishes lineage.
+func (s *servers) SetAncestry(ctx context.Context, ancestry Ancestry) {
+	ancestry.Start(ctx)
+	s.ancestry.Store(ancestry)
+}
+
+func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -228,15 +224,26 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 				http.StatusInternalServerError)
 			return
 		}
-		// Reading the audit cannot block or fail, so it is safe this late in the
-		// handler and cannot make the endpoint slow or unavailable.
+		// Snapshot is local and cannot fail.
 		var ancestryInfo *AncestryInfo
-		if ancestry != nil {
+		if ancestry, ok := s.ancestry.Load().(Ancestry); ok {
 			ancestryInfo = ancestry.Snapshot()
+		}
+
+		status := s.rt.Status()
+		var candidate *CandidateInfo
+		if status == runtimeStatusCandidate {
+			// Candidate details are best-effort.
+			if candidate, err = migrator.CandidateInfo(r.Context()); err != nil {
+				slog.Warn("could not read inbound migration intent", "error", err)
+				candidate = nil
+			}
 		}
 
 		_ = json.NewEncoder(w).Encode(RuntimeInfo{
 			Version:                  Version,
+			Status:                   status,
+			Candidate:                candidate,
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
 			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
@@ -250,97 +257,10 @@ func (s *servers) ConfigureEnclaveInfoHandler(
 	return nil
 }
 
-func (s *servers) StartMigrationControlServer(ctx context.Context, migrator Migrator) error {
-	lis, err := vsock.Listen(migrationControlPort, nil)
-	if err != nil {
-		return fmt.Errorf(
-			"listen on migration control vsock port %d: %w",
-			migrationControlPort,
-			err,
-		)
-	}
-
-	slog.Info("starting migration control listener", "vsock_port", migrationControlPort)
-	s.serveMigrationControl(ctx, migrator, lis)
-	return nil
-}
-
-func (s *servers) serveMigrationControl(
-	ctx context.Context,
-	migrator Migrator,
-	lis net.Listener,
-) {
-	server := &http.Server{Handler: migrationControlHandler(migrator)}
-
-	go func() {
-		<-ctx.Done()
-		_ = server.Close()
-	}()
-
-	go func() {
-		if err := server.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.rt.NotifyListenerError(fmt.Errorf("migration control listener: %w", err))
-		}
-	}()
-}
-
-func migrationControlHandler(migrator Migrator) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+migrationRequestPath, func(w http.ResponseWriter, r *http.Request) {
-		var req MigrationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		if err := req.Validate(); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		status, err := migrator.HandleMigrationRequest(r.Context(), req.Action, req.TargetPCR0)
-		if err != nil {
-			http.Error(
-				w,
-				fmt.Sprintf("failed to handle migration request: %v", err),
-				migrationHTTPStatus(err),
-			)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(status)
-	})
-
-	mux.HandleFunc("POST "+migrationFinalisationPath, func(w http.ResponseWriter, r *http.Request) {
-		res, err := migrator.CompleteMigration(r.Context())
-		if err != nil {
-			http.Error(
-				w,
-				fmt.Sprintf("failed to finalise migration: %v", err),
-				migrationHTTPStatus(err),
-			)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(res)
-	})
-
-	return mux
-}
-
+// migrationHTTPStatus maps the errors /enclave/v1/info can surface. Migration
+// itself has no HTTP surface; only reading its status does.
 func migrationHTTPStatus(err error) int {
 	switch {
-	case errors.Is(err, errMigrationCooldownActive):
-		return http.StatusTooEarly
-	case errors.Is(err, errMigrationIntentAbsent),
-		errors.Is(err, errMigrationIntentAborted),
-		errors.Is(err, errMigrationIntentAlreadyRequested),
-		errors.Is(err, errMigrationAlreadyFinalised):
-		return http.StatusConflict
-	case errors.Is(err, errMigrationIntentSelfTarget):
-		return http.StatusBadRequest
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
 		return http.StatusServiceUnavailable
 	default:
@@ -409,6 +329,19 @@ func certCallback(rt RuntimeState) TLSCertCallback {
 		}
 		return getCert(hello)
 	}
+}
+
+// whenReady serves next after the application starts.
+func whenReady(rt RuntimeState, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rt.Ready() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "initializing"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // attestationHandler serves NSM attestation bound to the currently served TLS leaf.

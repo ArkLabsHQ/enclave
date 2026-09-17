@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -173,6 +175,24 @@ func configureSelfSigned(
 
 	slog.Info("serving fleet-shared self-signed certificate", "fqdn", cfg.FQDN)
 	return manager.GetCertificate, nil
+}
+
+// candidateCertCallback keeps a stateless candidate observable over TLS.
+func candidateCertCallback(fqdn string) (TLSCertCallback, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate candidate cert key: %w", err)
+	}
+	certPEM, err := selfSignedIssuer{}.Issue(context.Background(), fqdn, key)
+	if err != nil {
+		return nil, fmt.Errorf("issue candidate cert: %w", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil, fmt.Errorf("decode candidate cert PEM")
+	}
+	cert := &tls.Certificate{Certificate: [][]byte{block.Bytes}, PrivateKey: key}
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil }, nil
 }
 
 // selfSignedIssuer mints the certificate itself, for deployments with no public

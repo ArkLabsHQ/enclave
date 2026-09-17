@@ -171,7 +171,6 @@ type AWSClient struct {
 // Returns an error if the IMDS-bridged config can't be loaded.
 func NewAWSClient(ctx context.Context) (*AWSClient, error) {
 	cfg, err := loadAWSConfigWithIMDS(ctx)
-
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
@@ -247,7 +246,8 @@ func newCloudWatchLogsClient(cfg aws.Config) *cloudwatchlogs.Client {
 
 func resolveInstanceID(ctx context.Context, cfg aws.Config) string {
 	out, err := imds.NewFromConfig(cfg).GetMetadata(
-		ctx, &imds.GetMetadataInput{Path: "instance-id"})
+		ctx, &imds.GetMetadataInput{Path: "instance-id"},
+	)
 	if err != nil {
 		slog.Warn("instance ID lookup: IMDS", "error", err)
 		return ""

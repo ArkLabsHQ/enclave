@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,12 @@ func testConfig() *Config { return newTestConfig("prod", "app", false) }
 
 // testCfg is the package-wide default namespace for tests.
 var testCfg = testConfig()
+
+func testConfigWithPreviousPCR0(prev string) *Config {
+	cfg := *testCfg
+	cfg.PreviousPCR0 = prev
+	return &cfg
+}
 
 func testConfigWithLogShipInterval(interval time.Duration) *Config {
 	cfg := *testCfg
@@ -124,8 +131,10 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 		{name: "whitespace only", raw: "   ", want: "/enclave"},
 		{name: "root only", raw: "/", want: "/enclave"},
 		{name: "slashes only", raw: "///", want: "/enclave"},
-		{name: "leading segments", raw: "/ark/se7enz/emulator",
-			want: "/ark/se7enz/emulator/enclave"},
+		{
+			name: "leading segments", raw: "/ark/se7enz/emulator",
+			want: "/ark/se7enz/emulator/enclave",
+		},
 		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing/enclave"},
 		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading/enclave"},
 		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded/enclave"},
@@ -182,4 +191,121 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	}
 	require.Equal(t, unscoped(locked), unscoped(unlocked),
 		"these paths must not be lock-scoped")
+}
+
+func TestLoadConfigMigrationCooldown(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_APP_NAME", "app")
+	}
+
+	t.Run("unset keeps the posture default", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, prodMigrationCooldown, cfg.MigrationCooldown)
+	})
+
+	t.Run("dev unset keeps the dev default", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_DEV", "true")
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, devMigrationCooldown, cfg.MigrationCooldown)
+	})
+
+	t.Run("override wins", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "48h")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, 48*time.Hour, cfg.MigrationCooldown)
+	})
+
+	// An explicit zero must stay distinct from an absent value, or "no cooldown"
+	// would silently read back as the 24 hour default.
+	t.Run("explicit zero is honoured", func(t *testing.T) {
+		base(t)
+		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "0s")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Zero(t, cfg.MigrationCooldown)
+	})
+
+	for _, tc := range []struct{ name, value, wantErr string }{
+		{"unparseable", "nope", "invalid ENCLAVE_MIGRATION_COOLDOWN"},
+		{"negative", "-1h", "must not be negative"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			base(t)
+			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
+
+			_, err := LoadConfig()
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestSecurityProfileMigrationTimeouts(t *testing.T) {
+	for _, dev := range []bool{false, true} {
+		cfg := newTestConfig("test", "app", dev)
+		want := 10 * time.Minute
+		if dev {
+			want = 2 * time.Minute
+		}
+		require.Equal(t, want, cfg.IntentWriteTimeout)
+		require.Greater(t, cfg.IntentRetention, cfg.IntentWriteTimeout)
+		require.Greater(t, cfg.IntentRetention-cfg.IntentWriteTimeout, time.Minute,
+			"the retained window must stay well clear of the tolerance")
+	}
+}
+
+func TestLoadConfigVerifyClockSource(t *testing.T) {
+	base := func(t *testing.T, dev bool) {
+		t.Helper()
+		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_APP_NAME", "app")
+		t.Setenv("ENCLAVE_DEV", strconv.FormatBool(dev))
+	}
+
+	t.Run("unset keeps the posture default", func(t *testing.T) {
+		for _, dev := range []bool{false, true} {
+			base(t, dev)
+			t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "")
+
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.Equal(t, !dev, cfg.VerifyClockSource)
+		}
+	})
+
+	// An explicit value must stay distinct from an absent one, or asking for the
+	// assertion in dev, or waiving it in prod, would silently do nothing.
+	t.Run("override wins in both postures", func(t *testing.T) {
+		for _, dev := range []bool{false, true} {
+			for _, want := range []bool{false, true} {
+				base(t, dev)
+				t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", strconv.FormatBool(want))
+
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				require.Equal(t, want, cfg.VerifyClockSource, "dev=%v want=%v", dev, want)
+			}
+		}
+	})
+
+	t.Run("rejects an unparseable value", func(t *testing.T) {
+		base(t, false)
+		t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "sometimes")
+
+		_, err := LoadConfig()
+		require.ErrorContains(t, err, "invalid ENCLAVE_VERIFY_CLOCK_SOURCE")
+	})
 }

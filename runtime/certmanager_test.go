@@ -110,14 +110,16 @@ func TestSelfSignedIssuerSharesOneCertAcrossTheFleet(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	key := newTestTLSKey(t)
-	firstStore := newCertStore(testCfg,
+	firstStore := newCertStore(
+		testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
 		certTestBucket,
 		"enclave.test",
 	)
-	secondStore := newCertStore(testCfg,
+	secondStore := newCertStore(
+		testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
@@ -538,7 +540,8 @@ func TestFleetKeepsOneIdentityWhilePeerHasNotAdoptedRenewal(t *testing.T) {
 		notAfter: time.Now().Add(time.Hour),
 	}
 	key := newTestTLSKey(t)
-	renewerStore := newCertStore(testCfg,
+	renewerStore := newCertStore(
+		testCfg,
 		s3f,
 		&dek{key: make([]byte, 32)},
 		key,
@@ -564,7 +567,8 @@ func TestFleetKeepsOneIdentityWhilePeerHasNotAdoptedRenewal(t *testing.T) {
 
 	require.NotEqual(t, oldCert.Certificate[0], newCert.Certificate[0],
 		"the peer intentionally has not polled and still serves the old certificate")
-	require.Equal(t,
+	require.Equal(
+		t,
 		certKeyHash(t, oldCert.Certificate[0]),
 		certKeyHash(t, newCert.Certificate[0]),
 		"old and renewed certificates must carry the same fleet public key",

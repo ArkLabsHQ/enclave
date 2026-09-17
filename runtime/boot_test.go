@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/stretchr/testify/require"
@@ -139,7 +140,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 				seedGenesisRecord(t, s3f, currentPCR0Hex)
 			}
 			boot := &Boot{
-				cfg: testCfg,
+				cfg: testConfigWithPreviousPCR0(prevPCR0),
 				nsm: fakePredecessorNSM{
 					NSM: &nsmW{nsm: &fakeNSM{
 						verifyErr: errors.New("unexpected attestation verification"),
@@ -488,37 +489,42 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 
 	ctx := context.Background()
 	keyID := "key-migration"
-	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	currentPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
 	wrongPCR0 := bytes.Repeat([]byte{0x77}, 48)
 	failedTargetPCR0 := bytes.Repeat([]byte{0x33}, 48)
 
 	type intentSeed struct {
-		source         []byte
-		action, target string
-		sequence       uint64
-		publishedAt    time.Time
+		source           []byte
+		action, target   string
+		sequence         uint64
+		publishedAt      time.Time
+		weakenCompliance func(*fakeS3Object)
 	}
 	// Authorization is judged at boot, so seeds are placed relative to now.
-	// afterPlan breaks the intent store only once the boot has classified
+	// beforeStateAdoptionChecks breaks the intent store only once the boot has classified
 	// itself as a migration.
 	bootAt := time.Now()
-	var afterPlan func(*fakeS3)
+	var beforeStateAdoptionChecks func(*fakeS3)
+	var eifPredecessor string
+	var eifPredecessorSet bool
+	var substituteState func(map[string]string)
+	var assertNoDecryptsOrWrites bool
 
-	seed := func(action, target string, sequence uint64, at time.Time) intentSeed {
+	createIntentRecord := func(action, target string, sequence uint64, at time.Time) intentSeed {
 		return intentSeed{
 			source: prevPCR0, action: action, target: target,
 			sequence: sequence, publishedAt: at,
 		}
 	}
-	authorized := func(source []byte, target string) []intentSeed {
+	createIntent := func(source []byte, target string) []intentSeed {
 		return []intentSeed{{
 			source: source, action: migrationIntentRequested, target: target,
 			sequence: 1, publishedAt: bootAt.Add(-time.Minute),
 		}}
 	}
 
-	run := func(
+	planAndAdopt := func(
 		t *testing.T,
 		prevPCR0Hex string,
 		verifiedPCRs map[uint][]byte,
@@ -526,19 +532,22 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	) (*fakeSSM, []byte, *x509.CertPool, error) {
 		t.Helper()
 		fake, ssm := stateOriginTestSSM(stateOriginParams(keyID))
-		fake.params[testCfg.migrationPreviousPCR0Param(hex.EncodeToString(ownPCR0))] = prevPCR0Hex
-		fake.params[testCfg.migrationPreviousKMSKeyIDParam(hex.EncodeToString(ownPCR0))] = "previous-key"
+		if substituteState != nil {
+			substituteState(fake.params)
+		}
+		fake.params[testCfg.migrationPreviousPCR0Param(hex.EncodeToString(currentPCR0))] = prevPCR0Hex
+		fake.params[testCfg.migrationPreviousKMSKeyIDParam(hex.EncodeToString(currentPCR0))] = "previous-key"
 		root := mustStateRoot(t, ctx, ssm, keyID)
-		transition := signedReceipt(t, verifiedPCRs, purposeMigrationTransition, root)
+		transitionReceipt := signedReceipt(t, verifiedPCRs, purposeMigrationTransition, root)
 		originSnapshot := bootSnapshot{
-			ownerPCR0: hex.EncodeToString(ownPCR0), kmsKeyID: keyID,
+			ownerPCR0: hex.EncodeToString(currentPCR0), kmsKeyID: keyID,
 			predecessorPCR0: prevPCR0Hex, predecessorKMSKeyID: "previous-key",
 		}
 		stateReceipt := signedOriginReceipt(
-			t, map[uint][]byte{0: ownPCR0}, root, originSnapshot,
+			t, map[uint][]byte{0: currentPCR0}, root, originSnapshot,
 		)
-		fake.params[testCfg.migrationStateOriginReceiptParam(keyID, hex.EncodeToString(ownPCR0))] = transition.docB64
-		fake.params[testCfg.migrationPreviousPCR0AttestationParam(hex.EncodeToString(ownPCR0))] = "previous-attestation"
+		fake.params[testCfg.migrationStateOriginReceiptParam(keyID, hex.EncodeToString(currentPCR0))] = transitionReceipt.docB64
+		fake.params[testCfg.migrationPreviousPCR0AttestationParam(hex.EncodeToString(currentPCR0))] = "previous-attestation"
 
 		session := &fakeNSMSession{}
 		session.responses = append(session.responses, attestationDocumentResponse(stateReceipt.doc))
@@ -564,42 +573,61 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 					t, s3f, nsmFake, signer, seed.source,
 					seed.action, seed.target, seed.sequence, seed.publishedAt,
 				)
+				if seed.weakenCompliance != nil {
+					key := migrationIntentObjectKey(hex.EncodeToString(seed.source), seed.sequence)
+					objects := s3f.objects[key]
+					seed.weakenCompliance(&objects[len(objects)-1])
+				}
 			}
 		}
 		cfg := migrationTestCfg()
+		cfg.PreviousPCR0 = prevPCR0Hex
+		if eifPredecessorSet {
+			cfg.PreviousPCR0 = eifPredecessor
+		}
 		boot := &Boot{
 			cfg: cfg,
 			nsm: seededGenesisNSM{NSM: fakePredecessorNSM{
 				NSM: nsm, doc: "previous-attestation",
 			}},
-			ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: ownPCR0,
+			ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: currentPCR0,
+		}
+		kms := &stateOriginTestKMS{keyID: keyID}
+		if assertNoDecryptsOrWrites {
+			before := maps.Clone(fake.params)
+			fake.beforePut = func(string) { t.Error("boot attempted an SSM write") }
+			s3f.beforePut = func(string) { t.Error("boot attempted an S3 write") }
+			defer func() {
+				require.Empty(t, kms.decryptCalls)
+				require.Equal(t, before, fake.params)
+			}()
 		}
 		planned, err := boot.plan(ctx)
 		if err != nil {
 			return fake, root, stateReceipt.roots, err
 		}
-		if afterPlan != nil {
-			afterPlan(s3f)
+		if beforeStateAdoptionChecks != nil {
+			beforeStateAdoptionChecks(s3f)
 		}
 
 		_, err = (&Boot{cfg: cfg, nsm: nsm, ssm: ssm}).establish(
-			ctx, planned, &stateOriginTestKMS{keyID: keyID},
+			ctx, planned, kms,
 		)
 		return fake, root, stateReceipt.roots, err
 	}
 
 	t.Run("accepts valid handoff", func(t *testing.T) {
-		fake, root, roots, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
+		fake, root, roots, err := planAndAdopt(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
-			migrationPCRIndex: pcrExtendFromZero(ownPCR0),
-		}, authorized(prevPCR0, hex.EncodeToString(ownPCR0)))
+			migrationPCRIndex: pcrExtendFromZero(currentPCR0),
+		}, createIntent(prevPCR0, hex.EncodeToString(currentPCR0)))
 		require.NoError(t, err)
 		require.NoError(t, verifyOriginReceipt(
 			NewNSM(WithAttestationRoots(roots)),
-			fake.params[testCfg.stateOriginReceiptParam(keyID, hex.EncodeToString(ownPCR0))],
+			fake.params[testCfg.stateOriginReceiptParam(keyID, hex.EncodeToString(currentPCR0))],
 			root,
 			(bootSnapshot{
-				ownerPCR0: hex.EncodeToString(ownPCR0), kmsKeyID: keyID,
+				ownerPCR0: hex.EncodeToString(currentPCR0), kmsKeyID: keyID,
 				predecessorPCR0:     hex.EncodeToString(prevPCR0),
 				predecessorKMSKeyID: "previous-key",
 			}).lineage(),
@@ -607,72 +635,170 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 	})
 
 	t.Run("rejects wrong PCR31", func(t *testing.T) {
-		_, _, _, err := run(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
+		_, _, _, err := planAndAdopt(t, hex.EncodeToString(prevPCR0), map[uint][]byte{
 			0:                 prevPCR0,
 			migrationPCRIndex: pcrExtendFromZero(wrongPCR0),
-		}, authorized(prevPCR0, hex.EncodeToString(ownPCR0)))
+		}, createIntent(prevPCR0, hex.EncodeToString(currentPCR0)))
 		require.Error(t, err)
 	})
 
 	valid := map[uint][]byte{
 		0:                 prevPCR0,
-		migrationPCRIndex: pcrExtendFromZero(ownPCR0),
+		migrationPCRIndex: pcrExtendFromZero(currentPCR0),
 	}
-	ownHex, prevHex := hex.EncodeToString(ownPCR0), hex.EncodeToString(prevPCR0)
-	otherHex := hex.EncodeToString(wrongPCR0)
-	authorize := func(t *testing.T, seeds ...intentSeed) error {
-		t.Helper()
-		_, _, _, err := run(t, prevHex, valid, seeds)
-		return err
-	}
+	currentPCR0Hex, prevPCR0Hex := hex.EncodeToString(currentPCR0), hex.EncodeToString(prevPCR0)
+	otherPCR0Hex := hex.EncodeToString(wrongPCR0)
 
 	t.Run("refuses when no intent was ever recorded", func(t *testing.T) {
-		err := authorize(t)
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, nil)
 		require.ErrorIs(t, err, errMigrationIntentAbsent)
 		require.ErrorContains(t, err, "recorded no intent")
 	})
 
+	// Keep the predecessor and signed intent valid; only its S3 Object Lock
+	// metadata changes. An unprotected request must not authorize adoption.
+	for _, tc := range []struct {
+		name             string
+		weakenCompliance func(*fakeS3Object)
+	}{
+		{
+			name:             "missing compliance mode",
+			weakenCompliance: func(object *fakeS3Object) { object.lockMode = "" },
+		},
+		{
+			name: "governance instead of compliance",
+			weakenCompliance: func(object *fakeS3Object) {
+				object.lockMode = s3types.ObjectLockModeGovernance
+			},
+		},
+		{
+			name:             "missing retention deadline",
+			weakenCompliance: func(object *fakeS3Object) { object.retainUntil = time.Time{} },
+		},
+		{
+			name: "retention below tolerated minimum",
+			weakenCompliance: func(object *fakeS3Object) {
+				cfg := migrationTestCfg()
+				object.retainUntil = object.lastModified.Add(
+					cfg.IntentRetention - cfg.IntentWriteTimeout - time.Second,
+				)
+			},
+		},
+	} {
+		t.Run("refuses intent with "+tc.name, func(t *testing.T) {
+			assertNoDecryptsOrWrites = true
+			defer func() { assertNoDecryptsOrWrites = false }()
+			intents := createIntent(prevPCR0, currentPCR0Hex)
+			intents[0].weakenCompliance = tc.weakenCompliance
+
+			_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, intents)
+
+			require.ErrorIs(t, err, errMigrationIntentAbsent)
+			require.ErrorContains(t, err, "recorded no intent")
+		})
+	}
+
 	t.Run("refuses an intent naming another successor", func(t *testing.T) {
-		err := authorize(t, seed(
-			migrationIntentRequested, otherHex, 1, bootAt.Add(-time.Hour),
-		))
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
+			createIntentRecord(migrationIntentRequested, otherPCR0Hex, 1, bootAt.Add(-time.Hour)),
+		})
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 	})
 
 	// Authorization must still be live at boot: an abort revokes it, whether or
 	// not the predecessor had already finalised.
 	t.Run("refuses when a later abort revoked the authorization", func(t *testing.T) {
-		err := authorize(t,
-			seed(migrationIntentRequested, ownHex, 1, bootAt.Add(-3*time.Hour)),
-			seed(migrationIntentAborted, ownHex, 2, bootAt.Add(-2*time.Hour)),
-		)
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				1,
+				bootAt.Add(-3*time.Hour),
+			),
+			createIntentRecord(migrationIntentAborted, currentPCR0Hex, 2, bootAt.Add(-2*time.Hour)),
+		})
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 	})
 
 	t.Run("adopts when a re-request superseded an earlier abort", func(t *testing.T) {
-		require.NoError(t, authorize(t,
-			seed(migrationIntentRequested, ownHex, 1, bootAt.Add(-5*time.Hour)),
-			seed(migrationIntentAborted, ownHex, 2, bootAt.Add(-4*time.Hour)),
-			seed(migrationIntentRequested, ownHex, 3, bootAt.Add(-3*time.Hour)),
-		))
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				1,
+				bootAt.Add(-5*time.Hour),
+			),
+			createIntentRecord(migrationIntentAborted, currentPCR0Hex, 2, bootAt.Add(-4*time.Hour)),
+			createIntentRecord(
+				migrationIntentRequested,
+				currentPCR0Hex,
+				3,
+				bootAt.Add(-3*time.Hour),
+			),
+		})
+		require.NoError(t, err)
 	})
 
 	t.Run("fails closed when the intent store is unreadable", func(t *testing.T) {
-		afterPlan = func(s3f *fakeS3) { s3f.listErr = errors.New("s3 unavailable") }
-		defer func() { afterPlan = nil }()
+		beforeStateAdoptionChecks = func(s3f *fakeS3) { s3f.listErr = errors.New("s3 unavailable") }
+		defer func() { beforeStateAdoptionChecks = nil }()
 
-		err := authorize(t, seed(
-			migrationIntentRequested, ownHex, 1, bootAt.Add(-time.Hour),
-		))
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, []intentSeed{
+			createIntentRecord(migrationIntentRequested, currentPCR0Hex, 1, bootAt.Add(-time.Hour)),
+		})
 		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+
+	t.Run("rejects substituted state from another predecessor before adoption", func(t *testing.T) {
+		defer func() {
+			eifPredecessorSet = false
+			substituteState = nil
+			assertNoDecryptsOrWrites = false
+		}()
+		// B commits to A, but the operator supplies Z's handoff under B's
+		// existing key. Recompute the receipt over the replacement ciphertexts
+		// so rejection cannot be attributed to a mismatched state root.
+		tlsParam := testCfg.tlsKeyCiphertextParam(keyID)
+		replacementTLS := stateOriginParams(keyID)[tlsParam]
+		substituteState = func(params map[string]string) {
+			params[tlsParam] = replacementTLS
+			params[testCfg.storageDEKCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
+				bytes.Repeat([]byte{0x5a}, 32),
+			)
+			for _, secret := range stateOriginTestSecrets {
+				params[testCfg.secretCiphertextParam(secret.Name, keyID)] = base64.StdEncoding.EncodeToString(
+					[]byte("operator-chosen-" + secret.Name),
+				)
+			}
+		}
+		zPCRs := map[uint][]byte{
+			0: wrongPCR0, migrationPCRIndex: pcrExtendFromZero(currentPCR0),
+		}
+		eifPredecessor, eifPredecessorSet = prevPCR0Hex, true
+		assertNoDecryptsOrWrites = true
+		_, _, _, err := planAndAdopt(
+			t,
+			otherPCR0Hex,
+			zPCRs,
+			createIntent(wrongPCR0, currentPCR0Hex),
+		)
+		require.ErrorContains(t, err, "does not match previous PCR0 committed in the EIF")
+	})
+
+	t.Run("rejects an image that commits to no predecessor", func(t *testing.T) {
+		eifPredecessor, eifPredecessorSet = "", true
+		defer func() { eifPredecessorSet = false }()
+
+		_, _, _, err := planAndAdopt(t, prevPCR0Hex, valid, createIntent(prevPCR0, currentPCR0Hex))
+		require.ErrorContains(t, err, "ENCLAVE_PREVIOUS_PCR0 is required")
 	})
 
 	// Naming yourself as your own predecessor used to be allowed as a rollback and
 	// skipped PCR31 with it, which let an attestation committing to nobody satisfy
 	// the handoff check. Each generation now keeps its own key, so it is rejected.
 	t.Run("rejects an enclave as its own predecessor", func(t *testing.T) {
-		_, _, _, err := run(t, hex.EncodeToString(ownPCR0), map[uint][]byte{
-			0:                 ownPCR0,
+		_, _, _, err := planAndAdopt(t, hex.EncodeToString(currentPCR0), map[uint][]byte{
+			0:                 currentPCR0,
 			migrationPCRIndex: pcrExtendFromZero(failedTargetPCR0),
 		}, nil)
 		require.ErrorContains(t, err, "cannot be its own predecessor")
@@ -860,6 +986,7 @@ type genesisFixture struct {
 	s3f     *fakeS3
 	kmsf    *fakeKMS
 	sts     *fakeSTS
+	signer  *testAttestationSigner
 	pcr0Hex string
 }
 
@@ -963,6 +1090,7 @@ func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 		s3f:     newFakeS3(),
 		kmsf:    newFakeKMS(),
 		sts:     &fakeSTS{arn: testRoleARN},
+		signer:  session.attestationSign,
 	}
 }
 
@@ -1229,13 +1357,13 @@ type seededGenesisNSM struct {
 	NSM
 }
 
-func (n seededGenesisNSM) VerifyAttestation(
+func (n seededGenesisNSM) VerifyAttestationDocument(
 	doc string, pcrs map[uint]string,
-) ([]byte, error) {
+) (*nitrite.Result, error) {
 	if doc == seededGenesisAttestation {
-		return nil, nil
+		return &nitrite.Result{Document: &nitrite.Document{}}, nil
 	}
-	return n.NSM.VerifyAttestation(doc, pcrs)
+	return n.NSM.VerifyAttestationDocument(doc, pcrs)
 }
 
 type fakePredecessorNSM struct {
@@ -1243,13 +1371,13 @@ type fakePredecessorNSM struct {
 	doc string
 }
 
-func (n fakePredecessorNSM) VerifyAttestation(
+func (n fakePredecessorNSM) VerifyAttestationDocument(
 	doc string, pcrs map[uint]string,
-) ([]byte, error) {
+) (*nitrite.Result, error) {
 	if doc == n.doc {
-		return nil, nil
+		return &nitrite.Result{Document: &nitrite.Document{}}, nil
 	}
-	return n.NSM.VerifyAttestation(doc, pcrs)
+	return n.NSM.VerifyAttestationDocument(doc, pcrs)
 }
 
 func TestDeletingKMSKeyIDFailsClosed(t *testing.T) {
@@ -1348,7 +1476,8 @@ func TestGenesisClaimsKMSKeyBeforeCommittingIntent(t *testing.T) {
 
 	require.ErrorContains(t, err, "key commit failed")
 	require.Empty(t, fx.ssmf.params[fx.keyIDParam()])
-	intent, loadErr := newGenesisLog(testCfg,
+	intent, loadErr := newGenesisLog(
+		testCfg,
 		fx.s3f, fx.nsm, stateOriginTestMigrationIntentBucket(),
 	)
 	require.NoError(t, loadErr)

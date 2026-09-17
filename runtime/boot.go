@@ -471,12 +471,18 @@ func (b *Boot) loadPredecessor(
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
-	if (pcr0 != "") != (keyID != "") || (pcr0 != "") != (attestation != "") {
+
+	havePCR0, haveKey, haveAttestation := pcr0 != "", keyID != "", attestation != ""
+	allPresent := havePCR0 && haveKey && haveAttestation
+	allAbsent := !havePCR0 && !haveKey && !haveAttestation
+
+	if !allPresent && !allAbsent {
 		return "", "", "", fmt.Errorf(
-			"inconsistent migration predecessor artifacts (pcr0 present=%v, key present=%v, attestation present=%v)",
-			pcr0 != "",
-			keyID != "",
-			attestation != "",
+			"inconsistent migration predecessor artifacts "+
+				"(pcr0 present=%v, key present=%v, attestation present=%v)",
+			havePCR0,
+			haveKey,
+			haveAttestation,
 		)
 	}
 	return pcr0, keyID, attestation, nil
@@ -502,6 +508,7 @@ func (b *Boot) genesisCommitted(ctx context.Context, genesis *genesisLog) (strin
 	if artifact == nil {
 		return "", nil
 	}
+
 	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)))
 	if err != nil {
 		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
@@ -691,6 +698,16 @@ func (b *migrationBoot) verifySnapshot(
 			prefix16(head.TargetPCR0),
 		)
 	}
+	if state.cfg.PreviousPCR0 == "" {
+		return fmt.Errorf(
+			"ENCLAVE_PREVIOUS_PCR0 is required: this image commits to no predecessor",
+		)
+	}
+	if !strings.EqualFold(state.cfg.PreviousPCR0, state.predecessorPCR0) {
+		return fmt.Errorf(
+			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
+		)
+	}
 	return nil
 }
 
@@ -821,12 +838,13 @@ func WriteTransitionReceipt(
 	if err != nil {
 		return fmt.Errorf("compute successor state_root: %w", err)
 	}
-	return writeStateReceipt(
+	return writeReceipt(
 		ctx,
 		nsm,
 		ssm,
-		root,
-		purposeMigrationTransition,
+		stateOriginPayloadV1{
+			Purpose: purposeMigrationTransition, StateRoot: root,
+		},
 		cfg.migrationStateOriginReceiptParam(snapshot.kmsKeyID, snapshot.ownerPCR0),
 		WithoutOverwrite(),
 	)
@@ -910,21 +928,8 @@ func stateRoot(cfg *Config, snapshot bootSnapshot) ([]byte, error) {
 	return out, nil
 }
 
-// writeStateReceipt attests over stateRoot and stores it at param. Advanced tier: an
+// writeReceipt attests over receipt and stores it at param. Advanced tier: an
 // attestation doc exceeds the 4 KB Standard-tier limit.
-func writeStateReceipt(
-	ctx context.Context,
-	nsm NSM,
-	ssm SSM,
-	stateRoot []byte,
-	purpose, param string,
-	opts ...SSMSetOption,
-) error {
-	return writeReceipt(ctx, nsm, ssm, stateOriginPayloadV1{
-		Purpose: purpose, StateRoot: stateRoot,
-	}, param, opts...)
-}
-
 func writeReceipt(
 	ctx context.Context,
 	nsm NSM,

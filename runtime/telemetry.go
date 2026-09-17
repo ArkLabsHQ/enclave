@@ -139,7 +139,8 @@ func (t *Telemetry) Start(ctx context.Context) error {
 
 func (t *Telemetry) Shutdown() {
 	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(), shutdownFlushTimeout)
+		context.Background(), shutdownFlushTimeout,
+	)
 	defer cancel()
 	if t.Tracing != nil {
 		t.Tracing.Shutdown(shutdownCtx)
@@ -296,7 +297,8 @@ func (t *Telemetry) pump(ctx context.Context, sig signal) {
 		select {
 		case <-ctx.Done():
 			final, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx), shutdownFlushTimeout)
+				context.WithoutCancel(ctx), shutdownFlushTimeout,
+			)
 			for drained := false; !drained; {
 				select {
 				case event := <-s.events:

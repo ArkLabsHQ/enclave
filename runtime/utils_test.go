@@ -377,15 +377,18 @@ func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientI
 		return nil
 	}
 
-	admitted, err := KeyPolicyAdmittedPCR0s(policy)
+	decoded, err := decodeKMSPolicy(policy, nil, false)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
+	}
+	if decoded.attested.Condition == nil {
+		return fmt.Errorf("AccessDeniedException: key %s lacks an attestation condition", keyID)
 	}
 	pcr0, err := fakeKMSAttestedPCR0(recipient.AttestationDocument)
 	if err != nil {
 		return fmt.Errorf("fake kms: %w", err)
 	}
-	if !admitted[pcr0] {
+	if !strings.EqualFold(decoded.attested.Condition.StringEqualsIgnoreCase.PCR0[0], pcr0) {
 		return fmt.Errorf(
 			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
 		)
@@ -884,7 +887,12 @@ func (f *fakeS3) GetObject(
 			if f.readErr != nil {
 				body = io.NopCloser(iotest.ErrReader(f.readErr))
 			}
-			return &s3.GetObjectOutput{Body: body, ETag: aws.String(objects[i].etag)}, nil
+			out := &s3.GetObjectOutput{Body: body, ETag: aws.String(objects[i].etag)}
+			out.ObjectLockMode = objects[i].lockMode
+			if !objects[i].retainUntil.IsZero() {
+				out.ObjectLockRetainUntilDate = aws.Time(objects[i].retainUntil)
+			}
+			return out, nil
 		}
 	}
 	return nil, &s3types.NoSuchKey{}
@@ -1012,7 +1020,23 @@ func (f *fakeS3) putRawObject(key string, body []byte) {
 	f.putRawObjectAt(key, body, time.Now().UTC())
 }
 
+// putRawObjectAt seeds a version the way the runtime writes one: retained under
+// compliance mode for the production intent retention. putRawObjectLockedAt
+// seeds the malformed lock states a hostile writer could publish instead.
 func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time) {
+	f.putRawObjectLockedAt(
+		key, body, lastModified,
+		s3types.ObjectLockModeCompliance, lastModified.Add(prodRetention),
+	)
+}
+
+func (f *fakeS3) putRawObjectLockedAt(
+	key string,
+	body []byte,
+	lastModified time.Time,
+	lockMode s3types.ObjectLockMode,
+	retainUntil time.Time,
+) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq++
@@ -1021,6 +1045,8 @@ func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time)
 		id:           id,
 		etag:         fmt.Sprintf("%q", "etag-"+id),
 		body:         body,
+		lockMode:     lockMode,
+		retainUntil:  retainUntil,
 		lastModified: lastModified,
 	})
 }

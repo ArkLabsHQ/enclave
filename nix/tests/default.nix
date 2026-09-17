@@ -27,14 +27,14 @@ let
 
   ministack = pkgs.python3Packages.buildPythonApplication rec {
     pname = "ministack";
-    version = "1.4.6";
+    version = "1.4.16";
     pyproject = true;
 
     src = pkgs.fetchFromGitHub {
       owner = "ministackorg";
       repo = "ministack";
       tag = "v${version}";
-      hash = "sha256-6BUczgfnrSRcFpzmcStvOIIsULjqphGqqWPJZRQHNuU=";
+      hash = "sha256-hqvlrhi/JLV3JCDXsQPmsWA+um/q/GsB/zwtFodxxj0=";
     };
 
     build-system = with pkgs.python3Packages; [
@@ -228,11 +228,13 @@ let
     };
 
   blueEif = mkTestEif {
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
   };
   bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
 
   greenEif = mkTestEif {
+    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
     ENCLAVE_TEST_SALT = "green";
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
@@ -349,19 +351,6 @@ let
         serviceConfig = {
           Type = "simple";
           ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:8002,fork TCP:169.254.169.254:80";
-          Restart = "always";
-          RestartSec = 5;
-        };
-      };
-
-      systemd.services.migration-proxy = {
-        description = "Migration control proxy";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8003,bind=127.0.0.1,fork,reuseaddr VSOCK-CONNECT:1:8003";
           Restart = "always";
           RestartSec = 5;
         };
@@ -544,6 +533,8 @@ in
         GREEN_PCR0 = ${builtins.toJSON greenPCR0}
         AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
       ''
+      + builtins.readFile ./helpers.py
+      + "\n"
       + builtins.readFile ./e2e.py;
   };
 }

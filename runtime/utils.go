@@ -24,11 +24,11 @@ func verifyAttestationUserData(
 	expectedPCRs map[uint]string,
 	expectedUserData []byte,
 ) error {
-	userData, err := nsm.VerifyAttestation(attestDocB64, expectedPCRs)
+	result, err := nsm.VerifyAttestationDocument(attestDocB64, expectedPCRs)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(userData, expectedUserData) {
+	if !bytes.Equal(result.Document.UserData, expectedUserData) {
 		return fmt.Errorf("attested user data does not match expected user data")
 	}
 	return nil

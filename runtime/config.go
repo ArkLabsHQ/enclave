@@ -10,12 +10,14 @@ import (
 )
 
 const (
-	prodRetention         = 10 * 365 * 24 * time.Hour
-	prodMigrationCooldown = 24 * time.Hour
+	prodRetention          = 10 * 365 * 24 * time.Hour
+	prodMigrationCooldown  = 24 * time.Hour
+	prodIntentWriteTimeout = 10 * time.Minute
 
-	devGenesisRetention  = 5 * time.Minute
-	devIntentRetention   = time.Minute
-	devMigrationCooldown = 2 * time.Second
+	devGenesisRetention   = 5 * time.Minute
+	devIntentRetention    = 10 * time.Minute
+	devMigrationCooldown  = 2 * time.Second
+	devIntentWriteTimeout = 2 * time.Minute
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
@@ -23,6 +25,11 @@ const (
 
 	logGroupNameChars  = "._-/#"
 	maxLogGroupNameLen = 512
+
+	migrationPollInterval    = 5 * time.Second
+	migrationChallengeRotate = time.Minute
+
+	migrationAbortResponse = "abort"
 )
 
 const (
@@ -47,10 +54,11 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment string
-	AppName    string
-	Dev        bool
-	AppPort    string
+	Deployment   string
+	AppName      string
+	Dev          bool
+	AppPort      string
+	PreviousPCR0 string
 
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
@@ -68,6 +76,7 @@ type Config struct {
 	VerifyClockSource     bool
 	GenesisRetention      time.Duration
 	IntentRetention       time.Duration
+	IntentWriteTimeout    time.Duration
 	MigrationCooldown     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
@@ -85,9 +94,10 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Deployment: getDeployment(),
-		AppName:    getAppName(),
-		AppPort:    appPort,
+		Deployment:   getDeployment(),
+		AppName:      getAppName(),
+		AppPort:      appPort,
+		PreviousPCR0: getPreviousPCR0(),
 
 		FQDN:             getFQDN(),
 		ExtPort:          extPort,
@@ -100,6 +110,22 @@ func LoadConfig() (*Config, error) {
 		LogGroupPrefix:   logGroupPrefix(),
 	}
 	cfg.setSecurityConfig(IsDev())
+
+	cooldown, set, err := migrationCooldown()
+	if err != nil {
+		return nil, err
+	}
+	if set {
+		cfg.MigrationCooldown = cooldown
+	}
+
+	verify, set, err := verifyClockSource()
+	if err != nil {
+		return nil, err
+	}
+	if set {
+		cfg.VerifyClockSource = verify
+	}
 	return cfg, nil
 }
 
@@ -180,11 +206,13 @@ func (c *Config) setSecurityConfig(dev bool) {
 	if dev {
 		c.GenesisRetention = devGenesisRetention
 		c.IntentRetention = devIntentRetention
+		c.IntentWriteTimeout = devIntentWriteTimeout
 		c.MigrationCooldown = devMigrationCooldown
 		return
 	}
 	c.GenesisRetention = prodRetention
 	c.IntentRetention = prodRetention
+	c.IntentWriteTimeout = prodIntentWriteTimeout
 	c.MigrationCooldown = prodMigrationCooldown
 }
 
@@ -259,7 +287,8 @@ func (c *Config) secretCiphertextParam(secretName, keyID string) string {
 	)
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext, lock-scoped and key-scoped.
+// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,
+// lock-scoped and key-scoped.
 func (c *Config) storageDEKCiphertextParam(keyID string) string {
 	return fmt.Sprintf(
 		"/%s/%s/%s/StorageDEK/Ciphertext/%s",
@@ -333,5 +362,23 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 		c.Deployment,
 		c.AppName,
 		strings.ToLower(pcr0),
+	)
+}
+
+// migrationChallengeParam: the live challenge published by a predecessor.
+func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationChallenge/%s", c.Deployment, c.AppName, strings.ToLower(sourcePCR0),
+	)
+}
+
+// migrationResponseParam identifies a candidate or operator response.
+func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationResponse/%s/%s",
+		c.Deployment,
+		c.AppName,
+		strings.ToLower(sourcePCR0),
+		strings.ToLower(responder),
 	)
 }

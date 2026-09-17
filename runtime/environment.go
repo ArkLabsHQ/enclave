@@ -11,15 +11,19 @@ import (
 )
 
 // nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM namespace or the managed-secret set. ENCLAVE_DEV additionally selects the
-// whole set of security settings — lock posture, both Object Lock retentions,
-// the migration cooldown and the clock-source assertion — and skips COSE
-// verification.
+// SSM namespace or the managed-secret set, or they decide the security posture.
+// ENCLAVE_DEV selects the lock posture and both Object Lock retentions and skips
+// COSE verification; the cooldown, the clock-source assertion and the
+// predecessor commitment are settable, but only baked into the measured image,
+// never from the overlay.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":     true,
-	"ENCLAVE_APP_NAME":       true,
-	"ENCLAVE_SECRETS_CONFIG": true,
-	"ENCLAVE_DEV":            true,
+	"ENCLAVE_DEPLOYMENT":          true,
+	"ENCLAVE_APP_NAME":            true,
+	"ENCLAVE_SECRETS_CONFIG":      true,
+	"ENCLAVE_DEV":                 true,
+	"ENCLAVE_MIGRATION_COOLDOWN":  true,
+	"ENCLAVE_VERIFY_CLOCK_SOURCE": true,
+	"ENCLAVE_PREVIOUS_PCR0":       true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
@@ -87,6 +91,10 @@ func getAppName() string {
 	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
 }
 
+func getPreviousPCR0() string {
+	return strings.TrimSpace(os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
+}
+
 func getAppPort() string {
 	return envDefault("ENCLAVE_APP_PORT", "7074")
 }
@@ -136,4 +144,31 @@ func normalizeLogGroupPrefix(raw string) string {
 		trimmed = "/" + trimmed
 	}
 	return trimmed + defaultLogGroupPrefix
+}
+
+func migrationCooldown() (time.Duration, bool, error) {
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
+	if v == "" {
+		return 0, false, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", v, err)
+	}
+	if d < 0 {
+		return 0, false, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+	}
+	return d, true, nil
+}
+
+func verifyClockSource() (bool, bool, error) {
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
+	if v == "" {
+		return false, false, nil
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, false, fmt.Errorf("invalid ENCLAVE_VERIFY_CLOCK_SOURCE %q: %w", v, err)
+	}
+	return enabled, true, nil
 }

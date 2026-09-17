@@ -47,10 +47,10 @@ func WithUserData(userData []byte) BuildAttestationOption {
 }
 
 type NSM interface {
-	VerifyAttestation(
+	VerifyAttestationDocument(
 		attestDocB64 string,
 		expectedPCRs map[uint]string,
-	) ([]byte, error)
+	) (*nitrite.Result, error)
 	BuildAttestationDocument(opts ...BuildAttestationOption) ([]byte, *rsa.PrivateKey, error)
 	LockPCR(index uint) error
 	ExtendPCR(index uint, data []byte) error
@@ -92,10 +92,12 @@ func NewNSM(opts ...VerifyAttestationOption) NSM {
 	return &nsmW{nsm: &awsNSM{unsigned: vao.unsigned, roots: vao.roots}}
 }
 
-func (n *nsmW) VerifyAttestation(
+// VerifyAttestationDocument checks the document's signature chain and that it
+// carries expectedPCRs, and returns the verified document.
+func (n *nsmW) VerifyAttestationDocument(
 	attestDocB64 string,
 	expectedPCRs map[uint]string,
-) ([]byte, error) {
+) (*nitrite.Result, error) {
 	attestDoc, err := base64.StdEncoding.DecodeString(attestDocB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode attestation base64: %w", err)
@@ -118,7 +120,7 @@ func (n *nsmW) VerifyAttestation(
 		}
 	}
 
-	return result.Document.UserData, nil
+	return result, nil
 }
 
 func (n *nsmW) BuildAttestationDocument(

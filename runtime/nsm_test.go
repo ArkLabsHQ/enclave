@@ -74,7 +74,7 @@ func TestAWSNSMVerifyAttestationSig(t *testing.T) {
 	})
 }
 
-func TestNSMVerifyAttestation(t *testing.T) {
+func TestNSMVerifyAttestationDocument(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	userData := []byte("expected user data")
 	doc := []byte("attestation doc")
@@ -84,7 +84,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation("not base64", map[uint]string{})
+		_, err := nsm.VerifyAttestationDocument("not base64", map[uint]string{})
 
 		require.Error(t, err)
 		require.Empty(t, fake.verifyDocs)
@@ -94,7 +94,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyErr: errors.New("verify failed")}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(docB64, map[uint]string{})
+		_, err := nsm.VerifyAttestationDocument(docB64, map[uint]string{})
 
 		require.Error(t, err)
 		require.Equal(t, [][]byte{doc}, fake.verifyDocs)
@@ -104,19 +104,19 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		got, err := nsm.VerifyAttestation(
+		got, err := nsm.VerifyAttestationDocument(
 			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
 		)
 
 		require.NoError(t, err)
-		require.Equal(t, userData, got)
+		require.Equal(t, userData, got.Document.UserData)
 	})
 
 	t.Run("missing PCR", func(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{1: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(
+		_, err := nsm.VerifyAttestationDocument(
 			docB64, map[uint]string{0: hex.EncodeToString(pcr0)},
 		)
 
@@ -127,7 +127,7 @@ func TestNSMVerifyAttestation(t *testing.T) {
 		fake := &fakeNSM{verifyResult: verifyDocResult(map[uint][]byte{0: pcr0}, userData)}
 		nsm := &nsmW{nsm: fake}
 
-		_, err := nsm.VerifyAttestation(
+		_, err := nsm.VerifyAttestationDocument(
 			docB64,
 			map[uint]string{0: hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 48))},
 		)
@@ -532,6 +532,18 @@ func (s *testAttestationSigner) build(
 	publicKey ...[]byte,
 ) signedAttestation {
 	t.Helper()
+	return s.buildWithNonce(t, pcrs, timestamp, userData, nil, publicKey...)
+}
+
+func (s *testAttestationSigner) buildWithNonce(
+	t *testing.T,
+	pcrs map[uint][]byte,
+	timestamp time.Time,
+	userData []byte,
+	nonce []byte,
+	publicKey ...[]byte,
+) signedAttestation {
+	t.Helper()
 
 	document := &nitrite.Document{
 		ModuleID:    "test-module",
@@ -541,6 +553,7 @@ func (s *testAttestationSigner) build(
 		Certificate: s.leafDER,
 		CABundle:    [][]byte{s.caDER},
 		UserData:    userData,
+		Nonce:       nonce,
 	}
 	if len(publicKey) > 0 {
 		document.PublicKey = publicKey[0]
@@ -798,13 +811,9 @@ func buildSignedAttestationForRequest(
 	req *request.Attestation,
 ) signedAttestation {
 	t.Helper()
-	return signer.build(
-		t,
-		pcrs,
-		time.Now(),
-		req.UserData,
-		req.PublicKey,
-	)
+	// The nonce must survive into the document: it is the only freshness signal
+	// a verifier has, so a fake that dropped it would make replay untestable.
+	return signer.buildWithNonce(t, pcrs, time.Now(), req.UserData, req.Nonce, req.PublicKey)
 }
 
 func clonePCRs(pcrs map[uint][]byte) map[uint][]byte {

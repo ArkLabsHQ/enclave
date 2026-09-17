@@ -21,6 +21,11 @@ const (
 
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
+
+	migrationPollInterval    = 5 * time.Second
+	migrationChallengeRotate = time.Minute
+
+	migrationAbortResponse = "abort"
 )
 
 const (
@@ -311,5 +316,23 @@ func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 		c.Deployment,
 		c.AppName,
 		strings.ToLower(pcr0),
+	)
+}
+
+// migrationChallengeParam: the live challenge published by a predecessor.
+func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationChallenge/%s", c.Deployment, c.AppName, strings.ToLower(sourcePCR0),
+	)
+}
+
+// migrationResponseParam identifies a candidate or operator response.
+func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
+	return fmt.Sprintf(
+		"/%s/%s/MigrationResponse/%s/%s",
+		c.Deployment,
+		c.AppName,
+		strings.ToLower(sourcePCR0),
+		strings.ToLower(responder),
 	)
 }

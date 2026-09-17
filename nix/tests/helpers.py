@@ -49,14 +49,14 @@ def print_enclave_diagnostics(node):
     print(
         node.execute(
             "systemctl status vhost-device-vsock enclave-heartbeat gvproxy "
-            "imds-proxy migration-proxy mock-imds-forward enclave-start "
+            "imds-proxy mock-imds-forward enclave-start "
             "--no-pager 2>&1"
         )[1]
     )
     print(
         node.execute(
             "journalctl -u vhost-device-vsock -u enclave-heartbeat -u gvproxy "
-            "-u imds-proxy -u migration-proxy -u mock-imds-forward "
+            "-u imds-proxy -u mock-imds-forward "
             "-u enclave-start --no-pager -n 150 2>&1"
         )[1]
     )

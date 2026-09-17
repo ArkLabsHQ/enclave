@@ -155,14 +155,14 @@ func (a *ancestry) loadVerifiedLineage(
 	if err != nil {
 		return "", "", err
 	}
-	userData, err := a.nsm.VerifyAttestation(
+	result, err := a.nsm.VerifyAttestationDocument(
 		receipt, map[uint]string{0: pcr0},
 	)
 	if err != nil {
 		return "", "", err
 	}
 	var payload stateOriginPayloadV1
-	if err := cbor.Unmarshal(userData, &payload); err != nil {
+	if err := cbor.Unmarshal(result.Document.UserData, &payload); err != nil {
 		return "", "", fmt.Errorf("decode state-origin receipt: %w", err)
 	}
 	if payload.Purpose != purposeStateOrigin || len(payload.StateRoot) == 0 {

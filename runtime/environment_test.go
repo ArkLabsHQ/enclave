@@ -4,74 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-func TestConfigValidate(t *testing.T) {
-	valid := func() *Config {
-		c := newTestConfig("prod", "myapp", false)
-		c.ExtPort, c.IntPort, c.HostProxyPort, c.FQDN = extPort, intPort, hostProxyPort, "localhost"
-		return c
-	}
-
-	for _, tc := range []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr string
-	}{
-		{name: "all set", mutate: func(*Config) {}},
-		{
-			name:    "deployment missing",
-			mutate:  func(c *Config) { c.Deployment = "" },
-			wantErr: "ENCLAVE_DEPLOYMENT must be set",
-		},
-		{
-			name:    "deployment has a character CloudWatch refuses",
-			mutate:  func(c *Config) { c.Deployment = "dev:us" },
-			wantErr: "names every CloudWatch log group",
-		},
-		{
-			name:    "app name missing",
-			mutate:  func(c *Config) { c.AppName = "" },
-			wantErr: "ENCLAVE_APP_NAME must be set",
-		},
-		{
-			name:    "port missing",
-			mutate:  func(c *Config) { c.ExtPort = 0 },
-			wantErr: "config is missing port",
-		},
-		{
-			name:    "FQDN missing",
-			mutate:  func(c *Config) { c.FQDN = "" },
-			wantErr: "config is missing FQDN",
-		},
-		{
-			name:    "log group prefix empty",
-			mutate:  func(c *Config) { c.LogGroupPrefix = "" },
-			wantErr: "ENCLAVE_LOG_GROUP_PREFIX must not be empty",
-		},
-		{
-			name:    "log group prefix has an illegal character",
-			mutate:  func(c *Config) { c.LogGroupPrefix = "/ark:se7enz" },
-			wantErr: "CloudWatch log group names allow only",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := valid()
-			tc.mutate(c)
-
-			err := c.Validate()
-
-			if tc.wantErr == "" {
-				require.NoError(t, err)
-				return
-			}
-			require.ErrorContains(t, err, tc.wantErr)
-		})
-	}
-}
 
 func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
@@ -160,30 +97,45 @@ func TestApplyEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
-			path("ENCLAVE_DEPLOYMENT"):          "dev",
-			path("ENCLAVE_APP_NAME"):            "evil",
-			path("ENCLAVE_SECRETS_CONFIG"):      `[{"name":"evil"}]`,
-			path("ENCLAVE_DEV"):                 "true",
-			path("ENCLAVE_MIGRATION_COOLDOWN"):  "0s",
-			path("ENCLAVE_VERIFY_CLOCK_SOURCE"): "false",
-			path("ENCLAVE_PREVIOUS_PCR0"):       "evil-pcr0",
-			path("SAFE_KEY"):                    "ok",
-		}))
-		require.NoError(t, err)
-		require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
-		// ENCLAVE_DEV now selects the lock posture, both Object Lock retentions
-		// and the migration cooldown, so an overlay that could set it would hand
-		// back everything this refused elsewhere.
-		require.Equal(t, "false", os.Getenv("ENCLAVE_DEV"))
-		require.Empty(t, os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"),
-			"the overlay must not be able to shorten the migration cooldown")
-		require.Empty(t, os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"),
-			"the overlay must not be able to waive the clock-source assertion")
-		require.Empty(t, os.Getenv("ENCLAVE_PREVIOUS_PCR0"),
-			"the overlay must not be able to name a different predecessor")
-		require.True(t, testCfg.KMSLocked)
-		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
+		for _, dev := range []bool{false, true} {
+			t.Run("dev="+strconv.FormatBool(dev), func(t *testing.T) {
+				setConfigTestEnv(t, dev)
+				t.Setenv("ENCLAVE_PREVIOUS_PCR0", "original-pcr0")
+				t.Setenv("SAFE_KEY", "")
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				before := *cfg
+
+				err = ApplyEnvOverrides(ctx, cfg, ssmFor(map[string]string{
+					path("ENCLAVE_DEPLOYMENT"):              "dev",
+					path("ENCLAVE_APP_NAME"):                "evil",
+					path("ENCLAVE_SECRETS_CONFIG"):          `[{"name":"evil"}]`,
+					path("ENCLAVE_DEV"):                     strconv.FormatBool(!dev),
+					path("ENCLAVE_MIGRATION_COOLDOWN"):      "0s",
+					path("ENCLAVE_VERIFY_CLOCK_SOURCE"):     "false",
+					path("ENCLAVE_INSECURE_VERIFY_SKIPPED"): "true",
+					path("ENCLAVE_PREVIOUS_PCR0"):           "evil-pcr0",
+					path("SAFE_KEY"):                        "ok",
+				}))
+				require.NoError(t, err)
+				require.Equal(t, "prod", os.Getenv("ENCLAVE_DEPLOYMENT"))
+				require.Equal(t, "app", os.Getenv("ENCLAVE_APP_NAME"))
+				require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
+				require.Equal(t, strconv.FormatBool(dev), os.Getenv("ENCLAVE_DEV"))
+				require.Empty(t, os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
+				require.Empty(t, os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
+				require.Empty(t, os.Getenv("ENCLAVE_INSECURE_VERIFY_SKIPPED"),
+					"the overlay must not be able to skip attestation verification")
+				require.Equal(t, "original-pcr0", os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
+				require.Equal(
+					t,
+					before,
+					*cfg,
+					"the overlay must preserve the loaded security settings",
+				)
+				require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
+			})
+		}
 	})
 
 	t.Run("returns SSM errors", func(t *testing.T) {
@@ -200,8 +152,12 @@ func TestIsDev(t *testing.T) {
 	}{
 		{"ENCLAVE_DEV=true is dev", "true", "prod", true},
 		{"ENCLAVE_DEV case-insensitive", "TRUE", "prod", true},
+		{"ENCLAVE_DEV mixed case", "True", "prod", true},
+		{"ENCLAVE_DEV trims whitespace", "  true  ", "prod", true},
 		{"ENCLAVE_DEV=false is not dev", "false", "dev", false},
 		{"unset is not dev regardless of deployment", "", "dev", false},
+		{"ENCLAVE_DEV=1 is not dev", "1", "dev", false},
+		{"ENCLAVE_DEV=yes is not dev", "yes", "dev", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -860,8 +860,9 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
 		fx.successor.cfg = newTestConfig(
-			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, true,
+			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, false,
 		)
+		fx.successor.cfg.KMSLocked = false
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 

@@ -13,18 +13,21 @@ import (
 
 // nonOverridableEnv lists vars the SSM env overlay must never set: they name the
 // SSM namespace or the managed-secret set, or they decide the security posture.
-// ENCLAVE_DEV selects the lock posture and both Object Lock retentions and skips
-// COSE verification; the cooldown, the clock-source assertion and the
-// predecessor commitment are settable, but only baked into the measured image,
-// never from the overlay.
+// ENCLAVE_DEV selects the KMS lock posture, both Object Lock retentions, the
+// intent write timeout and the clock-sync interval. Skipping COSE verification
+// requires ENCLAVE_INSECURE_VERIFY_SKIPPED=true and is only allowed in dev mode
+// for QEMU tests. The cooldown and clock-source assertion are independently
+// configurable in either mode. These settings and the predecessor commitment
+// must be baked into the measured image, never supplied by the overlay.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":          true,
-	"ENCLAVE_APP_NAME":            true,
-	"ENCLAVE_SECRETS_CONFIG":      true,
-	"ENCLAVE_DEV":                 true,
-	"ENCLAVE_MIGRATION_COOLDOWN":  true,
-	"ENCLAVE_VERIFY_CLOCK_SOURCE": true,
-	"ENCLAVE_PREVIOUS_PCR0":       true,
+	"ENCLAVE_DEPLOYMENT":              true,
+	"ENCLAVE_APP_NAME":                true,
+	"ENCLAVE_SECRETS_CONFIG":          true,
+	"ENCLAVE_DEV":                     true,
+	"ENCLAVE_MIGRATION_COOLDOWN":      true,
+	"ENCLAVE_VERIFY_CLOCK_SOURCE":     true,
+	"ENCLAVE_INSECURE_VERIFY_SKIPPED": true,
+	"ENCLAVE_PREVIOUS_PCR0":           true,
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
@@ -163,6 +166,18 @@ func verifyClockSource() (bool, bool, error) {
 	enabled, err := strconv.ParseBool(v)
 	if err != nil {
 		return false, false, fmt.Errorf("invalid ENCLAVE_VERIFY_CLOCK_SOURCE %q: %w", v, err)
+	}
+	return enabled, true, nil
+}
+
+func insecureVerifySkipped() (bool, bool, error) {
+	v := strings.TrimSpace(os.Getenv("ENCLAVE_INSECURE_VERIFY_SKIPPED"))
+	if v == "" {
+		return false, false, nil
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, false, fmt.Errorf("invalid ENCLAVE_INSECURE_VERIFY_SKIPPED %q: %w", v, err)
 	}
 	return enabled, true, nil
 }

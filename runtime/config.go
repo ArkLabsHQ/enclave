@@ -11,14 +11,17 @@ import (
 
 const (
 	prodRetention          = 10 * 365 * 24 * time.Hour
-	prodMigrationCooldown  = 24 * time.Hour
 	prodIntentWriteTimeout = 10 * time.Minute
+	// 5 min matches Evervault's /dev/ptp0 sync cadence:
+	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
+	prodClockSyncInterval = 5 * time.Minute
 
 	devGenesisRetention   = 5 * time.Minute
 	devIntentRetention    = 10 * time.Minute
-	devMigrationCooldown  = 2 * time.Second
 	devIntentWriteTimeout = 2 * time.Minute
+	devClockSyncInterval  = 5 * time.Second
 
+	defaulMigrationCooldown = 24 * time.Hour
 	defaultLogShipInterval  = 10 * time.Second
 	defaultLogRetentionDays = int32(30)
 	logGroupRoot            = "enclave"
@@ -55,7 +58,6 @@ type Config struct {
 	// to move the namespace out from under a running enclave.
 	Deployment   string
 	AppName      string
-	Dev          bool
 	AppPort      string
 	PreviousPCR0 string
 
@@ -77,6 +79,7 @@ type Config struct {
 	IntentRetention       time.Duration
 	IntentWriteTimeout    time.Duration
 	MigrationCooldown     time.Duration
+	ClockSyncInterval     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
 	LogGroupPrefix        string
@@ -98,24 +101,41 @@ func LoadConfig() (*Config, error) {
 		AppPort:      appPort,
 		PreviousPCR0: getPreviousPCR0(),
 
-		FQDN:             getFQDN(),
-		ExtPort:          extPort,
-		IntPort:          intPort,
-		HostProxyPort:    hostProxyPort,
-		AppWebSrv:        appWebSrv,
-		UpstreamProtocol: getUpstreamProtocol(),
-		LogShipInterval:  logShipInterval(),
-		LogRetentionDays: logRetentionDays(),
-		LogGroupPrefix:   logGroupPrefix(),
+		FQDN:                  getFQDN(),
+		ExtPort:               extPort,
+		IntPort:               intPort,
+		HostProxyPort:         hostProxyPort,
+		AppWebSrv:             appWebSrv,
+		UpstreamProtocol:      getUpstreamProtocol(),
+		LogShipInterval:       logShipInterval(),
+		LogRetentionDays:      logRetentionDays(),
+		LogGroupPrefix:        logGroupPrefix(),
+		GenesisRetention:      prodRetention,
+		IntentRetention:       prodRetention,
+		IntentWriteTimeout:    prodIntentWriteTimeout,
+		MigrationCooldown:     defaulMigrationCooldown,
+		ClockSyncInterval:     prodClockSyncInterval,
+		VerifyClockSource:     true,
+		InsecureVerifySkipped: false,
+		KMSLocked:             true,
 	}
-	cfg.setSecurityConfig(IsDev())
 
-	cooldown, set, err := migrationCooldown()
-	if err != nil {
-		return nil, err
-	}
-	if set {
-		cfg.MigrationCooldown = cooldown
+	if IsDev() {
+		cfg.KMSLocked = false
+		cfg.GenesisRetention = devGenesisRetention
+		cfg.IntentRetention = devIntentRetention
+		cfg.IntentWriteTimeout = devIntentWriteTimeout
+		cfg.ClockSyncInterval = devClockSyncInterval
+
+		// only allow overriding cfg.InsecureVerifySkipped in dev mode
+		// It is false by default unless explicitly overriden
+		verifySkipped, set, err := insecureVerifySkipped()
+		if err != nil {
+			return nil, err
+		}
+		if set {
+			cfg.InsecureVerifySkipped = verifySkipped
+		}
 	}
 
 	verify, set, err := verifyClockSource()
@@ -125,6 +145,15 @@ func LoadConfig() (*Config, error) {
 	if set {
 		cfg.VerifyClockSource = verify
 	}
+
+	cooldown, set, err := migrationCooldown()
+	if err != nil {
+		return nil, err
+	}
+	if set {
+		cfg.MigrationCooldown = cooldown
+	}
+
 	return cfg, nil
 }
 
@@ -195,25 +224,6 @@ func (c *Config) lockSegment() string {
 		return "locked"
 	}
 	return "unlocked"
-}
-
-func (c *Config) setSecurityConfig(dev bool) {
-	c.Dev = dev
-	c.KMSLocked = !dev
-	c.InsecureVerifySkipped = dev
-	c.VerifyClockSource = !dev
-
-	if dev {
-		c.GenesisRetention = devGenesisRetention
-		c.IntentRetention = devIntentRetention
-		c.IntentWriteTimeout = devIntentWriteTimeout
-		c.MigrationCooldown = devMigrationCooldown
-		return
-	}
-	c.GenesisRetention = prodRetention
-	c.IntentRetention = prodRetention
-	c.IntentWriteTimeout = prodIntentWriteTimeout
-	c.MigrationCooldown = prodMigrationCooldown
 }
 
 func (c *Config) applyEnvOverride(name, value string) error {

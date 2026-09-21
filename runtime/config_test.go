@@ -24,7 +24,7 @@ func newTestConfig(deployment, appName string, dev bool) *Config {
 		GenesisRetention:   prodRetention,
 		IntentRetention:    prodRetention,
 		IntentWriteTimeout: prodIntentWriteTimeout,
-		MigrationCooldown:  defaulMigrationCooldown,
+		MigrationCooldown:  defaultMigrationCooldown,
 		ClockSyncInterval:  prodClockSyncInterval,
 	}
 	if dev {

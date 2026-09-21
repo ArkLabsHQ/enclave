@@ -25,10 +25,10 @@ const (
 	devIntentWriteTimeout = 2 * time.Minute
 	devClockSyncInterval  = 5 * time.Second
 
-	defaulMigrationCooldown = 24 * time.Hour
-	defaultLogShipInterval  = 10 * time.Second
-	defaultLogRetentionDays = int32(30)
-	logGroupRoot            = "enclave"
+	defaultMigrationCooldown = 24 * time.Hour
+	defaultLogShipInterval   = 10 * time.Second
+	defaultLogRetentionDays  = int32(30)
+	logGroupRoot             = "enclave"
 
 	logGroupNameChars = "._-/#"
 
@@ -117,7 +117,7 @@ func LoadConfig() (*Config, error) {
 		GenesisRetention:      prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
-		MigrationCooldown:     defaulMigrationCooldown,
+		MigrationCooldown:     defaultMigrationCooldown,
 		ClockSyncInterval:     prodClockSyncInterval,
 		VerifyClockSource:     true,
 		InsecureVerifySkipped: false,
@@ -132,7 +132,7 @@ func LoadConfig() (*Config, error) {
 		cfg.ClockSyncInterval = devClockSyncInterval
 
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
-		// It is false by default unless explicitly overriden
+		// It is false by default unless explicitly overridden
 		verifySkipped, set, err := insecureVerifySkipped()
 		if err != nil {
 			return nil, err

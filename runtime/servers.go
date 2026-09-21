@@ -46,6 +46,7 @@ type RuntimeInfo struct {
 	PreviousPCR0             string           `json:"previous_pcr0"`
 	PreviousPCR0Attestation  string           `json:"previous_pcr0_attestation,omitempty"`
 	MigrationCooldownSeconds int              `json:"migration_cooldown_seconds"`
+	MigrationIntentBucket    string           `json:"migration_intent_bucket"`
 	Migration                *MigrationStatus `json:"migration"`
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
@@ -247,6 +248,7 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 			PreviousPCR0:             prevInfo.PCR0,
 			PreviousPCR0Attestation:  prevInfo.Attestation,
 			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
+			MigrationIntentBucket:    migrator.MigrationIntentBucket(),
 			Migration:                migrationStatus,
 			UpstreamApp:              s.rt.UpstreamAppInfo(),
 			KMSKeyLocked:             s.cfg.KMSLocked,

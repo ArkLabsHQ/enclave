@@ -198,11 +198,26 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 	}
 
 	state := &planned.state
+
+	// Inherited secrets come first: a value that fails its commitment check aborts here,
+	inheritedSecrets, err := resolveInheritedSecrets(
+		ctx, b.cfg, b.ssm, state.secretsMetadata.Inherited, time.Now(),
+	)
+	if err != nil {
+		return bootResult{}, err
+	}
+
 	kms, err := FetchOrCreatePrimaryKMS(ctx, b.cfg, b.nsm, b.kmsAPI, b.sts, state.kmsKeyID)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
-	return b.establish(ctx, planned, kms)
+	result, err := b.establish(ctx, planned, kms)
+	if err != nil {
+		return bootResult{}, err
+	}
+	result.secrets.Inherited = inheritedSecrets
+	
+	return result, nil
 }
 
 // plan decides, once, which of the three boots this is.
@@ -258,7 +273,7 @@ func (b *Boot) determineMode(
 		return nil, fmt.Errorf("failed to read deployment genesis: %w", err)
 	}
 	ownPCR0 := hex.EncodeToString(b.pcr0)
-	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(ownPCR0))
+	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(ownPCR0), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
@@ -276,7 +291,7 @@ func (b *Boot) determineMode(
 		)
 	}
 
-	state.bootReceipt, err = b.ssm.MayGet(ctx, b.cfg.stateOriginReceiptParam(keyID, ownPCR0))
+	state.bootReceipt, err = b.ssm.MayGet(ctx, b.cfg.stateOriginReceiptParam(keyID, ownPCR0), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get state-origin receipt SSM param: %w", err)
 	}
@@ -290,7 +305,7 @@ func (b *Boot) determineMode(
 	}
 
 	state.migrationReceipt, err = b.ssm.MayGet(
-		ctx, b.cfg.migrationStateOriginReceiptParam(keyID, ownPCR0),
+		ctx, b.cfg.migrationStateOriginReceiptParam(keyID, ownPCR0), false,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
@@ -413,26 +428,15 @@ func (b *Boot) establish(
 		})
 	}
 
-	inheritedSecrets, err := resolveInheritedSecrets(
-		ctx, b.cfg, b.ssm, state.secretsMetadata.Inherited, time.Now(),
-	)
-	if err != nil {
-		return bootResult{}, err
-	}
-
 	if err := planned.mode.commitSnapshot(
 		ctx, state, b.nsm, b.ssm, kms, snapshot, snapshotRoot,
 	); err != nil {
 		return bootResult{}, err
 	}
 	return bootResult{
-		kms: kms,
-		dek: &dek{key: dekPlaintext},
-		secrets: Secrets{
-			Static:    staticSecrets,
-			Inherited: inheritedSecrets,
-			metadata:  state.secretsMetadata,
-		},
+		kms:                       kms,
+		dek:                       &dek{key: dekPlaintext},
+		secrets:                   Secrets{Static: staticSecrets, metadata: state.secretsMetadata},
 		tlsKey:                    tlsKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 		lineage:                   snapshot.lineage(),
@@ -470,15 +474,19 @@ func (b *Boot) loadPredecessor(
 	ctx context.Context,
 ) (pcr0, keyID, attestation string, err error) {
 	ownPCR0 := hex.EncodeToString(b.pcr0)
-	pcr0, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0Param(ownPCR0))
+	pcr0, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0Param(ownPCR0), false)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
 	}
-	keyID, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousKMSKeyIDParam(ownPCR0))
+	keyID, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousKMSKeyIDParam(ownPCR0), false)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
 	}
-	attestation, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0))
+	attestation, err = b.ssm.MayGet(
+		ctx,
+		b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0),
+		false,
+	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
@@ -520,7 +528,7 @@ func (b *Boot) genesisCommitted(ctx context.Context, genesis *genesisLog) (strin
 		return "", nil
 	}
 
-	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)))
+	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)), false)
 	if err != nil {
 		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}

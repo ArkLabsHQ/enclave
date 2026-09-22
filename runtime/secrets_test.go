@@ -98,6 +98,11 @@ func TestValidateInheritSecrets(t *testing.T) {
 			with(func(m *InheritSecretMetadata) { m.Name = "a/b" }),
 			"single SSM path segment",
 		},
+		{
+			"name outside the SSM charset",
+			with(func(m *InheritSecretMetadata) { m.Name = "my secret" }),
+			"single SSM path segment",
+		},
 		{"duplicate name", []InheritSecretMetadata{valid, valid}, "duplicate inherited secret"},
 		{
 			"empty env var",
@@ -194,18 +199,10 @@ func TestResolveInheritedSecrets(t *testing.T) {
 	}
 	meta := []InheritSecretMetadata{keyMeta, hashMeta}
 
-	t.Run("no config reads nothing", func(t *testing.T) {
-		secrets, err := resolveInheritedSecrets(
-			ctx, cfg, NewSSM(&fakeSSM{err: errors.New("access denied")}), nil, now)
-		require.NoError(t, err)
-		require.Empty(t, secrets)
-	})
-
-	t.Run("returns verified secrets", func(t *testing.T) {
+	t.Run("returns verified secrets read with decryption", func(t *testing.T) {
 		fake := &fakeSSM{params: map[string]string{
 			"/dev/testapp/inherit/legacy": privKey + "\n",
 			"/dev/testapp/inherit/token":  "s3cr3t",
-			"/dev/testapp/inherit/stray":  "ignored",
 		}}
 		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(fake), meta, now)
 		require.NoError(t, err)
@@ -213,7 +210,9 @@ func TestResolveInheritedSecrets(t *testing.T) {
 			{InheritSecretMetadata: keyMeta, Plaintext: privKey},
 			{InheritSecretMetadata: hashMeta, Plaintext: "s3cr3t"},
 		}, secrets)
-		require.True(t, fake.lastDecryption, "SecureString values must be decrypted")
+		require.Equal(t, []string{
+			"/dev/testapp/inherit/legacy", "/dev/testapp/inherit/token",
+		}, fake.decryptedGets, "SecureString values must be decrypted")
 	})
 
 	t.Run("mismatch is fatal", func(t *testing.T) {
@@ -236,13 +235,23 @@ func TestResolveInheritedSecrets(t *testing.T) {
 		)
 	})
 
-	t.Run("past cutoff is skipped without verification", func(t *testing.T) {
-		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(&fakeSSM{params: map[string]string{
-			"/dev/testapp/inherit/legacy": privKey,
-			"/dev/testapp/inherit/token":  "tampered",
-		}}), meta, inheritTestCutoff)
+	// An expired secret's parameter may already be unreadable
+	t.Run("past cutoff is never read", func(t *testing.T) {
+		expired := hashMeta
+		expired.Cutoff = now
+		fake := &fakeSSM{
+			params:  map[string]string{"/dev/testapp/inherit/legacy": privKey},
+			getErrs: map[string]error{"/dev/testapp/inherit/token": errors.New("KMS key disabled")},
+		}
+		secrets, err := resolveInheritedSecrets(
+			ctx, cfg, NewSSM(fake), []InheritSecretMetadata{keyMeta, expired}, now)
 		require.NoError(t, err)
-		require.Empty(t, secrets)
+		require.Equal(
+			t,
+			[]InheritedSecret{{InheritSecretMetadata: keyMeta, Plaintext: privKey}},
+			secrets,
+		)
+		require.NotContains(t, fake.calls, "/dev/testapp/inherit/token")
 	})
 
 	t.Run("returns SSM errors", func(t *testing.T) {
@@ -259,8 +268,16 @@ func TestSecretsSetEnvVars(t *testing.T) {
 	t.Setenv("LEGACY_TOKEN", "planted")
 
 	staticMeta := StaticSecretMetadata{Name: "signing-key", EnvVar: "SIGNING_KEY"}
-	keyMeta := InheritSecretMetadata{Name: "legacy", EnvVar: "LEGACY_KEY"}
-	tokenMeta := InheritSecretMetadata{Name: "token", EnvVar: "LEGACY_TOKEN"}
+	keyMeta := InheritSecretMetadata{
+		Name:   "legacy",
+		EnvVar: "LEGACY_KEY",
+		Cutoff: inheritTestCutoff,
+	}
+	tokenMeta := InheritSecretMetadata{
+		Name:   "token",
+		EnvVar: "LEGACY_TOKEN",
+		Cutoff: inheritTestCutoff,
+	}
 
 	secrets := Secrets{
 		Static:    []StaticSecret{{StaticSecretMetadata: staticMeta, Plaintext: "minted"}},

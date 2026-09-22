@@ -446,7 +446,7 @@ application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array
 | `name` | The operator places the secret at `/<deployment>/<app>/inherit/<name>`, as a `String` or `SecureString`. |
 | `env_var` | Environment variable set on the application process, containing the parameter value with surrounding whitespace trimmed. |
 | `type` | `hash` or `publicKey`: what `value` pins. |
-| `value` | `hash`: hex SHA-256 of the secret value. `publicKey`: hex compressed secp256k1 public key; the secret must then be the matching private key as 64 hex characters. |
+| `value` | `hash`: hex SHA-256 of the secret value with surrounding whitespace trimmed, as it is delivered. `publicKey`: hex compressed secp256k1 public key; the secret must then be the matching private key as 64 hex characters. |
 | `cutoff` | RFC 3339 timestamp from which the application no longer receives the secret. Required. |
 
 The array is baked into the image, so the pins and cutoffs are part of PCR0: a
@@ -454,12 +454,17 @@ verifier knows which outside secret the enclave accepts, and until when.
 
 At boot, before the application starts:
 
-- A secret at or past its `cutoff` is not read.
+- A secret at or past its `cutoff` is not read: its parameter is never
+  fetched, so the parameter and the KMS key of a `SecureString` can be retired
+  once the cutoff has passed without affecting later boots.
 - A value that does not match its pin **aborts boot**.
-- A missing parameter is logged and skipped, which lets an operator withdraw a
-  secret early by deleting it.
+- A missing parameter is logged and skipped. Deleting a parameter therefore
+  withdraws the secret from future boots; enclaves already running keep it
+  until its cutoff or their next restart.
 - The `env_var` of every secret that is not delivered is cleared, so the SSM
   environment overlay cannot supply a substitute.
+- The cutoff is checked again just before the application is launched, so a
+  slow boot cannot hand over a secret that expired in the meantime.
 
 When a cutoff passes while the enclave is running, the runtime clears the
 variable and restarts the application without it. The runtime itself, its
@@ -478,8 +483,16 @@ An inherited secret is only as private as its history: whoever can read the SSM
 parameter can read it, and so could everyone who held it before. The pin
 guarantees the enclave uses the intended secret, not that nobody else has it.
 Inherited secrets are not extended into a PCR and are not part of the migration
-snapshot — a successor reads the same parameter. A `SecureString` needs
-`kms:Decrypt` on the key that encrypts the parameter, and on no other.
+snapshot — a successor reads the same parameter.
+
+The parameter type is the operator's choice and does not change what the
+enclave guarantees. A `String` is readable by anyone with `ssm:GetParameter` on
+the path. A `SecureString` is encrypted at rest by SSM with a KMS key the
+operator owns — the account's `aws/ssm` key or a customer-managed one, created
+before the parameter is written and unrelated to the enclave's own key — so
+reading it also takes `kms:Decrypt` on that key, and every read leaves a
+CloudTrail record. The runtime asks SSM to decrypt when it reads the parameter;
+the instance role therefore needs `kms:Decrypt` on that key, and on no other.
 
 ### SSM environment overlay
 

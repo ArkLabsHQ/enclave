@@ -144,7 +144,7 @@ func newMigrator(
 }
 
 func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
-	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(m.pcr0))
+	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(m.pcr0), false)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, err
 		pcr0 = "genesis"
 	}
 
-	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(m.pcr0))
+	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(m.pcr0), false)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +244,7 @@ func (m *migrator) RunPredecessorHandoff(
 // immediately for an existing generation or a fresh deployment.
 func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 	kmsIdParam := m.cfg.kmsKeyIDParam(m.pcr0)
-	keyID, err := m.ssm.MayGet(ctx, kmsIdParam)
+	keyID, err := m.ssm.MayGet(ctx, kmsIdParam, false)
 	if err != nil {
 		return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
@@ -276,7 +276,7 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		if keyID, err = m.ssm.MayGet(ctx, kmsIdParam); err != nil {
+		if keyID, err = m.ssm.MayGet(ctx, kmsIdParam, false); err != nil {
 			return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 		}
 	}
@@ -398,7 +398,7 @@ func (m *migrator) tryAcquireMigrationLease(ctx context.Context) (*Lease, error)
 // mayPublishChallenge creates or rotates the live nonce.
 func (m *migrator) mayPublishChallenge(ctx context.Context) (*migrationChallenge, error) {
 	param := m.cfg.migrationChallengeParam(m.pcr0)
-	published, err := m.ssm.MayGet(ctx, param)
+	published, err := m.ssm.MayGet(ctx, param, false)
 	if err != nil {
 		return nil, fmt.Errorf("read migration challenge: %w", err)
 	}
@@ -527,7 +527,7 @@ func (m *migrator) verifyChallengeResponses(
 // mayAbortMigration records a matching abort before the handoff commits.
 func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bool, error) {
 	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
-	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
+	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam, false)
 	if err != nil {
 		return false, fmt.Errorf("read migration abort: %w", err)
 	}
@@ -535,7 +535,7 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 		return false, nil
 	}
 
-	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0), false)
 	if err != nil {
 		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
 	}
@@ -586,7 +586,7 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		return fmt.Errorf("migration intent has invalid target PCR0: %w", err)
 	}
 
-	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
+	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0), false)
 	if err != nil {
 		return fmt.Errorf("failed to read target KMS key ID: %w", err)
 	}
@@ -739,7 +739,7 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	predecessor := m.cfg.PreviousPCR0
 
 	// Restarting an established generation must not offer another handoff.
-	keyID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(m.pcr0))
+	keyID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(m.pcr0), false)
 	if err != nil {
 		return fmt.Errorf("read candidate KMS key ID: %w", err)
 	}
@@ -747,7 +747,7 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 		return nil
 	}
 
-	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
+	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor), false)
 	if err != nil {
 		return fmt.Errorf("read migration challenge: %w", err)
 	}

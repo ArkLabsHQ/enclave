@@ -41,7 +41,10 @@ type fakeSSM struct {
 	params  map[string]string
 	err     error
 	putErrs map[string]error
+	getErrs map[string]error // per-name GetParameter failures, e.g. a retired KMS key
 	calls   []string
+	// decryptedGets lists the names read with WithDecryption, in order.
+	decryptedGets []string
 
 	// getSeq scripts successive reads of one parameter, for races that turn on
 	// a value changing between two reads. The i-th read returns the i-th entry;
@@ -97,8 +100,14 @@ func (f *fakeSSM) GetParameter(
 ) (*ssm.GetParameterOutput, error) {
 	name := aws.ToString(in.Name)
 	f.calls = append(f.calls, name)
+	if aws.ToBool(in.WithDecryption) {
+		f.decryptedGets = append(f.decryptedGets, name)
+	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if err := f.getErrs[name]; err != nil {
+		return nil, err
 	}
 	v, ok := f.params[name]
 	if seq, scripted := f.getSeq[name]; scripted && len(seq) > 0 {
@@ -198,9 +207,15 @@ func (f *fakeSSM) MustGet(_ context.Context, key string) (string, error) {
 	return val, nil
 }
 
-func (f *fakeSSM) MayGet(_ context.Context, key string) (string, error) {
+func (f *fakeSSM) MayGet(_ context.Context, key string, withDecryption bool) (string, error) {
+	if withDecryption {
+		f.decryptedGets = append(f.decryptedGets, key)
+	}
 	if f.err != nil {
 		return "", f.err
+	}
+	if err := f.getErrs[key]; err != nil {
+		return "", err
 	}
 	val := strings.TrimSpace(f.params[key])
 	if val == "UNSET" {

@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -55,9 +55,11 @@ type Secrets struct {
 	metadata SecretsMetadata
 }
 
-// SetEnvVars exports the static secrets, then the inherited ones, and clears the
-// env var of every inherited secret that was not delivered, so the SSM env
-// overlay can't stand in for one that is absent or past its cutoff.
+// SetEnvVars exports the static secrets, then the inherited ones still before
+// their cutoff. The cutoff is rechecked here because boot resolved the secrets
+// some time ago. The env var of every inherited secret that is not exported is
+// cleared, so the SSM env overlay can't stand in for one that is absent or past
+// its cutoff.
 func (s Secrets) SetEnvVars() error {
 	for _, secret := range s.Static {
 		if err := safeSetenv(secret.EnvVar, secret.Plaintext); err != nil {
@@ -69,7 +71,14 @@ func (s Secrets) SetEnvVars() error {
 			return fmt.Errorf("unset %s: %w", m.EnvVar, err)
 		}
 	}
+
+	now := time.Now()
 	for _, secret := range s.Inherited {
+		if !now.Before(secret.Cutoff) {
+			slog.Info("inherited secret reached its cutoff before the app started",
+				"name", secret.Name, "cutoff", secret.Cutoff)
+			continue
+		}
 		if err := safeSetenv(secret.EnvVar, secret.Plaintext); err != nil {
 			return fmt.Errorf("set %s: %w", secret.EnvVar, err)
 		}
@@ -181,7 +190,11 @@ var childReservedEnv = map[string]bool{
 	"ENCLAVE_RUNTIME_TOKEN": true,
 }
 
-var envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var (
+	envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// secretNamePattern is SSM's own path-segment charset.
+	secretNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+)
 
 func LoadInheritSecretMetadata() ([]InheritSecretMetadata, error) {
 	raw := getInheritSecretsConfig()
@@ -205,7 +218,7 @@ func (sm SecretsMetadata) validateInherited() error {
 
 	names := make(map[string]bool, len(sm.Inherited))
 	for _, m := range sm.Inherited {
-		if m.Name == "" || strings.ContainsRune(m.Name, '/') {
+		if !secretNamePattern.MatchString(m.Name) {
 			return fmt.Errorf("inherited secret name %q must be a single SSM path segment", m.Name)
 		}
 		if names[m.Name] {
@@ -289,9 +302,10 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 }
 
 // resolveInheritedSecrets reads the inherited secrets still before their cutoff
-// and verifies each against its pin. A value that fails its pin aborts boot; an
-// absent one is skipped, so an operator can withdraw a secret early by deleting
-// its parameter.
+// and verifies each against its pin. A secret past its cutoff is never fetched,
+// so its parameter and KMS key can be retired. A value that fails its pin
+// aborts boot; an absent one is skipped, which withdraws the secret from this
+// and future boots.
 func resolveInheritedSecrets(
 	ctx context.Context,
 	cfg *Config,
@@ -299,19 +313,7 @@ func resolveInheritedSecrets(
 	meta []InheritSecretMetadata,
 	now time.Time,
 ) ([]InheritedSecret, error) {
-	if len(meta) == 0 {
-		return nil, nil
-	}
-
 	prefix := cfg.inheritSecretPrefix()
-	params, err := ssm.ListParams(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list inherited secret SSM params: %w", err)
-	}
-	values := make(map[string]string, len(params))
-	for _, p := range params {
-		values[strings.TrimPrefix(p.Name, prefix)] = strings.TrimSpace(p.Value)
-	}
 
 	var secrets []InheritedSecret
 	for _, m := range meta {
@@ -319,12 +321,17 @@ func resolveInheritedSecrets(
 			slog.Info("inherited secret is past its cutoff", "name", m.Name, "cutoff", m.Cutoff)
 			continue
 		}
-		plaintext := values[m.Name]
+		plaintext, err := ssm.MayGet(ctx, prefix+m.Name, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read inherited secret %q: %w", m.Name, err)
+		}
 		if plaintext == "" {
 			slog.Warn(
 				"inherited secret is not present in SSM",
-				"name", m.Name,
-				"param", prefix+m.Name,
+				"name",
+				m.Name,
+				"param",
+				prefix+m.Name,
 			)
 			continue
 		}
@@ -338,15 +345,14 @@ func resolveInheritedSecrets(
 }
 
 // watchInheritCutoffs clears each secret's env var once its cutoff passes and
-// signals that the app must be relaunched without it. It polls the wall clock
-// rather than arming a timer, so steps applied by the clock syncer count.
+// signals that the app must be relaunched without it.
 func watchInheritCutoffs(
 	ctx context.Context,
-	active []InheritedSecret,
+	inherited []InheritedSecret,
 	interval time.Duration,
 ) <-chan struct{} {
 	restart := make(chan struct{}, 1)
-	if len(active) == 0 {
+	if len(inherited) == 0 {
 		return restart
 	}
 
@@ -354,14 +360,8 @@ func watchInheritCutoffs(
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		pending := active
+		pending := inherited
 		for len(pending) > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-
 			current := time.Now()
 			expired := false
 			remaining := pending[:0:0]
@@ -370,9 +370,12 @@ func watchInheritCutoffs(
 					remaining = append(remaining, s)
 					continue
 				}
+				if _, exported := os.LookupEnv(s.EnvVar); !exported {
+					continue
+				}
+				
 				if err := safeUnsetenv(s.EnvVar); err != nil {
 					slog.Error("failed to unset inherited secret", "name", s.Name, "error", err)
-					remaining = append(remaining, s)
 					continue
 				}
 				slog.Info("inherited secret reached its cutoff", "name", s.Name, "cutoff", s.Cutoff)
@@ -385,6 +388,12 @@ func watchInheritCutoffs(
 				case restart <- struct{}{}:
 				default:
 				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
 			}
 		}
 	}()

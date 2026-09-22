@@ -46,11 +46,14 @@ func (s *ssmTTLCache) MustGet(ctx context.Context, key string) (string, error) {
 	return val, err
 }
 
-func (s *ssmTTLCache) MayGet(ctx context.Context, key string) (string, error) {
+func (s *ssmTTLCache) MayGet(ctx context.Context, key string, withDecryption bool) (string, error) {
+	if withDecryption {
+		return s.ssm.MayGet(ctx, key, true)
+	}
 	if val, ok := s.get(key); ok {
 		return val, nil
 	}
-	val, err := s.ssm.MayGet(ctx, key)
+	val, err := s.ssm.MayGet(ctx, key, false)
 	if err == nil && val != "" {
 		s.set(key, val)
 	}

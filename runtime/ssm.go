@@ -23,7 +23,8 @@ type Param struct {
 type SSM interface {
 	Set(ctx context.Context, key, val string, opts ...SSMSetOption) error
 	MustGet(ctx context.Context, key string) (string, error)
-	MayGet(ctx context.Context, key string) (string, error)
+
+	MayGet(ctx context.Context, key string, withDecryption bool) (string, error)
 	ListParams(ctx context.Context, prefix string) ([]Param, error)
 }
 
@@ -92,10 +93,10 @@ func (s *ssmW) MustGet(ctx context.Context, key string) (string, error) {
 	return value, nil
 }
 
-func (s *ssmW) MayGet(ctx context.Context, key string) (string, error) {
+func (s *ssmW) MayGet(ctx context.Context, key string, withDecryption bool) (string, error) {
 	out, err := s.ssm.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(key),
-		WithDecryption: aws.Bool(false),
+		WithDecryption: aws.Bool(withDecryption),
 	})
 	if err != nil {
 		var pnf *ssmtypes.ParameterNotFound

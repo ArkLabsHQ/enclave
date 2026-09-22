@@ -909,10 +909,11 @@ func mustStateRoot(
 	predecessorPCR0, err := ssm.MayGet(
 		ctx,
 		testCfg.migrationPreviousPCR0Param(stateOriginTestPCR0Hex()),
+		false,
 	)
 	require.NoError(t, err)
 	predecessorKeyID, err := ssm.MayGet(
-		ctx, testCfg.migrationPreviousKMSKeyIDParam(stateOriginTestPCR0Hex()),
+		ctx, testCfg.migrationPreviousKMSKeyIDParam(stateOriginTestPCR0Hex()), false,
 	)
 	require.NoError(t, err)
 	root, err := stateRoot(testCfg, bootSnapshot{

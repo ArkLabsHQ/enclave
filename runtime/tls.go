@@ -69,7 +69,7 @@ func ConfigureTLS(
 		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
 	}
 
-	zoneID, err := ssm.MayGet(ctx, cfg.route53ZoneIDParam())
+	zoneID, err := ssm.MayGet(ctx, cfg.route53ZoneIDParam(), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Route53 zone ID: %w", err)
 	}
@@ -148,11 +148,11 @@ func configureSelfSigned(
 	tlsKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
-	certBucket, err := ssm.MayGet(ctx, cfg.certBucketParam())
+	certBucket, err := ssm.MayGet(ctx, cfg.certBucketParam(), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
 	}
-	leaseBucket, err := ssm.MayGet(ctx, cfg.leaseBucketParam())
+	leaseBucket, err := ssm.MayGet(ctx, cfg.leaseBucketParam(), false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read lease bucket name: %w", err)
 	}

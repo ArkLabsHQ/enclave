@@ -230,6 +230,7 @@ func (a *execApp) launch() error {
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("start child %s: %w", appPath, err)
 	}
+	a.cmd = child
 
 	rt.NotifyChildStart()
 	rt.NotifyReady()
@@ -237,7 +238,6 @@ func (a *execApp) launch() error {
 
 	go func() { rt.NotifyChildExit(child.Wait()) }()
 
-	a.cmd = child
 	return nil
 }
 
@@ -259,9 +259,7 @@ func (a *execApp) Stop() error {
 }
 
 func (a *execApp) Restart() error {
-	if err := a.Stop(); err != nil {
-		return err
-	}
+	_ = a.Stop() // stopApp escalates to SIGKILL and never fails
 	return a.launch()
 }
 

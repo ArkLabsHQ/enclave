@@ -323,6 +323,9 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 			hash := sha256.Sum256([]byte(value))
 			got = hash[:]
 		case inheritSecretTypePublicKey:
+			// A key may carry app metadata after a colon, "<key>:<unix-ts>";
+			// only the key is pinned, the entry is delivered whole.
+			value, _, _ = strings.Cut(value, ":")
 			secretBytes, err := hex.DecodeString(value)
 			if err != nil || len(secretBytes) != btcec.PrivKeyBytesLen {
 				return fmt.Errorf(

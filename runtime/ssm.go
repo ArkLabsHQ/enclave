@@ -110,7 +110,6 @@ func (s *ssmW) doGet(ctx context.Context, key string, opts ...SSMGetOption) (str
 
 func (s *ssmW) MustGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
 	value, err := s.doGet(ctx, key, opts...)
-
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +123,6 @@ func (s *ssmW) MustGet(ctx context.Context, key string, opts ...SSMGetOption) (s
 
 func (s *ssmW) MayGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
 	value, err := s.doGet(ctx, key, opts...)
-
 	if err != nil {
 		var pnf *ssmtypes.ParameterNotFound
 		if errors.As(err, &pnf) {

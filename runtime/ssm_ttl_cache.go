@@ -35,7 +35,11 @@ func (s *ssmTTLCache) Set(ctx context.Context, key, val string, opts ...SSMSetOp
 	return nil
 }
 
-func (s *ssmTTLCache) MustGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
+func (s *ssmTTLCache) MustGet(
+	ctx context.Context,
+	key string,
+	opts ...SSMGetOption,
+) (string, error) {
 	if val, ok := s.get(key); ok {
 		return val, nil
 	}
@@ -46,7 +50,11 @@ func (s *ssmTTLCache) MustGet(ctx context.Context, key string, opts ...SSMGetOpt
 	return val, err
 }
 
-func (s *ssmTTLCache) MayGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
+func (s *ssmTTLCache) MayGet(
+	ctx context.Context,
+	key string,
+	opts ...SSMGetOption,
+) (string, error) {
 	so := &SSMGetOptions{}
 
 	for _, opt := range opts {

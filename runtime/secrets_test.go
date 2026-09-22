@@ -233,6 +233,12 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	keyListMeta.Value = []string{pubKey, secondPubKey}
 	require.NoError(t, verifyInheritedSecret(keyListMeta, privKey+","+secondPrivKey))
 	require.NoError(t, verifyInheritedSecret(keyListMeta, secondPrivKey+","+privKey))
+	// Per-key metadata after a colon is delivered to the app but not pinned.
+	require.NoError(t, verifyInheritedSecret(
+		keyListMeta, privKey+":1798761600,"+secondPrivKey+":1830297600"))
+	require.ErrorContains(t,
+		verifyInheritedSecret(keyListMeta, privKey+":1798761600,"+privKey+":1830297600"),
+		"value 1 does not match")
 	require.ErrorContains(t, verifyInheritedSecret(keyListMeta, privKey), "got 1 values, want 2")
 	otherPrivateKey, _ := inheritTestKeyFrom(t, "other-inherit-secret-test-key")
 	require.ErrorContains(t,

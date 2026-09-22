@@ -69,14 +69,14 @@ func TestSSMTTLCacheMayGetDoesNotCacheEmpty(t *testing.T) {
 	fake := &fakeSSM{params: map[string]string{}}
 	ssm := NewSSMTTLCache(NewSSM(fake), time.Hour)
 
-	got, err := ssm.MayGet(ctx, "/key", false)
+	got, err := ssm.MayGet(ctx, "/key")
 	require.NoError(t, err)
 	if got != "" {
 		t.Fatalf("got %q, want empty", got)
 	}
 
 	fake.params["/key"] = "value"
-	got, err = ssm.MayGet(ctx, "/key", false)
+	got, err = ssm.MayGet(ctx, "/key")
 	require.NoError(t, err)
 	if got != "value" {
 		t.Fatalf("got %q, want %q", got, "value")
@@ -92,14 +92,14 @@ func TestSSMTTLCacheMayGetWithDecryptionBypassesCache(t *testing.T) {
 	ssm := NewSSMTTLCache(NewSSM(fake), time.Hour)
 
 	for range 2 {
-		got, err := ssm.MayGet(ctx, "/key", true)
+		got, err := ssm.MayGet(ctx, "/key", WithDecryption())
 		require.NoError(t, err)
 		require.Equal(t, "secret", got)
 	}
 	require.Len(t, fake.decryptedGets, 2, "decrypted reads must not be served from the cache")
 
 	// Nor may a decrypted read seed the cache for a plain one.
-	_, err := ssm.MayGet(ctx, "/key", false)
+	_, err := ssm.MayGet(ctx, "/key")
 	require.NoError(t, err)
 	require.Len(t, fake.calls, 3)
 }

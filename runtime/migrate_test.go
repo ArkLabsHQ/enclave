@@ -1226,7 +1226,7 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	// Standing in for a candidate publishing its answer to the live challenge.
 	answer := func(t *testing.T, m *migrator, session *fakeNSMSession, target string) {
 		t.Helper()
-		published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(oldPCR0Hex), false)
+		published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(oldPCR0Hex))
 		require.NoError(t, err)
 		require.NotEmpty(t, published, "predecessor must publish a challenge")
 		challenge, err := m.verifyMigrationChallenge(published, oldPCR0Hex)

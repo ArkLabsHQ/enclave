@@ -321,7 +321,7 @@ func resolveInheritedSecrets(
 			slog.Info("inherited secret is past its cutoff", "name", m.Name, "cutoff", m.Cutoff)
 			continue
 		}
-		plaintext, err := ssm.MayGet(ctx, prefix+m.Name, true)
+		plaintext, err := ssm.MayGet(ctx, prefix+m.Name, WithDecryption())
 		if err != nil {
 			return nil, fmt.Errorf("failed to read inherited secret %q: %w", m.Name, err)
 		}
@@ -373,7 +373,7 @@ func watchInheritCutoffs(
 				if _, exported := os.LookupEnv(s.EnvVar); !exported {
 					continue
 				}
-				
+
 				if err := safeUnsetenv(s.EnvVar); err != nil {
 					slog.Error("failed to unset inherited secret", "name", s.Name, "error", err)
 					continue

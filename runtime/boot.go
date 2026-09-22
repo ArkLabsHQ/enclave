@@ -216,7 +216,7 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 		return bootResult{}, err
 	}
 	result.secrets.Inherited = inheritedSecrets
-	
+
 	return result, nil
 }
 
@@ -273,7 +273,7 @@ func (b *Boot) determineMode(
 		return nil, fmt.Errorf("failed to read deployment genesis: %w", err)
 	}
 	ownPCR0 := hex.EncodeToString(b.pcr0)
-	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(ownPCR0), false)
+	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(ownPCR0))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
@@ -291,7 +291,7 @@ func (b *Boot) determineMode(
 		)
 	}
 
-	state.bootReceipt, err = b.ssm.MayGet(ctx, b.cfg.stateOriginReceiptParam(keyID, ownPCR0), false)
+	state.bootReceipt, err = b.ssm.MayGet(ctx, b.cfg.stateOriginReceiptParam(keyID, ownPCR0))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get state-origin receipt SSM param: %w", err)
 	}
@@ -305,7 +305,7 @@ func (b *Boot) determineMode(
 	}
 
 	state.migrationReceipt, err = b.ssm.MayGet(
-		ctx, b.cfg.migrationStateOriginReceiptParam(keyID, ownPCR0), false,
+		ctx, b.cfg.migrationStateOriginReceiptParam(keyID, ownPCR0),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
@@ -474,18 +474,17 @@ func (b *Boot) loadPredecessor(
 	ctx context.Context,
 ) (pcr0, keyID, attestation string, err error) {
 	ownPCR0 := hex.EncodeToString(b.pcr0)
-	pcr0, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0Param(ownPCR0), false)
+	pcr0, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0Param(ownPCR0))
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
 	}
-	keyID, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousKMSKeyIDParam(ownPCR0), false)
+	keyID, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousKMSKeyIDParam(ownPCR0))
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
 	}
 	attestation, err = b.ssm.MayGet(
 		ctx,
 		b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0),
-		false,
 	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
@@ -528,7 +527,7 @@ func (b *Boot) genesisCommitted(ctx context.Context, genesis *genesisLog) (strin
 		return "", nil
 	}
 
-	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)), false)
+	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(hex.EncodeToString(b.pcr0)))
 	if err != nil {
 		return "", fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}

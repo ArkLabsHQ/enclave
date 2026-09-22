@@ -130,6 +130,13 @@ cloud(
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
+for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
+    cloud(
+        f"ssm put-parameter --name /dev/testapp/inherit/{inherited} "
+        "--type String --value inherited-from-outside"
+    )
+# The overlay must not be able to stand in for a secret past its cutoff.
+put_env("E2E_EXPIRED", "planted-by-host")
 put_env("ENCLAVE_FQDN", FQDN)
 
 BLUES = (blue, blue_peer)
@@ -145,10 +152,13 @@ for node in BLUES:
     node.wait_for_unit("mock-imds-forward.service")
     node.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
     node.wait_for_unit("enclave-start.service")
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
+    assert env_value(node, "E2E_INHERITED") == "inherited-from-outside"
+    assert env_value(node, "E2E_CUTOFF") == "inherited-from-outside"
+    assert env_value(node, "E2E_EXPIRED") == ""
     node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg p '{BLUE_PCR0}' "
@@ -316,7 +326,7 @@ final_hardsteps = int(
     ).strip()
 )
 assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 
 hardsteps_before_sub = int(
     blue.succeed(
@@ -355,7 +365,7 @@ assert hardsteps_after_sub == hardsteps_before_sub, (
     hardsteps_before_sub,
     hardsteps_after_sub,
 )
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 
 # ACME settings are read when the runtime starts. The blues are already up and
 # stay self-signed; green reads these as it boots and applies them once it
@@ -483,7 +493,7 @@ assert get_param(receipt_param) == receipt_before
 # scope, so both blue nodes retain their genesis ancestry while reporting the
 # migration intent targeting green.
 for node in BLUES:
-    wait_healthy(node)
+    wait_enclave_healthy(node)
     assert secret_value(node) == blue_secret
     assert served_leaf_sha(node) == blue_leaf_sha
     node.wait_until_succeeds(
@@ -505,7 +515,7 @@ aws.wait_until_succeeds(
     "test -s /var/lib/route53-dns-proxy/events",
     timeout=900,
 )
-wait_healthy(green)
+wait_enclave_healthy(green)
 # Health and status share one lifecycle.
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -611,7 +621,7 @@ green_peer.wait_for_unit("multi-user.target")
 green_peer.wait_for_unit("mock-imds-forward.service")
 green_peer.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green_peer.wait_for_unit("enclave-start.service")
-wait_healthy(green_peer)
+wait_enclave_healthy(green_peer)
 
 # Joining must resume the committed state, not perform genesis or issue a cert.
 assert cloud(
@@ -620,6 +630,9 @@ assert cloud(
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
+assert env_value(green_peer, "E2E_INHERITED") == "inherited-from-outside"
+assert env_value(green_peer, "E2E_CUTOFF") == "inherited-from-outside"
+assert env_value(green_peer, "E2E_EXPIRED") == ""
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
@@ -656,14 +669,14 @@ green.wait_until_fails(
     "curl --connect-timeout 1 --max-time 2 -skf https://127.0.0.1/health",
     timeout=60,
 )
-wait_healthy(green_peer)
+wait_enclave_healthy(green_peer)
 assert secret_value(green_peer) == blue_secret
 assert served_leaf_sha(green_peer) == leaf_sha_before
 status, out = enclave_curl(green_peer, GREEN_PCR0, "/test/health")
 assert status == 0, out
 
 green.succeed("systemctl restart enclave-start")
-wait_healthy(green)
+wait_enclave_healthy(green)
 assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
@@ -680,7 +693,7 @@ assert status == 0, out
 # Green and green_peer were checked immediately above. Recheck that their
 # kill/rejoin did not disturb the still-running blue fleet.
 for node in (blue, blue_peer, green, green_peer):
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 for node in BLUES:
     assert served_leaf_sha(node) == blue_leaf_sha
@@ -691,7 +704,7 @@ for node in BLUES:
 # leaving the predecessor running, and the predecessor is always restartable.
 blue.succeed("kill $(cat /run/enclave-qemu.pid)")
 blue.succeed("systemctl restart enclave-start")
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 assert secret_value(blue) == blue_secret
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
 blue.succeed(
@@ -702,7 +715,7 @@ status, out = enclave_curl(blue, BLUE_PCR0)
 assert status == 0, out
 
 for node in (blue, blue_peer, green, green_peer):
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 # KMS deletion has a mandatory waiting period. Scheduling the retired blue key
 # must therefore appear as pending_deletion in green's ancestry.
@@ -712,7 +725,7 @@ cloud(
 )
 green.succeed("kill $(cat /run/enclave-qemu.pid)")
 green.succeed("systemctl restart enclave-start")
-wait_healthy(green)
+wait_enclave_healthy(green)
 green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg key {shlex.quote(genesis_key)} "
@@ -721,4 +734,36 @@ green.wait_until_succeeds(
     "and .ancestry.generations[0].key_id == $key "
     "and .ancestry.generations[0].state == \"pending_deletion\"'",
     timeout=60,
+)
+
+# An inherited secret reaching its cutoff while the app runs. The cutoff is
+# baked into the image, so the node's clock is stepped to a minute before it
+# and the enclave follows through /dev/ptp0. Last on purpose: from here this
+# node disagrees with its peers about the time.
+green_peer.succeed("systemctl stop systemd-timesyncd 2>/dev/null || true")
+green_peer.succeed("date -u -s '2039-12-31 23:59:00'")
+green_peer.wait_until_succeeds(
+    "test $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) -ge 2208988740",
+    timeout=30,
+)
+assert env_value(green_peer, "E2E_CUTOFF") == "inherited-from-outside"
+green_peer.wait_until_succeeds(
+    "grep 'inherited secret reached its cutoff' /var/log/enclave-console.log "
+    "| grep -q e2e-cutoff",
+    timeout=150,
+)
+# The runtime relaunches the app; the second "child started" is the new process.
+green_peer.wait_until_succeeds(
+    "test \"$(tr -d '\\000' </var/log/enclave-console.log "
+    "| grep -c 'child started')\" -ge 2",
+    timeout=60,
+)
+wait_upstream_healthy(green_peer)
+assert env_value(green_peer, "E2E_CUTOFF") == ""
+# It still holds everything that was not cut off.
+assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_INHERITED") == "inherited-from-outside"
+green_peer.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    "| jq -e '.status == \"ready\" and .upstream_app.exited == false'"
 )

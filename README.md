@@ -423,16 +423,74 @@ Constraints:
   for migration, so at most 15 secrets are supported.
 - Changing the array changes the measurement, and therefore PCR0.
 
+### Inherited secrets
+
+A static secret is born inside the enclave. An inherited secret already exists
+in the outside world — a legacy signing key, say — and is handed to the
+application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array:
+
+```json
+[
+  {
+    "name": "legacy-signer",
+    "env_var": "LEGACY_SIGNING_KEY",
+    "type": "publicKey",
+    "value": "02…",
+    "cutoff": "2027-01-01T00:00:00Z"
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The operator places the secret at `/<deployment>/<app>/inherit/<name>`, as a `String` or `SecureString`. |
+| `env_var` | Environment variable set on the application process, containing the parameter value with surrounding whitespace trimmed. |
+| `type` | `hash` or `publicKey`: what `value` pins. |
+| `value` | `hash`: hex SHA-256 of the secret value. `publicKey`: hex compressed secp256k1 public key; the secret must then be the matching private key as 64 hex characters. |
+| `cutoff` | RFC 3339 timestamp from which the application no longer receives the secret. Required. |
+
+The array is baked into the image, so the pins and cutoffs are part of PCR0: a
+verifier knows which outside secret the enclave accepts, and until when.
+
+At boot, before the application starts:
+
+- A secret at or past its `cutoff` is not read.
+- A value that does not match its pin **aborts boot**.
+- A missing parameter is logged and skipped, which lets an operator withdraw a
+  secret early by deleting it.
+- The `env_var` of every secret that is not delivered is cleared, so the SSM
+  environment overlay cannot supply a substitute.
+
+When a cutoff passes while the enclave is running, the runtime clears the
+variable and restarts the application without it. The runtime itself, its
+attestation and its TLS identity are unaffected; the application sees a
+`SIGTERM` (then `SIGKILL` after ten seconds) and a fresh start. The cutoff is
+checked every 30 seconds against the enclave's synchronised clock.
+
+Constraints:
+
+- `name` must be unique and a single path segment.
+- `env_var` must be a valid identifier, unique across static and inherited
+  secrets, and neither an overlay-refused name nor one of the variables listed
+  under [Application process environment](#application-process-environment).
+
+An inherited secret is only as private as its history: whoever can read the SSM
+parameter can read it, and so could everyone who held it before. The pin
+guarantees the enclave uses the intended secret, not that nobody else has it.
+Inherited secrets are not extended into a PCR and are not part of the migration
+snapshot — a successor reads the same parameter. A `SecureString` needs
+`kms:Decrypt` on the key that encrypts the parameter, and on no other.
+
 ### SSM environment overlay
 
 Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
 with decryption) and exported into the application's environment. This allows
 configuration changes without rebuilding the image.
 
-Seven names are refused, because they define the enclave's identity, its lineage
+Eight names are refused, because they define the enclave's identity, its lineage
 or its security posture and can only be changed by rebuilding:
 `ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
-`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
+`ENCLAVE_INHERIT_SECRETS_CONFIG`, `ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
 `ENCLAVE_PREVIOUS_PCR0`. The lock posture and the intent retention left the list
 by ceasing to be configuration at all — `ENCLAVE_DEV` settles them.
 
@@ -455,7 +513,7 @@ certificate and, when ACME is enabled, the ACME account key.
 ### Application process environment
 
 The runtime execs the application with the full runtime environment — including
-the SSM overlay and static secrets — plus:
+the SSM overlay, static secrets and inherited secrets — plus:
 
 | Variable | Value |
 |---|---|
@@ -476,6 +534,7 @@ With `D` = deployment, `A` = app name, `L` = `locked` or `unlocked`:
 | `/D/A/CertBucketName` | operator | Shared certificate and ACME account-key bucket. |
 | `/D/A/LeaseBucketName` | operator | Ephemeral coordination lease bucket. |
 | `/D/A/env/<NAME>` | operator | Environment overlay. |
+| `/D/A/inherit/<name>` | operator | Inherited secret, verified against its baked pin. |
 | `/D/A/L/KMSKeyID/<pcr0>` | runtime | Atomic commit point for the enclave measuring `<pcr0>`. Never manage this with deployment tooling. |
 | `/D/A/L/StorageDEK/Ciphertext/<keyID>` | runtime | Encrypted storage DEK. |
 | `/D/A/L/TLSKey/Ciphertext/<keyID>` | runtime | Encrypted TLS key. |

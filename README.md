@@ -435,7 +435,7 @@ application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array
     "name": "legacy-signer",
     "env_var": "LEGACY_SIGNING_KEY",
     "type": "publicKey",
-    "value": "02…",
+    "value": ["02…"],
     "cutoff": "2027-01-01T00:00:00Z"
   }
 ]
@@ -446,7 +446,7 @@ application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array
 | `name` | The operator places the secret at `/<deployment>/<app>/inherit/<name>`, as a `String` or `SecureString`. |
 | `env_var` | Environment variable set on the application process, containing the parameter value with surrounding whitespace trimmed. |
 | `type` | `hash` or `publicKey`: what `value` pins. |
-| `value` | `hash`: hex SHA-256 of the secret value with surrounding whitespace trimmed, as it is delivered. `publicKey`: hex compressed secp256k1 public key; the secret must then be the matching private key as 64 hex characters. |
+| `value` | Array of commitments, one per delivered entry. `hash`: hex SHA-256 of the entry with surrounding whitespace trimmed. `publicKey`: hex compressed secp256k1 public key; the entry is the matching private key as 64 hex characters. With more than one commitment the delivered value is a comma-separated list of the same length, each entry matched against one unused commitment in any order; an entry must not contain a comma. |
 | `cutoff` | RFC 3339 timestamp from which the application no longer receives the secret. Required. |
 
 The array is baked into the image, so the pins and cutoffs are part of PCR0: a

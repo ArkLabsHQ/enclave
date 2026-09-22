@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -166,14 +167,15 @@ const (
 
 // InheritSecretMetadata defines a secret born outside the enclave and handed in
 // through SSM (ENCLAVE_INHERIT_SECRETS_CONFIG). The image pins what the secret
-// must be, so the pin and the cutoff are part of PCR0: `hash` pins the SHA-256
-// of the value, `publicKey` pins the compressed secp256k1 public key of a
-// hex-encoded private key. From Cutoff on, the app no longer receives it.
+// must be, so the pin and the cutoff are part of PCR0. Value holds one
+// commitment per delivered entry: `hash` pins SHA-256 hashes, `publicKey` pins
+// compressed secp256k1 public keys whose secrets are hex-encoded private keys.
+// From Cutoff on, the app no longer receives it.
 type InheritSecretMetadata struct {
 	Name   string    `json:"name"`
 	EnvVar string    `json:"env_var"`
 	Type   string    `json:"type"`
-	Value  string    `json:"value"`
+	Value  []string  `json:"value"`
 	Cutoff time.Time `json:"cutoff"`
 }
 
@@ -237,28 +239,50 @@ func (sm SecretsMetadata) validateInherited() error {
 		}
 		envVars[m.EnvVar] = true
 
-		commitment, err := hex.DecodeString(m.Value)
-		if err != nil {
-			return fmt.Errorf("inherited secret %q: value is not hex: %w", m.Name, err)
-		}
+		var wantLen int
 		switch m.Type {
 		case inheritSecretTypeHash:
-			if len(commitment) != sha256.Size {
-				return fmt.Errorf("inherited secret %q: hash must be %d bytes", m.Name, sha256.Size)
-			}
+			wantLen = sha256.Size
 		case inheritSecretTypePublicKey:
-			if len(commitment) != btcec.PubKeyBytesLenCompressed {
-				return fmt.Errorf("inherited secret %q: public key must be compressed", m.Name)
+			wantLen = btcec.PubKeyBytesLenCompressed
+		default:
+			return fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
+		}
+		if len(m.Value) == 0 {
+			return fmt.Errorf(
+				"inherited secret %q: value must hold at least one %s",
+				m.Name,
+				m.Type,
+			)
+		}
+		seenValues := make(map[string]bool, len(m.Value))
+		for i, value := range m.Value {
+			if seenValues[value] {
+				return fmt.Errorf("inherited secret %q: %s %d is a duplicate", m.Name, m.Type, i)
 			}
-			if _, err := btcec.ParsePubKey(commitment); err != nil {
+			seenValues[value] = true
+			commitment, err := hex.DecodeString(value)
+			if err != nil {
 				return fmt.Errorf(
-					"inherited secret %q: invalid secp256k1 public key: %w",
+					"inherited secret %q: %s %d is not hex: %w",
 					m.Name,
+					m.Type,
+					i,
 					err,
 				)
 			}
-		default:
-			return fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
+			if len(commitment) != wantLen {
+				return fmt.Errorf(
+					"inherited secret %q: %s %d must be %d bytes", m.Name, m.Type, i, wantLen,
+				)
+			}
+			if m.Type == inheritSecretTypePublicKey {
+				if _, err := btcec.ParsePubKey(commitment); err != nil {
+					return fmt.Errorf(
+						"inherited secret %q: invalid secp256k1 public key %d: %w", m.Name, i, err,
+					)
+				}
+			}
 		}
 
 		if m.Cutoff.IsZero() {
@@ -268,35 +292,68 @@ func (sm SecretsMetadata) validateInherited() error {
 	return nil
 }
 
-// verifyInheritedSecret checks a handed-in value against its measured pin.
+// verifyInheritedSecret checks a handed-in value against its measured pin: each
+// comma-separated delivered entry must match one commitment, in any order, and
+// each commitment is used once, so an entry must not contain a comma. The
+// commitments were validated with the config; they are decoded again here so
+// the check fails closed on its own.
 func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
-	commitment, err := hex.DecodeString(m.Value)
-	if err != nil {
-		return fmt.Errorf("inherited secret %q: value is not hex: %w", m.Name, err)
+	values := strings.Split(plaintext, ",")
+	for i := range values {
+		values[i] = strings.TrimSpace(values[i])
+	}
+	if len(values) != len(m.Value) {
+		return fmt.Errorf(
+			"inherited secret %q: got %d values, want %d", m.Name, len(values), len(m.Value),
+		)
+	}
+	commitments := make([][]byte, len(m.Value))
+	for i, value := range m.Value {
+		commitment, err := hex.DecodeString(value)
+		if err != nil {
+			return fmt.Errorf("inherited secret %q: %s %d is not hex: %w", m.Name, m.Type, i, err)
+		}
+		commitments[i] = commitment
 	}
 
-	var got []byte
-	switch m.Type {
-	case inheritSecretTypeHash:
-		hash := sha256.Sum256([]byte(plaintext))
-		got = hash[:]
-	case inheritSecretTypePublicKey:
-		secretBytes, err := hex.DecodeString(plaintext)
-		if err != nil || len(secretBytes) != btcec.PrivKeyBytesLen {
-			return fmt.Errorf("inherited secret %q: not a hex-encoded 32-byte private key", m.Name)
+	for i, value := range values {
+		var got []byte
+		switch m.Type {
+		case inheritSecretTypeHash:
+			hash := sha256.Sum256([]byte(value))
+			got = hash[:]
+		case inheritSecretTypePublicKey:
+			secretBytes, err := hex.DecodeString(value)
+			if err != nil || len(secretBytes) != btcec.PrivKeyBytesLen {
+				return fmt.Errorf(
+					"inherited secret %q: value %d is not a hex-encoded 32-byte private key",
+					m.Name, i,
+				)
+			}
+			var scalar btcec.ModNScalar
+			if overflow := scalar.SetByteSlice(secretBytes); overflow || scalar.IsZero() {
+				return fmt.Errorf(
+					"inherited secret %q: value %d is not a valid secp256k1 private key",
+					m.Name,
+					i,
+				)
+			}
+			privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
+			got = privKey.PubKey().SerializeCompressed()
 		}
-		var scalar btcec.ModNScalar
-		if overflow := scalar.SetByteSlice(secretBytes); overflow || scalar.IsZero() {
-			return fmt.Errorf("inherited secret %q: invalid secp256k1 private key", m.Name)
+		matched := -1
+		for j, commitment := range commitments { // consumed entries are nil and never match
+			if subtle.ConstantTimeCompare(got, commitment) == 1 {
+				matched = j
+			}
 		}
-		privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
-		got = privKey.PubKey().SerializeCompressed()
-	default:
-		return fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
-	}
-
-	if subtle.ConstantTimeCompare(got, commitment) != 1 {
-		return fmt.Errorf("inherited secret %q does not match its pinned %s", m.Name, m.Type)
+		if matched < 0 {
+			return fmt.Errorf(
+				"inherited secret %q: value %d does not match an unused pinned %s",
+				m.Name, i, m.Type,
+			)
+		}
+		commitments[matched] = nil
 	}
 	return nil
 }

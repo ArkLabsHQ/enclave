@@ -217,21 +217,21 @@ let
         name = "e2e-inherited";
         env_var = "E2E_INHERITED";
         type = "hash";
-        value = "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
         cutoff = "2999-01-01T00:00:00Z";
       }
       {
         name = "e2e-expired";
         env_var = "E2E_EXPIRED";
         type = "hash";
-        value = "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
         cutoff = "2020-01-01T00:00:00Z";
       }
       {
         name = "e2e-cutoff";
         env_var = "E2E_CUTOFF";
         type = "hash";
-        value = "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
         cutoff = "2040-01-01T00:00:00Z";
       }
     ];

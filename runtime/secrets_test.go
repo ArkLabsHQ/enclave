@@ -18,8 +18,12 @@ import (
 var inheritTestCutoff = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func inheritTestKey(t *testing.T) (string, string) {
+	return inheritTestKeyFrom(t, "inherit-secret-test-key")
+}
+
+func inheritTestKeyFrom(t *testing.T, seed string) (string, string) {
 	t.Helper()
-	privBytes := sha256.Sum256([]byte("inherit-secret-test-key"))
+	privBytes := sha256.Sum256([]byte(seed))
 	privKey, _ := btcec.PrivKeyFromBytes(privBytes[:])
 	pubBytes := privKey.PubKey().SerializeCompressed()
 	return hex.EncodeToString(privBytes[:]), hex.EncodeToString(pubBytes)
@@ -40,7 +44,7 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 
 	t.Run("parses entries", func(t *testing.T) {
 		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"legacy","env_var":"LEGACY_KEY",`+
-			`"type":"hash","value":"ab","cutoff":"2030-01-01T00:00:00Z"}]`)
+			`"type":"hash","value":["ab"],"cutoff":"2030-01-01T00:00:00Z"}]`)
 		meta, err := LoadInheritSecretMetadata()
 		require.NoError(t, err)
 		require.Equal(t, []InheritSecretMetadata{
@@ -48,7 +52,7 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 				Name:   "legacy",
 				EnvVar: "LEGACY_KEY",
 				Type:   "hash",
-				Value:  "ab",
+				Value:  []string{"ab"},
 				Cutoff: inheritTestCutoff,
 			},
 		}, meta)
@@ -63,9 +67,10 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 
 func TestValidateInheritSecrets(t *testing.T) {
 	_, pubKey := inheritTestKey(t)
+	_, secondPubKey := inheritTestKeyFrom(t, "second-inherit-secret-test-key")
 	valid := InheritSecretMetadata{
 		Name: "legacy", EnvVar: "LEGACY_KEY", Type: inheritSecretTypePublicKey,
-		Value: pubKey, Cutoff: inheritTestCutoff,
+		Value: []string{pubKey}, Cutoff: inheritTestCutoff,
 	}
 	with := func(mutate func(*InheritSecretMetadata)) []InheritSecretMetadata {
 		m := valid
@@ -80,7 +85,14 @@ func TestValidateInheritSecrets(t *testing.T) {
 	require.NoError(t, validate(nil))
 	require.NoError(t, validate([]InheritSecretMetadata{valid}))
 	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
-		m.Type, m.Value = inheritSecretTypeHash, inheritTestHash("token")
+		m.Value = []string{pubKey, secondPubKey}
+	})))
+	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
+		m.Type, m.Value = inheritSecretTypeHash, []string{inheritTestHash("token")}
+	})))
+	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
+		m.Type = inheritSecretTypeHash
+		m.Value = []string{inheritTestHash("token"), inheritTestHash("second token")}
 	})))
 
 	tests := []struct {
@@ -104,6 +116,16 @@ func TestValidateInheritSecrets(t *testing.T) {
 			"single SSM path segment",
 		},
 		{"duplicate name", []InheritSecretMetadata{valid, valid}, "duplicate inherited secret"},
+		{
+			"empty value list",
+			with(func(m *InheritSecretMetadata) { m.Value = nil }),
+			"at least one",
+		},
+		{
+			"duplicate commitment",
+			with(func(m *InheritSecretMetadata) { m.Value = []string{pubKey, pubKey} }),
+			"publicKey 1 is a duplicate",
+		},
 		{
 			"empty env var",
 			with(func(m *InheritSecretMetadata) { m.EnvVar = "" }),
@@ -133,16 +155,30 @@ func TestValidateInheritSecrets(t *testing.T) {
 			with(func(m *InheritSecretMetadata) { m.Type = "ed25519" }),
 			"unknown type",
 		},
-		{"non hex value", with(func(m *InheritSecretMetadata) { m.Value = "zz" }), "not hex"},
+		{
+			"non hex value",
+			with(func(m *InheritSecretMetadata) { m.Value = []string{"zz"} }),
+			"not hex",
+		},
 		{"short hash", with(func(m *InheritSecretMetadata) {
-			m.Type, m.Value = inheritSecretTypeHash, "abcd"
-		}), "hash must be"},
+			m.Type, m.Value = inheritSecretTypeHash, []string{"abcd"}
+		}), "hash 0 must be"},
+		{"malformed hash list entry", with(func(m *InheritSecretMetadata) {
+			m.Type = inheritSecretTypeHash
+			m.Value = []string{inheritTestHash("token"), "zz"}
+		}), "hash 1 is not hex"},
 		{"uncompressed public key", with(func(m *InheritSecretMetadata) {
-			m.Value = "04" + strings.Repeat("11", 64)
-		}), "compressed"},
+			m.Value = []string{"04" + strings.Repeat("11", 64)}
+		}), "publicKey 0 must be 33 bytes"},
 		{"off curve public key", with(func(m *InheritSecretMetadata) {
-			m.Value = "02" + strings.Repeat("ff", 32)
+			m.Value = []string{"02" + strings.Repeat("ff", 32)}
 		}), "invalid secp256k1 public key"},
+		{"empty public key list entry", with(func(m *InheritSecretMetadata) {
+			m.Value = []string{pubKey, ""}
+		}), "publicKey 1 must be 33 bytes"},
+		{"malformed public key list entry", with(func(m *InheritSecretMetadata) {
+			m.Value = []string{pubKey, "zz"}
+		}), "publicKey 1 is not hex"},
 		{
 			"missing cutoff",
 			with(func(m *InheritSecretMetadata) { m.Cutoff = time.Time{} }),
@@ -158,17 +194,59 @@ func TestValidateInheritSecrets(t *testing.T) {
 
 func TestVerifyInheritedSecret(t *testing.T) {
 	privKey, pubKey := inheritTestKey(t)
+	secondPrivKey, secondPubKey := inheritTestKeyFrom(t, "second-inherit-secret-test-key")
 	keyMeta := InheritSecretMetadata{
 		Name:  "legacy",
 		Type:  inheritSecretTypePublicKey,
-		Value: pubKey,
+		Value: []string{pubKey},
 	}
 	hashMeta := InheritSecretMetadata{
-		Name: "token", Type: inheritSecretTypeHash, Value: inheritTestHash("s3cr3t token"),
+		Name:  "token",
+		Type:  inheritSecretTypeHash,
+		Value: []string{inheritTestHash("s3cr3t token")},
 	}
 
 	require.NoError(t, verifyInheritedSecret(keyMeta, privKey))
 	require.NoError(t, verifyInheritedSecret(hashMeta, "s3cr3t token"))
+	// A comma always separates entries, so a value cannot contain one.
+	commaHashMeta := hashMeta
+	commaHashMeta.Value = []string{inheritTestHash("first,second")}
+	require.ErrorContains(t,
+		verifyInheritedSecret(commaHashMeta, "first,second"), "got 2 values, want 1")
+
+	hashListMeta := hashMeta
+	hashListMeta.Value = []string{inheritTestHash("first"), inheritTestHash("second")}
+	require.NoError(t, verifyInheritedSecret(hashListMeta, "first,second"))
+	require.NoError(t, verifyInheritedSecret(hashListMeta, "second,first"))
+	require.NoError(t, verifyInheritedSecret(hashListMeta, "second, first"), "entries are trimmed")
+	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, "first"), "got 1 values, want 2")
+	require.ErrorContains(t,
+		verifyInheritedSecret(hashListMeta, "first,wrong"),
+		"value 1 does not match an unused pinned hash",
+	)
+	require.ErrorContains(t,
+		verifyInheritedSecret(hashListMeta, "first,first"),
+		"value 1 does not match an unused pinned hash",
+	)
+
+	keyListMeta := keyMeta
+	keyListMeta.Value = []string{pubKey, secondPubKey}
+	require.NoError(t, verifyInheritedSecret(keyListMeta, privKey+","+secondPrivKey))
+	require.NoError(t, verifyInheritedSecret(keyListMeta, secondPrivKey+","+privKey))
+	require.ErrorContains(t, verifyInheritedSecret(keyListMeta, privKey), "got 1 values, want 2")
+	otherPrivateKey, _ := inheritTestKeyFrom(t, "other-inherit-secret-test-key")
+	require.ErrorContains(t,
+		verifyInheritedSecret(keyListMeta, privKey+","+otherPrivateKey),
+		"value 1 does not match",
+	)
+	require.ErrorContains(t,
+		verifyInheritedSecret(keyListMeta, privKey+","+privKey),
+		"value 1 does not match",
+	)
+	require.ErrorContains(t,
+		verifyInheritedSecret(keyListMeta, privKey+",not-hex"),
+		"value 1 is not a hex-encoded 32-byte private key",
+	)
 
 	otherKey := sha256.Sum256([]byte("some other key"))
 	require.ErrorContains(t,
@@ -177,10 +255,10 @@ func TestVerifyInheritedSecret(t *testing.T) {
 
 	require.ErrorContains(t, verifyInheritedSecret(keyMeta, "not hex"), "32-byte private key")
 	require.ErrorContains(t, verifyInheritedSecret(keyMeta, "abcd"), "32-byte private key")
-	require.ErrorContains(t,
-		verifyInheritedSecret(keyMeta, strings.Repeat("00", 32)), "invalid secp256k1 private key")
-	require.ErrorContains(t,
-		verifyInheritedSecret(keyMeta, strings.Repeat("ff", 32)), "invalid secp256k1 private key")
+	require.ErrorContains(t, verifyInheritedSecret(keyMeta, strings.Repeat("00", 32)),
+		"not a valid secp256k1 private key")
+	require.ErrorContains(t, verifyInheritedSecret(keyMeta, strings.Repeat("ff", 32)),
+		"not a valid secp256k1 private key")
 }
 
 func TestResolveInheritedSecrets(t *testing.T) {
@@ -191,11 +269,11 @@ func TestResolveInheritedSecrets(t *testing.T) {
 
 	keyMeta := InheritSecretMetadata{
 		Name: "legacy", EnvVar: "LEGACY_KEY", Type: inheritSecretTypePublicKey,
-		Value: pubKey, Cutoff: inheritTestCutoff,
+		Value: []string{pubKey}, Cutoff: inheritTestCutoff,
 	}
 	hashMeta := InheritSecretMetadata{
 		Name: "token", EnvVar: "LEGACY_TOKEN", Type: inheritSecretTypeHash,
-		Value: inheritTestHash("s3cr3t"), Cutoff: inheritTestCutoff,
+		Value: []string{inheritTestHash("s3cr3t")}, Cutoff: inheritTestCutoff,
 	}
 	meta := []InheritSecretMetadata{keyMeta, hashMeta}
 
@@ -220,7 +298,7 @@ func TestResolveInheritedSecrets(t *testing.T) {
 			"/dev/testapp/inherit/legacy": privKey,
 			"/dev/testapp/inherit/token":  "tampered",
 		}}), meta, now)
-		require.ErrorContains(t, err, `"token" does not match`)
+		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
 	t.Run("missing param is skipped", func(t *testing.T) {
@@ -307,7 +385,7 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		t.Helper()
 		setStateOriginTestEnv(t)
 		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"token","env_var":"LEGACY_TOKEN",`+
-			`"type":"hash","value":"`+inheritTestHash("s3cr3t")+`","cutoff":"`+cutoff+`"}]`)
+			`"type":"hash","value":["`+inheritTestHash("s3cr3t")+`"],"cutoff":"`+cutoff+`"}]`)
 		fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
 		fx.ssmf.params[testCfg.inheritSecretPrefix()+"token"] = value
 		return fx.establish(ctx)
@@ -329,7 +407,7 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 
 	t.Run("mismatch aborts boot", func(t *testing.T) {
 		_, err := boot(t, "2999-01-01T00:00:00Z", "tampered")
-		require.ErrorContains(t, err, `"token" does not match`)
+		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
 	// plan validates the secrets config before anything else, so an empty Boot
@@ -338,7 +416,7 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
 		t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`)
 		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"legacy","env_var":"SIGNING_KEY",`+
-			`"type":"publicKey","value":"`+pubKey+`","cutoff":"2030-01-01T00:00:00Z"}]`)
+			`"type":"publicKey","value":["`+pubKey+`"],"cutoff":"2030-01-01T00:00:00Z"}]`)
 
 		_, err := (&Boot{}).plan(ctx)
 		require.ErrorContains(t, err, `env_var "SIGNING_KEY" is already used`)

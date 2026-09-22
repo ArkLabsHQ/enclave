@@ -274,14 +274,14 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 func TestValidateStaticSecretArtifacts(t *testing.T) {
 	setStateOriginTestEnv(t)
 
-	require.NoError(t, validateStaticSecretNames(stateOriginTestSecrets))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
+	require.NoError(t, SecretsMetadata{Static: stateOriginTestSecrets}.Validate())
+	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
 		{Name: "duplicate", EnvVar: "ONE"},
 		{Name: "duplicate", EnvVar: "TWO"},
-	}))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
+	}}.Validate())
+	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
 		{Name: "StorageDEK", EnvVar: "COLLISION"},
-	}))
+	}}.Validate())
 }
 
 func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
@@ -364,7 +364,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, established.dek)
-	require.Len(t, established.secrets, len(stateOriginTestSecrets))
+	require.Len(t, established.secrets.Static, len(stateOriginTestSecrets))
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[testCfg.stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))]

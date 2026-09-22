@@ -161,17 +161,20 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
-			path("ENCLAVE_DEPLOYMENT"):          "dev",
-			path("ENCLAVE_APP_NAME"):            "evil",
-			path("ENCLAVE_SECRETS_CONFIG"):      `[{"name":"evil"}]`,
-			path("ENCLAVE_DEV"):                 "true",
-			path("ENCLAVE_MIGRATION_COOLDOWN"):  "0s",
-			path("ENCLAVE_VERIFY_CLOCK_SOURCE"): "false",
-			path("ENCLAVE_PREVIOUS_PCR0"):       "evil-pcr0",
-			path("SAFE_KEY"):                    "ok",
+			path("ENCLAVE_DEPLOYMENT"):             "dev",
+			path("ENCLAVE_APP_NAME"):               "evil",
+			path("ENCLAVE_SECRETS_CONFIG"):         `[{"name":"evil"}]`,
+			path("ENCLAVE_INHERIT_SECRETS_CONFIG"): `[{"name":"evil"}]`,
+			path("ENCLAVE_DEV"):                    "true",
+			path("ENCLAVE_MIGRATION_COOLDOWN"):     "0s",
+			path("ENCLAVE_VERIFY_CLOCK_SOURCE"):    "false",
+			path("ENCLAVE_PREVIOUS_PCR0"):          "evil-pcr0",
+			path("SAFE_KEY"):                       "ok",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
+		require.Empty(t, os.Getenv("ENCLAVE_INHERIT_SECRETS_CONFIG"),
+			"the overlay must not be able to pin an inherited secret of its own")
 		// ENCLAVE_DEV now selects the lock posture, both Object Lock retentions
 		// and the migration cooldown, so an overlay that could set it would hand
 		// back everything this refused elsewhere.

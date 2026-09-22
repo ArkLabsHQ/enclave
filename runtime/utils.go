@@ -44,6 +44,13 @@ func safeSetenv(key, value string) error {
 	return os.Setenv(key, value)
 }
 
+// safeUnsetenv wraps os.Unsetenv under envMu.
+func safeUnsetenv(key string) error {
+	envMu.Lock()
+	defer envMu.Unlock()
+	return os.Unsetenv(key)
+}
+
 // generateRuntimeToken returns a 32-byte hex bearer token.
 func generateRuntimeToken() (string, error) {
 	b := make([]byte, 32)

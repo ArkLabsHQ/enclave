@@ -28,6 +28,8 @@ const (
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
 
+	inheritCutoffPollInterval = 30 * time.Second
+
 	migrationAbortResponse = "abort"
 )
 
@@ -287,6 +289,12 @@ func (c *Config) secretCiphertextParam(secretName, keyID string) string {
 		secretName,
 		keyID,
 	)
+}
+
+// inheritSecretPrefix: SSM path prefix under which the operator places inherited
+// secrets, one parameter per configured name.
+func (c *Config) inheritSecretPrefix() string {
+	return fmt.Sprintf("/%s/%s/inherit/", c.Deployment, c.AppName)
 }
 
 // storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,

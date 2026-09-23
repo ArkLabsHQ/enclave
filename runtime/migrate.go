@@ -27,6 +27,7 @@ const (
 // migrationClaimV1 binds an attestation to its state namespace.
 type migrationClaimV1 struct {
 	Schema     string `cbor:"schema"`
+	Prefix     string `cbor:"namespace_prefix"`
 	Deployment string `cbor:"deployment"`
 	AppName    string `cbor:"app_name"`
 	Lock       string `cbor:"lock"`
@@ -791,6 +792,7 @@ func (m *migrator) attestationPayload(schema string) ([]byte, error) {
 	}
 	payload, err := enc.Marshal(migrationClaimV1{
 		Schema:     schema,
+		Prefix:     m.cfg.NamespacePrefix,
 		Deployment: m.cfg.Deployment,
 		AppName:    m.cfg.AppName,
 		Lock:       m.cfg.lockSegment(),

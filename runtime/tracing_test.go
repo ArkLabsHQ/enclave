@@ -99,8 +99,8 @@ func TestTracingHandlers(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, w.Code)
 		require.JSONEq(t, `{"accepted":1}`, w.Body.String())
-		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/traces/app")
-		require.Equal(t, "/prod/enclave/traces/app", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/prod/app/enclave/traces/app")
+		require.Equal(t, "/prod/app/enclave/traces/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"test"`)
 	})
@@ -128,8 +128,8 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 			})
 		}
 
-		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/traces/app")
-		require.Equal(t, "/prod/enclave/traces/app", aws.ToString(put.LogGroupName))
+		put := requireCloudWatchPutTo(t, cw, "/prod/app/enclave/traces/app")
+		require.Equal(t, "/prod/app/enclave/traces/app", aws.ToString(put.LogGroupName))
 		require.Len(t, put.LogEvents, telemetryBatch)
 		// The oldest span was sent last, so ordering put it first.
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message),
@@ -154,7 +154,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		})
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/traces/app")
+		put := requireCloudWatchPutTo(t, cw, "/prod/app/enclave/traces/app")
 		require.Len(t, put.LogEvents, 1)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"flush me"`)
 	})
@@ -169,7 +169,7 @@ func TestTracingShipsToCloudWatch(t *testing.T) {
 		span.End()
 		telemetry.Shutdown()
 
-		put := requireCloudWatchPutTo(t, cw, "/prod/enclave/traces/supervisor")
+		put := requireCloudWatchPutTo(t, cw, "/prod/app/enclave/traces/supervisor")
 		require.NotEmpty(t, put.LogEvents)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"name":"boot"`)
 		require.Contains(t, aws.ToString(put.LogEvents[0].Message), `"source":"enclave"`)

@@ -18,6 +18,7 @@ import (
 // predecessor commitment are settable, but only baked into the measured image,
 // never from the overlay.
 var nonOverridableEnv = map[string]bool{
+	"ENCLAVE_NAMESPACE_PREFIX":    true,
 	"ENCLAVE_DEPLOYMENT":          true,
 	"ENCLAVE_APP_NAME":            true,
 	"ENCLAVE_SECRETS_CONFIG":      true,
@@ -28,7 +29,7 @@ var nonOverridableEnv = map[string]bool{
 }
 
 func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
-	prefix := fmt.Sprintf("/%s/%s/env/", cfg.Deployment, cfg.AppName)
+	prefix := cfg.envOverlayPrefix()
 
 	params, err := ssm.ListParams(ctx, prefix)
 	if err != nil {
@@ -132,11 +133,11 @@ func logRetentionDays() int32 {
 	return int32(days)
 }
 
-func logGroupPrefix() string {
-	return normalizeLogGroupPrefix(os.Getenv("ENCLAVE_LOG_GROUP_PREFIX"))
+func namespacePrefix() string {
+	return normalizeNamespacePrefix(os.Getenv("ENCLAVE_NAMESPACE_PREFIX"))
 }
 
-func normalizeLogGroupPrefix(raw string) string {
+func normalizeNamespacePrefix(raw string) string {
 	return path.Join("/", strings.TrimSpace(raw))
 }
 

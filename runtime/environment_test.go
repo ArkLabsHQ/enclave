@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -28,14 +29,58 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "ENCLAVE_DEPLOYMENT must be set",
 		},
 		{
-			name:    "deployment has a character CloudWatch refuses",
-			mutate:  func(c *Config) { c.Deployment = "dev:us" },
-			wantErr: "names every CloudWatch log group",
+			name:    "deployment has a character SSM refuses",
+			mutate:  func(c *Config) { c.Deployment = "dev#us" },
+			wantErr: "allow only letters, digits and _.-",
+		},
+		{
+			name:    "deployment spans path segments",
+			mutate:  func(c *Config) { c.Deployment = "ark/dev" },
+			wantErr: "must be a single path segment",
 		},
 		{
 			name:    "app name missing",
 			mutate:  func(c *Config) { c.AppName = "" },
 			wantErr: "ENCLAVE_APP_NAME must be set",
+		},
+		{
+			name:    "app name has a character SSM refuses",
+			mutate:  func(c *Config) { c.AppName = "app:one" },
+			wantErr: "allow only letters, digits and _.-",
+		},
+		{
+			name:    "app name spans path segments",
+			mutate:  func(c *Config) { c.AppName = "org/app" },
+			wantErr: "must be a single path segment",
+		},
+		{
+			name:    "namespace prefix has a character SSM refuses",
+			mutate:  func(c *Config) { c.NamespacePrefix = "/ark#se7enz" },
+			wantErr: "allow only letters, digits and _.-",
+		},
+		{
+			name:    "namespace prefix starts with a reserved SSM word",
+			mutate:  func(c *Config) { c.NamespacePrefix = "/AWS/team" },
+			wantErr: "SSM reserves parameter names",
+		},
+		{
+			name:    "deployment starts with a reserved SSM word when there is no prefix",
+			mutate:  func(c *Config) { c.Deployment = "ssm-prod" },
+			wantErr: "SSM reserves parameter names",
+		},
+		{
+			name:   "reserved word inside a later segment is fine",
+			mutate: func(c *Config) { c.NamespacePrefix = "/ark/aws" },
+		},
+		{
+			name:    "namespace prefix deeper than SSM allows",
+			mutate:  func(c *Config) { c.NamespacePrefix = "/a/b/c/d/e/f/g/h/i" },
+			wantErr: "at most 8 fit SSM's hierarchy",
+		},
+		{
+			name:    "namespace longer than the name limits allow",
+			mutate:  func(c *Config) { c.Deployment = strings.Repeat("d", 300) },
+			wantErr: "fit SSM and CloudWatch name limits",
 		},
 		{
 			name:    "port missing",
@@ -46,16 +91,6 @@ func TestConfigValidate(t *testing.T) {
 			name:    "FQDN missing",
 			mutate:  func(c *Config) { c.FQDN = "" },
 			wantErr: "config is missing FQDN",
-		},
-		{
-			name:    "log group prefix empty",
-			mutate:  func(c *Config) { c.LogGroupPrefix = "" },
-			wantErr: "ENCLAVE_LOG_GROUP_PREFIX must not be empty",
-		},
-		{
-			name:    "log group prefix has an illegal character",
-			mutate:  func(c *Config) { c.LogGroupPrefix = "/ark:se7enz" },
-			wantErr: "CloudWatch log group names allow only",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,10 +117,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("VALID_KEY", "")
 	t.Setenv("nested/IGNORE", "")
 	t.Setenv("SAFE_KEY", "")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "")
 
 	ctx := context.Background()
-	path := func(key string) string { return "/prod/app/env/" + key }
+	path := func(key string) string { return "/prod/app/enclave/env/" + key }
 	ssmFor := func(params map[string]string) SSM { return NewSSM(&fakeSSM{params: params}) }
 
 	t.Run("no params", func(t *testing.T) {
@@ -95,10 +129,11 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("applies current prefix", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
-			path("APPLY_FOO"):              "one",
-			path("APPLY_BAR"):              "two",
-			"/prod/other/env/OTHER_PREFIX": "wrong-app",
-			"/dev/app/env/OTHER_PREFIX":    "wrong-deploy",
+			path("APPLY_FOO"):                      "one",
+			path("APPLY_BAR"):                      "two",
+			"/prod/other/enclave/env/OTHER_PREFIX": "wrong-app",
+			"/dev/app/enclave/env/OTHER_PREFIX":    "wrong-deploy",
+			"/prod/app/env/OTHER_PREFIX":           "outside-namespace",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "one", os.Getenv("APPLY_FOO"))
@@ -109,13 +144,12 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Run("updates mutable runtime config", func(t *testing.T) {
 		cfg := *testCfg
 		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_APP_PORT"):         "9090",
-			path("ENCLAVE_FQDN"):             "app.example.com",
-			path("ENCLAVE_USE_ACME"):         "TRUE",
-			path("ENCLAVE_ACME_DIRECTORY"):   "https://acme.example.com/directory",
-			path("ENCLAVE_ACME_EMAIL"):       "ops@example.com",
-			path("ENCLAVE_ACME_CA"):          "test-ca",
-			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark/se7enz",
+			path("ENCLAVE_APP_PORT"):       "9090",
+			path("ENCLAVE_FQDN"):           "app.example.com",
+			path("ENCLAVE_USE_ACME"):       "TRUE",
+			path("ENCLAVE_ACME_DIRECTORY"): "https://acme.example.com/directory",
+			path("ENCLAVE_ACME_EMAIL"):     "ops@example.com",
+			path("ENCLAVE_ACME_CA"):        "test-ca",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "9090", cfg.AppPort)
@@ -125,17 +159,6 @@ func TestApplyEnvOverrides(t *testing.T) {
 		require.Equal(t, "https://acme.example.com/directory", cfg.ACMEDirectory)
 		require.Equal(t, "ops@example.com", cfg.ACMEEmail)
 		require.Equal(t, "test-ca", cfg.ACMECA)
-		require.Equal(t, "/ark/se7enz", cfg.LogGroupPrefix)
-	})
-
-	t.Run("rejects an unusable log group prefix", func(t *testing.T) {
-		cfg := *testCfg
-		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark:evil",
-		}))
-
-		require.ErrorContains(t, err, "apply env override ENCLAVE_LOG_GROUP_PREFIX")
-		require.Equal(t, testCfg.LogGroupPrefix, cfg.LogGroupPrefix)
 	})
 
 	t.Run("rejects invalid application port", func(t *testing.T) {
@@ -161,6 +184,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
+			path("ENCLAVE_NAMESPACE_PREFIX"):    "/evil",
 			path("ENCLAVE_DEPLOYMENT"):          "dev",
 			path("ENCLAVE_APP_NAME"):            "evil",
 			path("ENCLAVE_SECRETS_CONFIG"):      `[{"name":"evil"}]`,
@@ -182,6 +206,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 			"the overlay must not be able to waive the clock-source assertion")
 		require.Empty(t, os.Getenv("ENCLAVE_PREVIOUS_PCR0"),
 			"the overlay must not be able to name a different predecessor")
+		require.Empty(t, os.Getenv("ENCLAVE_NAMESPACE_PREFIX"),
+			"the overlay must not be able to move the namespace it is read from")
+		require.Equal(t, "/", testCfg.NamespacePrefix)
 		require.True(t, testCfg.KMSLocked)
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
 	})

@@ -385,7 +385,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		)
 		require.Empty(
 			t,
-			fx.ssmf.params["/prod/app/MigrationStateOriginReceipt/"+migrationKeyID],
+			fx.ssmf.params["/prod/app/enclave/MigrationStateOriginReceipt/"+migrationKeyID],
 			"the receipt must move to the PCR0-scoped path, not merely exist",
 		)
 		requireKMSCiphertextPlaintext(

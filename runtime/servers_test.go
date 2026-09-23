@@ -51,6 +51,10 @@ func (m *migrationControlMigrator) CandidateInfo(context.Context) (*CandidateInf
 	return m.candidate, m.candidateErr
 }
 
+func (m *migrationControlMigrator) MigrationIntentBucket() string {
+	return migrationIntentTestBucket
+}
+
 func TestServersStartReturnsBindErrors(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -287,6 +291,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 			PreviousPCR0:             "previous",
 			PreviousPCR0Attestation:  "attestation",
 			MigrationCooldownSeconds: int(testCfg.MigrationCooldown.Seconds()),
+			MigrationIntentBucket:    migrationIntentTestBucket,
 			Migration: &MigrationStatus{
 				State: migrationStateNone, SourcePCR0: strings.Repeat("ab", 48),
 			},

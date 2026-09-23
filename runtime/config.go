@@ -13,6 +13,49 @@ import (
 	"time"
 )
 
+// Configuration input names shared by the environment loader and SSM overlay.
+const (
+	// Application and identity.
+	envDeployment        = "ENCLAVE_DEPLOYMENT"
+	envAppName           = "ENCLAVE_APP_NAME"
+	envAppPort           = "ENCLAVE_APP_PORT"
+	envAppBinaryName     = "APP_BINARY_NAME"
+	envPreviousPCR0      = "ENCLAVE_PREVIOUS_PCR0"
+	envSecretsConfig     = "ENCLAVE_SECRETS_CONFIG"
+	envOverrideAllowList = "ENCLAVE_OVERRIDE_ALLOWLIST"
+
+	// Security and migration.
+	envDev                   = "ENCLAVE_DEV"
+	envInsecureVerifySkipped = "ENCLAVE_INSECURE_VERIFY_SKIPPED"
+	envVerifyClockSource     = "ENCLAVE_VERIFY_CLOCK_SOURCE"
+	envMigrationCooldown     = "ENCLAVE_MIGRATION_COOLDOWN"
+
+	// Networking and telemetry.
+	envFQDN             = "ENCLAVE_FQDN"
+	envUpstream         = "ENCLAVE_UPSTREAM"
+	envViproxyInAddrs   = "ENCLAVE_VIPROXY_IN_ADDRS"
+	envViproxyOutAddrs  = "ENCLAVE_VIPROXY_OUT_ADDRS"
+	envLogShipInterval  = "ENCLAVE_LOG_SHIP_INTERVAL"
+	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
+	envLogGroupPrefix   = "ENCLAVE_LOG_GROUP_PREFIX"
+
+	// ACME settings accepted by the SSM overlay.
+	envUseACME       = "ENCLAVE_USE_ACME"
+	envACMEDirectory = "ENCLAVE_ACME_DIRECTORY"
+	envACMEEmail     = "ENCLAVE_ACME_EMAIL"
+	envACMECA        = "ENCLAVE_ACME_CA"
+
+	// AWS configuration.
+	envAWSRegion           = "ENCLAVE_AWS_REGION"
+	envEC2MetadataEndpoint = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
+	envRoute53Endpoint     = "AWS_ENDPOINT_URL_ROUTE53"
+	envKMSEndpoint         = "AWS_ENDPOINT_URL_KMS"
+	envSSMEndpoint         = "AWS_ENDPOINT_URL_SSM"
+	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
+	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
+	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+)
+
 const (
 	prodRetention          = 10 * 365 * 24 * time.Hour
 	prodIntentWriteTimeout = 10 * time.Minute
@@ -36,21 +79,25 @@ const (
 	migrationChallengeRotate = time.Minute
 
 	migrationAbortResponse = "abort"
-)
 
-const (
 	// extPort is the public TLS listener. Fixed: the host's routing, the README
 	// and every client URL assume 443.
 	extPort = 443
-
 	// intPort is the loopback API listener, handed to the application as
 	// ENCLAVE_PROXY_PORT so it does not have to assume the value.
 	intPort = 8080
-
 	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
 	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
 	// alone silently breaks all networking.
 	hostProxyPort = 1024
+
+	defaultViproxyIn  = "127.0.0.1:80"
+	defaultViproxyOut = "3:8002"
+	// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
+	defaultIMDSEndpoint = "http://127.0.0.1:80"
+	defaultAWSRegion    = "us-east-1"
+	defaultFQDN         = "localhost"
+	defaultAppName      = "app"
 )
 
 // Config holds runtime HTTP/network settings, the enclave's identity, and the
@@ -60,10 +107,22 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment   string
-	AppName      string
-	AppPort      string
-	PreviousPCR0 string
+	Deployment         string
+	AppName            string
+	AppPort            string
+	AppBinaryName      string
+	PreviousPCR0       string
+	StaticSecretConfig string
+
+	// AWS config, EIF-baked and only overridable via in dev mode
+	Route53Endpoint     string
+	KMSEndpoint         string
+	SSMEndpoint         string
+	STSEndpoint         string
+	S3Endpoint          string
+	CloudWatchEndpoint  string
+	AWSRegion           string
+	EC2MetadataEndpoint string
 
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
@@ -75,6 +134,8 @@ type Config struct {
 	ACMECA           string   // PEM CA bundle for private/test ACME HTTPS.
 	AppWebSrv        *url.URL // Loopback URL the catch-all revProxy forwards to.
 	UpstreamProtocol string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
+	ViproxyInAddr    string
+	ViproxyOutAddr   string
 
 	KMSLocked             bool
 	InsecureVerifySkipped bool
@@ -88,40 +149,58 @@ type Config struct {
 	LogRetentionDays      int32
 	LogGroupPrefix        string
 	InstanceID            string
+
+	OverrideAllowList map[string]bool
 }
 
-// LoadConfig builds Config from ENCLAVE_* env vars.
+// LoadConfig captures runtime configuration and unsets each environment variable
+// it reads.
 func LoadConfig() (*Config, error) {
 	// Point the reverse proxy directly at the user app.
-	appPort := getAppPort()
+	appPort := takeEnvDefault(envAppPort, "7074")
 	appWebSrv, err := url.Parse("http://127.0.0.1:" + appPort)
 	if err != nil {
 		return nil, fmt.Errorf("parse app web srv url: %w", err)
 	}
 
 	cfg := &Config{
-		Deployment:   getDeployment(),
-		AppName:      getAppName(),
-		AppPort:      appPort,
-		PreviousPCR0: getPreviousPCR0(),
-
-		FQDN:                  getFQDN(),
+		Deployment:         takeEnv(envDeployment),
+		AppName:            takeEnv(envAppName),
+		AppBinaryName:      takeEnvDefault(envAppBinaryName, defaultAppName),
+		AppPort:            appPort,
+		PreviousPCR0:       takeEnv(envPreviousPCR0),
+		StaticSecretConfig: takeEnv(envSecretsConfig),
+		EC2MetadataEndpoint: takeEnvDefault(
+			envEC2MetadataEndpoint,
+			defaultIMDSEndpoint,
+		),
+		Route53Endpoint:       takeEnv(envRoute53Endpoint),
+		KMSEndpoint:           takeEnv(envKMSEndpoint),
+		SSMEndpoint:           takeEnv(envSSMEndpoint),
+		STSEndpoint:           takeEnv(envSTSEndpoint),
+		S3Endpoint:            takeEnv(envS3Endpoint),
+		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),
+		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
+		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),
+		FQDN:                  takeEnvDefault(envFQDN, defaultFQDN),
 		ExtPort:               extPort,
 		IntPort:               intPort,
 		HostProxyPort:         hostProxyPort,
 		AppWebSrv:             appWebSrv,
-		UpstreamProtocol:      getUpstreamProtocol(),
+		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
-		LogGroupPrefix:        logGroupPrefix(),
+		LogGroupPrefix:        normalizeLogGroupPrefix(takeEnv(envLogGroupPrefix)),
 		GenesisRetention:      prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
 		MigrationCooldown:     defaultMigrationCooldown,
 		ClockSyncInterval:     prodClockSyncInterval,
-		VerifyClockSource:     true,
+		VerifyClockSource:     takeEnv(envVerifyClockSource) != "false",
 		InsecureVerifySkipped: false,
 		KMSLocked:             true,
+		OverrideAllowList:     make(map[string]bool),
 	}
 
 	if IsDev() {
@@ -133,29 +212,23 @@ func LoadConfig() (*Config, error) {
 
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
 		// It is false by default unless explicitly overridden
-		verifySkipped, set, err := insecureVerifySkipped()
+		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
+	}
+
+	if cooldown := takeEnv(envMigrationCooldown); cooldown != "" {
+		d, err := time.ParseDuration(cooldown)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", cooldown, err)
 		}
-		if set {
-			cfg.InsecureVerifySkipped = verifySkipped
+		if d < 0 {
+			return nil, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
 		}
+
+		cfg.MigrationCooldown = d
 	}
 
-	verify, set, err := verifyClockSource()
-	if err != nil {
-		return nil, err
-	}
-	if set {
-		cfg.VerifyClockSource = verify
-	}
-
-	cooldown, set, err := migrationCooldown()
-	if err != nil {
-		return nil, err
-	}
-	if set {
-		cfg.MigrationCooldown = cooldown
+	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
+		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
 	}
 
 	return cfg, nil
@@ -189,6 +262,68 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
 	return c.validateLogGroupPrefix()
+}
+
+func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
+	prefix := fmt.Sprintf("/%s/%s/env/", c.Deployment, c.AppName)
+
+	params, err := ssm.ListParams(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list env override SSM params: %w", err)
+	}
+
+	applied := 0
+	for _, p := range params {
+		key := strings.TrimPrefix(p.Name, prefix)
+		// Defensive: skip empty or nested keys so a misconfigured SSM
+		// tree can't surface unexpected env var names.
+		if key == "" || strings.ContainsRune(key, '/') {
+			continue
+		}
+
+		switch key {
+		case envAppPort:
+			port, err := strconv.ParseUint(p.Value, 10, 16)
+			if err != nil || port == 0 {
+				return fmt.Errorf("invalid application port %q", p.Value)
+			}
+			appWebSrv, err := url.Parse("http://127.0.0.1:" + p.Value)
+			if err != nil {
+				return fmt.Errorf("parse app web srv url: %w", err)
+			}
+			c.AppPort = p.Value
+			c.AppWebSrv = appWebSrv
+		case envFQDN:
+			c.FQDN = p.Value
+		case envUseACME:
+			c.UseACME = strings.EqualFold(p.Value, "true")
+		case envACMEDirectory:
+			c.ACMEDirectory = p.Value
+		case envACMEEmail:
+			c.ACMEEmail = p.Value
+		case envACMECA:
+			c.ACMECA = p.Value
+		case envLogGroupPrefix:
+			c.LogGroupPrefix = normalizeLogGroupPrefix(p.Value)
+			if err := c.validateLogGroupPrefix(); err != nil {
+				return err
+			}
+		// key is not an overridable env var, check if overriding is allowed by the app
+		default:
+			if _, allowed := c.OverrideAllowList[key]; !allowed {
+				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
+				continue
+			}
+			if err := safeSetenv(key, p.Value); err != nil {
+				return fmt.Errorf("setenv %s: %w", key, err)
+			}
+		}
+		applied++
+	}
+
+	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
+
+	return nil
 }
 
 func (c *Config) validateLogGroupPrefix() error {
@@ -228,38 +363,6 @@ func (c *Config) lockSegment() string {
 		return "locked"
 	}
 	return "unlocked"
-}
-
-func (c *Config) applyEnvOverride(name, value string) error {
-	switch name {
-	case "ENCLAVE_APP_PORT":
-		port, err := strconv.ParseUint(value, 10, 16)
-		if err != nil || port == 0 {
-			return fmt.Errorf("invalid application port %q", value)
-		}
-		appWebSrv, err := url.Parse("http://127.0.0.1:" + value)
-		if err != nil {
-			return fmt.Errorf("parse app web srv url: %w", err)
-		}
-		c.AppPort = value
-		c.AppWebSrv = appWebSrv
-	case "ENCLAVE_FQDN":
-		c.FQDN = value
-	case "ENCLAVE_USE_ACME":
-		c.UseACME = strings.EqualFold(value, "true")
-	case "ENCLAVE_ACME_DIRECTORY":
-		c.ACMEDirectory = value
-	case "ENCLAVE_ACME_EMAIL":
-		c.ACMEEmail = value
-	case "ENCLAVE_ACME_CA":
-		c.ACMECA = value
-	case "ENCLAVE_LOG_GROUP_PREFIX":
-		c.LogGroupPrefix = normalizeLogGroupPrefix(value)
-		if err := c.validateLogGroupPrefix(); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (c *Config) logGroup(sig signal) string {
@@ -399,112 +502,29 @@ func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
 	)
 }
 
-// nonOverridableEnv lists vars the SSM env overlay must never set: they name the
-// SSM namespace or the managed-secret set, or they decide the security posture.
-// ENCLAVE_DEV selects the KMS lock posture, both Object Lock retentions, the
-// intent write timeout and the clock-sync interval. Skipping COSE verification
-// requires ENCLAVE_INSECURE_VERIFY_SKIPPED=true and is only allowed in dev mode
-// for QEMU tests. The cooldown and clock-source assertion are independently
-// configurable in either mode. These settings and the predecessor commitment
-// must be baked into the measured image, never supplied by the overlay.
-var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_DEPLOYMENT":              true,
-	"ENCLAVE_APP_NAME":                true,
-	"ENCLAVE_SECRETS_CONFIG":          true,
-	"ENCLAVE_DEV":                     true,
-	"ENCLAVE_MIGRATION_COOLDOWN":      true,
-	"ENCLAVE_VERIFY_CLOCK_SOURCE":     true,
-	"ENCLAVE_INSECURE_VERIFY_SKIPPED": true,
-	"ENCLAVE_PREVIOUS_PCR0":           true,
+// takeEnv consumes a configuration variable, removing it from the process environment.
+func takeEnv(key string) string {
+	value := os.Getenv(key)
+	_ = os.Unsetenv(key)
+	return strings.TrimSpace(value)
 }
 
-func ApplyEnvOverrides(ctx context.Context, cfg *Config, ssm SSM) error {
-	prefix := fmt.Sprintf("/%s/%s/env/", cfg.Deployment, cfg.AppName)
-
-	params, err := ssm.ListParams(ctx, prefix)
-	if err != nil {
-		return fmt.Errorf("failed to list env override SSM params: %w", err)
-	}
-
-	applied := 0
-	for _, p := range params {
-		key := strings.TrimPrefix(p.Name, prefix)
-		// Defensive: skip empty or nested keys so a misconfigured SSM
-		// tree can't surface unexpected env var names.
-		if key == "" || strings.ContainsRune(key, '/') {
-			continue
-		}
-
-		// Never let SSM overlay change EIF-baked identity or security knobs.
-		if nonOverridableEnv[key] {
-			slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
-			continue
-		}
-
-		nextCfg := *cfg
-		if err := nextCfg.applyEnvOverride(key, p.Value); err != nil {
-			return fmt.Errorf("apply env override %s: %w", key, err)
-		}
-		if err := safeSetenv(key, p.Value); err != nil {
-			return fmt.Errorf("setenv %s: %w", key, err)
-		}
-		*cfg = nextCfg
-		applied++
-	}
-
-	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
-
-	return nil
-}
-
-func envDefault(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+func takeEnvDefault(key, fallback string) string {
+	if v := takeEnv(key); v != "" {
 		return v
 	}
 	return fallback
 }
 
 func IsDev() bool {
-	if v := strings.TrimSpace(os.Getenv("ENCLAVE_DEV")); v != "" {
+	if v := takeEnv(envDev); v != "" {
 		return strings.EqualFold(v, "true")
 	}
 	return false
 }
 
-func getStaticSecretsConfig() string {
-	return os.Getenv("ENCLAVE_SECRETS_CONFIG")
-}
-
-func getDeployment() string {
-	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT"))
-}
-
-func getAppName() string {
-	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
-}
-
-func getPreviousPCR0() string {
-	return strings.TrimSpace(os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
-}
-
-func getAppPort() string {
-	return envDefault("ENCLAVE_APP_PORT", "7074")
-}
-
-func getAppBinaryName() string {
-	return envDefault("APP_BINARY_NAME", "app")
-}
-
-func getFQDN() string {
-	return envDefault("ENCLAVE_FQDN", "localhost")
-}
-
-func getUpstreamProtocol() string {
-	return strings.ToLower(envDefault("ENCLAVE_UPSTREAM", "auto"))
-}
-
 func logShipInterval() time.Duration {
-	value := envDefault("ENCLAVE_LOG_SHIP_INTERVAL", defaultLogShipInterval.String())
+	value := takeEnvDefault(envLogShipInterval, defaultLogShipInterval.String())
 	interval, err := time.ParseDuration(value)
 	if err != nil || interval <= 0 {
 		return defaultLogShipInterval
@@ -513,8 +533,8 @@ func logShipInterval() time.Duration {
 }
 
 func logRetentionDays() int32 {
-	value := envDefault(
-		"ENCLAVE_LOG_RETENTION_DAYS", strconv.FormatInt(int64(defaultLogRetentionDays), 10),
+	value := takeEnvDefault(
+		envLogRetentionDays, strconv.FormatInt(int64(defaultLogRetentionDays), 10),
 	)
 	days, err := strconv.ParseInt(value, 10, 32)
 	if err != nil || days <= 0 {
@@ -523,49 +543,6 @@ func logRetentionDays() int32 {
 	return int32(days)
 }
 
-func logGroupPrefix() string {
-	return normalizeLogGroupPrefix(os.Getenv("ENCLAVE_LOG_GROUP_PREFIX"))
-}
-
 func normalizeLogGroupPrefix(raw string) string {
 	return path.Join("/", strings.TrimSpace(raw))
-}
-
-func migrationCooldown() (time.Duration, bool, error) {
-	v := strings.TrimSpace(os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
-	if v == "" {
-		return 0, false, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, false, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", v, err)
-	}
-	if d < 0 {
-		return 0, false, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
-	}
-	return d, true, nil
-}
-
-func verifyClockSource() (bool, bool, error) {
-	v := strings.TrimSpace(os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
-	if v == "" {
-		return false, false, nil
-	}
-	enabled, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, false, fmt.Errorf("invalid ENCLAVE_VERIFY_CLOCK_SOURCE %q: %w", v, err)
-	}
-	return enabled, true, nil
-}
-
-func insecureVerifySkipped() (bool, bool, error) {
-	v := strings.TrimSpace(os.Getenv("ENCLAVE_INSECURE_VERIFY_SKIPPED"))
-	if v == "" {
-		return false, false, nil
-	}
-	enabled, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, false, fmt.Errorf("invalid ENCLAVE_INSECURE_VERIFY_SKIPPED %q: %w", v, err)
-	}
-	return enabled, true, nil
 }

@@ -58,13 +58,15 @@ func testConfigWithLogShipInterval(interval time.Duration) *Config {
 
 func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Helper()
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-	t.Setenv("ENCLAVE_APP_PORT", "7074")
-	t.Setenv("ENCLAVE_DEV", strconv.FormatBool(dev))
-	t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
-	t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "")
-	t.Setenv("ENCLAVE_INSECURE_VERIFY_SKIPPED", "")
+	t.Setenv(envDeployment, "prod")
+	t.Setenv(envAppName, "app")
+	t.Setenv(envAppPort, "7074")
+	t.Setenv(envDev, strconv.FormatBool(dev))
+	t.Setenv(envMigrationCooldown, "")
+	t.Setenv(envVerifyClockSource, "")
+	t.Setenv(envInsecureVerifySkipped, "")
+	t.Setenv(envSecretsConfig, "[]")
+	t.Setenv(envOverrideAllowList, "")
 }
 
 func TestLoadConfigSecurityDefaults(t *testing.T) {
@@ -168,9 +170,9 @@ func TestConfigValidate(t *testing.T) {
 
 func TestLoadConfigTelemetrySettings(t *testing.T) {
 	setConfigTestEnv(t, false)
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
-	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "/ark/se7enz/emulator")
+	t.Setenv(envLogShipInterval, "250ms")
+	t.Setenv(envLogRetentionDays, "7")
+	t.Setenv(envLogGroupPrefix, "/ark/se7enz/emulator")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
@@ -181,9 +183,9 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
 	setConfigTestEnv(t, false)
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
-	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "   ")
+	t.Setenv(envLogShipInterval, "invalid")
+	t.Setenv(envLogRetentionDays, "0")
+	t.Setenv(envLogGroupPrefix, "   ")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
@@ -285,7 +287,7 @@ func TestLoadConfigMigrationCooldown(t *testing.T) {
 		} {
 			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
 				setConfigTestEnv(t, dev)
-				t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
+				t.Setenv(envMigrationCooldown, tc.value)
 
 				cfg, err := LoadConfig()
 				if tc.wantErr != "" {
@@ -304,24 +306,20 @@ func TestLoadConfigVerifyClockSource(t *testing.T) {
 		for _, tc := range []struct {
 			name, value string
 			want        bool
-			wantErr     string
 		}{
 			{name: "unset", want: true},
 			{name: "blank", value: "  ", want: true},
 			{name: "enabled", value: "true", want: true},
 			{name: "disabled", value: "false", want: false},
-			{name: "padded uppercase", value: " FALSE ", want: false},
-			{name: "invalid", value: "sometimes", wantErr: "invalid ENCLAVE_VERIFY_CLOCK_SOURCE"},
+			{name: "padded lowercase", value: " false ", want: false},
+			{name: "uppercase uses default", value: " FALSE ", want: true},
+			{name: "unrecognized uses default", value: "sometimes", want: true},
 		} {
 			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
 				setConfigTestEnv(t, dev)
-				t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", tc.value)
+				t.Setenv(envVerifyClockSource, tc.value)
 
 				cfg, err := LoadConfig()
-				if tc.wantErr != "" {
-					require.ErrorContains(t, err, tc.wantErr)
-					return
-				}
 				require.NoError(t, err)
 				require.Equal(t, tc.want, cfg.VerifyClockSource)
 				require.False(t, cfg.InsecureVerifySkipped,
@@ -337,25 +335,20 @@ func TestLoadConfigInsecureVerifySkipped(t *testing.T) {
 		for _, tc := range []struct {
 			name, value string
 			want        bool
-			wantErr     string
 		}{
 			{name: "unset"},
 			{name: "blank", value: "  "},
 			{name: "enabled", value: "true", want: dev},
 			{name: "disabled", value: "false"},
-			{name: "padded uppercase", value: " TRUE ", want: dev},
-			{name: "invalid", value: "sometimes", wantErr: "invalid ENCLAVE_INSECURE_VERIFY_SKIPPED"},
+			{name: "padded lowercase", value: " true ", want: dev},
+			{name: "uppercase uses default", value: " TRUE "},
+			{name: "unrecognized uses default", value: "sometimes"},
 		} {
 			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
 				setConfigTestEnv(t, dev)
-				t.Setenv("ENCLAVE_INSECURE_VERIFY_SKIPPED", tc.value)
+				t.Setenv(envInsecureVerifySkipped, tc.value)
 
 				cfg, err := LoadConfig()
-				// Production ignores this dev-only flag, including malformed values.
-				if dev && tc.wantErr != "" {
-					require.ErrorContains(t, err, tc.wantErr)
-					return
-				}
 				require.NoError(t, err)
 				require.Equal(t, tc.want, cfg.InsecureVerifySkipped)
 				require.True(t, cfg.VerifyClockSource,
@@ -366,28 +359,32 @@ func TestLoadConfigInsecureVerifySkipped(t *testing.T) {
 	}
 }
 
-func TestApplyEnvOverrides(t *testing.T) {
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", "[]")
-	t.Setenv("ENCLAVE_DEV", "false")
+func TestApplySSMOverlay(t *testing.T) {
+	t.Setenv(envSecretsConfig, "[]")
+	t.Setenv(envDev, "false")
 	t.Setenv("APPLY_FOO", "")
 	t.Setenv("APPLY_BAR", "")
 	t.Setenv("OTHER_PREFIX", "")
 	t.Setenv("VALID_KEY", "")
 	t.Setenv("nested/IGNORE", "")
 	t.Setenv("SAFE_KEY", "")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "")
+	t.Setenv(envLogGroupPrefix, "")
 
 	ctx := context.Background()
 	path := func(key string) string { return "/prod/app/env/" + key }
 	ssmFor := func(params map[string]string) SSM { return NewSSM(&fakeSSM{params: params}) }
 
 	t.Run("no params", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(nil))
+		err := testCfg.ApplySSMOverlay(ctx, ssmFor(nil))
 		require.NoError(t, err)
 	})
 
 	t.Run("applies current prefix", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
+		cfg := testConfig()
+		cfg.OverrideAllowList = map[string]bool{
+			"APPLY_FOO": true, "APPLY_BAR": true, "OTHER_PREFIX": true,
+		}
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
 			path("APPLY_FOO"):              "one",
 			path("APPLY_BAR"):              "two",
 			"/prod/other/env/OTHER_PREFIX": "wrong-app",
@@ -401,14 +398,14 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("updates mutable runtime config", func(t *testing.T) {
 		cfg := *testCfg
-		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_APP_PORT"):         "9090",
-			path("ENCLAVE_FQDN"):             "app.example.com",
-			path("ENCLAVE_USE_ACME"):         "TRUE",
-			path("ENCLAVE_ACME_DIRECTORY"):   "https://acme.example.com/directory",
-			path("ENCLAVE_ACME_EMAIL"):       "ops@example.com",
-			path("ENCLAVE_ACME_CA"):          "test-ca",
-			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark/se7enz",
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envAppPort):        "9090",
+			path(envFQDN):           "app.example.com",
+			path(envUseACME):        "TRUE",
+			path(envACMEDirectory):  "https://acme.example.com/directory",
+			path(envACMEEmail):      "ops@example.com",
+			path(envACMECA):         "test-ca",
+			path(envLogGroupPrefix): "/ark/se7enz",
 		}))
 		require.NoError(t, err)
 		require.Equal(t, "9090", cfg.AppPort)
@@ -423,18 +420,18 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("rejects an unusable log group prefix", func(t *testing.T) {
 		cfg := *testCfg
-		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_LOG_GROUP_PREFIX"): "/ark:evil",
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envLogGroupPrefix): "/ark:evil",
 		}))
 
-		require.ErrorContains(t, err, "apply env override ENCLAVE_LOG_GROUP_PREFIX")
-		require.Equal(t, testCfg.LogGroupPrefix, cfg.LogGroupPrefix)
+		require.ErrorContains(t, err, envLogGroupPrefix)
+		require.ErrorContains(t, err, "CloudWatch log group names allow only")
 	})
 
 	t.Run("rejects invalid application port", func(t *testing.T) {
 		cfg := *testCfg
-		err := ApplyEnvOverrides(ctx, &cfg, ssmFor(map[string]string{
-			path("ENCLAVE_APP_PORT"): "not-a-port",
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envAppPort): "not-a-port",
 		}))
 
 		require.ErrorContains(t, err, "invalid application port")
@@ -442,7 +439,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("skips empty and nested keys", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
+		cfg := testConfig()
+		cfg.OverrideAllowList = map[string]bool{"VALID_KEY": true, "nested/IGNORE": true, "": true}
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
 			path("VALID_KEY"):     "ok",
 			path("nested/IGNORE"): "bad",
 			path(""):              "empty",
@@ -456,33 +455,34 @@ func TestApplyEnvOverrides(t *testing.T) {
 		for _, dev := range []bool{false, true} {
 			t.Run("dev="+strconv.FormatBool(dev), func(t *testing.T) {
 				setConfigTestEnv(t, dev)
-				t.Setenv("ENCLAVE_PREVIOUS_PCR0", "original-pcr0")
+				t.Setenv(envPreviousPCR0, "original-pcr0")
+				t.Setenv(envOverrideAllowList, "SAFE_KEY")
 				t.Setenv("SAFE_KEY", "")
 				cfg, err := LoadConfig()
 				require.NoError(t, err)
 				before := *cfg
 
-				err = ApplyEnvOverrides(ctx, cfg, ssmFor(map[string]string{
-					path("ENCLAVE_DEPLOYMENT"):              "dev",
-					path("ENCLAVE_APP_NAME"):                "evil",
-					path("ENCLAVE_SECRETS_CONFIG"):          `[{"name":"evil"}]`,
-					path("ENCLAVE_DEV"):                     strconv.FormatBool(!dev),
-					path("ENCLAVE_MIGRATION_COOLDOWN"):      "0s",
-					path("ENCLAVE_VERIFY_CLOCK_SOURCE"):     "false",
-					path("ENCLAVE_INSECURE_VERIFY_SKIPPED"): "true",
-					path("ENCLAVE_PREVIOUS_PCR0"):           "evil-pcr0",
-					path("SAFE_KEY"):                        "ok",
+				err = cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+					path(envDeployment):            "dev",
+					path(envAppName):               "evil",
+					path(envSecretsConfig):         `[{"name":"evil"}]`,
+					path(envDev):                   strconv.FormatBool(!dev),
+					path(envMigrationCooldown):     "0s",
+					path(envVerifyClockSource):     "false",
+					path(envInsecureVerifySkipped): "true",
+					path(envPreviousPCR0):          "evil-pcr0",
+					path("SAFE_KEY"):               "ok",
 				}))
 				require.NoError(t, err)
-				require.Equal(t, "prod", os.Getenv("ENCLAVE_DEPLOYMENT"))
-				require.Equal(t, "app", os.Getenv("ENCLAVE_APP_NAME"))
-				require.Equal(t, "[]", os.Getenv("ENCLAVE_SECRETS_CONFIG"))
-				require.Equal(t, strconv.FormatBool(dev), os.Getenv("ENCLAVE_DEV"))
-				require.Empty(t, os.Getenv("ENCLAVE_MIGRATION_COOLDOWN"))
-				require.Empty(t, os.Getenv("ENCLAVE_VERIFY_CLOCK_SOURCE"))
-				require.Empty(t, os.Getenv("ENCLAVE_INSECURE_VERIFY_SKIPPED"),
+				require.Empty(t, os.Getenv(envDeployment))
+				require.Empty(t, os.Getenv(envAppName))
+				require.Empty(t, os.Getenv(envSecretsConfig))
+				require.Empty(t, os.Getenv(envDev))
+				require.Empty(t, os.Getenv(envMigrationCooldown))
+				require.Empty(t, os.Getenv(envVerifyClockSource))
+				require.Empty(t, os.Getenv(envInsecureVerifySkipped),
 					"the overlay must not be able to skip attestation verification")
-				require.Equal(t, "original-pcr0", os.Getenv("ENCLAVE_PREVIOUS_PCR0"))
+				require.Empty(t, os.Getenv(envPreviousPCR0))
 				require.Equal(
 					t,
 					before,
@@ -495,9 +495,98 @@ func TestApplyEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("returns SSM errors", func(t *testing.T) {
-		err := ApplyEnvOverrides(ctx, testCfg, NewSSM(&fakeSSM{err: errors.New("access denied")}))
+		err := testCfg.ApplySSMOverlay(ctx, NewSSM(&fakeSSM{err: errors.New("access denied")}))
 		require.Error(t, err)
 	})
+}
+
+func TestApplySSMOverlayAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		name, allowlist, wantAllowed, wantSecond, wantAllowlistEnv string
+	}{
+		{name: "empty rejects application overrides", wantAllowed: "baked", wantSecond: "baked"},
+		{
+			name:        "comma separated names are trimmed and deduplicated",
+			allowlist:   " APP_ALLOWED , APP_SECOND , APP_ALLOWED ",
+			wantAllowed: "one", wantSecond: "two",
+		},
+		{
+			name:        "overlay cannot expand the loaded allowlist",
+			allowlist:   "APP_ALLOWED," + envOverrideAllowList,
+			wantAllowed: "one", wantSecond: "baked", wantAllowlistEnv: "APP_BLOCKED",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envOverrideAllowList, tc.allowlist)
+			for _, key := range []string{"APP_ALLOWED", "APP_SECOND", "APP_BLOCKED"} {
+				t.Setenv(key, "baked")
+			}
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			_, present := os.LookupEnv(envOverrideAllowList)
+			require.False(t, present, "the allowlist must be consumed by LoadConfig")
+
+			err = cfg.ApplySSMOverlay(
+				context.Background(),
+				NewSSM(&fakeSSM{params: map[string]string{
+					"/prod/app/env/APP_ALLOWED":             "one",
+					"/prod/app/env/APP_SECOND":              "two",
+					"/prod/app/env/APP_BLOCKED":             "changed",
+					"/prod/app/env/" + envOverrideAllowList: "APP_BLOCKED",
+					"/prod/app/env/" + envFQDN:              "overlay.example.com",
+				}}),
+			)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantAllowed, os.Getenv("APP_ALLOWED"))
+			require.Equal(t, tc.wantSecond, os.Getenv("APP_SECOND"))
+			require.Equal(t, "baked", os.Getenv("APP_BLOCKED"))
+			require.Equal(t, tc.wantAllowlistEnv, os.Getenv(envOverrideAllowList))
+			require.False(t, cfg.OverrideAllowList["APP_BLOCKED"])
+			require.Equal(t, "overlay.example.com", cfg.FQDN,
+				"explicit runtime overrides do not require an application allowlist entry")
+		})
+	}
+}
+
+func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
+	setConfigTestEnv(t, true)
+	const secrets = `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`
+	t.Setenv(envSecretsConfig, secrets)
+	t.Setenv(envAppBinaryName, "measured-app")
+	t.Setenv(envAWSRegion, "eu-west-1")
+	t.Setenv(envOverrideAllowList,
+		strings.Join([]string{
+			envSecretsConfig, envDev, envDeployment, envAppBinaryName, envAWSRegion,
+		}, ","))
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	before := *cfg
+	metadata, err := LoadStaticSecretMetadata(*cfg)
+	require.NoError(t, err)
+	require.Equal(t, []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}, metadata)
+
+	err = cfg.ApplySSMOverlay(context.Background(), NewSSM(&fakeSSM{params: map[string]string{
+		"/prod/app/env/" + envSecretsConfig: `[{"name":"changed"}]`,
+		"/prod/app/env/" + envDev:           "false",
+		"/prod/app/env/" + envDeployment:    "other",
+		"/prod/app/env/" + envAppBinaryName: "other-app",
+		"/prod/app/env/" + envAWSRegion:     "us-west-2",
+	}}))
+
+	require.NoError(t, err)
+	require.Equal(t, "other-app", os.Getenv(envAppBinaryName))
+	require.Equal(t, `[{"name":"changed"}]`, os.Getenv(envSecretsConfig))
+	require.Equal(
+		t,
+		before,
+		*cfg,
+		"allowlisted environment writes must not replace captured config",
+	)
+	after, err := LoadStaticSecretMetadata(*cfg)
+	require.NoError(t, err)
+	require.Equal(t, metadata, after, "boot must parse the captured secret definitions")
 }
 
 func TestIsDev(t *testing.T) {
@@ -517,8 +606,8 @@ func TestIsDev(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("ENCLAVE_DEV", c.dev)
-			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			t.Setenv(envDev, c.dev)
+			t.Setenv(envDeployment, c.deployment)
 			require.Equal(t, c.want, IsDev())
 		})
 	}

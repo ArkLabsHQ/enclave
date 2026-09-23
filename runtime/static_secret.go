@@ -22,8 +22,8 @@ type StaticSecret struct {
 	Plaintext string
 }
 
-func LoadStaticSecretMetadata() ([]StaticSecretMetadata, error) {
-	raw := getStaticSecretsConfig()
+func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
+	raw := cfg.StaticSecretConfig
 	if raw == "" {
 		return nil, nil
 	}

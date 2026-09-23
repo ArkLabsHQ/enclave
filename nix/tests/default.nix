@@ -227,6 +227,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 

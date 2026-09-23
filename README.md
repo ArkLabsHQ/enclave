@@ -219,10 +219,11 @@ Arguments:
 
 ```nix
 {
-  pkgs,                  # x86_64-linux package set
-  app,                   # package; executable selected with pkgs.lib.getExe
-  env,                   # environment baked into the measurement
-  extraPackages ? [ ],   # additional packages in the enclave rootfs
+  pkgs,                   # x86_64-linux package set
+  app,                    # package; executable selected with pkgs.lib.getExe
+  env,                    # environment baked into the measurement
+  overrideAllowlist ? [ ], # application env vars that SSM may override
+  extraPackages ? [ ],     # additional packages in the enclave rootfs
 }
 ```
 
@@ -234,6 +235,13 @@ Produces a derivation containing `image.eif` and `pcr.json`.
 - `env` is part of the measurement. Changing any value changes PCR0.
   `buildEif` does not currently validate runtime configuration; missing or invalid
   required values fail when the EIF boots.
+- `overrideAllowlist = [ "VAR_FOO" "VAR_BAR" ];` allows SSM to override those
+  application environment variables. It defaults to an empty list and is part of
+  the measurement. `buildEif` joins the names with commas and sets
+  `ENCLAVE_OVERRIDE_ALLOWLIST`; specifying that variable in `env` is an error.
+  The runtime's explicit SSM configuration overrides remain available regardless
+  of this list. Runtime configuration names are reserved; use separate names for
+  application settings. See [SSM environment overlay](#ssm-environment-overlay).
 - The rootfs contains the system CA store and nothing else by default. The
   runtime never shells out. Applications that need `/bin/sh` or other utilities
   must request them: `extraPackages = [ pkgs.busybox ]`.
@@ -295,10 +303,14 @@ to 24 hours in both modes. Set `ENCLAVE_VERIFY_CLOCK_SOURCE` and
 | `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
 | `ENCLAVE_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
 | `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
-| `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
 | `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
+
+The runtime always starts the in-process IMDS forwarder before loading AWS
+credentials. `ENCLAVE_VIPROXY_ENABLED` has been removed; setting it to `false`
+has no effect. The listen and target addresses remain configurable through
+`ENCLAVE_VIPROXY_IN_ADDRS` and `ENCLAVE_VIPROXY_OUT_ADDRS`.
 
 The external TLS listener (443), the internal loopback listener (8080) and the
 host vsock port gvproxy listens on (1024) are fixed. The last of those is
@@ -445,28 +457,41 @@ Constraints:
 ### SSM environment overlay
 
 Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
-with decryption) and exported into the application's environment. This allows
-configuration changes without rebuilding the image.
+with decryption). Application variables are exported only when named in
+`buildEif.overrideAllowlist`, which defaults to an empty list. This allows
+application configuration changes without rebuilding the image.
 
-Eight names are refused, because they define the enclave's identity, its lineage
-or its security posture and can only be changed by rebuilding:
-`ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
-`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
-`ENCLAVE_INSECURE_VERIFY_SKIPPED`, `ENCLAVE_PREVIOUS_PCR0`. `ENCLAVE_DEV`
-selects the KMS lock posture and Object Lock retentions; neither has a separate
-environment-variable override.
-
-Five TLS and ACME settings are read **only** from this overlay, never from the
-baked environment, because TLS is configured before the overlay is applied to
-the application:
+The following names update runtime configuration directly, regardless of the
+allowlist. They are reserved for the runtime: adding them to the allowlist does
+not export them into the application's environment. The runtime explicitly
+passes the final application port to the child as described in
+[Application process environment](#application-process-environment).
 
 | Parameter under `/<deployment>/<app>/env/` | Purpose |
 |---|---|
+| `ENCLAVE_APP_PORT` | Application listen port and runtime proxy target port. |
 | `ENCLAVE_FQDN` | Certificate hostname. |
 | `ENCLAVE_USE_ACME` | `true` switches from self-signed to ACME. |
 | `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
 | `ENCLAVE_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_LOG_GROUP_PREFIX` | Prefix for the runtime's CloudWatch log groups. |
+
+The four ACME settings are read only from this overlay. `ENCLAVE_FQDN` starts
+with the baked value (default `localhost`), which the overlay may replace.
+
+Applications that need the same value must use a separate variable. For example,
+allowlist `APP_PUBLIC_HOSTNAME` and set
+`/prod/wallet/env/APP_PUBLIC_HOSTNAME` to `wallet.example.com` for the app.
+Set `/prod/wallet/env/ENCLAVE_FQDN` separately for the runtime's TLS certificate.
+
+The overlay cannot change the runtime's captured identity, lineage or security
+settings: `ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
+`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
+`ENCLAVE_INSECURE_VERIFY_SKIPPED` and `ENCLAVE_PREVIOUS_PCR0`. Changing those
+runtime settings requires rebuilding the image. `ENCLAVE_DEV` selects the KMS
+lock posture and Object Lock retentions; neither has a separate
+environment-variable override.
 
 The TLS key is generated at genesis, encrypted with KMS, and included in the
 state root. Renewed certificates reuse it. The certificate bucket stores the
@@ -474,8 +499,10 @@ certificate and, when ACME is enabled, the ACME account key.
 
 ### Application process environment
 
-The runtime execs the application with the full runtime environment — including
-the SSM overlay and static secrets — plus:
+The runtime removes each configuration variable from the process environment
+as it loads it. The application inherits the remaining environment, including
+baked application variables, allowlisted SSM application overrides and static
+secrets, plus these explicit runtime exports:
 
 | Variable | Value |
 |---|---|

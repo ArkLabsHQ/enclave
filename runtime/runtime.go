@@ -51,12 +51,12 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
-	aws, err := NewAWSClient(ctx)
+	aws, err := NewAWSClient(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 	ssm := NewSSM(aws.SSM)
-	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+	if err := cfg.ApplySSMOverlay(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
@@ -188,7 +188,7 @@ type execApp struct {
 }
 
 func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + getAppBinaryName()
+	appPath := "/app/" + cfg.AppBinaryName
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout

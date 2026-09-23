@@ -8,8 +8,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,16 +30,6 @@ func verifyAttestationUserData(
 		return fmt.Errorf("attested user data does not match expected user data")
 	}
 	return nil
-}
-
-// envMu serializes process env writes.
-var envMu sync.Mutex
-
-// safeSetenv wraps os.Setenv under envMu to prevent concurrent env mutations.
-func safeSetenv(key, value string) error {
-	envMu.Lock()
-	defer envMu.Unlock()
-	return os.Setenv(key, value)
 }
 
 // generateRuntimeToken returns a 32-byte hex bearer token.

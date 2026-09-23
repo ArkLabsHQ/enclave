@@ -11,7 +11,7 @@ import (
 
 // StaticSecretMetadata defines a secret managed by KMS inside the enclave runtime
 // (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
-// into the configured env var, which the child app inherits via os.Environ().
+// into the configured env var only in the child app's environment.
 type StaticSecretMetadata struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
@@ -33,16 +33,6 @@ func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
 	}
 
 	return secretMeta, nil
-}
-
-func SetStaticSecretEnvVars(secrets []StaticSecret) error {
-	for _, s := range secrets {
-		if err := safeSetenv(s.EnvVar, s.Plaintext); err != nil {
-			return fmt.Errorf("set %s: %w", s.EnvVar, err)
-		}
-	}
-
-	return nil
 }
 
 // ExtendPCRRegistersWithStaticSecrets commits each secret pubkey hash to PCR(16+i).

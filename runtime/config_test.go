@@ -26,6 +26,7 @@ func newTestConfig(deployment, appName string, dev bool) *Config {
 		IntentWriteTimeout: prodIntentWriteTimeout,
 		MigrationCooldown:  defaultMigrationCooldown,
 		ClockSyncInterval:  prodClockSyncInterval,
+		ChildEnv:           make(map[string]string),
 	}
 	if dev {
 		c.KMSLocked = false
@@ -391,9 +392,9 @@ func TestApplySSMOverlay(t *testing.T) {
 			"/dev/app/env/OTHER_PREFIX":    "wrong-deploy",
 		}))
 		require.NoError(t, err)
-		require.Equal(t, "one", os.Getenv("APPLY_FOO"))
-		require.Equal(t, "two", os.Getenv("APPLY_BAR"))
-		require.Empty(t, os.Getenv("OTHER_PREFIX"))
+		require.Equal(t, map[string]string{"APPLY_FOO": "one", "APPLY_BAR": "two"}, cfg.ChildEnv)
+		require.Empty(t, os.Getenv("APPLY_FOO"))
+		require.Empty(t, os.Getenv("APPLY_BAR"))
 	})
 
 	t.Run("updates mutable runtime config", func(t *testing.T) {
@@ -447,8 +448,8 @@ func TestApplySSMOverlay(t *testing.T) {
 			path(""):              "empty",
 		}))
 		require.NoError(t, err)
-		require.Equal(t, "ok", os.Getenv("VALID_KEY"))
-		require.Empty(t, os.Getenv("nested/IGNORE"))
+		require.Equal(t, map[string]string{"VALID_KEY": "ok"}, cfg.ChildEnv)
+		require.Empty(t, os.Getenv("VALID_KEY"))
 	})
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
@@ -489,7 +490,8 @@ func TestApplySSMOverlay(t *testing.T) {
 					*cfg,
 					"the overlay must preserve the loaded security settings",
 				)
-				require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
+				require.Equal(t, map[string]string{"SAFE_KEY": "ok"}, cfg.ChildEnv)
+				require.Empty(t, os.Getenv("SAFE_KEY"))
 			})
 		}
 	})
@@ -504,7 +506,7 @@ func TestApplySSMOverlayAllowlist(t *testing.T) {
 	for _, tc := range []struct {
 		name, allowlist, wantAllowed, wantSecond, wantAllowlistEnv string
 	}{
-		{name: "empty rejects application overrides", wantAllowed: "baked", wantSecond: "baked"},
+		{name: "empty rejects application overrides"},
 		{
 			name:        "comma separated names are trimmed and deduplicated",
 			allowlist:   " APP_ALLOWED , APP_SECOND , APP_ALLOWED ",
@@ -513,7 +515,7 @@ func TestApplySSMOverlayAllowlist(t *testing.T) {
 		{
 			name:        "overlay cannot expand the loaded allowlist",
 			allowlist:   "APP_ALLOWED," + envOverrideAllowList,
-			wantAllowed: "one", wantSecond: "baked", wantAllowlistEnv: "APP_BLOCKED",
+			wantAllowed: "one", wantAllowlistEnv: "APP_BLOCKED",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -539,10 +541,14 @@ func TestApplySSMOverlayAllowlist(t *testing.T) {
 			)
 
 			require.NoError(t, err)
-			require.Equal(t, tc.wantAllowed, os.Getenv("APP_ALLOWED"))
-			require.Equal(t, tc.wantSecond, os.Getenv("APP_SECOND"))
-			require.Equal(t, "baked", os.Getenv("APP_BLOCKED"))
-			require.Equal(t, tc.wantAllowlistEnv, os.Getenv(envOverrideAllowList))
+			require.Equal(t, tc.wantAllowed, cfg.ChildEnv["APP_ALLOWED"])
+			require.Equal(t, tc.wantSecond, cfg.ChildEnv["APP_SECOND"])
+			require.NotContains(t, cfg.ChildEnv, "APP_BLOCKED")
+			require.Equal(t, tc.wantAllowlistEnv, cfg.ChildEnv[envOverrideAllowList])
+			for _, key := range []string{"APP_ALLOWED", "APP_SECOND", "APP_BLOCKED"} {
+				require.Equal(t, "baked", os.Getenv(key))
+			}
+			require.Empty(t, os.Getenv(envOverrideAllowList))
 			require.False(t, cfg.OverrideAllowList["APP_BLOCKED"])
 			require.Equal(t, "overlay.example.com", cfg.FQDN,
 				"explicit runtime overrides do not require an application allowlist entry")
@@ -576,8 +582,10 @@ func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
 	}}))
 
 	require.NoError(t, err)
-	require.Equal(t, "other-app", os.Getenv(envAppBinaryName))
-	require.Equal(t, `[{"name":"changed"}]`, os.Getenv(envSecretsConfig))
+	require.Equal(t, "other-app", cfg.ChildEnv[envAppBinaryName])
+	require.Equal(t, `[{"name":"changed"}]`, cfg.ChildEnv[envSecretsConfig])
+	require.Empty(t, os.Getenv(envAppBinaryName))
+	require.Empty(t, os.Getenv(envSecretsConfig))
 	require.Equal(
 		t,
 		before,

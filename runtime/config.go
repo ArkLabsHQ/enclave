@@ -151,6 +151,7 @@ type Config struct {
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
+	ChildEnv          map[string]string
 }
 
 // LoadConfig captures runtime configuration and unsets each environment variable
@@ -201,6 +202,7 @@ func LoadConfig() (*Config, error) {
 		InsecureVerifySkipped: false,
 		KMSLocked:             true,
 		OverrideAllowList:     make(map[string]bool),
+		ChildEnv:              make(map[string]string),
 	}
 
 	if IsDev() {
@@ -314,9 +316,8 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
 				continue
 			}
-			if err := safeSetenv(key, p.Value); err != nil {
-				return fmt.Errorf("setenv %s: %w", key, err)
-			}
+
+			c.ChildEnv[key] = p.Value
 		}
 		applied++
 	}

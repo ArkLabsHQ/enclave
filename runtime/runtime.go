@@ -1,4 +1,4 @@
-// Package runtime boots the in-enclave supervisor: networking, servers, TLS, AWS state, and app process.
+// Package runtime boots the in-enclave runtime: networking, servers, TLS, AWS state, and app process.
 package runtime
 
 import (

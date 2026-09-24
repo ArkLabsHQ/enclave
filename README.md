@@ -353,7 +353,7 @@ Log groups are named `<prefix>/<deployment>/enclave/<signal>/<source>`, where
 | Log group | Holds |
 |---|---|
 | `<prefix>/<deployment>/enclave/logs/app` | The application's OTLP log records. |
-| `<prefix>/<deployment>/enclave/logs/supervisor` | The runtime's own records. |
+| `<prefix>/<deployment>/enclave/logs/runtime` | The runtime's own records. |
 
 At boot, the runtime creates both groups and one stream per group named after
 the EC2 instance ID, applies retention, and writes a probe record. Failure to

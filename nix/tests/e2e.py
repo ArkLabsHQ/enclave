@@ -194,7 +194,7 @@ log_groups = cloud(
 ).split()
 assert sorted(log_groups) == [
     f"{LOG_PREFIX}/logs/app",
-    f"{LOG_PREFIX}/logs/supervisor",
+    f"{LOG_PREFIX}/logs/runtime",
 ], log_groups
 streams = cloud(
     f"logs describe-log-streams --log-group-name {LOG_PREFIX}/logs/app "
@@ -231,7 +231,7 @@ def wait_for_otlp(signal, needle, group=None, timeout=90):
 
 
 wait_for_otlp("logs", "handled health", f"{LOG_PREFIX}/logs/app")
-wait_for_otlp("logs", "child started", f"{LOG_PREFIX}/logs/supervisor")
+wait_for_otlp("logs", "child started", f"{LOG_PREFIX}/logs/runtime")
 wait_for_otlp("traces", '"name":"health"')
 wait_for_otlp("traces", '"name":"init"')
 wait_for_otlp("metrics", "testapp_requests_total")

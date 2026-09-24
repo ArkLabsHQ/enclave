@@ -41,7 +41,7 @@ type signal int
 
 const (
 	signalAppLogs signal = iota
-	signalSupervisorLogs
+	signalRuntimeLogs
 	signalCount
 )
 
@@ -128,8 +128,8 @@ var (
 const maxRelayBody = 64 << 10
 
 var signalNames = [signalCount]string{
-	signalAppLogs:        "logs/app",
-	signalSupervisorLogs: "logs/supervisor",
+	signalAppLogs:     "logs/app",
+	signalRuntimeLogs: "logs/runtime",
 }
 
 func (s signal) String() string {
@@ -221,7 +221,7 @@ func (t *Telemetry) Start(ctx context.Context) error {
 	}
 	if err := t.probe(ctx); err != nil {
 		return fmt.Errorf(
-			"failed to start %s cloudwatch export: %w", signalSupervisorLogs, err)
+			"failed to start %s cloudwatch export: %w", signalRuntimeLogs, err)
 	}
 	if err := t.startProviders(ctx); err != nil {
 		return fmt.Errorf("start telemetry exporters: %w", err)
@@ -254,7 +254,7 @@ func (t *Telemetry) startProviders(ctx context.Context) error {
 		otlploghttp.WithEndpointURL(logsEndpoint.base+otlpLogs.path),
 		otlploghttp.WithHTTPClient(logsEndpoint.client),
 		otlploghttp.WithHeaders(map[string]string{
-			"x-aws-log-group":  t.groups[signalSupervisorLogs],
+			"x-aws-log-group":  t.groups[signalRuntimeLogs],
 			"x-aws-log-stream": t.instanceID,
 		}),
 	)
@@ -384,7 +384,7 @@ func (t *Telemetry) forwardHandler(route otlpRoute) http.HandlerFunc {
 
 // probe verifies logs:PutLogEvents before the application starts.
 func (t *Telemetry) probe(ctx context.Context) error {
-	group := t.groups[signalSupervisorLogs]
+	group := t.groups[signalRuntimeLogs]
 	now := uint64(time.Now().UnixNano())
 	body, err := proto.Marshal(&collogspb.ExportLogsServiceRequest{
 		ResourceLogs: []*logspb.ResourceLogs{{

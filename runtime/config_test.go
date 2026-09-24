@@ -596,27 +596,3 @@ func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, metadata, after, "boot must parse the captured secret definitions")
 }
-
-func TestIsDev(t *testing.T) {
-	cases := []struct {
-		name            string
-		dev, deployment string
-		want            bool
-	}{
-		{"ENCLAVE_DEV=true is dev", "true", "prod", true},
-		{"ENCLAVE_DEV case-insensitive", "TRUE", "prod", true},
-		{"ENCLAVE_DEV mixed case", "True", "prod", true},
-		{"ENCLAVE_DEV trims whitespace", "  true  ", "prod", true},
-		{"ENCLAVE_DEV=false is not dev", "false", "dev", false},
-		{"unset is not dev regardless of deployment", "", "dev", false},
-		{"ENCLAVE_DEV=1 is not dev", "1", "dev", false},
-		{"ENCLAVE_DEV=yes is not dev", "yes", "dev", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Setenv(envDev, c.dev)
-			t.Setenv(envDeployment, c.deployment)
-			require.Equal(t, c.want, IsDev())
-		})
-	}
-}

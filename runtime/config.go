@@ -205,7 +205,7 @@ func LoadConfig() (*Config, error) {
 		ChildEnv:              make(map[string]string),
 	}
 
-	if IsDev() {
+	if takeEnv(envDev) == "true" {
 		cfg.KMSLocked = false
 		cfg.GenesisRetention = devGenesisRetention
 		cfg.IntentRetention = devIntentRetention
@@ -515,13 +515,6 @@ func takeEnvDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func IsDev() bool {
-	if v := takeEnv(envDev); v != "" {
-		return strings.EqualFold(v, "true")
-	}
-	return false
 }
 
 func logShipInterval() time.Duration {

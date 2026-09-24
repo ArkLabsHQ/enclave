@@ -319,83 +319,79 @@ The runtime hard-steps the clock onto the PTP hardware clock at startup, then
 runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
 another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
 
-### Logging and tracing
+### Telemetry
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
-| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
+| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Export cadence for the runtime's own logs, spans and metrics. The application's cadence is its own exporter's. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
 | `ENCLAVE_LOG_GROUP_PREFIX` | none | Optional segments placed before the deployment: `/ark/se7enz/emulator` yields `/ark/se7enz/emulator/<deployment>/enclave/...`. The value is cleaned as a path: a missing leading `/` is added, repeated and trailing `/` collapse, and `.` and `..` segments resolve. Anything CloudWatch would refuse fails the boot. Settable from the SSM overlay. |
+
+The application posts OTLP/HTTP to the internal listener. The runtime signs
+each request with the instance role, forwards its body unchanged, and returns
+the AWS response:
+
+| Signal | Endpoint | Signed as | Lands in |
+|---|---|---|---|
+| logs | `logs.<region>.amazonaws.com/v1/logs` | `logs` | The log groups below, in the stream named for the instance. |
+| traces | `xray.<region>.amazonaws.com/v1/traces` | `xray` | X-Ray, in the `aws/spans` log group Transaction Search owns. |
+| metrics | `monitoring.<region>.amazonaws.com/v1/metrics` | `monitoring` | The CloudWatch OpenTelemetry metrics store, queried with PromQL. |
+
+The relay accepts `application/x-protobuf` and `application/json`, including
+`gzip`, and caps encoded request bodies at 1 MiB for logs and metrics and 5 MiB
+for traces. AWS applies its decoded size, record count and timestamp limits. The
+runtime does not decode or retry uploads; it returns the AWS status,
+`Retry-After` and response body to the application exporter.
+
+The runtime exports its own telemetry with the OpenTelemetry SDK and identifies
+it with the `service.name=enclave-runtime` resource.
 
 Log groups are named `<prefix>/<deployment>/enclave/<signal>/<source>`, where
 `<prefix>` is `ENCLAVE_LOG_GROUP_PREFIX` and is empty by default:
 
 | Log group | Holds |
 |---|---|
-| `<prefix>/<deployment>/enclave/logs/app` | The application's OTLP log ingest. |
+| `<prefix>/<deployment>/enclave/logs/app` | The application's OTLP log records. |
 | `<prefix>/<deployment>/enclave/logs/supervisor` | The runtime's own records. |
-| `<prefix>/<deployment>/enclave/traces/app` | The application's OTLP spans. |
-| `<prefix>/<deployment>/enclave/traces/supervisor` | The runtime's own spans. |
-| `<prefix>/<deployment>/enclave/metrics` | The periodic snapshot, covering both. |
 
-The nesting is what makes both sources reachable at once: a
-`--log-group-name-prefix <prefix>/<deployment>/enclave/logs` query returns app and
-supervisor together, and CloudWatch Logs Insights accepts both groups in one query.
-Metrics are not split because the snapshot is a single document describing the whole
-enclave.
-
-Within each group the stream is named for the EC2 instance hosting the enclave, read
-from IMDS at startup. One stream per instance, shared by every batch and every signal,
-so a restart appends to the stream it was already writing instead of opening a new one,
-and each instance in a fleet stays separable. The instance ID survives reboots and
-stop/start, so only replacing the instance starts a new stream. IMDS is therefore a
-boot dependency: the runtime refuses to start, naming the IMDS failure, when it cannot
-read an instance ID, because without one there is no stream to ship to.
+At boot, the runtime creates both groups and one stream per group named after
+the EC2 instance ID, applies retention, and writes a probe record. Failure to
+read the instance ID from IMDS or write the probe aborts startup. Restarts on the
+same instance reuse its streams.
 
 The group path carries no `<app>` segment: `ENCLAVE_APP_NAME` still namespaces all SSM
 state, but not the log groups. Two applications sharing one deployment therefore share
 these groups unless `ENCLAVE_LOG_GROUP_PREFIX` distinguishes them.
 
-**Changed:** the runtime's own records used to share `/enclave/<deployment>/<app>/logs`
-and `.../traces` with the application's, distinguished only by each record's `source`
-field. Every group name has changed, and so have the counters that describe them.
-Alarms and dashboards keyed on the old names stop matching until they are updated:
+Spans require Transaction Search and metrics require
+`cloudwatch:PutMetricData`. Export failures are counted in
+`enclave_telemetry_export_errors_total`, rate limited on `stderr`, and do not
+abort startup. Metrics are queried with PromQL by their OTLP attributes.
 
-| Before | After |
-|---|---|
-| `enclave_log_entries_total`, every record | `enclave_log_entries_total`, application records only, plus `enclave_supervisor_log_entries_total` for the runtime's |
-| `enclave_telemetry_logs_dropped_total` | `enclave_telemetry_logs_app_dropped_total` and `enclave_telemetry_logs_supervisor_dropped_total` |
-| `enclave_telemetry_traces_dropped_total` | `enclave_telemetry_traces_app_dropped_total` and `enclave_telemetry_traces_supervisor_dropped_total` |
-| `enclave_telemetry_metrics_dropped_total` | unchanged |
+The runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
+`enclave_http_errors_total`, `enclave_app_proxied_requests_total`,
+`enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`,
+`enclave_otlp_<logs|traces|metrics>_upstream_errors_total` (a transport failure, a
+`429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
+and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
+
+**Changed:** trace and metric log groups and the local telemetry decoder were
+removed. Logs remain in the two groups above; spans and metrics use their native
+AWS stores. Records no longer contain the runtime-added `id`, `level` or
+`source` fields. The old entry and dropped-record counters were also removed,
+so affected alarms and dashboards need updating.
 
 `stderr` is unaffected: it still carries every runtime record, unbatched.
-
-The app's OTLP metric names are retained for the life of the enclave, so they are
-bounded by a 192 KiB budget of serialized size rather than by a name count: each
-name is charged the length of its JSON-encoded key, so escaping is paid for, plus
-a fixed allowance for the colon, comma and value that follow it. That admits roughly 4000
-twenty-byte names, 690 of 256 bytes, or a single name too large to afford at all,
-and keeps the snapshot inside the 256 KiB event limit at every name length. Past the budget new names are refused while names already
-stored keep updating, and every refusal is counted in
-`enclave_app_metrics_dropped_total`. The bound matters because the snapshot ships
-as a single event: an unbounded map would eventually exceed that limit and
-silently end all metrics shipping, the enclave's own counters included. OTLP log
-and span uploads are separately capped at 10000 records per request, answered
-with `413` above that.
-
-Events timestamped more than an hour from now, either direction, are dropped on
-arrival, as are events over 256 KiB. Both are enclave policy, stricter than AWS
-requires. The narrow timestamp window keeps normally produced batches well
-inside the 24-hour span `PutLogEvents` rejects wholesale. An application that
-deliberately ships backdated telemetry will lose it.
 
 ### AWS endpoint overrides
 
 `AWS_ENDPOINT_URL_KMS`, `AWS_ENDPOINT_URL_SSM`, `AWS_ENDPOINT_URL_STS`,
-`AWS_ENDPOINT_URL_S3`, and `AWS_ENDPOINT_URL_LOGS` override the corresponding
-service endpoints. Setting the S3 endpoint also forces path-style addressing.
-These exist for testing against an emulator.
+`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_LOGS`, `AWS_ENDPOINT_URL_XRAY` and
+`AWS_ENDPOINT_URL_MONITORING` override the corresponding service endpoints.
+`AWS_ENDPOINT_URL_LOGS` covers both the CloudWatch Logs API and its OTLP `/v1/logs`
+path, since they share an endpoint in production. Setting the S3 endpoint also
+forces path-style addressing. These exist for testing against an emulator.
 
 ### Static secrets
 
@@ -464,8 +460,8 @@ the SSM overlay and static secrets — plus:
 | `ENCLAVE_PROXY_PORT` | the internal API port, default `8080` |
 | `ENCLAVE_RUNTIME_TOKEN` | a 32-byte hex bearer token, regenerated each boot |
 
-`ENCLAVE_RUNTIME_TOKEN` authenticates the application to the runtime's telemetry
-ingest endpoints. `stdout` and `stderr` are inherited.
+`ENCLAVE_RUNTIME_TOKEN` authenticates the application to the runtime's OTLP
+forwarders on the internal listener. `stdout` and `stderr` are inherited.
 
 ### SSM parameters
 
@@ -516,15 +512,11 @@ preflight to any path in that namespace is answered `204` by the runtime.
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
 | GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
-| POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
-| POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
-| POST | `/enclave/v1/traces` | bearer | OTLP protobuf spans ingest, 1 MiB limit. |
 | any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
 
-Telemetry is ingest-only. It ships to CloudWatch and is never read back through
-the runtime, so a compromised enclave has no history to serve.
-
-Bearer endpoints expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`.
+Telemetry is forwarded, never stored. The OTLP forwarders live on the internal
+listener only, since they sign with the instance role, and nothing is read back
+through the runtime, so a compromised enclave has no history to serve.
 
 The complete `/enclave` namespace is reserved for runtime APIs. Unknown
 non-preflight paths beneath it return the runtime's `404` response, and no
@@ -570,12 +562,12 @@ PCR0/key identity stops the walk and is reported through `complete` and
 
 ### Internal listener, TCP 127.0.0.1:8080
 
-Serves `/v1/metrics`, `/v1/logs`, `/v1/traces`, and `/health` only, with the
-same handlers and authentication. The HTTP method selects metric, log, and trace
-ingest (POST) or readback (GET).
-This is the endpoint advertised to the application through
-`ENCLAVE_PROXY_PORT`. It does not serve `/enclave/v1/info`, the `/enclave/*`
-endpoints, or the application proxy.
+Serves `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces` and `GET /health`
+only. The three forwarders expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`,
+accept OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
+`gzip`-encoded, and answer with whatever AWS answered. This is the endpoint
+advertised to the application through `ENCLAVE_PROXY_PORT`. It does not serve
+`/enclave/v1/info`, the `/enclave/*` endpoints, or the application proxy.
 
 ## Deployment
 
@@ -624,7 +616,9 @@ AWS credentials delivered through IMDS must allow:
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
-| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/*` (`/<deployment>/enclave/*` by default). A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/*` (`/<deployment>/enclave/*` by default). The OTLP `/v1/logs` endpoint authorises as `PutLogEvents` on the same group ARNs. A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
+| `XRayAccess` | `xray:PutSpans`, `xray:PutSpansForIndexing` and `xray:PutTraceSegments` on `*`, plus Transaction Search enabled on the account. Without them every span export is refused; the enclave still boots and counts the refusals. |
+| `CloudWatchMetricsAccess` | `cloudwatch:PutMetricData` on `*`. Without it every metric export is refused; the enclave still boots and counts the refusals. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned
@@ -940,8 +934,8 @@ nix flake check --print-build-logs 2>&1 |
 
 ### E2E boundaries
 
-The e2e test uses three ordinary NixOS test nodes. `aws` runs the AWS emulator,
-the attestation-aware KMS `Recipient` proxy, IMDS, and ACME fixtures. `blue` and
+The e2e test uses three NixOS nodes. `aws` runs the AWS emulator, KMS
+`Recipient` proxy, IMDS, ACME fixtures and an OTLP receiver. `blue` and
 `green` launch measured EIFs with QEMU's `nitro-enclave` machine and
 `vhost-device-vsock`.
 
@@ -999,20 +993,17 @@ selects the SSM namespace; values such as `dev` and `prod` do not control
 verification. Both settings are baked into the measurement and cannot be
 overridden from SSM.
 
-**CloudWatch is a hard boot dependency.** Each stream is created *and written to*
-before the application starts, and a failure aborts the boot. The write matters:
-creating a log group proves nothing about being able to put events into it, so a
-role missing `logs:PutLogEvents` would otherwise boot clean and lose everything
-silently. An enclave whose telemetry goes
-nowhere cannot be audited, so it does not run. The trade is that a CloudWatch
-outage or a missing `CloudWatchLogsAccess` statement becomes an availability
-outage rather than a silent gap in the record.
+**CloudWatch Logs is a hard boot dependency.** Before starting the application,
+the runtime creates both log groups and streams and writes a probe through the
+OTLP endpoint. Any failure aborts startup. Span and metric export failures are
+reported but are not fatal.
 
-**Telemetry is not readable from the enclave.** Logs and spans are shipped and
-forgotten; there is no queryable history and no endpoint that reads one back. The runtime's
-IAM statement is write-only for the same reason, so a host that compromises the
-enclave recovers neither a buffered window of application logs nor the ability to
-query what was already shipped.
+**Telemetry is not readable from the enclave.** Uploads are forwarded without
+local history or read endpoints. The telemetry IAM permissions are write-only.
+
+**The forwarders are a signed proxy.** `ENCLAVE_RUNTIME_TOKEN` authorizes OTLP
+uploads signed with the instance role. The token is generated per boot and the
+forwarders are available only on the loopback listener.
 
 **Clients must pin PCR0.** `client.New` refuses to construct a client without
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is

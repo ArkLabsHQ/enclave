@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/hf/nsm"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
 func verifyAttestationUserData(
@@ -61,56 +60,6 @@ func secureRandom(b []byte) (int, error) {
 	}
 	defer func() { _ = session.Close() }()
 	return session.Read(b)
-}
-
-func anyValueToGo(v *commonpb.AnyValue) any {
-	if v == nil {
-		return nil
-	}
-	switch val := v.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		return val.StringValue
-	case *commonpb.AnyValue_IntValue:
-		return val.IntValue
-	case *commonpb.AnyValue_DoubleValue:
-		return val.DoubleValue
-	case *commonpb.AnyValue_BoolValue:
-		return val.BoolValue
-	case *commonpb.AnyValue_BytesValue:
-		return fmt.Sprintf("%x", val.BytesValue)
-	case *commonpb.AnyValue_ArrayValue:
-		if val.ArrayValue == nil {
-			return nil
-		}
-		result := make([]any, len(val.ArrayValue.Values))
-		for i, item := range val.ArrayValue.Values {
-			result[i] = anyValueToGo(item)
-		}
-		return result
-	case *commonpb.AnyValue_KvlistValue:
-		if val.KvlistValue == nil {
-			return nil
-		}
-		result := make(map[string]any, len(val.KvlistValue.Values))
-		for _, kv := range val.KvlistValue.Values {
-			result[kv.Key] = anyValueToGo(kv.Value)
-		}
-		return result
-	default:
-		return nil
-	}
-}
-
-func anyValueToString(v *commonpb.AnyValue) string {
-	if v == nil {
-		return ""
-	}
-	switch val := v.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		return val.StringValue
-	default:
-		return fmt.Sprintf("%v", anyValueToGo(v))
-	}
 }
 
 // prefix16 truncates a string to at most 16 characters for less noisy log fields.

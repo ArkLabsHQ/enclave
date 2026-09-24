@@ -1,4 +1,4 @@
-// Package runtime boots the in-enclave supervisor: networking, servers, TLS, AWS state, and app process.
+// Package runtime boots the in-enclave runtime: networking, servers, TLS, AWS state, and app process.
 package runtime
 
 import (
@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 )
 
@@ -61,14 +62,14 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	cfg.InstanceID = aws.InstanceID
-	telemetry := NewTelemetry(&cfg, aws.CWL)
+	telemetry := NewTelemetry(&cfg, aws)
 	if err := telemetry.Start(ctx); err != nil {
 		return err
 	}
 
 	defer telemetry.Shutdown()
 
-	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
+	ctx, initSpan := otel.Tracer(runtimeService).Start(ctx, "init")
 	initSpanEnded := false
 
 	defer func() {

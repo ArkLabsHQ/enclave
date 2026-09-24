@@ -1,12 +1,18 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"sort"
+	"maps"
+	"net/http"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,25 +20,116 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 type signal int
 
 const (
 	signalAppLogs signal = iota
-	signalSupervisorLogs
-	signalAppTraces
-	signalSupervisorTraces
-	signalMetrics
+	signalRuntimeLogs
 	signalCount
 )
 
+type otlpRequest struct {
+	contentType     string
+	contentEncoding string
+	group           string
+	body            []byte
+}
+
+type otlpEndpoint uint8
+
+const (
+	otlpEndpointInvalid otlpEndpoint = iota
+	otlpEndpointLogs
+	otlpEndpointTraces
+	otlpEndpointMetrics
+	otlpEndpointCount
+)
+
+type otlpRoute struct {
+	name     string
+	service  string
+	path     string
+	maxBody  int64
+	endpoint otlpEndpoint
+
+	metricForwarded string
+	metricErrors    string
+}
+
+var (
+	otlpLogs = otlpRoute{
+		name: "logs", service: "logs", path: "/v1/logs", maxBody: 1 << 20,
+		endpoint:        otlpEndpointLogs,
+		metricForwarded: "enclave_otlp_logs_forwarded_total",
+		metricErrors:    "enclave_otlp_logs_upstream_errors_total",
+	}
+	otlpTraces = otlpRoute{
+		name: "traces", service: "xray", path: "/v1/traces", maxBody: 5 << 20,
+		endpoint:        otlpEndpointTraces,
+		metricForwarded: "enclave_otlp_traces_forwarded_total",
+		metricErrors:    "enclave_otlp_traces_upstream_errors_total",
+	}
+	otlpMetrics = otlpRoute{
+		name: "metrics", service: "monitoring", path: "/v1/metrics", maxBody: 1 << 20,
+		endpoint:        otlpEndpointMetrics,
+		metricForwarded: "enclave_otlp_metrics_forwarded_total",
+		metricErrors:    "enclave_otlp_metrics_upstream_errors_total",
+	}
+)
+
+const (
+	metricHTTPRequests          = "enclave_http_requests_total"
+	metricHTTPErrors            = "enclave_http_errors_total"
+	metricAppProxiedRequests    = "enclave_app_proxied_requests_total"
+	metricAppProxiedErrors      = "enclave_app_proxied_errors_total"
+	metricTelemetryExportErrors = "enclave_telemetry_export_errors_total"
+)
+
+const runtimeMetricPrefix = "enclave_runtime_"
+
+var (
+	runtimeGauges = []string{
+		runtimeMetricGoroutines,
+		runtimeMetricNumCPU,
+		runtimeMetricHeapAllocBytes,
+		runtimeMetricHeapSysBytes,
+		runtimeMetricSysBytes,
+		runtimeMetricMemTotalKB,
+		runtimeMetricMemFreeKB,
+		runtimeMetricMemAvailableKB,
+	}
+	runtimeCounters = []string{
+		runtimeMetricGCPauseTotalNS,
+		runtimeMetricGCCount,
+		runtimeMetricCPUUser,
+		runtimeMetricCPUNice,
+		runtimeMetricCPUSystem,
+		runtimeMetricCPUIdle,
+	}
+)
+
+const maxRelayBody = 64 << 10
+
 var signalNames = [signalCount]string{
-	signalAppLogs:          "logs/app",
-	signalSupervisorLogs:   "logs/supervisor",
-	signalAppTraces:        "traces/app",
-	signalSupervisorTraces: "traces/supervisor",
-	signalMetrics:          "metrics",
+	signalAppLogs:     "logs/app",
+	signalRuntimeLogs: "logs/runtime",
 }
 
 func (s signal) String() string {
@@ -43,357 +140,428 @@ func (s signal) String() string {
 }
 
 const (
-	// telemetryQueue bounds what may be in flight before events are dropped.
-	telemetryQueue = 1000
+	runtimeService = "enclave-runtime"
 
-	telemetryBatch = 250
-	// shutdownFlushTimeout bounds the last flush after the context ends.
 	shutdownFlushTimeout = 5 * time.Second
 
-	maxBatchBytes = 1_048_576
-	maxEventBytes = 262_144
-	// eventOverhead is the per-event allowance AWS adds to the message size.
-	eventOverhead = 26
-
-	maxEventAge    = time.Hour
-	maxEventFuture = time.Hour
-
-	maxFlushAttempts = 3
-	maxOTLPRecords   = 10_000
-	maxFlushBackoff  = 5 * time.Minute
+	exportErrorLogInterval = 30 * time.Second
 )
 
-var (
-	errFlushBackoff   = errors.New("cloudwatch flush waiting out backoff")
-	errTooManyRecords = errors.New("too many records in one request")
-)
-
-type stream struct {
-	group  string
-	name   string
-	events chan cwltypes.InputLogEvent
-}
-
+// Telemetry forwards application and runtime telemetry to AWS.
 type Telemetry struct {
-	Metrics *Metrics
-	Logging *Logging
-	Tracing *Tracing
+	counters map[string]metric.Int64Counter
 
 	cw            CloudWatchLogsAPI
-	streams       [signalCount]*stream
+	groups        [signalCount]string
+	instanceID    string
 	shipInterval  time.Duration
 	retentionDays int32
+	res           *resource.Resource
 
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	endpoints [otlpEndpointCount]otlpClient
+
+	stderr    io.Writer
+	stderrLog *slog.Logger
+
+	lp *sdklog.LoggerProvider
+	tp *sdktrace.TracerProvider
+	mp *sdkmetric.MeterProvider
+
+	errMu       sync.Mutex
+	lastErrorAt time.Time
+
+	shutdownOnce sync.Once
 }
 
-// NewTelemetry wires every signal in dependency order.
-func NewTelemetry(cfg *Config, cw CloudWatchLogsAPI) *Telemetry {
+func NewTelemetry(cfg *Config, client *AWSClient) *Telemetry {
 	t := &Telemetry{
-		cw: cw, shipInterval: cfg.LogShipInterval, retentionDays: cfg.LogRetentionDays,
+		instanceID:    cfg.InstanceID,
+		shipInterval:  cfg.LogShipInterval,
+		retentionDays: cfg.LogRetentionDays,
+		stderr:        os.Stderr,
+		res: resource.NewSchemaless(
+			attribute.String("service.name", runtimeService),
+			attribute.String("service.version", Version),
+			attribute.String("deployment.environment", cfg.Deployment),
+			attribute.String("host.id", cfg.InstanceID),
+			attribute.String("enclave.app", cfg.AppName),
+		),
 	}
-
-	for sig := signal(0); sig < signalCount; sig++ {
-		t.streams[sig] = &stream{
-			group:  cfg.logGroup(sig),
-			name:   cfg.InstanceID,
-			events: make(chan cwltypes.InputLogEvent, telemetryQueue),
+	if client != nil {
+		t.cw = client.CWL
+		if client.OTLP != nil {
+			t.endpoints[otlpEndpointLogs] = client.OTLP.Logs
+			t.endpoints[otlpEndpointTraces] = client.OTLP.Traces
+			t.endpoints[otlpEndpointMetrics] = client.OTLP.Metrics
 		}
 	}
-
-	t.Metrics = NewMetrics()
-	t.Logging = NewLogging(t, t.Metrics)
-	t.Tracing = NewTracing(t)
+	for sig := signal(0); sig < signalCount; sig++ {
+		t.groups[sig] = cfg.logGroup(sig)
+	}
+	t.stderrLog = slog.New(newSlogHandler(t.stderr, nil))
 	return t
 }
 
+// Start verifies that the runtime can write logs before starting the exporters.
 func (t *Telemetry) Start(ctx context.Context) error {
 	if t.cw == nil {
 		return fmt.Errorf("telemetry: no CloudWatch Logs client")
 	}
-	if t.streams[0].name == "" {
+	if _, err := t.endpoint(otlpLogs); err != nil {
+		return err
+	}
+	if t.instanceID == "" {
 		return fmt.Errorf(
 			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream")
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
-		if err := t.ensureStream(ctx, sig); err != nil {
+		if err := t.ensureGroup(ctx, sig); err != nil {
 			return fmt.Errorf("failed to start %s cloudwatch export: %w", sig, err)
 		}
 	}
-
-	pumpCtx, cancel := context.WithCancel(context.Background())
-	t.cancel = cancel
-	for sig := signal(0); sig < signalCount; sig++ {
-		t.wg.Add(1)
-		go t.pump(pumpCtx, sig)
-		slog.Info("cloudwatch shipper started", "signal", sig.String(),
-			"log_group", t.streams[sig].group, "log_stream", t.streams[sig].name)
+	if err := t.probe(ctx); err != nil {
+		return fmt.Errorf(
+			"failed to start %s cloudwatch export: %w", signalRuntimeLogs, err)
+	}
+	if err := t.startProviders(ctx); err != nil {
+		return fmt.Errorf("start telemetry exporters: %w", err)
 	}
 
-	t.wg.Add(1)
-	go t.shipMetricSnapshots(pumpCtx)
-	slog.SetDefault(slog.New(NewSlogHandler(t.Logging)))
+	slog.SetDefault(slog.New(newSlogHandler(t.stderr, t.lp)))
+	slog.Info("telemetry started",
+		"log_groups", t.groups[:], "log_stream", t.instanceID,
+		"logs", t.endpoints[otlpEndpointLogs].base,
+		"traces", t.endpoints[otlpEndpointTraces].base,
+		"metrics", t.endpoints[otlpEndpointMetrics].base)
 	return nil
 }
 
-func (t *Telemetry) Shutdown() {
-	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(), shutdownFlushTimeout,
-	)
-	defer cancel()
-	if t.Tracing != nil {
-		t.Tracing.Shutdown(shutdownCtx)
-	}
-	t.Send(signalMetrics, time.Now(), t.Metrics.MetricsSnapshot())
-
-	if t.cancel != nil {
-		t.cancel()
-	}
-	t.wg.Wait()
-}
-
-// Dropped is the running count of one signal's lost events.
-func (t *Telemetry) Dropped(sig signal) int64 {
-	return t.Metrics.Counter(droppedMetric(sig))
-}
-
-func (t *Telemetry) Send(sig signal, ts time.Time, payload any) {
-	msg, err := json.Marshal(payload)
+func (t *Telemetry) startProviders(ctx context.Context) error {
+	logsEndpoint, err := t.endpoint(otlpLogs)
 	if err != nil {
-		t.dropN(sig, 1)
-		return
+		return err
+	}
+	tracesEndpoint, err := t.endpoint(otlpTraces)
+	if err != nil {
+		return err
+	}
+	metricsEndpoint, err := t.endpoint(otlpMetrics)
+	if err != nil {
+		return err
 	}
 
-	if len(msg)+eventOverhead > maxEventBytes {
-		t.dropN(sig, 1)
-		slog.Warn("telemetry event too large to ship",
-			"signal", sig.String(), "bytes", len(msg))
-		return
+	logs, err := otlploghttp.New(ctx,
+		otlploghttp.WithEndpointURL(logsEndpoint.base+otlpLogs.path),
+		otlploghttp.WithHTTPClient(logsEndpoint.client),
+		otlploghttp.WithHeaders(map[string]string{
+			"x-aws-log-group":  t.groups[signalRuntimeLogs],
+			"x-aws-log-stream": t.instanceID,
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("logs exporter: %w", err)
 	}
-	select {
-	case t.streams[sig].events <- cwltypes.InputLogEvent{
-		Message:   aws.String(string(msg)),
-		Timestamp: aws.Int64(ts.UnixMilli()),
-	}:
-	default:
-		t.dropN(sig, 1)
+	traces, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpointURL(tracesEndpoint.base+otlpTraces.path),
+		otlptracehttp.WithHTTPClient(tracesEndpoint.client),
+	)
+	if err != nil {
+		return fmt.Errorf("traces exporter: %w", err)
 	}
+	metrics, err := otlpmetrichttp.New(ctx,
+		otlpmetrichttp.WithEndpointURL(metricsEndpoint.base+otlpMetrics.path),
+		otlpmetrichttp.WithHTTPClient(metricsEndpoint.client),
+	)
+	if err != nil {
+		return fmt.Errorf("metrics exporter: %w", err)
+	}
+
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(t.exportFailed))
+	t.lp = sdklog.NewLoggerProvider(
+		sdklog.WithResource(t.res),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(
+			logs, sdklog.WithExportInterval(t.shipInterval),
+		)),
+	)
+	t.tp = sdktrace.NewTracerProvider(
+		sdktrace.WithResource(t.res),
+		sdktrace.WithBatcher(traces, sdktrace.WithBatchTimeout(t.shipInterval)),
+	)
+	t.mp = sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(t.res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
+			metrics, sdkmetric.WithInterval(t.shipInterval),
+		)),
+	)
+	meter := t.mp.Meter(runtimeService)
+	if t.counters == nil {
+		if t.counters, err = newCounters(meter); err != nil {
+			return fmt.Errorf("create runtime counters: %w", err)
+		}
+	}
+	if err := t.registerMetrics(meter); err != nil {
+		return fmt.Errorf("register runtime readings: %w", err)
+	}
+	otel.SetTracerProvider(t.tp)
+	otel.SetMeterProvider(t.mp)
+	return nil
 }
 
-func (t *Telemetry) dropN(sig signal, n int) {
-	if n <= 0 || t.Metrics == nil {
-		return
+// forward preserves the request body so compressed uploads remain compressed.
+func (t *Telemetry) forward(
+	ctx context.Context, route otlpRoute, in otlpRequest,
+) (*http.Response, error) {
+	up, err := t.endpoint(route)
+	if err != nil {
+		return nil, err
 	}
-	t.Metrics.IncBy(droppedMetric(sig), int64(n))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, up.base+route.path, bytes.NewReader(in.body),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", in.contentType)
+	if in.contentEncoding != "" {
+		req.Header.Set("Content-Encoding", in.contentEncoding)
+	}
+	if route.service == otlpLogs.service {
+		req.Header.Set("x-aws-log-group", in.group)
+		req.Header.Set("x-aws-log-stream", t.instanceID)
+	}
+	return up.client.Do(req)
 }
 
-func (t *Telemetry) shipMetricSnapshots(ctx context.Context) {
-	defer t.wg.Done()
-
-	ticker := time.NewTicker(t.shipInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+func (t *Telemetry) forwardHandler(route otlpRoute) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ct := r.Header.Get("Content-Type")
+		if !otlpContentType(ct) {
+			http.Error(w, jsonError("unsupported Content-Type "+strconv.Quote(ct)+
+				": OTLP is application/x-protobuf or application/json"),
+				http.StatusUnsupportedMediaType)
 			return
-		case now := <-ticker.C:
-			t.Send(signalMetrics, now, t.Metrics.MetricsSnapshot())
 		}
-	}
-}
-
-func (t *Telemetry) pump(ctx context.Context, sig signal) {
-	defer t.wg.Done()
-
-	s := t.streams[sig]
-	ticker := time.NewTicker(t.shipInterval)
-	defer ticker.Stop()
-
-	var batch []cwltypes.InputLogEvent
-	pending := 0  // bytes held, against the PutLogEvents size limit
-	failures := 0 // consecutive flush failures for this batch
-	reported := int64(0)
-	backoff := time.Duration(0)
-	var retryAt time.Time
-
-	fits := func(size int) bool { return pending+size <= maxBatchBytes }
-
-	reportDrops := func() {
-		if dropped := t.Dropped(sig); dropped > reported {
-			slog.Warn("cloudwatch shipper dropped events",
-				"signal", sig.String(), "dropped", dropped-reported, "total", dropped)
-			reported = dropped
-		}
-	}
-
-	dropBatch := func() {
-		t.dropN(sig, len(batch))
-		batch, pending, failures = nil, 0, 0
-	}
-
-	// flush returns an error only while a failed batch remains pending. Once the
-	// retry limit sheds that batch, it returns nil because the stream has room
-	// for new events again.
-	flush := func(ctx context.Context) error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if time.Now().Before(retryAt) {
-			return errFlushBackoff
-		}
-		sort.Slice(batch, func(i, j int) bool {
-			return *batch[i].Timestamp < *batch[j].Timestamp
-		})
-
-		out, err := t.cw.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
-			LogGroupName:  aws.String(s.group),
-			LogStreamName: aws.String(s.name),
-			LogEvents:     batch,
-		})
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, route.maxBody))
 		if err != nil {
-			failures++
-			backoff = min(max(backoff*2, t.shipInterval), maxFlushBackoff)
-			retryAt = time.Now().Add(backoff)
-			slog.Warn("cloudwatch shipper: PutLogEvents failed", "signal", sig.String(),
-				"error", err, "count", len(batch), "attempt", failures, "retry_in", backoff)
-			if failures >= maxFlushAttempts {
-				dropBatch()
-				return nil
-			}
-			return err
-		}
-
-		if lost := rejectedCount(out.RejectedLogEventsInfo, len(batch)); lost > 0 {
-			t.dropN(sig, lost)
-			slog.Warn("cloudwatch rejected events", "signal", sig.String(), "count", lost)
-		}
-		batch, pending, failures = nil, 0, 0
-		backoff, retryAt = 0, time.Time{}
-		return nil
-	}
-
-	accept := func(ctx context.Context, event cwltypes.InputLogEvent) {
-		now := time.Now()
-		ts := aws.ToInt64(event.Timestamp)
-		if ts < now.Add(-maxEventAge).UnixMilli() || ts > now.Add(maxEventFuture).UnixMilli() {
-			t.dropN(sig, 1)
-			return
-		}
-
-		size := eventBytes(event)
-		if !fits(size) {
-			if err := flush(ctx); err != nil {
-
-				t.dropN(sig, 1)
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, jsonError(fmt.Sprintf("body exceeds %d bytes", route.maxBody)),
+					http.StatusRequestEntityTooLarge)
 				return
 			}
-		}
-		batch = append(batch, event)
-		pending += size
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			final, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx), shutdownFlushTimeout,
-			)
-			for drained := false; !drained; {
-				select {
-				case event := <-s.events:
-					accept(final, event)
-				default:
-					drained = true
-				}
-			}
-			for len(batch) > 0 {
-				err := flush(final)
-				if err == nil {
-					break
-				}
-				if errors.Is(err, errFlushBackoff) || final.Err() != nil {
-					dropBatch()
-					break
-				}
-			}
-			reportDrops()
-			cancel()
+			http.Error(w, jsonError("read body: "+err.Error()), http.StatusBadRequest)
 			return
-		case event := <-s.events:
-			accept(ctx, event)
-			if len(batch) >= telemetryBatch {
-				_ = flush(ctx)
-			}
-		case <-ticker.C:
-			reportDrops()
-			_ = flush(ctx)
 		}
+		t.Inc(route.metricForwarded)
+
+		ctx, cancel := context.WithTimeout(r.Context(), otlpHTTPTimeout)
+		defer cancel()
+		resp, err := t.forward(ctx, route, otlpRequest{
+			contentType:     ct,
+			contentEncoding: r.Header.Get("Content-Encoding"),
+			group:           t.groups[signalAppLogs],
+			body:            body,
+		})
+		if err != nil {
+			t.Inc(route.metricErrors)
+			http.Error(w, jsonError("upstream "+route.service+": "+err.Error()),
+				http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			t.Inc(route.metricErrors)
+		}
+		for _, h := range []string{"Content-Type", "Retry-After", "X-Amzn-Requestid"} {
+			if v := resp.Header.Get(h); v != "" {
+				w.Header().Set(h, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, io.LimitReader(resp.Body, maxRelayBody))
 	}
 }
 
-func (t *Telemetry) ensureStream(ctx context.Context, sig signal) error {
-	s := t.streams[sig]
+// probe verifies logs:PutLogEvents before the application starts.
+func (t *Telemetry) probe(ctx context.Context) error {
+	group := t.groups[signalRuntimeLogs]
+	now := uint64(time.Now().UnixNano())
+	body, err := proto.Marshal(&collogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{{
+			Resource: t.resourceProto(),
+			ScopeLogs: []*logspb.ScopeLogs{{
+				Scope: &commonpb.InstrumentationScope{Name: runtimeService},
+				LogRecords: []*logspb.LogRecord{{
+					TimeUnixNano:         now,
+					ObservedTimeUnixNano: now,
+					SeverityNumber:       logspb.SeverityNumber_SEVERITY_NUMBER_INFO,
+					SeverityText:         "INFO",
+					Body:                 stringAnyValue("telemetry started"),
+				}},
+			}},
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("encode startup record: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, otlpHTTPTimeout)
+	defer cancel()
+	resp, err := t.forward(ctx, otlpLogs, otlpRequest{
+		contentType: "application/x-protobuf", group: group, body: body,
+	})
+	if err != nil {
+		return fmt.Errorf("write to log stream %s via OTLP: %w", group, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("write to log stream %s via OTLP: HTTP %d: %s",
+			group, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
+}
+
+func (t *Telemetry) resourceProto() *resourcepb.Resource {
+	attrs := t.res.Attributes()
+	out := make([]*commonpb.KeyValue, 0, len(attrs))
+	for _, kv := range attrs {
+		out = append(out, &commonpb.KeyValue{
+			Key: string(kv.Key), Value: stringAnyValue(kv.Value.AsString()),
+		})
+	}
+	return &resourcepb.Resource{Attributes: out}
+}
+
+func (t *Telemetry) registerMetrics(meter metric.Meter) error {
+	var observables []metric.Observable
+
+	gauges := make(map[string]metric.Float64ObservableGauge)
+	for _, name := range runtimeGauges {
+		inst, err := meter.Float64ObservableGauge(runtimeMetricPrefix + name)
+		if err != nil {
+			return err
+		}
+		gauges[name] = inst
+		observables = append(observables, inst)
+	}
+	totals := make(map[string]metric.Float64ObservableCounter)
+	for _, name := range runtimeCounters {
+		inst, err := meter.Float64ObservableCounter(runtimeMetricPrefix + name)
+		if err != nil {
+			return err
+		}
+		totals[name] = inst
+		observables = append(observables, inst)
+	}
+
+	_, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		levels := map[string]float64{
+			runtimeMetricGoroutines:     float64(runtime.NumGoroutine()),
+			runtimeMetricNumCPU:         float64(runtime.NumCPU()),
+			runtimeMetricHeapAllocBytes: float64(ms.HeapAlloc),
+			runtimeMetricHeapSysBytes:   float64(ms.HeapSys),
+			runtimeMetricSysBytes:       float64(ms.Sys),
+		}
+		growing := map[string]float64{
+			runtimeMetricGCPauseTotalNS: float64(ms.PauseTotalNs),
+			runtimeMetricGCCount:        float64(ms.NumGC),
+		}
+		// /proc is best effort: absent outside Linux and in some sandboxes.
+		if cpu, err := readProcCPU(); err == nil {
+			maps.Copy(growing, cpu)
+		}
+		if mem, err := readProcMeminfo(); err == nil {
+			maps.Copy(levels, mem)
+		}
+		for name, inst := range gauges {
+			if v, ok := levels[name]; ok {
+				o.ObserveFloat64(inst, v)
+			}
+		}
+		for name, inst := range totals {
+			if v, ok := growing[name]; ok {
+				o.ObserveFloat64(inst, v)
+			}
+		}
+		return nil
+	}, observables...)
+	return err
+}
+
+func (t *Telemetry) Inc(name string) {
+	if counter, ok := t.counters[name]; ok {
+		counter.Add(context.Background(), 1)
+	}
+}
+
+// exportFailed writes directly to stderr to avoid recursively exporting the error.
+func (t *Telemetry) exportFailed(err error) {
+	t.Inc(metricTelemetryExportErrors)
+
+	t.errMu.Lock()
+	throttled := time.Since(t.lastErrorAt) < exportErrorLogInterval
+	if !throttled {
+		t.lastErrorAt = time.Now()
+	}
+	t.errMu.Unlock()
+	if throttled {
+		return
+	}
+	t.stderrLog.Warn("telemetry export failed", "error", err)
+}
+
+// Shutdown flushes the telemetry providers.
+func (t *Telemetry) Shutdown() {
+	t.shutdownOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+		defer cancel()
+		if t.tp != nil {
+			if err := t.tp.Shutdown(ctx); err != nil {
+				t.exportFailed(fmt.Errorf("tracer provider shutdown: %w", err))
+			}
+		}
+		if t.mp != nil {
+			if err := t.mp.Shutdown(ctx); err != nil {
+				t.exportFailed(fmt.Errorf("meter provider shutdown: %w", err))
+			}
+		}
+		if t.lp != nil {
+			if err := t.lp.Shutdown(ctx); err != nil {
+				t.exportFailed(fmt.Errorf("logger provider shutdown: %w", err))
+			}
+		}
+	})
+}
+
+func (t *Telemetry) ensureGroup(ctx context.Context, sig signal) error {
+	group := t.groups[sig]
 
 	_, err := t.cw.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
-		LogGroupName: aws.String(s.group),
+		LogGroupName: aws.String(group),
 	})
 	if err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("create log group %s: %w", s.group, err)
+		return fmt.Errorf("create log group %s: %w", group, err)
 	}
 
 	_, err = t.cw.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
-		LogGroupName:    aws.String(s.group),
+		LogGroupName:    aws.String(group),
 		RetentionInDays: aws.Int32(t.retentionDays),
 	})
 	if err != nil {
-		slog.Warn("failed to set log retention", "log_group", s.group, "error", err)
+		slog.Warn("failed to set log retention", "log_group", group, "error", err)
 	}
 
 	_, err = t.cw.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{
-		LogGroupName:  aws.String(s.group),
-		LogStreamName: aws.String(s.name),
+		LogGroupName:  aws.String(group),
+		LogStreamName: aws.String(t.instanceID),
 	})
 	if err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("create log stream %s: %w", s.name, err)
-	}
-
-	marker, err := json.Marshal(map[string]string{
-		"event":  "shipper_started",
-		"signal": sig.String(),
-		"stream": s.name,
-	})
-	if err != nil {
-		return fmt.Errorf("encode %s startup marker: %w", sig, err)
-	}
-	if _, err := t.cw.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
-		LogGroupName:  aws.String(s.group),
-		LogStreamName: aws.String(s.name),
-		LogEvents: []cwltypes.InputLogEvent{{
-			Message:   aws.String(string(marker)),
-			Timestamp: aws.Int64(time.Now().UnixMilli()),
-		}},
-	}); err != nil {
-		return fmt.Errorf("write to log stream %s: %w", s.group, err)
+		return fmt.Errorf("create log stream %s: %w", t.instanceID, err)
 	}
 	return nil
-}
-
-// rejectedCount reads how many events a successful PutLogEvents refused anyway.
-func rejectedCount(info *cwltypes.RejectedLogEventsInfo, sent int) int {
-	if info == nil {
-		return 0
-	}
-	// CloudWatch reports the too-old end index as exclusive, but the expired
-	// end index as inclusive.
-	lost := int(aws.ToInt32(info.TooOldLogEventEndIndex))
-	if idx := info.ExpiredLogEventEndIndex; idx != nil {
-		lost += int(*idx) + 1
-	}
-	if idx := info.TooNewLogEventStartIndex; idx != nil {
-		lost += sent - int(*idx)
-	}
-	return lost
 }
 
 func isAlreadyExists(err error) bool {
@@ -401,12 +569,6 @@ func isAlreadyExists(err error) bool {
 	return errors.As(err, &exists)
 }
 
-func eventBytes(e cwltypes.InputLogEvent) int {
-	return len(aws.ToString(e.Message)) + eventOverhead
-}
-
-// jsonError renders {"error": msg} with the message encoded, so a quote or
-// backslash in an error cannot break the body.
 func jsonError(msg string) string {
 	body, err := json.Marshal(map[string]string{"error": msg})
 	if err != nil {
@@ -415,7 +577,45 @@ func jsonError(msg string) string {
 	return string(body)
 }
 
-func droppedMetric(sig signal) string {
-	return fmt.Sprintf(
-		"enclave_telemetry_%s_dropped_total", strings.ReplaceAll(sig.String(), "/", "_"))
+func stringAnyValue(s string) *commonpb.AnyValue {
+	return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: s}}
+}
+
+func otlpContentType(ct string) bool {
+	return strings.HasPrefix(ct, "application/x-protobuf") ||
+		strings.HasPrefix(ct, "application/json")
+}
+
+func newCounters(meter metric.Meter) (map[string]metric.Int64Counter, error) {
+	counters := make(map[string]metric.Int64Counter)
+	for _, name := range counterNames() {
+		counter, err := meter.Int64Counter(name)
+		if err != nil {
+			return nil, err
+		}
+		counters[name] = counter
+	}
+	return counters, nil
+}
+
+func counterNames() []string {
+	return []string{
+		metricHTTPRequests, metricHTTPErrors,
+		metricAppProxiedRequests, metricAppProxiedErrors,
+		metricTelemetryExportErrors,
+		otlpLogs.metricForwarded, otlpLogs.metricErrors,
+		otlpTraces.metricForwarded, otlpTraces.metricErrors,
+		otlpMetrics.metricForwarded, otlpMetrics.metricErrors,
+	}
+}
+
+func (t *Telemetry) endpoint(r otlpRoute) (otlpClient, error) {
+	if r.endpoint <= otlpEndpointInvalid || r.endpoint >= otlpEndpointCount {
+		return otlpClient{}, fmt.Errorf("telemetry: invalid %s endpoint", r.name)
+	}
+	endpoint := t.endpoints[r.endpoint]
+	if endpoint.client == nil {
+		return otlpClient{}, fmt.Errorf("telemetry: no %s endpoint", r.name)
+	}
+	return endpoint, nil
 }

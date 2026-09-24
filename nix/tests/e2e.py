@@ -7,6 +7,7 @@ ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/dev/enclave"
+INSTANCE_ID = "i-0e2ce2ce2ce2ce2ce"
 
 
 def put_env(name, value):
@@ -94,6 +95,8 @@ aws.wait_for_open_port(4566)
 aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
 aws.wait_for_open_port(4000)
 aws.wait_for_open_port(1338)
+aws.wait_for_open_port(4318)
+aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4318/_otlp/logs")
 aws.wait_for_open_port(14000)
 aws.wait_for_open_port(8055)
 aws.wait_for_open_port(4570)
@@ -184,23 +187,20 @@ for node in BLUES:
     assert status == 0, out
     assert "WARNING" in out, out
 
+# Verify the CloudWatch Logs destinations.
 log_groups = cloud(
     f"logs describe-log-groups --log-group-name-prefix {LOG_PREFIX} "
     "--query 'logGroups[].logGroupName' --output text"
 ).split()
 assert sorted(log_groups) == [
     f"{LOG_PREFIX}/logs/app",
-    f"{LOG_PREFIX}/logs/supervisor",
-    f"{LOG_PREFIX}/metrics",
-    f"{LOG_PREFIX}/traces/app",
-    f"{LOG_PREFIX}/traces/supervisor",
+    f"{LOG_PREFIX}/logs/runtime",
 ], log_groups
-
-shipped = cloud(
+streams = cloud(
     f"logs describe-log-streams --log-group-name {LOG_PREFIX}/logs/app "
-    "--query 'logStreams[].storedBytes' --output text"
-)
-assert shipped not in ("", "None"), shipped
+    "--query 'logStreams[].logStreamName' --output text"
+).split()
+assert streams == [INSTANCE_ID], streams
 
 # The buffers are gone, so their read-back endpoints are too.
 blue.succeed(
@@ -208,36 +208,41 @@ blue.succeed(
     'https://127.0.0.1/v1/enclave-logs)" = 404'
 )
 
-# The app's own OTLP reaches CloudWatch through the runtime's ingest endpoints,
-# emitted by the stock OpenTelemetry exporters.
+# Verify application and runtime telemetry reaches each AWS endpoint.
 blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null")
 
 
-def wait_for_shipped(group, needle, timeout=90):
+def otlp(signal):
+    return json.loads(aws.succeed(f"curl -fsS http://127.0.0.1:4318/_otlp/{signal}"))
+
+
+def wait_for_otlp(signal, needle, group=None, timeout=90):
     deadline = time.time() + timeout
     while True:
-        events = cloud(
-            f"logs filter-log-events --log-group-name {LOG_PREFIX}/{group} "
-            "--query 'events[].message' --output text"
-        )
-        if needle in events:
-            return
+        for record in otlp(signal):
+            if group is not None and record["group"] != group:
+                continue
+            if needle in json.dumps(record["body"], separators=(",", ":")):
+                return
         if time.time() > deadline:
-            raise Exception(f"{needle!r} never reached {LOG_PREFIX}/{group}")
+            print(aws.execute("journalctl -u awsmocks --no-pager -n 50")[1])
+            raise Exception(f"{needle!r} never reached the {signal} endpoint")
         time.sleep(2)
 
 
-wait_for_shipped("logs/app", "handled health")
-wait_for_shipped("traces/app", '"name":"health"')
-wait_for_shipped("metrics", "testapp_requests_total")
-wait_for_shipped("logs/supervisor", "child started")
-wait_for_shipped("traces/supervisor", '"name":"init"')
+wait_for_otlp("logs", "handled health", f"{LOG_PREFIX}/logs/app")
+wait_for_otlp("logs", "child started", f"{LOG_PREFIX}/logs/runtime")
+wait_for_otlp("traces", '"name":"health"')
+wait_for_otlp("traces", '"name":"init"')
+wait_for_otlp("metrics", "testapp_requests_total")
+wait_for_otlp("metrics", "enclave_http_requests_total")
 
-app_events = cloud(
-    f"logs filter-log-events --log-group-name {LOG_PREFIX}/logs/app "
-    "--query 'events[].message' --output text"
-)
-assert '"source":"enclave"' not in app_events, app_events
+for record in otlp("logs"):
+    assert record["stream"] == INSTANCE_ID, record
+    body = json.dumps(record["body"], separators=(",", ":"))
+    if record["group"] == f"{LOG_PREFIX}/logs/app":
+        assert "enclave-runtime" not in body, body
+        assert "child started" not in body, body
 
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")

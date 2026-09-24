@@ -23,6 +23,8 @@ const (
 	defaultLogRetentionDays = int32(30)
 	logGroupRoot            = "enclave"
 
+	otlpHTTPTimeout = 30 * time.Second
+
 	logGroupNameChars = "._-/#"
 
 	migrationPollInterval    = 5 * time.Second

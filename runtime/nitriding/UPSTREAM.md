@@ -31,7 +31,7 @@ in the package keep compiling.
 **`proxy.go` — stale TAP link cleanup in `setupNetworking`.** Upstream's
 teardown only closes the vsock connection and the tap fd; the interface's IP
 address and default route can survive across retries. When the host-side
-gvproxy restarts (e.g. supervisor relaunch), the reconnect loop in
+gvproxy restarts (e.g. runtime relaunch), the reconnect loop in
 `RunNetworking` then fails forever: `configureTapIface` gets EEXIST
 ("failed to set link address: file exists") on every attempt, leaving the
 enclave alive but permanently unreachable. We delete any pre-existing

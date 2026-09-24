@@ -20,7 +20,7 @@ let
     pname = "awsmocks";
     version = "0.1.0";
     src = ./awsmocks;
-    vendorHash = "sha256-FlTEY1v5ZVqTICXGLTBgVW+JhlWwIiuJDekX2d3bfWs=";
+    vendorHash = "sha256-gPgpKvfLuiO4N/+nJ24GHd5Pukk3Yo2dxwPK9XZfEf8=";
     env.CGO_ENABLED = "0";
     meta.mainProgram = "awsmocks";
   };
@@ -213,7 +213,9 @@ let
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
-    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_XRAY = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_MONITORING = "http://${awsNodeIP}:4318";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -422,6 +424,7 @@ let
       networking.firewall.allowedTCPPorts = [
         1338
         4000
+        4318
         4566
         4570
         14000
@@ -446,14 +449,16 @@ let
       };
 
       systemd.services.awsmocks = {
-        description = "Attested KMS proxy and IMDS stub";
+        description = "Attested KMS proxy, IMDS stub and OTLP receiver";
         wantedBy = [ "multi-user.target" ];
         wants = [ "ministack.service" ];
         after = [ "ministack.service" ];
         environment = {
           KMS_PROXY_LISTEN_ADDR = ":4000";
           IMDS_LISTEN_ADDR = ":1338";
+          OTLP_LISTEN_ADDR = ":4318";
           UPSTREAM_KMS_URL = "http://127.0.0.1:4566";
+          UPSTREAM_LOGS_URL = "http://127.0.0.1:4566";
         };
         serviceConfig = {
           Type = "simple";

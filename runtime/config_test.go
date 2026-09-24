@@ -150,15 +150,11 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 func TestConfigLogGroup(t *testing.T) {
 	cfg := newTestConfig("prod", "app", false)
 	require.Equal(t, "/prod/enclave/logs/app", cfg.logGroup(signalAppLogs))
-	require.Equal(t, "/prod/enclave/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
-	require.Equal(t, "/prod/enclave/traces/app", cfg.logGroup(signalAppTraces))
-	require.Equal(t,
-		"/prod/enclave/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
-	require.Equal(t, "/prod/enclave/metrics", cfg.logGroup(signalMetrics))
+	require.Equal(t, "/prod/enclave/logs/runtime", cfg.logGroup(signalRuntimeLogs))
 
 	cfg.LogGroupPrefix = "/ark/se7enz/emulator"
-	require.Equal(t, "/ark/se7enz/emulator/prod/enclave/logs/supervisor",
-		cfg.logGroup(signalSupervisorLogs))
+	require.Equal(t, "/ark/se7enz/emulator/prod/enclave/logs/runtime",
+		cfg.logGroup(signalRuntimeLogs))
 }
 
 // The lock posture is an IAM-enforceable boundary, so it must move exactly the

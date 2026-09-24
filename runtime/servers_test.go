@@ -554,14 +554,12 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			{http.MethodGet, "/enclave/v1/info", http.StatusOK},
 			// A ready request still requires a nonce.
 			{http.MethodGet, "/enclave/attestation", http.StatusBadRequest},
-			// Telemetry is ingest-only: it ships to CloudWatch and is never read
-			// back, so a compromised enclave has no history to serve.
-			{http.MethodGet, "/enclave/v1/metrics", http.StatusMethodNotAllowed},
-			{http.MethodGet, "/enclave/v1/logs", http.StatusMethodNotAllowed},
-			{http.MethodGet, "/enclave/v1/traces", http.StatusMethodNotAllowed},
-			{http.MethodPost, "/enclave/v1/metrics", http.StatusUnauthorized},
-			{http.MethodPost, "/enclave/v1/logs", http.StatusUnauthorized},
-			{http.MethodPost, "/enclave/v1/traces", http.StatusUnauthorized},
+			{http.MethodGet, "/enclave/v1/metrics", http.StatusNotFound},
+			{http.MethodGet, "/enclave/v1/logs", http.StatusNotFound},
+			{http.MethodGet, "/enclave/v1/traces", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/metrics", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/logs", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/traces", http.StatusNotFound},
 		} {
 			rr := httptest.NewRecorder()
 			s.em.ServeHTTP(rr, httptest.NewRequest(route.method, route.path, nil))

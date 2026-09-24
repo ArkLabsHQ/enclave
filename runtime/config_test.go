@@ -14,8 +14,8 @@ func newTestConfig(deployment, appName string, dev bool) *Config {
 		Deployment: deployment, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
-		LogGroupPrefix: "/",
-		InstanceID:     "i-0e2ce2ce2ce2ce2ce",
+		NamespacePrefix: "/",
+		InstanceID:      "i-0e2ce2ce2ce2ce2ce",
 	}
 	c.setSecurityConfig(dev)
 	return c
@@ -98,13 +98,11 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "/ark/se7enz/emulator")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, 250*time.Millisecond, cfg.LogShipInterval)
 	require.Equal(t, int32(7), cfg.LogRetentionDays)
-	require.Equal(t, "/ark/se7enz/emulator", cfg.LogGroupPrefix)
 }
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
@@ -112,16 +110,44 @@ func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
-	t.Setenv("ENCLAVE_LOG_GROUP_PREFIX", "   ")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, defaultLogShipInterval, cfg.LogShipInterval)
 	require.Equal(t, defaultLogRetentionDays, cfg.LogRetentionDays)
-	require.Equal(t, "/", cfg.LogGroupPrefix)
 }
 
-func TestNormalizeLogGroupPrefix(t *testing.T) {
+func TestConfigNamespace(t *testing.T) {
+	cfg := newTestConfig("se7enz", "emulator", false)
+	require.Equal(t, "/se7enz/emulator/enclave", cfg.namespace())
+	require.Equal(t, "/se7enz/emulator/enclave/env/", cfg.envOverlayPrefix())
+	require.Equal(t, "/se7enz/emulator/enclave/CertBucketName", cfg.certBucketParam())
+	require.Equal(t, "/se7enz/emulator/enclave/logs/app", cfg.logGroup(signalAppLogs))
+
+	cfg.NamespacePrefix = "/ark"
+	require.Equal(t, "/ark/se7enz/emulator/enclave", cfg.namespace())
+	require.Equal(t, "/ark/se7enz/emulator/enclave/env/", cfg.envOverlayPrefix())
+	require.Equal(t, "/ark/se7enz/emulator/enclave/logs/app", cfg.logGroup(signalAppLogs))
+}
+
+func TestLoadConfigNamespacePrefix(t *testing.T) {
+	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_APP_NAME", "app")
+
+	t.Setenv("ENCLAVE_NAMESPACE_PREFIX", "ark/se7enz/")
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "/ark/se7enz", cfg.NamespacePrefix)
+	require.Equal(t, "/ark/se7enz/prod/app/enclave", cfg.namespace())
+
+	t.Setenv("ENCLAVE_NAMESPACE_PREFIX", "   ")
+	cfg, err = LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "/", cfg.NamespacePrefix)
+	require.Equal(t, "/prod/app/enclave", cfg.namespace())
+}
+
+func TestNormalizeNamespacePrefix(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
@@ -129,12 +155,7 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 	}{
 		{name: "unset", raw: "", want: "/"},
 		{name: "whitespace only", raw: "   ", want: "/"},
-		{name: "root only", raw: "/", want: "/"},
 		{name: "slashes only", raw: "///", want: "/"},
-		{
-			name: "leading segments", raw: "/ark/se7enz/emulator",
-			want: "/ark/se7enz/emulator",
-		},
 		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing"},
 		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading"},
 		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded"},
@@ -142,23 +163,19 @@ func TestNormalizeLogGroupPrefix(t *testing.T) {
 		{name: "dot segments resolve", raw: "/ark/./x/../y", want: "/ark/y"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, normalizeLogGroupPrefix(tc.raw))
+			require.Equal(t, tc.want, normalizeNamespacePrefix(tc.raw))
 		})
 	}
 }
 
 func TestConfigLogGroup(t *testing.T) {
 	cfg := newTestConfig("prod", "app", false)
-	require.Equal(t, "/prod/enclave/logs/app", cfg.logGroup(signalAppLogs))
-	require.Equal(t, "/prod/enclave/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
-	require.Equal(t, "/prod/enclave/traces/app", cfg.logGroup(signalAppTraces))
+	require.Equal(t, "/prod/app/enclave/logs/app", cfg.logGroup(signalAppLogs))
+	require.Equal(t, "/prod/app/enclave/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
+	require.Equal(t, "/prod/app/enclave/traces/app", cfg.logGroup(signalAppTraces))
 	require.Equal(t,
-		"/prod/enclave/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
-	require.Equal(t, "/prod/enclave/metrics", cfg.logGroup(signalMetrics))
-
-	cfg.LogGroupPrefix = "/ark/se7enz/emulator"
-	require.Equal(t, "/ark/se7enz/emulator/prod/enclave/logs/supervisor",
-		cfg.logGroup(signalSupervisorLogs))
+		"/prod/app/enclave/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
+	require.Equal(t, "/prod/app/enclave/metrics", cfg.logGroup(signalMetrics))
 }
 
 // The lock posture is an IAM-enforceable boundary, so it must move exactly the

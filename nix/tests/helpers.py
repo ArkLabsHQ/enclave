@@ -19,11 +19,11 @@ def cloud(command):
 
 
 def key_param(pcr0):
-    return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
+    return f"/ark/e2e/dev/testapp/enclave/unlocked/KMSKeyID/{pcr0}"
 
 
 def migration_receipt_param(key_id, pcr0):
-    return f"/dev/testapp/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
+    return f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
 
 
 def get_param(name):

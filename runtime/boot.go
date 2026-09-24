@@ -814,6 +814,18 @@ func predecessorExpectedPCRs(state *bootState) map[uint]string {
 func validateStaticSecretNames(metadata []StaticSecretMetadata) error {
 	seen := make(map[string]bool, len(metadata))
 	for _, secret := range metadata {
+		if secret.Name == "" {
+			return fmt.Errorf("static secret with env var %q has no name", secret.EnvVar)
+		}
+		if len(secret.Name) > maxSecretNameLen {
+			return fmt.Errorf(
+				"static secret %q: name is %d characters, at most %d fit SSM's name limit",
+				secret.Name, len(secret.Name), maxSecretNameLen,
+			)
+		}
+		if err := validateNamespaceName("static secret", secret.Name, false); err != nil {
+			return err
+		}
 		if secret.Name == "StorageDEK" {
 			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
 		}

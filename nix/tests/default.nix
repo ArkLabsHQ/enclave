@@ -198,7 +198,7 @@ let
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
-    ENCLAVE_VERIFY_CLOCK_SOURCE = "false";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
     ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
     ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";

@@ -219,10 +219,11 @@ Arguments:
 
 ```nix
 {
-  pkgs,                  # x86_64-linux package set
-  app,                   # package; executable selected with pkgs.lib.getExe
-  env,                   # environment baked into the measurement
-  extraPackages ? [ ],   # additional packages in the enclave rootfs
+  pkgs,                   # x86_64-linux package set
+  app,                    # package; executable selected with pkgs.lib.getExe
+  env,                    # environment baked into the measurement
+  overrideAllowlist ? [ ], # application env vars that SSM may override
+  extraPackages ? [ ],     # additional packages in the enclave rootfs
 }
 ```
 
@@ -234,6 +235,13 @@ Produces a derivation containing `image.eif` and `pcr.json`.
 - `env` is part of the measurement. Changing any value changes PCR0.
   `buildEif` does not currently validate runtime configuration; missing or invalid
   required values fail when the EIF boots.
+- `overrideAllowlist = [ "VAR_FOO" "VAR_BAR" ];` allows SSM to override those
+  application environment variables. It defaults to an empty list and is part of
+  the measurement. `buildEif` joins the names with commas and sets
+  `ENCLAVE_OVERRIDE_ALLOWLIST`; specifying that variable in `env` is an error.
+  The runtime's explicit SSM configuration overrides remain available regardless
+  of this list. Runtime configuration names are reserved; use separate names for
+  application settings. See [SSM environment overlay](#ssm-environment-overlay).
 - The rootfs contains the system CA store and nothing else by default. The
   runtime never shells out. Applications that need `/bin/sh` or other utilities
   must request them: `extraPackages = [ pkgs.busybox ]`.
@@ -266,11 +274,27 @@ measurement. A subset can be overridden at runtime from SSM.
 |---|---|---|
 | `ENCLAVE_DEPLOYMENT` | none | Required. First SSM path segment and a segment of every CloudWatch log group, so only letters, digits and `._-/#`; anything else fails validation at boot. |
 | `ENCLAVE_APP_NAME` | none | Required. Second SSM path segment. |
-| `ENCLAVE_DEV` | `false` | Selects the whole security envelope. When `true`: COSE signature and certificate chain verification of attestation documents is disabled, the `kvm-clock` assertion is skipped, the KMS key policy keeps its root recovery principal and the SSM namespace segment is `unlocked`, the genesis and migration-intent Object Lock retentions become five minutes and ten minutes, the migration cooldown becomes two seconds, and the clock-sync poll drops from five minutes to five seconds. When `false`: verification on, `kvm-clock` required, key policy locked, both retentions ten years, cooldown 24 hours, unless `ENCLAVE_MIGRATION_COOLDOWN` overrides it. There is no
-way to ask for any other combination. For local testing against emulated NSM only. See [Security notes](#security-notes). |
+| `ENCLAVE_DEV` | `false` | Selects development retention periods, write timeout, clock-sync interval and unlocked KMS policy, as listed below. Attestation signature verification remains enabled. See [Security notes](#security-notes). |
+| `ENCLAVE_INSECURE_VERIFY_SKIPPED` | `false` | Skips COSE signature and certificate chain verification of attestation documents only when `ENCLAVE_DEV=true`. Ignored entirely in production, including malformed values. For QEMU-based tests only. Baked into the EIF, never read from the SSM overlay. |
+| `ENCLAVE_VERIFY_CLOCK_SOURCE` | `true` | Requires the system clock source to be `kvm-clock`. Can be enabled or disabled in either production or dev mode. Baked into the EIF, never read from the SSM overlay. |
 | `ENCLAVE_PREVIOUS_PCR0` | empty | The predecessor this image may adopt state from, or the literal `genesis` for an image that only ever genesises. Measured and not SSM-overridable. |
 | `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
 | `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
+
+`ENCLAVE_DEV=true` lets dev deployments use shorter timings while retaining
+attestation signature verification:
+
+| Setting | Production | Dev |
+|---|---|---|
+| Genesis Object Lock retention | 10 years | 5 minutes |
+| Migration intent Object Lock retention | 10 years | 10 minutes |
+| Migration intent write timeout | 10 minutes | 2 minutes |
+| Clock-sync interval | 5 minutes | 5 seconds |
+| KMS key policy / SSM namespace segment | Locked / `locked` | Root recovery principal retained / `unlocked` |
+
+Clock-source verification defaults to enabled and migration cooldown defaults
+to 24 hours in both modes. Set `ENCLAVE_VERIFY_CLOCK_SOURCE` and
+`ENCLAVE_MIGRATION_COOLDOWN` independently to override them.
 
 ### Listeners and application
 
@@ -279,10 +303,14 @@ way to ask for any other combination. For local testing against emulated NSM onl
 | `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
 | `ENCLAVE_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
 | `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
-| `ENCLAVE_VIPROXY_ENABLED` | `true` | Set to `false` to disable the in-process IMDS forwarder. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
 | `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
+
+The runtime always starts the in-process IMDS forwarder before loading AWS
+credentials. `ENCLAVE_VIPROXY_ENABLED` has been removed; setting it to `false`
+has no effect. The listen and target addresses remain configurable through
+`ENCLAVE_VIPROXY_IN_ADDRS` and `ENCLAVE_VIPROXY_OUT_ADDRS`.
 
 The external TLS listener (443), the internal loopback listener (8080) and the
 host vsock port gvproxy listens on (1024) are fixed. The last of those is
@@ -296,9 +324,9 @@ configurable: ten years in production, ten minutes under `ENCLAVE_DEV`. An
 operator who could shorten it could wait out the Object Lock and roll back
 undetected, so the measured image settles it. The cooldown between a candidate's
 attestation being adopted and the handoff committing — the window in which an
-abort can be written — is 24 hours in production and two seconds under
-`ENCLAVE_DEV`, and is the one setting here an operator may override, with
-`ENCLAVE_MIGRATION_COOLDOWN` baked into the image.
+abort can be written — defaults to 24 hours in both production and dev mode.
+An operator may override it in either mode with `ENCLAVE_MIGRATION_COOLDOWN`
+baked into the image.
 
 A successor ignores any intent record that is not retained under compliance
 mode, and any whose retain-until date does not cover the configured retention.
@@ -311,19 +339,22 @@ no environment-variable override.
 
 ### Clock
 
-Production fails the boot unless the system clock source is `kvm-clock`. Under
-`ENCLAVE_DEV` the assertion is skipped, because the QEMU harness boots without
-the paravirtualized clock.
+By default, both production and dev mode fail the boot unless the system clock
+source is `kvm-clock`. `ENCLAVE_VERIFY_CLOCK_SOURCE=false` skips this assertion
+in either mode. The QEMU harness sets it explicitly because it boots without
+the required clock source.
 
 The runtime hard-steps the clock onto the PTP hardware clock at startup, then
-runs a PI servo that corrects frequency drift. Offsets above 100 ms trigger
-another hard-step. `/dev/ptp0` is mandatory; the boot fails without it.
+runs a PI servo that corrects frequency drift every five minutes in production
+or every five seconds with `ENCLAVE_DEV=true`. Offsets above 100 ms trigger
+another hard-step. `/dev/ptp0` is mandatory even when clock-source verification
+is disabled; the boot fails without it.
 
 ### Logging and tracing
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCLAVE_MIGRATION_COOLDOWN` | posture default | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Unset leaves the `ENCLAVE_DEV` posture in charge: 24 hours in production, two seconds in dev. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
+| `ENCLAVE_MIGRATION_COOLDOWN` | `24h` | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Can be set in either production or dev mode; unset defaults to 24 hours in both. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Flush cadence for logs, spans and the metrics snapshot. Log and span batches also flush at 250 events, or at 1 MiB. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
 | `ENCLAVE_LOG_GROUP_PREFIX` | none | Optional segments placed before the deployment: `/ark/se7enz/emulator` yields `/ark/se7enz/emulator/<deployment>/enclave/...`. The value is cleaned as a path: a missing leading `/` is added, repeated and trailing `/` collapse, and `.` and `..` segments resolve. Anything CloudWatch would refuse fails the boot. Settable from the SSM overlay. |
@@ -426,27 +457,41 @@ Constraints:
 ### SSM environment overlay
 
 Parameters under `/<deployment>/<app>/env/` are read at boot (non-recursively,
-with decryption) and exported into the application's environment. This allows
-configuration changes without rebuilding the image.
+with decryption). Application variables are exported only when named in
+`buildEif.overrideAllowlist`, which defaults to an empty list. This allows
+application configuration changes without rebuilding the image.
 
-Seven names are refused, because they define the enclave's identity, its lineage
-or its security posture and can only be changed by rebuilding:
-`ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
-`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
-`ENCLAVE_PREVIOUS_PCR0`. The lock posture and the intent retention left the list
-by ceasing to be configuration at all — `ENCLAVE_DEV` settles them.
-
-Five TLS and ACME settings are read **only** from this overlay, never from the
-baked environment, because TLS is configured before the overlay is applied to
-the application:
+The following names update runtime configuration directly, regardless of the
+allowlist. They are reserved for the runtime: adding them to the allowlist does
+not export them into the application's environment. The runtime explicitly
+passes the final application port to the child as described in
+[Application process environment](#application-process-environment).
 
 | Parameter under `/<deployment>/<app>/env/` | Purpose |
 |---|---|
+| `ENCLAVE_APP_PORT` | Application listen port and runtime proxy target port. |
 | `ENCLAVE_FQDN` | Certificate hostname. |
 | `ENCLAVE_USE_ACME` | `true` switches from self-signed to ACME. |
 | `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
 | `ENCLAVE_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_LOG_GROUP_PREFIX` | Prefix for the runtime's CloudWatch log groups. |
+
+The four ACME settings are read only from this overlay. `ENCLAVE_FQDN` starts
+with the baked value (default `localhost`), which the overlay may replace.
+
+Applications that need the same value must use a separate variable. For example,
+allowlist `APP_PUBLIC_HOSTNAME` and set
+`/prod/wallet/env/APP_PUBLIC_HOSTNAME` to `wallet.example.com` for the app.
+Set `/prod/wallet/env/ENCLAVE_FQDN` separately for the runtime's TLS certificate.
+
+The overlay cannot change the runtime's captured identity, lineage or security
+settings: `ENCLAVE_DEPLOYMENT`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
+`ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`, `ENCLAVE_VERIFY_CLOCK_SOURCE`,
+`ENCLAVE_INSECURE_VERIFY_SKIPPED` and `ENCLAVE_PREVIOUS_PCR0`. Changing those
+runtime settings requires rebuilding the image. `ENCLAVE_DEV` selects the KMS
+lock posture and Object Lock retentions; neither has a separate
+environment-variable override.
 
 The TLS key is generated at genesis, encrypted with KMS, and included in the
 state root. Renewed certificates reuse it. The certificate bucket stores the
@@ -454,8 +499,10 @@ certificate and, when ACME is enabled, the ACME account key.
 
 ### Application process environment
 
-The runtime execs the application with the full runtime environment — including
-the SSM overlay and static secrets — plus:
+The runtime removes each configuration variable from the process environment
+as it loads it. The application inherits the remaining environment, including
+baked application variables, allowlisted SSM application overrides and static
+secrets, plus these explicit runtime exports:
 
 | Variable | Value |
 |---|---|
@@ -950,12 +997,18 @@ AWS APIs, then controls node startup according to the runtime migration order.
 It does not simulate a deployment system, host image lifecycle, or traffic
 cutover.
 
-The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace. It separately
-sets `ENCLAVE_DEV=true` because QEMU's emulated NSM produces no AWS certificate
-chain and the harness has no paravirtualized clock. That one flag also gives the
-suite the short Object Lock retentions and two-second cooldown it needs to
-exercise a handoff in seconds rather than years; it is only for local testing
-against the emulator.
+The test EIF uses `ENCLAVE_DEPLOYMENT=dev` as its SSM namespace and explicitly
+sets:
+
+- `ENCLAVE_DEV=true` for short Object Lock retentions, a short intent write
+  timeout, frequent clock sync and an unlocked KMS policy.
+- `ENCLAVE_INSECURE_VERIFY_SKIPPED=true` because QEMU's emulated NSM produces
+  no AWS certificate chain. This flag is only read in dev mode.
+- `ENCLAVE_VERIFY_CLOCK_SOURCE=false` because the harness lacks `kvm-clock`.
+- `ENCLAVE_MIGRATION_COOLDOWN=2s` to exercise migration handoffs quickly.
+
+Dev deployments keep attestation signature verification enabled by leaving
+`ENCLAVE_INSECURE_VERIFY_SKIPPED` unset or `false`.
 
 ### Troubleshooting
 
@@ -985,19 +1038,27 @@ should not be retried.
 
 ## Security notes
 
-**`ENCLAVE_DEV=true` selects the insecure security envelope.** It disables COSE
-signature verification, skips the `kvm-clock` assertion, leaves the KMS key
-policy amendable with its root recovery principal, and cuts both S3 Object Lock
-retentions to minutes and the migration cooldown to seconds — so a dev
-deployment's migration anchor can be waited out almost immediately. In that mode
-the runtime decodes attestation documents but does not verify their signature or
-validate the certificate chain against the AWS Nitro root. It logs `INSECURE:
-skipping COSE signature verification of attestation document` at startup. PCR
-comparison and `user_data` checks still apply. Only set `ENCLAVE_DEV=true` for
-local testing against emulated NSM. `ENCLAVE_DEPLOYMENT` is required but only
-selects the SSM namespace; values such as `dev` and `prod` do not control
-verification. Both settings are baked into the measurement and cannot be
-overridden from SSM.
+**Dev deployments verify attestation signatures by default.**
+`ENCLAVE_DEV=true` leaves the KMS key policy amendable with its root recovery
+principal, cuts both S3 Object Lock retentions to minutes, shortens the intent
+write timeout and increases clock-sync frequency. The shorter retentions let a
+dev deployment's migration anchor expire within minutes. Clock-source
+verification and migration cooldown remain independently configurable in both
+modes, defaulting to enabled and 24 hours respectively.
+
+**Skipping attestation signature verification is for QEMU-based tests only.**
+It requires both `ENCLAVE_DEV=true` and
+`ENCLAVE_INSECURE_VERIFY_SKIPPED=true`; production ignores the skip flag
+entirely. With both enabled, the runtime decodes attestation documents but does
+not verify their signature or validate the certificate chain against the AWS
+Nitro root. It logs `INSECURE: skipping COSE signature verification of
+attestation document` when verification is skipped. PCR comparison and
+`user_data` checks still apply.
+
+`ENCLAVE_DEPLOYMENT` is required but only selects the SSM namespace; values
+such as `dev` and `prod` do not control verification. Deployment and the
+security settings above are baked into the measurement and cannot be overridden
+from SSM.
 
 **CloudWatch is a hard boot dependency.** Each stream is created *and written to*
 before the application starts, and a failure aborts the boot. The write matters:
@@ -1083,7 +1144,8 @@ to liveness, not to a specific approved build. Closing that gap would need an
 external trust root — an operator-signed successor statement — which the runtime
 deliberately does not have.
 
-**The e2e test cannot validate this.** `ENCLAVE_DEV=true`, which the test
-harness sets, makes the runtime skip COSE signature verification entirely. A
-forged document passes there. The attestation checks are covered only by the Go
-unit tests, against a real test signer.
+**The e2e test cannot validate this.** The test harness sets both
+`ENCLAVE_DEV=true` and `ENCLAVE_INSECURE_VERIFY_SKIPPED=true`, making the
+runtime skip COSE signature verification entirely. A forged signature is not
+rejected there. The attestation checks are covered only by the Go unit tests,
+against a real test signer.

@@ -51,12 +51,12 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
-	aws, err := NewAWSClient(ctx)
+	aws, err := NewAWSClient(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 	ssm := NewSSM(aws.SSM)
-	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+	if err := cfg.ApplySSMOverlay(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
@@ -160,13 +160,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	// IMPORTANT: Set static secret env vars *AFTER* SSM env override to prevent host from
-	// overriding established secret state
-	if err := SetStaticSecretEnvVars(result.secrets); err != nil {
-		return fmt.Errorf("failed to set static secrets env vars: %w", err)
-	}
-
-	app, err := startApp(rt, cfg, authToken)
+	app, err := startApp(rt, cfg, appEnv(cfg, authToken, result.secrets))
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
@@ -187,19 +181,32 @@ type execApp struct {
 	cmd *exec.Cmd
 }
 
-func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	appPath := "/app/" + getAppBinaryName()
-
-	child := exec.Command(appPath)
-	child.Stdout = os.Stdout
-	child.Stderr = os.Stderr
-	child.Env = append(
-		os.Environ(),
+func appEnv(cfg Config, authToken string, secrets []StaticSecret) []string {
+	env := os.Environ()
+	// exec.Cmd.Env keeps the last value for duplicate keys, so append overrides.
+	for key, value := range cfg.ChildEnv {
+		env = append(env, key+"="+value)
+	}
+	// Static secrets take precedence over SSM overrides.
+	for _, secret := range secrets {
+		env = append(env, secret.EnvVar+"="+secret.Plaintext)
+	}
+	return append(
+		env,
 		"ENCLAVE_APP_PORT="+cfg.AppPort,
 		"PORT="+cfg.AppPort,
 		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
 		"ENCLAVE_RUNTIME_TOKEN="+authToken,
 	)
+}
+
+func startApp(rt RuntimeState, cfg Config, env []string) (appProcess, error) {
+	appPath := "/app/" + cfg.AppBinaryName
+
+	child := exec.Command(appPath)
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.Env = env
 
 	if err := child.Start(); err != nil {
 		return nil, fmt.Errorf("start child %s: %w", appPath, err)

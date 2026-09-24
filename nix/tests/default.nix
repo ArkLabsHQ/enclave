@@ -198,6 +198,9 @@ let
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
+    ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
+    ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -224,6 +227,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 

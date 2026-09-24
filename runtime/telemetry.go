@@ -114,7 +114,8 @@ func (t *Telemetry) Start(ctx context.Context) error {
 	}
 	if t.streams[0].name == "" {
 		return fmt.Errorf(
-			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream")
+			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream",
+		)
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
 		if err := t.ensureStream(ctx, sig); err != nil {
@@ -417,5 +418,6 @@ func jsonError(msg string) string {
 
 func droppedMetric(sig signal) string {
 	return fmt.Sprintf(
-		"enclave_telemetry_%s_dropped_total", strings.ReplaceAll(sig.String(), "/", "_"))
+		"enclave_telemetry_%s_dropped_total", strings.ReplaceAll(sig.String(), "/", "_"),
+	)
 }

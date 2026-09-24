@@ -207,7 +207,7 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 
 // plan decides, once, which of the three boots this is.
 func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
-	metadata, err := LoadStaticSecretMetadata()
+	metadata, err := LoadStaticSecretMetadata(*b.cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load static secret metadata: %w", err)
 	}

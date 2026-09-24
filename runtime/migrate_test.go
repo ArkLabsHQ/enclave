@@ -297,7 +297,8 @@ func TestHandOffToSuccessor(t *testing.T) {
 		Plaintext:            hex.EncodeToString(secretPlaintext),
 	}
 
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing_key"}]`)
+	successorCfg := successorTestCfg(oldPCR0Hex)
+	successorCfg.StaticSecretConfig = `[{"name":"signing_key"}]`
 
 	ctx := context.Background()
 	setup := func(t *testing.T, opts ...func(*startMigrationFixture)) *startMigrationFixture {
@@ -402,9 +403,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(
-				oldPCR0Hex,
-			),
+			successorCfg,
 			newNSM,
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
@@ -701,9 +700,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(
-				oldPCR0Hex,
-			),
+			successorCfg,
 			newNSM,
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
@@ -768,7 +765,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		session := newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes})
 		successor := func(roots *x509.CertPool) (*Boot, error) {
 			return NewBoot(
-				successorTestCfg(oldPCR0Hex),
+				successorCfg,
 				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
 				fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
 			)
@@ -860,8 +857,9 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
 		fx.successor.cfg = newTestConfig(
-			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, true,
+			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, false,
 		)
+		fx.successor.cfg.KMSLocked = false
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -1193,8 +1191,6 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	oldPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
 	newPCR0 := strings.Repeat("cd", 48)
-
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[]`)
 
 	ctx := context.Background()
 	setup := func(t *testing.T) (*migrator, *fakeSSM, *fakeNSMSession) {
@@ -1647,7 +1643,6 @@ func contextFor(t *testing.T, timeout time.Duration) context.Context {
 
 // A candidate waits for commit while answering its predecessor.
 func TestAwaitCandidateHandoffWaitsAndAnswersItsPredecessor(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx, m := newCandidateMigrator(t)
 	issuer := successorMigrator(t, m.cfg, fx.signer, mustDecodeHex(t, handoffPredecessorPCR0))
 	issuer.pcr0, issuer.ssm = handoffPredecessorPCR0, m.ssm
@@ -1672,8 +1667,6 @@ func TestAwaitCandidateHandoffWaitsAndAnswersItsPredecessor(t *testing.T) {
 
 // Existing generations and fresh deployments do not wait.
 func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	t.Run("committed key", func(t *testing.T) {
 		fx, m := newCandidateMigrator(t)
 		fx.ssmf.params[fx.keyIDParam()] = "committed-key"
@@ -1702,7 +1695,6 @@ func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
 
 // Partial artifacts do not end candidacy; the final pointer does.
 func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx, m := newCandidateMigrator(t)
 	attestation := testCfg.migrationPreviousPCR0AttestationParam(fx.pcr0Hex)
 	fx.ssmf.params[attestation] = "handoff-in-progress"
@@ -1724,7 +1716,6 @@ func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
 
 // An intent alone cannot end candidacy.
 func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
-	setStateOriginTestEnv(t)
 	ctx := context.Background()
 	fx := newMigrationIntentFixture(t)
 	target := strings.Repeat("cd", 48)
@@ -1756,8 +1747,6 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 
 // State read failures are fatal.
 func TestAwaitCandidateHandoffDoesNotRetryFatalErrors(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	for _, tc := range []struct {
 		name string
 		fail func(*genesisFixture)

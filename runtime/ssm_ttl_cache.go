@@ -40,6 +40,16 @@ func (s *ssmTTLCache) MustGet(
 	key string,
 	opts ...SSMGetOption,
 ) (string, error) {
+	so := &SSMGetOptions{}
+
+	for _, opt := range opts {
+		opt(so)
+	}
+
+	if so.withDecryption {
+		return s.ssm.MustGet(ctx, key, opts...)
+	}
+
 	if val, ok := s.get(key); ok {
 		return val, nil
 	}

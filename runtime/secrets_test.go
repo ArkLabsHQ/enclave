@@ -206,14 +206,14 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	commaHashMeta := hashMeta
 	commaHashMeta.Value = []string{inheritTestHash("first,second")}
 	require.ErrorContains(t,
-		verifyInheritedSecret(commaHashMeta, "first,second"), "got 2 values, want 1")
+		verifyInheritedSecret(commaHashMeta, "first,second"), "value count 2, want 1")
 
 	hashListMeta := hashMeta
 	hashListMeta.Value = []string{inheritTestHash("first"), inheritTestHash("second")}
 	require.NoError(t, verifyInheritedSecret(hashListMeta, "first,second"))
 	require.NoError(t, verifyInheritedSecret(hashListMeta, "second,first"))
 	require.NoError(t, verifyInheritedSecret(hashListMeta, "second, first"), "entries are trimmed")
-	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, "first"), "got 1 values, want 2")
+	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, "first"), "value count 1, want 2")
 	require.ErrorContains(t,
 		verifyInheritedSecret(hashListMeta, "first,wrong"),
 		"value 1 does not match an unused pinned hash",
@@ -233,7 +233,7 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	require.ErrorContains(t,
 		verifyInheritedSecret(keyListMeta, privKey+":1798761600,"+privKey+":1830297600"),
 		"value 1 does not match")
-	require.ErrorContains(t, verifyInheritedSecret(keyListMeta, privKey), "got 1 values, want 2")
+	require.ErrorContains(t, verifyInheritedSecret(keyListMeta, privKey), "value count 1, want 2")
 	otherPrivateKey, _ := inheritTestKeyFrom(t, "other-inherit-secret-test-key")
 	require.ErrorContains(t,
 		verifyInheritedSecret(keyListMeta, privKey+","+otherPrivateKey),
@@ -259,6 +259,11 @@ func TestVerifyInheritedSecret(t *testing.T) {
 		"not a valid secp256k1 private key")
 	require.ErrorContains(t, verifyInheritedSecret(keyMeta, strings.Repeat("ff", 32)),
 		"not a valid secp256k1 private key")
+
+	// Validation already refuses an unknown type; verification fails closed on its own.
+	require.ErrorContains(t, verifyInheritedSecret(InheritSecretMetadata{
+		Name: "odd", Type: "ed25519", Value: []string{inheritTestHash("v")},
+	}, "v"), `unknown type "ed25519"`)
 }
 
 func TestResolveInheritedSecrets(t *testing.T) {

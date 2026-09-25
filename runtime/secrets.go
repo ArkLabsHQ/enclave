@@ -73,6 +73,12 @@ func (s Secrets) beforeCutoff(now time.Time) Secrets {
 	return s
 }
 
+// applyTo returns env with the secrets set for an app launched at now: the
+// static secrets, then the inherited ones not past their cutoff. It runs on
+// every launch, so a relaunch leaves out a secret that expired while the app
+// ran. Every other entry for an inherited secret's env var is dropped, so
+// neither the baked environment nor the SSM env overlay can stand in for one
+// that is absent or past its cutoff.
 func (s Secrets) applyTo(env []string, now time.Time) []string {
 	inherited := make(map[string]bool, len(s.metadata.Inherited))
 	for _, m := range s.metadata.Inherited {
@@ -313,7 +319,7 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 	}
 	if len(values) != len(m.Value) {
 		return fmt.Errorf(
-			"inherited secret %q: got %d values, want %d", m.Name, len(values), len(m.Value),
+			"inherited secret %q: value count %d, want %d", m.Name, len(values), len(m.Value),
 		)
 	}
 	commitments := make([][]byte, len(m.Value))
@@ -352,6 +358,10 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 			}
 			privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
 			got = privKey.PubKey().SerializeCompressed()
+		default:
+			// Validation refuses this first; failing here keeps got non-empty
+			// below, so it can never match a consumed (nil) commitment.
+			return fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
 		}
 		matched := -1
 		for j, commitment := range commitments { // consumed entries are nil and never match

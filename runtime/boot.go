@@ -199,7 +199,8 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 
 	state := &planned.state
 
-	// Inherited secrets come first: a value that fails its commitment check aborts here,
+	// Inherited secrets come first: a value that fails its commitment check aborts
+	// the boot here, before a KMS key is created or any enclave state is written.
 	inheritedSecrets, err := resolveInheritedSecrets(
 		ctx, b.cfg, b.ssm, state.secretsMetadata.Inherited, time.Now(),
 	)

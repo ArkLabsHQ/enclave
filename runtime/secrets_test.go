@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -36,16 +36,16 @@ func inheritTestHash(value string) string {
 
 func TestLoadInheritSecretMetadata(t *testing.T) {
 	t.Run("unset", func(t *testing.T) {
-		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", "")
-		meta, err := LoadInheritSecretMetadata()
+		meta, err := LoadInheritSecretMetadata(Config{})
 		require.NoError(t, err)
 		require.Empty(t, meta)
 	})
 
 	t.Run("parses entries", func(t *testing.T) {
-		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"legacy","env_var":"LEGACY_KEY",`+
-			`"type":"hash","value":["ab"],"cutoff":"2030-01-01T00:00:00Z"}]`)
-		meta, err := LoadInheritSecretMetadata()
+		meta, err := LoadInheritSecretMetadata(Config{
+			InheritSecretConfig: `[{"name":"legacy","env_var":"LEGACY_KEY",` +
+				`"type":"hash","value":["ab"],"cutoff":"2030-01-01T00:00:00Z"}]`,
+		})
 		require.NoError(t, err)
 		require.Equal(t, []InheritSecretMetadata{
 			{
@@ -59,8 +59,9 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 	})
 
 	t.Run("rejects malformed cutoff", func(t *testing.T) {
-		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"legacy","cutoff":"next year"}]`)
-		_, err := LoadInheritSecretMetadata()
+		_, err := LoadInheritSecretMetadata(Config{
+			InheritSecretConfig: `[{"name":"legacy","cutoff":"next year"}]`,
+		})
 		require.Error(t, err)
 	})
 }
@@ -135,11 +136,6 @@ func TestValidateInheritSecrets(t *testing.T) {
 			"malformed env var",
 			with(func(m *InheritSecretMetadata) { m.EnvVar = "A=B" }),
 			"invalid env_var",
-		},
-		{
-			"non overridable env var",
-			with(func(m *InheritSecretMetadata) { m.EnvVar = "ENCLAVE_DEV" }),
-			"reserved",
 		},
 		{"child env var", with(func(m *InheritSecretMetadata) { m.EnvVar = "PORT" }), "reserved"},
 		{
@@ -345,12 +341,7 @@ func TestResolveInheritedSecrets(t *testing.T) {
 	})
 }
 
-func TestSecretsSetEnvVars(t *testing.T) {
-	// The overlay runs first, so the host may have planted every name.
-	t.Setenv("SIGNING_KEY", "planted")
-	t.Setenv("LEGACY_KEY", "planted")
-	t.Setenv("LEGACY_TOKEN", "planted")
-
+func TestSecretsApplyTo(t *testing.T) {
 	staticMeta := StaticSecretMetadata{Name: "signing-key", EnvVar: "SIGNING_KEY"}
 	keyMeta := InheritSecretMetadata{
 		Name:   "legacy",
@@ -371,15 +362,31 @@ func TestSecretsSetEnvVars(t *testing.T) {
 			Inherited: []InheritSecretMetadata{keyMeta, tokenMeta},
 		},
 	}
-	require.NoError(t, secrets.SetEnvVars())
+	// The baked environment or the SSM overlay may carry every name.
+	planted := []string{
+		"SIGNING_KEY=planted", "LEGACY_KEY=planted", "LEGACY_TOKEN=planted", "APP_SETTING=kept",
+	}
+	// What the app would see: exec keeps the last value of a duplicate key.
+	childEnv := func(now time.Time) []string {
+		return (&exec.Cmd{Env: secrets.applyTo(planted, now)}).Environ()
+	}
 
-	require.Equal(t, "minted", os.Getenv("SIGNING_KEY"))
-	require.Equal(t, "verified", os.Getenv("LEGACY_KEY"))
-	_, planted := os.LookupEnv("LEGACY_TOKEN")
-	require.False(
-		t,
-		planted,
+	require.ElementsMatch(t,
+		[]string{"SIGNING_KEY=minted", "LEGACY_KEY=verified", "APP_SETTING=kept"},
+		childEnv(inheritTestCutoff.Add(-time.Second)),
 		"an inherited secret that was not delivered must not reach the app from the overlay",
+	)
+	require.ElementsMatch(t,
+		[]string{"SIGNING_KEY=minted", "APP_SETTING=kept"},
+		childEnv(inheritTestCutoff),
+		"nor may one past its cutoff",
+	)
+	require.Equal(t,
+		[]string{
+			"SIGNING_KEY=planted", "LEGACY_KEY=planted", "LEGACY_TOKEN=planted", "APP_SETTING=kept",
+		},
+		planted,
+		"the caller's environment must not change",
 	)
 }
 
@@ -389,12 +396,16 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 
 	boot := func(t *testing.T, cutoff, value string) (bootResult, error) {
 		t.Helper()
-		setStateOriginTestEnv(t)
-		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"token","env_var":"LEGACY_TOKEN",`+
-			`"type":"hash","value":["`+inheritTestHash("s3cr3t")+`"],"cutoff":"`+cutoff+`"}]`)
+		cfg := stateOriginTestConfig()
+		cfg.InheritSecretConfig = `[{"name":"token","env_var":"LEGACY_TOKEN",` +
+			`"type":"hash","value":["` + inheritTestHash("s3cr3t") + `"],"cutoff":"` + cutoff + `"}]`
 		fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
 		fx.ssmf.params[testCfg.inheritSecretPrefix()+"token"] = value
-		return fx.establish(ctx)
+		b, err := NewBoot(cfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
+		if err != nil {
+			return bootResult{}, err
+		}
+		return b.Boot(ctx)
 	}
 
 	t.Run("before cutoff", func(t *testing.T) {
@@ -416,15 +427,16 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
-	// plan validates the secrets config before anything else, so an empty Boot
-	// is enough to reach it.
+	// plan validates the secrets config before anything else, so a Boot with
+	// only a config is enough to reach it.
 	t.Run("duplicate env var aborts plan", func(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
-		t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`)
-		t.Setenv("ENCLAVE_INHERIT_SECRETS_CONFIG", `[{"name":"legacy","env_var":"SIGNING_KEY",`+
-			`"type":"publicKey","value":["`+pubKey+`"],"cutoff":"2030-01-01T00:00:00Z"}]`)
+		cfg := testConfig()
+		cfg.StaticSecretConfig = `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`
+		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"SIGNING_KEY",` +
+			`"type":"publicKey","value":["` + pubKey + `"],"cutoff":"2030-01-01T00:00:00Z"}]`
 
-		_, err := (&Boot{}).plan(ctx)
+		_, err := (&Boot{cfg: cfg}).plan(ctx)
 		require.ErrorContains(t, err, `env_var "SIGNING_KEY" is already used`)
 	})
 }

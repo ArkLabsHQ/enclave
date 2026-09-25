@@ -135,7 +135,8 @@ for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
         f"ssm put-parameter --name /dev/testapp/inherit/{inherited} "
         "--type String --value inherited-from-outside"
     )
-# The overlay must not be able to stand in for a secret past its cutoff.
+# Even allowlisted, the overlay must not be able to stand in for a secret past
+# its cutoff.
 put_env("E2E_EXPIRED", "planted-by-host")
 put_env("ENCLAVE_FQDN", FQDN)
 
@@ -161,9 +162,10 @@ for node in BLUES:
     assert env_value(node, "E2E_EXPIRED") == ""
     node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-        f"| jq -e --arg p '{BLUE_PCR0}' "
+        f"| jq -e --arg p '{BLUE_PCR0}' --arg bucket '{INTENT_BUCKET}' "
         "'.previous_pcr0 == \"genesis\" and .migration.state == \"none\" "
-        "and .migration.source_pcr0 == $p'"
+        "and .migration.source_pcr0 == $p "
+        "and .migration_intent_bucket == $bucket'"
     )
 blue_secret = secret_value(blue)
 assert secret_value(blue_peer) == blue_secret
@@ -389,7 +391,8 @@ green.wait_for_unit("enclave-start.service")
 # Candidates serve neither the app nor attestation.
 green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    "| jq -e '.status == \"candidate\"'",
+    f"| jq -e --arg bucket '{INTENT_BUCKET}' "
+    "'.status == \"candidate\" and .migration_intent_bucket == $bucket'",
     timeout=900,
 )
 health_status, _ = green.execute("curl -skf --http1.1 https://127.0.0.1/health")
@@ -525,10 +528,12 @@ assert secret_value(green) == blue_secret
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
+    f"--arg bucket '{INTENT_BUCKET}' "
     "'.previous_pcr0 == $prev "
     "and (.previous_pcr0_attestation | length) > 0 "
     "and .migration.state == \"none\" "
-    "and .migration.source_pcr0 == $current'"
+    "and .migration.source_pcr0 == $current "
+    "and .migration_intent_bucket == $bucket'"
 )
 
 # The ancestor-key audit must name blue as the one prior generation and report
@@ -636,10 +641,12 @@ assert env_value(green_peer, "E2E_EXPIRED") == ""
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
+    f"--arg bucket '{INTENT_BUCKET}' "
     "'.previous_pcr0 == $prev "
     "and (.previous_pcr0_attestation | length) > 0 "
     "and .migration.state == \"none\" "
-    "and .migration.source_pcr0 == $current'"
+    "and .migration.source_pcr0 == $current "
+    "and .migration_intent_bucket == $bucket'"
 )
 assert served_leaf_sha(green_peer) == leaf_sha_before
 assert served_leaf_sha(green) == leaf_sha_before

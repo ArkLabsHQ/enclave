@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,12 +24,12 @@ type SecretsMetadata struct {
 	Inherited []InheritSecretMetadata
 }
 
-func LoadSecretsMetadata() (SecretsMetadata, error) {
-	static, err := LoadStaticSecretMetadata()
+func LoadSecretsMetadata(cfg Config) (SecretsMetadata, error) {
+	static, err := LoadStaticSecretMetadata(cfg)
 	if err != nil {
 		return SecretsMetadata{}, err
 	}
-	inherited, err := LoadInheritSecretMetadata()
+	inherited, err := LoadInheritSecretMetadata(cfg)
 	if err != nil {
 		return SecretsMetadata{}, err
 	}
@@ -56,41 +56,49 @@ type Secrets struct {
 	metadata SecretsMetadata
 }
 
-// SetEnvVars exports the static secrets, then the inherited ones still before
-// their cutoff. The cutoff is rechecked here because boot resolved the secrets
-// some time ago. The env var of every inherited secret that is not exported is
-// cleared, so the SSM env overlay can't stand in for one that is absent or past
-// its cutoff.
-func (s Secrets) SetEnvVars() error {
-	for _, secret := range s.Static {
-		if err := safeSetenv(secret.EnvVar, secret.Plaintext); err != nil {
-			return fmt.Errorf("set %s: %w", secret.EnvVar, err)
-		}
-	}
-	for _, m := range s.metadata.Inherited {
-		if err := safeUnsetenv(m.EnvVar); err != nil {
-			return fmt.Errorf("unset %s: %w", m.EnvVar, err)
-		}
-	}
-
-	now := time.Now()
+// beforeCutoff drops the inherited secrets that have reached their cutoff by
+// now. Boot resolved the secrets some time ago, so the app is started, and its
+// cutoffs watched, with what is left.
+func (s Secrets) beforeCutoff(now time.Time) Secrets {
+	var inherited []InheritedSecret
 	for _, secret := range s.Inherited {
 		if !now.Before(secret.Cutoff) {
 			slog.Info("inherited secret reached its cutoff before the app started",
 				"name", secret.Name, "cutoff", secret.Cutoff)
 			continue
 		}
-		if err := safeSetenv(secret.EnvVar, secret.Plaintext); err != nil {
-			return fmt.Errorf("set %s: %w", secret.EnvVar, err)
+		inherited = append(inherited, secret)
+	}
+	s.Inherited = inherited
+	return s
+}
+
+
+func (s Secrets) applyTo(env []string, now time.Time) []string {
+	inherited := make(map[string]bool, len(s.metadata.Inherited))
+	for _, m := range s.metadata.Inherited {
+		inherited[m.EnvVar] = true
+	}
+	env = slices.DeleteFunc(slices.Clone(env), func(entry string) bool {
+		key, _, _ := strings.Cut(entry, "=")
+		return inherited[key]
+	})
+
+	// exec.Cmd.Env keeps the last value for duplicate keys, so these override.
+	for _, secret := range s.Static {
+		env = append(env, secret.EnvVar+"="+secret.Plaintext)
+	}
+	for _, secret := range s.Inherited {
+		if now.Before(secret.Cutoff) {
+			env = append(env, secret.EnvVar+"="+secret.Plaintext)
 		}
 	}
-
-	return nil
+	return env
 }
 
 // StaticSecretMetadata defines a secret managed by KMS inside the enclave runtime
 // (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
-// into the configured env var, which the child app inherits via os.Environ().
+// into the configured env var only in the child app's environment.
 type StaticSecretMetadata struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
@@ -101,8 +109,8 @@ type StaticSecret struct {
 	Plaintext string
 }
 
-func LoadStaticSecretMetadata() ([]StaticSecretMetadata, error) {
-	raw := getStaticSecretsConfig()
+func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
+	raw := cfg.StaticSecretConfig
 	if raw == "" {
 		return nil, nil
 	}
@@ -184,7 +192,7 @@ type InheritedSecret struct {
 	Plaintext string
 }
 
-// childReservedEnv lists the vars startApp sets on the child itself.
+// childReservedEnv lists the vars appEnv sets on the child itself.
 var childReservedEnv = map[string]bool{
 	"ENCLAVE_APP_PORT":      true,
 	"PORT":                  true,
@@ -198,8 +206,8 @@ var (
 	secretNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 )
 
-func LoadInheritSecretMetadata() ([]InheritSecretMetadata, error) {
-	raw := getInheritSecretsConfig()
+func LoadInheritSecretMetadata(cfg Config) ([]InheritSecretMetadata, error) {
+	raw := cfg.InheritSecretConfig
 	if raw == "" {
 		return nil, nil
 	}
@@ -231,7 +239,7 @@ func (sm SecretsMetadata) validateInherited() error {
 		if !envVarNamePattern.MatchString(m.EnvVar) {
 			return fmt.Errorf("inherited secret %q: invalid env_var %q", m.Name, m.EnvVar)
 		}
-		if nonOverridableEnv[m.EnvVar] || childReservedEnv[m.EnvVar] {
+		if childReservedEnv[m.EnvVar] {
 			return fmt.Errorf("inherited secret %q: env_var %q is reserved", m.Name, m.EnvVar)
 		}
 		if envVars[m.EnvVar] {
@@ -404,8 +412,8 @@ func resolveInheritedSecrets(
 	return secrets, nil
 }
 
-// watchInheritCutoffs clears each secret's env var once its cutoff passes and
-// signals that the app must be relaunched without it.
+// watchInheritCutoffs signals that the app must be relaunched once one of the
+// inherited secrets it was started with reaches its cutoff.
 func watchInheritCutoffs(
 	ctx context.Context,
 	inherited []InheritedSecret,
@@ -428,14 +436,6 @@ func watchInheritCutoffs(
 			for _, s := range pending {
 				if current.Before(s.Cutoff) {
 					remaining = append(remaining, s)
-					continue
-				}
-				if _, exported := os.LookupEnv(s.EnvVar); !exported {
-					continue
-				}
-
-				if err := safeUnsetenv(s.EnvVar); err != nil {
-					slog.Error("failed to unset inherited secret", "name", s.Name, "error", err)
 					continue
 				}
 				slog.Info("inherited secret reached its cutoff", "name", s.Name, "cutoff", s.Cutoff)

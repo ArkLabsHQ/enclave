@@ -52,12 +52,12 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("starting networking failed: %w", err)
 	}
 
-	aws, err := NewAWSClient(ctx)
+	aws, err := NewAWSClient(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize AWS clients: %w", err)
 	}
 	ssm := NewSSM(aws.SSM)
-	if err := ApplyEnvOverrides(ctx, &cfg, ssm); err != nil {
+	if err := cfg.ApplySSMOverlay(ctx, ssm); err != nil {
 		return fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
@@ -167,20 +167,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	// IMPORTANT: Set secret env vars *AFTER* SSM env override to prevent host from
-	// overriding established secret state
-	if err := result.secrets.SetEnvVars(); err != nil {
-		return fmt.Errorf("failed to set secrets env vars: %w", err)
-	}
-
-	app, err := startApp(rt, cfg, authToken)
+	secrets := result.secrets.beforeCutoff(time.Now())
+	app, err := startApp(rt, cfg, authToken, secrets)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
 
 	restart := watchInheritCutoffs(
 		ctx,
-		result.secrets.Inherited,
+		secrets.Inherited,
 		inheritCutoffPollInterval,
 	)
 
@@ -193,7 +188,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 type appProcess interface {
 	Stop() error
-	// Restart stops the app and launches it again with the current environment.
+	// Restart stops the app and launches it again with a freshly built environment.
 	Restart() error
 }
 
@@ -201,11 +196,34 @@ type execApp struct {
 	rt        RuntimeState
 	cfg       Config
 	authToken string
+	secrets   Secrets
 	cmd       *exec.Cmd
 }
 
-func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error) {
-	app := &execApp{rt: rt, cfg: cfg, authToken: authToken}
+func appEnv(cfg Config, authToken string, secrets Secrets) []string {
+	env := os.Environ()
+	// exec.Cmd.Env keeps the last value for duplicate keys, so append overrides.
+	for key, value := range cfg.ChildEnv {
+		env = append(env, key+"="+value)
+	}
+	// Secrets take precedence over SSM overrides.
+	env = secrets.applyTo(env, time.Now())
+	return append(
+		env,
+		"ENCLAVE_APP_PORT="+cfg.AppPort,
+		"PORT="+cfg.AppPort,
+		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
+		"ENCLAVE_RUNTIME_TOKEN="+authToken,
+	)
+}
+
+func startApp(
+	rt RuntimeState,
+	cfg Config,
+	authToken string,
+	secrets Secrets,
+) (appProcess, error) {
+	app := &execApp{rt: rt, cfg: cfg, authToken: authToken, secrets: secrets}
 	if err := app.launch(); err != nil {
 		return nil, err
 	}
@@ -213,19 +231,13 @@ func startApp(rt RuntimeState, cfg Config, authToken string) (appProcess, error)
 }
 
 func (a *execApp) launch() error {
-	rt, cfg, authToken := a.rt, a.cfg, a.authToken
-	appPath := "/app/" + getAppBinaryName()
+	rt, cfg := a.rt, a.cfg
+	appPath := "/app/" + cfg.AppBinaryName
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = append(
-		os.Environ(),
-		"ENCLAVE_APP_PORT="+cfg.AppPort,
-		"PORT="+cfg.AppPort,
-		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-		"ENCLAVE_RUNTIME_TOKEN="+authToken,
-	)
+	child.Env = appEnv(cfg, a.authToken, a.secrets)
 
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("start child %s: %w", appPath, err)

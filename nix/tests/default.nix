@@ -198,6 +198,9 @@ let
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
+    ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
+    ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -251,6 +254,12 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      # E2E_EXPIRED is allowlisted so e2e.py can check that even a permitted
+      # override cannot stand in for an inherited secret past its cutoff.
+      overrideAllowlist = [
+        "E2E_OVERRIDE"
+        "E2E_EXPIRED"
+      ];
       env = commonEifEnv // env;
     };
 

@@ -222,7 +222,7 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 
 // plan decides, once, which of the three boots this is.
 func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
-	secretsMetadata, err := LoadSecretsMetadata()
+	secretsMetadata, err := LoadSecretsMetadata(*b.cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
 	}

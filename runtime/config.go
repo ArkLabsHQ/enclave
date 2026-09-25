@@ -1,27 +1,78 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// Configuration input names shared by the environment loader and SSM overlay.
+const (
+	// Application and identity.
+	envDeployment           = "ENCLAVE_DEPLOYMENT"
+	envAppName              = "ENCLAVE_APP_NAME"
+	envAppPort              = "ENCLAVE_APP_PORT"
+	envAppBinaryName        = "APP_BINARY_NAME"
+	envPreviousPCR0         = "ENCLAVE_PREVIOUS_PCR0"
+	envSecretsConfig        = "ENCLAVE_SECRETS_CONFIG"
+	envInheritSecretsConfig = "ENCLAVE_INHERIT_SECRETS_CONFIG"
+	envOverrideAllowList    = "ENCLAVE_OVERRIDE_ALLOWLIST"
+
+	// Security and migration.
+	envDev                   = "ENCLAVE_DEV"
+	envInsecureVerifySkipped = "ENCLAVE_INSECURE_VERIFY_SKIPPED"
+	envVerifyClockSource     = "ENCLAVE_VERIFY_CLOCK_SOURCE"
+	envMigrationCooldown     = "ENCLAVE_MIGRATION_COOLDOWN"
+
+	// Networking and telemetry.
+	envFQDN             = "ENCLAVE_FQDN"
+	envUpstream         = "ENCLAVE_UPSTREAM"
+	envViproxyInAddrs   = "ENCLAVE_VIPROXY_IN_ADDRS"
+	envViproxyOutAddrs  = "ENCLAVE_VIPROXY_OUT_ADDRS"
+	envLogShipInterval  = "ENCLAVE_LOG_SHIP_INTERVAL"
+	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
+	envLogGroupPrefix   = "ENCLAVE_LOG_GROUP_PREFIX"
+
+	// ACME settings accepted by the SSM overlay.
+	envUseACME       = "ENCLAVE_USE_ACME"
+	envACMEDirectory = "ENCLAVE_ACME_DIRECTORY"
+	envACMEEmail     = "ENCLAVE_ACME_EMAIL"
+	envACMECA        = "ENCLAVE_ACME_CA"
+
+	// AWS configuration.
+	envAWSRegion           = "ENCLAVE_AWS_REGION"
+	envEC2MetadataEndpoint = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
+	envRoute53Endpoint     = "AWS_ENDPOINT_URL_ROUTE53"
+	envKMSEndpoint         = "AWS_ENDPOINT_URL_KMS"
+	envSSMEndpoint         = "AWS_ENDPOINT_URL_SSM"
+	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
+	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
+	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+)
+
 const (
 	prodRetention          = 10 * 365 * 24 * time.Hour
-	prodMigrationCooldown  = 24 * time.Hour
 	prodIntentWriteTimeout = 10 * time.Minute
+	// 5 min matches Evervault's /dev/ptp0 sync cadence:
+	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
+	prodClockSyncInterval = 5 * time.Minute
 
 	devGenesisRetention   = 5 * time.Minute
 	devIntentRetention    = 10 * time.Minute
-	devMigrationCooldown  = 2 * time.Second
 	devIntentWriteTimeout = 2 * time.Minute
+	devClockSyncInterval  = 5 * time.Second
 
-	defaultLogShipInterval  = 10 * time.Second
-	defaultLogRetentionDays = int32(30)
-	logGroupRoot            = "enclave"
+	defaultMigrationCooldown = 24 * time.Hour
+	defaultLogShipInterval   = 10 * time.Second
+	defaultLogRetentionDays  = int32(30)
+	logGroupRoot             = "enclave"
 
 	logGroupNameChars = "._-/#"
 
@@ -31,21 +82,25 @@ const (
 	inheritCutoffPollInterval = 30 * time.Second
 
 	migrationAbortResponse = "abort"
-)
 
-const (
 	// extPort is the public TLS listener. Fixed: the host's routing, the README
 	// and every client URL assume 443.
 	extPort = 443
-
 	// intPort is the loopback API listener, handed to the application as
 	// ENCLAVE_PROXY_PORT so it does not have to assume the value.
 	intPort = 8080
-
 	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
 	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
 	// alone silently breaks all networking.
 	hostProxyPort = 1024
+
+	defaultViproxyIn  = "127.0.0.1:80"
+	defaultViproxyOut = "3:8002"
+	// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
+	defaultIMDSEndpoint = "http://127.0.0.1:80"
+	defaultAWSRegion    = "us-east-1"
+	defaultFQDN         = "localhost"
+	defaultAppName      = "app"
 )
 
 // Config holds runtime HTTP/network settings, the enclave's identity, and the
@@ -55,11 +110,23 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment   string
-	AppName      string
-	Dev          bool
-	AppPort      string
-	PreviousPCR0 string
+	Deployment          string
+	AppName             string
+	AppPort             string
+	AppBinaryName       string
+	PreviousPCR0        string
+	StaticSecretConfig  string
+	InheritSecretConfig string
+
+	// AWS config, EIF-baked and only overridable via in dev mode
+	Route53Endpoint     string
+	KMSEndpoint         string
+	SSMEndpoint         string
+	STSEndpoint         string
+	S3Endpoint          string
+	CloudWatchEndpoint  string
+	AWSRegion           string
+	EC2MetadataEndpoint string
 
 	FQDN             string   // Hostname the TLS cert is issued for.
 	ExtPort          uint16   // External TLS listener.
@@ -71,6 +138,8 @@ type Config struct {
 	ACMECA           string   // PEM CA bundle for private/test ACME HTTPS.
 	AppWebSrv        *url.URL // Loopback URL the catch-all revProxy forwards to.
 	UpstreamProtocol string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
+	ViproxyInAddr    string
+	ViproxyOutAddr   string
 
 	KMSLocked             bool
 	InsecureVerifySkipped bool
@@ -79,54 +148,96 @@ type Config struct {
 	IntentRetention       time.Duration
 	IntentWriteTimeout    time.Duration
 	MigrationCooldown     time.Duration
+	ClockSyncInterval     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
 	LogGroupPrefix        string
 	InstanceID            string
+
+	OverrideAllowList map[string]bool
+	ChildEnv          map[string]string
 }
 
-// LoadConfig builds Config from ENCLAVE_* env vars.
+// LoadConfig captures runtime configuration and unsets each environment variable
+// it reads.
 func LoadConfig() (*Config, error) {
 	// Point the reverse proxy directly at the user app.
-	appPort := getAppPort()
+	appPort := takeEnvDefault(envAppPort, "7074")
 	appWebSrv, err := url.Parse("http://127.0.0.1:" + appPort)
 	if err != nil {
 		return nil, fmt.Errorf("parse app web srv url: %w", err)
 	}
 
 	cfg := &Config{
-		Deployment:   getDeployment(),
-		AppName:      getAppName(),
-		AppPort:      appPort,
-		PreviousPCR0: getPreviousPCR0(),
+		Deployment:          takeEnv(envDeployment),
+		AppName:             takeEnv(envAppName),
+		AppBinaryName:       takeEnvDefault(envAppBinaryName, defaultAppName),
+		AppPort:             appPort,
+		PreviousPCR0:        takeEnv(envPreviousPCR0),
+		StaticSecretConfig:  takeEnv(envSecretsConfig),
+		InheritSecretConfig: takeEnv(envInheritSecretsConfig),
+		EC2MetadataEndpoint: takeEnvDefault(
+			envEC2MetadataEndpoint,
+			defaultIMDSEndpoint,
+		),
+		Route53Endpoint:       takeEnv(envRoute53Endpoint),
+		KMSEndpoint:           takeEnv(envKMSEndpoint),
+		SSMEndpoint:           takeEnv(envSSMEndpoint),
+		STSEndpoint:           takeEnv(envSTSEndpoint),
+		S3Endpoint:            takeEnv(envS3Endpoint),
+		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),
+		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
+		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),
+		FQDN:                  takeEnvDefault(envFQDN, defaultFQDN),
+		ExtPort:               extPort,
+		IntPort:               intPort,
+		HostProxyPort:         hostProxyPort,
+		AppWebSrv:             appWebSrv,
+		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
+		LogShipInterval:       logShipInterval(),
+		LogRetentionDays:      logRetentionDays(),
+		LogGroupPrefix:        normalizeLogGroupPrefix(takeEnv(envLogGroupPrefix)),
+		GenesisRetention:      prodRetention,
+		IntentRetention:       prodRetention,
+		IntentWriteTimeout:    prodIntentWriteTimeout,
+		MigrationCooldown:     defaultMigrationCooldown,
+		ClockSyncInterval:     prodClockSyncInterval,
+		VerifyClockSource:     takeEnv(envVerifyClockSource) != "false",
+		InsecureVerifySkipped: false,
+		KMSLocked:             true,
+		OverrideAllowList:     make(map[string]bool),
+		ChildEnv:              make(map[string]string),
+	}
 
-		FQDN:             getFQDN(),
-		ExtPort:          extPort,
-		IntPort:          intPort,
-		HostProxyPort:    hostProxyPort,
-		AppWebSrv:        appWebSrv,
-		UpstreamProtocol: getUpstreamProtocol(),
-		LogShipInterval:  logShipInterval(),
-		LogRetentionDays: logRetentionDays(),
-		LogGroupPrefix:   logGroupPrefix(),
-	}
-	cfg.setSecurityConfig(IsDev())
+	if takeEnv(envDev) == "true" {
+		cfg.KMSLocked = false
+		cfg.GenesisRetention = devGenesisRetention
+		cfg.IntentRetention = devIntentRetention
+		cfg.IntentWriteTimeout = devIntentWriteTimeout
+		cfg.ClockSyncInterval = devClockSyncInterval
 
-	cooldown, set, err := migrationCooldown()
-	if err != nil {
-		return nil, err
-	}
-	if set {
-		cfg.MigrationCooldown = cooldown
+		// only allow overriding cfg.InsecureVerifySkipped in dev mode
+		// It is false by default unless explicitly overridden
+		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
 	}
 
-	verify, set, err := verifyClockSource()
-	if err != nil {
-		return nil, err
+	if cooldown := takeEnv(envMigrationCooldown); cooldown != "" {
+		d, err := time.ParseDuration(cooldown)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", cooldown, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+		}
+
+		cfg.MigrationCooldown = d
 	}
-	if set {
-		cfg.VerifyClockSource = verify
+
+	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
+		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
 	}
+
 	return cfg, nil
 }
 
@@ -158,6 +269,67 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
 	return c.validateLogGroupPrefix()
+}
+
+func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
+	prefix := fmt.Sprintf("/%s/%s/env/", c.Deployment, c.AppName)
+
+	params, err := ssm.ListParams(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list env override SSM params: %w", err)
+	}
+
+	applied := 0
+	for _, p := range params {
+		key := strings.TrimPrefix(p.Name, prefix)
+		// Defensive: skip empty or nested keys so a misconfigured SSM
+		// tree can't surface unexpected env var names.
+		if key == "" || strings.ContainsRune(key, '/') {
+			continue
+		}
+
+		switch key {
+		case envAppPort:
+			port, err := strconv.ParseUint(p.Value, 10, 16)
+			if err != nil || port == 0 {
+				return fmt.Errorf("invalid application port %q", p.Value)
+			}
+			appWebSrv, err := url.Parse("http://127.0.0.1:" + p.Value)
+			if err != nil {
+				return fmt.Errorf("parse app web srv url: %w", err)
+			}
+			c.AppPort = p.Value
+			c.AppWebSrv = appWebSrv
+		case envFQDN:
+			c.FQDN = p.Value
+		case envUseACME:
+			c.UseACME = strings.EqualFold(p.Value, "true")
+		case envACMEDirectory:
+			c.ACMEDirectory = p.Value
+		case envACMEEmail:
+			c.ACMEEmail = p.Value
+		case envACMECA:
+			c.ACMECA = p.Value
+		case envLogGroupPrefix:
+			c.LogGroupPrefix = normalizeLogGroupPrefix(p.Value)
+			if err := c.validateLogGroupPrefix(); err != nil {
+				return err
+			}
+		// key is not an overridable env var, check if overriding is allowed by the app
+		default:
+			if _, allowed := c.OverrideAllowList[key]; !allowed {
+				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
+				continue
+			}
+
+			c.ChildEnv[key] = p.Value
+		}
+		applied++
+	}
+
+	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
+
+	return nil
 }
 
 func (c *Config) validateLogGroupPrefix() error {
@@ -197,57 +369,6 @@ func (c *Config) lockSegment() string {
 		return "locked"
 	}
 	return "unlocked"
-}
-
-func (c *Config) setSecurityConfig(dev bool) {
-	c.Dev = dev
-	c.KMSLocked = !dev
-	c.InsecureVerifySkipped = dev
-	c.VerifyClockSource = !dev
-
-	if dev {
-		c.GenesisRetention = devGenesisRetention
-		c.IntentRetention = devIntentRetention
-		c.IntentWriteTimeout = devIntentWriteTimeout
-		c.MigrationCooldown = devMigrationCooldown
-		return
-	}
-	c.GenesisRetention = prodRetention
-	c.IntentRetention = prodRetention
-	c.IntentWriteTimeout = prodIntentWriteTimeout
-	c.MigrationCooldown = prodMigrationCooldown
-}
-
-func (c *Config) applyEnvOverride(name, value string) error {
-	switch name {
-	case "ENCLAVE_APP_PORT":
-		port, err := strconv.ParseUint(value, 10, 16)
-		if err != nil || port == 0 {
-			return fmt.Errorf("invalid application port %q", value)
-		}
-		appWebSrv, err := url.Parse("http://127.0.0.1:" + value)
-		if err != nil {
-			return fmt.Errorf("parse app web srv url: %w", err)
-		}
-		c.AppPort = value
-		c.AppWebSrv = appWebSrv
-	case "ENCLAVE_FQDN":
-		c.FQDN = value
-	case "ENCLAVE_USE_ACME":
-		c.UseACME = strings.EqualFold(value, "true")
-	case "ENCLAVE_ACME_DIRECTORY":
-		c.ACMEDirectory = value
-	case "ENCLAVE_ACME_EMAIL":
-		c.ACMEEmail = value
-	case "ENCLAVE_ACME_CA":
-		c.ACMECA = value
-	case "ENCLAVE_LOG_GROUP_PREFIX":
-		c.LogGroupPrefix = normalizeLogGroupPrefix(value)
-		if err := c.validateLogGroupPrefix(); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (c *Config) logGroup(sig signal) string {
@@ -391,4 +512,42 @@ func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
 		strings.ToLower(sourcePCR0),
 		strings.ToLower(responder),
 	)
+}
+
+// takeEnv consumes a configuration variable, removing it from the process environment.
+func takeEnv(key string) string {
+	value := os.Getenv(key)
+	_ = os.Unsetenv(key)
+	return strings.TrimSpace(value)
+}
+
+func takeEnvDefault(key, fallback string) string {
+	if v := takeEnv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func logShipInterval() time.Duration {
+	value := takeEnvDefault(envLogShipInterval, defaultLogShipInterval.String())
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return defaultLogShipInterval
+	}
+	return interval
+}
+
+func logRetentionDays() int32 {
+	value := takeEnvDefault(
+		envLogRetentionDays, strconv.FormatInt(int64(defaultLogRetentionDays), 10),
+	)
+	days, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || days <= 0 {
+		return defaultLogRetentionDays
+	}
+	return int32(days)
+}
+
+func normalizeLogGroupPrefix(raw string) string {
+	return path.Join("/", strings.TrimSpace(raw))
 }

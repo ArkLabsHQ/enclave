@@ -62,7 +62,7 @@ type Secrets struct {
 func (s Secrets) beforeCutoff(now time.Time) Secrets {
 	var inherited []InheritedSecret
 	for _, secret := range s.Inherited {
-		if !now.Before(secret.Cutoff) {
+		if secret.pastCutoff(now) {
 			slog.Info("inherited secret reached its cutoff before the app started",
 				"name", secret.Name, "cutoff", secret.Cutoff)
 			continue
@@ -72,7 +72,6 @@ func (s Secrets) beforeCutoff(now time.Time) Secrets {
 	s.Inherited = inherited
 	return s
 }
-
 
 func (s Secrets) applyTo(env []string, now time.Time) []string {
 	inherited := make(map[string]bool, len(s.metadata.Inherited))
@@ -89,7 +88,7 @@ func (s Secrets) applyTo(env []string, now time.Time) []string {
 		env = append(env, secret.EnvVar+"="+secret.Plaintext)
 	}
 	for _, secret := range s.Inherited {
-		if now.Before(secret.Cutoff) {
+		if !secret.pastCutoff(now) {
 			env = append(env, secret.EnvVar+"="+secret.Plaintext)
 		}
 	}
@@ -178,13 +177,19 @@ const (
 // must be, so the pin and the cutoff are part of PCR0. Value holds one
 // commitment per delivered entry: `hash` pins SHA-256 hashes, `publicKey` pins
 // compressed secp256k1 public keys whose secrets are hex-encoded private keys.
-// From Cutoff on, the app no longer receives it.
+// From Cutoff on, the app no longer receives it; without a Cutoff, it always does.
 type InheritSecretMetadata struct {
 	Name   string    `json:"name"`
 	EnvVar string    `json:"env_var"`
 	Type   string    `json:"type"`
 	Value  []string  `json:"value"`
 	Cutoff time.Time `json:"cutoff"`
+}
+
+// pastCutoff reports whether the secret has reached its cutoff by now. A secret
+// without a cutoff never does.
+func (m InheritSecretMetadata) pastCutoff(now time.Time) bool {
+	return !m.Cutoff.IsZero() && !now.Before(m.Cutoff)
 }
 
 type InheritedSecret struct {
@@ -292,10 +297,6 @@ func (sm SecretsMetadata) validateInherited() error {
 				}
 			}
 		}
-
-		if m.Cutoff.IsZero() {
-			return fmt.Errorf("inherited secret %q: cutoff is required", m.Name)
-		}
 	}
 	return nil
 }
@@ -385,7 +386,7 @@ func resolveInheritedSecrets(
 
 	var secrets []InheritedSecret
 	for _, m := range meta {
-		if !now.Before(m.Cutoff) {
+		if m.pastCutoff(now) {
 			slog.Info("inherited secret is past its cutoff", "name", m.Name, "cutoff", m.Cutoff)
 			continue
 		}
@@ -413,14 +414,18 @@ func resolveInheritedSecrets(
 }
 
 // watchInheritCutoffs signals that the app must be relaunched once one of the
-// inherited secrets it was started with reaches its cutoff.
+// inherited secrets it was started with reaches its cutoff. Secrets without a
+// cutoff are never watched.
 func watchInheritCutoffs(
 	ctx context.Context,
 	inherited []InheritedSecret,
 	interval time.Duration,
 ) <-chan struct{} {
 	restart := make(chan struct{}, 1)
-	if len(inherited) == 0 {
+	pending := slices.DeleteFunc(slices.Clone(inherited), func(s InheritedSecret) bool {
+		return s.Cutoff.IsZero()
+	})
+	if len(pending) == 0 {
 		return restart
 	}
 
@@ -428,13 +433,12 @@ func watchInheritCutoffs(
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		pending := inherited
 		for len(pending) > 0 {
 			current := time.Now()
 			expired := false
 			remaining := pending[:0:0]
 			for _, s := range pending {
-				if current.Before(s.Cutoff) {
+				if !s.pastCutoff(current) {
 					remaining = append(remaining, s)
 					continue
 				}

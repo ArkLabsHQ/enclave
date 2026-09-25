@@ -89,6 +89,9 @@ func TestValidateInheritSecrets(t *testing.T) {
 		m.Value = []string{pubKey, secondPubKey}
 	})))
 	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
+		m.Cutoff = time.Time{} // the cutoff is optional
+	})))
+	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
 		m.Type, m.Value = inheritSecretTypeHash, []string{inheritTestHash("token")}
 	})))
 	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
@@ -175,11 +178,6 @@ func TestValidateInheritSecrets(t *testing.T) {
 		{"malformed public key list entry", with(func(m *InheritSecretMetadata) {
 			m.Value = []string{pubKey, "zz"}
 		}), "publicKey 1 is not hex"},
-		{
-			"missing cutoff",
-			with(func(m *InheritSecretMetadata) { m.Cutoff = time.Time{} }),
-			"cutoff is required",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

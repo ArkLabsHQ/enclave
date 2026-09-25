@@ -49,7 +49,7 @@ const (
 type bootResult struct {
 	kms     PrimaryKMS
 	dek     DEK
-	secrets []StaticSecret
+	secrets Secrets
 	tlsKey  crypto.Signer
 
 	migrationIntentBucketName string
@@ -86,10 +86,10 @@ func (s bootSnapshot) lineage() stateLineage {
 
 // bootState is what every boot knows, whatever brought it about.
 type bootState struct {
-	cfg         *Config
-	currentPCR0 []byte
-	metadata    []StaticSecretMetadata
-	kmsKeyID    string
+	cfg             *Config
+	currentPCR0     []byte
+	secretsMetadata SecretsMetadata
+	kmsKeyID        string
 
 	predecessorPCR0        string
 	predecessorKMSKeyID    string
@@ -198,21 +198,37 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 	}
 
 	state := &planned.state
+
+	// Inherited secrets come first: a value that fails its commitment check aborts
+	// the boot here, before a KMS key is created or any enclave state is written.
+	inheritedSecrets, err := resolveInheritedSecrets(
+		ctx, b.cfg, b.ssm, state.secretsMetadata.Inherited, time.Now(),
+	)
+	if err != nil {
+		return bootResult{}, err
+	}
+
 	kms, err := FetchOrCreatePrimaryKMS(ctx, b.cfg, b.nsm, b.kmsAPI, b.sts, state.kmsKeyID)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
-	return b.establish(ctx, planned, kms)
+	result, err := b.establish(ctx, planned, kms)
+	if err != nil {
+		return bootResult{}, err
+	}
+	result.secrets.Inherited = inheritedSecrets
+
+	return result, nil
 }
 
 // plan decides, once, which of the three boots this is.
 func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
-	metadata, err := LoadStaticSecretMetadata(*b.cfg)
+	secretsMetadata, err := LoadSecretsMetadata(*b.cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load static secret metadata: %w", err)
+		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
 	}
-	if err := validateStaticSecretNames(metadata); err != nil {
-		return nil, fmt.Errorf("invalid static secret metadata: %w", err)
+	if err := secretsMetadata.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
 	}
 	migrationIntentBucketName, err := b.migrationIntentBucket(ctx)
 	if err != nil {
@@ -230,7 +246,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	state := bootState{
 		cfg:                    b.cfg,
 		currentPCR0:            append([]byte(nil), b.pcr0...),
-		metadata:               metadata,
+		secretsMetadata:        secretsMetadata,
 		predecessorPCR0:        predecessorPCR0,
 		predecessorKMSKeyID:    predecessorKMSKeyID,
 		predecessorAttestation: predecessorAttestation,
@@ -395,8 +411,8 @@ func (b *Boot) establish(
 		return bootResult{}, fmt.Errorf("TLS key of type %T cannot sign", tlsKeyAny)
 	}
 
-	secrets := make([]StaticSecret, 0, len(state.metadata))
-	for _, meta := range state.metadata {
+	staticSecrets := make([]StaticSecret, 0, len(state.secretsMetadata.Static))
+	for _, meta := range state.secretsMetadata.Static {
 		ciphertext, ok := snapshot.staticSecrets[meta]
 		if !ok {
 			return bootResult{}, fmt.Errorf("snapshot missing static secret %s", meta.Name)
@@ -407,7 +423,7 @@ func (b *Boot) establish(
 				"failed to decrypt static secret %s: %w", meta.Name, err,
 			)
 		}
-		secrets = append(secrets, StaticSecret{
+		staticSecrets = append(staticSecrets, StaticSecret{
 			StaticSecretMetadata: meta,
 			Plaintext:            hex.EncodeToString(plaintext),
 		})
@@ -421,7 +437,7 @@ func (b *Boot) establish(
 	return bootResult{
 		kms:                       kms,
 		dek:                       &dek{key: dekPlaintext},
-		secrets:                   secrets,
+		secrets:                   Secrets{Static: staticSecrets, metadata: state.secretsMetadata},
 		tlsKey:                    tlsKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 		lineage:                   snapshot.lineage(),
@@ -430,8 +446,8 @@ func (b *Boot) establish(
 
 // loadSnapshotArtifacts fills in the ciphertexts a non-genesis boot inherits.
 func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyID string) error {
-	secrets := make(map[StaticSecretMetadata]string, len(state.metadata))
-	for _, secret := range state.metadata {
+	secrets := make(map[StaticSecretMetadata]string, len(state.secretsMetadata.Static))
+	for _, secret := range state.secretsMetadata.Static {
 		ciphertext, err := b.ssm.MustGet(ctx, b.cfg.secretCiphertextParam(secret.Name, keyID))
 		if err != nil {
 			return fmt.Errorf("required static secret SSM param missing: %w", err)
@@ -467,7 +483,10 @@ func (b *Boot) loadPredecessor(
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
 	}
-	attestation, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0))
+	attestation, err = b.ssm.MayGet(
+		ctx,
+		b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0),
+	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
@@ -585,8 +604,8 @@ func (b *genesisBoot) buildSnapshot(
 		return bootSnapshot{}, fmt.Errorf("failed to store DEK: %w", err)
 	}
 
-	persistedSecrets := make(map[StaticSecretMetadata]string, len(state.metadata))
-	for _, secret := range state.metadata {
+	persistedSecrets := make(map[StaticSecretMetadata]string, len(state.secretsMetadata.Static))
+	for _, secret := range state.secretsMetadata.Static {
 		data, err := kms.GenerateDataKey(ctx)
 		if err != nil {
 			return bootSnapshot{}, fmt.Errorf(
@@ -809,20 +828,6 @@ func predecessorExpectedPCRs(state *bootState) map[uint]string {
 		0:                 state.predecessorPCR0,
 		migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(state.currentPCR0)),
 	}
-}
-
-func validateStaticSecretNames(metadata []StaticSecretMetadata) error {
-	seen := make(map[string]bool, len(metadata))
-	for _, secret := range metadata {
-		if secret.Name == "StorageDEK" {
-			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
-		}
-		if seen[secret.Name] {
-			return fmt.Errorf("duplicate static secret %q", secret.Name)
-		}
-		seen[secret.Name] = true
-	}
-	return nil
 }
 
 // WriteTransitionReceipt is called by the predecessor during a handoff; PCR31

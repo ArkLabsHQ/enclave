@@ -16,13 +16,14 @@ import (
 // Configuration input names shared by the environment loader and SSM overlay.
 const (
 	// Application and identity.
-	envDeployment        = "ENCLAVE_DEPLOYMENT"
-	envAppName           = "ENCLAVE_APP_NAME"
-	envAppPort           = "ENCLAVE_APP_PORT"
-	envAppBinaryName     = "APP_BINARY_NAME"
-	envPreviousPCR0      = "ENCLAVE_PREVIOUS_PCR0"
-	envSecretsConfig     = "ENCLAVE_SECRETS_CONFIG"
-	envOverrideAllowList = "ENCLAVE_OVERRIDE_ALLOWLIST"
+	envDeployment           = "ENCLAVE_DEPLOYMENT"
+	envAppName              = "ENCLAVE_APP_NAME"
+	envAppPort              = "ENCLAVE_APP_PORT"
+	envAppBinaryName        = "APP_BINARY_NAME"
+	envPreviousPCR0         = "ENCLAVE_PREVIOUS_PCR0"
+	envSecretsConfig        = "ENCLAVE_SECRETS_CONFIG"
+	envInheritSecretsConfig = "ENCLAVE_INHERIT_SECRETS_CONFIG"
+	envOverrideAllowList    = "ENCLAVE_OVERRIDE_ALLOWLIST"
 
 	// Security and migration.
 	envDev                   = "ENCLAVE_DEV"
@@ -78,6 +79,8 @@ const (
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
 
+	inheritCutoffPollInterval = 30 * time.Second
+
 	migrationAbortResponse = "abort"
 
 	// extPort is the public TLS listener. Fixed: the host's routing, the README
@@ -107,12 +110,13 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment         string
-	AppName            string
-	AppPort            string
-	AppBinaryName      string
-	PreviousPCR0       string
-	StaticSecretConfig string
+	Deployment          string
+	AppName             string
+	AppPort             string
+	AppBinaryName       string
+	PreviousPCR0        string
+	StaticSecretConfig  string
+	InheritSecretConfig string
 
 	// AWS config, EIF-baked and only overridable via in dev mode
 	Route53Endpoint     string
@@ -165,12 +169,13 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Deployment:         takeEnv(envDeployment),
-		AppName:            takeEnv(envAppName),
-		AppBinaryName:      takeEnvDefault(envAppBinaryName, defaultAppName),
-		AppPort:            appPort,
-		PreviousPCR0:       takeEnv(envPreviousPCR0),
-		StaticSecretConfig: takeEnv(envSecretsConfig),
+		Deployment:          takeEnv(envDeployment),
+		AppName:             takeEnv(envAppName),
+		AppBinaryName:       takeEnvDefault(envAppBinaryName, defaultAppName),
+		AppPort:             appPort,
+		PreviousPCR0:        takeEnv(envPreviousPCR0),
+		StaticSecretConfig:  takeEnv(envSecretsConfig),
+		InheritSecretConfig: takeEnv(envInheritSecretsConfig),
 		EC2MetadataEndpoint: takeEnvDefault(
 			envEC2MetadataEndpoint,
 			defaultIMDSEndpoint,
@@ -405,6 +410,12 @@ func (c *Config) secretCiphertextParam(secretName, keyID string) string {
 		secretName,
 		keyID,
 	)
+}
+
+// inheritSecretPrefix: SSM path prefix under which the operator places inherited
+// secrets, one parameter per configured name.
+func (c *Config) inheritSecretPrefix() string {
+	return fmt.Sprintf("/%s/%s/inherit/", c.Deployment, c.AppName)
 }
 
 // storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,

@@ -22,10 +22,23 @@ type Param struct {
 
 type SSM interface {
 	Set(ctx context.Context, key, val string, opts ...SSMSetOption) error
-	MustGet(ctx context.Context, key string) (string, error)
-	MayGet(ctx context.Context, key string) (string, error)
+	MustGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error)
+
+	MayGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error)
 	ListParams(ctx context.Context, prefix string) ([]Param, error)
 }
+
+type SSMGetOptions struct {
+	withDecryption bool
+}
+
+func WithDecryption() SSMGetOption {
+	return func(so *SSMGetOptions) {
+		so.withDecryption = true
+	}
+}
+
+type SSMGetOption func(*SSMGetOptions)
 
 type SSMSetOptions struct {
 	tier      ssmtypes.ParameterTier
@@ -74,44 +87,55 @@ func (s *ssmW) Set(ctx context.Context, key, val string, opts ...SSMSetOption) e
 	return nil
 }
 
-func (s *ssmW) MustGet(ctx context.Context, key string) (string, error) {
+func (s *ssmW) doGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
+	so := &SSMGetOptions{}
+
+	for _, opt := range opts {
+		opt(so)
+	}
+
 	out, err := s.ssm.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(key),
-		WithDecryption: aws.Bool(false),
+		WithDecryption: aws.Bool(so.withDecryption),
 	})
 	if err != nil {
 		return "", fmt.Errorf("ssm get-parameter %s: %w", key, err)
 	}
 	if out.Parameter == nil || out.Parameter.Value == nil {
-		return "", fmt.Errorf("parameter %s has no value", key)
+		return "", nil
 	}
-	value := strings.TrimSpace(*out.Parameter.Value)
+
+	return strings.TrimSpace(*out.Parameter.Value), nil
+}
+
+func (s *ssmW) MustGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
+	value, err := s.doGet(ctx, key, opts...)
+	if err != nil {
+		return "", err
+	}
+
 	if value == "" || value == "UNSET" {
 		return "", fmt.Errorf("parameter %s is unset", key)
 	}
+
 	return value, nil
 }
 
-func (s *ssmW) MayGet(ctx context.Context, key string) (string, error) {
-	out, err := s.ssm.GetParameter(ctx, &ssm.GetParameterInput{
-		Name:           aws.String(key),
-		WithDecryption: aws.Bool(false),
-	})
+func (s *ssmW) MayGet(ctx context.Context, key string, opts ...SSMGetOption) (string, error) {
+	value, err := s.doGet(ctx, key, opts...)
 	if err != nil {
 		var pnf *ssmtypes.ParameterNotFound
 		if errors.As(err, &pnf) {
 			return "", nil
 		}
-		return "", fmt.Errorf("ssm get-parameter %s: %w", key, err)
+		return "", err
 	}
-	if out.Parameter == nil || out.Parameter.Value == nil {
+
+	if value == "UNSET" {
 		return "", nil
 	}
-	v := strings.TrimSpace(*out.Parameter.Value)
-	if v == "" || v == "UNSET" {
-		return "", nil
-	}
-	return v, nil
+
+	return value, nil
 }
 
 func (s *ssmW) ListParams(ctx context.Context, prefix string) ([]Param, error) {

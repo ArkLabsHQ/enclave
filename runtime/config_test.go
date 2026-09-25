@@ -467,6 +467,7 @@ func TestApplySSMOverlay(t *testing.T) {
 					path(envDeployment):            "dev",
 					path(envAppName):               "evil",
 					path(envSecretsConfig):         `[{"name":"evil"}]`,
+					path(envInheritSecretsConfig):  `[{"name":"evil"}]`,
 					path(envDev):                   strconv.FormatBool(!dev),
 					path(envMigrationCooldown):     "0s",
 					path(envVerifyClockSource):     "false",
@@ -478,6 +479,8 @@ func TestApplySSMOverlay(t *testing.T) {
 				require.Empty(t, os.Getenv(envDeployment))
 				require.Empty(t, os.Getenv(envAppName))
 				require.Empty(t, os.Getenv(envSecretsConfig))
+				require.Empty(t, os.Getenv(envInheritSecretsConfig),
+					"the overlay must not be able to pin an inherited secret of its own")
 				require.Empty(t, os.Getenv(envDev))
 				require.Empty(t, os.Getenv(envMigrationCooldown))
 				require.Empty(t, os.Getenv(envVerifyClockSource))

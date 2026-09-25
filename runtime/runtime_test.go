@@ -102,7 +102,9 @@ func TestAppEnv(t *testing.T) {
 			require.NoError(t, cfg.ApplySSMOverlay(t.Context(), NewSSM(&fakeSSM{params: params})))
 			overrides := maps.Clone(cfg.ChildEnv)
 
-			entries := (&exec.Cmd{Env: appEnv(*cfg, "runtime-token", tc.secrets)}).Environ()
+			entries := (&exec.Cmd{
+				Env: appEnv(*cfg, "runtime-token", Secrets{Static: tc.secrets}),
+			}).Environ()
 			values := make(map[string]string)
 			counts := make(map[string]int)
 			for _, entry := range entries {
@@ -137,8 +139,14 @@ func TestAppEnv(t *testing.T) {
 }
 
 type fakeAppProcess struct {
-	stops int
-	err   error
+	stops    int
+	restarts chan struct{}
+	err      error
+}
+
+func (a *fakeAppProcess) Restart() error {
+	a.restarts <- struct{}{}
+	return nil
 }
 
 func (a *fakeAppProcess) Stop() error {
@@ -153,7 +161,7 @@ func TestSuperviseContextDoneStopsApp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := supervise(ctx, rt, app)
+	err := supervise(ctx, rt, app, nil)
 	if !errors.Is(err, want) {
 		t.Fatalf("supervise error = %v, want %v", err, want)
 	}
@@ -168,7 +176,7 @@ func TestSuperviseListenerErrorStopsApp(t *testing.T) {
 	want := errors.New("listener failed")
 
 	done := make(chan error, 1)
-	go func() { done <- supervise(context.Background(), rt, app) }()
+	go func() { done <- supervise(context.Background(), rt, app, nil) }()
 	rt.NotifyListenerError(want)
 
 	err := waitTestResult(t, done)
@@ -187,7 +195,7 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app) }()
+	go func() { done <- supervise(ctx, rt, app, nil) }()
 
 	rt.NotifyChildExit(nil)
 	cancel()
@@ -201,6 +209,92 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	if !rt.UpstreamAppInfo().Exited {
 		t.Fatalf("UpstreamAppInfo().Exited = false, want true")
 	}
+}
+
+// A cutoff restart relaunches the app and keeps supervising it.
+func TestSuperviseRestartRelaunchesApp(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	restart := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app, restart) }()
+
+	restart <- struct{}{}
+	select {
+	case <-app.restarts:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for restart")
+	}
+	cancel()
+
+	require.NoError(t, waitTestResult(t, done))
+	require.Equal(t, 1, app.stops)
+}
+
+// The whole cutoff path short of the exec: a secret reaching its cutoff while
+// the app runs is left out of its environment, and the app is relaunched.
+func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Now()
+	legacy := InheritSecretMetadata{
+		Name: "legacy", EnvVar: "LEGACY_KEY", Cutoff: now.Add(50 * time.Millisecond),
+	}
+	token := InheritSecretMetadata{
+		Name: "token", EnvVar: "LEGACY_TOKEN", Cutoff: now.Add(time.Hour),
+	}
+	// Without a cutoff, a secret is neither watched nor ever dropped.
+	forever := InheritSecretMetadata{Name: "forever", EnvVar: "LEGACY_FOREVER"}
+	secrets := Secrets{
+		Inherited: []InheritedSecret{
+			{InheritSecretMetadata: legacy, Plaintext: "inherited"},
+			{InheritSecretMetadata: token, Plaintext: "inherited"},
+			{InheritSecretMetadata: forever, Plaintext: "inherited"},
+		},
+		metadata: SecretsMetadata{Inherited: []InheritSecretMetadata{legacy, token, forever}},
+	}
+	restart := watchInheritCutoffs(ctx, secrets.Inherited, 5*time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app, restart) }()
+
+	select {
+	case <-app.restarts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("app was not restarted at the cutoff")
+	}
+	require.False(t, time.Now().Before(now.Add(50*time.Millisecond)), "restarted before the cutoff")
+
+	// The relaunched app's environment is built at relaunch.
+	relaunched := secrets.applyTo(nil, time.Now())
+	require.Equal(t, []string{"LEGACY_TOKEN=inherited", "LEGACY_FOREVER=inherited"}, relaunched,
+		"the expired secret must be gone before the app comes back")
+
+	select {
+	case <-app.restarts:
+		t.Fatal("app restarted again with no further cutoff due")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	require.NoError(t, waitTestResult(t, done))
+	require.Equal(t, 1, app.stops)
+}
+
+func TestNotifyChildStartClearsExit(t *testing.T) {
+	rt := newRuntimeState()
+	go func() { <-rt.ChildDone() }()
+	rt.NotifyChildExit(errors.New("killed"))
+	require.True(t, rt.UpstreamAppInfo().Exited)
+
+	rt.NotifyChildStart()
+	require.Equal(t, UpstreamAppInfo{}, rt.UpstreamAppInfo())
 }
 
 func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {

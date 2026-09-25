@@ -33,6 +33,7 @@ type RuntimeState interface {
 	GetTLSCertCallback(ctx context.Context) (TLSCertCallback, error)
 	NotifyListenerError(err error)
 	ListenError() <-chan error
+	NotifyChildStart()
 	NotifyChildExit(err error)
 	ChildDone() <-chan error
 }
@@ -144,13 +145,19 @@ func Run(ctx context.Context, cfg Config) error {
 
 	rt.NotifyStarting()
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets); err != nil {
+	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets.Static); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
 	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
 
-	go migrator.RunPredecessorHandoff(ctx, result.kms, result.dek, result.secrets, result.tlsKey)
+	go migrator.RunPredecessorHandoff(
+		ctx,
+		result.kms,
+		result.dek,
+		result.secrets.Static,
+		result.tlsKey,
+	)
 
 	tlsCertCb, err := ConfigureTLS(
 		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
@@ -160,37 +167,47 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	app, err := startApp(rt, cfg, appEnv(cfg, authToken, result.secrets))
+	secrets := result.secrets.beforeCutoff(time.Now())
+	app, err := startApp(rt, cfg, authToken, secrets)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
+
+	restart := watchInheritCutoffs(
+		ctx,
+		secrets.Inherited,
+		inheritCutoffPollInterval,
+	)
 
 	initSpan.SetStatus(codes.Ok, "")
 	initSpan.End()
 	initSpanEnded = true
 
-	return supervise(ctx, rt, app)
+	return supervise(ctx, rt, app, restart)
 }
 
 type appProcess interface {
 	Stop() error
+	// Restart stops the app and launches it again with a freshly built environment.
+	Restart() error
 }
 
 type execApp struct {
-	rt  RuntimeState
-	cmd *exec.Cmd
+	rt        RuntimeState
+	cfg       Config
+	authToken string
+	secrets   Secrets
+	cmd       *exec.Cmd
 }
 
-func appEnv(cfg Config, authToken string, secrets []StaticSecret) []string {
+func appEnv(cfg Config, authToken string, secrets Secrets) []string {
 	env := os.Environ()
 	// exec.Cmd.Env keeps the last value for duplicate keys, so append overrides.
 	for key, value := range cfg.ChildEnv {
 		env = append(env, key+"="+value)
 	}
-	// Static secrets take precedence over SSM overrides.
-	for _, secret := range secrets {
-		env = append(env, secret.EnvVar+"="+secret.Plaintext)
-	}
+	// Secrets take precedence over SSM overrides.
+	env = secrets.applyTo(env, time.Now())
 	return append(
 		env,
 		"ENCLAVE_APP_PORT="+cfg.AppPort,
@@ -200,24 +217,40 @@ func appEnv(cfg Config, authToken string, secrets []StaticSecret) []string {
 	)
 }
 
-func startApp(rt RuntimeState, cfg Config, env []string) (appProcess, error) {
+func startApp(
+	rt RuntimeState,
+	cfg Config,
+	authToken string,
+	secrets Secrets,
+) (appProcess, error) {
+	app := &execApp{rt: rt, cfg: cfg, authToken: authToken, secrets: secrets}
+	if err := app.launch(); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+func (a *execApp) launch() error {
+	rt, cfg := a.rt, a.cfg
 	appPath := "/app/" + cfg.AppBinaryName
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = env
+	child.Env = appEnv(cfg, a.authToken, a.secrets)
 
 	if err := child.Start(); err != nil {
-		return nil, fmt.Errorf("start child %s: %w", appPath, err)
+		return fmt.Errorf("start child %s: %w", appPath, err)
 	}
+	a.cmd = child
 
+	rt.NotifyChildStart()
 	rt.NotifyReady()
 	slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
 
 	go func() { rt.NotifyChildExit(child.Wait()) }()
 
-	return &execApp{rt: rt, cmd: child}, nil
+	return nil
 }
 
 func stopApp(rt RuntimeState, child *exec.Cmd) error {
@@ -237,27 +270,48 @@ func (a *execApp) Stop() error {
 	return stopApp(a.rt, a.cmd)
 }
 
-func supervise(ctx context.Context, rt RuntimeState, child appProcess) error {
-	select {
-	case err := <-rt.ChildDone():
-		if err != nil {
-			slog.Error("upstream app exited; runtime stays alive", "error", err)
-		} else {
-			slog.Warn("upstream app exited cleanly; runtime stays alive")
-		}
-		return waitForRuntime(ctx, rt)
+func (a *execApp) Restart() error {
+	_ = a.Stop() // stopApp escalates to SIGKILL and never fails
+	return a.launch()
+}
 
-	case err := <-rt.ListenError():
-		_ = child.Stop()
-		return fmt.Errorf("HTTP listener failed: %w", err)
+// supervise runs until the runtime stops. A signal on restart relaunches the
+// app, so it comes back without an inherited secret past its cutoff.
+func supervise(
+	ctx context.Context,
+	rt RuntimeState,
+	child appProcess,
+	restart <-chan struct{},
+) error {
+	for {
+		select {
+		case err := <-rt.ChildDone():
+			if err != nil {
+				slog.Error("upstream app exited; runtime stays alive", "error", err)
+			} else {
+				slog.Warn("upstream app exited cleanly; runtime stays alive")
+			}
+			return waitForRuntime(ctx, rt)
 
-	case <-ctx.Done():
-		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+		case <-restart:
+			slog.Info("restarting upstream app without expired inherited secrets")
+			if err := child.Restart(); err != nil {
+				slog.Error("upstream app failed to restart; runtime stays alive", "error", err)
+				return waitForRuntime(ctx, rt)
+			}
+
+		case err := <-rt.ListenError():
 			_ = child.Stop()
-			return fmt.Errorf("runtime halted: %w", cause)
+			return fmt.Errorf("HTTP listener failed: %w", err)
+
+		case <-ctx.Done():
+			if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+				_ = child.Stop()
+				return fmt.Errorf("runtime halted: %w", cause)
+			}
+			slog.Info("shutting down")
+			return child.Stop()
 		}
-		slog.Info("shutting down")
-		return child.Stop()
 	}
 }
 
@@ -347,6 +401,12 @@ func (r *runtimeState) NotifyListenerError(err error) {
 
 func (r *runtimeState) ListenError() <-chan error {
 	return r.listenErrCh
+}
+
+// NotifyChildStart clears the exit record of a previous app process.
+func (r *runtimeState) NotifyChildStart() {
+	r.isExit.Store(false)
+	r.exitError.Store("")
 }
 
 func (r *runtimeState) NotifyChildExit(err error) {

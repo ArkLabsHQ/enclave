@@ -414,7 +414,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, secret.Plaintext, established.secrets.Static[0].Plaintext)
 		require.Equal(t, migrationIntentBucketName, established.migrationIntentBucketName)
 		newReceipt := testCfg.stateOriginReceiptParam(migrationKeyID, newPCR0)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
@@ -711,7 +711,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, secret.Plaintext, established.secrets.Static[0].Plaintext)
 	})
 
 	t.Run("refuses to commit when aborted during the handoff", func(t *testing.T) {

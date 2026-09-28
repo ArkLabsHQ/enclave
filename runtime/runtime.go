@@ -3,6 +3,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,7 @@ const (
 	runtimeStatusCandidate = "candidate"
 	runtimeStatusStarting  = "starting"
 	runtimeStatusReady     = "ready"
+	runtimeStatusFailed    = "failed"
 )
 
 type RuntimeState interface {
@@ -62,20 +64,6 @@ func Run(ctx context.Context, cfg Config) error {
 
 	cfg.InstanceID = aws.InstanceID
 	telemetry := NewTelemetry(&cfg, aws.CWL)
-	if err := telemetry.Start(ctx); err != nil {
-		return err
-	}
-
-	defer telemetry.Shutdown()
-
-	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
-	initSpanEnded := false
-
-	defer func() {
-		if !initSpanEnded {
-			initSpan.End()
-		}
-	}()
 
 	hashes := &AttestationHashes{}
 
@@ -101,6 +89,47 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to start HTTP servers: %w", err)
 	}
 
+	// Serve preflight failures over TLS.
+	candidateCertCb, err := candidateCertCallback(cfg.FQDN)
+	if err != nil {
+		return fmt.Errorf("failed to configure candidate TLS: %w", err)
+	}
+	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
+
+	pcr0, err := nsm.PCR0()
+	if err != nil {
+		return fmt.Errorf("failed to read PCR0 for permission preflight: %w", err)
+	}
+	if len(pcr0) != 48 {
+		return fmt.Errorf("invalid PCR0 length for permission preflight: %d", len(pcr0))
+	}
+
+	// Check permissions before durable writes; keep failures visible through the API.
+	permissions := &Permissions{
+		cfg: &cfg, ssm: ssm, iam: aws.IAM, pcr0: hex.EncodeToString(pcr0),
+		backoff: preflightBackoff,
+	}
+	if err := permissions.Preflight(ctx, aws.STS); err != nil {
+		slog.Error("boot stopped", "error", err)
+		servers.ReportBootFailure(err)
+		return waitForRuntime(ctx, rt)
+	}
+
+	if err := telemetry.Start(ctx); err != nil {
+		return err
+	}
+
+	defer telemetry.Shutdown()
+
+	ctx, initSpan := telemetry.Tracing.Span(ctx, "init")
+	initSpanEnded := false
+
+	defer func() {
+		if !initSpanEnded {
+			initSpan.End()
+		}
+	}()
+
 	boot, err := NewBoot(&cfg, nsm, aws.KMS, aws.STS, ssm, aws.S3)
 	if err != nil {
 		return fmt.Errorf("failed to establish state: %w", err)
@@ -125,12 +154,6 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := servers.ConfigureEnclaveInfoHandler(migrator); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
-
-	candidateCertCb, err := candidateCertCallback(cfg.FQDN)
-	if err != nil {
-		return fmt.Errorf("failed to configure candidate TLS: %w", err)
-	}
-	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
 
 	// Candidates wait here until their predecessor commits the handoff.
 	if err := migrator.AwaitCandidateHandoff(ctx); err != nil {

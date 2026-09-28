@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +70,17 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 	})
 }
 
+func TestValidateStaticSecrets(t *testing.T) {
+	require.NoError(t, SecretsMetadata{Static: stateOriginTestSecrets}.Validate(nil))
+	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
+		{Name: "duplicate", EnvVar: "ONE"},
+		{Name: "duplicate", EnvVar: "TWO"},
+	}}.Validate(nil))
+	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
+		{Name: "StorageDEK", EnvVar: "COLLISION"},
+	}}.Validate(nil))
+}
+
 func TestValidateInheritSecrets(t *testing.T) {
 	_, pubKey := inheritTestKey(t)
 	_, secondPubKey := inheritTestKeyFrom(t, "second-inherit-secret-test-key")
@@ -85,7 +95,7 @@ func TestValidateInheritSecrets(t *testing.T) {
 	}
 	static := []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}
 	validate := func(inherited []InheritSecretMetadata) error {
-		return SecretsMetadata{Static: static, Inherited: inherited}.Validate()
+		return SecretsMetadata{Static: static, Inherited: inherited}.Validate(nil)
 	}
 
 	require.NoError(t, validate(nil))
@@ -370,53 +380,20 @@ func TestResolveInheritedSecrets(t *testing.T) {
 	})
 }
 
-func TestSecretsApplyTo(t *testing.T) {
-	staticMeta := StaticSecretMetadata{Name: "signing-key", EnvVar: "SIGNING_KEY"}
-	keyMeta := InheritSecretMetadata{
-		Name:   "legacy",
-		EnvVar: "LEGACY_KEY",
-		Cutoff: inheritTestCutoff,
+func TestValidateChildEnv(t *testing.T) {
+	meta := SecretsMetadata{
+		Static:    []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}},
+		Inherited: []InheritSecretMetadata{{Name: "legacy", EnvVar: "LEGACY_KEY"}},
 	}
-	tokenMeta := InheritSecretMetadata{
-		Name:   "token",
-		EnvVar: "LEGACY_TOKEN",
-		Cutoff: inheritTestCutoff,
-	}
+	// A static secret is always set, so it may share its env var with either.
+	t.Setenv("SIGNING_KEY", "baked")
+	require.NoError(t,
+		meta.validateChildEnv(map[string]bool{"SIGNING_KEY": true, "APP_SETTING": true}))
 
-	secrets := Secrets{
-		Static:    []StaticSecret{{StaticSecretMetadata: staticMeta, Plaintext: "minted"}},
-		Inherited: []InheritedSecret{{InheritSecretMetadata: keyMeta, Plaintext: "verified"}},
-		metadata: SecretsMetadata{
-			Static:    []StaticSecretMetadata{staticMeta},
-			Inherited: []InheritSecretMetadata{keyMeta, tokenMeta},
-		},
-	}
-	// The baked environment or the SSM overlay may carry every name.
-	planted := []string{
-		"SIGNING_KEY=planted", "LEGACY_KEY=planted", "LEGACY_TOKEN=planted", "APP_SETTING=kept",
-	}
-	// What the app would see: exec keeps the last value of a duplicate key.
-	childEnv := func(now time.Time) []string {
-		return (&exec.Cmd{Env: secrets.applyTo(planted, now)}).Environ()
-	}
-
-	require.ElementsMatch(t,
-		[]string{"SIGNING_KEY=minted", "LEGACY_KEY=verified", "APP_SETTING=kept"},
-		childEnv(inheritTestCutoff.Add(-time.Second)),
-		"an inherited secret that was not delivered must not reach the app from the overlay",
-	)
-	require.ElementsMatch(t,
-		[]string{"SIGNING_KEY=minted", "APP_SETTING=kept"},
-		childEnv(inheritTestCutoff),
-		"nor may one past its cutoff",
-	)
-	require.Equal(t,
-		[]string{
-			"SIGNING_KEY=planted", "LEGACY_KEY=planted", "LEGACY_TOKEN=planted", "APP_SETTING=kept",
-		},
-		planted,
-		"the caller's environment must not change",
-	)
+	require.ErrorContains(t,
+		meta.validateChildEnv(map[string]bool{"LEGACY_KEY": true}), "override allowlist")
+	t.Setenv("LEGACY_KEY", "")
+	require.ErrorContains(t, meta.validateChildEnv(nil), "baked environment")
 }
 
 // Boot resolves inherited secrets alongside the static ones.
@@ -467,5 +444,16 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 
 		_, err := (&Boot{cfg: cfg}).plan(ctx)
 		require.ErrorContains(t, err, `env_var "SIGNING_KEY" is already used`)
+	})
+
+	t.Run("allowlisted env var aborts plan", func(t *testing.T) {
+		_, pubKey := inheritTestKey(t)
+		cfg := testConfig()
+		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"LEGACY_KEY",` +
+			`"type":"publicKey","value":["` + pubKey + `"]}]`
+		cfg.OverrideAllowList = map[string]bool{"LEGACY_KEY": true}
+
+		_, err := (&Boot{cfg: cfg}).plan(ctx)
+		require.ErrorContains(t, err, `env_var "LEGACY_KEY" is in the override allowlist`)
 	})
 }

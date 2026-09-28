@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -36,11 +37,14 @@ func LoadSecretsMetadata(cfg Config) (SecretsMetadata, error) {
 	return SecretsMetadata{Static: static, Inherited: inherited}, nil
 }
 
-func (sm SecretsMetadata) Validate() error {
+func (sm SecretsMetadata) Validate(overrideAllowList map[string]bool) error {
 	if err := sm.validateStatic(); err != nil {
 		return fmt.Errorf("invalid static secret metadata: %w", err)
 	}
 	if err := sm.validateInherited(); err != nil {
+		return fmt.Errorf("invalid inherited secret metadata: %w", err)
+	}
+	if err := sm.validateChildEnv(overrideAllowList); err != nil {
 		return fmt.Errorf("invalid inherited secret metadata: %w", err)
 	}
 	return nil
@@ -52,53 +56,6 @@ func (sm SecretsMetadata) Validate() error {
 type Secrets struct {
 	Static    []StaticSecret
 	Inherited []InheritedSecret
-
-	metadata SecretsMetadata
-}
-
-// beforeCutoff drops the inherited secrets that have reached their cutoff by
-// now. Boot resolved the secrets some time ago, so the app is started, and its
-// cutoffs watched, with what is left.
-func (s Secrets) beforeCutoff(now time.Time) Secrets {
-	var inherited []InheritedSecret
-	for _, secret := range s.Inherited {
-		if secret.pastCutoff(now) {
-			slog.Info("inherited secret reached its cutoff before the app started",
-				"name", secret.Name, "cutoff", secret.Cutoff)
-			continue
-		}
-		inherited = append(inherited, secret)
-	}
-	s.Inherited = inherited
-	return s
-}
-
-// applyTo returns env with the secrets set for an app launched at now: the
-// static secrets, then the inherited ones not past their cutoff. It runs on
-// every launch, so a relaunch leaves out a secret that expired while the app
-// ran. Every other entry for an inherited secret's env var is dropped, so
-// neither the baked environment nor the SSM env overlay can stand in for one
-// that is absent or past its cutoff.
-func (s Secrets) applyTo(env []string, now time.Time) []string {
-	inherited := make(map[string]bool, len(s.metadata.Inherited))
-	for _, m := range s.metadata.Inherited {
-		inherited[m.EnvVar] = true
-	}
-	env = slices.DeleteFunc(slices.Clone(env), func(entry string) bool {
-		key, _, _ := strings.Cut(entry, "=")
-		return inherited[key]
-	})
-
-	// exec.Cmd.Env keeps the last value for duplicate keys, so these override.
-	for _, secret := range s.Static {
-		env = append(env, secret.EnvVar+"="+secret.Plaintext)
-	}
-	for _, secret := range s.Inherited {
-		if !secret.pastCutoff(now) {
-			env = append(env, secret.EnvVar+"="+secret.Plaintext)
-		}
-	}
-	return env
 }
 
 // StaticSecretMetadata defines a secret managed by KMS inside the enclave runtime
@@ -229,6 +186,21 @@ func LoadInheritSecretMetadata(cfg Config) ([]InheritSecretMetadata, error) {
 	}
 
 	return meta, nil
+}
+
+// validateChildEnv stops the baked env or SSM overlay standing in for an inherited secret.
+func (sm SecretsMetadata) validateChildEnv(overrideAllowList map[string]bool) error {
+	for _, m := range sm.Inherited {
+		if overrideAllowList[m.EnvVar] {
+			return fmt.Errorf(
+				"inherited secret %q: env_var %q is in the override allowlist", m.Name, m.EnvVar)
+		}
+		if _, baked := os.LookupEnv(m.EnvVar); baked {
+			return fmt.Errorf(
+				"inherited secret %q: env_var %q is set in the baked environment", m.Name, m.EnvVar)
+		}
+	}
+	return nil
 }
 
 // validateInherited also refuses an env_var a static secret already uses.
@@ -428,15 +400,25 @@ func resolveInheritedSecrets(
 
 // watchInheritCutoffs signals that the app must be relaunched once one of the
 // inherited secrets it was started with reaches its cutoff. Secrets without a
-// cutoff are never watched.
+// cutoff, or already past it, are never watched: the app is launched without
+// the latter, so it must be called before the app is launched.
 func watchInheritCutoffs(
 	ctx context.Context,
 	inherited []InheritedSecret,
 	interval time.Duration,
 ) <-chan struct{} {
 	restart := make(chan struct{}, 1)
+	now := time.Now()
 	pending := slices.DeleteFunc(slices.Clone(inherited), func(s InheritedSecret) bool {
-		return s.Cutoff.IsZero()
+		if s.Cutoff.IsZero() {
+			return true
+		}
+		if !s.pastCutoff(now) {
+			return false
+		}
+		slog.Info("inherited secret reached its cutoff before the app started",
+			"name", s.Name, "cutoff", s.Cutoff)
+		return true
 	})
 	if len(pending) == 0 {
 		return restart
@@ -449,16 +431,14 @@ func watchInheritCutoffs(
 		for len(pending) > 0 {
 			current := time.Now()
 			expired := false
-			remaining := pending[:0:0]
-			for _, s := range pending {
+			pending = slices.DeleteFunc(pending, func(s InheritedSecret) bool {
 				if !s.pastCutoff(current) {
-					remaining = append(remaining, s)
-					continue
+					return false
 				}
 				slog.Info("inherited secret reached its cutoff", "name", s.Name, "cutoff", s.Cutoff)
 				expired = true
-			}
-			pending = remaining
+				return true
+			})
 
 			if expired {
 				select {

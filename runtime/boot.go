@@ -227,7 +227,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
 	}
-	if err := secretsMetadata.Validate(); err != nil {
+	if err := secretsMetadata.Validate(b.cfg.OverrideAllowList); err != nil {
 		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
 	}
 	migrationIntentBucketName, err := b.migrationIntentBucket(ctx)
@@ -437,7 +437,7 @@ func (b *Boot) establish(
 	return bootResult{
 		kms:                       kms,
 		dek:                       &dek{key: dekPlaintext},
-		secrets:                   Secrets{Static: staticSecrets, metadata: state.secretsMetadata},
+		secrets:                   Secrets{Static: staticSecrets},
 		tlsKey:                    tlsKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 		lineage:                   snapshot.lineage(),

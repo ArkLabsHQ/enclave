@@ -251,13 +251,17 @@ func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
 	}
 	// Without a cutoff, a secret is neither watched nor ever dropped.
 	forever := InheritSecretMetadata{Name: "forever", EnvVar: "LEGACY_FOREVER"}
+	// Already past its cutoff, a secret is neither handed to the app nor watched.
+	expired := InheritSecretMetadata{
+		Name: "expired", EnvVar: "LEGACY_EXPIRED", Cutoff: now.Add(-time.Minute),
+	}
 	secrets := Secrets{
 		Inherited: []InheritedSecret{
 			{InheritSecretMetadata: legacy, Plaintext: "inherited"},
 			{InheritSecretMetadata: token, Plaintext: "inherited"},
 			{InheritSecretMetadata: forever, Plaintext: "inherited"},
+			{InheritSecretMetadata: expired, Plaintext: "inherited"},
 		},
-		metadata: SecretsMetadata{Inherited: []InheritSecretMetadata{legacy, token, forever}},
 	}
 	restart := watchInheritCutoffs(ctx, secrets.Inherited, 5*time.Millisecond)
 
@@ -272,9 +276,11 @@ func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
 	require.False(t, time.Now().Before(now.Add(50*time.Millisecond)), "restarted before the cutoff")
 
 	// The relaunched app's environment is built at relaunch.
-	relaunched := secrets.applyTo(nil, time.Now())
-	require.Equal(t, []string{"LEGACY_TOKEN=inherited", "LEGACY_FOREVER=inherited"}, relaunched,
+	relaunched := appEnv(Config{}, "runtime-token", secrets)
+	require.Subset(t, relaunched, []string{"LEGACY_TOKEN=inherited", "LEGACY_FOREVER=inherited"})
+	require.NotContains(t, relaunched, "LEGACY_KEY=inherited",
 		"the expired secret must be gone before the app comes back")
+	require.NotContains(t, relaunched, "LEGACY_EXPIRED=inherited")
 
 	select {
 	case <-app.restarts:

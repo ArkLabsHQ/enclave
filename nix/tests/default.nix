@@ -254,12 +254,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
-      # E2E_EXPIRED is allowlisted so e2e.py can check that even a permitted
-      # override cannot stand in for an inherited secret past its cutoff.
-      overrideAllowlist = [
-        "E2E_OVERRIDE"
-        "E2E_EXPIRED"
-      ];
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 

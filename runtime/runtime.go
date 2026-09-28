@@ -167,17 +167,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	secrets := result.secrets.beforeCutoff(time.Now())
-	app, err := startApp(rt, cfg, authToken, secrets)
+	restart := watchInheritCutoffs(
+		ctx,
+		result.secrets.Inherited,
+		inheritCutoffPollInterval,
+	)
+	app, err := startApp(rt, cfg, authToken, result.secrets)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
-
-	restart := watchInheritCutoffs(
-		ctx,
-		secrets.Inherited,
-		inheritCutoffPollInterval,
-	)
 
 	initSpan.SetStatus(codes.Ok, "")
 	initSpan.End()
@@ -207,7 +205,16 @@ func appEnv(cfg Config, authToken string, secrets Secrets) []string {
 		env = append(env, key+"="+value)
 	}
 	// Secrets take precedence over SSM overrides.
-	env = secrets.applyTo(env, time.Now())
+	for _, secret := range secrets.Static {
+		env = append(env, secret.EnvVar+"="+secret.Plaintext)
+	}
+	// Built at every launch, so a relaunch leaves out a secret past its cutoff.
+	now := time.Now()
+	for _, secret := range secrets.Inherited {
+		if !secret.pastCutoff(now) {
+			env = append(env, secret.EnvVar+"="+secret.Plaintext)
+		}
+	}
 	return append(
 		env,
 		"ENCLAVE_APP_PORT="+cfg.AppPort,

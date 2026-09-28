@@ -270,17 +270,6 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestValidateStaticSecretArtifacts(t *testing.T) {
-	require.NoError(t, SecretsMetadata{Static: stateOriginTestSecrets}.Validate())
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "duplicate", EnvVar: "ONE"},
-		{Name: "duplicate", EnvVar: "TWO"},
-	}}.Validate())
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "StorageDEK", EnvVar: "COLLISION"},
-	}}.Validate())
-}
-
 func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	keyID := "key-single-snapshot"

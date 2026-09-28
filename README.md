@@ -493,9 +493,6 @@ At boot, before the application starts:
 - A missing parameter is logged and skipped. Deleting a parameter therefore
   withdraws the secret from future boots; enclaves already running keep it
   until its cutoff or their next restart.
-- The `env_var` of every secret that is not delivered is cleared, so neither
-  the baked environment nor an allowlisted SSM override can supply a
-  substitute.
 - The cutoff is checked again just before the application is launched, so a
   slow boot cannot hand over a secret that expired in the meantime.
 
@@ -511,6 +508,9 @@ Constraints:
 - `env_var` must be a valid identifier, unique across static and inherited
   secrets, and not one of the runtime exports listed under
   [Application process environment](#application-process-environment).
+- `env_var` must not be set in the baked environment nor be in
+  `overrideAllowlist`, so nothing else can stand in for a secret that is not
+  delivered or is past its cutoff. Either **aborts boot**.
 
 An inherited secret is only as private as its history: whoever can read the SSM
 parameter can read it, and so could everyone who held it before. The pin

@@ -137,9 +137,6 @@ for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
         f"ssm put-parameter --name /dev/testapp/inherit/{inherited} "
         f"--type String --value {INHERITED}"
     )
-# Even allowlisted, the overlay must not be able to stand in for a secret past
-# its cutoff.
-put_env("E2E_EXPIRED", "planted-by-host")
 put_env("ENCLAVE_FQDN", FQDN)
 
 BLUES = (blue, blue_peer)

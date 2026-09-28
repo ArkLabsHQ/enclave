@@ -7,6 +7,8 @@ ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/dev/enclave"
+# Inherited hash secrets are delivered hex; default.nix pins its SHA-256.
+INHERITED = b"inherited-from-outside".hex()
 
 
 def put_env(name, value):
@@ -133,7 +135,7 @@ put_env("E2E_OVERRIDE", "override-from-ssm")
 for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
     cloud(
         f"ssm put-parameter --name /dev/testapp/inherit/{inherited} "
-        "--type String --value inherited-from-outside"
+        f"--type String --value {INHERITED}"
     )
 # Even allowlisted, the overlay must not be able to stand in for a secret past
 # its cutoff.
@@ -157,8 +159,8 @@ for node in BLUES:
 
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
-    assert env_value(node, "E2E_INHERITED") == "inherited-from-outside"
-    assert env_value(node, "E2E_CUTOFF") == "inherited-from-outside"
+    assert env_value(node, "E2E_INHERITED") == INHERITED
+    assert env_value(node, "E2E_CUTOFF") == INHERITED
     assert env_value(node, "E2E_EXPIRED") == ""
     node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -635,8 +637,8 @@ assert cloud(
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
-assert env_value(green_peer, "E2E_INHERITED") == "inherited-from-outside"
-assert env_value(green_peer, "E2E_CUTOFF") == "inherited-from-outside"
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED
+assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
 assert env_value(green_peer, "E2E_EXPIRED") == ""
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -753,7 +755,7 @@ green_peer.wait_until_succeeds(
     "test $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) -ge 2208988740",
     timeout=30,
 )
-assert env_value(green_peer, "E2E_CUTOFF") == "inherited-from-outside"
+assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
 green_peer.wait_until_succeeds(
     "grep 'inherited secret reached its cutoff' /var/log/enclave-console.log "
     "| grep -q e2e-cutoff",
@@ -769,7 +771,7 @@ wait_upstream_healthy(green_peer)
 assert env_value(green_peer, "E2E_CUTOFF") == ""
 # It still holds everything that was not cut off.
 assert secret_value(green_peer) == blue_secret
-assert env_value(green_peer, "E2E_INHERITED") == "inherited-from-outside"
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.status == \"ready\" and .upstream_app.exited == false'"

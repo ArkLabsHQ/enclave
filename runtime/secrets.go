@@ -181,8 +181,9 @@ const (
 // InheritSecretMetadata defines a secret born outside the enclave and handed in
 // through SSM (ENCLAVE_INHERIT_SECRETS_CONFIG). The image pins what the secret
 // must be, so the pin and the cutoff are part of PCR0. Value holds one
-// commitment per delivered entry: `hash` pins SHA-256 hashes, `publicKey` pins
-// compressed secp256k1 public keys whose secrets are hex-encoded private keys.
+// commitment per delivered entry, and every entry's secret is hex: `hash` pins
+// the SHA-256 of the decoded secret, `publicKey` pins compressed secp256k1
+// public keys whose secrets are private keys.
 // From Cutoff on, the app no longer receives it; without a Cutoff, it always does.
 type InheritSecretMetadata struct {
 	Name   string    `json:"name"`
@@ -309,9 +310,9 @@ func (sm SecretsMetadata) validateInherited() error {
 
 // verifyInheritedSecret checks a handed-in value against its measured pin: each
 // comma-separated delivered entry must match one commitment, in any order, and
-// each commitment is used once, so an entry must not contain a comma. The
-// commitments were validated with the config; they are decoded again here so
-// the check fails closed on its own.
+// each commitment is used once. The secrets are hex, so a comma or colon in one
+// can never be mistaken for a separator. The commitments were validated with
+// the config; they are decoded again here so the check fails closed on its own.
 func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 	values := strings.Split(plaintext, ",")
 	for i := range values {
@@ -332,20 +333,22 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 	}
 
 	for i, value := range values {
+		// An entry may carry app metadata after a colon, "<secret>:<unix-ts>";
+		// only the secret is pinned, the entry is delivered whole.
+		value, _, _ = strings.Cut(value, ":")
+		secretBytes, err := hex.DecodeString(value)
+		if err != nil || len(secretBytes) == 0 {
+			return fmt.Errorf("inherited secret %q: value %d is not hex", m.Name, i)
+		}
 		var got []byte
 		switch m.Type {
 		case inheritSecretTypeHash:
-			hash := sha256.Sum256([]byte(value))
+			hash := sha256.Sum256(secretBytes)
 			got = hash[:]
 		case inheritSecretTypePublicKey:
-			// A key may carry app metadata after a colon, "<key>:<unix-ts>";
-			// only the key is pinned, the entry is delivered whole.
-			value, _, _ = strings.Cut(value, ":")
-			secretBytes, err := hex.DecodeString(value)
-			if err != nil || len(secretBytes) != btcec.PrivKeyBytesLen {
+			if len(secretBytes) != btcec.PrivKeyBytesLen {
 				return fmt.Errorf(
-					"inherited secret %q: value %d is not a hex-encoded 32-byte private key",
-					m.Name, i,
+					"inherited secret %q: value %d is not a 32-byte private key", m.Name, i,
 				)
 			}
 			var scalar btcec.ModNScalar

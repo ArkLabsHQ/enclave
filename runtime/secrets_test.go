@@ -34,6 +34,11 @@ func inheritTestHash(value string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// inheritTestHex is value as delivered for a `hash` secret pinned by inheritTestHash.
+func inheritTestHex(value string) string {
+	return hex.EncodeToString([]byte(value))
+}
+
 func TestLoadInheritSecretMetadata(t *testing.T) {
 	t.Run("unset", func(t *testing.T) {
 		meta, err := LoadInheritSecretMetadata(Config{})
@@ -201,25 +206,43 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	}
 
 	require.NoError(t, verifyInheritedSecret(keyMeta, privKey))
-	require.NoError(t, verifyInheritedSecret(hashMeta, "s3cr3t token"))
-	// A comma always separates entries, so a value cannot contain one.
-	commaHashMeta := hashMeta
-	commaHashMeta.Value = []string{inheritTestHash("first,second")}
+	require.NoError(t, verifyInheritedSecret(hashMeta, inheritTestHex("s3cr3t token")))
+	require.NoError(t, verifyInheritedSecret(hashMeta,
+		strings.ToUpper(inheritTestHex("s3cr3t token"))), "the decoded bytes are pinned")
+	// A hash secret must be hex, so it can hold neither separator.
+	require.ErrorContains(t, verifyInheritedSecret(hashMeta, "s3cr3t token"), "value 0 is not hex")
+	require.ErrorContains(t, verifyInheritedSecret(hashMeta, ":1798761600"), "value 0 is not hex")
+	// Metadata after a colon is delivered to the app but not pinned.
+	require.NoError(t,
+		verifyInheritedSecret(hashMeta, inheritTestHex("s3cr3t token")+":1798761600"))
 	require.ErrorContains(t,
-		verifyInheritedSecret(commaHashMeta, "first,second"), "value count 2, want 1")
+		verifyInheritedSecret(hashMeta, inheritTestHex("another token")+":1798761600"),
+		"does not match")
+	emptyHashMeta := hashMeta
+	emptyHashMeta.Value = []string{inheritTestHash("")}
+	require.ErrorContains(t, verifyInheritedSecret(emptyHashMeta, ""), "value 0 is not hex")
 
 	hashListMeta := hashMeta
 	hashListMeta.Value = []string{inheritTestHash("first"), inheritTestHash("second")}
-	require.NoError(t, verifyInheritedSecret(hashListMeta, "first,second"))
-	require.NoError(t, verifyInheritedSecret(hashListMeta, "second,first"))
-	require.NoError(t, verifyInheritedSecret(hashListMeta, "second, first"), "entries are trimmed")
-	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, "first"), "value count 1, want 2")
+	first, second := inheritTestHex("first"), inheritTestHex("second")
+	require.NoError(t, verifyInheritedSecret(hashListMeta, first+","+second))
+	require.NoError(t, verifyInheritedSecret(hashListMeta, second+","+first))
+	require.NoError(
+		t,
+		verifyInheritedSecret(hashListMeta, first+":1798761600,"+second+":1830297600"),
+	)
+	require.NoError(
+		t,
+		verifyInheritedSecret(hashListMeta, second+", "+first),
+		"entries are trimmed",
+	)
+	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, first), "value count 1, want 2")
 	require.ErrorContains(t,
-		verifyInheritedSecret(hashListMeta, "first,wrong"),
+		verifyInheritedSecret(hashListMeta, first+","+inheritTestHex("wrong")),
 		"value 1 does not match an unused pinned hash",
 	)
 	require.ErrorContains(t,
-		verifyInheritedSecret(hashListMeta, "first,first"),
+		verifyInheritedSecret(hashListMeta, first+","+first),
 		"value 1 does not match an unused pinned hash",
 	)
 
@@ -245,15 +268,16 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	)
 	require.ErrorContains(t,
 		verifyInheritedSecret(keyListMeta, privKey+",not-hex"),
-		"value 1 is not a hex-encoded 32-byte private key",
+		"value 1 is not hex",
 	)
 
 	otherKey := sha256.Sum256([]byte("some other key"))
 	require.ErrorContains(t,
 		verifyInheritedSecret(keyMeta, hex.EncodeToString(otherKey[:])), "does not match")
-	require.ErrorContains(t, verifyInheritedSecret(hashMeta, "another token"), "does not match")
+	require.ErrorContains(t,
+		verifyInheritedSecret(hashMeta, inheritTestHex("another token")), "does not match")
 
-	require.ErrorContains(t, verifyInheritedSecret(keyMeta, "not hex"), "32-byte private key")
+	require.ErrorContains(t, verifyInheritedSecret(keyMeta, "not hex"), "value 0 is not hex")
 	require.ErrorContains(t, verifyInheritedSecret(keyMeta, "abcd"), "32-byte private key")
 	require.ErrorContains(t, verifyInheritedSecret(keyMeta, strings.Repeat("00", 32)),
 		"not a valid secp256k1 private key")
@@ -263,7 +287,7 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	// Validation already refuses an unknown type; verification fails closed on its own.
 	require.ErrorContains(t, verifyInheritedSecret(InheritSecretMetadata{
 		Name: "odd", Type: "ed25519", Value: []string{inheritTestHash("v")},
-	}, "v"), `unknown type "ed25519"`)
+	}, inheritTestHex("v")), `unknown type "ed25519"`)
 }
 
 func TestResolveInheritedSecrets(t *testing.T) {
@@ -285,13 +309,13 @@ func TestResolveInheritedSecrets(t *testing.T) {
 	t.Run("returns verified secrets read with decryption", func(t *testing.T) {
 		fake := &fakeSSM{params: map[string]string{
 			"/dev/testapp/inherit/legacy": privKey + "\n",
-			"/dev/testapp/inherit/token":  "s3cr3t",
+			"/dev/testapp/inherit/token":  inheritTestHex("s3cr3t"),
 		}}
 		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(fake), meta, now)
 		require.NoError(t, err)
 		require.Equal(t, []InheritedSecret{
 			{InheritSecretMetadata: keyMeta, Plaintext: privKey},
-			{InheritSecretMetadata: hashMeta, Plaintext: "s3cr3t"},
+			{InheritSecretMetadata: hashMeta, Plaintext: inheritTestHex("s3cr3t")},
 		}, secrets)
 		require.Equal(t, []string{
 			"/dev/testapp/inherit/legacy", "/dev/testapp/inherit/token",
@@ -301,19 +325,21 @@ func TestResolveInheritedSecrets(t *testing.T) {
 	t.Run("mismatch is fatal", func(t *testing.T) {
 		_, err := resolveInheritedSecrets(ctx, cfg, NewSSM(&fakeSSM{params: map[string]string{
 			"/dev/testapp/inherit/legacy": privKey,
-			"/dev/testapp/inherit/token":  "tampered",
+			"/dev/testapp/inherit/token":  inheritTestHex("tampered"),
 		}}), meta, now)
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
 	t.Run("missing param is skipped", func(t *testing.T) {
 		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(&fakeSSM{params: map[string]string{
-			"/dev/testapp/inherit/token": "s3cr3t",
+			"/dev/testapp/inherit/token": inheritTestHex("s3cr3t"),
 		}}), meta, now)
 		require.NoError(t, err)
 		require.Equal(
 			t,
-			[]InheritedSecret{{InheritSecretMetadata: hashMeta, Plaintext: "s3cr3t"}},
+			[]InheritedSecret{
+				{InheritSecretMetadata: hashMeta, Plaintext: inheritTestHex("s3cr3t")},
+			},
 			secrets,
 		)
 	})
@@ -412,21 +438,21 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 	}
 
 	t.Run("before cutoff", func(t *testing.T) {
-		result, err := boot(t, "2999-01-01T00:00:00Z", "s3cr3t")
+		result, err := boot(t, "2999-01-01T00:00:00Z", inheritTestHex("s3cr3t"))
 		require.NoError(t, err)
 		require.Len(t, result.secrets.Inherited, 1)
-		require.Equal(t, "s3cr3t", result.secrets.Inherited[0].Plaintext)
+		require.Equal(t, inheritTestHex("s3cr3t"), result.secrets.Inherited[0].Plaintext)
 		require.Len(t, result.secrets.Static, len(stateOriginTestSecrets))
 	})
 
 	t.Run("past cutoff", func(t *testing.T) {
-		result, err := boot(t, "2020-01-01T00:00:00Z", "s3cr3t")
+		result, err := boot(t, "2020-01-01T00:00:00Z", inheritTestHex("s3cr3t"))
 		require.NoError(t, err)
 		require.Empty(t, result.secrets.Inherited)
 	})
 
 	t.Run("mismatch aborts boot", func(t *testing.T) {
-		_, err := boot(t, "2999-01-01T00:00:00Z", "tampered")
+		_, err := boot(t, "2999-01-01T00:00:00Z", inheritTestHex("tampered"))
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 

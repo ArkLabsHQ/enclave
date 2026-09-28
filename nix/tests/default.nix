@@ -211,10 +211,10 @@ let
         env_var = "E2E_SIGNING_KEY";
       }
     ];
-    # e2e.py places all three values in SSM; each pin is the SHA-256 of
-    # "inherited-from-outside". The first has no cutoff, so it is only
-    # verified. The second is already past its cutoff. The third's cutoff is
-    # reached when e2e.py steps a node's clock to just before it, so the
+    # e2e.py places all three values in SSM, hex-encoded; each pin is the
+    # SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
+    # only verified. The second is already past its cutoff. The third's cutoff
+    # is reached when e2e.py steps a node's clock to just before it, so the
     # restart-without-the-secret path runs for real.
     ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
       {

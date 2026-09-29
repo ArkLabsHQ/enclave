@@ -244,6 +244,7 @@ let
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_IAM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";

@@ -200,12 +200,15 @@ on `/enclave/v1/info`, and answers `503` on `/health`, `/enclave/attestation` an
 any application path until it is ready. It promotes in place when its commit
 pointer appears — no restart, and no action by the host.
 
-Boot order is fixed and every step is fatal: clock synchronisation against
-`/dev/ptp0`, networking, AWS clients, SSM environment overlay, telemetry, HTTP
-servers and `/enclave/v1/info`; then, as a candidate, the wait for a handoff and
-state establishment; then, starting, PCR extension, the predecessor side of the
-migration protocol, TLS, static secret export and exec of the application, at
-which point the enclave is ready.
+Boot order is fixed: clock synchronisation against `/dev/ptp0`, networking, AWS
+clients, SSM environment overlay, HTTP servers with the candidate certificate,
+the [permission preflight](#aws-requirements), telemetry and `/enclave/v1/info`;
+then, as a candidate, the wait for a handoff and state establishment; then,
+starting, PCR extension, the predecessor side of the migration protocol, TLS,
+static secret export and exec of the application, at which point the enclave is
+ready. Every step is fatal except the preflight: when it fails, the enclave stays
+up, writes nothing, and reports `status: "failed"` with the missing grants on
+`/enclave/v1/info`.
 
 ## Nix API
 
@@ -424,7 +427,8 @@ deliberately ships backdated telemetry will lose it.
 ### AWS endpoint overrides
 
 `AWS_ENDPOINT_URL_KMS`, `AWS_ENDPOINT_URL_SSM`, `AWS_ENDPOINT_URL_STS`,
-`AWS_ENDPOINT_URL_S3`, and `AWS_ENDPOINT_URL_LOGS` override the corresponding
+`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_LOGS`, `AWS_ENDPOINT_URL_IAM`, and
+`AWS_ENDPOINT_URL_ROUTE53` override the corresponding
 service endpoints. Setting the S3 endpoint also forces path-style addressing.
 These exist for testing against an emulator.
 
@@ -635,7 +639,7 @@ preflight to any path in that namespace is answered `204` by the runtime.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
-| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` naming the missing grants when the permission preflight stops the boot), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
 | POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
@@ -716,6 +720,35 @@ interfaces.
 - Route intended client traffic to the enclave's TLS listener, TCP port 443 by
   default.
 
+### Reaching the enclave from its instance
+
+An enclave has no shell, and its console is unreadable in production, so its
+runtime API is how an operator sees what it is doing, including why a boot
+stopped. The host already routes port 443 to the enclave's TLS listener, so from
+a shell on the instance (SSH or SSM Session Manager):
+
+```sh
+curl -sk --http1.1 https://127.0.0.1/enclave/v1/info | jq
+```
+
+The same request works wherever port 443 is
+routed to it. `-k` is needed because, until it holds state, an enclave serves an
+ephemeral self-signed certificate. That includes an
+enclave stopped by the [permission preflight](#aws-requirements), which answers
+`503` with (abridged):
+
+```json
+{
+  "version": "0.1.0",
+  "status": "failed",
+  "error": "permission preflight: role arn:aws:iam::123456789012:role/enclave is missing CloudWatchLogsAccess logs:PutLogEvents on arn:aws:logs:eu-west-1:123456789012:log-group:/prod/enclave/logs/app:log-stream:i-0123456789abcdef0 (implicitDeny)"
+}
+```
+
+A response read this way is not attested: whoever controls the host could have
+produced it. Use it to diagnose, and once the enclave reports `ready`, verify it
+with the CLI before trusting anything it says.
+
 ### AWS requirements
 
 Create a private S3 bucket for shared certificate state and write its name to
@@ -741,10 +774,12 @@ AWS credentials delivered through IMDS must allow:
 | Statement | Permissions |
 |---|---|
 | `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
-| `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
+| `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `GetObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Without `GetObjectRetention`, S3 hides the lock on every object and the runtime ignores every migration intent. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
 | `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
+| `PermissionPreflight` | `iam:SimulatePrincipalPolicy` on the enclave role's own ARN, and nothing else, so the enclave can ask what it may do but not what any other principal may. |
+| `Route53AcmeChallenge` | Only with `ENCLAVE_USE_ACME=true`: `ChangeResourceRecordSets` on the hosted zone named in `/<deployment>/<app>/Route53ZoneID`, and `GetChange`. |
 | `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/*` (`/<deployment>/enclave/*` by default). A custom prefix needs a policy widened to match, or the boot fails at `CreateLogGroup`. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
@@ -761,6 +796,54 @@ the runtime. Do not pre-create or declaratively manage it. Genesis claims it
 create-only, immediately before writing the `deployment-genesis` object;
 migration finalisation writes it last, as the atomic commit. A pre-existing value
 makes the runtime refuse to finalise a handoff onto that PCR0.
+
+Before telemetry starts and before its first durable write, every boot asks IAM,
+through `SimulatePrincipalPolicy`, whether the role holds the S3, SSM, KMS,
+CloudWatch Logs and (with ACME) Route53 grants above. A denied or incomplete
+simulation stops the boot before durable writes. The enclave stays up and
+`/enclave/v1/info` answers `503` with `status: "failed"` and an `error` naming every
+missing statement, action and resource, since the
+console is unreadable in production and telemetry has not started. Read it
+[from the instance](#reaching-the-enclave-from-its-instance), fix the policy,
+then restart the enclave.
+
+A check AWS leaves unanswered, because it throttled, failed server-side or was
+unreachable after the SDK's own retries, is repeated up to five times over about
+a minute before the boot stops on it, so a burst of enclaves booting together
+does not park on a momentary IAM limit. A denial, or any other error AWS
+answered with, such as a missing `iam:SimulatePrincipalPolicy` grant or bucket
+parameter, stops the boot at once.
+
+Known resources, including the genesis record, certificate objects, leases and
+current-generation SSM paths, are checked by their exact names. Future key IDs,
+migration objects and Route53 change IDs are checked at namespace scope; those
+checks cannot rule out denials on specific future resources or later policy changes.
+
+The simulation includes the region, caller ARN, KMS creation tags and DNS-01
+record context. Missing context reported by IAM is named in the error. It reads
+the role's policies, permissions boundary and service control policies, but not
+bucket policies or configuration: an intent bucket without versioning and Object
+Lock still fails at genesis. The role is derived from the STS session, so a role
+created with a path other than `/` is not found.
+
+`PermissionPreflight` must name the role itself, so whoever holds its
+credentials, the enclave or the host, can ask only what this role may do. In
+Terraform:
+
+```hcl
+resource "aws_iam_role_policy" "enclave_permission_preflight" {
+  role = aws_iam_role.enclave.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "PermissionPreflight"
+      Effect   = "Allow"
+      Action   = "iam:SimulatePrincipalPolicy"
+      Resource = aws_iam_role.enclave.arn
+    }]
+  })
+}
+```
 
 ## Blue/green migration
 

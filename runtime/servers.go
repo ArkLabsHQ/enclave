@@ -51,11 +51,14 @@ type RuntimeInfo struct {
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
 	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
+	// Error says why boot stopped, when Status is failed.
+	Error string `json:"error,omitempty"`
 }
 
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
 	ConfigureEnclaveInfoHandler(migrator Migrator) error
+	ReportBootFailure(err error)
 	SetAncestry(ctx context.Context, ancestry Ancestry)
 }
 
@@ -257,6 +260,21 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 	})
 
 	return nil
+}
+
+// ReportBootFailure exposes startup errors before telemetry is available.
+func (s *servers) ReportBootFailure(err error) {
+	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(RuntimeInfo{
+			Version:                  Version,
+			Status:                   runtimeStatusFailed,
+			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
+			KMSKeyLocked:             s.cfg.KMSLocked,
+			Error:                    err.Error(),
+		})
+	})
 }
 
 // migrationHTTPStatus maps the errors /enclave/v1/info can surface. Migration

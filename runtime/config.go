@@ -55,6 +55,7 @@ const (
 	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
 	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
 	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+	envIAMEndpoint         = "AWS_ENDPOINT_URL_IAM"
 )
 
 const (
@@ -125,6 +126,7 @@ type Config struct {
 	STSEndpoint         string
 	S3Endpoint          string
 	CloudWatchEndpoint  string
+	IAMEndpoint         string
 	AWSRegion           string
 	EC2MetadataEndpoint string
 
@@ -186,6 +188,7 @@ func LoadConfig() (*Config, error) {
 		STSEndpoint:           takeEnv(envSTSEndpoint),
 		S3Endpoint:            takeEnv(envS3Endpoint),
 		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		IAMEndpoint:           takeEnv(envIAMEndpoint),
 		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),
 		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
 		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),

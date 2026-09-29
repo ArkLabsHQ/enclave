@@ -338,14 +338,12 @@ func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int
 
 func testAWS(t *testing.T, cw CloudWatchLogsAPI, base string) *AWSClient {
 	t.Helper()
-	for _, name := range []string{
-		"AWS_ENDPOINT_URL_LOGS", "AWS_ENDPOINT_URL_XRAY", "AWS_ENDPOINT_URL_MONITORING",
-	} {
-		t.Setenv(name, base)
-	}
 	return &AWSClient{
-		CWL:  cw,
-		OTLP: newOTLPEndpoints(aws.Config{Region: "eu-west-1", Credentials: testCredentials}),
+		CWL: cw,
+		OTLP: newOTLPEndpoints(
+			Config{CloudWatchEndpoint: base, XRayEndpoint: base, MonitoringEndpoint: base},
+			aws.Config{Region: "eu-west-1", Credentials: testCredentials},
+		),
 	}
 }
 

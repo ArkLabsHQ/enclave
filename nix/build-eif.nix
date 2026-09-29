@@ -6,6 +6,7 @@
   pkgs,
   app,
   env,
+  overrideAllowlist ? [ ],
   extraPackages ? [ ],
 }:
 let
@@ -19,6 +20,9 @@ let
   version = "${app.version}-${runtime.version}";
   nitro = aws-nitro-util.lib.${system};
 in
+assert lib.assertMsg (
+  !(env ? ENCLAVE_OVERRIDE_ALLOWLIST)
+) "buildEif: set overrideAllowlist instead of env.ENCLAVE_OVERRIDE_ALLOWLIST";
 nitro.buildEif ({
   name = "${appName}-enclave-${version}";
   inherit version arch;
@@ -38,5 +42,11 @@ nitro.buildEif ({
     '';
   };
   entrypoint = "/app/runtime";
-  env = lib.generators.toKeyValue { } (env // { APP_BINARY_NAME = appBinaryName; });
+  env = lib.generators.toKeyValue { } (
+    env
+    // {
+      APP_BINARY_NAME = appBinaryName;
+      ENCLAVE_OVERRIDE_ALLOWLIST = lib.concatStringsSep "," overrideAllowlist;
+    }
+  );
 })

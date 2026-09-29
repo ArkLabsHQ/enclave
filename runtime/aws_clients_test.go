@@ -169,10 +169,10 @@ func TestSigV4TransportSignsEveryAttempt(t *testing.T) {
 }
 
 func TestOTLPBaseURLUsesRegionAndOverrides(t *testing.T) {
-	t.Setenv("AWS_ENDPOINT_URL_LOGS", "http://aws:4318/")
-	t.Setenv("AWS_ENDPOINT_URL_XRAY", "http://aws:4319")
-	t.Setenv("AWS_ENDPOINT_URL_MONITORING", "")
-	up := newOTLPEndpoints(aws.Config{Region: "eu-central-1", Credentials: testCredentials})
+	up := newOTLPEndpoints(
+		Config{CloudWatchEndpoint: "http://aws:4318/", XRayEndpoint: "http://aws:4319"},
+		aws.Config{Region: "eu-central-1", Credentials: testCredentials},
+	)
 
 	require.Equal(t, "http://aws:4318", up.Logs.base)
 	require.Equal(t, "http://aws:4319", up.Traces.base)

@@ -56,18 +56,7 @@ const (
 
 	clockSyncRetryInterval  = 10 * time.Second
 	clockSyncFailureTimeout = 10 * time.Minute
-
-	// 5 min matches Evervault's /dev/ptp0 sync cadence:
-	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
-	clockSyncPollInterval = 5 * time.Minute
 )
-
-func clockPollInterval(cfg *Config) time.Duration {
-	if cfg.Dev {
-		return 5 * time.Second
-	}
-	return clockSyncPollInterval
-}
 
 // offsetMeasurement is one PHC/REALTIME comparison.
 type offsetMeasurement struct {
@@ -123,7 +112,7 @@ func StartClockSyncer(ctx context.Context, cfg *Config) (context.Context, error)
 		}
 	}
 
-	cs, err := newClockSyncer(clockPollInterval(cfg))
+	cs, err := newClockSyncer(cfg.ClockSyncInterval)
 	if err != nil {
 		return nil, err
 	}

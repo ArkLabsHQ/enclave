@@ -14,13 +14,6 @@ import (
 	"github.com/mdlayher/vsock"
 )
 
-// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
-const (
-	viproxyDefaultIn  = "127.0.0.1:80"
-	viproxyDefaultOut = "3:8002"
-	imdsEndpointEnv   = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
-)
-
 func StartNetorking(ctx context.Context, cfg Config) error {
 	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
 	if err := os.WriteFile(
@@ -32,7 +25,7 @@ func StartNetorking(ctx context.Context, cfg Config) error {
 	}
 
 	// Start IMDS proxy before AWS clients load credentials.
-	if err := startViproxy(); err != nil {
+	if err := startViproxy(cfg); err != nil {
 		return fmt.Errorf("failed to start viproxy: %w", err)
 	}
 
@@ -50,22 +43,13 @@ func StartNetorking(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// startViproxy launches the in-process IMDS forwarder unless disabled via
-// ENCLAVE_VIPROXY_ENABLED=false. It returns once the listener is bound.
-//
-// Also sets AWS_EC2_METADATA_SERVICE_ENDPOINT so the AWS SDK targets the
-// local forwarder instead of the real (unreachable from inside an enclave)
-// 169.254.169.254.
-func startViproxy() error {
-	if strings.EqualFold(envDefault("ENCLAVE_VIPROXY_ENABLED", "true"), "false") {
-		return nil
-	}
-
-	in, err := parseViproxyAddr(envDefault("ENCLAVE_VIPROXY_IN_ADDRS", viproxyDefaultIn))
+// startViproxy launches the in-process IMDS forwarder
+func startViproxy(cfg Config) error {
+	in, err := parseViproxyAddr(cfg.ViproxyInAddr)
 	if err != nil {
 		return fmt.Errorf("parse IN addr: %w", err)
 	}
-	out, err := parseViproxyAddr(envDefault("ENCLAVE_VIPROXY_OUT_ADDRS", viproxyDefaultOut))
+	out, err := parseViproxyAddr(cfg.ViproxyOutAddr)
 	if err != nil {
 		return fmt.Errorf("parse OUT addr: %w", err)
 	}
@@ -75,9 +59,6 @@ func startViproxy() error {
 		return fmt.Errorf("viproxy start: %w", err)
 	}
 
-	if os.Getenv(imdsEndpointEnv) == "" {
-		_ = os.Setenv(imdsEndpointEnv, "http://127.0.0.1:80")
-	}
 	return nil
 }
 

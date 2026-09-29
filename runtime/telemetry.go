@@ -212,7 +212,8 @@ func (t *Telemetry) Start(ctx context.Context) error {
 	}
 	if t.instanceID == "" {
 		return fmt.Errorf(
-			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream")
+			"telemetry: no instance ID from IMDS: it names every CloudWatch log stream",
+		)
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
 		if err := t.ensureGroup(ctx, sig); err != nil {

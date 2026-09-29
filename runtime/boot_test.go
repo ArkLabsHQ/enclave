@@ -23,8 +23,6 @@ import (
 )
 
 func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	pcr0 := strings.Repeat("AB", 48)
 	require.Equal(
 		t,
@@ -39,8 +37,6 @@ func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
 }
 
 func TestLoadUnverifiedState(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-classify"
 	currentPCR0 := bytes.Repeat([]byte{0xab}, 48)
@@ -139,8 +135,10 @@ func TestLoadUnverifiedState(t *testing.T) {
 			if !tc.freshDeployment {
 				seedGenesisRecord(t, s3f, currentPCR0Hex)
 			}
+			cfg := stateOriginTestConfig()
+			cfg.PreviousPCR0 = prevPCR0
 			boot := &Boot{
-				cfg: testConfigWithPreviousPCR0(prevPCR0),
+				cfg: cfg,
 				nsm: fakePredecessorNSM{
 					NSM: &nsmW{nsm: &fakeNSM{
 						verifyErr: errors.New("unexpected attestation verification"),
@@ -171,20 +169,23 @@ func TestLoadUnverifiedState(t *testing.T) {
 }
 
 func TestNewBootRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	fake, ssm := stateOriginTestSSM(nil)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, 47)})
 
-	_, err := NewBoot(testCfg, &nsmW{nsm: &fakeNSM{session: session}}, nil, nil, ssm, nil)
+	_, err := NewBoot(
+		stateOriginTestConfig(),
+		&nsmW{nsm: &fakeNSM{session: session}},
+		nil,
+		nil,
+		ssm,
+		nil,
+	)
 
 	require.ErrorContains(t, err, "exactly 48 bytes")
 	require.Empty(t, fake.calls)
 }
 
 func TestVerifyStateOriginReceipt(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	stateRoot := []byte("state-root-commitment")
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	pcr0Hex := hex.EncodeToString(pcr0)
@@ -232,8 +233,6 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 }
 
 func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
 	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	stateRoot := []byte("successor-state-root")
@@ -271,22 +270,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestValidateStaticSecretArtifacts(t *testing.T) {
-	setStateOriginTestEnv(t)
-
-	require.NoError(t, validateStaticSecretNames(stateOriginTestSecrets))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
-		{Name: "duplicate", EnvVar: "ONE"},
-		{Name: "duplicate", EnvVar: "TWO"},
-	}))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
-		{Name: "StorageDEK", EnvVar: "COLLISION"},
-	}))
-}
-
 func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-single-snapshot"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
@@ -300,7 +284,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	kms := &stateOriginTestKMS{keyID: keyID}
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
-	boot := &Boot{cfg: testCfg, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
+	boot := &Boot{cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
@@ -309,7 +293,7 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	)
 
 	established, err := (&Boot{
-		cfg: testCfg,
+		cfg: stateOriginTestConfig(),
 		nsm: &nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
 		ssm: ssm,
 	}).establish(ctx, planned, kms)
@@ -320,8 +304,6 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 }
 
 func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-missing-state"
 	params := stateOriginParams(keyID)
@@ -332,7 +314,9 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 
-	_, err := (&Boot{cfg: testCfg, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(ctx)
+	_, err := (&Boot{cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(
+		ctx,
+	)
 
 	require.Error(t, err)
 	_, exists := fake.params[testCfg.secretCiphertextParam("alpha", keyID)]
@@ -340,8 +324,6 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 }
 
 func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-genesis"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
@@ -349,7 +331,14 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	s3f := newFakeS3()
-	boot := &Boot{cfg: testCfg, nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
+	boot := &Boot{
+		cfg:  stateOriginTestConfig(),
+		nsm:  nsm,
+		ssm:  ssm,
+		s3:   s3f,
+		sts:  &fakeSTS{},
+		pcr0: pcr0,
+	}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	lease, err := TryAcquireLease(ctx, testCfg, s3f, "genesis-leases", genesisLeaseName, leaseTTL)
@@ -358,13 +347,13 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	t.Cleanup(func() { _ = lease.Release(context.Background()) })
 	planned.mode.(*genesisBoot).lease = lease
 
-	established, err := (&Boot{cfg: testCfg, nsm: nsm, ssm: ssm}).establish(
+	established, err := (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm}).establish(
 		ctx, planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
 	require.NoError(t, err)
 	require.NotNil(t, established.dek)
-	require.Len(t, established.secrets, len(stateOriginTestSecrets))
+	require.Len(t, established.secrets.Static, len(stateOriginTestSecrets))
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[testCfg.stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))]
@@ -380,8 +369,6 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 }
 
 func TestEstablishLoadedStateGenesisWithoutLeaseWritesNoReceipt(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-genesis-without-lease"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
@@ -389,12 +376,12 @@ func TestEstablishLoadedStateGenesisWithoutLeaseWritesNoReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	s3f := newFakeS3()
-	planned, err := (&Boot{cfg: testCfg, nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(
+	planned, err := (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(
 		ctx,
 	)
 	require.NoError(t, err)
 
-	_, err = (&Boot{cfg: testCfg, nsm: nsm, ssm: ssm}).establish(
+	_, err = (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm}).establish(
 		ctx, planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
@@ -403,8 +390,6 @@ func TestEstablishLoadedStateGenesisWithoutLeaseWritesNoReceipt(t *testing.T) {
 }
 
 func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	keyID := "key-genesis-failure"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fake, ssm := stateOriginTestSSM(
@@ -417,7 +402,14 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	}
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
-	boot := &Boot{cfg: testCfg, nsm: nsm, ssm: ssm, s3: newFakeS3(), sts: &fakeSTS{}, pcr0: pcr0}
+	boot := &Boot{
+		cfg:  stateOriginTestConfig(),
+		nsm:  nsm,
+		ssm:  ssm,
+		s3:   newFakeS3(),
+		sts:  &fakeSTS{},
+		pcr0: pcr0,
+	}
 	planned, err := boot.plan(context.Background())
 	require.NoError(t, err)
 	lease, err := TryAcquireLease(
@@ -428,7 +420,7 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	t.Cleanup(func() { _ = lease.Release(context.Background()) })
 	planned.mode.(*genesisBoot).lease = lease
 
-	_, err = (&Boot{cfg: testCfg, nsm: nsm, ssm: ssm}).establish(
+	_, err = (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm}).establish(
 		context.Background(), planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
@@ -437,8 +429,6 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 }
 
 func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-resume"
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
@@ -464,13 +454,19 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			}
 			s3f := newFakeS3()
 			seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
-			boot := &Boot{cfg: testCfg, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
+			boot := &Boot{
+				cfg:  stateOriginTestConfig(),
+				ssm:  ssm,
+				s3:   s3f,
+				sts:  &fakeSTS{},
+				pcr0: pcr0,
+			}
 			planned, err := boot.plan(ctx)
 			require.NoError(t, err)
 			kms := &stateOriginTestKMS{keyID: keyID}
 
 			_, err = (&Boot{
-				cfg: testCfg,
+				cfg: stateOriginTestConfig(),
 				nsm: &nsmW{nsm: &fakeNSM{
 					session:     newStatefulNSMSession(t, map[uint][]byte{0: pcr0}),
 					verifyRoots: att.roots,
@@ -485,8 +481,6 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 }
 
 func TestEstablishLoadedStateMigration(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	keyID := "key-migration"
 	currentPCR0 := bytes.Repeat([]byte{0xab}, 48)
@@ -580,7 +574,8 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 				}
 			}
 		}
-		cfg := migrationTestCfg()
+		cfg := stateOriginTestConfig()
+		cfg.MigrationCooldown = 0
 		cfg.PreviousPCR0 = prevPCR0Hex
 		if eifPredecessorSet {
 			cfg.PreviousPCR0 = eifPredecessor
@@ -822,14 +817,13 @@ func stateOriginTestMigrationIntentBucket() string {
 	return migrationIntentBucketName(testCfg, fakeSTSAccountID)
 }
 
-func setStateOriginTestEnv(t *testing.T) {
-	t.Helper()
-	// Boot opens the intent log to classify itself; validateEnvironment
-	// guarantees this is set before any real boot reaches that point.
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[
+func stateOriginTestConfig() *Config {
+	cfg := testConfig()
+	cfg.StaticSecretConfig = `[
 		{"name":"alpha","env_var":"ALPHA"},
 		{"name":"beta","env_var":"BETA"}
-	]`)
+	]`
+	return cfg
 }
 
 type stateOriginTestKMS struct {
@@ -1095,7 +1089,7 @@ func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 }
 
 func (f *genesisFixture) establish(ctx context.Context) (bootResult, error) {
-	boot, err := NewBoot(testCfg, f.nsm, f.kmsf, f.sts, f.ssm, f.s3f)
+	boot, err := NewBoot(stateOriginTestConfig(), f.nsm, f.kmsf, f.sts, f.ssm, f.s3f)
 	if err != nil {
 		return bootResult{}, err
 	}
@@ -1104,7 +1098,6 @@ func (f *genesisFixture) establish(ctx context.Context) (bootResult, error) {
 
 // A live peer lease must stop genesis before any KMS key is minted
 func TestBootGenesisBlocksOnPeerLease(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
 
@@ -1121,7 +1114,6 @@ func TestBootGenesisBlocksOnPeerLease(t *testing.T) {
 // A second enclave arriving after a peer's genesis resumes against the committed
 // key and derives the identical DEK, rather than minting its own.
 func TestBootResumesAfterPeerGenesis(t *testing.T) {
-	setStateOriginTestEnv(t)
 	ctx := context.Background()
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
 
@@ -1143,7 +1135,6 @@ func TestBootResumesAfterPeerGenesis(t *testing.T) {
 
 // The lease is released once genesis commits, so it never wedges later boots.
 func TestBootReleasesGenesisLease(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
 
 	_, err := fx.establish(context.Background())
@@ -1156,7 +1147,6 @@ func TestBootReleasesGenesisLease(t *testing.T) {
 // enclave resumes immediately instead of winning the lock just to find the work
 // already done — otherwise a fleet's first boot drains one poll interval at a time.
 func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
-	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
@@ -1170,7 +1160,7 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
 		sts:  fx.sts,
@@ -1190,7 +1180,6 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 // finished. Resuming there replans into a genesis boot with a committed key,
 // which verify refuses — so the wait must hold until both are visible.
 func TestAwaitGenesisWaitsForTheArtifactNotTheKeyAlone(t *testing.T) {
-	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
@@ -1201,7 +1190,7 @@ func TestAwaitGenesisWaitsForTheArtifactNotTheKeyAlone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
 		sts:  fx.sts,
@@ -1218,7 +1207,6 @@ func TestAwaitGenesisWaitsForTheArtifactNotTheKeyAlone(t *testing.T) {
 // nobody else is running genesis, not that genesis has not already happened, so
 // the lease must be given straight back rather than used to redo the work.
 func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
-	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
@@ -1232,7 +1220,7 @@ func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
 		sts:  fx.sts,
@@ -1249,7 +1237,6 @@ func TestAwaitGenesisLeaseReleasesWhenPeerCommitsAfterWin(t *testing.T) {
 // A holder that died mid-genesis must not wedge the deployment forever — not
 // even against its own restart. Once the lease lapses the lock is reclaimable.
 func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
-	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
@@ -1259,7 +1246,7 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
 		sts:  fx.sts,
@@ -1283,7 +1270,6 @@ func TestAwaitGenesisReclaimsLapsedLock(t *testing.T) {
 
 // A live holder is still never displaced.
 func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
-	setStateOriginTestEnv(t)
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
@@ -1291,7 +1277,7 @@ func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	lease, err := (&Boot{cfg: testCfg, ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}).
+	lease, err := (&Boot{cfg: stateOriginTestConfig(), ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}).
 		awaitGenesisLease(
 			ctx,
 			fx.genesisLog(t),
@@ -1305,7 +1291,6 @@ func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
 // The KMSKeyID commit is unconditional, so losing the lock mid-genesis must
 // stop the commit rather than let it clobber whoever took over.
 func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
-	setStateOriginTestEnv(t)
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
@@ -1319,7 +1304,7 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
 
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		nsm:  fx.nsm,
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
@@ -1334,7 +1319,7 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 
 	_, err = (&Boot{
-		cfg: testCfg,
+		cfg: stateOriginTestConfig(),
 		nsm: &nsmW{nsm: &fakeNSM{
 			session:     session,
 			verifyRoots: session.attestationSign.roots,
@@ -1381,8 +1366,6 @@ func (n fakePredecessorNSM) VerifyAttestationDocument(
 }
 
 func TestDeletingKMSKeyIDFailsClosed(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
@@ -1438,7 +1421,6 @@ func TestGenesisRequiresAnEmptyGenesisIntent(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setStateOriginTestEnv(t)
 			fx := newGenesisFixture(t, pcr0)
 			if tc.seed != nil {
 				tc.seed(t, fx)
@@ -1463,8 +1445,6 @@ func TestGenesisRequiresAnEmptyGenesisIntent(t *testing.T) {
 
 // A failed create-only key claim must not leave an immutable genesis commit.
 func TestGenesisClaimsKMSKeyBeforeCommittingIntent(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
@@ -1489,8 +1469,6 @@ func TestGenesisClaimsKMSKeyBeforeCommittingIntent(t *testing.T) {
 // A peer claiming KMSKeyID inside the window between our verify and our
 // create-only write must stop us dead, leaving its claim and no genesis.
 func TestGenesisAbandonsCommitWhenPeerClaimsKeyFirst(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
@@ -1520,13 +1498,11 @@ func TestGenesisAbandonsCommitWhenPeerClaimsKeyFirst(t *testing.T) {
 // Once the create-only KMS claim succeeds, an intent failure leaves an
 // interrupted genesis that every later boot rejects.
 func TestGenesisIntentFailureLeavesFailClosedKMSClaim(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 	boot := &Boot{
-		cfg:  testCfg,
+		cfg:  stateOriginTestConfig(),
 		nsm:  fx.nsm,
 		ssm:  fx.ssm,
 		s3:   fx.s3f,
@@ -1554,8 +1530,6 @@ func TestGenesisIntentFailureLeavesFailClosedKMSClaim(t *testing.T) {
 // application's SSM namespace could otherwise aim the genesis check at an empty
 // bucket and have a second generation created beside the live one.
 func TestIntentBucketIsMeasuredNotReadFromSSM(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)

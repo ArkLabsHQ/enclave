@@ -198,6 +198,9 @@ let
   commonEifEnv = {
     ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
+    ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
+    ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -206,6 +209,33 @@ let
       {
         name = "e2e-signing-key";
         env_var = "E2E_SIGNING_KEY";
+      }
+    ];
+    # e2e.py places all three values in SSM, hex-encoded; each pin is the
+    # SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
+    # only verified. The second is already past its cutoff. The third's cutoff
+    # is reached when e2e.py steps a node's clock to just before it, so the
+    # restart-without-the-secret path runs for real.
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
+      {
+        name = "e2e-inherited";
+        env_var = "E2E_INHERITED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+      }
+      {
+        name = "e2e-expired";
+        env_var = "E2E_EXPIRED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2020-01-01T00:00:00Z";
+      }
+      {
+        name = "e2e-cutoff";
+        env_var = "E2E_CUTOFF";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2040-01-01T00:00:00Z";
       }
     ];
 
@@ -226,6 +256,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 

@@ -86,6 +86,22 @@ func TestSSMGet(t *testing.T) {
 			t.Fatalf("got %q, want %q", got, "value")
 		}
 	})
+
+	t.Run("may get with decryption asks for it", func(t *testing.T) {
+		fake := &fakeSSM{params: map[string]string{"/set": " value\n", "/unset": "UNSET"}}
+		ssm := NewSSM(fake)
+		got, err := ssm.MayGet(ctx, "/set", WithDecryption())
+		require.NoError(t, err)
+		require.Equal(t, "value", got)
+		got, err = ssm.MayGet(ctx, "/unset", WithDecryption())
+		require.NoError(t, err)
+		require.Empty(t, got)
+		require.Equal(t, []string{"/set", "/unset"}, fake.decryptedGets)
+
+		_, err = ssm.MayGet(ctx, "/set")
+		require.NoError(t, err)
+		require.Len(t, fake.decryptedGets, 2, "plain MayGet must not ask for decryption")
+	})
 }
 
 func TestSSMListParams(t *testing.T) {

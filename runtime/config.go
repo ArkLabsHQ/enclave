@@ -55,6 +55,8 @@ const (
 	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
 	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
 	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+	envXRayEndpoint        = "AWS_ENDPOINT_URL_XRAY"
+	envMonitoringEndpoint  = "AWS_ENDPOINT_URL_MONITORING"
 )
 
 const (
@@ -73,6 +75,8 @@ const (
 	defaultLogShipInterval   = 10 * time.Second
 	defaultLogRetentionDays  = int32(30)
 	logGroupRoot             = "enclave"
+
+	otlpHTTPTimeout = 30 * time.Second
 
 	logGroupNameChars = "._-/#"
 
@@ -125,6 +129,8 @@ type Config struct {
 	STSEndpoint         string
 	S3Endpoint          string
 	CloudWatchEndpoint  string
+	XRayEndpoint        string
+	MonitoringEndpoint  string
 	AWSRegion           string
 	EC2MetadataEndpoint string
 
@@ -186,6 +192,8 @@ func LoadConfig() (*Config, error) {
 		STSEndpoint:           takeEnv(envSTSEndpoint),
 		S3Endpoint:            takeEnv(envS3Endpoint),
 		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		XRayEndpoint:          takeEnv(envXRayEndpoint),
+		MonitoringEndpoint:    takeEnv(envMonitoringEndpoint),
 		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),
 		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
 		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),

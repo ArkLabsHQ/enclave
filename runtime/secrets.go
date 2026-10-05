@@ -87,6 +87,18 @@ func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
 func (sm SecretsMetadata) validateStatic() error {
 	seen := make(map[string]bool, len(sm.Static))
 	for _, secret := range sm.Static {
+		if secret.Name == "" {
+			return fmt.Errorf("static secret with env var %q has no name", secret.EnvVar)
+		}
+		if len(secret.Name) > maxSecretNameLen {
+			return fmt.Errorf(
+				"static secret %q: name is %d characters, at most %d fit SSM's name limit",
+				secret.Name, len(secret.Name), maxSecretNameLen,
+			)
+		}
+		if err := validateNamespaceName("static secret", secret.Name, false); err != nil {
+			return err
+		}
 		if secret.Name == "StorageDEK" {
 			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
 		}
@@ -193,11 +205,13 @@ func (sm SecretsMetadata) validateChildEnv(overrideAllowList map[string]bool) er
 	for _, m := range sm.Inherited {
 		if overrideAllowList[m.EnvVar] {
 			return fmt.Errorf(
-				"inherited secret %q: env_var %q is in the override allowlist", m.Name, m.EnvVar)
+				"inherited secret %q: env_var %q is in the override allowlist", m.Name, m.EnvVar,
+			)
 		}
 		if _, baked := os.LookupEnv(m.EnvVar); baked {
 			return fmt.Errorf(
-				"inherited secret %q: env_var %q is set in the baked environment", m.Name, m.EnvVar)
+				"inherited secret %q: env_var %q is set in the baked environment", m.Name, m.EnvVar,
+			)
 		}
 	}
 	return nil

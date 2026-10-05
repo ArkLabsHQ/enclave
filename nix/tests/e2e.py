@@ -2,11 +2,11 @@
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
-CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
-ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
-SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
+CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
+ACCOUNT_KEY = "ark/e2e/dev/testapp/data/acme/account.key"
+SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
-LOG_PREFIX = "/ark/e2e/dev/enclave"
+LOG_PREFIX = "/ark/e2e/dev/testapp/enclave"
 INSTANCE_ID = "i-0e2ce2ce2ce2ce2ce"
 # Inherited hash secrets are delivered hex; default.nix pins its SHA-256.
 INHERITED = b"inherited-from-outside".hex()
@@ -14,7 +14,7 @@ INHERITED = b"inherited-from-outside".hex()
 
 def put_env(name, value):
     cloud(
-        f"ssm put-parameter --name /dev/testapp/env/{name} "
+        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/env/{name} "
         f"--type String --value {shlex.quote(value)}"
     )
 
@@ -119,11 +119,11 @@ cloud(
     "--versioning-configuration Status=Enabled"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/CertBucketName "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/CertBucketName "
     f"--type String --value {CERT_BUCKET}"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/LeaseBucketName "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/LeaseBucketName "
     f"--type String --value {LEASE_BUCKET}"
 )
 route53_zone_id = cloud(
@@ -131,13 +131,13 @@ route53_zone_id = cloud(
     "--query HostedZone.Id --output text"
 ).rsplit("/", 1)[-1]
 cloud(
-    "ssm put-parameter --name /dev/testapp/Route53ZoneID "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/Route53ZoneID "
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
 for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
     cloud(
-        f"ssm put-parameter --name /dev/testapp/inherit/{inherited} "
+        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/{inherited} "
         f"--type String --value {INHERITED}"
     )
 put_env("ENCLAVE_FQDN", FQDN)
@@ -477,7 +477,7 @@ aws.succeed(
 # is refused — that is an IAM property, which LocalStack does not model.)
 receipt_param = migration_receipt_param(migration_key, GREEN_PCR0)
 assert get_param(receipt_param) not in ("", "UNSET", "None")
-assert get_param(f"/dev/testapp/MigrationStateOriginReceipt/{migration_key}") == ""
+assert get_param(f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{migration_key}") == ""
 receipt_before = get_param(receipt_param)
 create_only_status, _ = aws.execute(
     f"{CLOUD} ssm put-parameter --name {receipt_param} "

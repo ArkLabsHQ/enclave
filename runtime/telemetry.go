@@ -182,7 +182,7 @@ func NewTelemetry(cfg *Config, client *AWSClient) *Telemetry {
 		res: resource.NewSchemaless(
 			attribute.String("service.name", runtimeService),
 			attribute.String("service.version", Version),
-			attribute.String("deployment.environment", cfg.Deployment),
+			attribute.String("deployment.environment", cfg.Namespace),
 			attribute.String("host.id", cfg.InstanceID),
 			attribute.String("enclave.app", cfg.AppName),
 		),

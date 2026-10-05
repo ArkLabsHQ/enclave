@@ -196,13 +196,12 @@ let
   # The fixed four-node topology makes the AWS node's test-VLAN address stable.
   # Using it directly avoids depending on gvproxy forwarding /etc/hosts entries.
   commonEifEnv = {
-    ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
     ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
     ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
     ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
-    ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
+    ENCLAVE_NAMESPACE = "ark/e2e/dev";
     ENCLAVE_AWS_REGION = "us-east-1";
     ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [

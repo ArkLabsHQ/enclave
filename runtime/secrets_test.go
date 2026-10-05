@@ -79,6 +79,11 @@ func TestValidateStaticSecrets(t *testing.T) {
 	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
 		{Name: "StorageDEK", EnvVar: "COLLISION"},
 	}}.Validate(nil))
+	for _, name := range []string{"", "foo/bar", "key#1", "..", strings.Repeat("k", 129)} {
+		require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
+			{Name: name, EnvVar: "SHAPE"},
+		}}.Validate(nil), "a secret name must be one SSM path segment: %q", name)
+	}
 }
 
 func TestValidateInheritSecrets(t *testing.T) {
@@ -247,11 +252,13 @@ func TestVerifyInheritedSecret(t *testing.T) {
 		"entries are trimmed",
 	)
 	require.ErrorContains(t, verifyInheritedSecret(hashListMeta, first), "value count 1, want 2")
-	require.ErrorContains(t,
+	require.ErrorContains(
+		t,
 		verifyInheritedSecret(hashListMeta, first+","+inheritTestHex("wrong")),
 		"value 1 does not match an unused pinned hash",
 	)
-	require.ErrorContains(t,
+	require.ErrorContains(
+		t,
 		verifyInheritedSecret(hashListMeta, first+","+first),
 		"value 1 does not match an unused pinned hash",
 	)
@@ -262,21 +269,25 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	require.NoError(t, verifyInheritedSecret(keyListMeta, secondPrivKey+","+privKey))
 	// Per-key metadata after a colon is delivered to the app but not pinned.
 	require.NoError(t, verifyInheritedSecret(
-		keyListMeta, privKey+":1798761600,"+secondPrivKey+":1830297600"))
+		keyListMeta, privKey+":1798761600,"+secondPrivKey+":1830297600",
+	))
 	require.ErrorContains(t,
 		verifyInheritedSecret(keyListMeta, privKey+":1798761600,"+privKey+":1830297600"),
 		"value 1 does not match")
 	require.ErrorContains(t, verifyInheritedSecret(keyListMeta, privKey), "value count 1, want 2")
 	otherPrivateKey, _ := inheritTestKeyFrom(t, "other-inherit-secret-test-key")
-	require.ErrorContains(t,
+	require.ErrorContains(
+		t,
 		verifyInheritedSecret(keyListMeta, privKey+","+otherPrivateKey),
 		"value 1 does not match",
 	)
-	require.ErrorContains(t,
+	require.ErrorContains(
+		t,
 		verifyInheritedSecret(keyListMeta, privKey+","+privKey),
 		"value 1 does not match",
 	)
-	require.ErrorContains(t,
+	require.ErrorContains(
+		t,
 		verifyInheritedSecret(keyListMeta, privKey+",not-hex"),
 		"value 1 is not hex",
 	)
@@ -302,7 +313,7 @@ func TestVerifyInheritedSecret(t *testing.T) {
 
 func TestResolveInheritedSecrets(t *testing.T) {
 	ctx := context.Background()
-	cfg := &Config{Deployment: "dev", AppName: "testapp"}
+	cfg := &Config{Namespace: "dev", AppName: "testapp"}
 	privKey, pubKey := inheritTestKey(t)
 	now := inheritTestCutoff.Add(-time.Hour)
 
@@ -318,8 +329,8 @@ func TestResolveInheritedSecrets(t *testing.T) {
 
 	t.Run("returns verified secrets read with decryption", func(t *testing.T) {
 		fake := &fakeSSM{params: map[string]string{
-			"/dev/testapp/inherit/legacy": privKey + "\n",
-			"/dev/testapp/inherit/token":  inheritTestHex("s3cr3t"),
+			"/dev/testapp/enclave/inherit/legacy": privKey + "\n",
+			"/dev/testapp/enclave/inherit/token":  inheritTestHex("s3cr3t"),
 		}}
 		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(fake), meta, now)
 		require.NoError(t, err)
@@ -328,21 +339,21 @@ func TestResolveInheritedSecrets(t *testing.T) {
 			{InheritSecretMetadata: hashMeta, Plaintext: inheritTestHex("s3cr3t")},
 		}, secrets)
 		require.Equal(t, []string{
-			"/dev/testapp/inherit/legacy", "/dev/testapp/inherit/token",
+			"/dev/testapp/enclave/inherit/legacy", "/dev/testapp/enclave/inherit/token",
 		}, fake.decryptedGets, "SecureString values must be decrypted")
 	})
 
 	t.Run("mismatch is fatal", func(t *testing.T) {
 		_, err := resolveInheritedSecrets(ctx, cfg, NewSSM(&fakeSSM{params: map[string]string{
-			"/dev/testapp/inherit/legacy": privKey,
-			"/dev/testapp/inherit/token":  inheritTestHex("tampered"),
+			"/dev/testapp/enclave/inherit/legacy": privKey,
+			"/dev/testapp/enclave/inherit/token":  inheritTestHex("tampered"),
 		}}), meta, now)
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
 	t.Run("missing param is skipped", func(t *testing.T) {
 		secrets, err := resolveInheritedSecrets(ctx, cfg, NewSSM(&fakeSSM{params: map[string]string{
-			"/dev/testapp/inherit/token": inheritTestHex("s3cr3t"),
+			"/dev/testapp/enclave/inherit/token": inheritTestHex("s3cr3t"),
 		}}), meta, now)
 		require.NoError(t, err)
 		require.Equal(
@@ -359,23 +370,27 @@ func TestResolveInheritedSecrets(t *testing.T) {
 		expired := hashMeta
 		expired.Cutoff = now
 		fake := &fakeSSM{
-			params:  map[string]string{"/dev/testapp/inherit/legacy": privKey},
-			getErrs: map[string]error{"/dev/testapp/inherit/token": errors.New("KMS key disabled")},
+			params: map[string]string{"/dev/testapp/enclave/inherit/legacy": privKey},
+			getErrs: map[string]error{
+				"/dev/testapp/enclave/inherit/token": errors.New("KMS key disabled"),
+			},
 		}
 		secrets, err := resolveInheritedSecrets(
-			ctx, cfg, NewSSM(fake), []InheritSecretMetadata{keyMeta, expired}, now)
+			ctx, cfg, NewSSM(fake), []InheritSecretMetadata{keyMeta, expired}, now,
+		)
 		require.NoError(t, err)
 		require.Equal(
 			t,
 			[]InheritedSecret{{InheritSecretMetadata: keyMeta, Plaintext: privKey}},
 			secrets,
 		)
-		require.NotContains(t, fake.calls, "/dev/testapp/inherit/token")
+		require.NotContains(t, fake.calls, "/dev/testapp/enclave/inherit/token")
 	})
 
 	t.Run("returns SSM errors", func(t *testing.T) {
 		_, err := resolveInheritedSecrets(
-			ctx, cfg, NewSSM(&fakeSSM{err: errors.New("access denied")}), meta, now)
+			ctx, cfg, NewSSM(&fakeSSM{err: errors.New("access denied")}), meta, now,
+		)
 		require.Error(t, err)
 	})
 }

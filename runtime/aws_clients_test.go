@@ -122,7 +122,7 @@ func TestSigV4TransportSignsEveryAttempt(t *testing.T) {
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/x-protobuf")
 		req.Header.Set("Content-Encoding", "gzip")
-		req.Header.Set("x-aws-log-group", "/prod/enclave/logs/app")
+		req.Header.Set("x-aws-log-group", "/prod/app/enclave/logs/app")
 		req.Header.Set("x-aws-log-stream", "i-0e2ce2ce2ce2ce2ce")
 
 		resp, err := client.Do(req)
@@ -138,7 +138,8 @@ func TestSigV4TransportSignsEveryAttempt(t *testing.T) {
 	require.Len(t, seen, 2)
 	authorization := regexp.MustCompile(
 		`^AWS4-HMAC-SHA256 Credential=AKID/\d{8}/eu-west-1/logs/aws4_request, ` +
-			`SignedHeaders=([a-z0-9-]+;)*x-aws-log-group;x-aws-log-stream, Signature=[0-9a-f]{64}$`)
+			`SignedHeaders=([a-z0-9-]+;)*x-aws-log-group;x-aws-log-stream, Signature=[0-9a-f]{64}$`,
+	)
 	for _, got := range seen {
 		require.Regexp(t, authorization, got.header.Get("Authorization"))
 		require.NotEmpty(t, got.header.Get("X-Amz-Date"))

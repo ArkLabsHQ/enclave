@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +15,7 @@ import (
 // Configuration input names shared by the environment loader and SSM overlay.
 const (
 	// Application and identity.
-	envDeployment           = "ENCLAVE_DEPLOYMENT"
+	envNamespace            = "ENCLAVE_NAMESPACE"
 	envAppName              = "ENCLAVE_APP_NAME"
 	envAppPort              = "ENCLAVE_APP_PORT"
 	envAppBinaryName        = "APP_BINARY_NAME"
@@ -38,7 +37,6 @@ const (
 	envViproxyOutAddrs  = "ENCLAVE_VIPROXY_OUT_ADDRS"
 	envLogShipInterval  = "ENCLAVE_LOG_SHIP_INTERVAL"
 	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
-	envLogGroupPrefix   = "ENCLAVE_LOG_GROUP_PREFIX"
 
 	// ACME settings accepted by the SSM overlay.
 	envUseACME       = "ENCLAVE_USE_ACME"
@@ -74,11 +72,17 @@ const (
 	defaultMigrationCooldown = 24 * time.Hour
 	defaultLogShipInterval   = 10 * time.Second
 	defaultLogRetentionDays  = int32(30)
-	logGroupRoot             = "enclave"
 
 	otlpHTTPTimeout = 30 * time.Second
 
-	logGroupNameChars = "._-/#"
+	namespaceSegment = "enclave"
+
+	namespaceNameChars = "_.-"
+	// SSM allows 15 levels and the deepest runtime path adds 6 below the namespace:
+	// <app>/enclave/<lock>/<secret>/Ciphertext/<keyID>.
+	maxNamespaceDepth = 9
+	maxNamespaceLen   = 256
+	maxSecretNameLen  = 128
 
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
@@ -114,7 +118,7 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment          string
+	Namespace           string
 	AppName             string
 	AppPort             string
 	AppBinaryName       string
@@ -157,7 +161,6 @@ type Config struct {
 	ClockSyncInterval     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
-	LogGroupPrefix        string
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
@@ -175,8 +178,8 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Deployment:          takeEnv(envDeployment),
-		AppName:             takeEnv(envAppName),
+		Namespace:           takeEnvRaw(envNamespace),
+		AppName:             takeEnvRaw(envAppName),
 		AppBinaryName:       takeEnvDefault(envAppBinaryName, defaultAppName),
 		AppPort:             appPort,
 		PreviousPCR0:        takeEnv(envPreviousPCR0),
@@ -205,7 +208,6 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
-		LogGroupPrefix:        normalizeLogGroupPrefix(takeEnv(envLogGroupPrefix)),
 		GenesisRetention:      prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
@@ -257,18 +259,36 @@ func (c *Config) Validate() error {
 	if c.FQDN == "" {
 		return fmt.Errorf("config is missing FQDN")
 	}
-	if c.Deployment == "" {
-		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
-	}
-	if strings.IndexFunc(c.Deployment, invalidLogGroupRune) >= 0 {
-		return fmt.Errorf(
-			"ENCLAVE_DEPLOYMENT %q: it names every CloudWatch log group, which allow only "+
-				"letters, digits and %s",
-			c.Deployment, logGroupNameChars,
-		)
+	if c.Namespace == "" {
+		return fmt.Errorf("ENCLAVE_NAMESPACE must be set: it namespaces all SSM state")
 	}
 	if c.AppName == "" {
 		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	if err := validateNamespaceName("ENCLAVE_NAMESPACE", c.Namespace, true); err != nil {
+		return err
+	}
+	if err := validateNamespaceName("ENCLAVE_APP_NAME", c.AppName, false); err != nil {
+		return err
+	}
+	if depth := strings.Count(c.Namespace, "/") + 1; depth > maxNamespaceDepth {
+		return fmt.Errorf(
+			"ENCLAVE_NAMESPACE %q: %d segments, at most %d fit SSM's hierarchy",
+			c.Namespace, depth, maxNamespaceDepth,
+		)
+	}
+	ns := c.namespace()
+	if len(ns) > maxNamespaceLen {
+		return fmt.Errorf(
+			"namespace %q is %d characters, at most %d fit SSM and CloudWatch name limits",
+			ns, len(ns), maxNamespaceLen,
+		)
+	}
+	first := strings.ToLower(strings.SplitN(c.Namespace, "/", 2)[0])
+	if strings.HasPrefix(first, "aws") || strings.HasPrefix(first, "ssm") {
+		return fmt.Errorf(
+			"namespace %q: SSM reserves parameter names starting with \"aws\" or \"ssm\"", ns,
+		)
 	}
 	if c.AppPort == "" {
 		return fmt.Errorf("config is missing application process settings")
@@ -276,11 +296,41 @@ func (c *Config) Validate() error {
 	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
-	return c.validateLogGroupPrefix()
+	return nil
+}
+
+func validateNamespaceName(name, value string, multiSegment bool) error {
+	// Names are used verbatim in S3 keys too, where "." and ".." read as relative
+	// paths: S3 refuses keys that climb above their root, and tools may resolve
+	// the rest into another name's keys.
+	for _, seg := range strings.Split(value, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("%s %q: no leading, trailing or doubled \"/\" allowed", name, value)
+		case ".", "..":
+			return fmt.Errorf("%s %q: \".\" and \"..\" segments are not allowed", name, value)
+		}
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune(namespaceNameChars, r):
+		case r == '/' && multiSegment:
+		case r == '/':
+			return fmt.Errorf("%s %q must be a single path segment", name, value)
+		default:
+			return fmt.Errorf(
+				"%s %q: SSM parameter names and CloudWatch log groups allow only "+
+					"letters, digits and %s",
+				name, value, namespaceNameChars,
+			)
+		}
+	}
+	return nil
 }
 
 func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
-	prefix := fmt.Sprintf("/%s/%s/env/", c.Deployment, c.AppName)
+	prefix := c.envOverlayPrefix()
 
 	params, err := ssm.ListParams(ctx, prefix)
 	if err != nil {
@@ -318,11 +368,6 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 			c.ACMEEmail = p.Value
 		case envACMECA:
 			c.ACMECA = p.Value
-		case envLogGroupPrefix:
-			c.LogGroupPrefix = normalizeLogGroupPrefix(p.Value)
-			if err := c.validateLogGroupPrefix(); err != nil {
-				return err
-			}
 		// key is not an overridable env var, check if overriding is allowed by the app
 		default:
 			if _, allowed := c.OverrideAllowList[key]; !allowed {
@@ -340,30 +385,6 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 	return nil
 }
 
-func (c *Config) validateLogGroupPrefix() error {
-	if c.LogGroupPrefix == "" {
-		return fmt.Errorf(
-			"ENCLAVE_LOG_GROUP_PREFIX must not be empty: it heads every CloudWatch log group",
-		)
-	}
-	if strings.IndexFunc(c.LogGroupPrefix, invalidLogGroupRune) >= 0 {
-		return fmt.Errorf(
-			"ENCLAVE_LOG_GROUP_PREFIX %q: CloudWatch log group names allow only letters, "+
-				"digits and %s",
-			c.LogGroupPrefix, logGroupNameChars,
-		)
-	}
-	return nil
-}
-
-func invalidLogGroupRune(r rune) bool {
-	switch {
-	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		return false
-	}
-	return !strings.ContainsRune(logGroupNameChars, r)
-}
-
 func (c *Config) String() string {
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -379,31 +400,33 @@ func (c *Config) lockSegment() string {
 	return "unlocked"
 }
 
+func (c *Config) namespace() string {
+	return fmt.Sprintf("/%s/%s/%s", c.Namespace, c.AppName, namespaceSegment)
+}
+
 func (c *Config) logGroup(sig signal) string {
-	return fmt.Sprintf(
-		"%s/%s/%s/%s", strings.TrimSuffix(c.LogGroupPrefix, "/"), c.Deployment, logGroupRoot, sig,
-	)
+	return fmt.Sprintf("%s/%s", c.namespace(), sig)
+}
+
+func (c *Config) envOverlayPrefix() string {
+	return c.namespace() + "/env/"
 }
 
 func (c *Config) certBucketParam() string {
-	return fmt.Sprintf("/%s/%s/CertBucketName", c.Deployment, c.AppName)
+	return c.namespace() + "/CertBucketName"
 }
 
 func (c *Config) leaseBucketParam() string {
-	return fmt.Sprintf("/%s/%s/LeaseBucketName", c.Deployment, c.AppName)
+	return c.namespace() + "/LeaseBucketName"
 }
 
 func (c *Config) route53ZoneIDParam() string {
-	return fmt.Sprintf("/%s/%s/Route53ZoneID", c.Deployment, c.AppName)
+	return c.namespace() + "/Route53ZoneID"
 }
 
 func (c *Config) kmsKeyIDParam(pcr0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/%s/KMSKeyID/%s",
-		c.Deployment,
-		c.AppName,
-		c.lockSegment(),
-		strings.ToLower(pcr0),
+		"%s/%s/KMSKeyID/%s", c.namespace(), c.lockSegment(), strings.ToLower(pcr0),
 	)
 }
 
@@ -411,50 +434,32 @@ func (c *Config) kmsKeyIDParam(pcr0 string) string {
 // scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
 func (c *Config) secretCiphertextParam(secretName, keyID string) string {
 	return fmt.Sprintf(
-		"/%s/%s/%s/%s/Ciphertext/%s",
-		c.Deployment,
-		c.AppName,
-		c.lockSegment(),
-		secretName,
-		keyID,
+		"%s/%s/%s/Ciphertext/%s", c.namespace(), c.lockSegment(), secretName, keyID,
 	)
 }
 
 // inheritSecretPrefix: SSM path prefix under which the operator places inherited
 // secrets, one parameter per configured name.
 func (c *Config) inheritSecretPrefix() string {
-	return fmt.Sprintf("/%s/%s/inherit/", c.Deployment, c.AppName)
+	return c.namespace() + "/inherit/"
 }
 
 // storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,
 // lock-scoped and key-scoped.
 func (c *Config) storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf(
-		"/%s/%s/%s/StorageDEK/Ciphertext/%s",
-		c.Deployment,
-		c.AppName,
-		c.lockSegment(),
-		keyID,
-	)
+	return fmt.Sprintf("%s/%s/StorageDEK/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
 }
 
 // tlsKeyCiphertextParam returns the encrypted TLS key path.
 func (c *Config) tlsKeyCiphertextParam(keyID string) string {
-	return fmt.Sprintf(
-		"/%s/%s/%s/TLSKey/Ciphertext/%s",
-		c.Deployment, c.AppName, c.lockSegment(), keyID,
-	)
+	return fmt.Sprintf("%s/%s/TLSKey/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
 }
 
 // stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
 // own state at genesis (and after adopting a migration). Scoped by key ID and PCR0.
 func (c *Config) stateOriginReceiptParam(keyID, pcr0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/StateOriginReceipt/%s/%s",
-		c.Deployment,
-		c.AppName,
-		keyID,
-		strings.ToLower(pcr0),
+		"%s/StateOriginReceipt/%s/%s", c.namespace(), keyID, strings.ToLower(pcr0),
 	)
 }
 
@@ -466,67 +471,56 @@ func (c *Config) stateOriginReceiptParam(keyID, pcr0 string) string {
 // commitment point for a handoff is kmsKeyIDParam, not this receipt.
 func (c *Config) migrationStateOriginReceiptParam(keyID, pcr0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/MigrationStateOriginReceipt/%s/%s",
-		c.Deployment,
-		c.AppName,
-		keyID,
-		strings.ToLower(pcr0),
+		"%s/MigrationStateOriginReceipt/%s/%s", c.namespace(), keyID, strings.ToLower(pcr0),
 	)
 }
 
 // migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0,
 // scoped by the successor PCR0 that reads it.
 func (c *Config) migrationPreviousPCR0Param(pcr0 string) string {
-	return fmt.Sprintf(
-		"/%s/%s/MigrationPreviousPCR0/%s",
-		c.Deployment,
-		c.AppName,
-		strings.ToLower(pcr0),
-	)
+	return fmt.Sprintf("%s/MigrationPreviousPCR0/%s", c.namespace(), strings.ToLower(pcr0))
 }
 
 // migrationPreviousKMSKeyIDParam returns the predecessor key path for a generation.
 func (c *Config) migrationPreviousKMSKeyIDParam(pcr0 string) string {
-	return fmt.Sprintf(
-		"/%s/%s/MigrationPreviousKMSKeyID/%s",
-		c.Deployment, c.AppName, strings.ToLower(pcr0),
-	)
+	return fmt.Sprintf("%s/MigrationPreviousKMSKeyID/%s", c.namespace(), strings.ToLower(pcr0))
 }
 
 // migrationPreviousPCR0AttestationParam: SSM path for the predecessor enclave's
 // attestation document, scoped by the successor PCR0 that reads it.
 func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
 	return fmt.Sprintf(
-		"/%s/%s/MigrationPreviousPCR0Attestation/%s",
-		c.Deployment,
-		c.AppName,
-		strings.ToLower(pcr0),
+		"%s/MigrationPreviousPCR0Attestation/%s", c.namespace(), strings.ToLower(pcr0),
 	)
 }
 
 // migrationChallengeParam: the live challenge published by a predecessor.
 func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
-	return fmt.Sprintf(
-		"/%s/%s/MigrationChallenge/%s", c.Deployment, c.AppName, strings.ToLower(sourcePCR0),
-	)
+	return fmt.Sprintf("%s/MigrationChallenge/%s", c.namespace(), strings.ToLower(sourcePCR0))
 }
 
 // migrationResponseParam identifies a candidate or operator response.
 func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
 	return fmt.Sprintf(
-		"/%s/%s/MigrationResponse/%s/%s",
-		c.Deployment,
-		c.AppName,
+		"%s/MigrationResponse/%s/%s",
+		c.namespace(),
 		strings.ToLower(sourcePCR0),
 		strings.ToLower(responder),
 	)
 }
 
-// takeEnv consumes a configuration variable, removing it from the process environment.
-func takeEnv(key string) string {
+// takeEnvRaw consumes a configuration variable, removing it from the process
+// environment. Identity is taken this way, untrimmed: what the operator sets is
+// what gets hashed into the intent bucket name, so a padded value is refused.
+func takeEnvRaw(key string) string {
 	value := os.Getenv(key)
 	_ = os.Unsetenv(key)
-	return strings.TrimSpace(value)
+	return value
+}
+
+// takeEnv is takeEnvRaw with surrounding whitespace trimmed.
+func takeEnv(key string) string {
+	return strings.TrimSpace(takeEnvRaw(key))
 }
 
 func takeEnvDefault(key, fallback string) string {
@@ -554,8 +548,4 @@ func logRetentionDays() int32 {
 		return defaultLogRetentionDays
 	}
 	return int32(days)
-}
-
-func normalizeLogGroupPrefix(raw string) string {
-	return path.Join("/", strings.TrimSpace(raw))
 }

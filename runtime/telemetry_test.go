@@ -92,15 +92,15 @@ func TestStartCreatesTwoGroupsAndProbesTheLogsEndpoint(t *testing.T) {
 	startTelemetry(t, context.Background(), telemetry)
 
 	require.ElementsMatch(t, []string{
-		"/prod/enclave/logs/app",
-		"/prod/enclave/logs/runtime",
+		"/prod/app/enclave/logs/app",
+		"/prod/app/enclave/logs/runtime",
 	}, cw.groups)
 	require.Equal(t, []int32{30, 30}, cw.retentionDays)
 	require.Equal(t, []string{"i-0e2ce2ce2ce2ce2ce", "i-0e2ce2ce2ce2ce2ce"}, cw.streams)
 
 	probes := up.callsTo("/v1/logs")
 	require.Len(t, probes, 1, "one startup write, nothing else before the app runs")
-	require.Equal(t, "/prod/enclave/logs/runtime", probes[0].header.Get("x-aws-log-group"))
+	require.Equal(t, "/prod/app/enclave/logs/runtime", probes[0].header.Get("x-aws-log-group"))
 	require.Equal(t, "i-0e2ce2ce2ce2ce2ce", probes[0].header.Get("x-aws-log-stream"))
 	require.Equal(t, "logs", signedFor(probes[0]))
 	require.Equal(t, "application/x-protobuf", probes[0].header.Get("Content-Type"))
@@ -128,7 +128,7 @@ func TestStartFailsWhenTheLogsEndpointRefusesTheProbe(t *testing.T) {
 
 	err := telemetry.Start(context.Background())
 
-	require.ErrorContains(t, err, "write to log stream /prod/enclave/logs/runtime via OTLP")
+	require.ErrorContains(t, err, "write to log stream /prod/app/enclave/logs/runtime via OTLP")
 	require.ErrorContains(t, err, "HTTP 403")
 	require.ErrorContains(t, err, "logs:PutLogEvents")
 	require.Nil(t, telemetry.lp, "no exporter may start once the probe has failed")
@@ -153,7 +153,7 @@ func TestRuntimeLogsArriveAsOTLP(t *testing.T) {
 
 	var found *logspb.LogRecord
 	for _, call := range up.callsTo("/v1/logs")[1:] { // [0] is the startup probe
-		require.Equal(t, "/prod/enclave/logs/runtime", call.header.Get("x-aws-log-group"),
+		require.Equal(t, "/prod/app/enclave/logs/runtime", call.header.Get("x-aws-log-group"),
 			"the runtime's own records must never land in the app group")
 		require.Equal(t, "i-0e2ce2ce2ce2ce2ce", call.header.Get("x-aws-log-stream"))
 		require.Equal(t, "logs", signedFor(call))
@@ -633,7 +633,7 @@ func TestForwardAddsLogHeadersOnlyForLogs(t *testing.T) {
 
 	logs := up.callsTo("/v1/logs")
 	require.Len(t, logs, 1)
-	require.Equal(t, "/prod/enclave/logs/app", logs[0].header.Get("x-aws-log-group"))
+	require.Equal(t, "/prod/app/enclave/logs/app", logs[0].header.Get("x-aws-log-group"))
 	require.Equal(t, "i-0e2ce2ce2ce2ce2ce", logs[0].header.Get("x-aws-log-stream"))
 	require.Equal(t, "logs", signedFor(logs[0]))
 

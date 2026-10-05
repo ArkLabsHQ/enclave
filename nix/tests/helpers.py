@@ -10,7 +10,7 @@ AWS_ACCOUNT_ID = "000000000000"
 FQDN = "enclave.test"
 CERT_BUCKET = "enclave-e2e-certificates"
 LEASE_BUCKET = "enclave-e2e-leases"
-INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
+INTENT_DIGEST = hashlib.sha256(b"ark/e2e/dev\x00testapp").digest()[:8].hex()
 INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 
 
@@ -19,11 +19,11 @@ def cloud(command):
 
 
 def key_param(pcr0):
-    return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
+    return f"/ark/e2e/dev/testapp/enclave/unlocked/KMSKeyID/{pcr0}"
 
 
 def migration_receipt_param(key_id, pcr0):
-    return f"/dev/testapp/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
+    return f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
 
 
 def get_param(name):

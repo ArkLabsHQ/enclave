@@ -77,6 +77,7 @@ type Migrator interface {
 	PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error)
 	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
 	CandidateInfo(ctx context.Context) (*CandidateInfo, error)
+	MigrationIntentBucket() string
 }
 
 type migrator struct {
@@ -90,6 +91,7 @@ type migrator struct {
 	tlsKey        crypto.Signer
 	intent        *migrationIntentLog
 	genesis       *genesisLog
+	bucket        string
 
 	answeredChallenge string
 	s3                S3API
@@ -140,6 +142,7 @@ func newMigrator(
 		intent:  intent,
 		genesis: genesis,
 		s3:      s3,
+		bucket:  migrationIntentBucketName,
 	}, nil
 }
 
@@ -281,6 +284,10 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (m *migrator) MigrationIntentBucket() string {
+	return m.bucket
 }
 
 func (m *migrator) verifyIntent(

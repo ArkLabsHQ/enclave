@@ -20,7 +20,7 @@ let
     pname = "awsmocks";
     version = "0.1.0";
     src = ./awsmocks;
-    vendorHash = "sha256-FlTEY1v5ZVqTICXGLTBgVW+JhlWwIiuJDekX2d3bfWs=";
+    vendorHash = "sha256-gPgpKvfLuiO4N/+nJ24GHd5Pukk3Yo2dxwPK9XZfEf8=";
     env.CGO_ENABLED = "0";
     meta.mainProgram = "awsmocks";
   };
@@ -197,6 +197,9 @@ let
   # Using it directly avoids depending on gvproxy forwarding /etc/hosts entries.
   commonEifEnv = {
     ENCLAVE_DEV = "true";
+    ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
+    ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
+    ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_NAMESPACE = "ark/e2e/dev";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -207,12 +210,41 @@ let
         env_var = "E2E_SIGNING_KEY";
       }
     ];
+    # e2e.py places all three values in SSM, hex-encoded; each pin is the
+    # SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
+    # only verified. The second is already past its cutoff. The third's cutoff
+    # is reached when e2e.py steps a node's clock to just before it, so the
+    # restart-without-the-secret path runs for real.
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
+      {
+        name = "e2e-inherited";
+        env_var = "E2E_INHERITED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+      }
+      {
+        name = "e2e-expired";
+        env_var = "E2E_EXPIRED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2020-01-01T00:00:00Z";
+      }
+      {
+        name = "e2e-cutoff";
+        env_var = "E2E_CUTOFF";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2040-01-01T00:00:00Z";
+      }
+    ];
 
     AWS_ENDPOINT_URL_KMS = "http://${awsNodeIP}:4000";
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
-    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_XRAY = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_MONITORING = "http://${awsNodeIP}:4318";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -223,6 +255,7 @@ let
     self.lib.buildEif {
       inherit pkgs;
       app = testApp;
+      overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 
@@ -421,6 +454,7 @@ let
       networking.firewall.allowedTCPPorts = [
         1338
         4000
+        4318
         4566
         4570
         14000
@@ -445,14 +479,16 @@ let
       };
 
       systemd.services.awsmocks = {
-        description = "Attested KMS proxy and IMDS stub";
+        description = "Attested KMS proxy, IMDS stub and OTLP receiver";
         wantedBy = [ "multi-user.target" ];
         wants = [ "ministack.service" ];
         after = [ "ministack.service" ];
         environment = {
           KMS_PROXY_LISTEN_ADDR = ":4000";
           IMDS_LISTEN_ADDR = ":1338";
+          OTLP_LISTEN_ADDR = ":4318";
           UPSTREAM_KMS_URL = "http://127.0.0.1:4566";
+          UPSTREAM_LOGS_URL = "http://127.0.0.1:4566";
         };
         serviceConfig = {
           Type = "simple";

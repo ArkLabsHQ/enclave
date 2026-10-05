@@ -1,6 +1,9 @@
 package runtime
 
 import (
+	"context"
+	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,9 +17,23 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		Namespace: namespace, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
-		InstanceID: "i-0e2ce2ce2ce2ce2ce",
+		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
+		KMSLocked:          true,
+		VerifyClockSource:  true,
+		GenesisRetention:   prodRetention,
+		IntentRetention:    prodRetention,
+		IntentWriteTimeout: prodIntentWriteTimeout,
+		MigrationCooldown:  defaultMigrationCooldown,
+		ClockSyncInterval:  prodClockSyncInterval,
+		ChildEnv:           make(map[string]string),
 	}
-	c.setSecurityConfig(dev)
+	if dev {
+		c.KMSLocked = false
+		c.GenesisRetention = devGenesisRetention
+		c.IntentRetention = devIntentRetention
+		c.IntentWriteTimeout = devIntentWriteTimeout
+		c.ClockSyncInterval = devClockSyncInterval
+	}
 	return c
 }
 
@@ -39,64 +56,184 @@ func testConfigWithLogShipInterval(interval time.Duration) *Config {
 	return &cfg
 }
 
-func TestApplySecurityEnvelope(t *testing.T) {
-	prod := newTestConfig("prod", "app", false)
-	require.True(t, prod.KMSLocked, "production must not run an amendable key policy")
-	require.False(t, prod.InsecureVerifySkipped, "production must verify COSE signatures")
-	require.True(t, prod.VerifyClockSource)
-	require.Equal(t, prodRetention, prod.GenesisRetention)
-	require.Equal(t, prodRetention, prod.IntentRetention)
-	require.Equal(t, prodMigrationCooldown, prod.MigrationCooldown)
-
-	dev := newTestConfig("dev", "app", true)
-	require.False(t, dev.KMSLocked)
-	require.True(t, dev.InsecureVerifySkipped)
-	require.False(t, dev.VerifyClockSource)
-	require.Equal(t, devGenesisRetention, dev.GenesisRetention)
-	require.Equal(t, devIntentRetention, dev.IntentRetention)
-	require.Equal(t, devMigrationCooldown, dev.MigrationCooldown)
+func setConfigTestEnv(t *testing.T, dev bool) {
+	t.Helper()
+	t.Setenv(envNamespace, "prod")
+	t.Setenv(envAppName, "app")
+	t.Setenv(envAppPort, "7074")
+	t.Setenv(envDev, strconv.FormatBool(dev))
+	t.Setenv(envMigrationCooldown, "")
+	t.Setenv(envVerifyClockSource, "")
+	t.Setenv(envInsecureVerifySkipped, "")
+	t.Setenv(envSecretsConfig, "[]")
+	t.Setenv(envOverrideAllowList, "")
 }
 
-// Object Lock rejects a retain-until date that is not in the future, and a zero
-// cooldown would leave the cooling_down branch unreachable in both postures.
-func TestSecurityEnvelopeDurationsArePositive(t *testing.T) {
-	for _, dev := range []bool{false, true} {
-		c := newTestConfig("d", "a", dev)
-		require.Positive(t, c.GenesisRetention)
-		require.Positive(t, c.IntentRetention)
-		require.Positive(t, c.MigrationCooldown)
+func TestLoadConfigSecurityDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		dev                bool
+		genesisRetention   time.Duration
+		intentRetention    time.Duration
+		intentWriteTimeout time.Duration
+		clockSyncInterval  time.Duration
+	}{
+		{"prod", false, prodRetention, prodRetention, prodIntentWriteTimeout, prodClockSyncInterval},
+		{"dev", true, devGenesisRetention, devIntentRetention, devIntentWriteTimeout, devClockSyncInterval},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, tc.dev)
+
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.Equal(t, !tc.dev, cfg.KMSLocked)
+			require.False(
+				t,
+				cfg.InsecureVerifySkipped,
+				"skipping verification requires an explicit opt-in",
+			)
+			require.True(t, cfg.VerifyClockSource)
+			require.Equal(t, 24*time.Hour, cfg.MigrationCooldown)
+			require.Equal(t, tc.genesisRetention, cfg.GenesisRetention)
+			require.Equal(t, tc.intentRetention, cfg.IntentRetention)
+			require.Equal(t, tc.intentWriteTimeout, cfg.IntentWriteTimeout)
+			require.Equal(t, tc.clockSyncInterval, cfg.ClockSyncInterval)
+			require.Greater(t, cfg.IntentRetention-cfg.IntentWriteTimeout, time.Minute,
+				"the retained window must stay well clear of the tolerance")
+		})
 	}
 }
 
-// The posture used to come from an exact `== "true"`, so "True" silently meant
-// unlocked. IsDev trims and folds, which is why LoadConfig routes through it.
-func TestIsDevParsing(t *testing.T) {
-	for _, tc := range []struct {
-		value string
-		want  bool
-	}{
-		{"", false},
-		{"true", true},
-		{"TRUE", true},
-		{"  true  ", true},
-		{"True", true},
-		{"false", false},
-		{"1", false},
-		{"yes", false},
-	} {
-		t.Run("ENCLAVE_DEV="+tc.value, func(t *testing.T) {
-			t.Setenv("ENCLAVE_DEV", tc.value)
+func TestConfigValidate(t *testing.T) {
+	valid := func() *Config {
+		c := newTestConfig("prod", "myapp", false)
+		c.ExtPort, c.IntPort, c.HostProxyPort, c.FQDN = extPort, intPort, hostProxyPort, "localhost"
+		return c
+	}
 
-			require.Equal(t, tc.want, IsDev())
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "all set", mutate: func(*Config) {}},
+		{
+			name:    "namespace missing",
+			mutate:  func(c *Config) { c.Namespace = "" },
+			wantErr: "ENCLAVE_NAMESPACE must be set",
+		},
+		{
+			name:    "namespace has a leading slash",
+			mutate:  func(c *Config) { c.Namespace = "/ark/dev" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace has a trailing slash",
+			mutate:  func(c *Config) { c.Namespace = "ark/dev/" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace has an empty segment",
+			mutate:  func(c *Config) { c.Namespace = "ark//dev" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace climbs above its root",
+			mutate:  func(c *Config) { c.Namespace = "../prod" },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:    "namespace has a dot segment",
+			mutate:  func(c *Config) { c.Namespace = "ark/./prod" },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:   "dots inside a segment are fine",
+			mutate: func(c *Config) { c.Namespace = "ark/..backup/v1.2" },
+		},
+		{
+			name:    "app name is a dot-dot segment",
+			mutate:  func(c *Config) { c.AppName = ".." },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:    "namespace has a character SSM refuses",
+			mutate:  func(c *Config) { c.Namespace = "ark/dev#us" },
+			wantErr: "allow only letters, digits and _.-",
+		},
+		{
+			name:   "namespace spans path segments",
+			mutate: func(c *Config) { c.Namespace = "ark/se7enz/dev" },
+		},
+		{
+			name:    "app name missing",
+			mutate:  func(c *Config) { c.AppName = "" },
+			wantErr: "ENCLAVE_APP_NAME must be set",
+		},
+		{
+			name:    "app name has a character SSM refuses",
+			mutate:  func(c *Config) { c.AppName = "app:one" },
+			wantErr: "allow only letters, digits and _.-",
+		},
+		{
+			name:    "app name spans path segments",
+			mutate:  func(c *Config) { c.AppName = "org/app" },
+			wantErr: "must be a single path segment",
+		},
+		{
+			name:    "namespace starts with a reserved SSM word",
+			mutate:  func(c *Config) { c.Namespace = "AWS/team/prod" },
+			wantErr: "SSM reserves parameter names",
+		},
+		{
+			name:    "single-segment namespace starts with a reserved SSM word",
+			mutate:  func(c *Config) { c.Namespace = "ssm-prod" },
+			wantErr: "SSM reserves parameter names",
+		},
+		{
+			name:   "reserved word inside a later segment is fine",
+			mutate: func(c *Config) { c.Namespace = "ark/aws" },
+		},
+		{
+			name:    "namespace deeper than SSM allows",
+			mutate:  func(c *Config) { c.Namespace = "a/b/c/d/e/f/g/h/i/j" },
+			wantErr: "at most 9 fit SSM's hierarchy",
+		},
+		{
+			name:    "namespace longer than the name limits allow",
+			mutate:  func(c *Config) { c.Namespace = strings.Repeat("d", 300) },
+			wantErr: "fit SSM and CloudWatch name limits",
+		},
+		{
+			name:    "port missing",
+			mutate:  func(c *Config) { c.ExtPort = 0 },
+			wantErr: "config is missing port",
+		},
+		{
+			name:    "FQDN missing",
+			mutate:  func(c *Config) { c.FQDN = "" },
+			wantErr: "config is missing FQDN",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			tc.mutate(c)
+
+			err := c.Validate()
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
 }
 
 func TestLoadConfigTelemetrySettings(t *testing.T) {
-	t.Setenv("ENCLAVE_NAMESPACE", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
-	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
+	setConfigTestEnv(t, false)
+	t.Setenv(envLogShipInterval, "250ms")
+	t.Setenv(envLogRetentionDays, "7")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
@@ -105,10 +242,9 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 }
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
-	t.Setenv("ENCLAVE_NAMESPACE", "prod")
-	t.Setenv("ENCLAVE_APP_NAME", "app")
-	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
-	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
+	setConfigTestEnv(t, false)
+	t.Setenv(envLogShipInterval, "invalid")
+	t.Setenv(envLogRetentionDays, "0")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
@@ -120,6 +256,7 @@ func TestConfigNamespace(t *testing.T) {
 	cfg := newTestConfig("se7enz", "emulator", false)
 	require.Equal(t, "/se7enz/emulator/enclave", cfg.namespace())
 	require.Equal(t, "/se7enz/emulator/enclave/env/", cfg.envOverlayPrefix())
+	require.Equal(t, "/se7enz/emulator/enclave/inherit/", cfg.inheritSecretPrefix())
 	require.Equal(t, "/se7enz/emulator/enclave/CertBucketName", cfg.certBucketParam())
 	require.Equal(t, "/se7enz/emulator/enclave/logs/app", cfg.logGroup(signalAppLogs))
 
@@ -130,9 +267,9 @@ func TestConfigNamespace(t *testing.T) {
 }
 
 func TestLoadConfigNamespace(t *testing.T) {
-	t.Setenv("ENCLAVE_APP_NAME", "app")
+	setConfigTestEnv(t, false)
+	t.Setenv(envNamespace, "ark/se7enz/prod")
 
-	t.Setenv("ENCLAVE_NAMESPACE", "ark/se7enz/prod")
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, "ark/se7enz/prod", cfg.Namespace)
@@ -148,8 +285,9 @@ func TestLoadConfigIdentityIsVerbatim(t *testing.T) {
 		{" ark/prod ", "app", "allow only letters"},
 		{"ark/prod", " app", "allow only letters"},
 	} {
-		t.Setenv("ENCLAVE_NAMESPACE", tc.namespace)
-		t.Setenv("ENCLAVE_APP_NAME", tc.app)
+		setConfigTestEnv(t, false)
+		t.Setenv(envNamespace, tc.namespace)
+		t.Setenv(envAppName, tc.app)
 
 		cfg, err := LoadConfig()
 		require.NoError(t, err)
@@ -162,18 +300,15 @@ func TestLoadConfigIdentityIsVerbatim(t *testing.T) {
 func TestConfigLogGroup(t *testing.T) {
 	cfg := newTestConfig("prod", "app", false)
 	require.Equal(t, "/prod/app/enclave/logs/app", cfg.logGroup(signalAppLogs))
-	require.Equal(t, "/prod/app/enclave/logs/supervisor", cfg.logGroup(signalSupervisorLogs))
-	require.Equal(t, "/prod/app/enclave/traces/app", cfg.logGroup(signalAppTraces))
-	require.Equal(t,
-		"/prod/app/enclave/traces/supervisor", cfg.logGroup(signalSupervisorTraces))
-	require.Equal(t, "/prod/app/enclave/metrics", cfg.logGroup(signalMetrics))
+	require.Equal(t, "/prod/app/enclave/logs/runtime", cfg.logGroup(signalRuntimeLogs))
 }
 
 // The lock posture is an IAM-enforceable boundary, so it must move exactly the
 // KMS-subtree paths and nothing else.
 func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	pcr0, keyID := strings.Repeat("ab", 48), "key-1"
-	locked, unlocked := newTestConfig("prod", "app", false), newTestConfig("prod", "app", true)
+	locked, unlocked := testConfig(), testConfig()
+	unlocked.KMSLocked = false
 
 	scoped := func(c *Config) []string {
 		return []string{
@@ -204,118 +339,319 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 }
 
 func TestLoadConfigMigrationCooldown(t *testing.T) {
-	base := func(t *testing.T) {
-		t.Helper()
-		t.Setenv("ENCLAVE_NAMESPACE", "prod")
-		t.Setenv("ENCLAVE_APP_NAME", "app")
-	}
-
-	t.Run("unset keeps the posture default", func(t *testing.T) {
-		base(t)
-		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
-
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
-		require.Equal(t, prodMigrationCooldown, cfg.MigrationCooldown)
-	})
-
-	t.Run("dev unset keeps the dev default", func(t *testing.T) {
-		base(t)
-		t.Setenv("ENCLAVE_DEV", "true")
-		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "")
-
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
-		require.Equal(t, devMigrationCooldown, cfg.MigrationCooldown)
-	})
-
-	t.Run("override wins", func(t *testing.T) {
-		base(t)
-		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "48h")
-
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
-		require.Equal(t, 48*time.Hour, cfg.MigrationCooldown)
-	})
-
-	// An explicit zero must stay distinct from an absent value, or "no cooldown"
-	// would silently read back as the 24 hour default.
-	t.Run("explicit zero is honoured", func(t *testing.T) {
-		base(t)
-		t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", "0s")
-
-		cfg, err := LoadConfig()
-		require.NoError(t, err)
-		require.Zero(t, cfg.MigrationCooldown)
-	})
-
-	for _, tc := range []struct{ name, value, wantErr string }{
-		{"unparseable", "nope", "invalid ENCLAVE_MIGRATION_COOLDOWN"},
-		{"negative", "-1h", "must not be negative"},
-	} {
-		t.Run("rejects "+tc.name, func(t *testing.T) {
-			base(t)
-			t.Setenv("ENCLAVE_MIGRATION_COOLDOWN", tc.value)
-
-			_, err := LoadConfig()
-			require.ErrorContains(t, err, tc.wantErr)
-		})
-	}
-}
-
-func TestSecurityProfileMigrationTimeouts(t *testing.T) {
 	for _, dev := range []bool{false, true} {
-		cfg := newTestConfig("test", "app", dev)
-		want := 10 * time.Minute
-		if dev {
-			want = 2 * time.Minute
+		for _, tc := range []struct {
+			name, value string
+			want        time.Duration
+			wantErr     string
+		}{
+			{name: "unset", want: 24 * time.Hour},
+			{name: "blank", value: "  ", want: 24 * time.Hour},
+			{name: "override", value: "48h", want: 48 * time.Hour},
+			{name: "padded override", value: " 2s ", want: 2 * time.Second},
+			// Explicit zero must stay distinct from an absent value.
+			{name: "zero", value: "0s", want: 0},
+			{name: "unparseable", value: "nope", wantErr: "invalid ENCLAVE_MIGRATION_COOLDOWN"},
+			{name: "negative", value: "-1h", wantErr: "must not be negative"},
+		} {
+			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
+				setConfigTestEnv(t, dev)
+				t.Setenv(envMigrationCooldown, tc.value)
+
+				cfg, err := LoadConfig()
+				if tc.wantErr != "" {
+					require.ErrorContains(t, err, tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				require.Equal(t, tc.want, cfg.MigrationCooldown)
+			})
 		}
-		require.Equal(t, want, cfg.IntentWriteTimeout)
-		require.Greater(t, cfg.IntentRetention, cfg.IntentWriteTimeout)
-		require.Greater(t, cfg.IntentRetention-cfg.IntentWriteTimeout, time.Minute,
-			"the retained window must stay well clear of the tolerance")
 	}
 }
 
 func TestLoadConfigVerifyClockSource(t *testing.T) {
-	base := func(t *testing.T, dev bool) {
-		t.Helper()
-		t.Setenv("ENCLAVE_NAMESPACE", "prod")
-		t.Setenv("ENCLAVE_APP_NAME", "app")
-		t.Setenv("ENCLAVE_DEV", strconv.FormatBool(dev))
-	}
-
-	t.Run("unset keeps the posture default", func(t *testing.T) {
-		for _, dev := range []bool{false, true} {
-			base(t, dev)
-			t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "")
-
-			cfg, err := LoadConfig()
-			require.NoError(t, err)
-			require.Equal(t, !dev, cfg.VerifyClockSource)
-		}
-	})
-
-	// An explicit value must stay distinct from an absent one, or asking for the
-	// assertion in dev, or waiving it in prod, would silently do nothing.
-	t.Run("override wins in both postures", func(t *testing.T) {
-		for _, dev := range []bool{false, true} {
-			for _, want := range []bool{false, true} {
-				base(t, dev)
-				t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", strconv.FormatBool(want))
+	for _, dev := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, value string
+			want        bool
+		}{
+			{name: "unset", want: true},
+			{name: "blank", value: "  ", want: true},
+			{name: "enabled", value: "true", want: true},
+			{name: "disabled", value: "false", want: false},
+			{name: "padded lowercase", value: " false ", want: false},
+			{name: "uppercase uses default", value: " FALSE ", want: true},
+			{name: "unrecognized uses default", value: "sometimes", want: true},
+		} {
+			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
+				setConfigTestEnv(t, dev)
+				t.Setenv(envVerifyClockSource, tc.value)
 
 				cfg, err := LoadConfig()
 				require.NoError(t, err)
-				require.Equal(t, want, cfg.VerifyClockSource, "dev=%v want=%v", dev, want)
-			}
+				require.Equal(t, tc.want, cfg.VerifyClockSource)
+				require.False(t, cfg.InsecureVerifySkipped,
+					"waiving the clock assertion must not skip attestation verification")
+				require.Equal(t, !dev, cfg.KMSLocked)
+			})
+		}
+	}
+}
+
+func TestLoadConfigInsecureVerifySkipped(t *testing.T) {
+	for _, dev := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, value string
+			want        bool
+		}{
+			{name: "unset"},
+			{name: "blank", value: "  "},
+			{name: "enabled", value: "true", want: dev},
+			{name: "disabled", value: "false"},
+			{name: "padded lowercase", value: " true ", want: dev},
+			{name: "uppercase uses default", value: " TRUE "},
+			{name: "unrecognized uses default", value: "sometimes"},
+		} {
+			t.Run("dev="+strconv.FormatBool(dev)+"/"+tc.name, func(t *testing.T) {
+				setConfigTestEnv(t, dev)
+				t.Setenv(envInsecureVerifySkipped, tc.value)
+
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				require.Equal(t, tc.want, cfg.InsecureVerifySkipped)
+				require.True(t, cfg.VerifyClockSource,
+					"skipping attestation verification must not waive the clock assertion")
+				require.Equal(t, !dev, cfg.KMSLocked)
+			})
+		}
+	}
+}
+
+func TestApplySSMOverlay(t *testing.T) {
+	t.Setenv(envSecretsConfig, "[]")
+	t.Setenv(envDev, "false")
+	t.Setenv("APPLY_FOO", "")
+	t.Setenv("APPLY_BAR", "")
+	t.Setenv("OTHER_PREFIX", "")
+	t.Setenv("VALID_KEY", "")
+	t.Setenv("nested/IGNORE", "")
+	t.Setenv("SAFE_KEY", "")
+
+	ctx := context.Background()
+	path := func(key string) string { return "/prod/app/enclave/env/" + key }
+	ssmFor := func(params map[string]string) SSM { return NewSSM(&fakeSSM{params: params}) }
+
+	t.Run("no params", func(t *testing.T) {
+		err := testCfg.ApplySSMOverlay(ctx, ssmFor(nil))
+		require.NoError(t, err)
+	})
+
+	t.Run("applies current prefix", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.OverrideAllowList = map[string]bool{
+			"APPLY_FOO": true, "APPLY_BAR": true, "OTHER_PREFIX": true,
+		}
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path("APPLY_FOO"):                      "one",
+			path("APPLY_BAR"):                      "two",
+			"/prod/other/enclave/env/OTHER_PREFIX": "wrong-app",
+			"/dev/app/enclave/env/OTHER_PREFIX":    "wrong-namespace",
+			"/prod/app/env/OTHER_PREFIX":           "outside-namespace",
+		}))
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"APPLY_FOO": "one", "APPLY_BAR": "two"}, cfg.ChildEnv)
+		require.Empty(t, os.Getenv("APPLY_FOO"))
+		require.Empty(t, os.Getenv("APPLY_BAR"))
+	})
+
+	t.Run("updates mutable runtime config", func(t *testing.T) {
+		cfg := *testCfg
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envAppPort):       "9090",
+			path(envFQDN):          "app.example.com",
+			path(envUseACME):       "TRUE",
+			path(envACMEDirectory): "https://acme.example.com/directory",
+			path(envACMEEmail):     "ops@example.com",
+			path(envACMECA):        "test-ca",
+		}))
+		require.NoError(t, err)
+		require.Equal(t, "9090", cfg.AppPort)
+		require.Equal(t, "http://127.0.0.1:9090", cfg.AppWebSrv.String())
+		require.Equal(t, "app.example.com", cfg.FQDN)
+		require.True(t, cfg.UseACME)
+		require.Equal(t, "https://acme.example.com/directory", cfg.ACMEDirectory)
+		require.Equal(t, "ops@example.com", cfg.ACMEEmail)
+		require.Equal(t, "test-ca", cfg.ACMECA)
+	})
+
+	t.Run("rejects invalid application port", func(t *testing.T) {
+		cfg := *testCfg
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envAppPort): "not-a-port",
+		}))
+
+		require.ErrorContains(t, err, "invalid application port")
+		require.Equal(t, testCfg.AppPort, cfg.AppPort)
+	})
+
+	t.Run("skips empty and nested keys", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.OverrideAllowList = map[string]bool{"VALID_KEY": true, "nested/IGNORE": true, "": true}
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path("VALID_KEY"):     "ok",
+			path("nested/IGNORE"): "bad",
+			path(""):              "empty",
+		}))
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"VALID_KEY": "ok"}, cfg.ChildEnv)
+		require.Empty(t, os.Getenv("VALID_KEY"))
+	})
+
+	t.Run("skips non overridable keys", func(t *testing.T) {
+		for _, dev := range []bool{false, true} {
+			t.Run("dev="+strconv.FormatBool(dev), func(t *testing.T) {
+				setConfigTestEnv(t, dev)
+				t.Setenv(envPreviousPCR0, "original-pcr0")
+				t.Setenv(envOverrideAllowList, "SAFE_KEY")
+				t.Setenv("SAFE_KEY", "")
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				before := *cfg
+
+				err = cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+					path(envNamespace):             "dev",
+					path(envAppName):               "evil",
+					path(envSecretsConfig):         `[{"name":"evil"}]`,
+					path(envInheritSecretsConfig):  `[{"name":"evil"}]`,
+					path(envDev):                   strconv.FormatBool(!dev),
+					path(envMigrationCooldown):     "0s",
+					path(envVerifyClockSource):     "false",
+					path(envInsecureVerifySkipped): "true",
+					path(envPreviousPCR0):          "evil-pcr0",
+					path("SAFE_KEY"):               "ok",
+				}))
+				require.NoError(t, err)
+				require.Empty(t, os.Getenv(envNamespace))
+				require.Empty(t, os.Getenv(envAppName))
+				require.Empty(t, os.Getenv(envSecretsConfig))
+				require.Empty(t, os.Getenv(envInheritSecretsConfig),
+					"the overlay must not be able to pin an inherited secret of its own")
+				require.Empty(t, os.Getenv(envDev))
+				require.Empty(t, os.Getenv(envMigrationCooldown))
+				require.Empty(t, os.Getenv(envVerifyClockSource))
+				require.Empty(t, os.Getenv(envInsecureVerifySkipped),
+					"the overlay must not be able to skip attestation verification")
+				require.Empty(t, os.Getenv(envPreviousPCR0))
+				require.Equal(
+					t,
+					before,
+					*cfg,
+					"the overlay must preserve the loaded security settings",
+				)
+				require.Equal(t, map[string]string{"SAFE_KEY": "ok"}, cfg.ChildEnv)
+				require.Empty(t, os.Getenv("SAFE_KEY"))
+			})
 		}
 	})
 
-	t.Run("rejects an unparseable value", func(t *testing.T) {
-		base(t, false)
-		t.Setenv("ENCLAVE_VERIFY_CLOCK_SOURCE", "sometimes")
-
-		_, err := LoadConfig()
-		require.ErrorContains(t, err, "invalid ENCLAVE_VERIFY_CLOCK_SOURCE")
+	t.Run("returns SSM errors", func(t *testing.T) {
+		err := testCfg.ApplySSMOverlay(ctx, NewSSM(&fakeSSM{err: errors.New("access denied")}))
+		require.Error(t, err)
 	})
+}
+
+func TestApplySSMOverlayAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		name, allowlist, wantAllowed, wantSecond, wantAllowlistEnv string
+	}{
+		{name: "empty rejects application overrides"},
+		{
+			name:        "comma separated names are trimmed and deduplicated",
+			allowlist:   " APP_ALLOWED , APP_SECOND , APP_ALLOWED ",
+			wantAllowed: "one", wantSecond: "two",
+		},
+		{
+			name:        "overlay cannot expand the loaded allowlist",
+			allowlist:   "APP_ALLOWED," + envOverrideAllowList,
+			wantAllowed: "one", wantAllowlistEnv: "APP_BLOCKED",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envOverrideAllowList, tc.allowlist)
+			for _, key := range []string{"APP_ALLOWED", "APP_SECOND", "APP_BLOCKED"} {
+				t.Setenv(key, "baked")
+			}
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			_, present := os.LookupEnv(envOverrideAllowList)
+			require.False(t, present, "the allowlist must be consumed by LoadConfig")
+
+			err = cfg.ApplySSMOverlay(
+				context.Background(),
+				NewSSM(&fakeSSM{params: map[string]string{
+					"/prod/app/enclave/env/APP_ALLOWED":             "one",
+					"/prod/app/enclave/env/APP_SECOND":              "two",
+					"/prod/app/enclave/env/APP_BLOCKED":             "changed",
+					"/prod/app/enclave/env/" + envOverrideAllowList: "APP_BLOCKED",
+					"/prod/app/enclave/env/" + envFQDN:              "overlay.example.com",
+				}}),
+			)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantAllowed, cfg.ChildEnv["APP_ALLOWED"])
+			require.Equal(t, tc.wantSecond, cfg.ChildEnv["APP_SECOND"])
+			require.NotContains(t, cfg.ChildEnv, "APP_BLOCKED")
+			require.Equal(t, tc.wantAllowlistEnv, cfg.ChildEnv[envOverrideAllowList])
+			for _, key := range []string{"APP_ALLOWED", "APP_SECOND", "APP_BLOCKED"} {
+				require.Equal(t, "baked", os.Getenv(key))
+			}
+			require.Empty(t, os.Getenv(envOverrideAllowList))
+			require.False(t, cfg.OverrideAllowList["APP_BLOCKED"])
+			require.Equal(t, "overlay.example.com", cfg.FQDN,
+				"explicit runtime overrides do not require an application allowlist entry")
+		})
+	}
+}
+
+func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
+	setConfigTestEnv(t, true)
+	const secrets = `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`
+	t.Setenv(envSecretsConfig, secrets)
+	t.Setenv(envAppBinaryName, "measured-app")
+	t.Setenv(envAWSRegion, "eu-west-1")
+	t.Setenv(envOverrideAllowList,
+		strings.Join([]string{
+			envSecretsConfig, envDev, envNamespace, envAppBinaryName, envAWSRegion,
+		}, ","))
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	before := *cfg
+	metadata, err := LoadStaticSecretMetadata(*cfg)
+	require.NoError(t, err)
+	require.Equal(t, []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}, metadata)
+
+	err = cfg.ApplySSMOverlay(context.Background(), NewSSM(&fakeSSM{params: map[string]string{
+		"/prod/app/enclave/env/" + envSecretsConfig: `[{"name":"changed"}]`,
+		"/prod/app/enclave/env/" + envDev:           "false",
+		"/prod/app/enclave/env/" + envNamespace:     "other",
+		"/prod/app/enclave/env/" + envAppBinaryName: "other-app",
+		"/prod/app/enclave/env/" + envAWSRegion:     "us-west-2",
+	}}))
+
+	require.NoError(t, err)
+	require.Equal(t, "other-app", cfg.ChildEnv[envAppBinaryName])
+	require.Equal(t, `[{"name":"changed"}]`, cfg.ChildEnv[envSecretsConfig])
+	require.Empty(t, os.Getenv(envAppBinaryName))
+	require.Empty(t, os.Getenv(envSecretsConfig))
+	require.Equal(
+		t,
+		before,
+		*cfg,
+		"allowlisted environment writes must not replace captured config",
+	)
+	after, err := LoadStaticSecretMetadata(*cfg)
+	require.NoError(t, err)
+	require.Equal(t, metadata, after, "boot must parse the captured secret definitions")
 }

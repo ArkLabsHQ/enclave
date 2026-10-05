@@ -82,7 +82,6 @@ const (
 	// <app>/enclave/<lock>/<secret>/Ciphertext/<keyID>.
 	maxNamespaceDepth = 9
 	maxNamespaceLen   = 256
-	maxSecretNameLen  = 128
 
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute

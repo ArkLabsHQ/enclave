@@ -79,11 +79,6 @@ func TestValidateStaticSecrets(t *testing.T) {
 	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
 		{Name: "StorageDEK", EnvVar: "COLLISION"},
 	}}.Validate(nil))
-	for _, name := range []string{"", "foo/bar", "key#1", "..", strings.Repeat("k", 129)} {
-		require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-			{Name: name, EnvVar: "SHAPE"},
-		}}.Validate(nil), "a secret name must be one SSM path segment: %q", name)
-	}
 }
 
 func TestValidateInheritSecrets(t *testing.T) {

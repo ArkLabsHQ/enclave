@@ -401,8 +401,8 @@ S3 keys as well. It is baked rather than settable from the overlay, and with
 `ENCLAVE_APP_NAME` names every log group exactly as it names every SSM parameter. Alarms, dashboards and the `CloudWatchLogsAccess`
 policy keyed on the old names need updating.
 
-Spans require Transaction Search and metrics require
-`cloudwatch:PutMetricData`. Export failures are counted in
+Spans require Transaction Search to be enabled for X-Ray traces in the
+CloudWatch account settings, and metrics require `cloudwatch:PutMetricData`. Export failures are counted in
 `enclave_telemetry_export_errors_total`, rate limited on `stderr`, and do not
 abort startup. Metrics are queried with PromQL by their OTLP attributes.
 

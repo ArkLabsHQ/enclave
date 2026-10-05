@@ -17,6 +17,7 @@ func TestReadProcCPU(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, result, "cpu_user")
 	require.Contains(t, result, "cpu_idle")
+	require.Contains(t, result, "cpu_steal")
 }
 
 func TestReadProcMeminfo(t *testing.T) {

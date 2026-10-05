@@ -23,6 +23,10 @@ const (
 	runtimeMetricCPUNice        = "cpu_nice"
 	runtimeMetricCPUSystem      = "cpu_system"
 	runtimeMetricCPUIdle        = "cpu_idle"
+	runtimeMetricCPUIOWait      = "cpu_iowait"
+	runtimeMetricCPUIRQ         = "cpu_irq"
+	runtimeMetricCPUSoftIRQ     = "cpu_softirq"
+	runtimeMetricCPUSteal       = "cpu_steal"
 )
 
 // readProcCPU reads CPU counters from /proc/stat.
@@ -53,11 +57,22 @@ func readProcCPU() (map[string]float64, error) {
 		runtimeMetricCPUNice,
 		runtimeMetricCPUSystem,
 		runtimeMetricCPUIdle,
+		runtimeMetricCPUIOWait,
+		runtimeMetricCPUIRQ,
+		runtimeMetricCPUSoftIRQ,
+		runtimeMetricCPUSteal,
 	}
+	// Skip the "cpu" label; ignore extra counters and tolerate missing trailing ones.
+	counters := fields[1:]
 	for i, name := range names {
-		if v, err := strconv.ParseFloat(fields[i+1], 64); err == nil {
-			result[name] = v
+		if i >= len(counters) {
+			break
 		}
+		value, err := strconv.ParseFloat(counters[i], 64)
+		if err != nil {
+			continue
+		}
+		result[name] = value
 	}
 	return result, nil
 }

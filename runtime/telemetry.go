@@ -122,6 +122,10 @@ var (
 		runtimeMetricCPUNice,
 		runtimeMetricCPUSystem,
 		runtimeMetricCPUIdle,
+		runtimeMetricCPUIOWait,
+		runtimeMetricCPUIRQ,
+		runtimeMetricCPUSoftIRQ,
+		runtimeMetricCPUSteal,
 	}
 )
 

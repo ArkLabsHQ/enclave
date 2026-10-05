@@ -70,9 +70,11 @@ jobs:
           ENV_NAME: ${{ matrix.env }}
         run: nix build ".#eif-${ENV_NAME}" --out-link result
 
-      # The measurement is the product, so every artefact is named after it. SHA256SUMS
-      # globs only the payload, so it cannot cover itself.
+      # The measurement is the product, so every artefact is named after it. The step
+      # emits each path as an output, so the uploads below name their files rather than
+      # sweeping a directory and picking up whatever else happens to be in it.
       - name: Collect the measurement
+        id: measure
         env:
           ENV_NAME: ${{ matrix.env }}
           APP_NAME: ${{ inputs.app_name }}
@@ -86,12 +88,21 @@ jobs:
           fi
           pcr0="$(jq -r .PCR0 result/pcr.json)"
 
-          install -m644 result/image.eif "out/${APP_NAME}-${ENV_NAME}-${pcr0}.eif"
-          install -m644 result/pcr.json  "out/${APP_NAME}-${ENV_NAME}-${pcr0}.pcr.json"
+          base="${APP_NAME}-${ENV_NAME}-${pcr0}"
+          install -m644 result/image.eif "out/${base}.eif"
+          install -m644 result/pcr.json  "out/${base}.pcr.json"
 
-          (cd out && sha256sum "${APP_NAME}"-* > SHA256SUMS)
+          # Bare filenames, not out/-prefixed paths: the publish job runs
+          # sha256sum -c from the directory the artifact unpacks into.
+          (cd out && sha256sum "${base}.eif" "${base}.pcr.json" > SHA256SUMS)
 
-          sha="$(sha256sum "out/${APP_NAME}-${ENV_NAME}-${pcr0}.eif" | cut -d' ' -f1)"
+          sha="$(sha256sum "out/${base}.eif" | cut -d' ' -f1)"
+
+          {
+            echo "eif=out/${base}.eif"
+            echo "pcr=out/${base}.pcr.json"
+            echo "sums=out/SHA256SUMS"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "### ${APP_NAME} / ${ENV_NAME}"
@@ -107,13 +118,18 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: measurement-${{ matrix.env }}
-          path: out/*.pcr.json
+          path: ${{ steps.measure.outputs.pcr }}
           retention-days: 14
 
+      # pcr.json travels with the image as well: the publish job reads the PCR0 from it
+      # to build the object key.
       - name: Upload the image
         if: inputs.upload_images
         uses: actions/upload-artifact@v7
         with:
           name: eif-${{ matrix.env }}
-          path: out/
+          path: |
+            ${{ steps.measure.outputs.eif }}
+            ${{ steps.measure.outputs.pcr }}
+            ${{ steps.measure.outputs.sums }}
           retention-days: 7

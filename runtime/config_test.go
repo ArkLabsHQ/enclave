@@ -9,13 +9,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newTestConfig(deployment, appName string, dev bool) *Config {
+func newTestConfig(namespace, appName string, dev bool) *Config {
 	c := &Config{
-		Deployment: deployment, AppName: appName,
+		Namespace: namespace, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
-		NamespacePrefix: "/",
-		InstanceID:      "i-0e2ce2ce2ce2ce2ce",
+		InstanceID: "i-0e2ce2ce2ce2ce2ce",
 	}
 	c.setSecurityConfig(dev)
 	return c
@@ -94,7 +93,7 @@ func TestIsDevParsing(t *testing.T) {
 }
 
 func TestLoadConfigTelemetrySettings(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_NAMESPACE", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "250ms")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "7")
@@ -106,7 +105,7 @@ func TestLoadConfigTelemetrySettings(t *testing.T) {
 }
 
 func TestLoadConfigDefaultsInvalidTelemetrySettings(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+	t.Setenv("ENCLAVE_NAMESPACE", "prod")
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 	t.Setenv("ENCLAVE_LOG_SHIP_INTERVAL", "invalid")
 	t.Setenv("ENCLAVE_LOG_RETENTION_DAYS", "0")
@@ -124,47 +123,39 @@ func TestConfigNamespace(t *testing.T) {
 	require.Equal(t, "/se7enz/emulator/enclave/CertBucketName", cfg.certBucketParam())
 	require.Equal(t, "/se7enz/emulator/enclave/logs/app", cfg.logGroup(signalAppLogs))
 
-	cfg.NamespacePrefix = "/ark"
+	cfg.Namespace = "ark/se7enz"
 	require.Equal(t, "/ark/se7enz/emulator/enclave", cfg.namespace())
 	require.Equal(t, "/ark/se7enz/emulator/enclave/env/", cfg.envOverlayPrefix())
 	require.Equal(t, "/ark/se7enz/emulator/enclave/logs/app", cfg.logGroup(signalAppLogs))
 }
 
-func TestLoadConfigNamespacePrefix(t *testing.T) {
-	t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+func TestLoadConfigNamespace(t *testing.T) {
 	t.Setenv("ENCLAVE_APP_NAME", "app")
 
-	t.Setenv("ENCLAVE_NAMESPACE_PREFIX", "ark/se7enz/")
+	t.Setenv("ENCLAVE_NAMESPACE", "ark/se7enz/prod")
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
-	require.Equal(t, "/ark/se7enz", cfg.NamespacePrefix)
+	require.Equal(t, "ark/se7enz/prod", cfg.Namespace)
 	require.Equal(t, "/ark/se7enz/prod/app/enclave", cfg.namespace())
-
-	t.Setenv("ENCLAVE_NAMESPACE_PREFIX", "   ")
-	cfg, err = LoadConfig()
-	require.NoError(t, err)
-	require.Equal(t, "/", cfg.NamespacePrefix)
-	require.Equal(t, "/prod/app/enclave", cfg.namespace())
+	require.NoError(t, cfg.Validate())
 }
 
-func TestNormalizeNamespacePrefix(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		raw  string
-		want string
-	}{
-		{name: "unset", raw: "", want: "/"},
-		{name: "whitespace only", raw: "   ", want: "/"},
-		{name: "slashes only", raw: "///", want: "/"},
-		{name: "trailing slash", raw: "/ark/trailing/", want: "/ark/trailing"},
-		{name: "missing leading slash", raw: "ark/no-leading", want: "/ark/no-leading"},
-		{name: "surrounding whitespace", raw: "  /ark/padded  ", want: "/ark/padded"},
-		{name: "doubled slash collapses", raw: "/ark//doubled", want: "/ark/doubled"},
-		{name: "dot segments resolve", raw: "/ark/./x/../y", want: "/ark/y"},
+// Identity is taken verbatim, never cleaned: what the operator sets is what gets
+// hashed into the intent bucket name, so a value that would need cleaning is refused.
+func TestLoadConfigIdentityIsVerbatim(t *testing.T) {
+	for _, tc := range []struct{ namespace, app, wantErr string }{
+		{"/ark/prod", "app", "no leading, trailing or doubled"},
+		{" ark/prod ", "app", "allow only letters"},
+		{"ark/prod", " app", "allow only letters"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, normalizeNamespacePrefix(tc.raw))
-		})
+		t.Setenv("ENCLAVE_NAMESPACE", tc.namespace)
+		t.Setenv("ENCLAVE_APP_NAME", tc.app)
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, tc.namespace, cfg.Namespace)
+		require.Equal(t, tc.app, cfg.AppName)
+		require.ErrorContains(t, cfg.Validate(), tc.wantErr)
 	}
 }
 
@@ -215,7 +206,7 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 func TestLoadConfigMigrationCooldown(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Helper()
-		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_NAMESPACE", "prod")
 		t.Setenv("ENCLAVE_APP_NAME", "app")
 	}
 
@@ -289,7 +280,7 @@ func TestSecurityProfileMigrationTimeouts(t *testing.T) {
 func TestLoadConfigVerifyClockSource(t *testing.T) {
 	base := func(t *testing.T, dev bool) {
 		t.Helper()
-		t.Setenv("ENCLAVE_DEPLOYMENT", "prod")
+		t.Setenv("ENCLAVE_NAMESPACE", "prod")
 		t.Setenv("ENCLAVE_APP_NAME", "app")
 		t.Setenv("ENCLAVE_DEV", strconv.FormatBool(dev))
 	}

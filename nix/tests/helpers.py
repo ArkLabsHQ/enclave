@@ -10,7 +10,7 @@ AWS_ACCOUNT_ID = "000000000000"
 FQDN = "enclave.test"
 CERT_BUCKET = "enclave-e2e-certificates"
 LEASE_BUCKET = "enclave-e2e-leases"
-INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
+INTENT_DIGEST = hashlib.sha256(b"ark/e2e/dev\x00testapp").digest()[:8].hex()
 INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 
 

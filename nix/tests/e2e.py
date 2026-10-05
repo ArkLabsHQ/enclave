@@ -2,9 +2,9 @@
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
-CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
-ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
-SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
+CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
+ACCOUNT_KEY = "ark/e2e/dev/testapp/data/acme/account.key"
+SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/dev/testapp/enclave"
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -18,8 +17,7 @@ import (
 // predecessor commitment are settable, but only baked into the measured image,
 // never from the overlay.
 var nonOverridableEnv = map[string]bool{
-	"ENCLAVE_NAMESPACE_PREFIX":    true,
-	"ENCLAVE_DEPLOYMENT":          true,
+	"ENCLAVE_NAMESPACE":           true,
 	"ENCLAVE_APP_NAME":            true,
 	"ENCLAVE_SECRETS_CONFIG":      true,
 	"ENCLAVE_DEV":                 true,
@@ -85,12 +83,8 @@ func getStaticSecretsConfig() string {
 	return os.Getenv("ENCLAVE_SECRETS_CONFIG")
 }
 
-func getDeployment() string {
-	return strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT"))
-}
-
 func getAppName() string {
-	return strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME"))
+	return os.Getenv("ENCLAVE_APP_NAME")
 }
 
 func getPreviousPCR0() string {
@@ -133,12 +127,8 @@ func logRetentionDays() int32 {
 	return int32(days)
 }
 
-func namespacePrefix() string {
-	return normalizeNamespacePrefix(os.Getenv("ENCLAVE_NAMESPACE_PREFIX"))
-}
-
-func normalizeNamespacePrefix(raw string) string {
-	return path.Join("/", strings.TrimSpace(raw))
+func getNamespace() string {
+	return os.Getenv("ENCLAVE_NAMESPACE")
 }
 
 func migrationCooldown() (time.Duration, bool, error) {

@@ -24,10 +24,12 @@ const (
 
 	namespaceSegment = "enclave"
 
-	namespaceNameChars      = "_.-"
-	maxNamespacePrefixDepth = 8
-	maxNamespaceLen         = 256
-	maxSecretNameLen        = 128
+	namespaceNameChars = "_.-"
+	// SSM allows 15 levels and the deepest runtime path adds 6 below the namespace:
+	// <app>/enclave/<lock>/<secret>/Ciphertext/<keyID>.
+	maxNamespaceDepth = 9
+	maxNamespaceLen   = 256
+	maxSecretNameLen  = 128
 
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
@@ -57,7 +59,7 @@ type Config struct {
 	// which is the point: every SSM path is derived from these, and a later
 	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
 	// to move the namespace out from under a running enclave.
-	Deployment   string
+	Namespace    string
 	AppName      string
 	Dev          bool
 	AppPort      string
@@ -83,7 +85,6 @@ type Config struct {
 	MigrationCooldown     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
-	NamespacePrefix       string
 	InstanceID            string
 }
 
@@ -97,7 +98,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Deployment:   getDeployment(),
+		Namespace:    getNamespace(),
 		AppName:      getAppName(),
 		AppPort:      appPort,
 		PreviousPCR0: getPreviousPCR0(),
@@ -110,7 +111,6 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol: getUpstreamProtocol(),
 		LogShipInterval:  logShipInterval(),
 		LogRetentionDays: logRetentionDays(),
-		NamespacePrefix:  namespacePrefix(),
 	}
 	cfg.setSecurityConfig(IsDev())
 
@@ -140,32 +140,23 @@ func (c *Config) Validate() error {
 	if c.FQDN == "" {
 		return fmt.Errorf("config is missing FQDN")
 	}
-	if c.Deployment == "" {
-		return fmt.Errorf("ENCLAVE_DEPLOYMENT must be set: it namespaces all SSM state")
+	if c.Namespace == "" {
+		return fmt.Errorf("ENCLAVE_NAMESPACE must be set: it namespaces all SSM state")
 	}
 	if c.AppName == "" {
 		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
 	}
-	if err := validateNamespaceName(
-		"ENCLAVE_NAMESPACE_PREFIX",
-		c.NamespacePrefix,
-		true,
-	); err != nil {
-		return err
-	}
-	if err := validateNamespaceName("ENCLAVE_DEPLOYMENT", c.Deployment, false); err != nil {
+	if err := validateNamespaceName("ENCLAVE_NAMESPACE", c.Namespace, true); err != nil {
 		return err
 	}
 	if err := validateNamespaceName("ENCLAVE_APP_NAME", c.AppName, false); err != nil {
 		return err
 	}
-	if prefix := strings.Trim(c.NamespacePrefix, "/"); prefix != "" {
-		if depth := strings.Count(prefix, "/") + 1; depth > maxNamespacePrefixDepth {
-			return fmt.Errorf(
-				"ENCLAVE_NAMESPACE_PREFIX %q: %d segments, at most %d fit SSM's hierarchy",
-				c.NamespacePrefix, depth, maxNamespacePrefixDepth,
-			)
-		}
+	if depth := strings.Count(c.Namespace, "/") + 1; depth > maxNamespaceDepth {
+		return fmt.Errorf(
+			"ENCLAVE_NAMESPACE %q: %d segments, at most %d fit SSM's hierarchy",
+			c.Namespace, depth, maxNamespaceDepth,
+		)
 	}
 	ns := c.namespace()
 	if len(ns) > maxNamespaceLen {
@@ -174,7 +165,7 @@ func (c *Config) Validate() error {
 			ns, len(ns), maxNamespaceLen,
 		)
 	}
-	first := strings.ToLower(strings.SplitN(strings.TrimPrefix(ns, "/"), "/", 2)[0])
+	first := strings.ToLower(strings.SplitN(c.Namespace, "/", 2)[0])
 	if strings.HasPrefix(first, "aws") || strings.HasPrefix(first, "ssm") {
 		return fmt.Errorf(
 			"namespace %q: SSM reserves parameter names starting with \"aws\" or \"ssm\"", ns,
@@ -190,6 +181,14 @@ func (c *Config) Validate() error {
 }
 
 func validateNamespaceName(name, value string, multiSegment bool) error {
+	for _, seg := range strings.Split(value, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("%s %q: no leading, trailing or doubled \"/\" allowed", name, value)
+		case ".", "..":
+			return fmt.Errorf("%s %q: \".\" and \"..\" segments are not allowed", name, value)
+		}
+	}
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
@@ -270,10 +269,7 @@ func (c *Config) applyEnvOverride(name, value string) error {
 }
 
 func (c *Config) namespace() string {
-	return fmt.Sprintf(
-		"%s/%s/%s/%s",
-		strings.TrimSuffix(c.NamespacePrefix, "/"), c.Deployment, c.AppName, namespaceSegment,
-	)
+	return fmt.Sprintf("/%s/%s/%s", c.Namespace, c.AppName, namespaceSegment)
 }
 
 func (c *Config) logGroup(sig signal) string {

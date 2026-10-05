@@ -26,11 +26,10 @@ const (
 
 // migrationClaimV1 binds an attestation to its state namespace.
 type migrationClaimV1 struct {
-	Schema     string `cbor:"schema"`
-	Prefix     string `cbor:"namespace_prefix"`
-	Deployment string `cbor:"deployment"`
-	AppName    string `cbor:"app_name"`
-	Lock       string `cbor:"lock"`
+	Schema    string `cbor:"schema"`
+	Namespace string `cbor:"namespace"`
+	AppName   string `cbor:"app_name"`
+	Lock      string `cbor:"lock"`
 }
 
 // CandidateInfo is reported by an enclave still awaiting a handoff.
@@ -791,11 +790,10 @@ func (m *migrator) attestationPayload(schema string) ([]byte, error) {
 		return nil, fmt.Errorf("build canonical CBOR encoder: %w", err)
 	}
 	payload, err := enc.Marshal(migrationClaimV1{
-		Schema:     schema,
-		Prefix:     m.cfg.NamespacePrefix,
-		Deployment: m.cfg.Deployment,
-		AppName:    m.cfg.AppName,
-		Lock:       m.cfg.lockSegment(),
+		Schema:    schema,
+		Namespace: m.cfg.Namespace,
+		AppName:   m.cfg.AppName,
+		Lock:      m.cfg.lockSegment(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("serialize attestation payload: %w", err)

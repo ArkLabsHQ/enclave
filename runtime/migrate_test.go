@@ -849,7 +849,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 	t.Run("rejects a claim for another app", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Deployment, "other-app", false)
+		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Namespace, "other-app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -860,7 +860,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
 		fx.successor.cfg = newTestConfig(
-			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, true,
+			fx.predecessor.cfg.Namespace, fx.predecessor.cfg.AppName, true,
 		)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
@@ -868,10 +868,10 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		require.Empty(t, verify(t, fx, doc, challenge))
 	})
 
-	t.Run("rejects a claim for another deployment", func(t *testing.T) {
+	t.Run("rejects a claim for another namespace", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig("other-deployment", "app", false)
+		fx.successor.cfg = newTestConfig("ark/prod", "app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -884,10 +884,10 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
 		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:     "enclave.successor_claim.v2",
-			Deployment: fx.predecessor.cfg.Deployment,
-			AppName:    fx.predecessor.cfg.AppName,
-			Lock:       fx.predecessor.cfg.lockSegment(),
+			Schema:    "enclave.successor_claim.v2",
+			Namespace: fx.predecessor.cfg.Namespace,
+			AppName:   fx.predecessor.cfg.AppName,
+			Lock:      fx.predecessor.cfg.lockSegment(),
 		})
 		require.NoError(t, err)
 		raw, _, err := fx.successor.nsm.BuildAttestationDocument(

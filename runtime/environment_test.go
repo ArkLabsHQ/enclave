@@ -24,19 +24,52 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{name: "all set", mutate: func(*Config) {}},
 		{
-			name:    "deployment missing",
-			mutate:  func(c *Config) { c.Deployment = "" },
-			wantErr: "ENCLAVE_DEPLOYMENT must be set",
+			name:    "namespace missing",
+			mutate:  func(c *Config) { c.Namespace = "" },
+			wantErr: "ENCLAVE_NAMESPACE must be set",
 		},
 		{
-			name:    "deployment has a character SSM refuses",
-			mutate:  func(c *Config) { c.Deployment = "dev#us" },
+			name:    "namespace has a leading slash",
+			mutate:  func(c *Config) { c.Namespace = "/ark/dev" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace has a trailing slash",
+			mutate:  func(c *Config) { c.Namespace = "ark/dev/" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace has an empty segment",
+			mutate:  func(c *Config) { c.Namespace = "ark//dev" },
+			wantErr: "no leading, trailing or doubled",
+		},
+		{
+			name:    "namespace climbs above its root",
+			mutate:  func(c *Config) { c.Namespace = "../prod" },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:    "namespace has a dot segment",
+			mutate:  func(c *Config) { c.Namespace = "ark/./prod" },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:   "dots inside a segment are fine",
+			mutate: func(c *Config) { c.Namespace = "ark/..backup/v1.2" },
+		},
+		{
+			name:    "app name is a dot-dot segment",
+			mutate:  func(c *Config) { c.AppName = ".." },
+			wantErr: `"." and ".." segments are not allowed`,
+		},
+		{
+			name:    "namespace has a character SSM refuses",
+			mutate:  func(c *Config) { c.Namespace = "ark/dev#us" },
 			wantErr: "allow only letters, digits and _.-",
 		},
 		{
-			name:    "deployment spans path segments",
-			mutate:  func(c *Config) { c.Deployment = "ark/dev" },
-			wantErr: "must be a single path segment",
+			name:   "namespace spans path segments",
+			mutate: func(c *Config) { c.Namespace = "ark/se7enz/dev" },
 		},
 		{
 			name:    "app name missing",
@@ -54,32 +87,27 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "must be a single path segment",
 		},
 		{
-			name:    "namespace prefix has a character SSM refuses",
-			mutate:  func(c *Config) { c.NamespacePrefix = "/ark#se7enz" },
-			wantErr: "allow only letters, digits and _.-",
-		},
-		{
-			name:    "namespace prefix starts with a reserved SSM word",
-			mutate:  func(c *Config) { c.NamespacePrefix = "/AWS/team" },
+			name:    "namespace starts with a reserved SSM word",
+			mutate:  func(c *Config) { c.Namespace = "AWS/team/prod" },
 			wantErr: "SSM reserves parameter names",
 		},
 		{
-			name:    "deployment starts with a reserved SSM word when there is no prefix",
-			mutate:  func(c *Config) { c.Deployment = "ssm-prod" },
+			name:    "single-segment namespace starts with a reserved SSM word",
+			mutate:  func(c *Config) { c.Namespace = "ssm-prod" },
 			wantErr: "SSM reserves parameter names",
 		},
 		{
 			name:   "reserved word inside a later segment is fine",
-			mutate: func(c *Config) { c.NamespacePrefix = "/ark/aws" },
+			mutate: func(c *Config) { c.Namespace = "ark/aws" },
 		},
 		{
-			name:    "namespace prefix deeper than SSM allows",
-			mutate:  func(c *Config) { c.NamespacePrefix = "/a/b/c/d/e/f/g/h/i" },
-			wantErr: "at most 8 fit SSM's hierarchy",
+			name:    "namespace deeper than SSM allows",
+			mutate:  func(c *Config) { c.Namespace = "a/b/c/d/e/f/g/h/i/j" },
+			wantErr: "at most 9 fit SSM's hierarchy",
 		},
 		{
 			name:    "namespace longer than the name limits allow",
-			mutate:  func(c *Config) { c.Deployment = strings.Repeat("d", 300) },
+			mutate:  func(c *Config) { c.Namespace = strings.Repeat("d", 300) },
 			wantErr: "fit SSM and CloudWatch name limits",
 		},
 		{
@@ -184,8 +212,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 	t.Run("skips non overridable keys", func(t *testing.T) {
 		err := ApplyEnvOverrides(ctx, testCfg, ssmFor(map[string]string{
-			path("ENCLAVE_NAMESPACE_PREFIX"):    "/evil",
-			path("ENCLAVE_DEPLOYMENT"):          "dev",
+			path("ENCLAVE_NAMESPACE"):           "evil",
 			path("ENCLAVE_APP_NAME"):            "evil",
 			path("ENCLAVE_SECRETS_CONFIG"):      `[{"name":"evil"}]`,
 			path("ENCLAVE_DEV"):                 "true",
@@ -206,9 +233,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 			"the overlay must not be able to waive the clock-source assertion")
 		require.Empty(t, os.Getenv("ENCLAVE_PREVIOUS_PCR0"),
 			"the overlay must not be able to name a different predecessor")
-		require.Empty(t, os.Getenv("ENCLAVE_NAMESPACE_PREFIX"),
+		require.Empty(t, os.Getenv("ENCLAVE_NAMESPACE"),
 			"the overlay must not be able to move the namespace it is read from")
-		require.Equal(t, "/", testCfg.NamespacePrefix)
+		require.Equal(t, "prod", testCfg.Namespace)
 		require.True(t, testCfg.KMSLocked)
 		require.Equal(t, "ok", os.Getenv("SAFE_KEY"))
 	})
@@ -221,19 +248,19 @@ func TestApplyEnvOverrides(t *testing.T) {
 
 func TestIsDev(t *testing.T) {
 	cases := []struct {
-		name            string
-		dev, deployment string
-		want            bool
+		name           string
+		dev, namespace string
+		want           bool
 	}{
 		{"ENCLAVE_DEV=true is dev", "true", "prod", true},
 		{"ENCLAVE_DEV case-insensitive", "TRUE", "prod", true},
 		{"ENCLAVE_DEV=false is not dev", "false", "dev", false},
-		{"unset is not dev regardless of deployment", "", "dev", false},
+		{"unset is not dev regardless of namespace", "", "dev", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Setenv("ENCLAVE_DEV", c.dev)
-			t.Setenv("ENCLAVE_DEPLOYMENT", c.deployment)
+			t.Setenv("ENCLAVE_NAMESPACE", c.namespace)
 			require.Equal(t, c.want, IsDev())
 		})
 	}

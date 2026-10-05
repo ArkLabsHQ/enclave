@@ -318,7 +318,26 @@ func testMetrics(t *testing.T, telemetry *Telemetry) *sdkmetric.ManualReader {
 	counters, err := newCounters(provider.Meter("test"))
 	require.NoError(t, err)
 	telemetry.counters = counters
+	durations, err := newForwardDurations(provider.Meter("test"))
+	require.NoError(t, err)
+	telemetry.durations.Store(durations)
 	return reader
+}
+
+func histogramPoint(
+	t *testing.T, reader *sdkmetric.ManualReader, name string,
+) metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	var collected metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &collected))
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if h, ok := m.Data.(metricdata.Histogram[float64]); ok && m.Name == name {
+				return h.DataPoints[0]
+			}
+		}
+	}
+	return metricdata.HistogramDataPoint[float64]{}
 }
 
 func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
@@ -499,6 +518,7 @@ func TestForwardRelaysUpstreamResponse(t *testing.T) {
 		require.Equal(t, protobuf, calls[0].header.Get("Content-Type"))
 		require.Equal(t, int64(1), counterValue(t, reader, otlpLogs.metricForwarded))
 		require.Zero(t, counterValue(t, reader, otlpLogs.metricErrors))
+		require.Equal(t, uint64(1), histogramPoint(t, reader, otlpLogs.metricDuration).Count)
 	})
 
 	t.Run("a rejection comes back with its body", func(t *testing.T) {
@@ -546,6 +566,30 @@ func TestForwardRelaysUpstreamResponse(t *testing.T) {
 		require.Equal(t, http.StatusBadGateway, w.Code)
 		require.Contains(t, w.Body.String(), "upstream logs")
 		require.Equal(t, int64(1), counterValue(t, reader, otlpLogs.metricErrors))
+		require.Equal(t, uint64(1), histogramPoint(t, reader, otlpLogs.metricDuration).Count,
+			"a failed upload is timed too")
+	})
+
+	t.Run("a body that stalls after its headers is timed to the end", func(t *testing.T) {
+		const stall = 200 * time.Millisecond
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			time.Sleep(stall)
+			_, _ = w.Write([]byte("late"))
+		}))
+		t.Cleanup(up.Close)
+		telemetry := NewTelemetry(testCfg, testAWS(t, newFakeCloudWatchLogs(), up.URL))
+		reader := testMetrics(t, telemetry)
+
+		w := forwardRequest(t, telemetry, otlpLogs,
+			buildOTLPLogRequest(t, logspb.SeverityNumber_SEVERITY_NUMBER_INFO, "hi", "k", "v"),
+			protobuf)
+
+		require.Equal(t, "late", w.Body.String())
+		point := histogramPoint(t, reader, otlpLogs.metricDuration)
+		require.Equal(t, uint64(1), point.Count)
+		require.GreaterOrEqual(t, point.Sum, stall.Seconds())
 	})
 
 	t.Run("json is the other OTLP encoding", func(t *testing.T) {

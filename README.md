@@ -413,11 +413,29 @@ The runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
 `429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
 and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
 
+`enclave_otlp_<logs|traces|metrics>_forward_duration_seconds` is a histogram of
+each upload's full exchange with AWS, from sending the request to the end of the
+response body, failed ones included, whether relayed for the application or
+exported by the runtime. Both leave the enclave over the vsock
+proxy, so a slowing egress path shows here as rising latency long before uploads
+fail at the 30-second timeout. Buckets run from 5 ms to 30 s.
+
 **Changed:** trace and metric log groups and the local telemetry decoder were
 removed. Logs remain in the two groups above; spans and metrics use their native
 AWS stores. Records no longer contain the runtime-added `id`, `level` or
-`source` fields. The old entry and dropped-record counters were also removed,
-so affected alarms and dashboards need updating.
+`source` fields. Eight counters were removed, so alarms and dashboards on them
+need updating: `enclave_log_entries_total`, `enclave_supervisor_log_entries_total`,
+`enclave_app_metrics_dropped_total`, and the queue-overflow counters
+`enclave_telemetry_logs_app_dropped_total`,
+`enclave_telemetry_logs_supervisor_dropped_total`,
+`enclave_telemetry_traces_app_dropped_total`,
+`enclave_telemetry_traces_supervisor_dropped_total` and
+`enclave_telemetry_metrics_dropped_total`. Application uploads are no longer
+queued: the relay is synchronous, so the application's exporter sees each failure
+and `Retry-After` itself. The runtime's own records still pass through the
+OpenTelemetry SDK's batch queues, whose overflow drops are not counted. The
+forward-duration histograms show a congested egress path, not whether anything
+was dropped.
 
 `stderr` is unaffected: it still carries every runtime record, unbatched.
 

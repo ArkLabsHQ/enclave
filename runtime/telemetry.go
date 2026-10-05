@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -71,6 +72,7 @@ type otlpRoute struct {
 
 	metricForwarded string
 	metricErrors    string
+	metricDuration  string
 }
 
 var (
@@ -79,18 +81,21 @@ var (
 		endpoint:        otlpEndpointLogs,
 		metricForwarded: "enclave_otlp_logs_forwarded_total",
 		metricErrors:    "enclave_otlp_logs_upstream_errors_total",
+		metricDuration:  "enclave_otlp_logs_forward_duration_seconds",
 	}
 	otlpTraces = otlpRoute{
 		name: "traces", service: "xray", path: "/v1/traces", maxBody: 5 << 20,
 		endpoint:        otlpEndpointTraces,
 		metricForwarded: "enclave_otlp_traces_forwarded_total",
 		metricErrors:    "enclave_otlp_traces_upstream_errors_total",
+		metricDuration:  "enclave_otlp_traces_forward_duration_seconds",
 	}
 	otlpMetrics = otlpRoute{
 		name: "metrics", service: "monitoring", path: "/v1/metrics", maxBody: 1 << 20,
 		endpoint:        otlpEndpointMetrics,
 		metricForwarded: "enclave_otlp_metrics_forwarded_total",
 		metricErrors:    "enclave_otlp_metrics_upstream_errors_total",
+		metricDuration:  "enclave_otlp_metrics_forward_duration_seconds",
 	}
 )
 
@@ -103,6 +108,13 @@ const (
 )
 
 const runtimeMetricPrefix = "enclave_runtime_"
+
+// forwardDurationBuckets are in seconds, up to the otlpHTTPTimeout ceiling. The
+// SDK's default boundaries assume milliseconds and would put every upload in the
+// first bucket.
+var forwardDurationBuckets = []float64{
+	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30,
+}
 
 var (
 	runtimeGauges = []string{
@@ -153,7 +165,8 @@ const (
 
 // Telemetry forwards application and runtime telemetry to AWS.
 type Telemetry struct {
-	counters map[string]metric.Int64Counter
+	counters  map[string]metric.Int64Counter
+	durations atomic.Pointer[[otlpEndpointCount]metric.Float64Histogram]
 
 	cw            CloudWatchLogsAPI
 	groups        [signalCount]string
@@ -194,9 +207,9 @@ func NewTelemetry(cfg *Config, client *AWSClient) *Telemetry {
 	if client != nil {
 		t.cw = client.CWL
 		if client.OTLP != nil {
-			t.endpoints[otlpEndpointLogs] = client.OTLP.Logs
-			t.endpoints[otlpEndpointTraces] = client.OTLP.Traces
-			t.endpoints[otlpEndpointMetrics] = client.OTLP.Metrics
+			t.endpoints[otlpEndpointLogs] = t.timed(otlpEndpointLogs, client.OTLP.Logs)
+			t.endpoints[otlpEndpointTraces] = t.timed(otlpEndpointTraces, client.OTLP.Traces)
+			t.endpoints[otlpEndpointMetrics] = t.timed(otlpEndpointMetrics, client.OTLP.Metrics)
 		}
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
@@ -304,6 +317,11 @@ func (t *Telemetry) startProviders(ctx context.Context) error {
 			return fmt.Errorf("create runtime counters: %w", err)
 		}
 	}
+	durations, err := newForwardDurations(meter)
+	if err != nil {
+		return fmt.Errorf("create forward durations: %w", err)
+	}
+	t.durations.Store(durations)
 	if err := t.registerMetrics(meter); err != nil {
 		return fmt.Errorf("register runtime readings: %w", err)
 	}
@@ -569,6 +587,60 @@ func (t *Telemetry) ensureGroup(ctx context.Context, sig signal) error {
 	return nil
 }
 
+// timed wraps an endpoint's client so every upload over it is timed: the app's
+// relayed requests and the runtime's own exports share the vsock egress path, and
+// a slowing path shows here long before anything reaches otlpHTTPTimeout.
+func (t *Telemetry) timed(endpoint otlpEndpoint, c otlpClient) otlpClient {
+	if c.client == nil {
+		return c
+	}
+	client := *c.client
+	client.Transport = &timedTransport{t: t, endpoint: endpoint, next: c.client.Transport}
+	return otlpClient{base: c.base, client: &client}
+}
+
+type timedTransport struct {
+	t        *Telemetry
+	endpoint otlpEndpoint
+	next     http.RoundTripper
+}
+
+// RoundTrip times the whole exchange. A transport failure is recorded at once;
+// otherwise closing the body records it, so a response that stalls after its
+// headers is timed to the end, up to the client's timeout.
+func (tt *timedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := tt.next.RoundTrip(req)
+	if err != nil {
+		tt.record(req.Context(), start)
+		return resp, err
+	}
+	resp.Body = &timedBody{
+		ReadCloser: resp.Body,
+		done:       func() { tt.record(req.Context(), start) },
+	}
+	return resp, nil
+}
+
+func (tt *timedTransport) record(ctx context.Context, start time.Time) {
+	if durations := tt.t.durations.Load(); durations != nil {
+		durations[tt.endpoint].Record(ctx, time.Since(start).Seconds())
+	}
+}
+
+// timedBody records once, on Close: every caller closes the body, whether it read
+// to EOF, stopped early or failed mid-read.
+type timedBody struct {
+	io.ReadCloser
+	once sync.Once
+	done func()
+}
+
+func (b *timedBody) Close() error {
+	b.once.Do(b.done)
+	return b.ReadCloser.Close()
+}
+
 func isAlreadyExists(err error) bool {
 	var exists *cwltypes.ResourceAlreadyExistsException
 	return errors.As(err, &exists)
@@ -601,6 +673,22 @@ func newCounters(meter metric.Meter) (map[string]metric.Int64Counter, error) {
 		counters[name] = counter
 	}
 	return counters, nil
+}
+
+func newForwardDurations(
+	meter metric.Meter,
+) (*[otlpEndpointCount]metric.Float64Histogram, error) {
+	var durations [otlpEndpointCount]metric.Float64Histogram
+	for _, r := range []otlpRoute{otlpLogs, otlpTraces, otlpMetrics} {
+		h, err := meter.Float64Histogram(r.metricDuration,
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(forwardDurationBuckets...))
+		if err != nil {
+			return nil, err
+		}
+		durations[r.endpoint] = h
+	}
+	return &durations, nil
 }
 
 func counterNames() []string {

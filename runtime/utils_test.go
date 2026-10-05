@@ -33,7 +33,6 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
 type fakeSSM struct {
@@ -705,10 +704,6 @@ func (f *fakeCloudWatchLogs) PutRetentionPolicy(
 	f.retentionDays = append(f.retentionDays, aws.ToInt32(in.RetentionInDays))
 	f.mu.Unlock()
 	return &cloudwatchlogs.PutRetentionPolicyOutput{}, nil
-}
-
-func stringValue(value string) *commonpb.AnyValue {
-	return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}}
 }
 
 func (f *fakeS3) PutObject(

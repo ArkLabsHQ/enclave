@@ -375,8 +375,6 @@ func (t *Telemetry) forwardHandler(route otlpRoute) http.HandlerFunc {
 			http.Error(w, jsonError("read body: "+err.Error()), http.StatusBadRequest)
 			return
 		}
-		t.Inc(route.metricForwarded)
-
 		ctx, cancel := context.WithTimeout(r.Context(), otlpHTTPTimeout)
 		defer cancel()
 		resp, err := t.forward(ctx, route, otlpRequest{
@@ -392,7 +390,11 @@ func (t *Telemetry) forwardHandler(route otlpRoute) http.HandlerFunc {
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		// Any other 4xx is the application's own error and counts as neither.
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			t.Inc(route.metricForwarded)
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			t.Inc(route.metricErrors)
 		}
 		for _, h := range []string{"Content-Type", "Retry-After", "X-Amzn-Requestid"} {

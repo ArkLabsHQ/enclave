@@ -566,6 +566,8 @@ func TestForwardRelaysUpstreamResponse(t *testing.T) {
 		require.Equal(t, http.StatusBadGateway, w.Code)
 		require.Contains(t, w.Body.String(), "upstream logs")
 		require.Equal(t, int64(1), counterValue(t, reader, otlpLogs.metricErrors))
+		require.Zero(t, counterValue(t, reader, otlpLogs.metricForwarded),
+			"an upload AWS never accepted was not forwarded")
 		require.Equal(t, uint64(1), histogramPoint(t, reader, otlpLogs.metricDuration).Count,
 			"a failed upload is timed too")
 	})
@@ -726,7 +728,7 @@ func buildOTLPTraceRequest(t *testing.T, name string, statusCode tracepb.Status_
 			Resource: &resourcepb.Resource{
 				Attributes: []*commonpb.KeyValue{{
 					Key:   "service.name",
-					Value: stringValue("test-svc"),
+					Value: stringAnyValue("test-svc"),
 				}},
 			},
 			ScopeSpans: []*tracepb.ScopeSpans{{
@@ -758,7 +760,7 @@ func buildOTLPTraceRequest(t *testing.T, name string, statusCode tracepb.Status_
 						Status:            &tracepb.Status{Code: statusCode},
 						Attributes: []*commonpb.KeyValue{{
 							Key:   "test.attr",
-							Value: stringValue("val"),
+							Value: stringAnyValue("val"),
 						}},
 					},
 				},
@@ -781,17 +783,17 @@ func buildOTLPLogRequest(
 			Resource: &resourcepb.Resource{
 				Attributes: []*commonpb.KeyValue{{
 					Key:   "service.name",
-					Value: stringValue("test"),
+					Value: stringAnyValue("test"),
 				}},
 			},
 			ScopeLogs: []*logspb.ScopeLogs{{
 				LogRecords: []*logspb.LogRecord{{
 					TimeUnixNano:   uint64(time.Now().UnixNano()),
 					SeverityNumber: severity,
-					Body:           stringValue(body),
+					Body:           stringAnyValue(body),
 					Attributes: []*commonpb.KeyValue{{
 						Key:   attrKey,
-						Value: stringValue(attrVal),
+						Value: stringAnyValue(attrVal),
 					}},
 				}},
 			}},

@@ -387,9 +387,9 @@ namespace as the [SSM parameters](#ssm-parameters), where `<namespace>` is
 | `/<namespace>/<app>/enclave/logs/runtime` | The runtime's own records. |
 
 At boot, the runtime creates both groups and one stream per group named after
-the EC2 instance ID, applies retention, and writes a probe record. Failure to
-read the instance ID from IMDS or write the probe aborts startup. Restarts on the
-same instance reuse its streams.
+the EC2 instance ID, applies retention, and writes a probe record to the runtime
+group. Failure to read the instance ID from IMDS or write the probe aborts
+startup. Restarts on the same instance reuse its streams.
 
 **Changed:** group names used to be `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/...`,
 with no `<app>` segment, so two applications in one deployment shared groups unless the
@@ -408,7 +408,8 @@ abort startup. Metrics are queried with PromQL by their OTLP attributes.
 
 The runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
 `enclave_http_errors_total`, `enclave_app_proxied_requests_total`,
-`enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`,
+`enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`
+(uploads AWS accepted with a `2xx`),
 `enclave_otlp_<logs|traces|metrics>_upstream_errors_total` (a transport failure, a
 `429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
 and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
@@ -1166,7 +1167,10 @@ from SSM.
 
 **CloudWatch Logs is a hard boot dependency.** Before starting the application,
 the runtime creates both log groups and streams and writes a probe through the
-OTLP endpoint. Any failure aborts startup. Span and metric export failures are
+OTLP endpoint. Any failure aborts startup. The probe writes only to the runtime
+group: a policy that denies the application group still boots, and the
+application's log uploads then fail, counted in
+`enclave_otlp_logs_upstream_errors_total`. Span and metric export failures are
 reported but are not fatal.
 
 **Telemetry is not readable from the enclave.** Uploads are forwarded without

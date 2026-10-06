@@ -540,6 +540,90 @@ let
     };
 in
 {
+  e2e-derived-secrets =
+    let
+      external = name: env_var: {
+        inherit name env_var;
+        type = "publicKey";
+        # secp256k1 private scalar 1, used only in this test deployment.
+        value = [ "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" ];
+      };
+      seed = {
+        name = "e2e-signing-key";
+        type = "seed";
+        env_var = "E2E_HIDDEN_SEED"; # ignored, even when explicitly supplied
+      };
+      derived = name: env_var: {
+        inherit name env_var;
+        type = "derived";
+        seed = "e2e-signing-key";
+      };
+      mkSecretsEif =
+        previous: secrets: inherited:
+        self.lib.buildEif {
+          inherit pkgs;
+          app = testApp;
+          env = commonEifEnv // {
+            ENCLAVE_PREVIOUS_PCR0 = previous;
+            ENCLAVE_SECRETS_CONFIG = builtins.toJSON secrets;
+            ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON inherited;
+          };
+        };
+      measurement = eif: lib.toLower (builtins.fromJSON (builtins.readFile "${eif}/pcr.json")).PCR0;
+      blue =
+        mkSecretsEif "genesis"
+          [
+            {
+              # Omitting type preserves legacy passthrough behavior.
+              name = "e2e-signing-key";
+              env_var = "E2E_SIGNING_KEY";
+            }
+          ]
+          [ (external "e2e-old-external-key" "E2E_DEPRECATED_KEYS") ];
+      green =
+        mkSecretsEif (measurement blue)
+          [
+            seed
+            (derived "e2e-derived-signing-key" "E2E_SIGNING_KEY")
+          ]
+          [ (external "e2e-old-external-key" "E2E_DEPRECATED_KEYS") ];
+      third =
+        mkSecretsEif (measurement green)
+          [ seed ]
+          [
+            (external "e2e-external-signing-key" "E2E_SIGNING_KEY")
+          ];
+      restored =
+        mkSecretsEif (measurement third)
+          [
+            seed
+            (derived "e2e-derived-signing-key" "E2E_RESTORED_KEY")
+            (derived "e2e-derived-signing-key-v2" "E2E_SIGNING_KEY")
+          ]
+          [ (external "e2e-external-signing-key" "E2E_DEPRECATED_KEYS") ];
+    in
+    pkgs.testers.runNixOSTest {
+      name = "enclave-derived-secrets-e2e";
+      nodes = {
+        aws = awsNode;
+        blue = mkEnclaveNode blue;
+        green = mkEnclaveNode green;
+        green_peer = mkEnclaveNode green;
+        third = mkEnclaveNode third;
+        restored = mkEnclaveNode restored;
+      };
+      testScript =
+        ''
+          BLUE_PCR0 = ${builtins.toJSON (measurement blue)}
+          GREEN_PCR0 = ${builtins.toJSON (measurement green)}
+          THIRD_PCR0 = ${builtins.toJSON (measurement third)}
+          RESTORED_PCR0 = ${builtins.toJSON (measurement restored)}
+        ''
+        + builtins.readFile ./helpers.py
+        + "\n"
+        + builtins.readFile ./derived-secrets.py;
+    };
+
   eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
     test -s ${blueEif}/image.eif
     test -s ${greenEif}/image.eif

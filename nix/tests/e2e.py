@@ -2,6 +2,8 @@
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
+import time
+
 CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
@@ -425,11 +427,13 @@ assert (
     >= 1
 )
 
-# Green can see who is offering it the handoff, while still a candidate.
+# Green identifies the predecessor while waiting. It may already have promoted
+# while the preceding AWS assertions ran, so also accept its established lineage.
 green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg b '{BLUE_PCR0}' "
-    "'.candidate.awaiting_handoff_from == $b'",
+    "'(.candidate.awaiting_handoff_from == $b) or "
+    "(.status == \"ready\" and .previous_pcr0 == $b)'",
     timeout=120,
 )
 

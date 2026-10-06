@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/hkdf"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -15,11 +16,11 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/fxamacker/cbor/v2"
 )
 
-// SecretsMetadata is the secret configuration baked into the image: the static
-// secrets minted inside the enclave, and the inherited ones handed in from
-// outside.
+// SecretsMetadata is baked into the image: managed secrets (persisted or
+// derived) and inherited secrets supplied from outside.
 type SecretsMetadata struct {
 	Static    []StaticSecretMetadata
 	Inherited []InheritSecretMetadata
@@ -50,25 +51,56 @@ func (sm SecretsMetadata) Validate(overrideAllowList map[string]bool) error {
 	return nil
 }
 
-// Secrets is what boot resolved from SecretsMetadata: the decrypted static
-// secrets, and the inherited ones that are present, verified and before their
-// cutoff.
+// Secrets holds managed values in configuration order (including hidden seeds
+// and derived outputs), and verified inherited values before their cutoff.
 type Secrets struct {
 	Static    []StaticSecret
 	Inherited []InheritedSecret
 }
 
-// StaticSecretMetadata defines a secret managed by KMS inside the enclave runtime
-// (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
-// into the configured env var only in the child app's environment.
+const (
+	secretTypePassthrough = "passthrough"
+	secretTypeSeed        = "seed"
+	secretTypeDerived     = "derived"
+	derivedSecretSalt     = "enclave.derived-secret.v1"
+	maxManagedSecrets     = migrationPCRIndex - 16
+)
+
+// StaticSecretMetadata describes an ENCLAVE_SECRETS_CONFIG entry. An omitted
+// type means passthrough. Only passthrough and seed entries have ciphertexts.
 type StaticSecretMetadata struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
+	Type   string `json:"type,omitempty"`
+	Seed   string `json:"seed,omitempty"`
 }
 
 type StaticSecret struct {
 	StaticSecretMetadata
 	Plaintext string
+}
+
+func (m StaticSecretMetadata) persisted() bool { return m.Type != secretTypeDerived }
+
+// persisted includes hidden seeds; derived values never enter a handoff.
+func (s Secrets) persisted() []StaticSecret {
+	var out []StaticSecret
+	for _, secret := range s.Static {
+		if secret.persisted() {
+			out = append(out, secret)
+		}
+	}
+	return out
+}
+
+func (s Secrets) exported() []StaticSecret {
+	var out []StaticSecret
+	for _, secret := range s.Static {
+		if secret.Type != secretTypeSeed {
+			out = append(out, secret)
+		}
+	}
+	return out
 }
 
 func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
@@ -85,39 +117,107 @@ func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
 }
 
 func (sm SecretsMetadata) validateStatic() error {
-	seen := make(map[string]bool, len(sm.Static))
+	if len(sm.Static) > maxManagedSecrets {
+		return fmt.Errorf("at most %d managed secrets fit in PCR16–PCR30", maxManagedSecrets)
+	}
+	seen := make(map[string]StaticSecretMetadata, len(sm.Static))
+	envVars := make(map[string]bool, len(sm.Static))
 	for _, secret := range sm.Static {
+		if !secretNamePattern.MatchString(secret.Name) {
+			return fmt.Errorf(
+				"static secret name %q must be a single SSM path segment",
+				secret.Name,
+			)
+		}
 		if secret.Name == "StorageDEK" {
 			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
 		}
-		if seen[secret.Name] {
+		if _, ok := seen[secret.Name]; ok {
 			return fmt.Errorf("duplicate static secret %q", secret.Name)
 		}
-		seen[secret.Name] = true
+		seen[secret.Name] = secret
+		switch secret.Type {
+		case "", secretTypePassthrough, secretTypeSeed:
+		case secretTypeDerived:
+			if secret.Seed == "" {
+				return fmt.Errorf("derived secret %q requires seed", secret.Name)
+			}
+		default:
+			return fmt.Errorf("secret %q: unknown type %q", secret.Name, secret.Type)
+		}
+		if secret.Type == secretTypeSeed {
+			continue // env_var is ignored, including for collision checks.
+		}
+		if !envVarNamePattern.MatchString(secret.EnvVar) || childReservedEnv[secret.EnvVar] {
+			return fmt.Errorf(
+				"secret %q: invalid or reserved env_var %q",
+				secret.Name,
+				secret.EnvVar,
+			)
+		}
+		if envVars[secret.EnvVar] {
+			return fmt.Errorf("secret %q: env_var %q is already used", secret.Name, secret.EnvVar)
+		}
+		envVars[secret.EnvVar] = true
+	}
+	for _, secret := range sm.Static {
+		if secret.Type == secretTypeDerived && seen[secret.Seed].Type != secretTypeSeed {
+			return fmt.Errorf(
+				"derived secret %q: seed %q must name a configured seed",
+				secret.Name,
+				secret.Seed,
+			)
+		}
 	}
 	return nil
 }
 
+// deriveSecret uses RFC 5869 extract-and-expand with a fixed protocol salt.
+// Info is one definite-length CBOR text string, not an array or a byte string.
+// Names use the ASCII SSM-segment alphabet; their bytes are never normalized.
+func deriveSecret(seed []byte, name string) (string, error) {
+	if len(seed) != 32 {
+		return "", fmt.Errorf("seed must be 32 bytes, got %d", len(seed))
+	}
+	// ponytail: default CBOR encoding is deterministic for a plain string.
+	info, err := cbor.Marshal(name)
+	if err != nil {
+		return "", err
+	}
+	key, err := hkdf.Key(sha256.New, seed, []byte(derivedSecretSalt), string(info), 32)
+	if err != nil {
+		return "", err
+	}
+	// Reject an invalid signing scalar
+	var scalar btcec.ModNScalar
+	if len(key) != 32 || scalar.SetByteSlice(key) || scalar.IsZero() {
+		return "", fmt.Errorf("derived value is not a secp256k1 scalar in [1, N-1]")
+	}
+	return hex.EncodeToString(key), nil
+}
+
 // ExtendPCRRegistersWithStaticSecrets commits each secret pubkey hash to PCR(16+i).
 func ExtendPCRRegistersWithStaticSecrets(nsm NSM, secrets []StaticSecret) error {
+	if len(secrets) > maxManagedSecrets {
+		return fmt.Errorf(
+			"at most %d managed secrets fit before migration PCR31",
+			maxManagedSecrets,
+		)
+	}
 	for i, s := range secrets {
 		pcrIndex := uint(16) + uint(i)
-		if pcrIndex >= migrationPCRIndex {
-			return fmt.Errorf("secret %q: PCR index %d would collide with migration PCR (PCR%d)",
-				s.Name, pcrIndex, migrationPCRIndex)
-		}
-
 		secretBytes, err := hex.DecodeString(s.Plaintext)
 		if err != nil {
 			return fmt.Errorf("decode secret %s hex: %w", s.Name, err)
 		}
 
-		privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
-		if privKey == nil {
-			return fmt.Errorf("secret %q: invalid secp256k1 private key", s.Name)
-		}
+		// Preserve the historical PCR mapping for persisted secrets, including
+		// when a passthrough becomes a seed: interpret the first 32 bytes as an
+		// unsigned big-endian integer and reduce modulo N. Derived values were
+		// checked by deriveSecret, so this conversion leaves their scalar unchanged.
+		_, pubKey := btcec.PrivKeyFromBytes(secretBytes)
 
-		pubkeyBytes := privKey.PubKey().SerializeCompressed()
+		pubkeyBytes := pubKey.SerializeCompressed()
 		hash := sha256.Sum256(pubkeyBytes)
 
 		if err := nsm.ExtendPCR(pcrIndex, hash[:]); err != nil {
@@ -207,7 +307,9 @@ func (sm SecretsMetadata) validateChildEnv(overrideAllowList map[string]bool) er
 func (sm SecretsMetadata) validateInherited() error {
 	envVars := make(map[string]bool, len(sm.Inherited)+len(sm.Static))
 	for _, s := range sm.Static {
-		envVars[s.EnvVar] = true
+		if s.Type != secretTypeSeed {
+			envVars[s.EnvVar] = true
+		}
 	}
 
 	names := make(map[string]bool, len(sm.Inherited))

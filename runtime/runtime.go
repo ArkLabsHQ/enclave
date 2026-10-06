@@ -155,7 +155,7 @@ func Run(ctx context.Context, cfg Config) error {
 		ctx,
 		result.kms,
 		result.dek,
-		result.secrets.Static,
+		result.secrets.persisted(),
 		result.tlsKey,
 	)
 
@@ -205,7 +205,7 @@ func appEnv(cfg Config, authToken string, secrets Secrets) []string {
 		env = append(env, key+"="+value)
 	}
 	// Secrets take precedence over SSM overrides.
-	for _, secret := range secrets.Static {
+	for _, secret := range secrets.exported() {
 		env = append(env, secret.EnvVar+"="+secret.Plaintext)
 	}
 	// Built at every launch, so a relaunch leaves out a secret past its cutoff.

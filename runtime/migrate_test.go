@@ -293,12 +293,12 @@ func TestHandOffToSuccessor(t *testing.T) {
 	dekKey := bytes.Repeat([]byte{0x42}, 32)
 	secretPlaintext := bytes.Repeat([]byte{0x11}, 32)
 	secret := StaticSecret{
-		StaticSecretMetadata: StaticSecretMetadata{Name: "signing_key"},
+		StaticSecretMetadata: StaticSecretMetadata{Name: "signing_key", EnvVar: "SIGNING_KEY"},
 		Plaintext:            hex.EncodeToString(secretPlaintext),
 	}
 
 	successorCfg := successorTestCfg(oldPCR0Hex)
-	successorCfg.StaticSecretConfig = `[{"name":"signing_key"}]`
+	successorCfg.StaticSecretConfig = `[{"name":"signing_key","env_var":"SIGNING_KEY"}]`
 
 	ctx := context.Background()
 	setup := func(t *testing.T, opts ...func(*startMigrationFixture)) *startMigrationFixture {
@@ -430,6 +430,167 @@ func TestHandOffToSuccessor(t *testing.T) {
 			verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true),
 		)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
+	})
+
+	t.Run("mixed secrets preserve explicit and omitted passthrough handoffs", func(t *testing.T) {
+		fx := setup(t)
+		seed := StaticSecret{
+			StaticSecretMetadata: StaticSecretMetadata{Name: "seed", Type: secretTypeSeed},
+			Plaintext:            strings.Repeat("55", 32),
+		}
+		explicit := StaticSecret{
+			StaticSecretMetadata: StaticSecretMetadata{
+				Name: "explicit", Type: secretTypePassthrough, EnvVar: "EXPLICIT_KEY",
+			},
+			Plaintext: secret.Plaintext,
+		}
+		derived := StaticSecret{
+			StaticSecretMetadata: StaticSecretMetadata{
+				Name: "app-key", Type: secretTypeDerived, Seed: "seed", EnvVar: "APP_KEY",
+			},
+			// Independently calculated HKDF vector for the 0x55 seed.
+			Plaintext: "393b03e82110532071f891a35aa13d8522209973660f44e3fddf2ec1f00cd6af",
+		}
+		secrets := Secrets{Static: []StaticSecret{derived, explicit, seed, secret}}
+		fx.m.staticSecrets = secrets.persisted()
+		request(t, fx, newPCR0)
+		require.NoError(t, fx.m.handOffToSuccessor(ctx))
+		for _, tc := range []struct {
+			name          string
+			wantPlaintext string
+		}{
+			{"explicit", secret.Plaintext},
+			{"seed", strings.Repeat("55", 32)},
+			{"signing_key", secret.Plaintext},
+		} {
+			t.Run(tc.name+" ciphertext", func(t *testing.T) {
+				requireKMSCiphertextPlaintext(t, fx.kmsf,
+					fx.ssmf.params[testCfg.secretCiphertextParam(tc.name, migrationKeyID)],
+					mustDecodeHex(t, tc.wantPlaintext))
+			})
+		}
+		require.NotContains(
+			t,
+			fx.ssmf.params,
+			testCfg.secretCiphertextParam("app-key", migrationKeyID),
+		)
+		cfg := successorTestCfg(oldPCR0Hex)
+		cfg.StaticSecretConfig = managedSecretConfig(t, []StaticSecretMetadata{
+			derived.StaticSecretMetadata,
+			explicit.StaticSecretMetadata,
+			seed.StaticSecretMetadata,
+			secret.StaticSecretMetadata,
+		})
+		nsm := &nsmW{nsm: &fakeNSM{
+			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
+			verifyRoots: fx.session.attestationSign.roots,
+		}}
+		boot, err := NewBoot(cfg, nsm, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f)
+		require.NoError(t, err)
+		result, err := boot.Boot(ctx)
+		require.NoError(t, err)
+		require.Equal(t, secrets, result.secrets)
+		require.Subset(t, appEnv(Config{}, "token", result.secrets), []string{
+			"EXPLICIT_KEY=" + secret.Plaintext,
+			"SIGNING_KEY=" + secret.Plaintext,
+			"APP_KEY=" + derived.Plaintext,
+		})
+	})
+
+	t.Run("legacy to seed with derived removal restoration and later handoffs", func(t *testing.T) {
+		fx := setup(t)
+		predecessor := fx.m
+		previousPCR0 := oldPCR0Hex
+		seed := StaticSecretMetadata{Name: "signing_key", Type: secretTypeSeed}
+		adopted := StaticSecretMetadata{
+			Name: "app-key-v1", Type: secretTypeDerived, Seed: "signing_key", EnvVar: "APP_KEY_1",
+		}
+		restored := StaticSecretMetadata{
+			Name: "app-key-v1", Type: secretTypeDerived, Seed: "signing_key", EnvVar: "APP_KEY_3",
+		}
+		// Independently calculated HKDF vector for the legacy 0x11 plaintext.
+		const derivedKey = "7e38f2c26b62813faf1fd9aa61368c4fdf9c4eec7a81c15058444b6deb23cd3c"
+		// These steps share a predecessor chain and must run in order.
+		for _, step := range []struct {
+			name         string
+			pcr0         []byte
+			metadata     []StaticSecretMetadata
+			wantExported []StaticSecret
+		}{
+			{
+				name:         "adopt legacy as seed",
+				pcr0:         bytes.Repeat([]byte{0xce}, 48),
+				metadata:     []StaticSecretMetadata{seed, adopted},
+				wantExported: []StaticSecret{{StaticSecretMetadata: adopted, Plaintext: derivedKey}},
+			},
+			{
+				name:     "remove derived export",
+				pcr0:     bytes.Repeat([]byte{0xcf}, 48),
+				metadata: []StaticSecretMetadata{seed},
+			},
+			{
+				name:         "restore derived export",
+				pcr0:         bytes.Repeat([]byte{0xd0}, 48),
+				metadata:     []StaticSecretMetadata{seed, restored},
+				wantExported: []StaticSecret{{StaticSecretMetadata: restored, Plaintext: derivedKey}},
+			},
+		} {
+			if !t.Run(step.name, func(t *testing.T) {
+				pcr0Hex := hex.EncodeToString(step.pcr0)
+				_, err := requestMigrationTo(
+					t,
+					ctx,
+					predecessor,
+					fx.session.attestationSign,
+					pcr0Hex,
+				)
+				require.NoError(t, err)
+				require.NoError(t, predecessor.handOffToSuccessor(ctx))
+				keyID := fx.ssmf.params[testCfg.kmsKeyIDParam(pcr0Hex)]
+				requireKMSCiphertextPlaintext(
+					t,
+					fx.kmsf,
+					fx.ssmf.params[testCfg.secretCiphertextParam(secret.Name, keyID)],
+					secretPlaintext,
+				)
+				blobCount := len(fx.kmsf.blobs)
+				cfg := successorTestCfg(previousPCR0)
+				cfg.StaticSecretConfig = managedSecretConfig(t, step.metadata)
+				session := newStatefulNSMSession(
+					t, map[uint][]byte{0: step.pcr0, migrationPCRIndex: make([]byte, 48)},
+				)
+				session.attestationSign = fx.session.attestationSign
+				nsm := &nsmW{
+					nsm: &fakeNSM{session: session, verifyRoots: fx.session.attestationSign.roots},
+				}
+				boot, err := NewBoot(cfg, nsm, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f)
+				require.NoError(t, err)
+				result, err := boot.Boot(ctx)
+				require.NoError(t, err)
+				require.Equal(t, []StaticSecret{
+					{StaticSecretMetadata: seed, Plaintext: secret.Plaintext},
+				}, result.secrets.persisted())
+				require.Equal(t, step.wantExported, result.secrets.exported())
+				require.Equal(t, blobCount, len(fx.kmsf.blobs), "adoption generates no ciphertexts")
+				require.NotContains(
+					t,
+					fx.ssmf.params,
+					testCfg.secretCiphertextParam("app-key-v1", keyID),
+				)
+
+				// A second boot verifies the successor's own signed receipt.
+				resumed, err := boot.Boot(ctx)
+				require.NoError(t, err)
+				require.Equal(t, result.secrets, resumed.secrets)
+				predecessor, err = newMigrator(cfg, nsm, fx.ssm, fx.s3f, migrationIntentBucketName)
+				require.NoError(t, err)
+				predecessor.kms, predecessor.dek = result.kms, result.dek
+				predecessor.tlsKey, predecessor.staticSecrets = result.tlsKey, result.secrets.persisted()
+				previousPCR0 = pcr0Hex
+			}) {
+				return
+			}
+		}
 	})
 
 	t.Run("refuses to re-finalise onto an existing target pointer", func(t *testing.T) {

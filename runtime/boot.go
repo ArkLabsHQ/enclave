@@ -412,7 +412,11 @@ func (b *Boot) establish(
 	}
 
 	staticSecrets := make([]StaticSecret, 0, len(state.secretsMetadata.Static))
+	plaintexts := make(map[string][]byte, len(snapshot.staticSecrets))
 	for _, meta := range state.secretsMetadata.Static {
+		if !meta.persisted() {
+			continue
+		}
 		ciphertext, ok := snapshot.staticSecrets[meta]
 		if !ok {
 			return bootResult{}, fmt.Errorf("snapshot missing static secret %s", meta.Name)
@@ -423,9 +427,28 @@ func (b *Boot) establish(
 				"failed to decrypt static secret %s: %w", meta.Name, err,
 			)
 		}
+		if meta.Type == secretTypeSeed && len(plaintext) != 32 {
+			return bootResult{}, fmt.Errorf(
+				"seed %q must be 32 bytes, got %d",
+				meta.Name,
+				len(plaintext),
+			)
+		}
+		plaintexts[meta.Name] = plaintext
+	}
+	// Resolve in configuration order, after every persisted value was verified
+	// and decrypted. A derived entry may precede its seed in the configuration.
+	for _, meta := range state.secretsMetadata.Static {
+		plaintext := hex.EncodeToString(plaintexts[meta.Name])
+		if meta.Type == secretTypeDerived {
+			plaintext, err = deriveSecret(plaintexts[meta.Seed], meta.Name)
+			if err != nil {
+				return bootResult{}, fmt.Errorf("derive secret %q: %w", meta.Name, err)
+			}
+		}
 		staticSecrets = append(staticSecrets, StaticSecret{
 			StaticSecretMetadata: meta,
-			Plaintext:            hex.EncodeToString(plaintext),
+			Plaintext:            plaintext,
 		})
 	}
 
@@ -448,6 +471,9 @@ func (b *Boot) establish(
 func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyID string) error {
 	secrets := make(map[StaticSecretMetadata]string, len(state.secretsMetadata.Static))
 	for _, secret := range state.secretsMetadata.Static {
+		if !secret.persisted() {
+			continue
+		}
 		ciphertext, err := b.ssm.MustGet(ctx, b.cfg.secretCiphertextParam(secret.Name, keyID))
 		if err != nil {
 			return fmt.Errorf("required static secret SSM param missing: %w", err)
@@ -606,6 +632,9 @@ func (b *genesisBoot) buildSnapshot(
 
 	persistedSecrets := make(map[StaticSecretMetadata]string, len(state.secretsMetadata.Static))
 	for _, secret := range state.secretsMetadata.Static {
+		if !secret.persisted() {
+			continue
+		}
 		data, err := kms.GenerateDataKey(ctx)
 		if err != nil {
 			return bootSnapshot{}, fmt.Errorf(

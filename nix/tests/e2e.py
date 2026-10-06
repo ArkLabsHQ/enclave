@@ -233,7 +233,7 @@ def wait_for_otlp(signal, needle, group=None, timeout=90):
             if group is not None and record["group"] != group:
                 continue
             if needle in json.dumps(record["body"], separators=(",", ":")):
-                return
+                return record
         if time.time() > deadline:
             print(aws.execute("journalctl -u awsmocks --no-pager -n 50")[1])
             raise Exception(f"{needle!r} never reached the {signal} endpoint")
@@ -246,6 +246,26 @@ wait_for_otlp("traces", '"name":"health"')
 wait_for_otlp("traces", '"name":"init"')
 wait_for_otlp("metrics", "testapp_requests_total")
 wait_for_otlp("metrics", "enclave_http_requests_total")
+
+for signal in ("logs", "traces", "metrics"):
+    name = f"enclave_otlp_{signal}_forward_duration_seconds"
+    record = wait_for_otlp("metrics", name)
+    metric = next(
+        m
+        for resource in record["body"]["resourceMetrics"]
+        for scope in resource["scopeMetrics"]
+        for m in scope["metrics"]
+        if m["name"] == name
+    )
+    assert metric["unit"] == "s", metric
+    histogram = metric["histogram"]
+    assert histogram["aggregationTemporality"] == "AGGREGATION_TEMPORALITY_CUMULATIVE", histogram
+    assert histogram["dataPoints"], histogram
+    for point in histogram["dataPoints"]:
+        assert int(point["count"]) > 0, point
+        assert point["sum"] > 0, point
+        assert len(point["bucketCounts"]) == len(point["explicitBounds"]) + 1, point
+        assert sum(int(n) for n in point["bucketCounts"]) == int(point["count"]), point
 
 for record in otlp("logs"):
     assert record["stream"] == INSTANCE_ID, record

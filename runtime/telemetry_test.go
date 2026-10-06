@@ -117,6 +117,30 @@ func TestStartCreatesTwoGroupsAndProbesTheLogsEndpoint(t *testing.T) {
 	require.Equal(t, logspb.SeverityNumber_SEVERITY_NUMBER_INFO, records[0].SeverityNumber)
 }
 
+// Traces and metrics are optional: with both off everything is still set up,
+// but only logs leave the enclave.
+func TestStartWithTracesAndMetricsOffExportsOnlyLogs(t *testing.T) {
+	cfg := testConfigWithLogShipInterval(time.Hour)
+	cfg.ExportTraces, cfg.ExportMetrics = false, false
+	up := newFakeOTLPEndpoints(t)
+	telemetry := NewTelemetry(cfg, testAWS(t, newFakeCloudWatchLogs(), up.URL))
+	var stderr bytes.Buffer
+	telemetry.stderr = &stderr
+	telemetry.stderrLog = slog.New(newSlogHandler(&stderr, nil))
+
+	startTelemetry(t, context.Background(), telemetry)
+	_, span := telemetry.tp.Tracer("test").Start(context.Background(), "dropped")
+	span.End()
+	telemetry.Inc(metricHTTPRequests)
+	telemetry.Shutdown()
+
+	require.Empty(t, up.callsTo("/v1/traces"))
+	require.Empty(t, up.callsTo("/v1/metrics"))
+	require.Greater(t, len(up.callsTo("/v1/logs")), 1, "the probe, then the flushed startup record")
+	require.NotContains(t, stderr.String(), "telemetry export failed",
+		"a dropped upload is a success, not an export failure")
+}
+
 func TestStartFailsWhenTheLogsEndpointRefusesTheProbe(t *testing.T) {
 	before := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(before) })
@@ -592,6 +616,30 @@ func TestForwardRelaysUpstreamResponse(t *testing.T) {
 		point := histogramPoint(t, reader, otlpLogs.metricDuration)
 		require.Equal(t, uint64(1), point.Count)
 		require.GreaterOrEqual(t, point.Sum, stall.Seconds())
+	})
+
+	t.Run("a signal that is off is accepted and dropped", func(t *testing.T) {
+		up := newFakeOTLPEndpoints(t)
+		cfg := *testCfg
+		cfg.ExportTraces = false
+		telemetry := NewTelemetry(&cfg, testAWS(t, newFakeCloudWatchLogs(), up.URL))
+
+		w := forwardRequest(t, telemetry, otlpTraces,
+			buildOTLPTraceRequest(t, "s", tracepb.Status_STATUS_CODE_OK), protobuf)
+		require.Equal(t, http.StatusOK, w.Code)
+		require.Equal(t, protobuf, w.Header().Get("Content-Type"))
+		require.Empty(t, w.Body.String(), "an empty protobuf response is a valid success")
+
+		w = forwardRequest(t, telemetry, otlpTraces, []byte(`{"resourceSpans":[]}`),
+			"application/json")
+		require.Equal(t, http.StatusOK, w.Code)
+		require.Equal(t, "{}", w.Body.String())
+		require.Empty(t, up.callsTo("/v1/traces"), "nothing may reach AWS")
+
+		w = forwardRequest(t, telemetry, otlpMetrics,
+			buildOTLPSumMetric(t, "requests", 1), protobuf)
+		require.Equal(t, http.StatusOK, w.Code)
+		require.Len(t, up.callsTo("/v1/metrics"), 1, "only the signal that is off is dropped")
 	})
 
 	t.Run("json is the other OTLP encoding", func(t *testing.T) {

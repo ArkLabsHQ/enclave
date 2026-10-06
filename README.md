@@ -357,6 +357,8 @@ is disabled; the boot fails without it.
 | `ENCLAVE_MIGRATION_COOLDOWN` | `24h` | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Can be set in either production or dev mode; unset defaults to 24 hours in both. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Export cadence for the runtime's own logs, spans and metrics. The application's cadence is its own exporter's. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_TRACES` | `false` | `true` exports spans to X-Ray: the runtime's own and the application's, relayed from `/v1/traces`. Needs Transaction Search and the `XRayAccess` statement. Otherwise the application's uploads and the runtime's own spans are dropped inside the enclave with an empty success response. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
+| `ENCLAVE_METRICS` | `false` | `true` exports metrics to CloudWatch: the runtime's own counters, `/proc` readings and forward-duration histograms, and the application's, relayed from `/v1/metrics`. Needs the `CloudWatchMetricsAccess` statement. Otherwise the application's uploads and the runtime's own metrics are dropped inside the enclave with an empty success response, so export failures show only on `stderr`. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
 
 The application posts OTLP/HTTP to the internal listener. The runtime signs
 each request with the instance role, forwards its body unchanged, and returns
@@ -367,6 +369,10 @@ the AWS response:
 | logs | `logs.<region>.amazonaws.com/v1/logs` | `logs` | The log groups below, in the stream named for the instance. |
 | traces | `xray.<region>.amazonaws.com/v1/traces` | `xray` | X-Ray, in the `aws/spans` log group Transaction Search owns. |
 | metrics | `monitoring.<region>.amazonaws.com/v1/metrics` | `monitoring` | The CloudWatch OpenTelemetry metrics store, queried with PromQL. |
+
+Logs are always forwarded. Traces and metrics are forwarded only when
+`ENCLAVE_TRACES` or `ENCLAVE_METRICS` is `true`; otherwise their uploads get an
+empty success response and are dropped, so the application's exporter carries on.
 
 The relay accepts `application/x-protobuf` and `application/json`, including
 `gzip`, and caps encoded request bodies at 1 MiB for logs and metrics and 5 MiB
@@ -401,15 +407,16 @@ S3 keys as well. It is baked rather than settable from the overlay, and with
 `ENCLAVE_APP_NAME` names every log group exactly as it names every SSM parameter. Alarms, dashboards and the `CloudWatchLogsAccess`
 policy keyed on the old names need updating.
 
-Spans require Transaction Search to be enabled for X-Ray traces in the
+When those signals are on, spans require Transaction Search to be enabled for X-Ray traces in the
 CloudWatch account settings, and metrics require `cloudwatch:PutMetricData`. Export failures are counted in
 `enclave_telemetry_export_errors_total`, rate limited on `stderr`, and do not
 abort startup. Metrics are queried with PromQL by their OTLP attributes.
 
-The runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
+With `ENCLAVE_METRICS=true`, the runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
 `enclave_http_errors_total`, `enclave_app_proxied_requests_total`,
 `enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`
-(uploads AWS accepted with a `2xx`),
+(uploads accepted with a `2xx`, by AWS or, for a signal that is off, by the enclave
+dropping them),
 `enclave_otlp_<logs|traces|metrics>_upstream_errors_total` (a transport failure, a
 `429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
 and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
@@ -420,6 +427,10 @@ response body, failed ones included, whether relayed for the application or
 exported by the runtime. Both leave the enclave over the vsock
 proxy, so a slowing egress path shows here as rising latency long before uploads
 fail at the 30-second timeout. Buckets run from 5 ms to 30 s.
+
+**Changed:** traces and metrics are opt-in. Set `ENCLAVE_TRACES=true` and
+`ENCLAVE_METRICS=true` to keep exporting them; without them only logs leave the
+enclave.
 
 **Changed:** trace and metric log groups and the local telemetry decoder were
 removed. Logs remain in the two groups above; spans and metrics use their native
@@ -721,7 +732,8 @@ PCR0/key identity stops the walk and is reported through `complete` and
 Serves `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces` and `GET /health`
 only. The three forwarders expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`,
 accept OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
-`gzip`-encoded, and answer with whatever AWS answered. This is the endpoint
+`gzip`-encoded, and answer with whatever AWS answered. When traces or metrics
+are off, that forwarder answers with an empty success and forwards nothing. This is the endpoint
 advertised to the application through `ENCLAVE_PROXY_PORT`. It does not serve
 `/enclave/v1/info`, the `/enclave/*` endpoints, or the application proxy.
 
@@ -775,8 +787,8 @@ AWS credentials delivered through IMDS must allow:
 | `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
 | `STSAccess` | `GetCallerIdentity`. |
 | `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/<namespace>/<app>/enclave/*`. The OTLP `/v1/logs` endpoint authorises as `PutLogEvents` on the same group ARNs. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
-| `XRayAccess` | `xray:PutSpans`, `xray:PutSpansForIndexing` and `xray:PutTraceSegments` on `*`, plus Transaction Search enabled on the account. Without them every span export is refused; the enclave still boots and counts the refusals. |
-| `CloudWatchMetricsAccess` | `cloudwatch:PutMetricData` on `*`. Without it every metric export is refused; the enclave still boots and counts the refusals. |
+| `XRayAccess` | Only with `ENCLAVE_TRACES=true`. `xray:PutSpans`, `xray:PutSpansForIndexing` and `xray:PutTraceSegments` on `*`, plus Transaction Search enabled on the account. Without them every span export is refused; the enclave still boots and counts the refusals. |
+| `CloudWatchMetricsAccess` | Only with `ENCLAVE_METRICS=true`. `cloudwatch:PutMetricData` on `*`. Without it every metric export is refused; the enclave still boots and counts the refusals. |
 
 `Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
 operations are authorised by the enclave-created key's own PCR0-conditioned
@@ -1111,6 +1123,7 @@ sets:
   no AWS certificate chain. This flag is only read in dev mode.
 - `ENCLAVE_VERIFY_CLOCK_SOURCE=false` because the harness lacks `kvm-clock`.
 - `ENCLAVE_MIGRATION_COOLDOWN=2s` to exercise migration handoffs quickly.
+- `ENCLAVE_TRACES=true` and `ENCLAVE_METRICS=true` so the run covers every signal.
 
 Dev deployments keep attestation signature verification enabled by leaving
 `ENCLAVE_INSECURE_VERIFY_SKIPPED` unset or `false`.
@@ -1170,8 +1183,8 @@ the runtime creates both log groups and streams and writes a probe through the
 OTLP endpoint. Any failure aborts startup. The probe writes only to the runtime
 group: a policy that denies the application group still boots, and the
 application's log uploads then fail, counted in
-`enclave_otlp_logs_upstream_errors_total`. Span and metric export failures are
-reported but are not fatal.
+`enclave_otlp_logs_upstream_errors_total`. Span and metric export failures, when
+those signals are enabled, are reported but are not fatal.
 
 **Telemetry is not readable from the enclave.** Uploads are forwarded without
 local history or read endpoints. The telemetry IAM permissions are write-only.

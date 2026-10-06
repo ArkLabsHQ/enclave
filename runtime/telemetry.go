@@ -176,6 +176,7 @@ type Telemetry struct {
 	res           *resource.Resource
 
 	endpoints [otlpEndpointCount]otlpClient
+	exports   [otlpEndpointCount]bool
 
 	stderr    io.Writer
 	stderrLog *slog.Logger
@@ -195,7 +196,11 @@ func NewTelemetry(cfg *Config, client *AWSClient) *Telemetry {
 		instanceID:    cfg.InstanceID,
 		shipInterval:  cfg.LogShipInterval,
 		retentionDays: cfg.LogRetentionDays,
-		stderr:        os.Stderr,
+		exports: [otlpEndpointCount]bool{
+			otlpEndpointLogs: true, otlpEndpointTraces: cfg.ExportTraces,
+			otlpEndpointMetrics: cfg.ExportMetrics,
+		},
+		stderr: os.Stderr,
 		res: resource.NewSchemaless(
 			attribute.String("service.name", runtimeService),
 			attribute.String("service.version", Version),
@@ -210,6 +215,11 @@ func NewTelemetry(cfg *Config, client *AWSClient) *Telemetry {
 			t.endpoints[otlpEndpointLogs] = t.timed(otlpEndpointLogs, client.OTLP.Logs)
 			t.endpoints[otlpEndpointTraces] = t.timed(otlpEndpointTraces, client.OTLP.Traces)
 			t.endpoints[otlpEndpointMetrics] = t.timed(otlpEndpointMetrics, client.OTLP.Metrics)
+			for _, e := range []otlpEndpoint{otlpEndpointTraces, otlpEndpointMetrics} {
+				if !t.exports[e] {
+					t.endpoints[e].client = &http.Client{Transport: dropTransport{}}
+				}
+			}
 		}
 	}
 	for sig := signal(0); sig < signalCount; sig++ {
@@ -246,11 +256,17 @@ func (t *Telemetry) Start(ctx context.Context) error {
 	}
 
 	slog.SetDefault(slog.New(newSlogHandler(t.stderr, t.lp)))
+	exportsTo := func(e otlpEndpoint) string {
+		if !t.exports[e] {
+			return "disabled"
+		}
+		return t.endpoints[e].base
+	}
 	slog.Info("telemetry started",
 		"log_groups", t.groups[:], "log_stream", t.instanceID,
-		"logs", t.endpoints[otlpEndpointLogs].base,
-		"traces", t.endpoints[otlpEndpointTraces].base,
-		"metrics", t.endpoints[otlpEndpointMetrics].base)
+		"logs", exportsTo(otlpEndpointLogs),
+		"traces", exportsTo(otlpEndpointTraces),
+		"metrics", exportsTo(otlpEndpointMetrics))
 	return nil
 }
 
@@ -599,6 +615,29 @@ func (t *Telemetry) timed(endpoint otlpEndpoint, c otlpClient) otlpClient {
 	client := *c.client
 	client.Transport = &timedTransport{t: t, endpoint: endpoint, next: c.client.Transport}
 	return otlpClient{base: c.base, client: &client}
+}
+
+// dropTransport is the endpoint of a signal this enclave does not export. Every
+// upload, relayed or the runtime's own, is answered with an empty success without
+// leaving the enclave: an empty Export*ServiceResponse is zero bytes in protobuf
+// and {} in JSON.
+type dropTransport struct{}
+
+func (dropTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	ct := req.Header.Get("Content-Type")
+	body := ""
+	if strings.HasPrefix(ct, "application/json") {
+		body = "{}"
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {ct}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}, nil
 }
 
 type timedTransport struct {

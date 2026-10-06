@@ -204,6 +204,8 @@ let
     ENCLAVE_NAMESPACE = "ark/e2e/dev";
     ENCLAVE_AWS_REGION = "us-east-1";
     ENCLAVE_UPSTREAM = "h1";
+    ENCLAVE_TRACES = "true";
+    ENCLAVE_METRICS = "true";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";

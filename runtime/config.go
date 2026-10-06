@@ -37,6 +37,8 @@ const (
 	envViproxyOutAddrs  = "ENCLAVE_VIPROXY_OUT_ADDRS"
 	envLogShipInterval  = "ENCLAVE_LOG_SHIP_INTERVAL"
 	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
+	envTraces           = "ENCLAVE_TRACES"
+	envMetrics          = "ENCLAVE_METRICS"
 
 	// ACME settings accepted by the SSM overlay.
 	envUseACME       = "ENCLAVE_USE_ACME"
@@ -160,6 +162,8 @@ type Config struct {
 	ClockSyncInterval     time.Duration
 	LogShipInterval       time.Duration
 	LogRetentionDays      int32
+	ExportTraces          bool // Logs always ship; traces and metrics only when enabled.
+	ExportMetrics         bool
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
@@ -229,6 +233,13 @@ func LoadConfig() (*Config, error) {
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
 		// It is false by default unless explicitly overridden
 		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
+	}
+
+	if cfg.ExportTraces, err = takeEnvBool(envTraces); err != nil {
+		return nil, err
+	}
+	if cfg.ExportMetrics, err = takeEnvBool(envMetrics); err != nil {
+		return nil, err
 	}
 
 	if cooldown := takeEnv(envMigrationCooldown); cooldown != "" {
@@ -527,6 +538,20 @@ func takeEnvDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// takeEnvBool consumes an optional boolean: unset is false, and a value
+// strconv.ParseBool rejects is an error rather than a silent default.
+func takeEnvBool(key string) (bool, error) {
+	v := takeEnv(key)
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: want true or false", key, v)
+	}
+	return b, nil
 }
 
 func logShipInterval() time.Duration {

@@ -17,6 +17,7 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		Namespace: namespace, AppName: appName,
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
+		ExportTraces: true, ExportMetrics: true,
 		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
 		KMSLocked:          true,
 		VerifyClockSource:  true,
@@ -65,6 +66,8 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envMigrationCooldown, "")
 	t.Setenv(envVerifyClockSource, "")
 	t.Setenv(envInsecureVerifySkipped, "")
+	t.Setenv(envTraces, "")
+	t.Setenv(envMetrics, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")
 }
@@ -399,6 +402,38 @@ func TestLoadConfigVerifyClockSource(t *testing.T) {
 	}
 }
 
+// Logs always ship; traces and metrics only when their variable is set true.
+func TestLoadConfigTelemetrySignals(t *testing.T) {
+	for _, tc := range []struct {
+		name, traces, metrics   string
+		wantTraces, wantMetrics bool
+		wantErr                 string
+	}{
+		{name: "unset"},
+		{name: "blank", traces: "  ", metrics: "  "},
+		{name: "traces only", traces: "true", metrics: "false", wantTraces: true},
+		{name: "padded uppercase metrics only", metrics: " TRUE ", wantMetrics: true},
+		{name: "numeric", traces: "1", metrics: "0", wantTraces: true},
+		{name: "traces not a boolean", traces: "yes", wantErr: "invalid ENCLAVE_TRACES"},
+		{name: "metrics not a boolean", metrics: "on", wantErr: "invalid ENCLAVE_METRICS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envTraces, tc.traces)
+			t.Setenv(envMetrics, tc.metrics)
+
+			cfg, err := LoadConfig()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantTraces, cfg.ExportTraces)
+			require.Equal(t, tc.wantMetrics, cfg.ExportMetrics)
+		})
+	}
+}
+
 func TestLoadConfigInsecureVerifySkipped(t *testing.T) {
 	for _, dev := range []bool{false, true} {
 		for _, tc := range []struct {
@@ -528,6 +563,8 @@ func TestApplySSMOverlay(t *testing.T) {
 					path(envMigrationCooldown):     "0s",
 					path(envVerifyClockSource):     "false",
 					path(envInsecureVerifySkipped): "true",
+					path(envTraces):                "true",
+					path(envMetrics):               "true",
 					path(envPreviousPCR0):          "evil-pcr0",
 					path("SAFE_KEY"):               "ok",
 				}))

@@ -20,6 +20,7 @@ func newCurlCommand() *cobra.Command {
 		headers     []string
 		strictTLS   bool
 		skipCOSE    bool
+		signed      bool
 		verbose     bool
 	)
 
@@ -41,6 +42,7 @@ Use /enclave/v1/info for runtime, status, and migration information.`,
 				headers:     headers,
 				strictTLS:   strictTLS,
 				skipCOSE:    skipCOSE,
+				signed:      signed,
 				verbose:     verbose,
 				path:        args[0],
 			})
@@ -58,6 +60,10 @@ Use /enclave/v1/info for runtime, status, and migration information.`,
 		BoolVar(&skipCOSE, "insecure-skip-cose-verify", false,
 			"skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only)")
 	cmd.Flags().
+		BoolVar(&signed, "signed", false,
+			"require a response signed by the attested response-signing key "+
+				"(application routes and /enclave/v1/info)")
+	cmd.Flags().
 		BoolVarP(&verbose, "verbose", "v", false, "write request and verification details to stderr")
 	_ = cmd.MarkFlagRequired("base-url")
 	_ = cmd.MarkFlagRequired("expected-pcr0")
@@ -72,6 +78,7 @@ type curlOptions struct {
 	headers     []string
 	strictTLS   bool
 	skipCOSE    bool
+	signed      bool
 	verbose     bool
 	path        string
 }
@@ -117,6 +124,7 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 		ExpectedPCR0:           opts.expectedPCR,
 		StrictTLS:              opts.strictTLS,
 		InsecureSkipCOSEVerify: opts.skipCOSE,
+		SignedResponses:        opts.signed,
 	})
 	if err != nil {
 		return err
@@ -127,11 +135,11 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 	}
 
 	if opts.verbose {
-		fmt.Fprintf(
-			os.Stderr,
-			"< %d (PCR0 and attested TLS pin verified)\n",
-			resp.StatusCode,
-		)
+		verified := "PCR0 and attested TLS pin verified"
+		if opts.signed {
+			verified = "PCR0, attested TLS pin, and response signature verified"
+		}
+		fmt.Fprintf(os.Stderr, "< %d (%s)\n", resp.StatusCode, verified)
 	}
 	if _, err := os.Stdout.Write(resp.Body); err != nil {
 		return fmt.Errorf("write response: %w", err)

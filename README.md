@@ -634,8 +634,8 @@ preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
-| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 79 bytes: ASCII `sha256:`, the raw 32-byte SHA-256 of the TLS PublicKey, ASCII `ed25519:`, then the raw 32-byte Ed25519 response-signing public key (all zero until state is established). `503` until the application has been started, so always on a candidate. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. Signed on request; see [Signed responses](#signed-responses). |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
 | POST | `/enclave/v1/metrics` | bearer | OTLP protobuf metrics ingest, 1 MiB limit. |
 | POST | `/enclave/v1/logs` | bearer | OTLP protobuf logs ingest, 1 MiB limit. |
@@ -655,6 +655,124 @@ request in that namespace is proxied to the application. A request to the bare
 `/health` reports ready as soon as the application process has been started,
 which is marginally before it binds its port. Readiness probes should target an
 application endpoint.
+
+#### Signed responses
+
+A proxy in front of the enclave defeats TLS pinning, so a client can instead ask
+for each application response to be signed. A request carrying
+`X-Enclave-Sign-Nonce: <nonce>` (any non-empty value; use a fresh random one per
+request) gets back `X-Enclave-Signature`, a base64 Ed25519 signature by the key
+in the attestation `user_data` over these lines joined by `\n`, with no trailing
+newline:
+
+```
+enclave-signed-response
+<METHOD> <path as received, then ?query only if the query is non-empty>
+<lowercase authority: Host / HTTP/2 :authority, including any explicit port>
+<hex SHA-256 of the canonical request headers>
+<hex SHA-256 of the request body>
+<status code, decimal>
+<hex SHA-256 of the response body>
+```
+
+The signature binds the response to the request's method, path/query, authority,
+body, and its `Authorization`, `Content-Type`, and `X-Enclave-Sign-Nonce`
+headers; the nonce is bound through the header hash. Adding, removing, or
+changing a covered header invalidates verification. A gateway must preserve the
+authority and the covered headers; rewriting the path also breaks verification.
+
+No other request header is covered. Browsers, proxies, and CDNs add and rewrite
+headers such as `Origin`, `Cookie`, `X-Forwarded-For`, and tracing IDs in
+transit, and page JavaScript cannot read `HttpOnly` cookies, so covering them
+would fail legitimate requests. In a signed request an application must not rely
+on any other header for identity or authority, cookies and custom headers such
+as `X-API-Key` or `X-Tenant-ID` included: a proxy can add or change them
+unnoticed.
+
+The canonical headers are the covered names that are present, lowercase and
+sorted. Each is a record `name:base64(value1),base64(value2)\n`, including its
+final newline. Values are raw HTTP header bytes, with only leading/trailing
+spaces and tabs trimmed. Repeated values preserve their order and remain
+distinct from comma-folded values. An absent header has no record; a present
+empty value has one. Signed requests reject trailers and `Connection` options
+other than `close`/`keep-alive`, so a proxy cannot hide a covered header from
+the application by marking it hop-by-hop.
+
+Verification detects tampering when the response arrives; it does not prevent
+an altered request from executing. Response headers are not authenticated.
+Unsigned requests do not use this signature format.
+
+The key is derived from the storage DEK and the current PCR0 read from NSM with
+HKDF-SHA256. The salt is `enclave-response-signing`; the context is
+`enclave-response-signing-v2`, a zero byte, then the raw 48-byte PCR0. The
+32-byte output is the Ed25519 seed. Replicas and restarts of the same image
+share the key, while a migration to another PCR0 changes it without storing
+additional state. A predecessor's response cannot verify against the successor's
+attested signing key. This separates responses by measured image; a holder of
+the shared DEK can still derive keys for other PCR0 values.
+
+Requests without the header are proxied unchanged and stream as before.
+Signed request and response bodies are buffered whole before the signature is
+sent, so signed requests suit bounded bodies, not uploads, downloads or streams. Signed responses carry `Cache-Control: no-store`, since each
+answers a single nonce. The `502` for an unreachable application is signed like
+any other response. `/enclave/v1/info` is signed the same way once the runtime
+holds its signing key; before that, as a candidate, a signed request to it is
+answered `503` while unsigned requests are served as usual. Other `/enclave/*`
+endpoints, `/health`, the `503` served before the application starts, and gRPC
+are not signed.
+
+The response body is signed decoded: for a signed request the runtime drops
+`Accept-Encoding` before proxying, so Go's upstream transport requests gzip and
+decodes it, and clients verify the body after their own decompression (the Go
+client also lets its transport handle compression). An application that sends a
+compressed body regardless of `Accept-Encoding`, such as pre-compressed `br`
+assets, fails verification. Signed responses carry
+`Access-Control-Expose-Headers: X-Enclave-Signature`; a cross-origin page also
+needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
+
+##### Verifying in a browser
+
+Browsers verify with WebCrypto Ed25519 (Chrome 137+, Firefox 129+, Safari 17+).
+`signingKey` must come from an attestation document the page has verified
+(COSE signature, AWS Nitro chain, PCR0): it is bytes 47–79 of `user_data`.
+
+```js
+async function signedFetch(url, init = {}, signingKey) {
+  const hex = (b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+  const sha256 = async (b) => hex(await crypto.subtle.digest("SHA-256", b));
+  const nonce = hex(crypto.getRandomValues(new Uint8Array(20)));
+  const headers = new Headers(init.headers);
+  headers.set("X-Enclave-Sign-Nonce", nonce);
+
+  // Build once: Request captures the automatic Content-Type and the body bytes.
+  const req = new Request(new URL(url, location.href), {
+    ...init, headers, redirect: "error", cache: "no-store",
+  });
+  const u = new URL(req.url);
+  const reqBody = await req.clone().arrayBuffer();
+  const canonical = ["authorization", "content-type", "x-enclave-sign-nonce"]
+    .filter((name) => req.headers.has(name))
+    .map((name) => `${name}:${btoa(req.headers.get(name).replace(/^[ \t]+|[ \t]+$/g, ""))}\n`)
+    .join("");
+  const headerHash = await sha256(new TextEncoder().encode(canonical));
+
+  const resp = await fetch(req);
+  const body = new Uint8Array(await resp.arrayBuffer());
+  const msg = `enclave-signed-response\n${req.method} ${u.pathname}${u.search}\n` +
+    `${u.host.toLowerCase()}\n${headerHash}\n${await sha256(reqBody)}\n` +
+    `${resp.status}\n${await sha256(body)}`;
+
+  const key = await crypto.subtle.importKey("raw", signingKey, { name: "Ed25519" }, false, ["verify"]);
+  const sig = Uint8Array.from(atob(resp.headers.get("X-Enclave-Signature") ?? ""), (c) => c.charCodeAt(0));
+  if (!(await crypto.subtle.verify({ name: "Ed25519" }, key, sig, new TextEncoder().encode(msg)))) {
+    throw new Error("missing or invalid X-Enclave-Signature");
+  }
+  return { status: resp.status, headers: resp.headers, body };
+}
+```
+
+Cookies, if the page sends them, are not covered; authenticate signed requests
+with an `Authorization` header.
 
 #### Ancestor-key audit
 
@@ -935,7 +1053,8 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 79-byte `user_data` binding, and live certificate pinning are still checked. |
+| `--signed` | `false` | Require a [signed response](#signed-responses), verified against the attested signing key. Covers application routes and `/enclave/v1/info`. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
@@ -949,8 +1068,8 @@ enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 ```
 
-The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
-status is 400 or above.
+The CLI exits non-zero if attestation, TLS pinning, or a requested response
+signature fails, and if the HTTP status is 400 or above.
 
 ### Go client
 
@@ -988,6 +1107,7 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
 | `InsecureTLS` | unset | Removes the certificate pin entirely. |
+| `SignedResponses` | `false` | Requests and verifies a [signed response](#signed-responses) on every `Do`, `Get`, and `Post`, on top of the TLS pin. Redirects are returned to the caller, not followed. Behind a proxy that terminates TLS, also set `InsecureTLS`. |
 
 What is verified on the first request, and cached for `CacheTTL`:
 
@@ -996,9 +1116,10 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
+| `user_data` is exactly the 79-byte TLS PublicKey hash and signing key layout, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
+| Each response's signature verifies under the attested signing key (per response, not cached) | off | enabled by `SignedResponses` |
 
 The certificate pin is installed from the attestation document before any
 request carrying data is made, so a request issued before verification completes

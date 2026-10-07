@@ -2,20 +2,25 @@ package runtime
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/hf/nsm/request"
@@ -245,7 +250,7 @@ func TestAttestationHandler(t *testing.T) {
 		if !bytes.Equal(req.UserData, hashes.Serialize()) {
 			t.Fatalf("user_data: got %x, want %x", req.UserData, hashes.Serialize())
 		}
-		require.Len(t, req.UserData, 39)
+		require.Len(t, req.UserData, 79)
 	})
 }
 
@@ -608,4 +613,222 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		require.Equal(t, "/enclave/", rr.Header().Get("Location"))
 		require.NotContains(t, proxied, "/enclave")
 	})
+}
+
+func TestSignedProxiedResponse(t *testing.T) {
+	var received []byte
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		out := append([]byte("echo:"), received...)
+		// Like typical compression middleware.
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			var buf bytes.Buffer
+			zw := gzip.NewWriter(&buf)
+			_, _ = zw.Write(out)
+			_ = zw.Close()
+			w.Header().Set("Content-Encoding", "gzip")
+			out = buf.Bytes()
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(out)
+	}))
+	defer app.Close()
+	appURL, err := url.Parse(app.URL)
+	require.NoError(t, err)
+
+	rt := newRuntimeState()
+	rt.NotifyReady()
+	hashes := &AttestationHashes{}
+	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
+	s := SetupHttpServers(
+		rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), hashes, "token",
+	).(*servers)
+
+	serveURI := func(uri, nonce string, header http.Header) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, uri, strings.NewReader("amount=10"))
+		maps.Copy(req.Header, header)
+		if nonce != "" {
+			req.Header.Set(signNonceHeader, nonce)
+		}
+		rr := httptest.NewRecorder()
+		s.em.ServeHTTP(rr, req)
+		return rr
+	}
+	serve := func(nonce string) *httptest.ResponseRecorder {
+		return serveURI("/orders?x=1", nonce, nil)
+	}
+	verify := func(t *testing.T, rr *httptest.ResponseRecorder, nonce, uri string) {
+		t.Helper()
+		reqHash := sha256.Sum256([]byte("amount=10"))
+		respHash := sha256.Sum256(rr.Body.Bytes())
+		headersHash := sha256.Sum256([]byte("x-enclave-sign-nonce:" +
+			base64.StdEncoding.EncodeToString([]byte(nonce)) + "\n"))
+		msg := "enclave-signed-response\nPOST " + uri + "\nexample.com\n" +
+			hex.EncodeToString(headersHash[:]) + "\n" + hex.EncodeToString(reqHash[:]) +
+			"\n201\n" + hex.EncodeToString(respHash[:])
+		sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+		require.NoError(t, err)
+		require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), []byte(msg), sig))
+	}
+
+	t.Run("fails closed without a signing key, before the app sees it", func(t *testing.T) {
+		require.Equal(t, http.StatusServiceUnavailable, serve("n1").Code)
+		require.Nil(t, received)
+	})
+
+	hashes.SetResponseSigningKey(key)
+
+	t.Run("signs request and response when asked", func(t *testing.T) {
+		rr := serve("n1")
+		require.Equal(t, http.StatusCreated, rr.Code)
+		require.Equal(t, "amount=10", string(received), "the app still gets the body")
+		require.Equal(t, "echo:amount=10", rr.Body.String())
+		verify(t, rr, "n1", "/orders?x=1")
+		require.Contains(t, rr.Header().Values("Access-Control-Expose-Headers"), signatureHeader)
+		require.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
+	})
+
+	// Browsers always decompress and send "/a?" or "/a" interchangeably, so the
+	// signature must cover the decoded body and drop an empty query.
+	t.Run("signs what a browser sees", func(t *testing.T) {
+		rr := serveURI("/orders?", "n3", http.Header{"Accept-Encoding": {"gzip, br"}})
+		require.Equal(t, http.StatusCreated, rr.Code)
+		require.Empty(t, rr.Header().Get("Content-Encoding"))
+		require.Equal(t, "echo:amount=10", rr.Body.String())
+		verify(t, rr, "n3", "/orders")
+	})
+
+	t.Run("leaves other responses unsigned", func(t *testing.T) {
+		rr := serve("")
+		require.Equal(t, http.StatusCreated, rr.Code)
+		require.Empty(t, rr.Header().Get(signatureHeader))
+	})
+
+	t.Run("signs the proxy's own 502 when the app is down", func(t *testing.T) {
+		app.Close()
+		rr := serve("n2")
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.NotEmpty(t, rr.Header().Get(signatureHeader))
+	})
+}
+
+func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
+	hashes := &AttestationHashes{}
+	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
+	hashes.SetResponseSigningKey(key)
+	h := signResponses(hashes, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*http.Request)
+		detected bool
+	}{
+		{name: "unchanged"},
+		{"authorization", func(r *http.Request) { r.Header.Set("Authorization", "Bearer bob") }, true},
+		{"content type", func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") }, true},
+		{"authority", func(r *http.Request) { r.Host = "other.example" }, true},
+		{"cookie is not covered", func(r *http.Request) { r.Header.Set("Cookie", "session=bob") }, false},
+		{"proxy header is not covered", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "10.0.0.1")
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
+			req.Header.Set(signNonceHeader, "nonce")
+			req.Header.Set("Authorization", "Bearer alice")
+			expected, err := captureResponseSigningContext(req, nil)
+			require.NoError(t, err)
+			if tc.mutate != nil {
+				tc.mutate(req)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+			sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+			require.NoError(t, err)
+			msg := expected.responseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
+			valid := ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig)
+			require.Equal(t, !tc.detected, valid)
+		})
+	}
+}
+
+func TestSignedResponseRejectsConnectionHeaderStripping(t *testing.T) {
+	hashes := &AttestationHashes{}
+	hashes.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	called := false
+	h := signResponses(hashes, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
+	req.Header.Set(signNonceHeader, "nonce")
+	req.Header.Set("Authorization", "Bearer alice")
+	req.Header.Set("Connection", "Authorization")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	require.False(t, called, "reject before ReverseProxy removes a covered header")
+}
+
+func TestSignedRequestBodyReadError(t *testing.T) {
+	hashes := &AttestationHashes{}
+	hashes.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	h := signResponses(hashes, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("the app must not see a signed request whose body could not be read")
+	}))
+	body := iotest.ErrReader(errors.New("client went away"))
+	req := httptest.NewRequest(http.MethodPost, "/orders", body)
+	req.Header.Set(signNonceHeader, "n")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestSignedEnclaveInfo(t *testing.T) {
+	hashes := &AttestationHashes{}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), hashes: hashes}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
+		previous: &PreviousPCR0Info{},
+		status:   &MigrationStatus{},
+	}))
+	request := func(method, nonce string) (*http.Request, *httptest.ResponseRecorder) {
+		req := httptest.NewRequest(method, "/enclave/v1/info", nil)
+		if nonce != "" {
+			req.Header.Set(signNonceHeader, nonce)
+		}
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, req)
+		return req, rr
+	}
+	get := func(nonce string) (*http.Request, *httptest.ResponseRecorder) {
+		return request(http.MethodGet, nonce)
+	}
+
+	// A candidate has no signing key yet; plain readers still get the info.
+	_, rr := get("")
+	require.Equal(t, http.StatusOK, rr.Code)
+	_, rr = get("n1")
+	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+
+	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
+	hashes.SetResponseSigningKey(key)
+	req, rr := get("n2")
+	require.Equal(t, http.StatusOK, rr.Code)
+	signingContext, err := captureResponseSigningContext(req, nil)
+	require.NoError(t, err)
+	sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+	require.NoError(t, err)
+	msg := signingContext.responseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
+	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
+
+	// GET patterns also serve HEAD, whose response reaches the client bodiless.
+	req, rr = request(http.MethodHead, "n3")
+	require.Equal(t, http.StatusOK, rr.Code)
+	signingContext, err = captureResponseSigningContext(req, nil)
+	require.NoError(t, err)
+	sig, err = base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+	require.NoError(t, err)
+	msg = signingContext.responseMessage(sha256.Sum256(nil), rr.Code)
+	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }

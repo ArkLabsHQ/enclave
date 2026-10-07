@@ -23,6 +23,8 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -66,6 +68,12 @@ type Options struct {
 	// tests where the emulated NSM doesn't produce an AWS-rooted ECDSA384
 	// signature. Never set this against a real production enclave.
 	InsecureSkipCOSEVerify bool
+
+	// SignedResponses asks the enclave to sign each response with its attested
+	// response-signing key, bound to this request, and fails any response whose
+	// signature is missing or invalid. It is checked on top of the TLS pin;
+	// behind a proxy that terminates TLS, also set InsecureTLS.
+	SignedResponses bool
 }
 
 // Response wraps an HTTP response with attestation verification metadata.
@@ -79,7 +87,8 @@ type Response struct {
 type AttestationResult struct {
 	PCR0       string
 	PCRs       map[uint]string
-	TLSKeyHash string // hex-encoded SHA-256 of the enclave TLS PublicKey
+	TLSKeyHash string            // hex-encoded SHA-256 of the enclave TLS PublicKey
+	SigningKey ed25519.PublicKey // response-signing key; nil if the enclave attests none
 	Verified   bool
 	VerifiedAt time.Time
 }
@@ -156,6 +165,13 @@ func New(baseURL string, opts Options) (*Client, error) {
 		}
 	}
 	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: mainTransport}
+	if opts.SignedResponses {
+		// A redirect is signed for the request that drew it, so return it to
+		// the caller instead of following it.
+		c.httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 
 	return c, nil
 }
@@ -197,10 +213,25 @@ func (c *Client) Post(ctx context.Context, path string, body io.Reader) (*Respon
 }
 
 // Do verifies attestation and activates the attested TLS pin before executing
-// the request over the pinned connection.
+// the request over the pinned connection. With SignedResponses it also
+// verifies the response signature.
 func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
-	if _, err := c.ensureVerified(ctx); err != nil {
+	attest, err := c.ensureVerified(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("attestation verification failed: %w", err)
+	}
+
+	var signingContext responseSigningContext
+	if c.opts.SignedResponses {
+		if attest.SigningKey == nil {
+			return nil, fmt.Errorf("enclave attests no response signing key")
+		}
+		// Sign a copy so the caller's headers stay unchanged; the body is still
+		// consumed, as by any Do.
+		req = req.Clone(req.Context())
+		if signingContext, err = prepareResponseSigningContext(req); err != nil {
+			return nil, err
+		}
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -212,6 +243,21 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if c.opts.SignedResponses {
+		msg := signingContext.responseMessage(sha256.Sum256(body), resp.StatusCode)
+		if err := verifyResponseSignature(attest.SigningKey, msg, resp.Header); err != nil {
+			// The key may have changed (a fresh genesis, or the other generation
+			// during a migration): attest again on the next call.
+			c.mu.Lock()
+			if c.cachedState == attest {
+				c.cachedState = nil
+			}
+			c.mu.Unlock()
+			// The status is unauthenticated; it only says what answered.
+			return nil, fmt.Errorf("response signature (HTTP %d): %w", resp.StatusCode, err)
+		}
 	}
 
 	return &Response{
@@ -255,9 +301,9 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 	}
 
 	// 2. Extract the attested tlsKeyHash and activate the pin before any further request.
-	tlsKeyHash, err := extractTLSKeyHash(nitResult)
+	tlsKeyHash, signingKey, err := parseUserData(nitResult)
 	if err != nil {
-		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
+		return nil, fmt.Errorf("parse user_data: %w", err)
 	}
 	c.setPinHash(tlsKeyHash)
 
@@ -289,6 +335,7 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 		PCR0:       c.opts.ExpectedPCR0,
 		PCRs:       pcrs,
 		TLSKeyHash: tlsKeyHash,
+		SigningKey: signingKey,
 		Verified:   true,
 		VerifiedAt: time.Now(),
 	}

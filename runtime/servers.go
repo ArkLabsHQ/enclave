@@ -3,14 +3,19 @@ package runtime
 // servers.go wires public/private muxes, admin handlers, reverse proxy, and listeners.
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -26,6 +31,9 @@ const (
 	nonceNumDigits          = 40 // 20-byte nonce, hex-encoded
 	enclavePrefix           = "/enclave/"
 	externalRuntimeV1Prefix = enclavePrefix + "v1/"
+
+	signNonceHeader = "X-Enclave-Sign-Nonce"
+	signatureHeader = "X-Enclave-Signature"
 )
 
 var (
@@ -67,6 +75,7 @@ type servers struct {
 	em  *http.ServeMux
 	rt  RuntimeState
 
+	hashes   *AttestationHashes
 	ancestry atomic.Value // Ancestry, set once state is established
 }
 
@@ -111,7 +120,7 @@ func SetupHttpServers(
 
 	em.Handle("/health", sm)
 
-	em.Handle("/", whenReady(rt, revProxy))
+	em.Handle("/", whenReady(rt, signResponses(hashes, revProxy)))
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
@@ -132,12 +141,13 @@ func SetupHttpServers(
 	}
 
 	return &servers{
-		cfg: &cfg,
-		ext: ext,
-		int: int,
-		rm:  rm,
-		em:  em,
-		rt:  rt,
+		cfg:    &cfg,
+		ext:    ext,
+		int:    int,
+		rm:     rm,
+		em:     em,
+		rt:     rt,
+		hashes: hashes,
 	}
 }
 
@@ -209,7 +219,7 @@ func (s *servers) SetAncestry(ctx context.Context, ancestry Ancestry) {
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
-	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
+	info := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		migrationStatus, err := migrator.MigrationStatus(r.Context())
@@ -254,7 +264,9 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 			KMSKeyLocked:             s.cfg.KMSLocked,
 			Ancestry:                 ancestryInfo,
 		})
-	})
+	}
+	// Signed on request like application responses, once the signing key exists.
+	s.rm.Handle("GET /enclave/v1/info", signResponses(s.hashes, http.HandlerFunc(info)))
 
 	return nil
 }
@@ -377,6 +389,67 @@ func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 		_, _ = fmt.Fprintln(w, base64.StdEncoding.EncodeToString(doc))
 	}
 }
+
+// signResponses signs the response to a request carrying signNonceHeader with
+// the attested response-signing key, over the request as received and the
+// response as sent. Other requests pass through unbuffered.
+func signResponses(hashes *AttestationHashes, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce := r.Header.Get(signNonceHeader)
+		if nonce == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Refuse before the app acts on the request, not after.
+		key := hashes.responseSigningKey()
+		if key == nil {
+			http.Error(w, "no response signing key", http.StatusServiceUnavailable)
+			return
+		}
+		reqBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		signingContext, err := captureResponseSigningContext(r, reqBody)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Sign the decoded body: browsers always decompress and cannot opt out.
+		// Without the header, the upstream transport requests gzip itself and
+		// decodes it before we see the body.
+		r.Header.Del("Accept-Encoding")
+
+		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		// A HEAD response carries no body on the wire; sign the empty one sent.
+		if r.Method == http.MethodHead {
+			rec.body.Reset()
+		}
+		msg := signingContext.responseMessage(sha256.Sum256(rec.body.Bytes()), rec.status)
+		maps.Copy(w.Header(), rec.header)
+		w.Header().Set(signatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg)))
+		// Lets cross-origin browser code read the signature.
+		w.Header().Add("Access-Control-Expose-Headers", signatureHeader)
+		// The signature answers one nonce; a cached copy could only fail verification.
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(rec.status)
+		_, _ = w.Write(rec.body.Bytes())
+	})
+}
+
+// bufferedResponse holds a response until it is signed.
+type bufferedResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *bufferedResponse) Header() http.Header         { return b.header }
+func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
+func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
 // so, the error from its exit. The runtime stays alive after app exit so

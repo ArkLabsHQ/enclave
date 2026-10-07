@@ -3,7 +3,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -105,11 +104,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	// Check permissions before durable writes; keep failures visible through the API.
-	permissions := &Permissions{
-		cfg: &cfg, ssm: ssm, iam: aws.IAM, pcr0: hex.EncodeToString(pcr0),
-		backoff: preflightBackoff,
-	}
-	if err := permissions.Preflight(ctx, aws.STS); err != nil {
+	if err := CheckPermissions(ctx, &cfg, ssm, aws.IAM, aws.STS, pcr0); err != nil {
 		slog.Error("boot stopped", "error", err)
 		servers.ReportBootFailure(err)
 		return waitForRuntime(ctx, rt)

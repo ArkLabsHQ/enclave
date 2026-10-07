@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,20 +31,31 @@ const (
 	preflightBackoff  = 5 * time.Second
 )
 
-// Permissions checks the host role's boot and migration grants.
-type Permissions struct {
+type permissions struct {
 	cfg     *Config
 	ssm     SSM
 	iam     IAMAPI
+	sts     STSAPI
 	pcr0    string
 	backoff time.Duration // grows linearly between attempts
 }
 
-// Preflight checks role grants before durable writes can strand state.
-// It does not check resource policies or bucket configuration.
-func (p *Permissions) Preflight(ctx context.Context, stsc STSAPI) error {
+// CheckPermissions checks the host role's boot and migration grants before
+// durable writes can strand state. It does not check resource policies or
+// bucket configuration.
+func CheckPermissions(
+	ctx context.Context, cfg *Config, ssm SSM, iam IAMAPI, sts STSAPI, pcr0 []byte,
+) error {
+	p := &permissions{
+		cfg: cfg, ssm: ssm, iam: iam, sts: sts,
+		pcr0: hex.EncodeToString(pcr0), backoff: preflightBackoff,
+	}
+	return p.preflight(ctx)
+}
+
+func (p *permissions) preflight(ctx context.Context) error {
 	for attempt := 1; ; attempt++ {
-		err := p.check(ctx, stsc)
+		err := p.check(ctx)
 		if err == nil || !isTransient(err) || attempt == preflightAttempts {
 			return err
 		}
@@ -57,8 +69,8 @@ func (p *Permissions) Preflight(ctx context.Context, stsc STSAPI) error {
 	}
 }
 
-func (p *Permissions) check(ctx context.Context, stsc STSAPI) error {
-	identity, err := stsc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+func (p *permissions) check(ctx context.Context) error {
+	identity, err := p.sts.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
 		return fmt.Errorf("permission preflight: resolve caller identity: %w", err)
 	}
@@ -98,7 +110,7 @@ func (p *Permissions) check(ctx context.Context, stsc STSAPI) error {
 	return nil
 }
 
-func (p *Permissions) simulateGrant(
+func (p *permissions) simulateGrant(
 	ctx context.Context, roleARN string, g requiredGrant,
 	entries []iamtypes.ContextEntry,
 ) ([]string, error) {
@@ -165,7 +177,7 @@ func (p *Permissions) simulateGrant(
 	return missing, nil
 }
 
-func (p *Permissions) requiredGrants(
+func (p *permissions) requiredGrants(
 	ctx context.Context, partition, account string,
 ) ([]requiredGrant, error) {
 	intentBucket := migrationIntentBucketName(p.cfg, account)

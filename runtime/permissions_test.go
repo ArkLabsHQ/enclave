@@ -132,13 +132,14 @@ func TestPermissionsPreflight(t *testing.T) {
 				tc.cfg.route53ZoneIDParam(): "/hostedzone/Z123",
 			}})
 
-			permissions := &Permissions{
+			p := &permissions{
 				cfg:  tc.cfg,
 				ssm:  ssm,
 				iam:  tc.iam,
+				sts:  sts,
 				pcr0: permissionTestPCR0,
 			}
-			err := permissions.Preflight(context.Background(), sts)
+			err := p.preflight(context.Background())
 			if tc.wantErr == nil {
 				require.NoError(t, err)
 				return
@@ -157,8 +158,8 @@ func TestPermissionsPreflight(t *testing.T) {
 			cfg.leaseBucketParam(): "lease-bucket",
 			cfg.certBucketParam():  "cert-bucket",
 		}})
-		permissions := &Permissions{cfg: &cfg, ssm: ssm, iam: fake, pcr0: permissionTestPCR0}
-		require.NoError(t, permissions.Preflight(context.Background(), sts))
+		p := &permissions{cfg: &cfg, ssm: ssm, iam: fake, sts: sts, pcr0: permissionTestPCR0}
+		require.NoError(t, p.preflight(context.Background()))
 
 		for _, call := range fake.calls {
 			require.Equal(
@@ -187,30 +188,32 @@ func TestPermissionsPreflight(t *testing.T) {
 	})
 
 	t.Run("missing bucket parameter", func(t *testing.T) {
-		permissions := &Permissions{
+		p := &permissions{
 			cfg:  testCfg,
 			ssm:  NewSSM(&fakeSSM{}),
 			iam:  &fakeIAM{},
+			sts:  sts,
 			pcr0: permissionTestPCR0,
 		}
-		err := permissions.Preflight(context.Background(), sts)
+		err := p.preflight(context.Background())
 		require.ErrorContains(t, err, testCfg.leaseBucketParam())
 	})
 }
 
-func permissionFixture(acme bool) (*Permissions, *fakeSTS) {
+func permissionFixture(acme bool) *permissions {
 	cfg := *testCfg
 	cfg.UseACME = acme
 	cfg.AWSRegion = "eu-west-1"
 	cfg.FQDN = "Enclave.Example.com"
-	return &Permissions{
+	return &permissions{
 		cfg: &cfg, pcr0: permissionTestPCR0,
 		ssm: NewSSM(&fakeSSM{params: map[string]string{
 			cfg.leaseBucketParam():   "lease-bucket",
 			cfg.certBucketParam():    "cert-bucket",
 			cfg.route53ZoneIDParam(): "/hostedzone/Z123",
 		}}),
-	}, &fakeSTS{arn: "arn:aws:sts::123456789012:assumed-role/enclave/session"}
+		sts: &fakeSTS{arn: "arn:aws:sts::123456789012:assumed-role/enclave/session"},
+	}
 }
 
 func permissionContextValues(entries []iamtypes.ContextEntry) map[string][]string {
@@ -222,7 +225,7 @@ func permissionContextValues(entries []iamtypes.ContextEntry) map[string][]strin
 }
 
 func TestPermissionsConditionalPolicies(t *testing.T) {
-	permissions, sts := permissionFixture(true)
+	p := permissionFixture(true)
 	seen := make(map[string]bool)
 	fake := &fakeIAM{
 		evaluate: func(action, resource string, entries []iamtypes.ContextEntry) iamtypes.PolicyEvaluationDecisionType {
@@ -281,8 +284,8 @@ func TestPermissionsConditionalPolicies(t *testing.T) {
 			return iamtypes.PolicyEvaluationDecisionTypeAllowed
 		},
 	}
-	permissions.iam = fake
-	require.NoError(t, permissions.Preflight(context.Background(), sts))
+	p.iam = fake
+	require.NoError(t, p.preflight(context.Background()))
 	require.Len(t, seen, 7)
 
 	fake.evaluate = func(action, _ string, entries []iamtypes.ContextEntry) iamtypes.PolicyEvaluationDecisionType {
@@ -297,14 +300,14 @@ func TestPermissionsConditionalPolicies(t *testing.T) {
 	}
 	require.ErrorContains(
 		t,
-		permissions.Preflight(context.Background(), sts),
+		p.preflight(context.Background()),
 		"kms:CreateKey on * (explicitDeny)",
 	)
 }
 
 func TestPermissionsConcreteResourceDenials(t *testing.T) {
-	permissions, sts := permissionFixture(true)
-	intentBucket := migrationIntentBucketName(permissions.cfg, fakeSTSAccountID)
+	p := permissionFixture(true)
+	intentBucket := migrationIntentBucketName(p.cfg, fakeSTSAccountID)
 	tests := []struct{ name, resource, action string }{
 		{"genesis record", "arn:aws:s3:::" + intentBucket + "/deployment-genesis", "s3:PutObject"},
 		{"genesis lease", "arn:aws:s3:::lease-bucket/prod/app/lock/genesis", "s3:PutObject"},
@@ -340,15 +343,15 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 					return iamtypes.PolicyEvaluationDecisionTypeAllowed
 				},
 			}
-			permissions.iam = fake
-			err := permissions.Preflight(context.Background(), sts)
+			p.iam = fake
+			err := p.preflight(context.Background())
 			require.ErrorContains(t, err, tc.action+" on "+tc.resource+" (explicitDeny)")
 		})
 	}
-	permissions, sts = permissionFixture(false)
+	p = permissionFixture(false)
 	fake := &fakeIAM{}
-	permissions.iam = fake
-	require.NoError(t, permissions.Preflight(context.Background(), sts))
+	p.iam = fake
+	require.NoError(t, p.preflight(context.Background()))
 	require.True(
 		t,
 		fake.simulated(
@@ -363,7 +366,7 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 }
 
 func TestPermissionsPagination(t *testing.T) {
-	permissions, sts := permissionFixture(false)
+	p := permissionFixture(false)
 	for _, denied := range []bool{false, true} {
 		t.Run(
 			map[bool]string{false: "allowed second page", true: "denied second page"}[denied],
@@ -385,8 +388,8 @@ func TestPermissionsPagination(t *testing.T) {
 					}
 					return out, err
 				}
-				permissions.iam = fake
-				err := permissions.Preflight(context.Background(), sts)
+				p.iam = fake
+				err := p.preflight(context.Background())
 				if denied {
 					require.ErrorContains(t, err, "ssm:PutParameter")
 				} else {
@@ -404,7 +407,7 @@ func TestPermissionsPagination(t *testing.T) {
 }
 
 func TestPermissionsIncompleteSimulation(t *testing.T) {
-	permissions, sts := permissionFixture(false)
+	p := permissionFixture(false)
 	for _, tc := range []struct {
 		name string
 		out  *iam.SimulatePrincipalPolicyOutput
@@ -421,10 +424,10 @@ func TestPermissionsIncompleteSimulation(t *testing.T) {
 					return tc.out, nil
 				},
 			}
-			permissions.iam = fake
+			p.iam = fake
 			require.ErrorContains(
 				t,
-				permissions.Preflight(context.Background(), sts),
+				p.preflight(context.Background()),
 				tc.want,
 			)
 			require.LessOrEqual(t, len(fake.calls), 2)
@@ -433,7 +436,7 @@ func TestPermissionsIncompleteSimulation(t *testing.T) {
 }
 
 func TestPermissionsMissingContextDiagnostic(t *testing.T) {
-	permissions, sts := permissionFixture(false)
+	p := permissionFixture(false)
 	fake := &fakeIAM{
 		respond: func(in *iam.SimulatePrincipalPolicyInput) (*iam.SimulatePrincipalPolicyOutput, error) {
 			out, err := (&fakeIAM{}).SimulatePrincipalPolicy(context.Background(), in)
@@ -445,10 +448,10 @@ func TestPermissionsMissingContextDiagnostic(t *testing.T) {
 			return out, err
 		},
 	}
-	permissions.iam = fake
+	p.iam = fake
 	require.ErrorContains(
 		t,
-		permissions.Preflight(context.Background(), sts),
+		p.preflight(context.Background()),
 		"missing simulation context: aws:SourceIp, aws:SourceVpce",
 	)
 }
@@ -457,51 +460,51 @@ func TestPermissionsPreflightRetries(t *testing.T) {
 	throttled := &retry.MaxAttemptsError{Attempt: 3, Err: errors.New("Throttling: Rate exceeded")}
 
 	t.Run("retries a simulation AWS left unanswered", func(t *testing.T) {
-		permissions, sts := permissionFixture(false)
+		p := permissionFixture(false)
 		fake := &fakeIAM{}
 		fake.respond = func(*iam.SimulatePrincipalPolicyInput) (*iam.SimulatePrincipalPolicyOutput, error) {
 			fake.respond = nil
 			return nil, throttled
 		}
-		permissions.iam = fake
-		require.NoError(t, permissions.Preflight(context.Background(), sts))
+		p.iam = fake
+		require.NoError(t, p.preflight(context.Background()))
 	})
 
 	t.Run("stops after bounded attempts", func(t *testing.T) {
-		permissions, sts := permissionFixture(false)
+		p := permissionFixture(false)
 		fake := &fakeIAM{err: throttled}
-		permissions.iam = fake
-		err := permissions.Preflight(context.Background(), sts)
+		p.iam = fake
+		err := p.preflight(context.Background())
 		require.ErrorContains(t, err, "Rate exceeded")
 		require.Len(t, fake.calls, preflightAttempts)
 	})
 
 	t.Run("does not retry a denial", func(t *testing.T) {
-		permissions, sts := permissionFixture(false)
+		p := permissionFixture(false)
 		allowed := &fakeIAM{}
-		permissions.iam = allowed
-		require.NoError(t, permissions.Preflight(context.Background(), sts))
+		p.iam = allowed
+		require.NoError(t, p.preflight(context.Background()))
 
 		denied := &fakeIAM{denied: map[string]bool{"s3:GetObjectRetention": true}}
-		permissions.iam = denied
-		require.ErrorContains(t, permissions.Preflight(context.Background(), sts), "is missing")
+		p.iam = denied
+		require.ErrorContains(t, p.preflight(context.Background()), "is missing")
 		require.Len(t, denied.calls, len(allowed.calls), "a denial is one pass, not a retry")
 	})
 
 	t.Run("does not retry an answered error", func(t *testing.T) {
-		permissions, sts := permissionFixture(false)
+		p := permissionFixture(false)
 		fake := &fakeIAM{err: errors.New("AccessDenied: not authorized to SimulatePrincipalPolicy")}
-		permissions.iam = fake
-		require.ErrorContains(t, permissions.Preflight(context.Background(), sts), "AccessDenied")
+		p.iam = fake
+		require.ErrorContains(t, p.preflight(context.Background()), "AccessDenied")
 		require.Len(t, fake.calls, 1)
 	})
 
 	t.Run("stops waiting when the context ends", func(t *testing.T) {
-		permissions, sts := permissionFixture(false)
-		permissions.iam = &fakeIAM{err: throttled}
-		permissions.backoff = time.Hour
+		p := permissionFixture(false)
+		p.iam = &fakeIAM{err: throttled}
+		p.backoff = time.Hour
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		require.ErrorContains(t, permissions.Preflight(ctx, sts), "Rate exceeded")
+		require.ErrorContains(t, p.preflight(ctx), "Rate exceeded")
 	})
 }

@@ -45,12 +45,13 @@ def console_owners(nodes, needle):
     return [n.name for n in nodes if console_has(n, needle)]
 
 
-def enclave_curl(node, pcr0, path="/health"):
+def enclave_curl(node, pcr0, path="/health", signed=False):
     # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
-    # 39-byte TLS binding, and live certificate pinning remain checked.
+    # 79-byte user_data binding, and live certificate pinning remain checked.
     return node.execute(
         f"enclave curl {path} --base-url https://127.0.0.1 "
-        f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify 2>&1"
+        f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify "
+        f"{'--signed ' if signed else ''}2>&1"
     )
 
 
@@ -655,6 +656,12 @@ assert challenge_record_count(route53_zone_id) == 0
 
 for node in (green, green_peer):
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
+    assert status == 0, out
+    # The signing key derives from the migrated DEK and GREEN_PCR0, so green
+    # replicas share the attested key while blue has a different signing key.
+    status, out = enclave_curl(node, GREEN_PCR0, "/test/health", signed=True)
+    assert status == 0, out
+    status, out = enclave_curl(node, GREEN_PCR0, "/enclave/v1/info", signed=True)
     assert status == 0, out
     for _ in range(5):
         node.succeed(

@@ -151,6 +151,16 @@ func Run(ctx context.Context, cfg Config) error {
 
 	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
 
+	pcr0, err := nsm.PCR0()
+	if err != nil {
+		return fmt.Errorf("read PCR0 for response signing: %w", err)
+	}
+	responseKey, err := result.dek.ResponseSigningKey(pcr0)
+	if err != nil {
+		return err
+	}
+	hashes.SetResponseSigningKey(responseKey)
+
 	go migrator.RunPredecessorHandoff(
 		ctx,
 		result.kms,

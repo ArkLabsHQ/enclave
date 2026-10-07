@@ -20,7 +20,7 @@ let
     pname = "awsmocks";
     version = "0.1.0";
     src = ./awsmocks;
-    vendorHash = "sha256-FlTEY1v5ZVqTICXGLTBgVW+JhlWwIiuJDekX2d3bfWs=";
+    vendorHash = "sha256-gPgpKvfLuiO4N/+nJ24GHd5Pukk3Yo2dxwPK9XZfEf8=";
     env.CGO_ENABLED = "0";
     meta.mainProgram = "awsmocks";
   };
@@ -196,19 +196,47 @@ let
   # The fixed four-node topology makes the AWS node's test-VLAN address stable.
   # Using it directly avoids depending on gvproxy forwarding /etc/hosts entries.
   commonEifEnv = {
-    ENCLAVE_DEPLOYMENT = "dev";
     ENCLAVE_DEV = "true";
     ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
     ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
     ENCLAVE_MIGRATION_COOLDOWN = "2s";
     ENCLAVE_APP_NAME = "testapp";
-    ENCLAVE_LOG_GROUP_PREFIX = "/ark/e2e";
+    ENCLAVE_NAMESPACE = "ark/e2e/dev";
     ENCLAVE_AWS_REGION = "us-east-1";
     ENCLAVE_UPSTREAM = "h1";
+    ENCLAVE_TRACES = "true";
+    ENCLAVE_METRICS = "true";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-signing-key";
         env_var = "E2E_SIGNING_KEY";
+      }
+    ];
+    # e2e.py places all three values in SSM, hex-encoded; each pin is the
+    # SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
+    # only verified. The second is already past its cutoff. The third's cutoff
+    # is reached when e2e.py steps a node's clock to just before it, so the
+    # restart-without-the-secret path runs for real.
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
+      {
+        name = "e2e-inherited";
+        env_var = "E2E_INHERITED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+      }
+      {
+        name = "e2e-expired";
+        env_var = "E2E_EXPIRED";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2020-01-01T00:00:00Z";
+      }
+      {
+        name = "e2e-cutoff";
+        env_var = "E2E_CUTOFF";
+        type = "hash";
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        cutoff = "2040-01-01T00:00:00Z";
       }
     ];
 
@@ -216,7 +244,9 @@ let
     AWS_ENDPOINT_URL_SSM = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
-    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_XRAY = "http://${awsNodeIP}:4318";
+    AWS_ENDPOINT_URL_MONITORING = "http://${awsNodeIP}:4318";
     AWS_ENDPOINT_URL_IAM = "http://${awsNodeIP}:4001";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
@@ -428,6 +458,7 @@ let
         1338
         4000
         4001
+        4318
         4566
         4570
         14000
@@ -452,7 +483,7 @@ let
       };
 
       systemd.services.awsmocks = {
-        description = "Attested KMS proxy and IMDS stub";
+        description = "Attested KMS proxy, IMDS and IAM stubs, and OTLP receiver";
         wantedBy = [ "multi-user.target" ];
         wants = [ "ministack.service" ];
         after = [ "ministack.service" ];
@@ -461,7 +492,9 @@ let
           IMDS_LISTEN_ADDR = ":1338";
           IAM_LISTEN_ADDR = ":4001";
           IAM_DENY_FILE = "/var/lib/awsmocks/iam-deny";
+          OTLP_LISTEN_ADDR = ":4318";
           UPSTREAM_KMS_URL = "http://127.0.0.1:4566";
+          UPSTREAM_LOGS_URL = "http://127.0.0.1:4566";
         };
         serviceConfig = {
           Type = "simple";
@@ -518,32 +551,40 @@ let
     };
 in
 {
-  eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
-    test -s ${blueEif}/image.eif
-    test -s ${greenEif}/image.eif
-    jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${blueEif}/pcr.json
-    jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${greenEif}/pcr.json
-    test ${lib.escapeShellArg bluePCR0} != ${lib.escapeShellArg greenPCR0}
-    touch $out
-  '';
+  checks = {
+    eif-build = pkgs.runCommand "check-eif-build" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      test -s ${blueEif}/image.eif
+      test -s ${greenEif}/image.eif
+      jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${blueEif}/pcr.json
+      jq -e '.PCR0 | test("^[0-9a-fA-F]{96}$")' ${greenEif}/pcr.json
+      test ${lib.escapeShellArg bluePCR0} != ${lib.escapeShellArg greenPCR0}
+      touch $out
+    '';
 
-  e2e = pkgs.testers.runNixOSTest {
-    name = "enclave-runtime-e2e";
-    nodes = {
-      aws = awsNode;
-      blue = mkEnclaveNode blueEif;
-      blue_peer = mkEnclaveNode blueEif;
-      green = mkEnclaveNode greenEif;
-      green_peer = mkEnclaveNode greenEif;
+    e2e = pkgs.testers.runNixOSTest {
+      name = "enclave-runtime-e2e";
+      nodes = {
+        aws = awsNode;
+        blue = mkEnclaveNode blueEif;
+        blue_peer = mkEnclaveNode blueEif;
+        green = mkEnclaveNode greenEif;
+        green_peer = mkEnclaveNode greenEif;
+      };
+      testScript =
+        ''
+          BLUE_PCR0 = ${builtins.toJSON bluePCR0}
+          GREEN_PCR0 = ${builtins.toJSON greenPCR0}
+          AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
+        ''
+        + builtins.readFile ./helpers.py
+        + "\n"
+        + builtins.readFile ./e2e.py;
     };
-    testScript =
-      ''
-        BLUE_PCR0 = ${builtins.toJSON bluePCR0}
-        GREEN_PCR0 = ${builtins.toJSON greenPCR0}
-        AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
-      ''
-      + builtins.readFile ./helpers.py
-      + "\n"
-      + builtins.readFile ./e2e.py;
   };
+
+  # Exposed as packages by flake.nix so the reusable eif-build workflow can resolve
+  # them by name. They are already inputs to the eif-build check above, so listing
+  # them here costs no extra build.
+  eif-blue = blueEif;
+  eif-green = greenEif;
 }

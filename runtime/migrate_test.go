@@ -386,7 +386,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		)
 		require.Empty(
 			t,
-			fx.ssmf.params["/prod/app/MigrationStateOriginReceipt/"+migrationKeyID],
+			fx.ssmf.params["/prod/app/enclave/MigrationStateOriginReceipt/"+migrationKeyID],
 			"the receipt must move to the PCR0-scoped path, not merely exist",
 		)
 		requireKMSCiphertextPlaintext(
@@ -414,7 +414,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, secret.Plaintext, established.secrets.Static[0].Plaintext)
 		require.Equal(t, migrationIntentBucketName, established.migrationIntentBucketName)
 		newReceipt := testCfg.stateOriginReceiptParam(migrationKeyID, newPCR0)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
@@ -711,7 +711,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
 		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, secret.Plaintext, established.secrets.Static[0].Plaintext)
 	})
 
 	t.Run("refuses to commit when aborted during the handoff", func(t *testing.T) {
@@ -846,7 +846,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 	t.Run("rejects a claim for another app", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Deployment, "other-app", false)
+		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Namespace, "other-app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -857,7 +857,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
 		fx.successor.cfg = newTestConfig(
-			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, false,
+			fx.predecessor.cfg.Namespace, fx.predecessor.cfg.AppName, false,
 		)
 		fx.successor.cfg.KMSLocked = false
 		doc, err := successorAttestation(fx.successor, challenge)
@@ -866,10 +866,10 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		require.Empty(t, verify(t, fx, doc, challenge))
 	})
 
-	t.Run("rejects a claim for another deployment", func(t *testing.T) {
+	t.Run("rejects a claim for another namespace", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig("other-deployment", "app", false)
+		fx.successor.cfg = newTestConfig("ark/prod", "app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -882,10 +882,10 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
 		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:     "enclave.successor_claim.v2",
-			Deployment: fx.predecessor.cfg.Deployment,
-			AppName:    fx.predecessor.cfg.AppName,
-			Lock:       fx.predecessor.cfg.lockSegment(),
+			Schema:    "enclave.successor_claim.v2",
+			Namespace: fx.predecessor.cfg.Namespace,
+			AppName:   fx.predecessor.cfg.AppName,
+			Lock:      fx.predecessor.cfg.lockSegment(),
 		})
 		require.NoError(t, err)
 		raw, _, err := fx.successor.nsm.BuildAttestationDocument(

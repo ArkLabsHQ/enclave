@@ -23,7 +23,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -34,14 +33,16 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
 type fakeSSM struct {
 	params  map[string]string
 	err     error
 	putErrs map[string]error
+	getErrs map[string]error // per-name GetParameter failures, e.g. a retired KMS key
 	calls   []string
+	// decryptedGets lists the names read with WithDecryption, in order.
+	decryptedGets []string
 
 	// getSeq scripts successive reads of one parameter, for races that turn on
 	// a value changing between two reads. The i-th read returns the i-th entry;
@@ -97,8 +98,14 @@ func (f *fakeSSM) GetParameter(
 ) (*ssm.GetParameterOutput, error) {
 	name := aws.ToString(in.Name)
 	f.calls = append(f.calls, name)
+	if aws.ToBool(in.WithDecryption) {
+		f.decryptedGets = append(f.decryptedGets, name)
+	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if err := f.getErrs[name]; err != nil {
+		return nil, err
 	}
 	v, ok := f.params[name]
 	if seq, scripted := f.getSeq[name]; scripted && len(seq) > 0 {
@@ -198,9 +205,15 @@ func (f *fakeSSM) MustGet(_ context.Context, key string) (string, error) {
 	return val, nil
 }
 
-func (f *fakeSSM) MayGet(_ context.Context, key string) (string, error) {
+func (f *fakeSSM) MayGet(_ context.Context, key string, withDecryption bool) (string, error) {
+	if withDecryption {
+		f.decryptedGets = append(f.decryptedGets, key)
+	}
 	if f.err != nil {
 		return "", f.err
+	}
+	if err := f.getErrs[key]; err != nil {
+		return "", err
 	}
 	val := strings.TrimSpace(f.params[key])
 	if val == "UNSET" {
@@ -647,22 +660,12 @@ type fakeCloudWatchLogs struct {
 	mu                 sync.Mutex
 	createLogGroupErr  error
 	createLogStreamErr error
-	putLogEventsErr    error
 	groups             []string
 	streams            []string
 	retentionDays      []int32
-	puts               []*cloudwatchlogs.PutLogEventsInput
-	putCalls           int
-	putCh              chan *cloudwatchlogs.PutLogEventsInput
-
-	// putBlock stalls PutLogEvents until closed, standing in for a CloudWatch
-	// that has stopped accepting writes.
-	putBlock chan struct{}
 }
 
-func newFakeCloudWatchLogs() *fakeCloudWatchLogs {
-	return &fakeCloudWatchLogs{putCh: make(chan *cloudwatchlogs.PutLogEventsInput, 64)}
-}
+func newFakeCloudWatchLogs() *fakeCloudWatchLogs { return &fakeCloudWatchLogs{} }
 
 func (f *fakeCloudWatchLogs) CreateLogGroup(
 	_ context.Context,
@@ -701,74 +704,6 @@ func (f *fakeCloudWatchLogs) PutRetentionPolicy(
 	f.retentionDays = append(f.retentionDays, aws.ToInt32(in.RetentionInDays))
 	f.mu.Unlock()
 	return &cloudwatchlogs.PutRetentionPolicyOutput{}, nil
-}
-
-func (f *fakeCloudWatchLogs) PutLogEvents(
-	_ context.Context,
-	in *cloudwatchlogs.PutLogEventsInput,
-	_ ...func(*cloudwatchlogs.Options),
-) (*cloudwatchlogs.PutLogEventsOutput, error) {
-	f.mu.Lock()
-	putErr := f.putLogEventsErr
-	f.putCalls++
-	f.mu.Unlock()
-	if putErr != nil {
-		return nil, putErr
-	}
-	// The startup marker proves the stream is writable; blocking it would stall
-	// Start rather than the shipping this hook exists to stall.
-	if f.putBlock != nil && !isShipperMarker(in) {
-		<-f.putBlock
-	}
-	f.mu.Lock()
-	copyIn := *in
-	copyIn.LogEvents = append([]cwltypes.InputLogEvent(nil), in.LogEvents...)
-	f.puts = append(f.puts, &copyIn)
-	f.mu.Unlock()
-	if f.putCh != nil {
-		select {
-		case f.putCh <- &copyIn:
-		default:
-		}
-	}
-	return &cloudwatchlogs.PutLogEventsOutput{}, nil
-}
-
-func isShipperMarker(in *cloudwatchlogs.PutLogEventsInput) bool {
-	return len(in.LogEvents) == 1 &&
-		strings.Contains(aws.ToString(in.LogEvents[0].Message), "shipper_started")
-}
-
-// requireCloudWatchPutTo waits for a batch on one log group. The signals share a
-// client, so a bare "next put" would race between them.
-func requireCloudWatchPutTo(
-	t *testing.T,
-	cw *fakeCloudWatchLogs,
-	group string,
-) *cloudwatchlogs.PutLogEventsInput {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case put := <-cw.putCh:
-			if aws.ToString(put.LogGroupName) != group {
-				continue
-			}
-			// Start writes a marker to prove the stream is writable; callers of
-			// this helper are waiting for their own events.
-			if isShipperMarker(put) {
-				continue
-			}
-			return put
-		case <-deadline:
-			require.FailNow(t, "timed out waiting for PutLogEvents on "+group)
-			return nil
-		}
-	}
-}
-
-func stringValue(value string) *commonpb.AnyValue {
-	return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}}
 }
 
 func (f *fakeS3) PutObject(

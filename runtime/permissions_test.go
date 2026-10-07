@@ -92,7 +92,7 @@ func TestPermissionsPreflight(t *testing.T) {
 			iam:  &fakeIAM{denied: map[string]bool{"logs:PutLogEvents": true}},
 			wantErr: []string{
 				"CloudWatchLogsAccess logs:PutLogEvents on arn:aws:logs:",
-				":123456789012:log-group:/prod/enclave/logs/app:log-stream:i-0e2ce2ce2ce2ce2ce",
+				":123456789012:log-group:/prod/app/enclave/logs/app:log-stream:i-0e2ce2ce2ce2ce2ce",
 			},
 		},
 		{
@@ -175,13 +175,13 @@ func TestPermissionsPreflight(t *testing.T) {
 		)
 		require.True(t, fake.simulated("s3:ListBucketVersions", "arn:aws:s3:::"+intentBucket))
 		require.True(t, fake.simulated(
-			"ssm:PutParameter", "arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/*",
+			"ssm:PutParameter", "arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/*",
 		))
 		require.True(t, fake.simulated("kms:CreateKey", "*"),
 			"CreateKey has no resource type, so IAM evaluates it against *")
 		require.True(t, fake.simulated(
 			"logs:CreateLogGroup",
-			"arn:aws:logs:eu-west-1:123456789012:log-group:/prod/enclave/traces/app:*",
+			"arn:aws:logs:eu-west-1:123456789012:log-group:/prod/app/enclave/logs/runtime:*",
 		))
 		require.False(t, fake.simulated("route53:GetChange", "arn:aws:route53:::change/*"),
 			"Route53 is only needed with ACME")
@@ -264,11 +264,11 @@ func TestPermissionsConditionalPolicies(t *testing.T) {
 			switch action {
 			case "kms:CreateKey", "kms:TagResource":
 				if !slices.Equal(values["aws:RequestTag/ManagedBy"], []string{"enclave"}) ||
-					!slices.Equal(values["aws:RequestTag/Deployment"], []string{"prod"}) ||
+					!slices.Equal(values["aws:RequestTag/Namespace"], []string{"prod"}) ||
 					!slices.Equal(values["aws:RequestTag/AppName"], []string{"app"}) {
 					return iamtypes.PolicyEvaluationDecisionTypeImplicitDeny
 				}
-				keys := []string{"AppName", "Deployment", "ManagedBy"}
+				keys := []string{"AppName", "Namespace", "ManagedBy"}
 				scenario := "genesis"
 				if purpose, ok := values["aws:RequestTag/Purpose"]; ok {
 					require.Equal(t, []string{"migration"}, purpose)
@@ -349,7 +349,7 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 		{"ACME account", "arn:aws:s3:::cert-bucket/prod/app/data/acme/account.key", "s3:GetObject"},
 		{
 			"commit pointer",
-			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/locked/KMSKeyID/" + permissionTestPCR0,
+			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/locked/KMSKeyID/" + permissionTestPCR0,
 			"ssm:PutParameter",
 		},
 	}

@@ -44,7 +44,7 @@
                 version = "0.1.0";
                 src = ./runtime;
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-q5kRK6rm11QvjRltWtmi946NFtmi2UXm+8RfmR6ZsAE=";
+                vendorHash = "sha256-DLL7mCtn2hKbKWAAwZuAHQygHLMRw7wgEIoGbib/Lo0=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -54,6 +54,12 @@
                 ];
                 tags = [ "netgo" ];
               });
+
+              # x86_64-linux only, like runtime: aarch64 EIFs measure correctly but
+              # cannot boot. Built from nix/tests/test-app, and exposed so this repo can
+              # exercise its own eif-build workflow against a real EIF.
+              eif-blue = (import ./nix/tests { inherit pkgs system self; }).eif-blue;
+              eif-green = (import ./nix/tests { inherit pkgs system self; }).eif-green;
             }
           ))
           (
@@ -101,13 +107,13 @@
 
       checks = forSystems enclaveSystems (
         { pkgs, system, ... }:
-        import ./nix/tests {
+        (import ./nix/tests {
           inherit
             pkgs
             system
             self
             ;
-        }
+        }).checks
       );
 
       lib = {

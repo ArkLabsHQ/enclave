@@ -2,16 +2,19 @@
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
-CERT_KEY = f"dev/testapp/data/acme/{FQDN}/cert"
-ACCOUNT_KEY = "dev/testapp/data/acme/account.key"
-SELF_SIGNED_KEY = f"dev/testapp/data/self-signed/{FQDN}/cert"
+CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
+ACCOUNT_KEY = "ark/e2e/dev/testapp/data/acme/account.key"
+SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
-LOG_PREFIX = "/ark/e2e/dev/enclave"
+LOG_PREFIX = "/ark/e2e/dev/testapp/enclave"
+INSTANCE_ID = "i-0e2ce2ce2ce2ce2ce"
+# Inherited hash secrets are delivered hex; default.nix pins its SHA-256.
+INHERITED = b"inherited-from-outside".hex()
 
 
 def put_env(name, value):
     cloud(
-        f"ssm put-parameter --name /dev/testapp/env/{name} "
+        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/env/{name} "
         f"--type String --value {shlex.quote(value)}"
     )
 
@@ -95,6 +98,8 @@ aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
 aws.wait_for_open_port(4000)
 aws.wait_for_open_port(4001)
 aws.wait_for_open_port(1338)
+aws.wait_for_open_port(4318)
+aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4318/_otlp/logs")
 aws.wait_for_open_port(14000)
 aws.wait_for_open_port(8055)
 aws.wait_for_open_port(4570)
@@ -115,11 +120,11 @@ cloud(
     "--versioning-configuration Status=Enabled"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/CertBucketName "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/CertBucketName "
     f"--type String --value {CERT_BUCKET}"
 )
 cloud(
-    "ssm put-parameter --name /dev/testapp/LeaseBucketName "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/LeaseBucketName "
     f"--type String --value {LEASE_BUCKET}"
 )
 route53_zone_id = cloud(
@@ -127,10 +132,15 @@ route53_zone_id = cloud(
     "--query HostedZone.Id --output text"
 ).rsplit("/", 1)[-1]
 cloud(
-    "ssm put-parameter --name /dev/testapp/Route53ZoneID "
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/Route53ZoneID "
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
+for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
+    cloud(
+        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/{inherited} "
+        f"--type String --value {INHERITED}"
+    )
 put_env("ENCLAVE_FQDN", FQDN)
 
 BLUES = (blue, blue_peer)
@@ -163,10 +173,13 @@ for node in BLUES:
     node.succeed("kill $(cat /run/enclave-qemu.pid)")
     node.succeed("systemctl restart enclave-start")
 for node in BLUES:
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
+    assert env_value(node, "E2E_INHERITED") == INHERITED
+    assert env_value(node, "E2E_CUTOFF") == INHERITED
+    assert env_value(node, "E2E_EXPIRED") == ""
     node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg p '{BLUE_PCR0}' --arg bucket '{INTENT_BUCKET}' "
@@ -202,23 +215,20 @@ for node in BLUES:
     assert status == 0, out
     assert "WARNING" in out, out
 
+# Verify the CloudWatch Logs destinations.
 log_groups = cloud(
     f"logs describe-log-groups --log-group-name-prefix {LOG_PREFIX} "
     "--query 'logGroups[].logGroupName' --output text"
 ).split()
 assert sorted(log_groups) == [
     f"{LOG_PREFIX}/logs/app",
-    f"{LOG_PREFIX}/logs/supervisor",
-    f"{LOG_PREFIX}/metrics",
-    f"{LOG_PREFIX}/traces/app",
-    f"{LOG_PREFIX}/traces/supervisor",
+    f"{LOG_PREFIX}/logs/runtime",
 ], log_groups
-
-shipped = cloud(
+streams = cloud(
     f"logs describe-log-streams --log-group-name {LOG_PREFIX}/logs/app "
-    "--query 'logStreams[].storedBytes' --output text"
-)
-assert shipped not in ("", "None"), shipped
+    "--query 'logStreams[].logStreamName' --output text"
+).split()
+assert streams == [INSTANCE_ID], streams
 
 # The buffers are gone, so their read-back endpoints are too.
 blue.succeed(
@@ -226,36 +236,61 @@ blue.succeed(
     'https://127.0.0.1/v1/enclave-logs)" = 404'
 )
 
-# The app's own OTLP reaches CloudWatch through the runtime's ingest endpoints,
-# emitted by the stock OpenTelemetry exporters.
+# Verify application and runtime telemetry reaches each AWS endpoint.
 blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null")
 
 
-def wait_for_shipped(group, needle, timeout=90):
+def otlp(signal):
+    return json.loads(aws.succeed(f"curl -fsS http://127.0.0.1:4318/_otlp/{signal}"))
+
+
+def wait_for_otlp(signal, needle, group=None, timeout=90):
     deadline = time.time() + timeout
     while True:
-        events = cloud(
-            f"logs filter-log-events --log-group-name {LOG_PREFIX}/{group} "
-            "--query 'events[].message' --output text"
-        )
-        if needle in events:
-            return
+        for record in otlp(signal):
+            if group is not None and record["group"] != group:
+                continue
+            if needle in json.dumps(record["body"], separators=(",", ":")):
+                return record
         if time.time() > deadline:
-            raise Exception(f"{needle!r} never reached {LOG_PREFIX}/{group}")
+            print(aws.execute("journalctl -u awsmocks --no-pager -n 50")[1])
+            raise Exception(f"{needle!r} never reached the {signal} endpoint")
         time.sleep(2)
 
 
-wait_for_shipped("logs/app", "handled health")
-wait_for_shipped("traces/app", '"name":"health"')
-wait_for_shipped("metrics", "testapp_requests_total")
-wait_for_shipped("logs/supervisor", "child started")
-wait_for_shipped("traces/supervisor", '"name":"init"')
+wait_for_otlp("logs", "handled health", f"{LOG_PREFIX}/logs/app")
+wait_for_otlp("logs", "child started", f"{LOG_PREFIX}/logs/runtime")
+wait_for_otlp("traces", '"name":"health"')
+wait_for_otlp("traces", '"name":"init"')
+wait_for_otlp("metrics", "testapp_requests_total")
+wait_for_otlp("metrics", "enclave_http_requests_total")
 
-app_events = cloud(
-    f"logs filter-log-events --log-group-name {LOG_PREFIX}/logs/app "
-    "--query 'events[].message' --output text"
-)
-assert '"source":"enclave"' not in app_events, app_events
+for signal in ("logs", "traces", "metrics"):
+    name = f"enclave_otlp_{signal}_forward_duration_seconds"
+    record = wait_for_otlp("metrics", name)
+    metric = next(
+        m
+        for resource in record["body"]["resourceMetrics"]
+        for scope in resource["scopeMetrics"]
+        for m in scope["metrics"]
+        if m["name"] == name
+    )
+    assert metric["unit"] == "s", metric
+    histogram = metric["histogram"]
+    assert histogram["aggregationTemporality"] == "AGGREGATION_TEMPORALITY_CUMULATIVE", histogram
+    assert histogram["dataPoints"], histogram
+    for point in histogram["dataPoints"]:
+        assert int(point["count"]) > 0, point
+        assert point["sum"] > 0, point
+        assert len(point["bucketCounts"]) == len(point["explicitBounds"]) + 1, point
+        assert sum(int(n) for n in point["bucketCounts"]) == int(point["count"]), point
+
+for record in otlp("logs"):
+    assert record["stream"] == INSTANCE_ID, record
+    body = json.dumps(record["body"], separators=(",", ":"))
+    if record["group"] == f"{LOG_PREFIX}/logs/app":
+        assert "enclave-runtime" not in body, body
+        assert "child started" not in body, body
 
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")
@@ -335,7 +370,7 @@ final_hardsteps = int(
     ).strip()
 )
 assert final_hardsteps == initial_hardsteps + 1, (initial_hardsteps, final_hardsteps)
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 
 hardsteps_before_sub = int(
     blue.succeed(
@@ -374,7 +409,7 @@ assert hardsteps_after_sub == hardsteps_before_sub, (
     hardsteps_before_sub,
     hardsteps_after_sub,
 )
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 
 # ACME settings are read when the runtime starts. The blues are already up and
 # stay self-signed; green reads these as it boots and applies them once it
@@ -480,7 +515,7 @@ aws.succeed(
 # is refused — that is an IAM property, which LocalStack does not model.)
 receipt_param = migration_receipt_param(migration_key, GREEN_PCR0)
 assert get_param(receipt_param) not in ("", "UNSET", "None")
-assert get_param(f"/dev/testapp/MigrationStateOriginReceipt/{migration_key}") == ""
+assert get_param(f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{migration_key}") == ""
 receipt_before = get_param(receipt_param)
 create_only_status, _ = aws.execute(
     f"{CLOUD} ssm put-parameter --name {receipt_param} "
@@ -503,7 +538,7 @@ assert get_param(receipt_param) == receipt_before
 # scope, so both blue nodes retain their genesis ancestry while reporting the
 # migration intent targeting green.
 for node in BLUES:
-    wait_healthy(node)
+    wait_enclave_healthy(node)
     assert secret_value(node) == blue_secret
     assert served_leaf_sha(node) == blue_leaf_sha
     node.wait_until_succeeds(
@@ -525,7 +560,7 @@ aws.wait_until_succeeds(
     "test -s /var/lib/route53-dns-proxy/events",
     timeout=900,
 )
-wait_healthy(green)
+wait_enclave_healthy(green)
 # Health and status share one lifecycle.
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -633,7 +668,7 @@ green_peer.wait_for_unit("multi-user.target")
 green_peer.wait_for_unit("mock-imds-forward.service")
 green_peer.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
 green_peer.wait_for_unit("enclave-start.service")
-wait_healthy(green_peer)
+wait_enclave_healthy(green_peer)
 
 # Joining must resume the committed state, not perform genesis or issue a cert.
 assert cloud(
@@ -642,6 +677,9 @@ assert cloud(
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED
+assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
+assert env_value(green_peer, "E2E_EXPIRED") == ""
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
@@ -680,14 +718,14 @@ green.wait_until_fails(
     "curl --connect-timeout 1 --max-time 2 -skf https://127.0.0.1/health",
     timeout=60,
 )
-wait_healthy(green_peer)
+wait_enclave_healthy(green_peer)
 assert secret_value(green_peer) == blue_secret
 assert served_leaf_sha(green_peer) == leaf_sha_before
 status, out = enclave_curl(green_peer, GREEN_PCR0, "/test/health")
 assert status == 0, out
 
 green.succeed("systemctl restart enclave-start")
-wait_healthy(green)
+wait_enclave_healthy(green)
 assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
@@ -704,7 +742,7 @@ assert status == 0, out
 # Green and green_peer were checked immediately above. Recheck that their
 # kill/rejoin did not disturb the still-running blue fleet.
 for node in (blue, blue_peer, green, green_peer):
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 for node in BLUES:
     assert served_leaf_sha(node) == blue_leaf_sha
@@ -715,7 +753,7 @@ for node in BLUES:
 # leaving the predecessor running, and the predecessor is always restartable.
 blue.succeed("kill $(cat /run/enclave-qemu.pid)")
 blue.succeed("systemctl restart enclave-start")
-wait_healthy(blue)
+wait_enclave_healthy(blue)
 assert secret_value(blue) == blue_secret
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
 blue.succeed(
@@ -726,7 +764,7 @@ status, out = enclave_curl(blue, BLUE_PCR0)
 assert status == 0, out
 
 for node in (blue, blue_peer, green, green_peer):
-    wait_healthy(node)
+    wait_enclave_healthy(node)
 
 # KMS deletion has a mandatory waiting period. Scheduling the retired blue key
 # must therefore appear as pending_deletion in green's ancestry.
@@ -736,7 +774,7 @@ cloud(
 )
 green.succeed("kill $(cat /run/enclave-qemu.pid)")
 green.succeed("systemctl restart enclave-start")
-wait_healthy(green)
+wait_enclave_healthy(green)
 green.wait_until_succeeds(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg key {shlex.quote(genesis_key)} "
@@ -745,4 +783,36 @@ green.wait_until_succeeds(
     "and .ancestry.generations[0].key_id == $key "
     "and .ancestry.generations[0].state == \"pending_deletion\"'",
     timeout=60,
+)
+
+# An inherited secret reaching its cutoff while the app runs. The cutoff is
+# baked into the image, so the node's clock is stepped to a minute before it
+# and the enclave follows through /dev/ptp0. Last on purpose: from here this
+# node disagrees with its peers about the time.
+green_peer.succeed("systemctl stop systemd-timesyncd 2>/dev/null || true")
+green_peer.succeed("date -u -s '2039-12-31 23:59:00'")
+green_peer.wait_until_succeeds(
+    "test $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) -ge 2208988740",
+    timeout=30,
+)
+assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
+green_peer.wait_until_succeeds(
+    "grep 'inherited secret reached its cutoff' /var/log/enclave-console.log "
+    "| grep -q e2e-cutoff",
+    timeout=150,
+)
+# The runtime relaunches the app; the second "child started" is the new process.
+green_peer.wait_until_succeeds(
+    "test \"$(tr -d '\\000' </var/log/enclave-console.log "
+    "| grep -c 'child started')\" -ge 2",
+    timeout=60,
+)
+wait_upstream_healthy(green_peer)
+assert env_value(green_peer, "E2E_CUTOFF") == ""
+# It still holds everything that was not cut off.
+assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED
+green_peer.succeed(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    "| jq -e '.status == \"ready\" and .upstream_app.exited == false'"
 )

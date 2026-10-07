@@ -26,12 +26,12 @@ func TestStateOriginReceiptParamIsPCRScoped(t *testing.T) {
 	pcr0 := strings.Repeat("AB", 48)
 	require.Equal(
 		t,
-		"/prod/app/StateOriginReceipt/key-1/"+strings.ToLower(pcr0),
+		"/prod/app/enclave/StateOriginReceipt/key-1/"+strings.ToLower(pcr0),
 		testCfg.stateOriginReceiptParam("key-1", pcr0),
 	)
 	require.Equal(
 		t,
-		"/prod/app/MigrationStateOriginReceipt/key-1/"+strings.ToLower(pcr0),
+		"/prod/app/enclave/MigrationStateOriginReceipt/key-1/"+strings.ToLower(pcr0),
 		testCfg.migrationStateOriginReceiptParam("key-1", pcr0),
 	)
 }
@@ -270,17 +270,6 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestValidateStaticSecretArtifacts(t *testing.T) {
-	require.NoError(t, validateStaticSecretNames(stateOriginTestSecrets))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
-		{Name: "duplicate", EnvVar: "ONE"},
-		{Name: "duplicate", EnvVar: "TWO"},
-	}))
-	require.Error(t, validateStaticSecretNames([]StaticSecretMetadata{
-		{Name: "StorageDEK", EnvVar: "COLLISION"},
-	}))
-}
-
 func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	keyID := "key-single-snapshot"
@@ -364,7 +353,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, established.dek)
-	require.Len(t, established.secrets, len(stateOriginTestSecrets))
+	require.Len(t, established.secrets.Static, len(stateOriginTestSecrets))
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
 	written := fake.params[testCfg.stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))]
@@ -375,7 +364,7 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 		established.lineage,
 	))
 	require.Equal(t, keyID, fake.params[testCfg.kmsKeyIDParam(hex.EncodeToString(pcr0))])
-	_, hasLegacyReceipt := fake.params["/prod/state-origin/StateOriginReceipt/"+keyID]
+	_, hasLegacyReceipt := fake.params["/prod/state-origin/enclave/StateOriginReceipt/"+keyID]
 	require.False(t, hasLegacyReceipt)
 }
 
@@ -1544,11 +1533,11 @@ func TestIntentBucketIsMeasuredNotReadFromSSM(t *testing.T) {
 	ctx := context.Background()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
-	fx.ssmf.params["/prod/state-origin/MigrationIntentBucketName"] = "attacker-empty-bucket"
+	fx.ssmf.params["/prod/state-origin/enclave/MigrationIntentBucketName"] = "attacker-empty-bucket"
 
 	result, err := fx.establish(ctx)
 
 	require.NoError(t, err)
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), result.migrationIntentBucketName)
-	require.NotContains(t, fx.ssmf.calls, "/prod/state-origin/MigrationIntentBucketName")
+	require.NotContains(t, fx.ssmf.calls, "/prod/state-origin/enclave/MigrationIntentBucketName")
 }

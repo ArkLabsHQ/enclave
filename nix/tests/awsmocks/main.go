@@ -1,5 +1,4 @@
-// Attestation-aware KMS Recipient proxy that CMS-wraps plaintext to the
-// enclave's RSA key, plus IMDSv2 and IAM policy simulation stubs.
+// AWS service stubs used by the Nix end-to-end test.
 package main
 
 import (
@@ -121,13 +120,19 @@ func main() {
 	imdsListen := envOrDefault("IMDS_LISTEN_ADDR", ":1338")
 	iamListen := envOrDefault("IAM_LISTEN_ADDR", ":4001")
 	iamDenyFile := envOrDefault("IAM_DENY_FILE", "/var/lib/awsmocks/iam-deny")
+	otlpListen := envOrDefault("OTLP_LISTEN_ADDR", ":4318")
+	upstreamLogs := envOrDefault("UPSTREAM_LOGS_URL", upstreamKMS)
 
 	upstream, err := url.Parse(upstreamKMS)
 	if err != nil {
 		log.Fatalf("invalid UPSTREAM_KMS_URL %q: %v", upstreamKMS, err)
 	}
+	logsUpstream, err := url.Parse(upstreamLogs)
+	if err != nil {
+		log.Fatalf("invalid UPSTREAM_LOGS_URL %q: %v", upstreamLogs, err)
+	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 
 	go func() {
 		errCh <- runKMSProxy(kmsListen, upstream)
@@ -138,8 +143,10 @@ func main() {
 	go func() {
 		errCh <- runMockIAM(iamListen, iamDenyFile)
 	}()
+	go func() {
+		errCh <- runOTLPReceiver(otlpListen, logsUpstream)
+	}()
 
-	// First fatal error from any listener wins.
 	log.Fatal(<-errCh)
 }
 

@@ -10,7 +10,7 @@ AWS_ACCOUNT_ID = "000000000000"
 FQDN = "enclave.test"
 CERT_BUCKET = "enclave-e2e-certificates"
 LEASE_BUCKET = "enclave-e2e-leases"
-INTENT_DIGEST = hashlib.sha256(b"dev\x00testapp").digest()[:8].hex()
+INTENT_DIGEST = hashlib.sha256(b"ark/e2e/dev\x00testapp").digest()[:8].hex()
 INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 
 
@@ -19,11 +19,11 @@ def cloud(command):
 
 
 def key_param(pcr0):
-    return f"/dev/testapp/unlocked/KMSKeyID/{pcr0}"
+    return f"/ark/e2e/dev/testapp/enclave/unlocked/KMSKeyID/{pcr0}"
 
 
 def migration_receipt_param(key_id, pcr0):
-    return f"/dev/testapp/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
+    return f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
 
 
 def get_param(name):
@@ -74,18 +74,9 @@ def print_enclave_diagnostics(node):
     )
 
 
-def wait_healthy(node):
+def _wait_enclave(node, command, timeout):
     try:
-        node.wait_until_succeeds(
-            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            'https://127.0.0.1/health | jq -e ".status == \\"ready\\""',
-            timeout=900,
-        )
-        node.wait_until_succeeds(
-            "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
-            'https://127.0.0.1/test/health | jq -e ".status == \\"ok\\""',
-            timeout=300,
-        )
+        node.wait_until_succeeds(command, timeout=timeout)
     except Exception:
         print_enclave_diagnostics(node)
         print(
@@ -94,6 +85,32 @@ def wait_healthy(node):
             )[1]
         )
         raise
+
+
+def wait_runtime_healthy(node):
+    """Wait until the enclave runtime reports its state established."""
+    _wait_enclave(
+        node,
+        "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
+        'https://127.0.0.1/health | jq -e ".status == \\"ready\\""',
+        timeout=900,
+    )
+
+
+def wait_upstream_healthy(node):
+    """Wait until the upstream app answers its own health check."""
+    _wait_enclave(
+        node,
+        "curl --connect-timeout 2 --max-time 5 -skf --http1.1 "
+        'https://127.0.0.1/test/health | jq -e ".status == \\"ok\\""',
+        timeout=300,
+    )
+
+
+def wait_enclave_healthy(node):
+    """Wait until the runtime has established state and the upstream app is serving."""
+    wait_runtime_healthy(node)
+    wait_upstream_healthy(node)
 
 
 def secret_value(node):

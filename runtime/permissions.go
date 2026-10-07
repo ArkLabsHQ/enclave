@@ -189,8 +189,8 @@ func (p *permissions) requiredGrants(
 	grants := []requiredGrant{
 		{
 			sid: "SSMParams",
-			resource: fmt.Sprintf("arn:%s:ssm:%s:%s:parameter/%s/%s/*",
-				partition, p.cfg.AWSRegion, account, p.cfg.Deployment, p.cfg.AppName),
+			resource: fmt.Sprintf("arn:%s:ssm:%s:%s:parameter%s/*",
+				partition, p.cfg.AWSRegion, account, p.cfg.namespace()),
 			actions: []string{"ssm:GetParameter", "ssm:GetParametersByPath", "ssm:PutParameter"},
 		},
 		{

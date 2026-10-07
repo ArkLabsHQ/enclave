@@ -1,5 +1,5 @@
 // Attestation-aware KMS Recipient proxy that CMS-wraps plaintext to the
-// enclave's RSA key, plus an IMDSv2 stub.
+// enclave's RSA key, plus IMDSv2 and IAM policy simulation stubs.
 package main
 
 import (
@@ -14,6 +14,7 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/fxamacker/cbor/v2"
@@ -117,13 +119,15 @@ func main() {
 	kmsListen := envOrDefault("KMS_PROXY_LISTEN_ADDR", ":4000")
 	upstreamKMS := envOrDefault("UPSTREAM_KMS_URL", "http://local-kms:8080")
 	imdsListen := envOrDefault("IMDS_LISTEN_ADDR", ":1338")
+	iamListen := envOrDefault("IAM_LISTEN_ADDR", ":4001")
+	iamDenyFile := envOrDefault("IAM_DENY_FILE", "/var/lib/awsmocks/iam-deny")
 
 	upstream, err := url.Parse(upstreamKMS)
 	if err != nil {
 		log.Fatalf("invalid UPSTREAM_KMS_URL %q: %v", upstreamKMS, err)
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	go func() {
 		errCh <- runKMSProxy(kmsListen, upstream)
@@ -131,8 +135,11 @@ func main() {
 	go func() {
 		errCh <- runMockIMDS(imdsListen)
 	}()
+	go func() {
+		errCh <- runMockIAM(iamListen, iamDenyFile)
+	}()
 
-	// First fatal error from either listener wins.
+	// First fatal error from any listener wins.
 	log.Fatal(<-errCh)
 }
 
@@ -158,6 +165,50 @@ func runKMSProxy(listenAddr string, upstream *url.URL) error {
 	})
 
 	log.Printf("kms-proxy listening on %s, forwarding to %s", listenAddr, upstream.String())
+	return http.ListenAndServe(listenAddr, mux)
+}
+
+type simulateResponse struct {
+	XMLName     xml.Name     `xml:"https://iam.amazonaws.com/doc/2010-05-08/ SimulatePrincipalPolicyResponse"`
+	Results     []evalResult `xml:"SimulatePrincipalPolicyResult>EvaluationResults>member"`
+	IsTruncated bool         `xml:"SimulatePrincipalPolicyResult>IsTruncated"`
+}
+
+type evalResult struct {
+	EvalActionName   string
+	EvalResourceName string
+	EvalDecision     string
+}
+
+// runMockIAM answers the runtime's permission preflight. MiniStack allows every
+// simulated action, so a test denies actions by listing them in denyFile.
+func runMockIAM(listenAddr, denyFile string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil || r.PostForm.Get("Action") != "SimulatePrincipalPolicy" {
+			http.Error(w, "only SimulatePrincipalPolicy is mocked", http.StatusBadRequest)
+			return
+		}
+		deny, _ := os.ReadFile(denyFile) // missing file: deny nothing
+		denied := strings.Fields(string(deny))
+		resource := r.PostForm.Get("ResourceArns.member.1")
+		var resp simulateResponse
+		for i := 1; ; i++ {
+			action := r.PostForm.Get(fmt.Sprintf("ActionNames.member.%d", i))
+			if action == "" {
+				break
+			}
+			decision := "allowed"
+			if slices.Contains(denied, action) {
+				decision = "implicitDeny"
+			}
+			resp.Results = append(resp.Results, evalResult{action, resource, decision})
+		}
+		w.Header().Set("Content-Type", "text/xml")
+		_ = xml.NewEncoder(w).Encode(resp)
+	})
+
+	log.Printf("mock-iam listening on %s, denying actions listed in %s", listenAddr, denyFile)
 	return http.ListenAndServe(listenAddr, mux)
 }
 

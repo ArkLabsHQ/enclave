@@ -217,7 +217,7 @@ let
     AWS_ENDPOINT_URL_S3 = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_STS = "http://${awsNodeIP}:4566";
     AWS_ENDPOINT_URL_LOGS = "http://${awsNodeIP}:4566";
-    AWS_ENDPOINT_URL_IAM = "http://${awsNodeIP}:4566";
+    AWS_ENDPOINT_URL_IAM = "http://${awsNodeIP}:4001";
     AWS_ENDPOINT_URL_ROUTE53 = "http://${awsNodeIP}:4570";
     AWS_REQUEST_CHECKSUM_CALCULATION = "when_required";
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
@@ -427,6 +427,7 @@ let
       networking.firewall.allowedTCPPorts = [
         1338
         4000
+        4001
         4566
         4570
         14000
@@ -458,12 +459,15 @@ let
         environment = {
           KMS_PROXY_LISTEN_ADDR = ":4000";
           IMDS_LISTEN_ADDR = ":1338";
+          IAM_LISTEN_ADDR = ":4001";
+          IAM_DENY_FILE = "/var/lib/awsmocks/iam-deny";
           UPSTREAM_KMS_URL = "http://127.0.0.1:4566";
         };
         serviceConfig = {
           Type = "simple";
           ExecStart = "${awsmocks}/bin/awsmocks";
           Restart = "on-failure";
+          StateDirectory = "awsmocks";
         };
       };
 

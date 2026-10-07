@@ -702,7 +702,7 @@ AWS credentials delivered through IMDS must allow:
 | `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
 | `S3MigrationIntentObjectLock` | `PutObject`, `GetObject`, `GetObjectVersion`, `PutObjectRetention`, `GetObjectRetention`, `ListBucket`, `ListBucketVersions`, `GetBucketLocation` on the derived intent bucket. Without `GetObjectRetention`, S3 hides the lock on every object and the runtime ignores every migration intent. Grant no `s3:CreateBucket`: the runtime must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath`, `PutParameter` on `/<deployment>/<app>/*`. |
-| `KMSAccess` | `CreateKey`, `TagResource`, `DescribeKey`. Locked keys also authorise `DescribeKey` through their `EnclaveOperations` statement. |
+| `KMSAccess` | `CreateKey`, `TagResource`. `DescribeKey` is optional; see below. |
 | `STSAccess` | `GetCallerIdentity`. |
 | `PermissionPreflight` | `iam:SimulatePrincipalPolicy` on the enclave role's own ARN, and nothing else, so the enclave can ask what it may do but not what any other principal may. |
 | `Route53AcmeChallenge` | Only with `ENCLAVE_USE_ACME=true`: `ChangeResourceRecordSets` on the hosted zone named in `/<deployment>/<app>/Route53ZoneID`, and `GetChange`. |
@@ -713,9 +713,10 @@ operations are authorised by the enclave-created key's own PCR0-conditioned
 policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
-`DescribeKey` is read-only metadata and grants nothing over ciphertext. It exists
-so a running enclave can report whether its ancestors' keys have been deleted;
-host credentials still cannot read enclave state with it.
+`DescribeKey` is read-only and only reports whether ancestor keys were deleted.
+Each key's `EnclaveOperations` statement already grants it to the role that
+created the key, so this grant only matters for unlocked ancestor keys created
+under another role, which otherwise read `unknown`.
 
 `/<deployment>/<app>/<locked|unlocked>/KMSKeyID/<pcr0>` is owned exclusively by
 the runtime. Do not pre-create or declaratively manage it. Genesis claims it

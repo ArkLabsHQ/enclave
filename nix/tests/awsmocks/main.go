@@ -1,5 +1,4 @@
-// Attestation-aware KMS Recipient proxy that CMS-wraps plaintext to the
-// enclave's RSA key, plus an IMDSv2 stub.
+// AWS service stubs used by the Nix end-to-end test.
 package main
 
 import (
@@ -117,13 +116,19 @@ func main() {
 	kmsListen := envOrDefault("KMS_PROXY_LISTEN_ADDR", ":4000")
 	upstreamKMS := envOrDefault("UPSTREAM_KMS_URL", "http://local-kms:8080")
 	imdsListen := envOrDefault("IMDS_LISTEN_ADDR", ":1338")
+	otlpListen := envOrDefault("OTLP_LISTEN_ADDR", ":4318")
+	upstreamLogs := envOrDefault("UPSTREAM_LOGS_URL", upstreamKMS)
 
 	upstream, err := url.Parse(upstreamKMS)
 	if err != nil {
 		log.Fatalf("invalid UPSTREAM_KMS_URL %q: %v", upstreamKMS, err)
 	}
+	logsUpstream, err := url.Parse(upstreamLogs)
+	if err != nil {
+		log.Fatalf("invalid UPSTREAM_LOGS_URL %q: %v", upstreamLogs, err)
+	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	go func() {
 		errCh <- runKMSProxy(kmsListen, upstream)
@@ -131,8 +136,10 @@ func main() {
 	go func() {
 		errCh <- runMockIMDS(imdsListen)
 	}()
+	go func() {
+		errCh <- runOTLPReceiver(otlpListen, logsUpstream)
+	}()
 
-	// First fatal error from either listener wins.
 	log.Fatal(<-errCh)
 }
 

@@ -279,5 +279,5 @@ func validateLeaf(leaf *x509.Certificate, domain string, now time.Time) error {
 }
 
 func objectKeyFor(cfg *Config, prefix, name string) string {
-	return cfg.Deployment + "/" + cfg.AppName + "/" + prefix + name
+	return cfg.Namespace + "/" + cfg.AppName + "/" + prefix + name
 }

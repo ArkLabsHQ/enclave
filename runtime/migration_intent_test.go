@@ -710,8 +710,8 @@ var _ S3API = (*migrationIntentPagedS3)(nil)
 
 func TestMigrationIntentBucketNameDerivation(t *testing.T) {
 	const account = "123456789012"
-	nameFor := func(deployment, app string) string {
-		return migrationIntentBucketName(newTestConfig(deployment, app, false), account)
+	nameFor := func(namespace, app string) string {
+		return migrationIntentBucketName(newTestConfig(namespace, app, false), account)
 	}
 	name := nameFor("prod", "wallet")
 
@@ -725,7 +725,8 @@ func TestMigrationIntentBucketNameDerivation(t *testing.T) {
 	))
 
 	require.NotEqual(t, name, nameFor("prod", "vault"), "distinct per application")
-	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per deployment")
+	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per namespace")
+	require.NotEqual(t, name, nameFor("ark/prod", "wallet"), "distinct per namespace prefix")
 
 	// The NUL separator is what stops "prodwal"+"let" colliding with
 	// "prod"+"wallet".

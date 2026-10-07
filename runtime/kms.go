@@ -124,7 +124,7 @@ func FetchOrCreatePrimaryKMS(
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave genesis key for %s/%s", cfg.Deployment, cfg.AppName)
+	description := fmt.Sprintf("enclave genesis key for %s/%s", cfg.Namespace, cfg.AppName)
 
 	createOut, err := kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
@@ -132,7 +132,7 @@ func FetchOrCreatePrimaryKMS(
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
 			{TagKey: aws.String("AppName"), TagValue: aws.String(cfg.AppName)},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(cfg.Deployment)},
+			{TagKey: aws.String("Namespace"), TagValue: aws.String(cfg.Namespace)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 		},
 	})
@@ -251,7 +251,7 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		return nil, fmt.Errorf("failed to build KMS policy: %w", err)
 	}
 
-	description := fmt.Sprintf("enclave migration key for %s/%s", k.cfg.Deployment, k.cfg.AppName)
+	description := fmt.Sprintf("enclave migration key for %s/%s", k.cfg.Namespace, k.cfg.AppName)
 
 	out, err := k.kms.CreateKey(ctx, &kmscmd.CreateKeyInput{
 		Description:                    aws.String(description),
@@ -259,7 +259,7 @@ func (k *kmsW) CreateMigrationKMS(ctx context.Context, newPCR0 string) (KMS, err
 		BypassPolicyLockoutSafetyCheck: true,
 		Tags: []kmstypes.Tag{
 			{TagKey: aws.String("AppName"), TagValue: aws.String(k.cfg.AppName)},
-			{TagKey: aws.String("Deployment"), TagValue: aws.String(k.cfg.Deployment)},
+			{TagKey: aws.String("Namespace"), TagValue: aws.String(k.cfg.Namespace)},
 			{TagKey: aws.String("ManagedBy"), TagValue: aws.String("enclave")},
 			{TagKey: aws.String("Purpose"), TagValue: aws.String("migration")},
 		},

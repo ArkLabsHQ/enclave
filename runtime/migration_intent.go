@@ -82,7 +82,7 @@ type migrationIntentLog struct {
 }
 
 func migrationIntentBucketName(cfg *Config, accountID string) string {
-	identity := cfg.Deployment + "\x00" + cfg.AppName
+	identity := cfg.Namespace + "\x00" + cfg.AppName
 	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("enclave-%s-%x-migration-intents", accountID, digest[:8])
 }

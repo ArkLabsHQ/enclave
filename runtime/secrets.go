@@ -193,11 +193,13 @@ func (sm SecretsMetadata) validateChildEnv(overrideAllowList map[string]bool) er
 	for _, m := range sm.Inherited {
 		if overrideAllowList[m.EnvVar] {
 			return fmt.Errorf(
-				"inherited secret %q: env_var %q is in the override allowlist", m.Name, m.EnvVar)
+				"inherited secret %q: env_var %q is in the override allowlist", m.Name, m.EnvVar,
+			)
 		}
 		if _, baked := os.LookupEnv(m.EnvVar); baked {
 			return fmt.Errorf(
-				"inherited secret %q: env_var %q is set in the baked environment", m.Name, m.EnvVar)
+				"inherited secret %q: env_var %q is set in the baked environment", m.Name, m.EnvVar,
+			)
 		}
 	}
 	return nil

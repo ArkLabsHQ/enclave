@@ -365,7 +365,7 @@ func (d leaseDocV1) lapsed(now time.Time) bool {
 
 // leaseObjectKey namespaces locks inside the storage bucket.
 func leaseObjectKey(cfg *Config, name string) string {
-	return fmt.Sprintf("%s/%s/lock/%s", cfg.Deployment, cfg.AppName, name)
+	return fmt.Sprintf("%s/%s/lock/%s", cfg.Namespace, cfg.AppName, name)
 }
 
 func backoff(ctx context.Context, attempt int) error {

@@ -79,12 +79,9 @@ func (p *permissions) check(ctx context.Context) error {
 		return fmt.Errorf("permission preflight: %w", err)
 	}
 
-	grants, err := p.requiredGrants(
+	grants, lookupErr := p.requiredGrants(
 		ctx, strings.SplitN(roleARN, ":", 3)[1], aws.ToString(identity.Account),
 	)
-	if err != nil {
-		return fmt.Errorf("permission preflight: %w", err)
-	}
 
 	var missing []string
 	for _, g := range grants {
@@ -102,10 +99,12 @@ func (p *permissions) check(ctx context.Context) error {
 		}
 		missing = append(missing, denied...)
 	}
+	var denied error
 	if len(missing) > 0 {
-		return fmt.Errorf(
-			"permission preflight: role %s is missing %s", roleARN, strings.Join(missing, "; "),
-		)
+		denied = fmt.Errorf("role %s is missing %s", roleARN, strings.Join(missing, "; "))
+	}
+	if err := errors.Join(denied, lookupErr); err != nil {
+		return fmt.Errorf("permission preflight: %w", err)
 	}
 	return nil
 }
@@ -177,19 +176,13 @@ func (p *permissions) simulateGrant(
 	return missing, nil
 }
 
+// requiredGrants names every grant it can. Bucket and zone names live in SSM, so
+// a failed lookup drops only the grants that need it and is returned alongside
+// them: a role denied SSM still gets a full report.
 func (p *permissions) requiredGrants(
 	ctx context.Context, partition, account string,
 ) ([]requiredGrant, error) {
 	intentBucket := migrationIntentBucketName(p.cfg, account)
-	leaseBucket, err := p.ssm.MustGet(ctx, p.cfg.leaseBucketParam())
-	if err != nil {
-		return nil, err
-	}
-	certBucket, err := p.ssm.MustGet(ctx, p.cfg.certBucketParam())
-	if err != nil {
-		return nil, err
-	}
-
 	s3ARN := func(resource string) string { return fmt.Sprintf("arn:%s:s3:::%s", partition, resource) }
 	objectRW := []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"}
 
@@ -199,17 +192,6 @@ func (p *permissions) requiredGrants(
 			resource: fmt.Sprintf("arn:%s:ssm:%s:%s:parameter/%s/%s/*",
 				partition, p.cfg.AWSRegion, account, p.cfg.Deployment, p.cfg.AppName),
 			actions: []string{"ssm:GetParameter", "ssm:GetParametersByPath", "ssm:PutParameter"},
-		},
-		// Without ListBucket, S3 answers a missing key with 403 rather than 404.
-		{
-			sid:      "S3CertAndLeaseReadWrite",
-			resource: s3ARN(leaseBucket),
-			actions:  []string{"s3:ListBucket"},
-		},
-		{
-			sid:      "S3CertAndLeaseReadWrite",
-			resource: s3ARN(certBucket),
-			actions:  []string{"s3:ListBucket"},
 		},
 		{
 			sid:      "S3MigrationIntentObjectLock",
@@ -225,33 +207,7 @@ func (p *permissions) requiredGrants(
 			resource: s3ARN(intentBucket),
 			actions:  []string{"s3:ListBucketVersions"},
 		},
-	}
-
-	for _, name := range []string{genesisLeaseName, certLeaseName, "migration-" + p.pcr0} {
-		grants = append(grants, requiredGrant{
-			sid:      "S3CertAndLeaseReadWrite",
-			resource: s3ARN(leaseBucket + "/" + leaseObjectKey(p.cfg, name)), actions: objectRW,
-		})
-	}
-	certPrefix := selfSignedStoragePrefix
-	if p.cfg.UseACME {
-		certPrefix = acmeStoragePrefix
-		grants = append(grants, requiredGrant{
-			sid: "S3CertAndLeaseReadWrite",
-			resource: s3ARN(
-				certBucket + "/" + objectKeyFor(p.cfg, acmeStoragePrefix, "account.key"),
-			),
-			actions: []string{"s3:GetObject", "s3:PutObject"},
-		})
-	}
-	grants = append(
-		grants,
-		requiredGrant{
-			sid:      "S3CertAndLeaseReadWrite",
-			resource: s3ARN(certBucket + "/" + objectKeyFor(p.cfg, certPrefix, p.cfg.FQDN+"/cert")),
-			actions:  []string{"s3:GetObject", "s3:PutObject"},
-		},
-		requiredGrant{
+		{
 			sid:      "S3MigrationIntentObjectLock",
 			resource: s3ARN(intentBucket + "/" + deploymentGenesisKey),
 			actions: []string{
@@ -259,7 +215,48 @@ func (p *permissions) requiredGrants(
 				"s3:PutObjectRetention", "s3:GetObjectRetention",
 			},
 		},
-	)
+	}
+
+	leaseBucket, leaseErr := p.ssm.MustGet(ctx, p.cfg.leaseBucketParam())
+	if leaseErr == nil {
+		// Without ListBucket, S3 answers a missing key with 403 rather than 404.
+		grants = append(grants, requiredGrant{
+			sid:      "S3CertAndLeaseReadWrite",
+			resource: s3ARN(leaseBucket),
+			actions:  []string{"s3:ListBucket"},
+		})
+		for _, name := range []string{genesisLeaseName, certLeaseName, "migration-" + p.pcr0} {
+			grants = append(grants, requiredGrant{
+				sid:      "S3CertAndLeaseReadWrite",
+				resource: s3ARN(leaseBucket + "/" + leaseObjectKey(p.cfg, name)), actions: objectRW,
+			})
+		}
+	}
+
+	certBucket, certErr := p.ssm.MustGet(ctx, p.cfg.certBucketParam())
+	if certErr == nil {
+		grants = append(grants, requiredGrant{
+			sid:      "S3CertAndLeaseReadWrite",
+			resource: s3ARN(certBucket),
+			actions:  []string{"s3:ListBucket"},
+		})
+		certPrefix := selfSignedStoragePrefix
+		if p.cfg.UseACME {
+			certPrefix = acmeStoragePrefix
+			grants = append(grants, requiredGrant{
+				sid: "S3CertAndLeaseReadWrite",
+				resource: s3ARN(
+					certBucket + "/" + objectKeyFor(p.cfg, acmeStoragePrefix, "account.key"),
+				),
+				actions: []string{"s3:GetObject", "s3:PutObject"},
+			})
+		}
+		grants = append(grants, requiredGrant{
+			sid:      "S3CertAndLeaseReadWrite",
+			resource: s3ARN(certBucket + "/" + objectKeyFor(p.cfg, certPrefix, p.cfg.FQDN+"/cert")),
+			actions:  []string{"s3:GetObject", "s3:PutObject"},
+		})
+	}
 	for _, param := range []string{
 		p.cfg.kmsKeyIDParam(p.pcr0), p.cfg.migrationChallengeParam(p.pcr0),
 		p.cfg.migrationPreviousPCR0Param(p.pcr0), p.cfg.migrationPreviousKMSKeyIDParam(p.pcr0),
@@ -328,28 +325,31 @@ func (p *permissions) requiredGrants(
 		)
 	}
 
+	var zoneErr error
 	if p.cfg.UseACME {
-		zoneID, err := p.ssm.MustGet(ctx, p.cfg.route53ZoneIDParam())
-		if err != nil {
-			return nil, err
-		}
 		region := "us-east-1"
 		if partition == "aws-cn" {
 			region = "cn-northwest-1"
 		}
-		for _, action := range []string{"UPSERT", "DELETE"} {
-			grants = append(grants, requiredGrant{
-				sid: "Route53AcmeChallenge",
-				resource: fmt.Sprintf("arn:%s:route53:::hostedzone/%s",
-					partition, strings.TrimPrefix(zoneID, "/hostedzone/")),
-				actions: []string{"route53:ChangeResourceRecordSets"}, region: region,
-				context: []iamtypes.ContextEntry{
-					permissionListContext("route53:ChangeResourceRecordSetsNormalizedRecordNames",
-						strings.ToLower(strings.TrimSuffix(acmeChallengeName(p.cfg.FQDN), "."))),
-					permissionListContext("route53:ChangeResourceRecordSetsRecordTypes", "TXT"),
-					permissionListContext("route53:ChangeResourceRecordSetsActions", action),
-				},
-			})
+		var zoneID string
+		zoneID, zoneErr = p.ssm.MustGet(ctx, p.cfg.route53ZoneIDParam())
+		if zoneErr == nil {
+			for _, action := range []string{"UPSERT", "DELETE"} {
+				grants = append(grants, requiredGrant{
+					sid: "Route53AcmeChallenge",
+					resource: fmt.Sprintf("arn:%s:route53:::hostedzone/%s",
+						partition, strings.TrimPrefix(zoneID, "/hostedzone/")),
+					actions: []string{"route53:ChangeResourceRecordSets"}, region: region,
+					context: []iamtypes.ContextEntry{
+						permissionListContext(
+							"route53:ChangeResourceRecordSetsNormalizedRecordNames",
+							strings.ToLower(strings.TrimSuffix(acmeChallengeName(p.cfg.FQDN), ".")),
+						),
+						permissionListContext("route53:ChangeResourceRecordSetsRecordTypes", "TXT"),
+						permissionListContext("route53:ChangeResourceRecordSetsActions", action),
+					},
+				})
+			}
 		}
 		grants = append(grants, requiredGrant{
 			sid:      "Route53AcmeChallenge",
@@ -358,7 +358,7 @@ func (p *permissions) requiredGrants(
 			region:   region,
 		})
 	}
-	return grants, nil
+	return grants, errors.Join(leaseErr, certErr, zoneErr)
 }
 
 func permissionContext(name, value string) iamtypes.ContextEntry {

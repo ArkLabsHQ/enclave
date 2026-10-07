@@ -198,6 +198,26 @@ func TestPermissionsPreflight(t *testing.T) {
 		err := p.preflight(context.Background())
 		require.ErrorContains(t, err, testCfg.leaseBucketParam())
 	})
+
+	t.Run("denied SSM reads still report every other grant", func(t *testing.T) {
+		p := &permissions{
+			cfg: &acme,
+			ssm: NewSSM(&fakeSSM{err: errors.New("AccessDeniedException")}),
+			iam: &fakeIAM{denied: map[string]bool{
+				"ssm:GetParameter": true, "kms:CreateKey": true,
+			}},
+			sts:  sts,
+			pcr0: permissionTestPCR0,
+		}
+		err := p.preflight(context.Background())
+		require.ErrorContains(t, err, "SSMParams ssm:GetParameter on arn:aws:ssm:")
+		require.ErrorContains(t, err, "KMSAccess kms:CreateKey on * (implicitDeny)")
+		for _, param := range []string{
+			acme.leaseBucketParam(), acme.certBucketParam(), acme.route53ZoneIDParam(),
+		} {
+			require.ErrorContains(t, err, param)
+		}
+	})
 }
 
 func permissionFixture(acme bool) *permissions {

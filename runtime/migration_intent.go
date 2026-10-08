@@ -317,9 +317,9 @@ func (l *migrationIntentLog) compliesWithObjectLock(
 	return true
 }
 
-// readIntent returns one version if it is a well-formed record at the expected
-// sequence, retained under the Object Lock the runtime writes. It does not
-// verify the attestation.
+// readIntent returns one version if it is a well-formed, non-multipart record at
+// the expected sequence, retained under the Object Lock the runtime writes.
+// It does not verify the attestation.
 func (l *migrationIntentLog) readIntent(
 	ctx context.Context,
 	key, versionID string,
@@ -328,9 +328,10 @@ func (l *migrationIntentLog) readIntent(
 ) (migrationIntentObjectV1, bool, error) {
 	var entry migrationIntentObjectV1
 	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket:    aws.String(l.bucket),
-		Key:       aws.String(key),
-		VersionId: aws.String(versionID),
+		Bucket:     aws.String(l.bucket),
+		Key:        aws.String(key),
+		VersionId:  aws.String(versionID),
+		PartNumber: aws.Int32(1), // Exposes res.PartsCount if object was a multipart upload
 	})
 	if err != nil {
 		return entry, false, fmt.Errorf(
@@ -342,6 +343,12 @@ func (l *migrationIntentLog) readIntent(
 		)
 	}
 	defer func() { _ = out.Body.Close() }()
+	// Multipart LastModified dates from upload initiation, so a host could
+	// replay an intent into an old upload to bypass the migration cooldown.
+	if out.PartsCount != nil {
+		slog.Warn("ignoring multipart migration intent", "key", key, "version", versionID)
+		return entry, false, nil
+	}
 	if !l.compliesWithObjectLock(key, versionID, publishedAt, out) {
 		return entry, false, nil
 	}

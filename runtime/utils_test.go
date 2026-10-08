@@ -630,6 +630,7 @@ type fakeS3Object struct {
 	lockMode     s3types.ObjectLockMode
 	retainUntil  time.Time
 	lastModified time.Time
+	partsCount   *int32
 }
 
 type fakeS3 struct {
@@ -823,6 +824,9 @@ func (f *fakeS3) GetObject(
 				body = io.NopCloser(iotest.ErrReader(f.readErr))
 			}
 			out := &s3.GetObjectOutput{Body: body, ETag: aws.String(objects[i].etag)}
+			if in.PartNumber != nil {
+				out.PartsCount = objects[i].partsCount
+			}
 			out.ObjectLockMode = objects[i].lockMode
 			if !objects[i].retainUntil.IsZero() {
 				out.ObjectLockRetainUntilDate = aws.Time(objects[i].retainUntil)

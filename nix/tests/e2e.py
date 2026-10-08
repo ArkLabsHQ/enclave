@@ -519,6 +519,8 @@ with subtest("multipart replay preserves the migration cooldown"):
                 "| jq -e '.status == \"candidate\"'"
             )
             time.sleep(1)
+        for node in BLUES:
+            assert console_has(node, "ignoring multipart migration intent"), node.name
     except Exception:
         for node in (*BLUES, green):
             print_enclave_diagnostics(node)

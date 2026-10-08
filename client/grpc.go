@@ -18,8 +18,9 @@ import (
 // configured CacheTTL.
 //
 // HTTP and gRPC use the same trust model: verified Nitro attestation plus a TLS
-// handshake pinned to its leaf hash. A wrong PCR0 or mismatched certificate
-// makes the connection fail.
+// handshake pinned to the retained public-key hash, including on reconnects.
+// A wrong PCR0 or different deployment key makes verification fail. Caller
+// dial options cannot override the pinned transport credentials.
 //
 // Usage:
 //
@@ -49,10 +50,10 @@ func (c *Client) GRPCConn(ctx context.Context, opts ...grpc.DialOption) (*grpc.C
 	}
 
 	host := strings.TrimPrefix(c.baseURL, "https://")
-	host = strings.TrimPrefix(host, "http://")
 
-	dialOpts := append([]grpc.DialOption{
+	dialOpts := append(
+		opts[:len(opts):len(opts)],
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	}, opts...)
+	)
 	return grpc.NewClient(host, dialOpts...)
 }

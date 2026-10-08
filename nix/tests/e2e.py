@@ -1,6 +1,8 @@
-# default.nix prepends BLUE_PCR0, GREEN_PCR0, and AWS_NODE_IP.
+# default.nix prepends PCR0s, AWS_NODE_IP, and MIGRATION_COOLDOWN_SECONDS.
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
+
+from datetime import datetime, timedelta, timezone
 
 CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
 ACCOUNT_KEY = "ark/e2e/dev/testapp/data/acme/account.key"
@@ -8,15 +10,9 @@ SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/dev/testapp/enclave"
 INSTANCE_ID = "i-0e2ce2ce2ce2ce2ce"
-# Inherited hash secrets are delivered hex; default.nix pins its SHA-256.
-INHERITED = b"inherited-from-outside".hex()
-
-
-def put_env(name, value):
-    cloud(
-        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/env/{name} "
-        f"--type String --value {shlex.quote(value)}"
-    )
+BACKDATE_SECONDS = 48 * 3600
+REPLAY_OBSERVATION_SECONDS = 10
+INTENT_KEY = f"migration-intent/{BLUE_PCR0}/{1:020d}"
 
 
 def served_leaf(node, x509_args):
@@ -91,14 +87,41 @@ def env_value(node, name):
     ).strip()
 
 
-aws.start()
-aws.wait_for_unit("multi-user.target")
-aws.wait_for_open_port(4566)
-aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
-aws.wait_for_open_port(4000)
-aws.wait_for_open_port(1338)
-aws.wait_for_open_port(4318)
-aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4318/_otlp/logs")
+def intent_versions():
+    out = json.loads(
+        cloud(
+            f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+            f"--prefix {INTENT_KEY} --output json"
+        )
+    )
+    return [v for v in out.get("Versions", []) if v["Key"] == INTENT_KEY]
+
+
+setup_aws()
+
+# A hostile host starts a multipart upload before any genuine migration intent
+# exists. AWS dates completed multipart objects from initiation; the ministack
+# patch preserves that behavior. Only the AWS node's clock moves, before any
+# enclaves start. The predictable first intent key lets us replay its future
+# body and attestation with a timestamp older than the cooldown.
+aws.succeed("systemctl stop systemd-timesyncd 2>/dev/null || true")
+real_epoch = int(aws.succeed("date +%s").strip())
+retain_until = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+    "%Y-%m-%dT%H:%M:%SZ"
+)
+aws.succeed(f"date -u -s @{real_epoch - BACKDATE_SECONDS}")
+try:
+    upload_id = cloud(
+        f"s3api create-multipart-upload --bucket {INTENT_BUCKET} "
+        f"--key {INTENT_KEY} --content-type application/json "
+        "--object-lock-mode COMPLIANCE "
+        f"--object-lock-retain-until-date {retain_until} "
+        "--query UploadId --output text"
+    )
+finally:
+    aws.succeed(f"date -u -s @{real_epoch}")
+assert upload_id, "multipart upload was not initiated"
+
 aws.wait_for_open_port(14000)
 aws.wait_for_open_port(8055)
 aws.wait_for_open_port(4570)
@@ -107,25 +130,6 @@ aws.wait_until_succeeds(
     "| grep -q newOrder"
 )
 
-# Create only the AWS resources consumed by the runtime.
-cloud(f"s3api create-bucket --bucket {CERT_BUCKET}")
-cloud(f"s3api create-bucket --bucket {LEASE_BUCKET}")
-cloud(
-    f"s3api create-bucket --bucket {INTENT_BUCKET} "
-    "--object-lock-enabled-for-bucket"
-)
-cloud(
-    f"s3api put-bucket-versioning --bucket {INTENT_BUCKET} "
-    "--versioning-configuration Status=Enabled"
-)
-cloud(
-    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/CertBucketName "
-    f"--type String --value {CERT_BUCKET}"
-)
-cloud(
-    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/LeaseBucketName "
-    f"--type String --value {LEASE_BUCKET}"
-)
 route53_zone_id = cloud(
     f"route53 create-hosted-zone --name {FQDN}. --caller-reference enclave-e2e "
     "--query HostedZone.Id --output text"
@@ -135,12 +139,6 @@ cloud(
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
-for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
-    cloud(
-        f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/{inherited} "
-        f"--type String --value {INHERITED}"
-    )
-put_env("ENCLAVE_FQDN", FQDN)
 
 BLUES = (blue, blue_peer)
 kms_keys_before_genesis = kms_key_count()
@@ -437,18 +435,96 @@ assert attestation_code == "503", attestation_code
 for node in BLUES:
     node.wait_until_succeeds(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-        f"| jq -e --arg p '{GREEN_PCR0}' '.migration.target_pcr0 == $p'",
+        f"| jq -e --arg p '{GREEN_PCR0}' "
+        "'.migration.state == \"cooling_down\" and .migration.target_pcr0 == $p'",
         timeout=180,
     )
-assert (
-    int(
+assert get_param(key_param(GREEN_PCR0)) == ""
+
+# Both blues may publish the same request. Replay the earliest genuine version
+# byte-for-byte; it is the one that determines the cooldown's start.
+genuine = intent_versions()
+assert genuine, "no genuine migration intent was published"
+first_intent = min(genuine, key=lambda v: datetime.fromisoformat(v["LastModified"]))
+genuine_last_modified = datetime.fromisoformat(first_intent["LastModified"])
+eligible_at = genuine_last_modified + timedelta(seconds=MIGRATION_COOLDOWN_SECONDS)
+genuine_ids = {v["VersionId"] for v in genuine}
+
+cloud(
+    f"s3api get-object --bucket {INTENT_BUCKET} --key {INTENT_KEY} "
+    f"--version-id {first_intent['VersionId']} /tmp/replayed-intent.json >/dev/null"
+)
+part_etag = cloud(
+    f"s3api upload-part --bucket {INTENT_BUCKET} --key {INTENT_KEY} "
+    f"--upload-id {upload_id} --part-number 1 "
+    "--body /tmp/replayed-intent.json --query ETag --output text"
+)
+complete_request = json.dumps({"Parts": [{"PartNumber": 1, "ETag": part_etag}]})
+cloud(
+    f"s3api complete-multipart-upload --bucket {INTENT_BUCKET} "
+    f"--key {INTENT_KEY} --upload-id {upload_id} "
+    f"--multipart-upload {shlex.quote(complete_request)}"
+)
+
+# The replay must really be backdated and identifiable as multipart even with
+# one part. Read part 1 of each exact version, as the runtime does when scanning.
+versions = intent_versions()
+assert len(versions) == len(genuine) + 1, versions
+for version in versions:
+    metadata = json.loads(
         cloud(
-            f"s3api list-object-versions --bucket {INTENT_BUCKET} "
-            "--query 'length(Versions)' --output text"
+            f"s3api get-object --bucket {INTENT_BUCKET} "
+            f"--key {INTENT_KEY} --version-id {version['VersionId']} "
+            "--part-number 1 --output json /dev/null"
         )
     )
-    >= 1
-)
+    is_replay = version["VersionId"] not in genuine_ids
+    assert ("PartsCount" in metadata) == is_replay, metadata
+    if is_replay:
+        assert metadata["PartsCount"] == 1, metadata
+        backdated = datetime.fromisoformat(version["LastModified"])
+        skew = (genuine_last_modified - backdated).total_seconds()
+        assert skew >= BACKDATE_SECONDS - 60, (backdated, genuine_last_modified)
+
+with subtest("multipart replay preserves the migration cooldown"):
+    deadline = time.monotonic() + REPLAY_OBSERVATION_SECONDS
+    try:
+        for node in BLUES:
+            node.succeed(
+                "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+                f"| jq -e '.migration.remaining_seconds > {REPLAY_OBSERVATION_SECONDS}'"
+            )
+        while time.monotonic() < deadline:
+            for node in BLUES:
+                migration = json.loads(
+                    node.succeed("curl -skf --http1.1 https://127.0.0.1/enclave/v1/info")
+                )["migration"]
+                assert migration["state"] == "cooling_down", (
+                    f"{node.name}: multipart replay bypassed the migration cooldown: {migration}"
+                )
+                assert migration["target_pcr0"] == GREEN_PCR0, migration
+                assert migration["remaining_seconds"] > 0, migration
+                assert (
+                    datetime.fromisoformat(migration["published_at"])
+                    == genuine_last_modified
+                ), migration
+                assert (
+                    datetime.fromisoformat(migration["eligible_at"]) == eligible_at
+                ), migration
+            assert get_param(key_param(GREEN_PCR0)) == "", (
+                "handoff committed during cooldown"
+            )
+            green.succeed(
+                "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+                "| jq -e '.status == \"candidate\"'"
+            )
+            time.sleep(1)
+    except Exception:
+        for node in (*BLUES, green):
+            print_enclave_diagnostics(node)
+        raise
+
+print("e2e-summary: multipart replay preserved the migration cooldown on both blues")
 
 # Green can see who is offering it the handoff, while still a candidate.
 green.wait_until_succeeds(
@@ -460,7 +536,7 @@ green.wait_until_succeeds(
 
 # A blue commits on its own once eligible.
 migration_key = ""
-for _ in range(120):
+for _ in range(MIGRATION_COOLDOWN_SECONDS + 120):
     migration_key = get_param(key_param(GREEN_PCR0))
     if migration_key not in ("", "UNSET", "None"):
         break

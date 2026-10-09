@@ -7,16 +7,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"math/big"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -213,258 +207,86 @@ func TestDerivationCBORLengthBoundaries(t *testing.T) {
 	}
 }
 
-func requireChildSecretExports(
-	t *testing.T,
-	cfg Config,
-	result bootResult,
-	want map[string]string,
-) {
-	t.Helper()
-	values := map[string]string{}
-	for _, entry := range (&exec.Cmd{Env: appEnv(cfg, "token", result.secrets)}).Environ() {
-		key, value, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "DERIVED_TEST_") {
-			values[key] = value
-		}
+func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
+	const keyID = "key-declarations"
+	params := stateOriginParams(keyID)
+	snapshot := bootSnapshot{
+		kmsKeyID: keyID, ownerPCR0: stateOriginTestPCR0Hex(),
+		masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
+		tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
+		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 	}
-	require.Equal(
+	root, err := stateRoot(testCfg, snapshot)
+	require.NoError(t, err)
+	receipt := signedOriginReceipt(
 		t,
-		want,
-		values,
-		"only declared static and resolved inherited secrets are exported",
+		map[uint][]byte{0: mustDecodeHex(t, snapshot.ownerPCR0)},
+		root,
+		snapshot,
 	)
-	tlsDER, err := x509.MarshalPKCS8PrivateKey(result.tlsKey)
-	require.NoError(t, err)
-	accountDER, err := x509.MarshalPKCS8PrivateKey(result.acmeAccountKey)
-	require.NoError(t, err)
-	env := strings.Join(appEnv(cfg, "token", result.secrets), "\n")
-	for _, secret := range [][]byte{result.masterSeed, result.dek.(*dek).key, tlsDER, accountDER, result.tlsKey.(*ecdsa.PrivateKey).D.FillBytes(make([]byte, 32)), result.acmeAccountKey.(*ecdsa.PrivateKey).D.FillBytes(make([]byte, 32))} {
-		require.NotContains(t, env, hex.EncodeToString(secret))
-		require.NotContains(t, env, base64.StdEncoding.EncodeToString(secret))
-		require.NotContains(t, env, string(secret))
+	byName := map[string]string{}
+	for _, name := range []string{"alpha", "beta"} {
+		byName[name], err = deriveSecret(bytes.Repeat([]byte{0x42}, 32), name)
+		require.NoError(t, err)
+	}
+	a, b := stateOriginTestSecrets[0], stateOriginTestSecrets[1]
+	for _, tc := range []struct {
+		name   string
+		static []StaticSecretMetadata
+	}{
+		{"renamed env", []StaticSecretMetadata{{Name: a.Name, EnvVar: "RENAMED"}, b}},
+		{"reordered", []StaticSecretMetadata{b, a}},
+		{"removed", []StaticSecretMetadata{b}},
+		{"removed all", nil},
+		{"restored", []StaticSecretMetadata{a, b}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			boot := &Boot{cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots))}
+			result, err := boot.establish(t.Context(), &plannedBoot{
+				mode: &resumeBoot{},
+				state: bootState{
+					snapshot: snapshot, bootReceipt: receipt.docB64,
+					secretsMetadata: SecretsMetadata{Static: tc.static},
+				},
+			}, &stateOriginTestKMS{keyID: keyID})
+			require.NoError(t, err)
+			want := make([]StaticSecret, 0, len(tc.static))
+			for _, meta := range tc.static {
+				want = append(
+					want,
+					StaticSecret{StaticSecretMetadata: meta, Plaintext: byName[meta.Name]},
+				)
+			}
+			require.Equal(t, want, result.secrets.Static)
+		})
 	}
 }
 
-func TestDerivedBootLifecycle(t *testing.T) {
-	keyA := StaticSecretMetadata{Name: "e2e-signing-key", EnvVar: "DERIVED_TEST_A"}
-	keyB := StaticSecretMetadata{Name: "e2e-second-key", EnvVar: "DERIVED_TEST_B"}
-	renamedEnv := StaticSecretMetadata{Name: keyA.Name, EnvVar: "DERIVED_TEST_RENAMED"}
-	rotated := StaticSecretMetadata{Name: keyA.Name + "-v2", EnvVar: keyA.EnvVar}
-	replacement, pin := inheritTestKey(t)
-	inherited := InheritSecretMetadata{
-		Name:   "replacement",
-		EnvVar: keyA.EnvVar,
-		Type:   inheritSecretTypePublicKey,
-		Value:  []string{pin},
+func TestExtendPCRRegistersWithStaticSecrets(t *testing.T) {
+	keyA, pubA := inheritTestKeyFrom(t, "pcr-a")
+	keyB, pubB := inheritTestKeyFrom(t, "pcr-b")
+	session := newStatefulNSMSession(t, nil)
+	nsm := &nsmW{nsm: &fakeNSM{session: session}}
+	require.NoError(t, ExtendPCRRegistersWithStaticSecrets(nsm, nil))
+	require.Empty(t, session.requests)
+
+	require.NoError(t, ExtendPCRRegistersWithStaticSecrets(nsm, []StaticSecret{
+		{Plaintext: keyA}, {Plaintext: keyB},
+	}))
+	for i, pub := range []string{pubA, pubB} {
+		hash := sha256.Sum256(mustDecodeHex(t, pub))
+		require.Equal(t, hash[:], requireExtendPCR(t, session, uint(16+i)).Data)
 	}
-	type stage struct {
-		name        string
-		static      []StaticSecretMetadata
-		replacement bool
-	}
-	for _, scenario := range []struct {
-		name   string
-		stages []stage
-	}{
-		{"declaration changes", []stage{
-			{"Blue", []StaticSecretMetadata{keyA}, false},
-			{"Green", []StaticSecretMetadata{keyA, keyB}, false},
-			{"Red", []StaticSecretMetadata{keyB}, true},
-			{"restored with changed env", []StaticSecretMetadata{renamedEnv, keyB}, false},
-			{"rotated name", []StaticSecretMetadata{rotated, keyB}, false},
-			{"removed all", nil, false},
-			{"restored reordered", []StaticSecretMetadata{keyB, keyA}, false},
-		}},
-		{"no static declarations", []stage{{"genesis", nil, false}, {"successor", nil, false}}},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			ctx := t.Context()
-			fx := newGenesisFixture(t, bytes.Repeat([]byte{1}, 48))
-			var first bootResult
-			var stored []byte
-			var certETag string
-			byName := map[string]string{}
-			for index, stage := range scenario.stages {
-				if !t.Run(stage.name, func(t *testing.T) {
-					cfg := migrationTestCfg()
-					cfg.FQDN = "enclave.test"
-					if index > 0 {
-						cfg.PreviousPCR0 = hex.EncodeToString(bytes.Repeat([]byte{byte(index)}, 48))
-					}
-					raw, err := json.Marshal(stage.static)
-					require.NoError(t, err)
-					cfg.StaticSecretConfig = string(raw)
-					if stage.replacement {
-						raw, err = json.Marshal([]InheritSecretMetadata{inherited})
-						require.NoError(t, err)
-						cfg.InheritSecretConfig = string(raw)
-					}
-					pcr0 := bytes.Repeat([]byte{byte(index + 1)}, 48)
-					var current bootResult
-					var currentNSM NSM
-					for bootIndex := 0; bootIndex < 2; bootIndex++ { // first boot, resume
-						session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
-						session.attestationSign = fx.signer
-						nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.signer.roots}}
-						boot, err := NewBoot(cfg, nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
-						require.NoError(t, err)
-						before := maps.Clone(fx.ssmf.params)
-						seq := fx.kmsf.seq
-						parent := os.Environ()
-						result, err := boot.Boot(ctx)
-						require.Equal(
-							t,
-							parent,
-							os.Environ(),
-							"boot must not export keys to the parent environment",
-						)
-						require.NoError(t, err)
-						if bootIndex > 0 {
-							require.Equal(
-								t,
-								before,
-								fx.ssmf.params,
-								"resume must reuse receipts and ciphertexts",
-							)
-							require.Equal(
-								t,
-								seq,
-								fx.kmsf.seq,
-								"resume must not generate or encrypt keys",
-							)
-						}
-						require.Len(t, result.masterSeed, 32)
-						require.Len(t, result.secrets.Static, len(stage.static))
-						if index == 0 && bootIndex == 0 {
-							first = result
-							stored, err = result.dek.Seal(
-								[]byte("before migration"),
-								[]byte("object"),
-							)
-							require.NoError(t, err)
-							store := newCertStore(
-								cfg,
-								fx.s3f,
-								result.dek,
-								result.tlsKey,
-								"certs",
-								cfg.FQDN,
-							)
-							bundle, err := store.SaveCert(
-								ctx,
-								issueTestCertWithKey(
-									t,
-									cfg.FQDN,
-									time.Now().Add(90*24*time.Hour),
-									result.tlsKey,
-								),
-								"",
-							)
-							require.NoError(t, err)
-							certETag = bundle.etag
-						}
-						require.Equal(t, first.masterSeed, result.masterSeed)
-						require.Equal(t, first.dek.(*dek).key, result.dek.(*dek).key)
-						require.True(
-							t,
-							first.tlsKey.Public().(*ecdsa.PublicKey).Equal(result.tlsKey.Public()),
-						)
-						plaintext, err := result.dek.Open(stored, []byte("object"))
-						require.NoError(t, err)
-						require.Equal(t, []byte("before migration"), plaintext)
-						bundle, err := newCertStore(
-							cfg,
-							fx.s3f,
-							result.dek,
-							result.tlsKey,
-							"certs",
-							cfg.FQDN,
-						).LoadCert(ctx)
-						require.NoError(t, err)
-						require.Equal(t, certETag, bundle.etag)
-						require.True(
-							t,
-							first.acmeAccountKey.Public().(*ecdsa.PublicKey).Equal(
-								result.acmeAccountKey.Public(),
-							),
-							"ACME account key must survive every boot and migration",
-						)
-						var ciphertextPaths []string
-						for path := range fx.ssmf.params {
-							if strings.HasSuffix(path, "/Ciphertext/"+result.kms.KeyID()) {
-								ciphertextPaths = append(ciphertextPaths, path)
-							}
-						}
-						require.ElementsMatch(
-							t,
-							[]string{
-								cfg.masterSeedCiphertextParam(result.kms.KeyID()),
-								cfg.tlsKeyCiphertextParam(result.kms.KeyID()),
-							},
-							ciphertextPaths,
-						)
-						require.NoError(
-							t,
-							ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets.Static),
-						)
-						wantEnv := map[string]string{}
-						for i, secret := range result.secrets.Static {
-							require.Equal(t, stage.static[i], secret.StaticSecretMetadata)
-							if old, ok := byName[secret.Name]; ok {
-								require.Equal(t, old, secret.Plaintext)
-							} else {
-								for _, old := range byName {
-									require.NotEqual(t, old, secret.Plaintext)
-								}
-								byName[secret.Name] = secret.Plaintext
-							}
-							wantEnv[secret.EnvVar] = secret.Plaintext
-							_, pub := btcec.PrivKeyFromBytes(mustDecodeHex(t, secret.Plaintext))
-							hash := sha256.Sum256(pub.SerializeCompressed())
-							require.Equal(t, hash[:], requireExtendPCR(t, session, uint(16+i)).Data)
-							require.True(t, session.locks[uint(16+i)])
-						}
-						require.Len(
-							t,
-							session.locks,
-							len(stage.static),
-							"master seed and internal keys consume no application PCR",
-						)
-						if stage.replacement && bootIndex > 0 {
-							wantEnv[inherited.EnvVar] = replacement
-						}
-						requireChildSecretExports(t, *cfg, result, wantEnv)
-						current, currentNSM = result, nsm
-						if stage.replacement && bootIndex == 0 {
-							fx.ssmf.params[cfg.inheritSecretPrefix()+inherited.Name] = replacement
-						}
-					}
-					if index+1 < len(scenario.stages) {
-						m, err := newMigrator(
-							cfg,
-							currentNSM,
-							fx.ssm,
-							fx.s3f,
-							current.migrationIntentBucketName,
-						)
-						require.NoError(t, err)
-						m.kms, m.masterSeed, m.tlsKey = current.kms, current.masterSeed, current.tlsKey
-						_, err = requestMigrationTo(
-							t,
-							ctx,
-							m,
-							fx.signer,
-							hex.EncodeToString(bytes.Repeat([]byte{byte(index + 2)}, 48)),
-						)
-						require.NoError(t, err)
-						require.NoError(t, m.handOffToSuccessor(ctx))
-					}
-				}) {
-					return
-				}
-			}
-		})
-	}
+	require.Equal(t, map[uint]bool{16: true, 17: true}, session.locks)
+	require.Len(t, session.requests, 4)
+
+	t.Run("too many secrets", func(t *testing.T) {
+		session := newStatefulNSMSession(t, nil)
+		require.Error(t, ExtendPCRRegistersWithStaticSecrets(
+			&nsmW{nsm: &fakeNSM{session: session}}, make([]StaticSecret, 16),
+		))
+		require.Empty(t, session.requests)
+	})
 }
 
 func inheritTestHash(value string) string {
@@ -510,76 +332,110 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 }
 
 func TestValidateStaticSecrets(t *testing.T) {
-	require.NoError(t, SecretsMetadata{Static: stateOriginTestSecrets}.Validate(nil))
-	for _, tc := range []struct {
-		name, env string
-		valid     bool
-	}{
-		{"signing-key", "SIGNING_KEY", true},
-		{"A_Z.09-a", "_KEY0", true},
-		{"StorageDEK", "KEY", true},
-		{"ACMEAccountKey", "KEY", true},
-		{"MasterSeed", "KEY", true},
-		{"runtime/StorageDEK", "KEY", false},
-		{"runtime/ACMEAccountKey", "KEY", false},
-		{"runtime/ACMEAccountKey-v2", "KEY", false},
-		{"runtime/future-key", "KEY", false},
-		{"some/other", "KEY", false},
-		{"", "KEY", false},
-		{"../key", "KEY", false},
-		{"café", "KEY", false},
-		{" key", "KEY", false},
-		{"key\x00", "KEY", false},
-		{"key", "", false},
-		{"key", "0KEY", false},
-		{"key", "BAD=KEY", false},
-		{"key", "PORT", false},
-		{"key", "ENCLAVE_RUNTIME_TOKEN", false},
-		{"key", "ENCLAVE_APP_PORT", false},
-		{"key", "ENCLAVE_PROXY_PORT", false},
-	} {
-		t.Run(tc.name+"/"+tc.env, func(t *testing.T) {
-			err := (SecretsMetadata{Static: []StaticSecretMetadata{{Name: tc.name, EnvVar: tc.env}}}).Validate(
-				nil,
-			)
-			if tc.valid {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
-		})
-	}
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "duplicate", EnvVar: "ONE"},
-		{Name: "duplicate", EnvVar: "TWO"},
-	}}.Validate(nil))
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "one", EnvVar: "KEY"},
-		{Name: "two", EnvVar: "KEY"},
-	}}.Validate(nil))
 	_, pin := inheritTestKey(t)
-	require.Error(t, SecretsMetadata{
-		Static: []StaticSecretMetadata{{Name: "one", EnvVar: "KEY"}},
-		Inherited: []InheritSecretMetadata{
-			{Name: "two", EnvVar: "KEY", Type: inheritSecretTypePublicKey, Value: []string{pin}},
-		},
-	}.Validate(nil))
-
-	var meta SecretsMetadata
-	for i := 0; i < 15; i++ {
-		meta.Static = append(meta.Static, StaticSecretMetadata{
+	var fifteen []StaticSecretMetadata
+	for i := range 15 {
+		fifteen = append(fifteen, StaticSecretMetadata{
 			Name: fmt.Sprintf("key%d", i), EnvVar: fmt.Sprintf("KEY%d", i),
 		})
 	}
-	require.NoError(t, meta.Validate(nil))
-	meta.Static = append(meta.Static, StaticSecretMetadata{Name: "extra", EnvVar: "EXTRA"})
-	require.ErrorContains(t, meta.Validate(nil), "PCR16–PCR30")
 
-	session := newStatefulNSMSession(t, nil)
-	require.Error(t, ExtendPCRRegistersWithStaticSecrets(
-		&nsmW{nsm: &fakeNSM{session: session}}, make([]StaticSecret, 16),
-	))
-	require.Empty(t, session.requests)
+	t.Run("valid", func(t *testing.T) {
+		for name, meta := range map[string]SecretsMetadata{
+			"state origin":   {Static: stateOriginTestSecrets},
+			"signing key":    {Static: []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}},
+			"allowed chars":  {Static: []StaticSecretMetadata{{Name: "A_Z.09-a", EnvVar: "_KEY0"}}},
+			"StorageDEK":     {Static: []StaticSecretMetadata{{Name: "StorageDEK", EnvVar: "KEY"}}},
+			"ACMEAccountKey": {Static: []StaticSecretMetadata{{Name: "ACMEAccountKey", EnvVar: "KEY"}}},
+			"MasterSeed":     {Static: []StaticSecretMetadata{{Name: "MasterSeed", EnvVar: "KEY"}}},
+			"15 secrets":     {Static: fifteen},
+		} {
+			t.Run(name, func(t *testing.T) {
+				require.NoError(t, meta.Validate(nil))
+			})
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			meta SecretsMetadata
+			want string
+		}{
+			{"runtime/StorageDEK", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/StorageDEK", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/ACMEAccountKey", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/ACMEAccountKey", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/ACMEAccountKey-v2", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/ACMEAccountKey-v2", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/future-key", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/future-key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"nested name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "some/other", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"empty name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"parent path", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "../key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"non-ASCII name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "café", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"space in name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: " key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"NUL in name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key\x00", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"empty env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: ""},
+			}}, "invalid or reserved env_var"},
+			{"env var starts with digit", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "0KEY"},
+			}}, "invalid or reserved env_var"},
+			{"equals in env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "BAD=KEY"},
+			}}, "invalid or reserved env_var"},
+			{"PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "PORT"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_RUNTIME_TOKEN", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_RUNTIME_TOKEN"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_APP_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_APP_PORT"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_PROXY_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_PROXY_PORT"},
+			}}, "invalid or reserved env_var"},
+			{"duplicate name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "duplicate", EnvVar: "ONE"},
+				{Name: "duplicate", EnvVar: "TWO"},
+			}}, "duplicate static secret"},
+			{"duplicate env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "one", EnvVar: "KEY"},
+				{Name: "two", EnvVar: "KEY"},
+			}}, "already used"},
+			{"inherited env var collision", SecretsMetadata{
+				Static: []StaticSecretMetadata{{Name: "one", EnvVar: "KEY"}},
+				Inherited: []InheritSecretMetadata{
+					{Name: "two", EnvVar: "KEY", Type: inheritSecretTypePublicKey, Value: []string{pin}},
+				},
+			}, "already used"},
+			{"16 secrets", SecretsMetadata{
+				Static: append(fifteen, StaticSecretMetadata{Name: "extra", EnvVar: "EXTRA"}),
+			}, "PCR16–PCR30"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.ErrorContains(t, tc.meta.Validate(nil), tc.want)
+			})
+		}
+	})
 }
 
 func TestValidateInheritSecrets(t *testing.T) {

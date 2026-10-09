@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1101,6 +1102,7 @@ func TestBootGenesisBlocksOnPeerLease(t *testing.T) {
 func TestBootResumesAfterPeerGenesis(t *testing.T) {
 	ctx := context.Background()
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+	parentEnv := os.Environ()
 
 	first, err := fx.establish(ctx)
 	require.NoError(t, err)
@@ -1116,6 +1118,23 @@ func TestBootResumesAfterPeerGenesis(t *testing.T) {
 	require.Equal(t, first.kms.KeyID(), second.kms.KeyID())
 	require.Equal(t, first.dek.(*dek).key, second.dek.(*dek).key, "fleet must share one DEK")
 	require.Equal(t, first.secrets, second.secrets)
+	require.Equal(t, first.acmeAccountKey, second.acmeAccountKey)
+	require.Equal(t, parentEnv, os.Environ(), "boot must not export keys to the parent environment")
+
+	internalKeys := [][]byte{second.masterSeed, second.dek.(*dek).key}
+	for _, key := range []*ecdsa.PrivateKey{
+		second.tlsKey.(*ecdsa.PrivateKey), second.acmeAccountKey.(*ecdsa.PrivateKey),
+	} {
+		der, err := x509.MarshalPKCS8PrivateKey(key)
+		require.NoError(t, err)
+		internalKeys = append(internalKeys, der, key.D.FillBytes(make([]byte, 32)))
+	}
+	env := strings.Join(appEnv(*stateOriginTestConfig(), "token", second.secrets), "\n")
+	for _, key := range internalKeys {
+		require.NotContains(t, env, hex.EncodeToString(key))
+		require.NotContains(t, env, base64.StdEncoding.EncodeToString(key))
+		require.NotContains(t, env, string(key))
+	}
 }
 
 // The lease is released once genesis commits, so it never wedges later boots.
@@ -1556,92 +1575,123 @@ func TestGenesisSnapshotSecretInventory(t *testing.T) {
 }
 
 func TestCommittedSecretArtifactsFailClosed(t *testing.T) {
-	for _, mode := range []string{"resume", "migration"} {
-		for _, artifact := range []string{"master seed", "TLS key", "receipt"} {
-			for _, change := range []string{"missing", "substituted", "malformed"} {
-				t.Run(mode+"/"+artifact+"/"+change, func(t *testing.T) {
-					ctx := t.Context()
-					pcr0 := bytes.Repeat([]byte{0xab}, 48)
-					fx := newGenesisFixture(t, pcr0)
-					first, err := fx.establish(ctx)
-					require.NoError(t, err)
-					cfg := stateOriginTestConfig()
-					nsm := fx.nsm
-					keyID := first.kms.KeyID()
-					if mode == "migration" {
-						target := bytes.Repeat([]byte{0xcd}, 48)
-						m, err := newMigrator(
-							migrationTestCfg(),
-							fx.nsm,
-							fx.ssm,
-							fx.s3f,
-							first.migrationIntentBucketName,
-						)
-						require.NoError(t, err)
-						m.kms, m.masterSeed, m.tlsKey = first.kms, first.masterSeed, first.tlsKey
-						_, err = requestMigrationTo(
-							t,
-							ctx,
-							m,
-							fx.signer,
-							hex.EncodeToString(target),
-						)
-						require.NoError(t, err)
-						require.NoError(t, m.handOffToSuccessor(ctx))
-						cfg.PreviousPCR0 = hex.EncodeToString(pcr0)
-						pcr0 = target
-						session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
-						session.attestationSign = fx.signer
-						nsm = &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.signer.roots}}
-						keyID = fx.ssmf.params[cfg.kmsKeyIDParam(hex.EncodeToString(pcr0))]
-					}
-					param := cfg.masterSeedCiphertextParam(keyID)
-					switch artifact {
-					case "TLS key":
-						param = cfg.tlsKeyCiphertextParam(keyID)
-					case "receipt":
-						param = cfg.stateOriginReceiptParam(keyID, hex.EncodeToString(pcr0))
-						if mode == "migration" {
-							param = cfg.migrationStateOriginReceiptParam(
-								keyID,
-								hex.EncodeToString(pcr0),
-							)
-						}
-					}
-					switch change {
-					case "missing":
-						delete(fx.ssmf.params, param)
-					case "substituted":
-						fx.ssmf.params[param] = base64.StdEncoding.EncodeToString(
-							bytes.Repeat([]byte{0xff}, 32),
-						)
-					case "malformed":
-						fx.ssmf.params[param] = "not base64!"
-					}
-					before := maps.Clone(fx.ssmf.params)
-					kms := &stateOriginTestKMS{keyID: keyID}
-					b := &Boot{cfg: cfg, nsm: nsm, ssm: fx.ssm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
-					planned, err := b.plan(ctx)
-					if err == nil {
-						_, err = b.establish(ctx, planned, kms)
-					}
-					require.Error(t, err)
-					require.Empty(
-						t,
-						kms.decryptCalls,
-						"verification must precede decryption and derivation",
-					)
-					require.Zero(t, kms.generateCall, "established state cannot be replaced")
-					require.Equal(
-						t,
-						before,
-						fx.ssmf.params,
-						"failed boot must write no replacement material or receipt",
-					)
-				})
-			}
+	substituted := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, 32))
+	corruptions := []struct {
+		name, artifact, value, wantErr string
+	}{
+		{"master seed/missing", "master seed", "", "required master seed SSM param missing"},
+		{"master seed/substituted", "master seed", substituted, "invalid state-origin receipt"},
+		{
+			"master seed/malformed",
+			"master seed",
+			"not base64!",
+			"failed sha256 hash of master seed",
+		},
+		{"TLS key/missing", "TLS key", "", "required TLS key SSM param missing"},
+		{"TLS key/substituted", "TLS key", substituted, "invalid state-origin receipt"},
+		{"TLS key/malformed", "TLS key", "not base64!", "failed sha256 hash of TLS key"},
+		{
+			"receipt/missing",
+			"receipt",
+			"",
+			"",
+		}, // Each boot mode supplies its missing-receipt error.
+		{"receipt/substituted", "receipt", substituted, "invalid state-origin receipt"},
+		{"receipt/malformed", "receipt", "not base64!", "invalid state-origin receipt"},
+	}
+
+	checkArtifacts := func(
+		t *testing.T, boot Boot, params map[string]string, receiptParam, missingReceiptErr string,
+	) {
+		t.Helper()
+		keyID := params[boot.cfg.kmsKeyIDParam(hex.EncodeToString(boot.pcr0))]
+		require.NotEmpty(t, keyID)
+		artifactParams := map[string]string{
+			"master seed": boot.cfg.masterSeedCiphertextParam(keyID),
+			"TLS key":     boot.cfg.tlsKeyCiphertextParam(keyID),
+			"receipt":     receiptParam,
+		}
+		for _, tc := range corruptions {
+			t.Run(tc.name, func(t *testing.T) {
+				param := artifactParams[tc.artifact]
+				wantErr := tc.wantErr
+				if wantErr == "" {
+					wantErr = missingReceiptErr
+				}
+				fake, ssm := stateOriginTestSSM(params)
+				if tc.value == "" {
+					delete(fake.params, param)
+				} else {
+					fake.params[param] = tc.value
+				}
+				before := maps.Clone(fake.params)
+				kms := &stateOriginTestKMS{keyID: keyID}
+				b := boot
+				b.ssm = ssm
+				planned, err := b.plan(t.Context())
+				if err == nil {
+					_, err = b.establish(t.Context(), planned, kms)
+				}
+				require.ErrorContains(t, err, wantErr)
+				require.Empty(
+					t,
+					kms.decryptCalls,
+					"verification must precede decryption and derivation",
+				)
+				require.Zero(t, kms.generateCall, "established state cannot be replaced")
+				require.Equal(
+					t,
+					before,
+					fake.params,
+					"failed boot must write no replacement material or receipt",
+				)
+			})
 		}
 	}
+
+	t.Run("resume", func(t *testing.T) {
+		pcr0 := bytes.Repeat([]byte{0xab}, 48)
+		fx := newGenesisFixture(t, pcr0)
+		first, err := fx.establish(t.Context())
+		require.NoError(t, err)
+		cfg := stateOriginTestConfig()
+		boot := Boot{cfg: cfg, nsm: fx.nsm, s3: fx.s3f, sts: fx.sts, pcr0: pcr0}
+		checkArtifacts(
+			t, boot, fx.ssmf.params,
+			cfg.stateOriginReceiptParam(first.kms.KeyID(), hex.EncodeToString(pcr0)),
+			"no state-origin receipt for this PCR0 and no predecessor to migrate from",
+		)
+	})
+
+	t.Run("migration", func(t *testing.T) {
+		ctx := t.Context()
+		pcr0 := bytes.Repeat([]byte{0xab}, 48)
+		target := bytes.Repeat([]byte{0xcd}, 48)
+		fx := newGenesisFixture(t, pcr0)
+		first, err := fx.establish(ctx)
+		require.NoError(t, err)
+		m, err := newMigrator(
+			migrationTestCfg(), fx.nsm, fx.ssm, fx.s3f, first.migrationIntentBucketName,
+		)
+		require.NoError(t, err)
+		m.kms, m.masterSeed, m.tlsKey = first.kms, first.masterSeed, first.tlsKey
+		_, err = requestMigrationTo(t, ctx, m, fx.signer, hex.EncodeToString(target))
+		require.NoError(t, err)
+		require.NoError(t, m.handOffToSuccessor(ctx))
+
+		cfg := stateOriginTestConfig()
+		cfg.PreviousPCR0 = hex.EncodeToString(pcr0)
+		session := newStatefulNSMSession(t, map[uint][]byte{0: target})
+		session.attestationSign = fx.signer
+		nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.signer.roots}}
+		keyID := fx.ssmf.params[cfg.kmsKeyIDParam(hex.EncodeToString(target))]
+		boot := Boot{cfg: cfg, nsm: nsm, s3: fx.s3f, sts: fx.sts, pcr0: target}
+		checkArtifacts(
+			t, boot, fx.ssmf.params,
+			cfg.migrationStateOriginReceiptParam(keyID, hex.EncodeToString(target)),
+			"predecessor artifacts present but no migration transition receipt",
+		)
+	})
 }
 
 // These ciphertexts use the identity encoding of stateOriginTestKMS, so boot

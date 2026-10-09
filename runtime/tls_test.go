@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -169,13 +170,53 @@ func acmeTestCAPEM(t *testing.T) string {
 	return string(pemCert)
 }
 
-// A fresh certificate store forces registration with the boot-provided signer.
-func TestConfigureTLSUsesBootAccountKey(t *testing.T) {
+func TestConfigureTLSRegistersACMEWithBootAccountKey(t *testing.T) {
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{1}, 48))
-	result, err := fx.establish(t.Context())
+	boot, err := fx.establish(t.Context())
 	require.NoError(t, err)
+
+	directory, ca, registrations := newACMERegistrationServer(t)
 	cfg := *stateOriginTestConfig()
 	cfg.FQDN = "enclave.test"
+	cfg.UseACME = true
+	cfg.ACMEDirectory = directory
+	cfg.ACMECA = ca
+	_, ssm := stateOriginTestSSM(map[string]string{
+		cfg.route53ZoneIDParam(): "zone",
+		cfg.certBucketParam():    "certs",
+		cfg.leaseBucketParam():   "leases",
+	})
+	s3 := newFakeS3() // A fresh certificate store forces account registration.
+
+	_, err = ConfigureTLS(
+		t.Context(),
+		&cfg,
+		s3,
+		boot.dek,
+		ssm,
+		&fakeRoute53{},
+		boot.tlsKey,
+		boot.acmeAccountKey,
+		&AttestationHashes{},
+	)
+	require.ErrorContains(t, err, "test stops after account registration")
+
+	var registration []byte
+	select {
+	case registration = <-registrations:
+	default:
+		t.Fatal("ACME client did not register an account")
+	}
+	requireRegistrationSignedBy(t, registration, boot.acmeAccountKey)
+	require.NotEqual(t, boot.tlsKey.Public(), boot.acmeAccountKey.Public(), "ACME and TLS use separate keys")
+	for path := range s3.objects {
+		require.NotContains(t, path, "account.key")
+	}
+}
+
+// Capture account registration, then stop before certificate issuance.
+func newACMERegistrationServer(t *testing.T) (directory, ca string, registrations <-chan []byte) {
+	t.Helper()
 	requests := make(chan []byte, 1)
 	var endpoint string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -206,39 +247,18 @@ func TestConfigureTLSUsesBootAccountKey(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 	endpoint = srv.URL
-	cfg.UseACME = true
-	cfg.ACMEDirectory = endpoint + "/directory"
-	cfg.ACMECA = string(
+	ca = string(
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}),
 	)
-	_, ssm := stateOriginTestSSM(map[string]string{
-		cfg.route53ZoneIDParam(): "zone",
-		cfg.certBucketParam():    "certs",
-		cfg.leaseBucketParam():   "leases",
-	})
-	s3 := newFakeS3()
-	_, err = ConfigureTLS(
-		t.Context(),
-		&cfg,
-		s3,
-		result.dek,
-		ssm,
-		&fakeRoute53{},
-		result.tlsKey,
-		result.acmeAccountKey,
-		&AttestationHashes{},
-	)
-	require.ErrorContains(t, err, "test stops after account registration")
-	var body []byte
-	select {
-	case body = <-requests:
-	default:
-		t.Fatal("ACME client did not register with the boot-provided signer")
-	}
+	return endpoint + "/directory", ca, requests
+}
+
+func requireRegistrationSignedBy(t *testing.T, registration []byte, signer crypto.Signer) {
+	t.Helper()
 	var jws struct{ Protected, Payload, Signature string }
-	require.NoError(t, json.Unmarshal(body, &jws))
+	require.NoError(t, json.Unmarshal(registration, &jws))
 	decode := func(s string) []byte {
 		b, err := base64.RawURLEncoding.DecodeString(s)
 		require.NoError(t, err)
@@ -270,9 +290,5 @@ func TestConfigureTLSUsesBootAccountKey(t *testing.T) {
 		),
 		"the advertised key must sign the registration",
 	)
-	require.True(t, key.Equal(result.acmeAccountKey.Public()))
-	require.False(t, key.Equal(result.tlsKey.Public()), "ACME and TLS use separate keys")
-	for path := range s3.objects {
-		require.NotContains(t, path, "account.key")
-	}
+	require.True(t, key.Equal(signer.Public()), "registration must use the boot account key")
 }

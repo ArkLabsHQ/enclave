@@ -531,9 +531,8 @@ algorithm are protocol constants; environment variables, PCR0 and KMS IDs do
 not enter derivation. Storage-key rotation requires a separate data migration
 design; keep `runtime/StorageDEK` unchanged.
 
-This format requires a fresh genesis deployment. Master-seed compromise requires
-another fresh deployment with a new seed: migration and renaming cannot restore
-secrecy, including for names introduced by future releases. Renaming can replace
+Master-seed compromise requires another fresh deployment with a new seed: migration and renaming
+cannot restore secrecy, including for names introduced by future releases. Renaming can replace
 a compromised derived key while the seed remains private, but it neither revokes
 the old key nor removes it from previous releases. The release must handle any
 dependent state, including account registration if the ACME derivation name changes.

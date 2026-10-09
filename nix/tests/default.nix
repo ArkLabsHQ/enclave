@@ -203,7 +203,20 @@ let
     ThreadingHTTPServer(("0.0.0.0", 4570), Handler).serve_forever()
   '';
 
-  # The fixed four-node topology makes the AWS node's test-VLAN address stable.
+  signingSecret = {
+    name = "e2e-signing-key";
+    env_var = "E2E_SIGNING_KEY";
+  };
+  secondSecret = {
+    name = "e2e-second-key";
+    env_var = "E2E_SECOND_KEY";
+  };
+  thirdSecret = {
+    name = "e2e-third-key";
+    env_var = "E2E_THIRD_KEY";
+  };
+
+  # The fixed five-node topology makes the AWS node's test-VLAN address stable.
   # Using it directly avoids depending on gvproxy forwarding /etc/hosts entries.
   commonEifEnv = {
     ENCLAVE_DEV = "true";
@@ -216,14 +229,8 @@ let
     ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_TRACES = "true";
     ENCLAVE_METRICS = "true";
-    ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
-      {
-        name = "e2e-signing-key";
-        env_var = "E2E_SIGNING_KEY";
-      }
-    ];
-    # e2e.py places all three values in SSM, hex-encoded; each pin is the
-    # SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
+    # e2e.py places the inherited values in SSM, hex-encoded; each hash pin is
+    # the SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
     # only verified. The second is already past its cutoff. The third's cutoff
     # is reached when e2e.py steps a node's clock to just before it, so the
     # restart-without-the-secret path runs for real.
@@ -275,12 +282,45 @@ let
   blueEif = mkTestEif {
     ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
+    ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
+      signingSecret
+      secondSecret
+    ];
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON (
+      (builtins.fromJSON commonEifEnv.ENCLAVE_INHERIT_SECRETS_CONFIG)
+      ++ [
+        (
+          thirdSecret
+          // {
+            type = "publicKey";
+            # Scalar 2 is inherited in Blue, then replaced by derivation in Green.
+            value = [ "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5" ];
+          }
+        )
+      ]
+    );
   };
   bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
 
   greenEif = mkTestEif {
     ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
     ENCLAVE_TEST_SALT = "green";
+    ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
+      signingSecret
+      thirdSecret
+    ];
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON (
+      (builtins.fromJSON commonEifEnv.ENCLAVE_INHERIT_SECRETS_CONFIG)
+      ++ [
+        {
+          name = "e2e-second-key-replacement";
+          env_var = "E2E_SECOND_KEY";
+          type = "publicKey";
+          # Compressed secp256k1 public key for scalar 1, delivered by e2e.py.
+          value = [ "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" ];
+        }
+      ]
+    );
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
 

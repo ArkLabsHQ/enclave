@@ -5,7 +5,6 @@
 from datetime import datetime, timedelta, timezone
 
 CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
-ACCOUNT_KEY = "ark/e2e/dev/testapp/data/acme/account.key"
 SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
 LOG_PREFIX = "/ark/e2e/dev/testapp/enclave"
@@ -13,6 +12,11 @@ INSTANCE_ID = "i-0e2ce2ce2ce2ce2ce"
 BACKDATE_SECONDS = 48 * 3600
 REPLAY_OBSERVATION_SECONDS = 10
 INTENT_KEY = f"migration-intent/{BLUE_PCR0}/{1:020d}"
+# Scalar 2 matches Blue's baked publicKey pin in default.nix.
+BLUE_THIRD_SECRET = "00" * 31 + "02"
+# Scalar 1 matches Green's baked publicKey pin in default.nix.
+REPLACEMENT_SECRET = "00" * 31 + "01"
+REPLACEMENT_PARAM = "/ark/e2e/dev/testapp/enclave/inherit/e2e-second-key-replacement"
 
 
 def served_leaf(node, x509_args):
@@ -53,6 +57,30 @@ def enclave_curl(node, pcr0, path="/health"):
 
 def kms_key_count():
     return int(cloud("kms list-keys --query 'length(Keys)' --output text"))
+
+
+def secret_ciphertexts(key_id):
+    # Filter by the committed key: a losing concurrent handoff may leave an
+    # orphan KMS key and its artifacts behind.
+    prefix = "/ark/e2e/dev/testapp/enclave/unlocked"
+    parameters = json.loads(
+        cloud(f"ssm get-parameters-by-path --path {prefix}/ --recursive --output json")
+    )["Parameters"]
+    ciphertexts = {
+        p["Name"]: p["Value"]
+        for p in parameters
+        if p["Name"].endswith(f"/Ciphertext/{key_id}")
+    }
+    expected = {
+        f"{prefix}/MasterSeed/Ciphertext/{key_id}",
+        f"{prefix}/TLSKey/Ciphertext/{key_id}",
+    }
+    assert set(ciphertexts) == expected, (
+        f"committed snapshot must contain only MasterSeed and TLSKey ciphertexts: "
+        f"{sorted(ciphertexts)}"
+    )
+    assert all(ciphertexts.values()), "committed secret ciphertexts must be nonempty"
+    return ciphertexts
 
 
 def cert_etag():
@@ -139,8 +167,13 @@ cloud(
     f"--type String --value {route53_zone_id}"
 )
 put_env("E2E_OVERRIDE", "override-from-ssm")
+cloud(
+    "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/e2e-third-key "
+    f"--type String --value {BLUE_THIRD_SECRET}"
+)
 
 BLUES = (blue, blue_peer)
+GREENS = (green, green_peer)
 kms_keys_before_genesis = kms_key_count()
 
 # Preflight runs before any durable write. With kms:CreateKey denied, both
@@ -177,6 +210,10 @@ for node in BLUES:
     assert env_value(node, "E2E_INHERITED") == INHERITED
     assert env_value(node, "E2E_CUTOFF") == INHERITED
     assert env_value(node, "E2E_EXPIRED") == ""
+    assert env_value(node, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
+    second = env_value(node, "E2E_SECOND_KEY")
+    assert len(second) == 64, second
+    assert all(c in "0123456789abcdef" for c in second), second
     node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg p '{BLUE_PCR0}' --arg bucket '{INTENT_BUCKET}' "
@@ -186,6 +223,9 @@ for node in BLUES:
     )
 blue_secret = secret_value(blue)
 assert secret_value(blue_peer) == blue_secret
+blue_second_secret = env_value(blue, "E2E_SECOND_KEY")
+assert env_value(blue_peer, "E2E_SECOND_KEY") == blue_second_secret
+assert REPLACEMENT_SECRET != blue_second_secret
 
 for node in BLUES:
     leaf_issuer = served_leaf(node, "-noout -issuer")
@@ -199,6 +239,8 @@ for node in BLUES:
 # from either enclave must reach the other.
 blue_leaf_sha = served_leaf_sha(blue)
 assert served_leaf_sha(blue_peer) == blue_leaf_sha
+tls_public_key = served_leaf(blue, "-noout -pubkey")
+assert served_leaf(blue_peer, "-noout -pubkey") == tls_public_key
 assert len(console_owners(BLUES, "renewed the fleet certificate")) == 1
 
 # One stored object for the whole fleet, not one per enclave.
@@ -291,6 +333,7 @@ for record in otlp("logs"):
 
 genesis_key = get_param(key_param(BLUE_PCR0))
 assert genesis_key not in ("", "UNSET", "None")
+blue_ciphertexts = secret_ciphertexts(genesis_key)
 # Green's commit pointer is created by a blue when it commits; not yet.
 assert get_param(key_param(GREEN_PCR0)) == ""
 
@@ -446,6 +489,15 @@ attestation_code = green.succeed(
 ).strip()
 assert attestation_code == "503", attestation_code
 
+# Check transient candidate details before the AWS calls below, while Green
+# is still awaiting the handoff.
+green.wait_until_succeeds(
+    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+    f"| jq -e --arg b '{BLUE_PCR0}' "
+    "'.candidate.awaiting_handoff_from == $b'",
+    timeout=120,
+)
+
 # A blue records an intent naming green, derived from green's attestation. No
 # operator wrote that PCR0 anywhere. The blues share one intent chain, so both
 # report it whichever of them adopted green's answer.
@@ -545,14 +597,6 @@ with subtest("multipart replay preserves the migration cooldown"):
 
 print("e2e-summary: multipart replay preserved the migration cooldown on both blues")
 
-# Green can see who is offering it the handoff, while still a candidate.
-green.wait_until_succeeds(
-    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    f"| jq -e --arg b '{BLUE_PCR0}' "
-    "'.candidate.awaiting_handoff_from == $b'",
-    timeout=120,
-)
-
 # A blue commits on its own once eligible.
 migration_key = ""
 for _ in range(MIGRATION_COOLDOWN_SECONDS + 120):
@@ -566,6 +610,8 @@ else:
     raise Exception("no blue committed the handoff")
 
 assert migration_key != genesis_key
+green_ciphertexts = secret_ciphertexts(migration_key)
+assert secret_ciphertexts(genesis_key) == blue_ciphertexts
 # The handoff writes only into green's scope: blue's pointer is untouched, which
 # is what lets blue keep serving and reboot without any rollback machinery.
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
@@ -617,6 +663,8 @@ assert get_param(receipt_param) == receipt_before
 for node in BLUES:
     wait_enclave_healthy(node)
     assert secret_value(node) == blue_secret
+    assert env_value(node, "E2E_SECOND_KEY") == blue_second_secret
+    assert env_value(node, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
     assert served_leaf_sha(node) == blue_leaf_sha
     node.wait_until_succeeds(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -644,6 +692,13 @@ green.succeed(
     "| jq -e '.status == \"ready\"'"
 )
 assert secret_value(green) == blue_secret
+assert env_value(green, "E2E_SECOND_KEY") == ""
+green_third_secret = env_value(green, "E2E_THIRD_KEY")
+assert len(green_third_secret) == 64, green_third_secret
+assert all(c in "0123456789abcdef" for c in green_third_secret), green_third_secret
+# Green derives its own value even while Blue's inherited value remains in SSM.
+assert green_third_secret not in (blue_secret, blue_second_secret, BLUE_THIRD_SECRET)
+assert served_leaf(green, "-noout -pubkey") == tls_public_key
 green.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
@@ -718,9 +773,8 @@ cache_keys = cloud(
     f"s3api list-objects-v2 --bucket {CERT_BUCKET} "
     "--query 'Contents[].Key' --output text"
 ).split()
-assert sorted(cache_keys) == sorted(
-    [CERT_KEY, ACCOUNT_KEY, SELF_SIGNED_KEY]
-), cache_keys
+# The ACME account key is derived; only encrypted certificates are stored.
+assert sorted(cache_keys) == sorted([CERT_KEY, SELF_SIGNED_KEY]), cache_keys
 aws.succeed("rm -rf /tmp/tls-cache")
 cloud(f"s3 cp s3://{CERT_BUCKET} /tmp/tls-cache --recursive")
 _, pem_hits = aws.execute(
@@ -729,6 +783,17 @@ _, pem_hits = aws.execute(
 )
 assert pem_hits.strip() == "", pem_hits
 assert challenge_record_count(route53_zone_id) == 0
+
+# Green omitted inherited B because its replacement was not available at boot.
+# Populate it before the existing peer join and Green resume; the running
+# Green keeps the omitted value until it resumes its established state.
+assert get_param(REPLACEMENT_PARAM) == ""
+assert env_value(green, "E2E_SECOND_KEY") == ""
+cloud(
+    f"ssm put-parameter --name {REPLACEMENT_PARAM} "
+    f"--type String --value {REPLACEMENT_SECRET}"
+)
+assert env_value(green, "E2E_SECOND_KEY") == ""
 
 # Snapshot the established fleet state before a same-EIF peer joins.
 leaf_sha_before = served_leaf_sha(green)
@@ -753,6 +818,9 @@ assert cloud(
 ) == migration_key
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
+assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
+assert served_leaf(green_peer, "-noout -pubkey") == tls_public_key
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
 assert env_value(green_peer, "E2E_INHERITED") == INHERITED
 assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
@@ -773,7 +841,7 @@ assert cert_etag() == cert_etag_before
 assert challenge_event_count() == challenge_events_before
 assert challenge_record_count(route53_zone_id) == 0
 
-for node in (green, green_peer):
+for node in GREENS:
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
     assert status == 0, out
     for _ in range(5):
@@ -790,6 +858,9 @@ for node in (green, green_peer):
     )
 
 # Scale one node in while its peer remains live, then rejoin the same fleet.
+green_origin_param = f"/ark/e2e/dev/testapp/enclave/StateOriginReceipt/{migration_key}/{GREEN_PCR0}"
+green_origin_receipt = get_param(green_origin_param)
+assert green_origin_receipt not in ("", "UNSET", "None")
 green.succeed("kill $(cat /run/enclave-qemu.pid)")
 green.wait_until_fails(
     "curl --connect-timeout 1 --max-time 2 -skf https://127.0.0.1/health",
@@ -797,6 +868,8 @@ green.wait_until_fails(
 )
 wait_enclave_healthy(green_peer)
 assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
+assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
 assert served_leaf_sha(green_peer) == leaf_sha_before
 status, out = enclave_curl(green_peer, GREEN_PCR0, "/test/health")
 assert status == 0, out
@@ -806,9 +879,14 @@ wait_enclave_healthy(green)
 assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
+assert env_value(green, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
+assert env_value(green, "E2E_THIRD_KEY") == green_third_secret
+assert secret_ciphertexts(migration_key) == green_ciphertexts
 assert cloud(
     f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
 ) == migration_key
+assert get_param(receipt_param) == receipt_before
+assert get_param(green_origin_param) == green_origin_receipt
 assert kms_key_count() == kms_keys_before
 assert cert_etag() == cert_etag_before
 assert challenge_event_count() == challenge_events_before
@@ -824,6 +902,8 @@ for node in (blue, blue_peer, green, green_peer):
 for node in BLUES:
     assert served_leaf_sha(node) == blue_leaf_sha
     assert secret_value(node) == blue_secret
+    assert env_value(node, "E2E_SECOND_KEY") == blue_second_secret
+    assert env_value(node, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
 
 # Blue reboots onto its own untouched key long after handing off to green. This
 # is what makes rollback machinery unnecessary: a failed successor is survived by
@@ -832,6 +912,10 @@ blue.succeed("kill $(cat /run/enclave-qemu.pid)")
 blue.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(blue)
 assert secret_value(blue) == blue_secret
+assert env_value(blue, "E2E_SECOND_KEY") == blue_second_secret
+assert env_value(blue, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
+assert secret_ciphertexts(genesis_key) == blue_ciphertexts
+assert served_leaf(blue, "-noout -pubkey") == tls_public_key
 assert get_param(key_param(BLUE_PCR0)) == genesis_key
 blue.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
@@ -842,6 +926,23 @@ assert status == 0, out
 
 for node in (blue, blue_peer, green, green_peer):
     wait_enclave_healthy(node)
+
+# Later declarations and the inherited replacement cannot change earlier fleets.
+for node in (*BLUES, *GREENS):
+    wait_enclave_healthy(node)
+    assert env_value(node, "E2E_SIGNING_KEY") == blue_secret
+    assert env_value(node, "E2E_SECOND_KEY") == (
+        blue_second_secret if node in BLUES else REPLACEMENT_SECRET
+    )
+    assert env_value(node, "E2E_THIRD_KEY") == (
+        BLUE_THIRD_SECRET if node in BLUES else green_third_secret
+    )
+    assert served_leaf(node, "-noout -pubkey") == tls_public_key
+assert get_param(key_param(BLUE_PCR0)) == genesis_key
+assert get_param(key_param(GREEN_PCR0)) == migration_key
+assert get_param(receipt_param) == receipt_before
+assert secret_ciphertexts(genesis_key) == blue_ciphertexts
+assert secret_ciphertexts(migration_key) == green_ciphertexts
 
 # KMS deletion has a mandatory waiting period. Scheduling the retired blue key
 # must therefore appear as pending_deletion in green's ancestry.
@@ -902,6 +1003,8 @@ wait_upstream_healthy(green_peer)
 assert env_value(green_peer, "E2E_CUTOFF") == ""
 # It still holds everything that was not cut off.
 assert secret_value(green_peer) == blue_secret
+assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
+assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
 assert env_value(green_peer, "E2E_INHERITED") == INHERITED
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "

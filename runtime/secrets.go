@@ -2,6 +2,9 @@ package runtime
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/hkdf"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -15,10 +18,77 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/fxamacker/cbor/v2"
 )
 
+const (
+	derivedSecretSalt        = "enclave.derived-secret.v1"
+	maxStaticSecrets         = migrationPCRIndex - 16
+	signingKeyExpansionBytes = 255 * sha256.Size
+
+	// The runtime/ derivation namespace is reserved for internal keys. Static
+	// application secret names cannot contain '/', so they cannot collide with
+	// current or future internal names, including versioned names such as
+	// runtime/ACMEAccountKey-v2. Preserve this separation when changing name validation.
+	runtimeDerivationPrefix      = "runtime/"
+	storageDEKDerivationName     = runtimeDerivationPrefix + "StorageDEK"
+	acmeAccountKeyDerivationName = runtimeDerivationPrefix + "ACMEAccountKey"
+)
+
+// deriveKeyBytes uses HKDF-SHA256 extract-and-expand with protocol constants.
+// A plain CBOR string has a definite, shortest-length header and preserves the
+// exact name bytes. No deployment metadata enters the derivation.
+func deriveKeyBytes(seed []byte, name string, length int) ([]byte, error) {
+	if len(seed) != 32 {
+		return nil, fmt.Errorf("seed must be 32 bytes, got %d", len(seed))
+	}
+	info, err := cbor.Marshal(name)
+	if err != nil {
+		return nil, err
+	}
+	return hkdf.Key(sha256.New, seed, []byte(derivedSecretSalt), string(info), length)
+}
+
+func deriveSecret(seed []byte, name string) (string, error) {
+	blocks, err := deriveKeyBytes(seed, name, signingKeyExpansionBytes)
+	if err != nil {
+		return "", err
+	}
+	return selectSecp256k1Scalar(blocks)
+}
+
+// Signing keys scan successive blocks of one expansion, without reduction.
+func selectSecp256k1Scalar(blocks []byte) (string, error) {
+	for offset := 0; offset+32 <= len(blocks); offset += 32 {
+		block := blocks[offset : offset+32]
+		var scalar btcec.ModNScalar
+		if !scalar.SetByteSlice(block) && !scalar.IsZero() {
+			return hex.EncodeToString(block), nil
+		}
+	}
+	return "", fmt.Errorf("HKDF expansion contains no valid secp256k1 scalar")
+}
+
+func deriveACMEAccountKey(seed []byte) (*ecdsa.PrivateKey, error) {
+	blocks, err := deriveKeyBytes(seed, acmeAccountKeyDerivationName, signingKeyExpansionBytes)
+	if err != nil {
+		return nil, err
+	}
+	return selectP256Key(blocks)
+}
+
+func selectP256Key(blocks []byte) (*ecdsa.PrivateKey, error) {
+	for offset := 0; offset+32 <= len(blocks); offset += 32 {
+		key, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), blocks[offset:offset+32])
+		if err == nil {
+			return key, nil
+		}
+	}
+	return nil, fmt.Errorf("HKDF expansion contains no valid P-256 scalar")
+}
+
 // SecretsMetadata is the secret configuration baked into the image: the static
-// secrets minted inside the enclave, and the inherited ones handed in from
+// secrets derived inside the enclave, and the inherited ones handed in from
 // outside.
 type SecretsMetadata struct {
 	Static    []StaticSecretMetadata
@@ -50,7 +120,7 @@ func (sm SecretsMetadata) Validate(overrideAllowList map[string]bool) error {
 	return nil
 }
 
-// Secrets is what boot resolved from SecretsMetadata: the decrypted static
+// Secrets is what boot resolved from SecretsMetadata: the derived static
 // secrets, and the inherited ones that are present, verified and before their
 // cutoff.
 type Secrets struct {
@@ -58,7 +128,7 @@ type Secrets struct {
 	Inherited []InheritedSecret
 }
 
-// StaticSecretMetadata defines a secret managed by KMS inside the enclave runtime
+// StaticSecretMetadata declares a secret derived from the master seed
 // (configured in enclave.yaml under `secrets:`). Its plaintext is hex-encoded
 // into the configured env var only in the child app's environment.
 type StaticSecretMetadata struct {
@@ -85,11 +155,29 @@ func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
 }
 
 func (sm SecretsMetadata) validateStatic() error {
+	if len(sm.Static) > maxStaticSecrets {
+		return fmt.Errorf("at most %d static secrets fit in PCR16–PCR30", maxStaticSecrets)
+	}
 	seen := make(map[string]bool, len(sm.Static))
+	envVars := make(map[string]bool, len(sm.Static))
 	for _, secret := range sm.Static {
-		if secret.Name == "StorageDEK" {
-			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
+		if !secretNamePattern.MatchString(secret.Name) {
+			return fmt.Errorf(
+				"static secret name %q must use only letters, digits, '_', '.', or '-'",
+				secret.Name,
+			)
 		}
+		if !envVarNamePattern.MatchString(secret.EnvVar) || childReservedEnv[secret.EnvVar] {
+			return fmt.Errorf(
+				"secret %q: invalid or reserved env_var %q",
+				secret.Name,
+				secret.EnvVar,
+			)
+		}
+		if envVars[secret.EnvVar] {
+			return fmt.Errorf("secret %q: env_var %q is already used", secret.Name, secret.EnvVar)
+		}
+		envVars[secret.EnvVar] = true
 		if seen[secret.Name] {
 			return fmt.Errorf("duplicate static secret %q", secret.Name)
 		}
@@ -100,22 +188,22 @@ func (sm SecretsMetadata) validateStatic() error {
 
 // ExtendPCRRegistersWithStaticSecrets commits each secret pubkey hash to PCR(16+i).
 func ExtendPCRRegistersWithStaticSecrets(nsm NSM, secrets []StaticSecret) error {
+	if len(secrets) > maxStaticSecrets {
+		return fmt.Errorf("at most %d static secrets fit before migration PCR31", maxStaticSecrets)
+	}
 	for i, s := range secrets {
 		pcrIndex := uint(16) + uint(i)
-		if pcrIndex >= migrationPCRIndex {
-			return fmt.Errorf("secret %q: PCR index %d would collide with migration PCR (PCR%d)",
-				s.Name, pcrIndex, migrationPCRIndex)
-		}
 
 		secretBytes, err := hex.DecodeString(s.Plaintext)
 		if err != nil {
 			return fmt.Errorf("decode secret %s hex: %w", s.Name, err)
 		}
 
-		privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
-		if privKey == nil {
+		var scalar btcec.ModNScalar
+		if len(secretBytes) != 32 || scalar.SetByteSlice(secretBytes) || scalar.IsZero() {
 			return fmt.Errorf("secret %q: invalid secp256k1 private key", s.Name)
 		}
+		privKey := btcec.PrivKeyFromScalar(&scalar)
 
 		pubkeyBytes := privKey.PubKey().SerializeCompressed()
 		hash := sha256.Sum256(pubkeyBytes)

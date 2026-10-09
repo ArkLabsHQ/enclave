@@ -1,15 +1,23 @@
 package runtime
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -160,4 +168,127 @@ func acmeTestCAPEM(t *testing.T) string {
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	require.NotNil(t, pemCert)
 	return string(pemCert)
+}
+
+func TestConfigureTLSRegistersACMEWithBootAccountKey(t *testing.T) {
+	fx := newGenesisFixture(t, bytes.Repeat([]byte{1}, 48))
+	boot, err := fx.establish(t.Context())
+	require.NoError(t, err)
+
+	directory, ca, registrations := newACMERegistrationServer(t)
+	cfg := *stateOriginTestConfig()
+	cfg.FQDN = "enclave.test"
+	cfg.UseACME = true
+	cfg.ACMEDirectory = directory
+	cfg.ACMECA = ca
+	_, ssm := stateOriginTestSSM(map[string]string{
+		cfg.route53ZoneIDParam(): "zone",
+		cfg.certBucketParam():    "certs",
+		cfg.leaseBucketParam():   "leases",
+	})
+	s3 := newFakeS3() // A fresh certificate store forces account registration.
+
+	_, err = ConfigureTLS(
+		t.Context(),
+		&cfg,
+		s3,
+		boot.dek,
+		ssm,
+		&fakeRoute53{},
+		boot.tlsKey,
+		boot.acmeAccountKey,
+		&AttestationHashes{},
+	)
+	require.ErrorContains(t, err, "test stops after account registration")
+
+	var registration []byte
+	select {
+	case registration = <-registrations:
+	default:
+		t.Fatal("ACME client did not register an account")
+	}
+	requireRegistrationSignedBy(t, registration, boot.acmeAccountKey)
+	require.NotEqual(t, boot.tlsKey.Public(), boot.acmeAccountKey.Public(), "ACME and TLS use separate keys")
+	for path := range s3.objects {
+		require.NotContains(t, path, "account.key")
+	}
+}
+
+// Capture account registration, then stop before certificate issuance.
+func newACMERegistrationServer(t *testing.T) (directory, ca string, registrations <-chan []byte) {
+	t.Helper()
+	requests := make(chan []byte, 1)
+	var endpoint string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Replay-Nonce", "dGVzdC1ub25jZQ")
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/directory":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"newAccount": endpoint + "/account",
+				"newNonce":   endpoint + "/nonce",
+				"newOrder":   endpoint + "/order",
+			})
+		case "/nonce":
+			w.WriteHeader(http.StatusOK)
+		case "/account":
+			body, _ := io.ReadAll(r.Body)
+			requests <- body
+			w.Header().Set("Location", endpoint+"/accounts/1")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"status":"valid"}`)
+		case "/order":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(
+				w,
+				`{"type":"urn:ietf:params:acme:error:rejectedIdentifier","detail":"test stops after account registration"}`,
+			)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	endpoint = srv.URL
+	ca = string(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}),
+	)
+	return endpoint + "/directory", ca, requests
+}
+
+func requireRegistrationSignedBy(t *testing.T, registration []byte, signer crypto.Signer) {
+	t.Helper()
+	var jws struct{ Protected, Payload, Signature string }
+	require.NoError(t, json.Unmarshal(registration, &jws))
+	decode := func(s string) []byte {
+		b, err := base64.RawURLEncoding.DecodeString(s)
+		require.NoError(t, err)
+		return b
+	}
+	var protected struct {
+		Alg string
+		JWK struct{ Kty, Crv, X, Y string }
+	}
+	require.NoError(t, json.Unmarshal(decode(jws.Protected), &protected))
+	require.Equal(t, "ES256", protected.Alg)
+	require.Equal(t, "EC", protected.JWK.Kty)
+	require.Equal(t, "P-256", protected.JWK.Crv)
+	key := &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     new(big.Int).SetBytes(decode(protected.JWK.X)),
+		Y:     new(big.Int).SetBytes(decode(protected.JWK.Y)),
+	}
+	sig := decode(jws.Signature)
+	require.Len(t, sig, 64)
+	digest := sha256.Sum256([]byte(jws.Protected + "." + jws.Payload))
+	require.True(
+		t,
+		ecdsa.Verify(
+			key,
+			digest[:],
+			new(big.Int).SetBytes(sig[:32]),
+			new(big.Int).SetBytes(sig[32:]),
+		),
+		"the advertised key must sign the registration",
+	)
+	require.True(t, key.Equal(signer.Public()), "registration must use the boot account key")
 }

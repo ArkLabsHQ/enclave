@@ -2,11 +2,12 @@ package runtime
 
 import (
 	"bytes"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/elliptic"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,21 +89,18 @@ func testDEK() *dek {
 	return &dek{key: bytes.Repeat([]byte{0x42}, 32)}
 }
 
-func TestDEKExportKeyStoresExactlyWhatItReturns(t *testing.T) {
-	d := testDEK()
-	kmsf := newFakeKMS()
-	successor := &kmsW{
-		cfg:   testCfg,
-		nsm:   kmsTestNSMWithRecipient(t),
-		kms:   kmsf,
-		keyID: "successor-key",
+func TestStorageKeyHasNoSigningScalarRestrictions(t *testing.T) {
+	for _, key := range [][]byte{
+		make([]byte, 32),
+		btcec.S256().N.FillBytes(make([]byte, 32)),
+		elliptic.P256().Params().N.FillBytes(make([]byte, 32)),
+		bytes.Repeat([]byte{0xff}, 32),
+	} {
+		d := &dek{key: key}
+		sealed, err := d.Seal([]byte("stored"), []byte("aad"))
+		require.NoError(t, err)
+		opened, err := d.Open(sealed, []byte("aad"))
+		require.NoError(t, err)
+		require.Equal(t, []byte("stored"), opened)
 	}
-	ssmf := &fakeSSM{}
-
-	ciphertext, err := d.ExportKey(context.Background(), testCfg, successor, NewSSM(ssmf))
-
-	require.NoError(t, err)
-	require.NotEmpty(t, ciphertext)
-
-	require.Equal(t, ciphertext, ssmf.params[testCfg.storageDEKCiphertextParam("successor-key")])
 }

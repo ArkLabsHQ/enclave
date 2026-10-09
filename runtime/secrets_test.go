@@ -3,14 +3,20 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,6 +32,261 @@ func inheritTestKeyFrom(t *testing.T, seed string) (string, string) {
 	privKey, _ := btcec.PrivKeyFromBytes(privBytes[:])
 	pubBytes := privKey.PubKey().SerializeCompressed()
 	return hex.EncodeToString(privBytes[:]), hex.EncodeToString(pubBytes)
+}
+
+func TestDerivedSecretVectors(t *testing.T) {
+	// Independently calculated with Python hashlib/hmac and literal CBOR bytes.
+	seed := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	for _, tc := range []struct{ seed, name, info, key string }{
+		{
+			seed, "signing-key", "6b7369676e696e672d6b6579",
+			"bf527f09d8f89bca004c459551dfb5ceb50a4df5edadae180e24e694326810f7",
+		},
+		{
+			seed, "Signing-key", "6b5369676e696e672d6b6579",
+			"761643bf0d89a83f06a6cddcdebdcb44d85d7c6b6e0cfe5126ff6a1a88288814",
+		},
+		{
+			seed, "SIGNING-KEY", "6b5349474e494e472d4b4559",
+			"5a8565be409c9df49735e71c75addd584784fb6962ab2fcaf981251ba2e4152e",
+		},
+		{
+			seed, "signing-key-v1", "6e7369676e696e672d6b65792d7631",
+			"6940476271c06be36d06e1e141ea90f6cf2bd84f77521029c5b646085f1ab8ce",
+		},
+		{
+			seed, "signing-key-v2", "6e7369676e696e672d6b65792d7632",
+			"d99feff83f1bd44a1bbf2d323b6b0b1da0256f2a69b88a2469fa6112a3838596",
+		},
+		{
+			strings.Repeat("00", 32), strings.Repeat("a", 24),
+			"7818616161616161616161616161616161616161616161616161",
+			"c75c82c2b9f482fa4cef23fc5accc2386de864f47e5bd0f9a33cbd38f0143e13",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := cbor.Marshal(tc.name)
+			require.NoError(t, err)
+			require.Equal(t, tc.info, hex.EncodeToString(info))
+			key, err := deriveSecret(mustDecodeHex(t, tc.seed), tc.name)
+			require.NoError(t, err)
+			require.Equal(t, tc.key, key)
+		})
+	}
+}
+
+func TestInternalDerivationVectors(t *testing.T) {
+	// Independent Python hashlib/hmac calculation with literal CBOR text headers.
+	seed := mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	for _, tc := range []struct{ name, info, key string }{
+		{storageDEKDerivationName, "7272756e74696d652f53746f7261676544454b", "37c7bbea31c2a2c0dac8ec251a580fe290e7d7256f60e318934ccfcdd0d27c78"},
+		{acmeAccountKeyDerivationName, "7672756e74696d652f41434d454163636f756e744b6579", "bec57a2982fe406add38a52a6907e4b1658ff8cbcb41b33782a53cdc791ffdea"},
+		{"StorageDEK", "6a53746f7261676544454b", "f71b9c41253dc71047f87e42be49cbc7af08e4fde1762f8f800348c38693b99a"},
+		{"ACMEAccountKey", "6e41434d454163636f756e744b6579", "37eefb0b1dee3490a97a38fb506af4ae9b6af8a77dd838e814987958f9288641"},
+		{"runtime/ACMEAccountKey-v2", "781972756e74696d652f41434d454163636f756e744b65792d7632", "215e66b2f930b853f05467a009af31ae05b8d9f66b3182b2e510723f4e330099"},
+		{"leading-zero-188", "706c656164696e672d7a65726f2d313838", "00fbbfbaa53904d6ee9ebe1464ac920cf58571c65d4f81e32adabecba477d0f6"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := cbor.Marshal(tc.name)
+			require.NoError(t, err)
+			require.Equal(t, tc.info, hex.EncodeToString(info))
+			raw, err := deriveKeyBytes(seed, tc.name, 32)
+			require.NoError(t, err)
+			require.Equal(t, tc.key, hex.EncodeToString(raw))
+			// Valid first blocks preserve the reference commit's output exactly.
+			secret, err := deriveSecret(seed, tc.name)
+			require.NoError(t, err)
+			require.Equal(t, tc.key, secret)
+			require.Len(t, secret, 64)
+			if tc.name == acmeAccountKeyDerivationName {
+				key, err := deriveACMEAccountKey(seed)
+				require.NoError(t, err)
+				require.Equal(t, tc.key, hex.EncodeToString(key.D.FillBytes(make([]byte, 32))))
+			}
+		})
+	}
+}
+
+func TestSigningScalarSelection(t *testing.T) {
+	for _, curve := range []struct {
+		name      string
+		order     *big.Int
+		selectKey func([]byte) ([]byte, error)
+	}{
+		{"secp256k1", btcec.S256().N, func(blocks []byte) ([]byte, error) {
+			key, err := selectSecp256k1Scalar(blocks)
+			if err != nil {
+				return nil, err
+			}
+			return hex.DecodeString(key)
+		}},
+		{"P256", elliptic.P256().Params().N, func(blocks []byte) ([]byte, error) {
+			key, err := selectP256Key(blocks)
+			if err != nil {
+				return nil, err
+			}
+			// Parsing must construct a usable signer, not just accept the integer.
+			digest := make([]byte, 32)
+			sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
+			require.NoError(t, err)
+			require.True(t, ecdsa.VerifyASN1(&key.PublicKey, digest, sig))
+			return key.D.FillBytes(make([]byte, 32)), nil
+		}},
+	} {
+		t.Run(curve.name, func(t *testing.T) {
+			n := curve.order.FillBytes(make([]byte, 32))
+			nPlusOne := new(big.Int).Add(curve.order, big.NewInt(1)).FillBytes(make([]byte, 32))
+			nMinusOne := new(big.Int).Sub(curve.order, big.NewInt(1)).FillBytes(make([]byte, 32))
+			one := big.NewInt(1).FillBytes(make([]byte, 32))
+			for _, tc := range []struct {
+				name         string
+				blocks, want []byte
+			}{
+				{"zero", make([]byte, 32), nil},
+				{"order", n, nil},
+				{"above order", nPlusOne, nil},
+				{"maximum integer", bytes.Repeat([]byte{0xff}, 32), nil},
+				{"one with leading zeros", one, one},
+				{"order minus one", nMinusOne, nMinusOne},
+				{"reject then accept", bytes.Join([][]byte{make([]byte, 32), n, nPlusOne, one, nMinusOne}, nil), one},
+				{"first valid wins", append(bytes.Clone(nMinusOne), one...), nMinusOne},
+				{"last block", append(make([]byte, 254*32), one...), one},
+				{"exhaust zero blocks", make([]byte, 255*32), nil},
+				{"exhaust overflow blocks", bytes.Repeat(n, 255), nil},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					got, err := curve.selectKey(tc.blocks)
+					if tc.want == nil {
+						require.ErrorContains(t, err, "no valid")
+						require.Nil(t, got)
+					} else {
+						require.NoError(t, err)
+						require.Equal(t, tc.want, got)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDerivedSeedLengthAcrossHelpers(t *testing.T) {
+	for _, length := range []int{0, 1, 31, 33, 64} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			seed := make([]byte, length)
+			_, err := deriveKeyBytes(seed, storageDEKDerivationName, 32)
+			require.ErrorContains(t, err, "seed must be 32 bytes")
+			_, err = deriveSecret(seed, "signing-key")
+			require.ErrorContains(t, err, "seed must be 32 bytes")
+			_, err = deriveACMEAccountKey(seed)
+			require.ErrorContains(t, err, "seed must be 32 bytes")
+		})
+	}
+}
+
+func TestDerivationCBORLengthBoundaries(t *testing.T) {
+	seed := mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	// Independent Python HMAC vectors using literal shortest-length CBOR headers.
+	for _, tc := range []struct {
+		length      int
+		header, key string
+	}{
+		{23, "77", "2f67d1e2c10e60c5a48a3f62d36109d23225bc0ebf74e0564aeed42d9e3d0082"},
+		{24, "7818", "498331b950de19b6a234c013fd69c193745b184366702173fe0c12de35f69a02"},
+		{255, "78ff", "a5096433c8b8977c3e7eed8a65f469e1a7d02f956f322beed780e0658fe297cf"},
+		{256, "790100", "e24a75e5c52865b151272a631301d1ab717740697237861d28c94d59cf493292"},
+	} {
+		t.Run(fmt.Sprint(tc.length), func(t *testing.T) {
+			name := strings.Repeat("a", tc.length)
+			encoded, err := cbor.Marshal(name)
+			require.NoError(t, err)
+			require.Equal(t, append(mustDecodeHex(t, tc.header), []byte(name)...), encoded)
+			key, err := deriveSecret(seed, name)
+			require.NoError(t, err)
+			require.Equal(t, tc.key, key)
+		})
+	}
+}
+
+func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
+	const keyID = "key-declarations"
+	params := stateOriginParams(keyID)
+	snapshot := bootSnapshot{
+		kmsKeyID: keyID, ownerPCR0: stateOriginTestPCR0Hex(),
+		masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
+		tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
+		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
+	}
+	root, err := stateRoot(testCfg, snapshot)
+	require.NoError(t, err)
+	receipt := signedOriginReceipt(
+		t,
+		map[uint][]byte{0: mustDecodeHex(t, snapshot.ownerPCR0)},
+		root,
+		snapshot,
+	)
+	byName := map[string]string{}
+	for _, name := range []string{"alpha", "beta"} {
+		byName[name], err = deriveSecret(bytes.Repeat([]byte{0x42}, 32), name)
+		require.NoError(t, err)
+	}
+	a, b := stateOriginTestSecrets[0], stateOriginTestSecrets[1]
+	for _, tc := range []struct {
+		name   string
+		static []StaticSecretMetadata
+	}{
+		{"renamed env", []StaticSecretMetadata{{Name: a.Name, EnvVar: "RENAMED"}, b}},
+		{"reordered", []StaticSecretMetadata{b, a}},
+		{"removed", []StaticSecretMetadata{b}},
+		{"removed all", nil},
+		{"restored", []StaticSecretMetadata{a, b}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			boot := &Boot{cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots))}
+			result, err := boot.establish(t.Context(), &plannedBoot{
+				mode: &resumeBoot{},
+				state: bootState{
+					snapshot: snapshot, bootReceipt: receipt.docB64,
+					secretsMetadata: SecretsMetadata{Static: tc.static},
+				},
+			}, &stateOriginTestKMS{keyID: keyID})
+			require.NoError(t, err)
+			want := make([]StaticSecret, 0, len(tc.static))
+			for _, meta := range tc.static {
+				want = append(
+					want,
+					StaticSecret{StaticSecretMetadata: meta, Plaintext: byName[meta.Name]},
+				)
+			}
+			require.Equal(t, want, result.secrets.Static)
+		})
+	}
+}
+
+func TestExtendPCRRegistersWithStaticSecrets(t *testing.T) {
+	keyA, pubA := inheritTestKeyFrom(t, "pcr-a")
+	keyB, pubB := inheritTestKeyFrom(t, "pcr-b")
+	session := newStatefulNSMSession(t, nil)
+	nsm := &nsmW{nsm: &fakeNSM{session: session}}
+	require.NoError(t, ExtendPCRRegistersWithStaticSecrets(nsm, nil))
+	require.Empty(t, session.requests)
+
+	require.NoError(t, ExtendPCRRegistersWithStaticSecrets(nsm, []StaticSecret{
+		{Plaintext: keyA}, {Plaintext: keyB},
+	}))
+	for i, pub := range []string{pubA, pubB} {
+		hash := sha256.Sum256(mustDecodeHex(t, pub))
+		require.Equal(t, hash[:], requireExtendPCR(t, session, uint(16+i)).Data)
+	}
+	require.Equal(t, map[uint]bool{16: true, 17: true}, session.locks)
+	require.Len(t, session.requests, 4)
+
+	t.Run("too many secrets", func(t *testing.T) {
+		session := newStatefulNSMSession(t, nil)
+		require.Error(t, ExtendPCRRegistersWithStaticSecrets(
+			&nsmW{nsm: &fakeNSM{session: session}}, make([]StaticSecret, 16),
+		))
+		require.Empty(t, session.requests)
+	})
 }
 
 func inheritTestHash(value string) string {
@@ -71,14 +332,110 @@ func TestLoadInheritSecretMetadata(t *testing.T) {
 }
 
 func TestValidateStaticSecrets(t *testing.T) {
-	require.NoError(t, SecretsMetadata{Static: stateOriginTestSecrets}.Validate(nil))
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "duplicate", EnvVar: "ONE"},
-		{Name: "duplicate", EnvVar: "TWO"},
-	}}.Validate(nil))
-	require.Error(t, SecretsMetadata{Static: []StaticSecretMetadata{
-		{Name: "StorageDEK", EnvVar: "COLLISION"},
-	}}.Validate(nil))
+	_, pin := inheritTestKey(t)
+	var fifteen []StaticSecretMetadata
+	for i := range 15 {
+		fifteen = append(fifteen, StaticSecretMetadata{
+			Name: fmt.Sprintf("key%d", i), EnvVar: fmt.Sprintf("KEY%d", i),
+		})
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		for name, meta := range map[string]SecretsMetadata{
+			"state origin":   {Static: stateOriginTestSecrets},
+			"signing key":    {Static: []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}},
+			"allowed chars":  {Static: []StaticSecretMetadata{{Name: "A_Z.09-a", EnvVar: "_KEY0"}}},
+			"StorageDEK":     {Static: []StaticSecretMetadata{{Name: "StorageDEK", EnvVar: "KEY"}}},
+			"ACMEAccountKey": {Static: []StaticSecretMetadata{{Name: "ACMEAccountKey", EnvVar: "KEY"}}},
+			"MasterSeed":     {Static: []StaticSecretMetadata{{Name: "MasterSeed", EnvVar: "KEY"}}},
+			"15 secrets":     {Static: fifteen},
+		} {
+			t.Run(name, func(t *testing.T) {
+				require.NoError(t, meta.Validate(nil))
+			})
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			meta SecretsMetadata
+			want string
+		}{
+			{"runtime/StorageDEK", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/StorageDEK", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/ACMEAccountKey", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/ACMEAccountKey", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/ACMEAccountKey-v2", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/ACMEAccountKey-v2", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"runtime/future-key", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "runtime/future-key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"nested name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "some/other", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"empty name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"parent path", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "../key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"non-ASCII name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "café", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"space in name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: " key", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"NUL in name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key\x00", EnvVar: "KEY"},
+			}}, "must use only"},
+			{"empty env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: ""},
+			}}, "invalid or reserved env_var"},
+			{"env var starts with digit", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "0KEY"},
+			}}, "invalid or reserved env_var"},
+			{"equals in env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "BAD=KEY"},
+			}}, "invalid or reserved env_var"},
+			{"PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "PORT"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_RUNTIME_TOKEN", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_RUNTIME_TOKEN"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_APP_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_APP_PORT"},
+			}}, "invalid or reserved env_var"},
+			{"ENCLAVE_PROXY_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "ENCLAVE_PROXY_PORT"},
+			}}, "invalid or reserved env_var"},
+			{"duplicate name", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "duplicate", EnvVar: "ONE"},
+				{Name: "duplicate", EnvVar: "TWO"},
+			}}, "duplicate static secret"},
+			{"duplicate env var", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "one", EnvVar: "KEY"},
+				{Name: "two", EnvVar: "KEY"},
+			}}, "already used"},
+			{"inherited env var collision", SecretsMetadata{
+				Static: []StaticSecretMetadata{{Name: "one", EnvVar: "KEY"}},
+				Inherited: []InheritSecretMetadata{
+					{Name: "two", EnvVar: "KEY", Type: inheritSecretTypePublicKey, Value: []string{pin}},
+				},
+			}, "already used"},
+			{"16 secrets", SecretsMetadata{
+				Static: append(fifteen, StaticSecretMetadata{Name: "extra", EnvVar: "EXTRA"}),
+			}, "PCR16–PCR30"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.ErrorContains(t, tc.meta.Validate(nil), tc.want)
+			})
+		}
+	})
 }
 
 func TestValidateInheritSecrets(t *testing.T) {

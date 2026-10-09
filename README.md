@@ -937,7 +937,11 @@ The order is:
     you will never boot that PCR0 again.
 11. If you do retire a generation's key, schedule its deletion out of band, then
     poll the successor's `/enclave/v1/info` until that generation reports
-    `state: "deleted"` in the `ancestry` block. Responses on that route are
+    `state: "deleted"` in the `ancestry` block. The instance role can cancel a
+    pending deletion (`CancelKeyDeletion`, then `EnableKey`, since cancelling
+    leaves the key disabled), so a mistaken or malicious deletion is reversible
+    within the waiting period. The same right means `pending_deletion` proves
+    nothing: only `deleted` does. Responses on that route are
     signed by the attestation-bound key, so that reading is the receipt that the
     retired generation can no longer decrypt anything. Preserve its state-origin
     receipt until the audit has verified the deletion; a missing receipt makes

@@ -767,6 +767,20 @@ green.wait_until_succeeds(
     timeout=60,
 )
 
+# The deletion is reversible. Blue cannot cold-start while its key is pending
+# deletion, nor once cancelled, since cancelling leaves the key disabled; enabling
+# it brings blue back on the same key and secret. The emulator does not evaluate
+# key policies, so this proves the recovery, not the role's right to perform it.
+restart_expecting_boot_failure(blue, "KMSInvalidStateException")
+cloud(f"kms cancel-key-deletion --key-id {shlex.quote(genesis_key)}")
+restart_expecting_boot_failure(blue, "DisabledException")
+cloud(f"kms enable-key --key-id {shlex.quote(genesis_key)}")
+blue.succeed("kill $(cat /run/enclave-qemu.pid) 2>/dev/null || true")
+blue.succeed("systemctl restart enclave-start")
+wait_enclave_healthy(blue)
+assert secret_value(blue) == blue_secret
+assert get_param(key_param(BLUE_PCR0)) == genesis_key
+
 # An inherited secret reaching its cutoff while the app runs. The cutoff is
 # baked into the image, so the node's clock is stepped to a minute before it
 # and the enclave follows through /dev/ptp0. Last on purpose: from here this

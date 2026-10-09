@@ -113,6 +113,17 @@ def wait_enclave_healthy(node):
     wait_upstream_healthy(node)
 
 
+def restart_expecting_boot_failure(node, error):
+    """Restart the enclave and wait for its runtime to exit with error."""
+    node.succeed("kill $(cat /run/enclave-qemu.pid) 2>/dev/null || true")
+    node.succeed("systemctl restart enclave-start")
+    node.wait_until_succeeds(
+        "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
+        f"| grep -F 'runtime failed' | grep -qF {shlex.quote(error)}",
+        timeout=120,
+    )
+
+
 def secret_value(node):
     value = node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY "

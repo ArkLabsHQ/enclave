@@ -33,6 +33,7 @@ def setup_aws():
     aws.wait_for_open_port(4566)
     aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4566/_ministack/health")
     aws.wait_for_open_port(4000)
+    aws.wait_for_open_port(4001)
     aws.wait_for_open_port(1338)
     aws.wait_for_open_port(4318)
     aws.wait_until_succeeds("curl -fsS http://127.0.0.1:4318/_otlp/logs")

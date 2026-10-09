@@ -55,6 +55,7 @@ const (
 	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
 	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
 	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+	envIAMEndpoint         = "AWS_ENDPOINT_URL_IAM"
 	envXRayEndpoint        = "AWS_ENDPOINT_URL_XRAY"
 	envMonitoringEndpoint  = "AWS_ENDPOINT_URL_MONITORING"
 )
@@ -134,6 +135,7 @@ type Config struct {
 	STSEndpoint         string
 	S3Endpoint          string
 	CloudWatchEndpoint  string
+	IAMEndpoint         string
 	XRayEndpoint        string
 	MonitoringEndpoint  string
 	AWSRegion           string
@@ -198,6 +200,7 @@ func LoadConfig() (*Config, error) {
 		STSEndpoint:           takeEnv(envSTSEndpoint),
 		S3Endpoint:            takeEnv(envS3Endpoint),
 		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		IAMEndpoint:           takeEnv(envIAMEndpoint),
 		XRayEndpoint:          takeEnv(envXRayEndpoint),
 		MonitoringEndpoint:    takeEnv(envMonitoringEndpoint),
 		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),

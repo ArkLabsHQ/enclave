@@ -641,3 +641,18 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		require.NotContains(t, proxied, "/enclave")
 	})
 }
+
+func TestReportBootFailure(t *testing.T) {
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
+	s.ReportBootFailure(errors.New("permission preflight: role is missing SSMParams"))
+
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	var info RuntimeInfo
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &info))
+	require.Equal(t, runtimeStatusFailed, info.Status)
+	require.Equal(t, "permission preflight: role is missing SSMParams", info.Error)
+	require.Equal(t, Version, info.Version)
+}

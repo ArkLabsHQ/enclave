@@ -17,6 +17,7 @@ import (
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -134,6 +135,15 @@ type STSAPI interface {
 	) (*sts.GetCallerIdentityOutput, error)
 }
 
+// IAMAPI is the subset of *iam.Client used by the runtime.
+type IAMAPI interface {
+	SimulatePrincipalPolicy(
+		ctx context.Context,
+		params *iam.SimulatePrincipalPolicyInput,
+		optFns ...func(*iam.Options),
+	) (*iam.SimulatePrincipalPolicyOutput, error)
+}
+
 // CloudWatchLogsAPI is the subset of *cloudwatchlogs.Client used by the runtime.
 type CloudWatchLogsAPI interface {
 	CreateLogGroup(
@@ -159,6 +169,7 @@ type AWSClient struct {
 	SSM     SSMAPI
 	S3      S3API
 	STS     STSAPI
+	IAM     IAMAPI
 	CWL     CloudWatchLogsAPI
 	Route53 Route53API
 
@@ -194,6 +205,7 @@ func NewAWSClient(ctx context.Context, cfg Config) (*AWSClient, error) {
 		SSM:     newSSMClient(cfg, awsCfg),
 		S3:      newS3Client(cfg, awsCfg),
 		STS:     newSTSClient(cfg, awsCfg),
+		IAM:     newIAMClient(cfg, awsCfg),
 		CWL:     newCloudWatchLogsClient(cfg, awsCfg),
 		Route53: newRoute53Client(cfg, awsCfg),
 		OTLP:    newOTLPEndpoints(cfg, awsCfg),
@@ -230,6 +242,14 @@ func newSTSClient(cfg Config, awsCfg aws.Config) *sts.Client {
 	return sts.NewFromConfig(awsCfg, func(o *sts.Options) {
 		if cfg.STSEndpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.STSEndpoint)
+		}
+	})
+}
+
+func newIAMClient(cfg Config, awsCfg aws.Config) *iam.Client {
+	return iam.NewFromConfig(awsCfg, func(o *iam.Options) {
+		if cfg.IAMEndpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.IAMEndpoint)
 		}
 	})
 }

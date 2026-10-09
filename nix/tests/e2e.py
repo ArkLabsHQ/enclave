@@ -143,9 +143,9 @@ put_env("E2E_OVERRIDE", "override-from-ssm")
 BLUES = (blue, blue_peer)
 kms_keys_before_genesis = kms_key_count()
 
-# Both blues boot into genesis together: exactly one wins the lease and mints
-# the key, the other resumes onto it. start() is asynchronous, so issuing both
-# before any wait is what creates the overlap.
+# Preflight runs before any durable write. With kms:CreateKey denied, both
+# blues report the failure over /enclave/v1/info and leave no state behind.
+aws.succeed("echo kms:CreateKey > /var/lib/awsmocks/iam-deny")
 blue.start()
 blue_peer.start()
 for node in BLUES:
@@ -153,6 +153,23 @@ for node in BLUES:
     node.wait_for_unit("mock-imds-forward.service")
     node.wait_until_succeeds("curl -fsS http://169.254.169.254/health")
     node.wait_for_unit("enclave-start.service")
+    node.wait_until_succeeds(
+        "curl --connect-timeout 2 --max-time 5 -sk --http1.1 "
+        "https://127.0.0.1/enclave/v1/info | jq -e '.status == \"failed\" "
+        "and (.error | contains(\"kms:CreateKey\"))'",
+        timeout=900,
+    )
+assert get_param(key_param(BLUE_PCR0)) == ""
+assert kms_key_count() == kms_keys_before_genesis
+
+# Both blues boot into genesis together: exactly one wins the lease and mints
+# the key, the other resumes onto it. Restarting both before any wait is what
+# creates the overlap.
+aws.succeed("rm /var/lib/awsmocks/iam-deny")
+for node in BLUES:
+    node.succeed("kill $(cat /run/enclave-qemu.pid)")
+    node.succeed("systemctl restart enclave-start")
+for node in BLUES:
     wait_enclave_healthy(node)
 
 for node in BLUES:

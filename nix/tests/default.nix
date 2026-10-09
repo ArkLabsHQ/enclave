@@ -8,6 +8,10 @@ let
 
   awsNodeIP = "192.168.1.1";
 
+  # Leave time to replay an intent and observe two handoff polling intervals
+  # before the same fleet completes its normal handoff.
+  migrationCooldownSeconds = 60;
+
   testApp = pkgs.buildGoModule {
     pname = "testapp";
     version = "0.1.0";
@@ -36,6 +40,12 @@ let
       tag = "v${version}";
       hash = "sha256-hqvlrhi/JLV3JCDXsQPmsWA+um/q/GsB/zwtFodxxj0=";
     };
+
+    # AWS assigns a multipart object's creation date at initiation, not
+    # completion; stock ministack uses the completion time. The e2e replay
+    # check also needs versioned GetObject to honor partNumber and return
+    # PartsCount for multipart uploads, including those with one part.
+    patches = [ ./patches/ministack-multipart-initiation-date.patch ];
 
     build-system = with pkgs.python3Packages; [
       setuptools
@@ -199,7 +209,7 @@ let
     ENCLAVE_DEV = "true";
     ENCLAVE_VERIFY_CLOCK_SOURCE = "true";
     ENCLAVE_INSECURE_VERIFY_SKIPPED = "true";
-    ENCLAVE_MIGRATION_COOLDOWN = "2s";
+    ENCLAVE_MIGRATION_COOLDOWN = "${toString migrationCooldownSeconds}s";
     ENCLAVE_APP_NAME = "testapp";
     ENCLAVE_NAMESPACE = "ark/e2e/dev";
     ENCLAVE_AWS_REGION = "us-east-1";
@@ -575,6 +585,7 @@ in
           BLUE_PCR0 = ${builtins.toJSON bluePCR0}
           GREEN_PCR0 = ${builtins.toJSON greenPCR0}
           AWS_NODE_IP = ${builtins.toJSON awsNodeIP}
+          MIGRATION_COOLDOWN_SECONDS = ${toString migrationCooldownSeconds}
         ''
         + builtins.readFile ./helpers.py
         + "\n"

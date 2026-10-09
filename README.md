@@ -364,6 +364,12 @@ skew between the writer's clock and the `LastModified` S3 stamps, using a fixed
 security-profile budget: two minutes in development, ten in production. It has
 no environment-variable override.
 
+The runtime reads each exact version with `GetObject` and `PartNumber=1`, then
+ignores responses containing `PartsCount`, including multipart uploads with only
+one part. S3 dates multipart objects from upload initiation, so accepting one
+would let a host backdate a replayed intent and bypass the cooldown. A failed
+read stops the scan.
+
 ### Clock
 
 By default, both production and dev mode fail the boot unless the system clock
@@ -1021,11 +1027,30 @@ The order is:
     you will never boot that PCR0 again.
 11. If you do retire a generation's key, schedule its deletion out of band, then
     poll the successor's `/enclave/v1/info` until that generation reports
-    `state: "deleted"` in the `ancestry` block. Responses on that route are
+    `state: "deleted"` in the `ancestry` block. The instance role can cancel a
+    pending deletion (`CancelKeyDeletion`, then `EnableKey`, since cancelling
+    leaves the key disabled), so a mistaken or malicious deletion is reversible
+    within the waiting period. The same right means `pending_deletion` proves
+    nothing: only `deleted` does. Responses on that route are
     signed by the attestation-bound key, so that reading is the receipt that the
     retired generation can no longer decrypt anything. Preserve its state-origin
     receipt until the audit has verified the deletion; a missing receipt makes
     the ancestry incomplete rather than proving retirement.
+
+    To stop the host from cancelling the retirement, attach this to the
+    instance role's IAM policy before scheduling the deletion:
+
+    ```json
+    {
+      "Effect": "Deny",
+      "Action": "kms:CancelKeyDeletion",
+      "Resource": "arn:aws:kms:<region>:<account>:key/<retired key ID>"
+    }
+    ```
+
+    An explicit deny overrides the key policy's allow, and the instance role
+    has no IAM permissions with which to remove it. Scope it to the retired key
+    only, so every other key keeps its cancel right.
 
 Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
 `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
@@ -1168,7 +1193,7 @@ nix flake check
 | Check | Purpose |
 |---|---|
 | `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
-| `e2e` | x86-only runtime lifecycle across ordinary `aws`, `blue`, and `green` NixOS nodes: direct AWS setup, genesis, clock recovery, attestation, ACME, migration, adoption, and restart recovery. |
+| `e2e` | x86-only runtime lifecycle across an AWS fixture node and blue/green replica pairs: direct AWS setup, genesis, clock recovery, attestation, ACME, migration cooldown replay protection, adoption, and restart recovery. |
 
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
@@ -1193,7 +1218,10 @@ therefore force `clocksource=tsc`; NixOS test instrumentation otherwise appends
 `clocksource=acpi_pm`, and the kernel honours the last value on the command line.
 Without this the enclave has no `/dev/ptp0` and boot fails before networking.
 
-After the cache is warm the full e2e test takes roughly four minutes.
+The e2e test includes a one-minute migration cooldown. During that cooldown,
+it replays a genuine intent through a multipart upload initiated 48 hours earlier
+and checks that both blue replicas preserve the original eligibility time and
+keep green waiting. The same fleet then completes the handoff and recovery checks.
 
 ### Reading test output
 
@@ -1212,10 +1240,10 @@ nix flake check --print-build-logs 2>&1 |
 
 ### E2E boundaries
 
-The e2e test uses three NixOS nodes. `aws` runs the AWS emulator, KMS
-`Recipient` proxy, IMDS, ACME fixtures and an OTLP receiver. `blue` and
-`green` launch measured EIFs with QEMU's `nitro-enclave` machine and
-`vhost-device-vsock`.
+The e2e test uses five ordinary NixOS test nodes. `aws` runs the AWS emulator,
+the attestation-aware KMS `Recipient` proxy, IMDS, ACME fixtures, and an OTLP
+receiver. `blue`, `blue_peer`, `green`, and `green_peer` launch measured EIFs
+with QEMU's `nitro-enclave` machine and `vhost-device-vsock`.
 
 The test driver creates the required buckets and SSM parameters directly through
 AWS APIs, then controls node startup according to the runtime migration order.
@@ -1229,8 +1257,9 @@ sets:
   timeout, frequent clock sync and an unlocked KMS policy.
 - `ENCLAVE_INSECURE_VERIFY_SKIPPED=true` because QEMU's emulated NSM produces
   no AWS certificate chain. This flag is only read in dev mode.
-- `ENCLAVE_VERIFY_CLOCK_SOURCE=false` because the harness lacks `kvm-clock`.
-- `ENCLAVE_MIGRATION_COOLDOWN=2s` to exercise migration handoffs quickly.
+- `ENCLAVE_VERIFY_CLOCK_SOURCE=true` to check the enclave's `kvm-clock` source.
+- `ENCLAVE_MIGRATION_COOLDOWN=60s` to test multipart replay protection before
+  completing the migration handoff.
 - `ENCLAVE_TRACES=true` and `ENCLAVE_METRICS=true` so the run covers every signal.
 
 Dev deployments keep attestation signature verification enabled by leaving

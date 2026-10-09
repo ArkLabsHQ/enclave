@@ -70,11 +70,8 @@ func testSnapshot(pcr0, keyID, prevPCR0, prevKeyID string) bootSnapshot {
 		ownerPCR0: pcr0, kmsKeyID: keyID,
 		predecessorPCR0: prevPCR0, predecessorKMSKeyID: prevKeyID,
 		migrationIntentBucketName: "intent-bucket",
-		staticSecrets: map[StaticSecretMetadata]string{
-			{Name: "secret"}: base64.StdEncoding.EncodeToString([]byte("secret-" + keyID)),
-		},
-		storageDEK:       base64.StdEncoding.EncodeToString([]byte("dek-" + keyID)),
-		tlsKeyCiphertext: base64.StdEncoding.EncodeToString([]byte("tls-" + keyID)),
+		masterSeedCiphertext:      base64.StdEncoding.EncodeToString([]byte("seed-" + keyID)),
+		tlsKeyCiphertext:          base64.StdEncoding.EncodeToString([]byte("tls-" + keyID)),
 	}
 }
 

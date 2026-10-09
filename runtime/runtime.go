@@ -173,13 +173,20 @@ func Run(ctx context.Context, cfg Config) error {
 	go migrator.RunPredecessorHandoff(
 		ctx,
 		result.kms,
-		result.dek,
-		result.secrets.Static,
+		result.masterSeed,
 		result.tlsKey,
 	)
 
 	tlsCertCb, err := ConfigureTLS(
-		ctx, &cfg, aws.S3, result.dek, ssm, aws.Route53, result.tlsKey, hashes,
+		ctx,
+		&cfg,
+		aws.S3,
+		result.dek,
+		ssm,
+		aws.Route53,
+		result.tlsKey,
+		result.acmeAccountKey,
+		hashes,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)

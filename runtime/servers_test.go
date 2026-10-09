@@ -33,7 +33,7 @@ type migrationControlMigrator struct {
 }
 
 func (m *migrationControlMigrator) RunPredecessorHandoff(
-	context.Context, PrimaryKMS, DEK, []StaticSecret, crypto.Signer,
+	context.Context, PrimaryKMS, []byte, crypto.Signer,
 ) {
 }
 

@@ -316,8 +316,7 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	scoped := func(c *Config) []string {
 		return []string{
 			c.kmsKeyIDParam(pcr0),
-			c.secretCiphertextParam("alpha", keyID),
-			c.storageDEKCiphertextParam(keyID),
+			c.masterSeedCiphertextParam(keyID),
 			c.tlsKeyCiphertextParam(keyID),
 		}
 	}

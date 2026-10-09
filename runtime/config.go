@@ -443,24 +443,16 @@ func (c *Config) kmsKeyIDParam(pcr0 string) string {
 	)
 }
 
-// secretCiphertextParam: SSM path for a secret's KMS ciphertext, lock-scoped and
-// scoped by the KMS key ID. Flipping the KMSKeyID param is the atomic migration commit.
-func (c *Config) secretCiphertextParam(secretName, keyID string) string {
-	return fmt.Sprintf(
-		"%s/%s/%s/Ciphertext/%s", c.namespace(), c.lockSegment(), secretName, keyID,
-	)
-}
-
 // inheritSecretPrefix: SSM path prefix under which the operator places inherited
 // secrets, one parameter per configured name.
 func (c *Config) inheritSecretPrefix() string {
 	return c.namespace() + "/inherit/"
 }
 
-// storageDEKCiphertextParam: SSM path for the storage DEK's KMS ciphertext,
+// masterSeedCiphertextParam: SSM path for the master seed's KMS ciphertext,
 // lock-scoped and key-scoped.
-func (c *Config) storageDEKCiphertextParam(keyID string) string {
-	return fmt.Sprintf("%s/%s/StorageDEK/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
+func (c *Config) masterSeedCiphertextParam(keyID string) string {
+	return fmt.Sprintf("%s/%s/MasterSeed/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
 }
 
 // tlsKeyCiphertextParam returns the encrypted TLS key path.

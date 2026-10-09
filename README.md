@@ -943,11 +943,30 @@ The order is:
     you will never boot that PCR0 again.
 11. If you do retire a generation's key, schedule its deletion out of band, then
     poll the successor's `/enclave/v1/info` until that generation reports
-    `state: "deleted"` in the `ancestry` block. Responses on that route are
+    `state: "deleted"` in the `ancestry` block. The instance role can cancel a
+    pending deletion (`CancelKeyDeletion`, then `EnableKey`, since cancelling
+    leaves the key disabled), so a mistaken or malicious deletion is reversible
+    within the waiting period. The same right means `pending_deletion` proves
+    nothing: only `deleted` does. Responses on that route are
     signed by the attestation-bound key, so that reading is the receipt that the
     retired generation can no longer decrypt anything. Preserve its state-origin
     receipt until the audit has verified the deletion; a missing receipt makes
     the ancestry incomplete rather than proving retirement.
+
+    To stop the host from cancelling the retirement, attach this to the
+    instance role's IAM policy before scheduling the deletion:
+
+    ```json
+    {
+      "Effect": "Deny",
+      "Action": "kms:CancelKeyDeletion",
+      "Resource": "arn:aws:kms:<region>:<account>:key/<retired key ID>"
+    }
+    ```
+
+    An explicit deny overrides the key policy's allow, and the instance role
+    has no IAM permissions with which to remove it. Scope it to the retired key
+    only, so every other key keeps its cancel right.
 
 Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
 `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a

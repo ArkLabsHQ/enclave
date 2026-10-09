@@ -947,6 +947,21 @@ The order is:
     receipt until the audit has verified the deletion; a missing receipt makes
     the ancestry incomplete rather than proving retirement.
 
+    To stop the host from cancelling the retirement, attach this to the
+    instance role's IAM policy before scheduling the deletion:
+
+    ```json
+    {
+      "Effect": "Deny",
+      "Action": "kms:CancelKeyDeletion",
+      "Resource": "arn:aws:kms:<region>:<account>:key/<retired key ID>"
+    }
+    ```
+
+    An explicit deny overrides the key policy's allow, and the instance role
+    has no IAM permissions with which to remove it. Scope it to the retired key
+    only, so every other key keeps its cancel right.
+
 Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
 `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
 different subtree, finds nothing, and fails to boot. A production image can

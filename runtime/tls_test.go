@@ -208,7 +208,12 @@ func TestConfigureTLSRegistersACMEWithBootAccountKey(t *testing.T) {
 		t.Fatal("ACME client did not register an account")
 	}
 	requireRegistrationSignedBy(t, registration, boot.acmeAccountKey)
-	require.NotEqual(t, boot.tlsKey.Public(), boot.acmeAccountKey.Public(), "ACME and TLS use separate keys")
+	require.NotEqual(
+		t,
+		boot.tlsKey.Public(),
+		boot.acmeAccountKey.Public(),
+		"ACME and TLS use separate keys",
+	)
 	for path := range s3.objects {
 		require.NotContains(t, path, "account.key")
 	}

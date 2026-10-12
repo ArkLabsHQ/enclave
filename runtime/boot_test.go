@@ -301,9 +301,11 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	}).establish(ctx, planned, kms)
 
 	require.NoError(t, err)
-	wantDEK, err := deriveKeyBytes(bytes.Repeat([]byte{0x42}, 32), storageDEKDerivationName, 32)
+	wantDEK, err := deriveSecret(bytes.Repeat([]byte{0x42}, 32), storageDEKDerivationName)
 	require.NoError(t, err)
-	require.Equal(t, wantDEK, established.dek.(*dek).key)
+	wantDEKBytes, err := hex.DecodeString(wantDEK)
+	require.NoError(t, err)
+	require.Equal(t, wantDEKBytes, established.dek.(*dek).key)
 	require.Len(t, fake.calls, readCount, "establishment must not read SSM")
 }
 

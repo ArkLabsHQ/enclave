@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -90,9 +89,6 @@ func TestInternalDerivationVectors(t *testing.T) {
 			info, err := cbor.Marshal(tc.name)
 			require.NoError(t, err)
 			require.Equal(t, tc.info, hex.EncodeToString(info))
-			raw, err := deriveKeyBytes(seed, tc.name, 32)
-			require.NoError(t, err)
-			require.Equal(t, tc.key, hex.EncodeToString(raw))
 			// Valid first blocks preserve the reference commit's output exactly.
 			secret, err := deriveSecret(seed, tc.name)
 			require.NoError(t, err)
@@ -101,70 +97,59 @@ func TestInternalDerivationVectors(t *testing.T) {
 			if tc.name == acmeAccountKeyDerivationName {
 				key, err := deriveACMEAccountKey(seed)
 				require.NoError(t, err)
+				require.Equal(t, elliptic.P256(), key.Curve)
 				require.Equal(t, tc.key, hex.EncodeToString(key.D.FillBytes(make([]byte, 32))))
+				// Parsing must construct a usable signer, not just accept the integer.
+				digest := make([]byte, 32)
+				sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
+				require.NoError(t, err)
+				require.True(t, ecdsa.VerifyASN1(&key.PublicKey, digest, sig))
 			}
 		})
 	}
 }
 
-func TestSigningScalarSelection(t *testing.T) {
-	for _, curve := range []struct {
-		name      string
-		order     *big.Int
-		selectKey func([]byte) ([]byte, error)
+func TestDeriveValidScalarSelection(t *testing.T) {
+	seed := mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	// Independent Python hashlib/hmac vectors from one HKDF expansion.
+	for _, tc := range []struct {
+		name        string
+		acceptBlock int
+		want        string
 	}{
-		{"secp256k1", btcec.S256().N, func(blocks []byte) ([]byte, error) {
-			key, err := selectSecp256k1Scalar(blocks)
-			if err != nil {
-				return nil, err
-			}
-			return hex.DecodeString(key)
-		}},
-		{"P256", elliptic.P256().Params().N, func(blocks []byte) ([]byte, error) {
-			key, err := selectP256Key(blocks)
-			if err != nil {
-				return nil, err
-			}
-			// Parsing must construct a usable signer, not just accept the integer.
-			digest := make([]byte, 32)
-			sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
-			require.NoError(t, err)
-			require.True(t, ecdsa.VerifyASN1(&key.PublicKey, digest, sig))
-			return key.D.FillBytes(make([]byte, 32)), nil
-		}},
+		{
+			"first valid wins", 1,
+			"bf527f09d8f89bca004c459551dfb5ceb50a4df5edadae180e24e694326810f7",
+		},
+		{
+			"reject then accept", 3,
+			"fd4fce702a5a59760e22ad9bbf3798d5440a6b2fcee7e2951d6b272e9e4d1bfd",
+		},
+		{
+			"last block", 255,
+			"f1a74bde23cac39dbc5b0e78546674b307f60518bb544fdb5f355b35edbfaad2",
+		},
+		{"exhaust expansion", 0, ""},
 	} {
-		t.Run(curve.name, func(t *testing.T) {
-			n := curve.order.FillBytes(make([]byte, 32))
-			nPlusOne := new(big.Int).Add(curve.order, big.NewInt(1)).FillBytes(make([]byte, 32))
-			nMinusOne := new(big.Int).Sub(curve.order, big.NewInt(1)).FillBytes(make([]byte, 32))
-			one := big.NewInt(1).FillBytes(make([]byte, 32))
-			for _, tc := range []struct {
-				name         string
-				blocks, want []byte
-			}{
-				{"zero", make([]byte, 32), nil},
-				{"order", n, nil},
-				{"above order", nPlusOne, nil},
-				{"maximum integer", bytes.Repeat([]byte{0xff}, 32), nil},
-				{"one with leading zeros", one, one},
-				{"order minus one", nMinusOne, nMinusOne},
-				{"reject then accept", bytes.Join([][]byte{make([]byte, 32), n, nPlusOne, one, nMinusOne}, nil), one},
-				{"first valid wins", append(bytes.Clone(nMinusOne), one...), nMinusOne},
-				{"last block", append(make([]byte, 254*32), one...), one},
-				{"exhaust zero blocks", make([]byte, 255*32), nil},
-				{"exhaust overflow blocks", bytes.Repeat(n, 255), nil},
-			} {
-				t.Run(tc.name, func(t *testing.T) {
-					got, err := curve.selectKey(tc.blocks)
-					if tc.want == nil {
-						require.ErrorContains(t, err, "no valid")
-						require.Nil(t, got)
-					} else {
-						require.NoError(t, err)
-						require.Equal(t, tc.want, got)
-					}
-				})
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			got, err := deriveValidScalar(
+				seed,
+				"signing-key",
+				func(candidate []byte) (string, bool) {
+					calls++
+					require.Len(t, candidate, 32)
+					return hex.EncodeToString(candidate), calls == tc.acceptBlock
+				},
+			)
+			if tc.acceptBlock == 0 {
+				require.ErrorContains(t, err, "no valid")
+				require.Equal(t, 255, calls)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.acceptBlock, calls)
 			}
+			require.Equal(t, tc.want, got)
 		})
 	}
 }
@@ -173,7 +158,14 @@ func TestDerivedSeedLengthAcrossHelpers(t *testing.T) {
 	for _, length := range []int{0, 1, 31, 33, 64} {
 		t.Run(fmt.Sprint(length), func(t *testing.T) {
 			seed := make([]byte, length)
-			_, err := deriveKeyBytes(seed, storageDEKDerivationName, 32)
+			_, err := deriveValidScalar(
+				seed,
+				storageDEKDerivationName,
+				func([]byte) (string, bool) {
+					t.Fatal("invalid seed must be rejected before parsing")
+					return "", false
+				},
+			)
 			require.ErrorContains(t, err, "seed must be 32 bytes")
 			_, err = deriveSecret(seed, "signing-key")
 			require.ErrorContains(t, err, "seed must be 32 bytes")
@@ -394,25 +386,25 @@ func TestValidateStaticSecrets(t *testing.T) {
 			}}, "must use only"},
 			{"empty env var", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: ""},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use invalid env_var"},
 			{"env var starts with digit", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "0KEY"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use invalid env_var"},
 			{"equals in env var", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "BAD=KEY"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use invalid env_var"},
 			{"PORT", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "PORT"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use reserved env_var"},
 			{"ENCLAVE_RUNTIME_TOKEN", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "ENCLAVE_RUNTIME_TOKEN"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use reserved env_var"},
 			{"ENCLAVE_APP_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "ENCLAVE_APP_PORT"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use reserved env_var"},
 			{"ENCLAVE_PROXY_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "ENCLAVE_PROXY_PORT"},
-			}}, "invalid or reserved env_var"},
+			}}, "cannot use reserved env_var"},
 			{"duplicate name", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "duplicate", EnvVar: "ONE"},
 				{Name: "duplicate", EnvVar: "TWO"},

@@ -291,7 +291,9 @@ func TestHandOffToSuccessor(t *testing.T) {
 	newPCR0Bytes := bytes.Repeat([]byte{0xcd}, 48)
 	newPCR0 := hex.EncodeToString(newPCR0Bytes)
 	masterSeed := bytes.Repeat([]byte{0x42}, 32)
-	dekKey, err := deriveKeyBytes(masterSeed, storageDEKDerivationName, 32)
+	dekKey, err := deriveSecret(masterSeed, storageDEKDerivationName)
+	require.NoError(t, err)
+	dekKeyBytes, err := hex.DecodeString(dekKey)
 	require.NoError(t, err)
 	secretPlaintext, err := deriveSecret(masterSeed, "signing_key")
 	require.NoError(t, err)
@@ -411,7 +413,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
-		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
 		require.Equal(t, secretPlaintext, established.secrets.Static[0].Plaintext)
 		accountKey, err := deriveACMEAccountKey(masterSeed)
 		require.NoError(t, err)
@@ -707,7 +709,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
-		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
 		require.Equal(t, secretPlaintext, established.secrets.Static[0].Plaintext)
 	})
 
@@ -781,7 +783,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := restarted.Boot(ctx)
 		require.NoError(t, err, "a committed generation must survive a later abort")
-		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
 	})
 
 	t.Run("fails when KMSKeyID write fails", func(t *testing.T) {

@@ -35,56 +35,63 @@ const (
 	acmeAccountKeyDerivationName = runtimeDerivationPrefix + "ACMEAccountKey"
 )
 
-// deriveKeyBytes uses HKDF-SHA256 extract-and-expand with protocol constants.
+// deriveValidScalar uses HKDF-SHA256 extract-and-expand with protocol constants.
 // A plain CBOR string has a definite, shortest-length header and preserves the
 // exact name bytes. No deployment metadata enters the derivation.
-func deriveKeyBytes(seed []byte, name string, length int) ([]byte, error) {
+func deriveValidScalar[T any](seed []byte, name string, parse func([]byte) (T, bool)) (T, error) {
+	var zero T
+
 	if len(seed) != 32 {
-		return nil, fmt.Errorf("seed must be 32 bytes, got %d", len(seed))
+		return zero, fmt.Errorf("seed must be 32 bytes, got %d", len(seed))
 	}
 	info, err := cbor.Marshal(name)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
-	return hkdf.Key(sha256.New, seed, []byte(derivedSecretSalt), string(info), length)
-}
-
-func deriveSecret(seed []byte, name string) (string, error) {
-	blocks, err := deriveKeyBytes(seed, name, signingKeyExpansionBytes)
+	blocks, err := hkdf.Key(
+		sha256.New,
+		seed,
+		[]byte(derivedSecretSalt),
+		string(info),
+		signingKeyExpansionBytes,
+	)
 	if err != nil {
-		return "", err
+		return zero, err
 	}
-	return selectSecp256k1Scalar(blocks)
-}
-
-// Signing keys scan successive blocks of one expansion, without reduction.
-func selectSecp256k1Scalar(blocks []byte) (string, error) {
 	for offset := 0; offset+32 <= len(blocks); offset += 32 {
-		block := blocks[offset : offset+32]
-		var scalar btcec.ModNScalar
-		if !scalar.SetByteSlice(block) && !scalar.IsZero() {
-			return hex.EncodeToString(block), nil
-		}
-	}
-	return "", fmt.Errorf("HKDF expansion contains no valid secp256k1 scalar")
-}
+		candidate := blocks[offset : offset+32]
 
-func deriveACMEAccountKey(seed []byte) (*ecdsa.PrivateKey, error) {
-	blocks, err := deriveKeyBytes(seed, acmeAccountKeyDerivationName, signingKeyExpansionBytes)
-	if err != nil {
-		return nil, err
-	}
-	return selectP256Key(blocks)
-}
-
-func selectP256Key(blocks []byte) (*ecdsa.PrivateKey, error) {
-	for offset := 0; offset+32 <= len(blocks); offset += 32 {
-		key, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), blocks[offset:offset+32])
-		if err == nil {
+		if key, valid := parse(candidate); valid {
 			return key, nil
 		}
 	}
-	return nil, fmt.Errorf("HKDF expansion contains no valid P-256 scalar")
+	return zero, fmt.Errorf("HKDF expansion contains no valid scalar")
+}
+
+func deriveSecret(seed []byte, name string) (string, error) {
+	return deriveValidScalar(seed, name, func(candidate []byte) (string, bool) {
+		var scalar btcec.ModNScalar
+
+		if scalar.SetByteSlice(candidate) || scalar.IsZero() {
+			return "", false
+		}
+
+		return hex.EncodeToString(candidate), true
+	})
+}
+
+func deriveACMEAccountKey(seed []byte) (*ecdsa.PrivateKey, error) {
+	return deriveValidScalar(
+		seed,
+		acmeAccountKeyDerivationName,
+		func(candidate []byte) (*ecdsa.PrivateKey, bool) {
+			key, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), candidate)
+			if err != nil {
+				return nil, false
+			}
+			return key, true
+		},
+	)
 }
 
 // SecretsMetadata is the secret configuration baked into the image: the static
@@ -167,13 +174,22 @@ func (sm SecretsMetadata) validateStatic() error {
 				secret.Name,
 			)
 		}
-		if !envVarNamePattern.MatchString(secret.EnvVar) || childReservedEnv[secret.EnvVar] {
+		if !envVarNamePattern.MatchString(secret.EnvVar) {
 			return fmt.Errorf(
-				"secret %q: invalid or reserved env_var %q",
+				"secret %q: cannot use invalid env_var %q",
 				secret.Name,
 				secret.EnvVar,
 			)
 		}
+
+		if childReservedEnv[secret.EnvVar] {
+			return fmt.Errorf(
+				"secret %q: cannot use reserved env_var %q",
+				secret.Name,
+				secret.EnvVar,
+			)
+		}
+
 		if envVars[secret.EnvVar] {
 			return fmt.Errorf("secret %q: env_var %q is already used", secret.Name, secret.EnvVar)
 		}
@@ -199,10 +215,19 @@ func ExtendPCRRegistersWithStaticSecrets(nsm NSM, secrets []StaticSecret) error 
 			return fmt.Errorf("decode secret %s hex: %w", s.Name, err)
 		}
 
-		var scalar btcec.ModNScalar
-		if len(secretBytes) != 32 || scalar.SetByteSlice(secretBytes) || scalar.IsZero() {
-			return fmt.Errorf("secret %q: invalid secp256k1 private key", s.Name)
+		if len(secretBytes) != 32 {
+			return fmt.Errorf("secret must be exactly 32 bytes")
 		}
+
+		var scalar btcec.ModNScalar
+		if overflow := scalar.SetByteSlice(secretBytes); overflow {
+			return fmt.Errorf("secret scalar exceeds the curve order")
+		}
+
+		if scalar.IsZero() {
+			return fmt.Errorf("secret scalar cannot be zero")
+		}
+
 		privKey := btcec.PrivKeyFromScalar(&scalar)
 
 		pubkeyBytes := privKey.PubKey().SerializeCompressed()

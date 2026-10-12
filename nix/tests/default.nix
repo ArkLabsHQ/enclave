@@ -8,8 +8,7 @@ let
 
   awsNodeIP = "192.168.1.1";
 
-  # Leave time to replay an intent and observe two handoff polling intervals
-  # before the same fleet completes its normal handoff.
+  # Leave time to observe the candidate and cooling-down states before handoff.
   migrationCooldownSeconds = 60;
 
   testApp = pkgs.buildGoModule {

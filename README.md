@@ -751,32 +751,54 @@ key, not the individual serving replica's current PCR0.
 
 ```sh
 nix run github:ArkLabsHQ/enclave -- curl <path> \
-  --base-url <url> --expected-pcr0 <hex>
+  --base-url <url> --expected-pcr0 <hex> --expected-tls-key-hash <saved-hex>
 ```
 
 The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
+
+Enroll once with `enclave attest`. It verifies the Nitro attestation, nonce, and
+expected PCR0, then prints only the attested TLS public-key fingerprint and a
+newline to stdout. The fingerprint is the SHA-256 of the key's DER
+SubjectPublicKeyInfo, encoded as 64 hex characters. Save it for subsequent calls:
+
+```sh
+enclave attest \
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  > deployment-tls-key.sha256
+```
+
+`attest` makes no application request. `curl` verifies the attestation and checks
+the live TLS key before sending the application request. Both commands accept
+`--base-url`, `--expected-pcr0`, `--expected-tls-key-hash`, `--strict-tls`, and
+`--insecure-skip-cose-verify`:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--base-url` | required | Enclave base URL. |
 | `--expected-pcr0` | required | Expected PCR0, compared case-insensitively. |
+| `--expected-tls-key-hash` | empty | Expected nonzero TLS public-key SHA-256, as 64 hex characters, compared case-insensitively. Empty trusts the first verified attestation for this invocation. |
 | `-X`, `--method` | `GET` | HTTP method. |
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning to stderr). PCR0, nonce, the exact 39-byte TLS binding, and any expected fingerprint are still checked; `curl` also checks the live TLS key. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
 # Runtime and migration status.
 enclave curl /enclave/v1/info \
-  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  --expected-tls-key-hash "$(cat deployment-tls-key.sha256)"
 
 # Authenticated POST.
 enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   -H "Authorization: Bearer $TOKEN" \
-  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  --expected-tls-key-hash "$(cat deployment-tls-key.sha256)"
 ```
+
+Keep the saved fingerprint when accepting a successor image's PCR0. Enrolling
+again on every invocation would discard the deployment identity check.
 
 The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
 status is 400 or above.
@@ -849,7 +871,7 @@ if err != nil {
 Omitting the fingerprint establishes trust on first successful verification;
 PCR0 alone does not distinguish deployments of the same image. After enrollment,
 load the saved value before creating a client. Do not replace it by enrolling
-again on every run. The CLI currently establishes first-use trust per invocation.
+again on every run. The CLI accepts the saved value through `--expected-tls-key-hash`.
 
 What is verified on the first request, and cached for `CacheTTL`:
 
@@ -893,6 +915,11 @@ nix flake check
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
 available.
+
+The E2E suite exercises the packaged CLI: it saves an `enclave attest`
+fingerprint and reuses it with `enclave curl` across replicas, migration,
+certificate changes, and restarts. It also checks that invalid fingerprints,
+wrong PCR0s, and failed verification leave stdout empty and return an error.
 
 ### Requirements
 

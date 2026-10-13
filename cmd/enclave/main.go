@@ -27,11 +27,13 @@ func main() {
 // surface can be tested without exiting the process.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:     "enclave",
-		Short:   "Verified client for AWS Nitro Enclaves",
-		Long:    "Make attestation-verified requests to an AWS Nitro Enclave.",
-		Version: Version,
+		Use:           "enclave",
+		Short:         "Verified client for AWS Nitro Enclaves",
+		Long:          "Make attestation-verified requests to an AWS Nitro Enclave.",
+		Version:       Version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
-	root.AddCommand(newCurlCommand())
+	root.AddCommand(newCurlCommand(), newAttestCommand())
 	return root
 }

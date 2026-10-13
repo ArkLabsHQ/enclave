@@ -4,76 +4,46 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
-	"github.com/ArkLabsHQ/enclave/client"
 	"github.com/spf13/cobra"
 )
 
 func newCurlCommand() *cobra.Command {
-	var (
-		baseURL     string
-		expectedPCR string
-		method      string
-		data        string
-		headers     []string
-		strictTLS   bool
-		skipCOSE    bool
-		verbose     bool
-	)
+	var opts curlOptions
 
 	cmd := &cobra.Command{
 		Use:   "curl <path>",
 		Short: "Make an attestation-verified request",
-		Long: `Verifies the enclave's Nitro attestation and PCR0, pins the live TLS
-certificate to the leaf hash in the attestation document, then makes the
-requested call over that authenticated connection.
+		Long: `Verifies the enclave's Nitro attestation and PCR0, checks
+--expected-tls-key-hash when supplied, then makes the requested call over a
+TLS connection pinned to the attested public-key fingerprint.
 
+Use 'enclave attest' to obtain the fingerprint for subsequent calls.
 Use /enclave/v1/info for runtime, status, and migration information.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCurl(cmd, curlOptions{
-				baseURL:     baseURL,
-				expectedPCR: expectedPCR,
-				method:      method,
-				data:        data,
-				headers:     headers,
-				strictTLS:   strictTLS,
-				skipCOSE:    skipCOSE,
-				verbose:     verbose,
-				path:        args[0],
-			})
+			opts.path = args[0]
+			return runCurl(cmd, opts)
 		},
 	}
-	cmd.Flags().StringVar(&baseURL, "base-url", "", "enclave HTTPS base URL (required)")
-	cmd.Flags().StringVar(&expectedPCR, "expected-pcr0", "", "expected PCR0 hex value (required)")
-	cmd.Flags().StringVarP(&method, "method", "X", http.MethodGet, "HTTP method")
-	cmd.Flags().StringVarP(&data, "data", "d", "", "request body")
+	opts.addFlags(cmd)
+	cmd.Flags().StringVarP(&opts.method, "method", "X", http.MethodGet, "HTTP method")
+	cmd.Flags().StringVarP(&opts.data, "data", "d", "", "request body")
 	cmd.Flags().
-		StringArrayVarP(&headers, "header", "H", nil, "request header, in 'Name: value' form (repeatable)")
+		StringArrayVarP(&opts.headers, "header", "H", nil, "request header, in 'Name: value' form (repeatable)")
 	cmd.Flags().
-		BoolVar(&strictTLS, "strict-tls", false, "also require public CA and hostname validation")
-	cmd.Flags().
-		BoolVar(&skipCOSE, "insecure-skip-cose-verify", false,
-			"skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only)")
-	cmd.Flags().
-		BoolVarP(&verbose, "verbose", "v", false, "write request and verification details to stderr")
-	_ = cmd.MarkFlagRequired("base-url")
-	_ = cmd.MarkFlagRequired("expected-pcr0")
+		BoolVarP(&opts.verbose, "verbose", "v", false, "write request and verification details to stderr")
 	return cmd
 }
 
 type curlOptions struct {
-	baseURL     string
-	expectedPCR string
-	method      string
-	data        string
-	headers     []string
-	strictTLS   bool
-	skipCOSE    bool
-	verbose     bool
-	path        string
+	verificationOptions
+	method  string
+	data    string
+	headers []string
+	verbose bool
+	path    string
 }
 
 func runCurl(cmd *cobra.Command, opts curlOptions) error {
@@ -103,21 +73,10 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 	}
 
 	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "> %s %s\n", req.Method, req.URL)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "> %s %s\n", req.Method, req.URL)
 	}
 
-	if opts.skipCOSE {
-		fmt.Fprintln(
-			os.Stderr,
-			"WARNING: skipping attestation COSE signature and AWS Nitro root chain verification — QEMU/local test only",
-		)
-	}
-
-	c, err := client.New(baseURL, client.Options{
-		ExpectedPCR0:           opts.expectedPCR,
-		StrictTLS:              opts.strictTLS,
-		InsecureSkipCOSEVerify: opts.skipCOSE,
-	})
+	c, err := opts.newClient(cmd)
 	if err != nil {
 		return err
 	}
@@ -127,17 +86,17 @@ func runCurl(cmd *cobra.Command, opts curlOptions) error {
 	}
 
 	if opts.verbose {
-		fmt.Fprintf(
-			os.Stderr,
+		_, _ = fmt.Fprintf(
+			cmd.ErrOrStderr(),
 			"< %d (PCR0 and attested TLS pin verified)\n",
 			resp.StatusCode,
 		)
 	}
-	if _, err := os.Stdout.Write(resp.Body); err != nil {
+	if _, err := cmd.OutOrStdout().Write(resp.Body); err != nil {
 		return fmt.Errorf("write response: %w", err)
 	}
 	if len(resp.Body) == 0 || resp.Body[len(resp.Body)-1] != '\n' {
-		_, _ = fmt.Fprintln(os.Stdout)
+		_, _ = fmt.Fprintln(cmd.OutOrStdout())
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)

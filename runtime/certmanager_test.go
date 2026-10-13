@@ -646,21 +646,6 @@ func TestCertStoreMissingObject(t *testing.T) {
 	require.Nil(t, bundle)
 }
 
-func TestLoadOrCreateAccountKeyConvergesOnOne(t *testing.T) {
-	setCertTestEnv(t)
-	ctx := context.Background()
-	s3f := newFakeS3()
-	store := newCertTestStore(s3f)
-
-	first, err := store.LoadOrCreateAccountKey(ctx)
-	require.NoError(t, err)
-
-	// A second enclave must adopt the stored key, not register its own account.
-	second, err := store.LoadOrCreateAccountKey(ctx)
-	require.NoError(t, err)
-	require.Equal(t, first.Public(), second.Public())
-}
-
 func TestCertManagerIssueFailurePropagates(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()

@@ -290,14 +290,16 @@ func TestHandOffToSuccessor(t *testing.T) {
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
 	newPCR0Bytes := bytes.Repeat([]byte{0xcd}, 48)
 	newPCR0 := hex.EncodeToString(newPCR0Bytes)
-	dekKey := bytes.Repeat([]byte{0x42}, 32)
-	secretPlaintext := bytes.Repeat([]byte{0x11}, 32)
-	secret := StaticSecret{
-		StaticSecretMetadata: StaticSecretMetadata{Name: "signing_key"},
-		Plaintext:            hex.EncodeToString(secretPlaintext),
-	}
+	masterSeed := bytes.Repeat([]byte{0x42}, 32)
+	dekKey, err := deriveSecret(masterSeed, storageDEKDerivationName)
+	require.NoError(t, err)
+	dekKeyBytes, err := hex.DecodeString(dekKey)
+	require.NoError(t, err)
+	secretPlaintext, err := deriveSecret(masterSeed, "signing_key")
+	require.NoError(t, err)
 
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[{"name":"signing_key"}]`)
+	successorCfg := successorTestCfg(oldPCR0Hex)
+	successorCfg.StaticSecretConfig = `[{"name":"signing_key","env_var":"SIGNING_KEY"}]`
 
 	ctx := context.Background()
 	setup := func(t *testing.T, opts ...func(*startMigrationFixture)) *startMigrationFixture {
@@ -335,8 +337,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		m, err := newMigrator(migrationTestCfg(), nsm, fx.ssm, s3f, migrationIntentBucketName)
 		require.NoError(t, err)
 		m.kms = &kmsW{cfg: testCfg, nsm: nsm, kms: kmsf, sts: sts, keyID: "old-key"}
-		m.dek = &dek{key: dekKey}
-		m.staticSecrets = []StaticSecret{secret}
+		m.masterSeed = masterSeed
 		m.tlsKey = newTestTLSKey(t)
 		fx.m = m
 		return fx
@@ -378,21 +379,21 @@ func TestHandOffToSuccessor(t *testing.T) {
 			t, "old-key", fx.ssmf.params[testCfg.kmsKeyIDParam(oldPCR0Hex)],
 			"the predecessor's own commit pointer must survive the handoff",
 		)
-		require.NotEmpty(t, fx.ssmf.params[testCfg.storageDEKCiphertextParam(migrationKeyID)])
+		require.NotEmpty(t, fx.ssmf.params[testCfg.masterSeedCiphertextParam(migrationKeyID)])
 		require.NotEmpty(
 			t,
 			fx.ssmf.params[testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)],
 		)
 		require.Empty(
 			t,
-			fx.ssmf.params["/prod/app/MigrationStateOriginReceipt/"+migrationKeyID],
+			fx.ssmf.params["/prod/app/enclave/MigrationStateOriginReceipt/"+migrationKeyID],
 			"the receipt must move to the PCR0-scoped path, not merely exist",
 		)
 		requireKMSCiphertextPlaintext(
 			t,
 			fx.kmsf,
-			fx.ssmf.params[testCfg.secretCiphertextParam("signing_key", migrationKeyID)],
-			secretPlaintext,
+			fx.ssmf.params[testCfg.masterSeedCiphertextParam(migrationKeyID)],
+			masterSeed,
 		)
 		requireKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), newPCR0, true)
 		require.NotNil(t, fx.session.attestationRoots)
@@ -402,9 +403,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(
-				oldPCR0Hex,
-			),
+			successorCfg,
 			newNSM,
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
@@ -414,8 +413,12 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
-		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
+		require.Equal(t, secretPlaintext, established.secrets.Static[0].Plaintext)
+		accountKey, err := deriveACMEAccountKey(masterSeed)
+		require.NoError(t, err)
+		require.Equal(t, accountKey, established.acmeAccountKey)
+		require.Equal(t, fx.m.tlsKey, established.tlsKey)
 		require.Equal(t, migrationIntentBucketName, established.migrationIntentBucketName)
 		newReceipt := testCfg.stateOriginReceiptParam(migrationKeyID, newPCR0)
 		require.NotEmpty(t, fx.ssmf.params[newReceipt])
@@ -466,7 +469,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 				keyID: migrationKeyID,
 			}
 			_, err = predecessorOnMigrationKey.Decrypt(
-				ctx, fx.ssmf.params[testCfg.storageDEKCiphertextParam(migrationKeyID)],
+				ctx, fx.ssmf.params[testCfg.masterSeedCiphertextParam(migrationKeyID)],
 			)
 			require.ErrorContains(t, err, "AccessDenied")
 		})
@@ -524,8 +527,8 @@ func TestHandOffToSuccessor(t *testing.T) {
 			migrationTestCfg(), fx.m.nsm, fx.ssm, fx.s3f, migrationIntentBucketName,
 		)
 		require.NoError(t, err)
-		restarted.kms, restarted.dek = fx.m.kms, fx.m.dek
-		restarted.staticSecrets, restarted.tlsKey = fx.m.staticSecrets, fx.m.tlsKey
+		restarted.kms, restarted.masterSeed = fx.m.kms, fx.m.masterSeed
+		restarted.tlsKey = fx.m.tlsKey
 
 		err = restarted.handOffToSuccessor(ctx)
 
@@ -556,7 +559,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.Contains(t, err.Error(), "failed to create migration key")
 	})
 
-	t.Run("fails when secret export fails", func(t *testing.T) {
+	t.Run("fails when master seed encryption fails", func(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.kmsf.encryptErr = errors.New("encrypt failed")
 		})
@@ -565,13 +568,13 @@ func TestHandOffToSuccessor(t *testing.T) {
 		err := fx.m.handOffToSuccessor(ctx)
 
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "failed to re-encrypt secret signing_key")
+		require.Contains(t, err.Error(), "failed to re-encrypt master seed")
 	})
 
-	t.Run("fails when DEK export fails", func(t *testing.T) {
+	t.Run("fails when master seed persistence fails", func(t *testing.T) {
 		fx := setup(t, func(fx *startMigrationFixture) {
 			fx.ssmf.putErrs = map[string]error{
-				testCfg.storageDEKCiphertextParam(migrationKeyID): errors.New("set failed"),
+				testCfg.masterSeedCiphertextParam(migrationKeyID): errors.New("set failed"),
 			}
 		})
 		request(t, fx, newPCR0)
@@ -579,7 +582,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		err := fx.m.handOffToSuccessor(ctx)
 
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "DEK export failed")
+		require.Contains(t, err.Error(), "failed to store master seed")
 	})
 
 	t.Run("fails when transition receipt write fails", func(t *testing.T) {
@@ -639,16 +642,11 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NotEmpty(t, first)
 
 		err = WriteTransitionReceipt(ctx, testCfg, fx.m.nsm, fx.ssm, bootSnapshot{
-			kmsKeyID:            migrationKeyID,
-			ownerPCR0:           newPCR0,
-			predecessorPCR0:     oldPCR0Hex,
-			predecessorKMSKeyID: "old-key",
-			staticSecrets: map[StaticSecretMetadata]string{
-				secret.StaticSecretMetadata: fx.ssmf.params[testCfg.secretCiphertextParam(
-					"signing_key", migrationKeyID,
-				)],
-			},
-			storageDEK:                fx.ssmf.params[testCfg.storageDEKCiphertextParam(migrationKeyID)],
+			kmsKeyID:                  migrationKeyID,
+			ownerPCR0:                 newPCR0,
+			predecessorPCR0:           oldPCR0Hex,
+			predecessorKMSKeyID:       "old-key",
+			masterSeedCiphertext:      fx.ssmf.params[testCfg.masterSeedCiphertextParam(migrationKeyID)],
 			tlsKeyCiphertext:          fx.ssmf.params[testCfg.tlsKeyCiphertextParam(migrationKeyID)],
 			migrationIntentBucketName: migrationIntentBucketName,
 		})
@@ -701,9 +699,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			verifyRoots: fx.session.attestationRoots,
 		}}
 		newBoot, err := NewBoot(
-			successorTestCfg(
-				oldPCR0Hex,
-			),
+			successorCfg,
 			newNSM,
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
@@ -713,8 +709,8 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := newBoot.Boot(ctx)
 		require.NoError(t, err)
-		require.Equal(t, dekKey, established.dek.(*dek).key)
-		require.Equal(t, secret.Plaintext, established.secrets[0].Plaintext)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
+		require.Equal(t, secretPlaintext, established.secrets.Static[0].Plaintext)
 	})
 
 	t.Run("refuses to commit when aborted during the handoff", func(t *testing.T) {
@@ -768,7 +764,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		session := newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes})
 		successor := func(roots *x509.CertPool) (*Boot, error) {
 			return NewBoot(
-				successorTestCfg(oldPCR0Hex),
+				successorCfg,
 				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
 				fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
 			)
@@ -787,7 +783,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		established, err := restarted.Boot(ctx)
 		require.NoError(t, err, "a committed generation must survive a later abort")
-		require.Equal(t, dekKey, established.dek.(*dek).key)
+		require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
 	})
 
 	t.Run("fails when KMSKeyID write fails", func(t *testing.T) {
@@ -849,7 +845,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 	t.Run("rejects a claim for another app", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Deployment, "other-app", false)
+		fx.successor.cfg = newTestConfig(fx.predecessor.cfg.Namespace, "other-app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -860,18 +856,19 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
 		fx.successor.cfg = newTestConfig(
-			fx.predecessor.cfg.Deployment, fx.predecessor.cfg.AppName, true,
+			fx.predecessor.cfg.Namespace, fx.predecessor.cfg.AppName, false,
 		)
+		fx.successor.cfg.KMSLocked = false
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
 		require.Empty(t, verify(t, fx, doc, challenge))
 	})
 
-	t.Run("rejects a claim for another deployment", func(t *testing.T) {
+	t.Run("rejects a claim for another namespace", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		fx.successor.cfg = newTestConfig("other-deployment", "app", false)
+		fx.successor.cfg = newTestConfig("ark/prod", "app", false)
 		doc, err := successorAttestation(fx.successor, challenge)
 		require.NoError(t, err)
 
@@ -884,10 +881,10 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
 		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:     "enclave.successor_claim.v2",
-			Deployment: fx.predecessor.cfg.Deployment,
-			AppName:    fx.predecessor.cfg.AppName,
-			Lock:       fx.predecessor.cfg.lockSegment(),
+			Schema:    "enclave.successor_claim.v2",
+			Namespace: fx.predecessor.cfg.Namespace,
+			AppName:   fx.predecessor.cfg.AppName,
+			Lock:      fx.predecessor.cfg.lockSegment(),
 		})
 		require.NoError(t, err)
 		raw, _, err := fx.successor.nsm.BuildAttestationDocument(
@@ -1194,8 +1191,6 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	oldPCR0Hex := hex.EncodeToString(oldPCR0)
 	newPCR0 := strings.Repeat("cd", 48)
 
-	t.Setenv("ENCLAVE_SECRETS_CONFIG", `[]`)
-
 	ctx := context.Background()
 	setup := func(t *testing.T) (*migrator, *fakeSSM, *fakeNSMSession) {
 		t.Helper()
@@ -1218,7 +1213,7 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 			cfg: testCfg, nsm: nsm, kms: newFakeKMS(), sts: &fakeSTS{arn: testRoleARN},
 			keyID: "old-key",
 		}
-		m.dek = &dek{key: bytes.Repeat([]byte{0x42}, 32)}
+		m.masterSeed = bytes.Repeat([]byte{0x42}, 32)
 		m.tlsKey = newTestTLSKey(t)
 		return m, ssmf, session
 	}
@@ -1647,7 +1642,6 @@ func contextFor(t *testing.T, timeout time.Duration) context.Context {
 
 // A candidate waits for commit while answering its predecessor.
 func TestAwaitCandidateHandoffWaitsAndAnswersItsPredecessor(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx, m := newCandidateMigrator(t)
 	issuer := successorMigrator(t, m.cfg, fx.signer, mustDecodeHex(t, handoffPredecessorPCR0))
 	issuer.pcr0, issuer.ssm = handoffPredecessorPCR0, m.ssm
@@ -1672,8 +1666,6 @@ func TestAwaitCandidateHandoffWaitsAndAnswersItsPredecessor(t *testing.T) {
 
 // Existing generations and fresh deployments do not wait.
 func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	t.Run("committed key", func(t *testing.T) {
 		fx, m := newCandidateMigrator(t)
 		fx.ssmf.params[fx.keyIDParam()] = "committed-key"
@@ -1702,7 +1694,6 @@ func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
 
 // Partial artifacts do not end candidacy; the final pointer does.
 func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
-	setStateOriginTestEnv(t)
 	fx, m := newCandidateMigrator(t)
 	attestation := testCfg.migrationPreviousPCR0AttestationParam(fx.pcr0Hex)
 	fx.ssmf.params[attestation] = "handoff-in-progress"
@@ -1724,7 +1715,6 @@ func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
 
 // An intent alone cannot end candidacy.
 func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
-	setStateOriginTestEnv(t)
 	ctx := context.Background()
 	fx := newMigrationIntentFixture(t)
 	target := strings.Repeat("cd", 48)
@@ -1756,8 +1746,6 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 
 // State read failures are fatal.
 func TestAwaitCandidateHandoffDoesNotRetryFatalErrors(t *testing.T) {
-	setStateOriginTestEnv(t)
-
 	for _, tc := range []struct {
 		name string
 		fail func(*genesisFixture)

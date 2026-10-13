@@ -62,7 +62,9 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
         "AWS": ["arn:aws:iam::123456789012:role/ec2"]
       },
       "Action": [
-        "kms:ScheduleKeyDeletion"
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:EnableKey"
       ],
       "Resource": ["*"]
     }
@@ -117,7 +119,9 @@ func TestBuildKMSPolicy_RecoveryGolden(t *testing.T) {
         "AWS": ["arn:aws:iam::123456789012:role/ec2"]
       },
       "Action": [
-        "kms:ScheduleKeyDeletion"
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:EnableKey"
       ],
       "Resource": ["*"]
     },
@@ -256,7 +260,11 @@ func ppOps() map[string]any {
 }
 
 func ppDelete() map[string]any {
-	return ppAllow("kms:ScheduleKeyDeletion", ppRole, nil)
+	return ppAllow(
+		[]string{"kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion", "kms:EnableKey"},
+		ppRole,
+		nil,
+	)
 }
 
 func ppRootRecovery(principal any) map[string]any {
@@ -320,7 +328,11 @@ func TestKMSPolicyActionIsolation(t *testing.T) {
 		policyStrings{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
 		fresh.operations.Action,
 	)
-	require.Equal(t, policyStrings{"kms:ScheduleKeyDeletion"}, fresh.deletion.Action)
+	require.Equal(
+		t,
+		policyStrings{"kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion", "kms:EnableKey"},
+		fresh.deletion.Action,
+	)
 	require.Equal(
 		t,
 		policyStrings{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"},

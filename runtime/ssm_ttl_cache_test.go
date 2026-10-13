@@ -86,6 +86,42 @@ func TestSSMTTLCacheMayGetDoesNotCacheEmpty(t *testing.T) {
 	}
 }
 
+func TestSSMTTLCacheMayGetWithDecryptionBypassesCache(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeSSM{params: map[string]string{"/key": "secret"}}
+	ssm := NewSSMTTLCache(NewSSM(fake), time.Hour)
+
+	for range 2 {
+		got, err := ssm.MayGet(ctx, "/key", WithDecryption())
+		require.NoError(t, err)
+		require.Equal(t, "secret", got)
+	}
+	require.Len(t, fake.decryptedGets, 2, "decrypted reads must not be served from the cache")
+
+	// Nor may a decrypted read seed the cache for a plain one.
+	_, err := ssm.MayGet(ctx, "/key")
+	require.NoError(t, err)
+	require.Len(t, fake.calls, 3)
+}
+
+func TestSSMTTLCacheMustGetWithDecryptionBypassesCache(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeSSM{params: map[string]string{"/key": "secret"}}
+	ssm := NewSSMTTLCache(NewSSM(fake), time.Hour)
+
+	for range 2 {
+		got, err := ssm.MustGet(ctx, "/key", WithDecryption())
+		require.NoError(t, err)
+		require.Equal(t, "secret", got)
+	}
+	require.Len(t, fake.decryptedGets, 2, "decrypted reads must not be served from the cache")
+
+	// Nor may a decrypted read seed the cache for a plain one.
+	_, err := ssm.MustGet(ctx, "/key")
+	require.NoError(t, err)
+	require.Len(t, fake.calls, 3)
+}
+
 func TestSSMTTLCacheSetInvalidatesCache(t *testing.T) {
 	ctx := context.Background()
 	fake := &fakeSSM{params: map[string]string{"/key": "one"}}

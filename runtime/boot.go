@@ -12,8 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"maps"
-	"slices"
 	"strings"
 	"time"
 
@@ -47,10 +45,12 @@ const (
 
 // bootResult is the boot machine's terminal state
 type bootResult struct {
-	kms     PrimaryKMS
-	dek     DEK
-	secrets []StaticSecret
-	tlsKey  crypto.Signer
+	kms            PrimaryKMS
+	dek            DEK
+	secrets        Secrets
+	tlsKey         crypto.Signer
+	masterSeed     []byte
+	acmeAccountKey crypto.Signer
 
 	migrationIntentBucketName string
 	lineage                   stateLineage
@@ -71,8 +71,7 @@ type bootSnapshot struct {
 	ownerPCR0                 string // generation the KMSKeyID path is scoped to
 	predecessorPCR0           string
 	predecessorKMSKeyID       string
-	staticSecrets             map[StaticSecretMetadata]string // metadata → ciphertext
-	storageDEK                string
+	masterSeedCiphertext      string
 	tlsKeyCiphertext          string
 	migrationIntentBucketName string
 }
@@ -86,10 +85,10 @@ func (s bootSnapshot) lineage() stateLineage {
 
 // bootState is what every boot knows, whatever brought it about.
 type bootState struct {
-	cfg         *Config
-	currentPCR0 []byte
-	metadata    []StaticSecretMetadata
-	kmsKeyID    string
+	cfg             *Config
+	currentPCR0     []byte
+	secretsMetadata SecretsMetadata
+	kmsKeyID        string
 
 	predecessorPCR0        string
 	predecessorKMSKeyID    string
@@ -198,21 +197,37 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 	}
 
 	state := &planned.state
+
+	// Inherited secrets come first: a value that fails its commitment check aborts
+	// the boot here, before a KMS key is created or any enclave state is written.
+	inheritedSecrets, err := resolveInheritedSecrets(
+		ctx, b.cfg, b.ssm, state.secretsMetadata.Inherited, time.Now(),
+	)
+	if err != nil {
+		return bootResult{}, err
+	}
+
 	kms, err := FetchOrCreatePrimaryKMS(ctx, b.cfg, b.nsm, b.kmsAPI, b.sts, state.kmsKeyID)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
-	return b.establish(ctx, planned, kms)
+	result, err := b.establish(ctx, planned, kms)
+	if err != nil {
+		return bootResult{}, err
+	}
+	result.secrets.Inherited = inheritedSecrets
+
+	return result, nil
 }
 
 // plan decides, once, which of the three boots this is.
 func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
-	metadata, err := LoadStaticSecretMetadata()
+	secretsMetadata, err := LoadSecretsMetadata(*b.cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load static secret metadata: %w", err)
+		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
 	}
-	if err := validateStaticSecretNames(metadata); err != nil {
-		return nil, fmt.Errorf("invalid static secret metadata: %w", err)
+	if err := secretsMetadata.Validate(b.cfg.OverrideAllowList); err != nil {
+		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
 	}
 	migrationIntentBucketName, err := b.migrationIntentBucket(ctx)
 	if err != nil {
@@ -230,7 +245,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	state := bootState{
 		cfg:                    b.cfg,
 		currentPCR0:            append([]byte(nil), b.pcr0...),
-		metadata:               metadata,
+		secretsMetadata:        secretsMetadata,
 		predecessorPCR0:        predecessorPCR0,
 		predecessorKMSKeyID:    predecessorKMSKeyID,
 		predecessorAttestation: predecessorAttestation,
@@ -378,9 +393,21 @@ func (b *Boot) establish(
 		return bootResult{}, err
 	}
 
-	dekPlaintext, err := kms.Decrypt(ctx, snapshot.storageDEK)
+	masterSeed, err := kms.Decrypt(ctx, snapshot.masterSeedCiphertext)
 	if err != nil {
-		return bootResult{}, fmt.Errorf("failed to decrypt DEK: %w", err)
+		return bootResult{}, fmt.Errorf("failed to decrypt master seed: %w", err)
+	}
+	storageKey, err := deriveSecret(masterSeed, storageDEKDerivationName)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("derive storage DEK: %w", err)
+	}
+	storageKeyBytes, err := hex.DecodeString(storageKey)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("decode storage DEK hex: %w", err)
+	}
+	accountKey, err := deriveACMEAccountKey(masterSeed)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("derive ACME account key: %w", err)
 	}
 	tlsKeyPKCS8, err := kms.Decrypt(ctx, snapshot.tlsKeyCiphertext)
 	if err != nil {
@@ -390,26 +417,20 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to parse TLS key: %w", err)
 	}
-	tlsKey, ok := tlsKeyAny.(crypto.Signer)
-	if !ok {
-		return bootResult{}, fmt.Errorf("TLS key of type %T cannot sign", tlsKeyAny)
+	tlsKey, ok := tlsKeyAny.(*ecdsa.PrivateKey)
+	if !ok || tlsKey.Curve != elliptic.P256() {
+		return bootResult{}, fmt.Errorf("TLS key must be an ECDSA P-256 private key")
 	}
 
-	secrets := make([]StaticSecret, 0, len(state.metadata))
-	for _, meta := range state.metadata {
-		ciphertext, ok := snapshot.staticSecrets[meta]
-		if !ok {
-			return bootResult{}, fmt.Errorf("snapshot missing static secret %s", meta.Name)
-		}
-		plaintext, err := kms.Decrypt(ctx, ciphertext)
+	staticSecrets := make([]StaticSecret, 0, len(state.secretsMetadata.Static))
+	for _, meta := range state.secretsMetadata.Static {
+		plaintext, err := deriveSecret(masterSeed, meta.Name)
 		if err != nil {
-			return bootResult{}, fmt.Errorf(
-				"failed to decrypt static secret %s: %w", meta.Name, err,
-			)
+			return bootResult{}, fmt.Errorf("derive static secret %s: %w", meta.Name, err)
 		}
-		secrets = append(secrets, StaticSecret{
+		staticSecrets = append(staticSecrets, StaticSecret{
 			StaticSecretMetadata: meta,
-			Plaintext:            hex.EncodeToString(plaintext),
+			Plaintext:            plaintext,
 		})
 	}
 
@@ -420,9 +441,11 @@ func (b *Boot) establish(
 	}
 	return bootResult{
 		kms:                       kms,
-		dek:                       &dek{key: dekPlaintext},
-		secrets:                   secrets,
+		dek:                       &dek{key: storageKeyBytes},
+		secrets:                   Secrets{Static: staticSecrets},
 		tlsKey:                    tlsKey,
+		masterSeed:                masterSeed,
+		acmeAccountKey:            accountKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 		lineage:                   snapshot.lineage(),
 	}, nil
@@ -430,17 +453,9 @@ func (b *Boot) establish(
 
 // loadSnapshotArtifacts fills in the ciphertexts a non-genesis boot inherits.
 func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyID string) error {
-	secrets := make(map[StaticSecretMetadata]string, len(state.metadata))
-	for _, secret := range state.metadata {
-		ciphertext, err := b.ssm.MustGet(ctx, b.cfg.secretCiphertextParam(secret.Name, keyID))
-		if err != nil {
-			return fmt.Errorf("required static secret SSM param missing: %w", err)
-		}
-		secrets[secret] = ciphertext
-	}
-	dekCiphertext, err := b.ssm.MustGet(ctx, b.cfg.storageDEKCiphertextParam(keyID))
+	masterSeedCiphertext, err := b.ssm.MustGet(ctx, b.cfg.masterSeedCiphertextParam(keyID))
 	if err != nil {
-		return fmt.Errorf("required DEK SSM param missing: %w", err)
+		return fmt.Errorf("required master seed SSM param missing: %w", err)
 	}
 	tlsKeyCiphertext, err := b.ssm.MustGet(ctx, b.cfg.tlsKeyCiphertextParam(keyID))
 	if err != nil {
@@ -449,8 +464,7 @@ func (b *Boot) loadSnapshotArtifacts(ctx context.Context, state *bootState, keyI
 	state.snapshot.kmsKeyID = keyID
 	state.snapshot.predecessorPCR0 = state.predecessorPCR0
 	state.snapshot.predecessorKMSKeyID = state.predecessorKMSKeyID
-	state.snapshot.staticSecrets = secrets
-	state.snapshot.storageDEK = dekCiphertext
+	state.snapshot.masterSeedCiphertext = masterSeedCiphertext
 	state.snapshot.tlsKeyCiphertext = tlsKeyCiphertext
 	return nil
 }
@@ -467,7 +481,10 @@ func (b *Boot) loadPredecessor(
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
 	}
-	attestation, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0))
+	attestation, err = b.ssm.MayGet(
+		ctx,
+		b.cfg.migrationPreviousPCR0AttestationParam(ownPCR0),
+	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get predecessor attestation SSM param: %w", err)
 	}
@@ -572,36 +589,19 @@ func (b *Boot) awaitGenesisLease(
 func (b *genesisBoot) buildSnapshot(
 	ctx context.Context, state *bootState, kms PrimaryKMS, ssm SSM,
 ) (bootSnapshot, error) {
-	dekData, err := kms.GenerateDataKey(ctx)
+	seedData, err := kms.GenerateDataKey(ctx)
 	if err != nil {
-		return bootSnapshot{}, fmt.Errorf("generate DEK: %w", err)
+		return bootSnapshot{}, fmt.Errorf("generate master seed: %w", err)
 	}
-	dekCiphertext := base64.StdEncoding.EncodeToString(dekData.Ciphertext)
+	masterSeedCiphertext := base64.StdEncoding.EncodeToString(seedData.Ciphertext)
 	if err := ssm.Set(
 		ctx,
-		state.cfg.storageDEKCiphertextParam(kms.KeyID()),
-		dekCiphertext,
+		state.cfg.masterSeedCiphertextParam(kms.KeyID()),
+		masterSeedCiphertext,
 	); err != nil {
-		return bootSnapshot{}, fmt.Errorf("failed to store DEK: %w", err)
+		return bootSnapshot{}, fmt.Errorf("failed to store master seed: %w", err)
 	}
 
-	persistedSecrets := make(map[StaticSecretMetadata]string, len(state.metadata))
-	for _, secret := range state.metadata {
-		data, err := kms.GenerateDataKey(ctx)
-		if err != nil {
-			return bootSnapshot{}, fmt.Errorf(
-				"failed to generate static secret %s: %w", secret.Name, err,
-			)
-		}
-		ciphertext := base64.StdEncoding.EncodeToString(data.Ciphertext)
-		param := state.cfg.secretCiphertextParam(secret.Name, kms.KeyID())
-		if err := ssm.Set(ctx, param, ciphertext); err != nil {
-			return bootSnapshot{}, fmt.Errorf(
-				"failed to store static secret %s: %w", secret.Name, err,
-			)
-		}
-		persistedSecrets[secret] = ciphertext
-	}
 	tlsKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return bootSnapshot{}, fmt.Errorf("generate TLS key: %w", err)
@@ -623,8 +623,7 @@ func (b *genesisBoot) buildSnapshot(
 	return bootSnapshot{
 		kmsKeyID:                  kms.KeyID(),
 		ownerPCR0:                 state.snapshot.ownerPCR0,
-		staticSecrets:             persistedSecrets,
-		storageDEK:                dekCiphertext,
+		masterSeedCiphertext:      masterSeedCiphertext,
 		tlsKeyCiphertext:          tlsKeyCiphertext,
 		migrationIntentBucketName: state.snapshot.migrationIntentBucketName,
 	}, nil
@@ -811,20 +810,6 @@ func predecessorExpectedPCRs(state *bootState) map[uint]string {
 	}
 }
 
-func validateStaticSecretNames(metadata []StaticSecretMetadata) error {
-	seen := make(map[string]bool, len(metadata))
-	for _, secret := range metadata {
-		if secret.Name == "StorageDEK" {
-			return fmt.Errorf("static secret %q collides with storage DEK", secret.Name)
-		}
-		if seen[secret.Name] {
-			return fmt.Errorf("duplicate static secret %q", secret.Name)
-		}
-		seen[secret.Name] = true
-	}
-	return nil
-}
-
 // WriteTransitionReceipt is called by the predecessor during a handoff; PCR31
 // must already commit to the successor PCR0.
 func WriteTransitionReceipt(
@@ -862,7 +847,7 @@ func stateRoot(cfg *Config, snapshot bootSnapshot) ([]byte, error) {
 		return nil, fmt.Errorf("failed to build canonical CBOR encoder: %v", err)
 	}
 
-	artifacts := make([]ssmArtifactV1, 0, len(snapshot.staticSecrets)+6)
+	artifacts := make([]ssmArtifactV1, 0, 6)
 	artifacts = append(artifacts, ssmArtifactV1{
 		Name: cfg.kmsKeyIDParam(snapshot.ownerPCR0), Value: snapshot.kmsKeyID,
 	})
@@ -877,30 +862,12 @@ func stateRoot(cfg *Config, snapshot bootSnapshot) ([]byte, error) {
 		Value: snapshot.predecessorKMSKeyID,
 	})
 
-	// The root must be deterministic; map order is not.
-	metas := slices.SortedFunc(maps.Keys(snapshot.staticSecrets),
-		func(a, b StaticSecretMetadata) int { return strings.Compare(a.Name, b.Name) })
-
-	for _, metadata := range metas {
-		param := cfg.secretCiphertextParam(metadata.Name, snapshot.kmsKeyID)
-		h, err := sha256OfB64(snapshot.staticSecrets[metadata])
-		if err != nil {
-			return nil, fmt.Errorf(
-				"failed sha256 hash of ciphertext %s: %w", param, err,
-			)
-		}
-		artifacts = append(artifacts, ssmArtifactV1{Name: param, ValueSHA256: h})
-	}
-
-	dekParam := cfg.storageDEKCiphertextParam(snapshot.kmsKeyID)
-	dekHash, err := sha256OfB64(snapshot.storageDEK)
+	seedParam := cfg.masterSeedCiphertextParam(snapshot.kmsKeyID)
+	seedHash, err := sha256OfB64(snapshot.masterSeedCiphertext)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"failed sha256 hash of DEK %s: %w", dekParam, err,
-		)
+		return nil, fmt.Errorf("failed sha256 hash of master seed %s: %w", seedParam, err)
 	}
-
-	artifacts = append(artifacts, ssmArtifactV1{Name: dekParam, ValueSHA256: dekHash})
+	artifacts = append(artifacts, ssmArtifactV1{Name: seedParam, ValueSHA256: seedHash})
 
 	tlsKeyParam := cfg.tlsKeyCiphertextParam(snapshot.kmsKeyID)
 	tlsKeyHash, err := sha256OfB64(snapshot.tlsKeyCiphertext)

@@ -35,22 +35,51 @@ func (s *ssmTTLCache) Set(ctx context.Context, key, val string, opts ...SSMSetOp
 	return nil
 }
 
-func (s *ssmTTLCache) MustGet(ctx context.Context, key string) (string, error) {
+func (s *ssmTTLCache) MustGet(
+	ctx context.Context,
+	key string,
+	opts ...SSMGetOption,
+) (string, error) {
+	so := &SSMGetOptions{}
+
+	for _, opt := range opts {
+		opt(so)
+	}
+
+	if so.withDecryption {
+		return s.ssm.MustGet(ctx, key, opts...)
+	}
+
 	if val, ok := s.get(key); ok {
 		return val, nil
 	}
-	val, err := s.ssm.MustGet(ctx, key)
+	val, err := s.ssm.MustGet(ctx, key, opts...)
 	if err == nil {
 		s.set(key, val)
 	}
 	return val, err
 }
 
-func (s *ssmTTLCache) MayGet(ctx context.Context, key string) (string, error) {
+func (s *ssmTTLCache) MayGet(
+	ctx context.Context,
+	key string,
+	opts ...SSMGetOption,
+) (string, error) {
+	so := &SSMGetOptions{}
+
+	for _, opt := range opts {
+		opt(so)
+	}
+
+	if so.withDecryption {
+		return s.ssm.MayGet(ctx, key, opts...)
+	}
+
 	if val, ok := s.get(key); ok {
 		return val, nil
 	}
-	val, err := s.ssm.MayGet(ctx, key)
+
+	val, err := s.ssm.MayGet(ctx, key, opts...)
 	if err == nil && val != "" {
 		s.set(key, val)
 	}

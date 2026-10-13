@@ -49,7 +49,7 @@ func startTelemetry(ctx context.Context) (*telemetry, error) {
 	// the runtime reads, and pinning a semconv version here would only add churn.
 	res := resource.NewWithAttributes("",
 		attribute.String("service.name", envOrDefault("ENCLAVE_APP_NAME", "testapp")),
-		attribute.String("deployment.environment", envOrDefault("ENCLAVE_DEPLOYMENT", "dev")),
+		attribute.String("deployment.environment", envOrDefault("ENCLAVE_NAMESPACE", "dev")),
 	)
 
 	t := &telemetry{}

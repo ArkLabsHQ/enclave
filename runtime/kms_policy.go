@@ -14,8 +14,9 @@ const kmsPolicyVersion = "2012-10-17"
 var (
 	attestedActions   = []string{"kms:Decrypt", "kms:GenerateDataKey"}
 	operationsActions = []string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}
-	deletionActions   = []string{"kms:ScheduleKeyDeletion"}
-	recoveryActions   = []string{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"}
+	// Cancelling leaves a key Disabled, so EnableKey makes a deletion reversible.
+	deletionActions = []string{"kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion", "kms:EnableKey"}
+	recoveryActions = []string{"kms:PutKeyPolicy", "kms:GetKeyPolicy", "kms:DescribeKey"}
 )
 
 // KMSPolicy gates Decrypt and GenerateDataKey on one PCR0, with optional root recovery.

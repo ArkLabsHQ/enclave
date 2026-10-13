@@ -38,7 +38,7 @@ type migrationControlMigrator struct {
 }
 
 func (m *migrationControlMigrator) RunPredecessorHandoff(
-	context.Context, PrimaryKMS, DEK, []StaticSecret, crypto.Signer,
+	context.Context, PrimaryKMS, []byte, crypto.Signer,
 ) {
 }
 
@@ -490,6 +490,40 @@ func assertCORSHeaders(t *testing.T, h http.Header) {
 	}
 }
 
+// The forwarders are reachable only on the internal listener. The external mux
+// sends the same paths to the application, which the test below pins.
+func TestInternalMuxRoutesOTLPToTheForwarders(t *testing.T) {
+	up := newFakeOTLPEndpoints(t)
+	appURL, err := url.Parse("http://127.0.0.1:1")
+	require.NoError(t, err)
+	s := SetupHttpServers(
+		newRuntimeState(),
+		Config{AppWebSrv: appURL},
+		&nsmW{},
+		NewTelemetry(testCfg, testAWS(t, newFakeCloudWatchLogs(), up.URL)),
+		&AttestationHashes{},
+		"token",
+	).(*servers)
+
+	for _, path := range []string{"/v1/logs", "/v1/traces", "/v1/metrics"} {
+		post := func(authorization string) int {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
+			req.Header.Set("Content-Type", "application/json")
+			if authorization != "" {
+				req.Header.Set("Authorization", authorization)
+			}
+			rr := httptest.NewRecorder()
+			s.int.Handler.ServeHTTP(rr, req)
+			return rr.Code
+		}
+
+		require.Equal(t, http.StatusUnauthorized, post(""), "%s needs the runtime token", path)
+		require.Empty(t, up.callsTo(path))
+		require.Equal(t, http.StatusOK, post("Bearer token"), path)
+		require.Len(t, up.callsTo(path), 1, "%s must reach its AWS endpoint", path)
+	}
+}
+
 func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	var proxied []string
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -559,14 +593,12 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 			{http.MethodGet, "/enclave/v1/info", http.StatusOK},
 			// A ready request still requires a nonce.
 			{http.MethodGet, "/enclave/attestation", http.StatusBadRequest},
-			// Telemetry is ingest-only: it ships to CloudWatch and is never read
-			// back, so a compromised enclave has no history to serve.
-			{http.MethodGet, "/enclave/v1/metrics", http.StatusMethodNotAllowed},
-			{http.MethodGet, "/enclave/v1/logs", http.StatusMethodNotAllowed},
-			{http.MethodGet, "/enclave/v1/traces", http.StatusMethodNotAllowed},
-			{http.MethodPost, "/enclave/v1/metrics", http.StatusUnauthorized},
-			{http.MethodPost, "/enclave/v1/logs", http.StatusUnauthorized},
-			{http.MethodPost, "/enclave/v1/traces", http.StatusUnauthorized},
+			{http.MethodGet, "/enclave/v1/metrics", http.StatusNotFound},
+			{http.MethodGet, "/enclave/v1/logs", http.StatusNotFound},
+			{http.MethodGet, "/enclave/v1/traces", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/metrics", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/logs", http.StatusNotFound},
+			{http.MethodPost, "/enclave/v1/traces", http.StatusNotFound},
 		} {
 			rr := httptest.NewRecorder()
 			s.em.ServeHTTP(rr, httptest.NewRequest(route.method, route.path, nil))
@@ -831,4 +863,19 @@ func TestSignedEnclaveInfo(t *testing.T) {
 	require.NoError(t, err)
 	msg = signingContext.responseMessage(sha256.Sum256(nil), rr.Code)
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
+}
+
+func TestReportBootFailure(t *testing.T) {
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
+	s.ReportBootFailure(errors.New("permission preflight: role is missing SSMParams"))
+
+	rr := httptest.NewRecorder()
+	s.rm.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/enclave/v1/info", nil))
+
+	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	var info RuntimeInfo
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &info))
+	require.Equal(t, runtimeStatusFailed, info.Status)
+	require.Equal(t, "permission preflight: role is missing SSMParams", info.Error)
+	require.Equal(t, Version, info.Version)
 }

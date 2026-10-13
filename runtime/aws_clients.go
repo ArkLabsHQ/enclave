@@ -1,7 +1,11 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,9 +13,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -129,13 +135,17 @@ type STSAPI interface {
 	) (*sts.GetCallerIdentityOutput, error)
 }
 
+// IAMAPI is the subset of *iam.Client used by the runtime.
+type IAMAPI interface {
+	SimulatePrincipalPolicy(
+		ctx context.Context,
+		params *iam.SimulatePrincipalPolicyInput,
+		optFns ...func(*iam.Options),
+	) (*iam.SimulatePrincipalPolicyOutput, error)
+}
+
 // CloudWatchLogsAPI is the subset of *cloudwatchlogs.Client used by the runtime.
 type CloudWatchLogsAPI interface {
-	PutLogEvents(
-		ctx context.Context,
-		params *cloudwatchlogs.PutLogEventsInput,
-		optFns ...func(*cloudwatchlogs.Options),
-	) (*cloudwatchlogs.PutLogEventsOutput, error)
 	CreateLogGroup(
 		ctx context.Context,
 		params *cloudwatchlogs.CreateLogGroupInput,
@@ -159,8 +169,12 @@ type AWSClient struct {
 	SSM     SSMAPI
 	S3      S3API
 	STS     STSAPI
+	IAM     IAMAPI
 	CWL     CloudWatchLogsAPI
 	Route53 Route53API
+
+	// OTLP signs for the AWS OTLP endpoints, which no SDK client speaks.
+	OTLP *OTLPEndpoints
 
 	InstanceID string
 }
@@ -191,8 +205,10 @@ func NewAWSClient(ctx context.Context, cfg Config) (*AWSClient, error) {
 		SSM:     newSSMClient(cfg, awsCfg),
 		S3:      newS3Client(cfg, awsCfg),
 		STS:     newSTSClient(cfg, awsCfg),
+		IAM:     newIAMClient(cfg, awsCfg),
 		CWL:     newCloudWatchLogsClient(cfg, awsCfg),
 		Route53: newRoute53Client(cfg, awsCfg),
+		OTLP:    newOTLPEndpoints(cfg, awsCfg),
 
 		InstanceID: instanceID,
 	}, nil
@@ -226,6 +242,14 @@ func newSTSClient(cfg Config, awsCfg aws.Config) *sts.Client {
 	return sts.NewFromConfig(awsCfg, func(o *sts.Options) {
 		if cfg.STSEndpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.STSEndpoint)
+		}
+	})
+}
+
+func newIAMClient(cfg Config, awsCfg aws.Config) *iam.Client {
+	return iam.NewFromConfig(awsCfg, func(o *iam.Options) {
+		if cfg.IAMEndpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.IAMEndpoint)
 		}
 	})
 }
@@ -272,4 +296,92 @@ func resolveInstanceID(ctx context.Context, client imdsMetadataAPI) (string, err
 		return "", fmt.Errorf("IMDS returned an empty instance-id")
 	}
 	return id, nil
+}
+
+type otlpClient struct {
+	base   string
+	client *http.Client
+}
+
+// OTLPEndpoints contains a signing client for each AWS OTLP service.
+type OTLPEndpoints struct {
+	Logs    otlpClient
+	Traces  otlpClient
+	Metrics otlpClient
+}
+
+func newOTLPEndpoints(cfg Config, awsCfg aws.Config) *OTLPEndpoints {
+	signer := v4.NewSigner()
+	return &OTLPEndpoints{
+		Logs:    newOTLPClient(awsCfg, signer, "logs", cfg.CloudWatchEndpoint),
+		Traces:  newOTLPClient(awsCfg, signer, "xray", cfg.XRayEndpoint),
+		Metrics: newOTLPClient(awsCfg, signer, "monitoring", cfg.MonitoringEndpoint),
+	}
+}
+
+func newOTLPClient(cfg aws.Config, signer *v4.Signer, service, override string) otlpClient {
+	base := fmt.Sprintf("https://%s.%s.amazonaws.com", service, cfg.Region)
+	if override != "" {
+		base = strings.TrimRight(override, "/")
+	}
+
+	// AWS OTLP endpoints require HTTP/1.1.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+
+	return otlpClient{
+		base: base,
+		client: &http.Client{
+			Timeout: otlpHTTPTimeout,
+			Transport: &sigv4Transport{
+				creds:   cfg.Credentials,
+				region:  cfg.Region,
+				service: service,
+				signer:  signer,
+				next:    transport,
+			},
+		},
+	}
+}
+
+// sigv4Transport signs requests without modifying the caller's request.
+type sigv4Transport struct {
+	creds   aws.CredentialsProvider
+	region  string
+	service string
+	signer  *v4.Signer
+	next    http.RoundTripper
+}
+
+func (t *sigv4Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("sigv4: read body: %w", err)
+		}
+	}
+	creds, err := t.creds.Retrieve(req.Context())
+	if err != nil {
+		return nil, fmt.Errorf("sigv4: credentials: %w", err)
+	}
+
+	signed := req.Clone(req.Context())
+	signed.Body = io.NopCloser(bytes.NewReader(body))
+	signed.ContentLength = int64(len(body))
+	signed.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	sum := sha256.Sum256(body)
+	if err := t.signer.SignHTTP(
+		req.Context(), creds, signed, hex.EncodeToString(sum[:]),
+		t.service, t.region, time.Now(),
+	); err != nil {
+		return nil, fmt.Errorf("sigv4: sign %s request: %w", t.service, err)
+	}
+	return t.next.RoundTrip(signed)
 }

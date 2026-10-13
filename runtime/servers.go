@@ -59,11 +59,14 @@ type RuntimeInfo struct {
 	UpstreamApp              UpstreamAppInfo  `json:"upstream_app"`
 	KMSKeyLocked             bool             `json:"kms_key_locked"`
 	Ancestry                 *AncestryInfo    `json:"ancestry,omitempty"`
+	// Error says why boot stopped, when Status is failed.
+	Error string `json:"error,omitempty"`
 }
 
 type Servers interface {
 	Start(ctx context.Context, cfg Config) error
 	ConfigureEnclaveInfoHandler(migrator Migrator) error
+	ReportBootFailure(err error)
 	SetAncestry(ctx context.Context, ancestry Ancestry)
 }
 
@@ -87,8 +90,7 @@ func SetupHttpServers(
 	hashes *AttestationHashes,
 	authToken string,
 ) Servers {
-	metrics := telemetry.Metrics
-	metricsMW := metricsMiddleware(metrics)
+	metricsMW := metricsMiddleware(telemetry)
 
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -98,11 +100,11 @@ func SetupHttpServers(
 	revProxy.Transport = upstreamTransport(cfg.UpstreamProtocol)
 	revProxy.FlushInterval = -1
 	revProxy.ModifyResponse = func(*http.Response) error {
-		metrics.Inc(metricAppProxiedRequests)
+		telemetry.Inc(metricAppProxiedRequests)
 		return nil
 	}
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		metrics.Inc(metricAppProxiedErrors)
+		telemetry.Inc(metricAppProxiedErrors)
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
@@ -110,9 +112,8 @@ func SetupHttpServers(
 	registerRuntimeV1Handlers(sm, "/v1/", telemetry, authToken)
 	sm.Handle("GET /health", healthHandler(rt))
 
+	// OTLP forwarding stays on loopback because requests use instance credentials.
 	rm := http.NewServeMux()
-	registerRuntimeV1Handlers(rm, externalRuntimeV1Prefix, telemetry, authToken)
-
 	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, hashes)))
 
 	em := http.NewServeMux()
@@ -189,9 +190,6 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// registerRuntimeV1Handlers mounts the OTLP ingest endpoints under prefix. Ingest
-// only: the runtime ships telemetry to CloudWatch and never reads it back, so a
-// compromised enclave has no history to serve.
 func registerRuntimeV1Handlers(
 	mux *http.ServeMux,
 	prefix string,
@@ -200,15 +198,15 @@ func registerRuntimeV1Handlers(
 ) {
 	mux.HandleFunc(
 		"POST "+prefix+"metrics",
-		withTokenAuth(authToken, HandleMetricPost(telemetry.Metrics)),
+		withTokenAuth(authToken, telemetry.forwardHandler(otlpMetrics)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"logs",
-		withTokenAuth(authToken, HandleLogsPost(telemetry.Logging)),
+		withTokenAuth(authToken, telemetry.forwardHandler(otlpLogs)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"traces",
-		withTokenAuth(authToken, HandleTracingPost(telemetry.Tracing)),
+		withTokenAuth(authToken, telemetry.forwardHandler(otlpTraces)),
 	)
 }
 
@@ -271,6 +269,21 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 	return nil
 }
 
+// ReportBootFailure exposes startup errors before telemetry is available.
+func (s *servers) ReportBootFailure(err error) {
+	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(RuntimeInfo{
+			Version:                  Version,
+			Status:                   runtimeStatusFailed,
+			MigrationCooldownSeconds: int(s.cfg.MigrationCooldown.Seconds()),
+			KMSKeyLocked:             s.cfg.KMSLocked,
+			Error:                    err.Error(),
+		})
+	})
+}
+
 // migrationHTTPStatus maps the errors /enclave/v1/info can surface. Migration
 // itself has no HTTP surface; only reading its status does.
 func migrationHTTPStatus(err error) int {
@@ -282,7 +295,7 @@ func migrationHTTPStatus(err error) int {
 	}
 }
 
-func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
+func metricsMiddleware(telemetry *Telemetry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
@@ -295,9 +308,9 @@ func metricsMiddleware(metrics *Metrics) func(http.Handler) http.Handler {
 				"status", sw.status,
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
-			metrics.Inc(metricHTTPRequests)
+			telemetry.Inc(metricHTTPRequests)
 			if sw.status >= 400 {
-				metrics.Inc(metricHTTPErrors)
+				telemetry.Inc(metricHTTPErrors)
 			}
 		})
 	}

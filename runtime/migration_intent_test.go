@@ -309,6 +309,52 @@ func TestMigrationIntentPrefersTheRetainedVersion(t *testing.T) {
 		"the earliest version must be picked from those actually retained")
 }
 
+func TestMigrationIntentIgnoresMultipartVersions(t *testing.T) {
+	for name, parts := range map[string]*int32{
+		"one part":      aws.Int32(1),
+		"several parts": aws.Int32(2),
+		"zero count":    aws.Int32(0),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, latest := range []bool{false, true} {
+				name := "genuine version is latest"
+				if latest {
+					name = "replay is latest"
+				}
+				t.Run(name, func(t *testing.T) {
+					fx := newMigrationIntentFixture(t)
+					ctx := context.Background()
+					key := migrationIntentObjectKey(fx.source, 1)
+					body := fx.object(t, 1, migrationIntentRequested, strings.Repeat("cd", 48),
+						migrationIntentTestBucket, fx.pcr0)
+					published := time.Now().UTC()
+					// The host initiates the upload before the legitimate intent exists,
+					// then replays its body and attestation to backdate publication.
+					fx.s3.putRawObjectAt(key, body, published.Add(-48*time.Hour))
+					fx.s3.objects[key][0].partsCount = parts
+
+					head, err := fx.log.Head(ctx, fx.source)
+					require.NoError(t, err)
+					require.Nil(t, head, "a multipart version alone must not authorize migration")
+
+					fx.s3.putRawObjectAt(key, body, published)
+					genuineID := fx.s3.objects[key][1].id
+					if latest {
+						versions := fx.s3.objects[key]
+						versions[0], versions[1] = versions[1], versions[0]
+					}
+					head, err = fx.log.Head(ctx, fx.source)
+					require.NoError(t, err)
+					require.NotNil(t, head)
+					require.Equal(t, published, head.PublishedAt,
+						"the replay must not advance the start of the cooldown")
+					require.Equal(t, genuineID, head.VersionID)
+				})
+			}
+		})
+	}
+}
+
 func TestMigrationIntentCanonicalHead(t *testing.T) {
 	targetA := strings.Repeat("cd", 48)
 	targetB := strings.Repeat("ef", 48)
@@ -710,8 +756,8 @@ var _ S3API = (*migrationIntentPagedS3)(nil)
 
 func TestMigrationIntentBucketNameDerivation(t *testing.T) {
 	const account = "123456789012"
-	nameFor := func(deployment, app string) string {
-		return migrationIntentBucketName(newTestConfig(deployment, app, false), account)
+	nameFor := func(namespace, app string) string {
+		return migrationIntentBucketName(newTestConfig(namespace, app, false), account)
 	}
 	name := nameFor("prod", "wallet")
 
@@ -725,7 +771,8 @@ func TestMigrationIntentBucketNameDerivation(t *testing.T) {
 	))
 
 	require.NotEqual(t, name, nameFor("prod", "vault"), "distinct per application")
-	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per deployment")
+	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per namespace")
+	require.NotEqual(t, name, nameFor("ark/prod", "wallet"), "distinct per namespace prefix")
 
 	// The NUL separator is what stops "prodwal"+"let" colliding with
 	// "prod"+"wallet".

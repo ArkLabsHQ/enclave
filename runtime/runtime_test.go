@@ -97,7 +97,7 @@ func TestAppEnv(t *testing.T) {
 
 			params := make(map[string]string)
 			for key, value := range tc.overrides {
-				params["/prod/app/env/"+key] = value
+				params["/prod/app/enclave/env/"+key] = value
 			}
 			require.NoError(t, cfg.ApplySSMOverlay(t.Context(), NewSSM(&fakeSSM{params: params})))
 			overrides := maps.Clone(cfg.ChildEnv)

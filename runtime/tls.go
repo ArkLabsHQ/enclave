@@ -62,7 +62,7 @@ func ConfigureTLS(
 	dek DEK,
 	ssm SSM,
 	r53 Route53API,
-	tlsKey crypto.Signer,
+	tlsKey, accountKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	if !cfg.UseACME {
@@ -81,7 +81,7 @@ func ConfigureTLS(
 				"and needs a Route53 hosted zone", cfg.route53ZoneIDParam(),
 		)
 	}
-	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, hashes)
+	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, accountKey, hashes)
 }
 
 func configureDNS01Cert(
@@ -92,7 +92,7 @@ func configureDNS01Cert(
 	ssm SSM,
 	r53 Route53API,
 	zoneID string,
-	tlsKey crypto.Signer,
+	tlsKey, accountKey crypto.Signer,
 	hashes *AttestationHashes,
 ) (TLSCertCallback, error) {
 	certBucket, err := ssm.MustGet(ctx, cfg.certBucketParam())
@@ -106,9 +106,8 @@ func configureDNS01Cert(
 
 	store := newCertStore(cfg, s3, dek, tlsKey, certBucket, cfg.FQDN)
 
-	accountKey, err := store.LoadOrCreateAccountKey(ctx)
-	if err != nil {
-		return nil, err
+	if accountKey == nil {
+		return nil, fmt.Errorf("ACME account key is required")
 	}
 	client, err := acmeClientForDirectory(cfg.ACMEDirectory, cfg.ACMECA)
 	if err != nil {

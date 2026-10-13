@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -118,62 +115,8 @@ func (c *certStore) SaveCert(
 	return bundle, nil
 }
 
-// LoadOrCreateAccountKey returns ACME account key
-func (c *certStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, error) {
-	pemBytes, err := c.loadAccountKey(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if pemBytes != nil {
-		return parseECKey(pemBytes)
-	}
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate ACME account key: %w", err)
-	}
-	encoded, err := encodeECKey(key)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := c.saveAccountKey(ctx, encoded); err != nil {
-		if !errors.Is(err, errCertChanged) {
-			return nil, fmt.Errorf("store ACME account key: %w", err)
-		}
-		// A peer created the account between our load and our write. Theirs is
-		// the fleet's key; discard the one we just generated.
-		pemBytes, err = c.loadAccountKey(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if pemBytes == nil {
-			return nil, errors.New("ACME account key: create lost the race but no key is stored")
-		}
-		return parseECKey(pemBytes)
-	}
-	return key, nil
-}
-
 func (c *certStore) certObjectKey() string {
 	return objectKeyFor(c.cfg, c.prefix, c.fqdn+"/cert")
-}
-
-func (c *certStore) accountObjectKey() string {
-	return objectKeyFor(c.cfg, acmeStoragePrefix, "account.key")
-}
-
-// loadAccountKey returns the fleet-shared ACME account key, or nil if unset.
-func (c *certStore) loadAccountKey(ctx context.Context) ([]byte, error) {
-	raw, _, err := c.get(ctx, c.accountObjectKey())
-	return raw, err
-}
-
-// saveAccountKey stores the account key create-only, returning errCertChanged if
-// a peer stored one first.
-func (c *certStore) saveAccountKey(ctx context.Context, keyPEM []byte) error {
-	_, err := c.putConditional(ctx, c.accountObjectKey(), keyPEM, "")
-	return err
 }
 
 func (c *certStore) get(ctx context.Context, key string) ([]byte, string, error) {

@@ -4,7 +4,6 @@ package runtime
 import (
 	"context"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -256,22 +255,6 @@ func (i *acmeIssuer) waitInSync(ctx context.Context, changeID string) error {
 	}
 }
 
-func parseECKey(pemBytes []byte) (crypto.Signer, error) {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, errors.New("ACME account key is not PEM")
-	}
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse ACME account key: %w", err)
-	}
-	signer, ok := key.(crypto.Signer)
-	if !ok {
-		return nil, fmt.Errorf("ACME account key of type %T cannot sign", key)
-	}
-	return signer, nil
-}
-
 func dns01Challenge(authz *acme.Authorization) *acme.Challenge {
 	for _, chal := range authz.Challenges {
 		if chal.Type == "dns-01" {
@@ -287,14 +270,6 @@ func encodeCertChain(chain [][]byte) []byte {
 		out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 	}
 	return out
-}
-
-func encodeECKey(key *ecdsa.PrivateKey) ([]byte, error) {
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("marshal private key: %w", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
 // quoteTXTValue wraps a TXT value in the double quotes Route53 requires.

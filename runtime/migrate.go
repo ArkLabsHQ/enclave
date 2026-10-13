@@ -70,7 +70,7 @@ const (
 
 type Migrator interface {
 	RunPredecessorHandoff(
-		ctx context.Context, kms PrimaryKMS, dek DEK, secrets []StaticSecret, tlsKey crypto.Signer,
+		ctx context.Context, kms PrimaryKMS, masterSeed []byte, tlsKey crypto.Signer,
 	)
 	AwaitCandidateHandoff(ctx context.Context) error
 
@@ -81,17 +81,16 @@ type Migrator interface {
 }
 
 type migrator struct {
-	cfg           *Config
-	nsm           NSM
-	pcr0          string // hex; read from the NSM once, in newMigrator
-	kms           PrimaryKMS
-	ssm           SSM
-	dek           DEK
-	staticSecrets []StaticSecret
-	tlsKey        crypto.Signer
-	intent        *migrationIntentLog
-	genesis       *genesisLog
-	bucket        string
+	cfg        *Config
+	nsm        NSM
+	pcr0       string // hex; read from the NSM once, in newMigrator
+	kms        PrimaryKMS
+	ssm        SSM
+	masterSeed []byte
+	tlsKey     crypto.Signer
+	intent     *migrationIntentLog
+	genesis    *genesisLog
+	bucket     string
 
 	answeredChallenge string
 	s3                S3API
@@ -223,9 +222,9 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 //
 
 func (m *migrator) RunPredecessorHandoff(
-	ctx context.Context, kms PrimaryKMS, dek DEK, secrets []StaticSecret, tlsKey crypto.Signer,
+	ctx context.Context, kms PrimaryKMS, masterSeed []byte, tlsKey crypto.Signer,
 ) {
-	m.kms, m.dek, m.staticSecrets, m.tlsKey = kms, dek, secrets, tlsKey
+	m.kms, m.masterSeed, m.tlsKey = kms, masterSeed, tlsKey
 
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
@@ -621,28 +620,16 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		"new_pcr0", prefix16(targetPCR0),
 	)
 
-	transitionSecrets := make(map[StaticSecretMetadata]string, len(m.staticSecrets))
-	for _, secret := range m.staticSecrets {
-		secretBytes, err := hex.DecodeString(secret.Plaintext)
-		if err != nil {
-			return fmt.Errorf("failed to decode secret %s hex: %w", secret.Name, err)
-		}
-
-		ciphertextB64, err := migrationKMS.Encrypt(ctx, secretBytes)
-		if err != nil {
-			return fmt.Errorf("failed to re-encrypt secret %s: %w", secret.Name, err)
-		}
-
-		ciphertextParam := m.cfg.secretCiphertextParam(secret.Name, migrationKMS.KeyID())
-		if err := m.ssm.Set(ctx, ciphertextParam, ciphertextB64); err != nil {
-			return fmt.Errorf("failed to store re-encrypted secret %s: %w", secret.Name, err)
-		}
-		transitionSecrets[secret.StaticSecretMetadata] = ciphertextB64
-	}
-
-	dekCiphertext, err := m.dek.ExportKey(ctx, m.cfg, migrationKMS, m.ssm)
+	seedCiphertext, err := migrationKMS.Encrypt(ctx, m.masterSeed)
 	if err != nil {
-		return fmt.Errorf("DEK export failed: %w", err)
+		return fmt.Errorf("failed to re-encrypt master seed: %w", err)
+	}
+	if err := m.ssm.Set(
+		ctx,
+		m.cfg.masterSeedCiphertextParam(migrationKMS.KeyID()),
+		seedCiphertext,
+	); err != nil {
+		return fmt.Errorf("failed to store master seed: %w", err)
 	}
 	tlsKey, err := x509.MarshalPKCS8PrivateKey(m.tlsKey)
 	if err != nil {
@@ -699,8 +686,7 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 			ownerPCR0:                 targetPCR0,
 			predecessorPCR0:           m.pcr0,
 			predecessorKMSKeyID:       m.kms.KeyID(),
-			staticSecrets:             transitionSecrets,
-			storageDEK:                dekCiphertext,
+			masterSeedCiphertext:      seedCiphertext,
 			tlsKeyCiphertext:          tlsKeyCiphertext,
 			migrationIntentBucketName: m.intent.bucket,
 		},
@@ -737,7 +723,6 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		"committed successor KMSKeyID",
 		"key_id", migrationKMS.KeyID(),
 		"target_pcr0", prefix16(targetPCR0),
-		"exported", len(transitionSecrets),
 	)
 	return nil
 }

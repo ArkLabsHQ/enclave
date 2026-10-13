@@ -805,14 +805,15 @@ Verification detects tampering when the response arrives; it does not prevent
 an altered request from executing. Response headers are not authenticated.
 Unsigned requests do not use this signature format.
 
-The key is derived from the storage DEK and the current PCR0 read from NSM with
-HKDF-SHA256. The salt is `enclave-response-signing`; the context is
-`enclave-response-signing-v2`, a zero byte, then the raw 48-byte PCR0. The
-32-byte output is the Ed25519 seed. Replicas and restarts of the same image
-share the key, while a migration to another PCR0 changes it without storing
-additional state. A predecessor's response cannot verify against the successor's
-attested signing key. This separates responses by measured image; a holder of
-the shared DEK can still derive keys for other PCR0 values.
+Boot derives the key from the deployment's master seed and the current PCR0
+read from NSM using HKDF-SHA256 with salt `enclave.derived-secret.v1`. The
+context is `runtime/ResponseSigningKey`, a zero byte, and the raw 48-byte PCR0,
+encoded together as one CBOR text string. The first 32-byte block is the
+Ed25519 seed. Replicas and restarts of the same image share the key, while a
+migration to another PCR0 changes it without storing additional state. A
+predecessor's response cannot verify against the successor's attested signing
+key. This separates responses by measured image; a holder of
+the shared master seed can still derive keys for other PCR0 values.
 
 Requests without the header are proxied unchanged and stream as before.
 Signed request and response bodies are buffered whole before the signature is

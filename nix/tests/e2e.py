@@ -2,6 +2,7 @@
 # default.nix also prepends helpers.py.
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
+import base64
 from datetime import datetime, timedelta, timezone
 
 CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
@@ -53,6 +54,20 @@ def enclave_curl(node, pcr0, path="/health", signed=False):
         f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify "
         f"{'--signed ' if signed else ''}2>&1"
     )
+
+
+def health_signature(node):
+    # A fixed request and response make Ed25519 signatures comparable across
+    # replicas, restarts, and migration, without decoding attestation CBOR.
+    body, status, signature = node.succeed(
+        "curl -skf --http1.1 https://127.0.0.1/test/health "
+        "-H 'X-Enclave-Sign-Nonce: key-lifecycle' "
+        "-w '\\n%{http_code}\\n%header{x-enclave-signature}'"
+    ).strip().rsplit("\n", 2)
+    assert status == "200", status
+    assert json.loads(body) == {"status": "ok"}, body
+    assert len(base64.b64decode(signature, validate=True)) == 64, signature
+    return signature
 
 
 def kms_key_count():
@@ -223,6 +238,8 @@ for node in BLUES:
     )
 blue_secret = secret_value(blue)
 assert secret_value(blue_peer) == blue_secret
+blue_signature = health_signature(blue)
+assert health_signature(blue_peer) == blue_signature
 blue_second_secret = env_value(blue, "E2E_SECOND_KEY")
 assert env_value(blue_peer, "E2E_SECOND_KEY") == blue_second_secret
 assert REPLACEMENT_SECRET != blue_second_secret
@@ -253,6 +270,8 @@ for node in BLUES:
     status, out = enclave_curl(node, BLUE_PCR0)
     assert status == 0, out
     assert "WARNING" in out, out
+    status, out = enclave_curl(node, BLUE_PCR0, "/test/health", signed=True)
+    assert status == 0, out
 
 # Verify the CloudWatch Logs destinations.
 log_groups = cloud(
@@ -770,6 +789,8 @@ cloud(
 assert env_value(green, "E2E_SECOND_KEY") == ""
 
 # Snapshot the established fleet state before a same-EIF peer joins.
+green_signature = health_signature(green)
+assert green_signature != blue_signature, "migration must change the signing key"
 leaf_sha_before = served_leaf_sha(green)
 leaf_serial_before = leaf_serial
 cert_etag_before = cert_etag()
@@ -818,8 +839,8 @@ assert challenge_record_count(route53_zone_id) == 0
 for node in GREENS:
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
     assert status == 0, out
-    # The signing key derives from the migrated DEK and GREEN_PCR0, so green
-    # replicas share the attested key while blue has a different signing key.
+    # The migrated master seed and current PCR0 determine the signing key.
+    assert health_signature(node) == green_signature
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health", signed=True)
     assert status == 0, out
     status, out = enclave_curl(node, GREEN_PCR0, "/enclave/v1/info", signed=True)
@@ -856,6 +877,7 @@ assert status == 0, out
 
 green.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(green)
+assert health_signature(green) == green_signature
 assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
@@ -871,7 +893,7 @@ assert kms_key_count() == kms_keys_before
 assert cert_etag() == cert_etag_before
 assert challenge_event_count() == challenge_events_before
 assert challenge_record_count(route53_zone_id) == 0
-status, out = enclave_curl(green, GREEN_PCR0, "/test/health")
+status, out = enclave_curl(green, GREEN_PCR0, "/test/health", signed=True)
 assert status == 0, out
 
 # Green and green_peer were checked immediately above. Recheck that their
@@ -891,6 +913,7 @@ for node in BLUES:
 blue.succeed("kill $(cat /run/enclave-qemu.pid)")
 blue.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(blue)
+assert health_signature(blue) == blue_signature
 assert secret_value(blue) == blue_secret
 assert env_value(blue, "E2E_SECOND_KEY") == blue_second_secret
 assert env_value(blue, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET

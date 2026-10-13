@@ -21,13 +21,12 @@ import (
 const migrationIntentTestBucket = "migration-intent-test"
 
 type migrationIntentFixture struct {
-	log     *migrationIntentLog
-	genesis *genesisLog
-	s3      *fakeS3
-	nsm     *nsmW
-	pcr0    []byte
-	source  string
-	signer  *testAttestationSigner
+	log    *migrationIntentLog
+	s3     *fakeS3
+	nsm    *nsmW
+	pcr0   []byte
+	source string
+	signer *testAttestationSigner
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
@@ -47,16 +46,13 @@ func newMigrationIntentFixtureWithConfig(
 	s3f := newFakeS3()
 	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
-	genesis, err := newGenesisLog(cfg, s3f, nsm, migrationIntentTestBucket)
-	require.NoError(t, err)
 	return &migrationIntentFixture{
-		log:     log,
-		genesis: genesis,
-		s3:      s3f,
-		nsm:     nsm,
-		pcr0:    pcr0,
-		source:  strings.Repeat("ab", 48),
-		signer:  session.attestationSign,
+		log:    log,
+		s3:     s3f,
+		nsm:    nsm,
+		pcr0:   pcr0,
+		source: strings.Repeat("ab", 48),
+		signer: session.attestationSign,
 	}
 }
 
@@ -809,7 +805,8 @@ func TestMigrationIntentRetentionBoundary(t *testing.T) {
 						ObjectLockRetainUntilDate: tc.deadline,
 					}
 					require.Equal(t, tc.want,
-						log.compliesWithObjectLock("key", "version", published, out))
+						compliesWithObjectLock("migration intent", "key", "version", published, out,
+							retention, log.writeTimeout()))
 				})
 			}
 		})

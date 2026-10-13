@@ -80,6 +80,43 @@ def get_param(name):
     return out.strip() if status == 0 else ""
 
 
+def snapshot_key(pcr0):
+    return f"snapshot/{pcr0.lower()}"
+
+
+def snapshot_versions(pcr0):
+    """Every version of a generation's snapshot object, oldest first."""
+    out = json.loads(
+        cloud(
+            f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+            f"--prefix {snapshot_key(pcr0)} --output json"
+        )
+    )
+    versions = [v for v in out.get("Versions", []) if v["Key"] == snapshot_key(pcr0)]
+    return [v["VersionId"] for v in sorted(versions, key=lambda v: v["LastModified"])]
+
+
+def runtime_ssm_params():
+    """Names of SSM parameters under the runtime root that no operator wrote."""
+    out = json.loads(
+        cloud(
+            "ssm get-parameters-by-path --path /ark/e2e/dev/testapp/enclave "
+            "--recursive --query 'Parameters[].Name' --output json"
+        )
+    )
+    operator = ("/CertBucketName", "/LeaseBucketName", "/Route53ZoneID", "/env/", "/inherit/")
+    return sorted(n for n in out if not any(marker in n for marker in operator))
+
+
+def console_field(node, needle, field):
+    """A field of the last JSON console line containing needle."""
+    line = node.succeed(
+        "tr -d '\\000' </var/log/enclave-console.log | tr '\\r' '\\n' "
+        f"| grep -F {shlex.quote(needle)} | tail -n 1"
+    ).strip()
+    return json.loads(line[line.index("{"):])[field]
+
+
 def print_enclave_diagnostics(node):
     print(
         node.execute(

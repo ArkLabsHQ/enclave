@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -75,6 +76,9 @@ type Migrator interface {
 	AwaitCandidateHandoff(ctx context.Context) error
 
 	PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error)
+
+	SetSnapshot(snapshot Snapshot)
+
 	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
 	CandidateInfo(ctx context.Context) (*CandidateInfo, error)
 	MigrationIntentBucket() string
@@ -89,8 +93,9 @@ type migrator struct {
 	masterSeed []byte
 	tlsKey     crypto.Signer
 	intent     *migrationIntentLog
-	genesis    *genesisLog
 	bucket     string
+
+	snapshot atomic.Pointer[Snapshot]
 
 	answeredChallenge string
 	s3                S3API
@@ -129,37 +134,30 @@ func newMigrator(
 	if err != nil {
 		return nil, err
 	}
-	genesis, err := newGenesisLog(cfg, s3, nsm, migrationIntentBucketName)
-	if err != nil {
-		return nil, err
-	}
 	return &migrator{
-		cfg:     cfg,
-		nsm:     nsm,
-		pcr0:    hex.EncodeToString(pcr0),
-		ssm:     ssm,
-		intent:  intent,
-		genesis: genesis,
-		s3:      s3,
-		bucket:  migrationIntentBucketName,
+		cfg:    cfg,
+		nsm:    nsm,
+		pcr0:   hex.EncodeToString(pcr0),
+		ssm:    ssm,
+		intent: intent,
+		s3:     s3,
+		bucket: migrationIntentBucketName,
 	}, nil
 }
 
-func (m *migrator) PreviousPCR0Info(ctx context.Context) (*PreviousPCR0Info, error) {
-	pcr0, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0Param(m.pcr0))
-	if err != nil {
-		return nil, err
-	}
+func (m *migrator) SetSnapshot(snapshot Snapshot) {
+	m.snapshot.Store(&snapshot)
+}
 
-	if pcr0 == "" {
-		pcr0 = "genesis"
+func (m *migrator) PreviousPCR0Info(context.Context) (*PreviousPCR0Info, error) {
+	snapshot := m.snapshot.Load()
+	if snapshot == nil || snapshot.predecessorPCR0 == "" {
+		return &PreviousPCR0Info{PCR0: genesisPreviousPCR0}, nil
 	}
-
-	attest, err := m.ssm.MayGet(ctx, m.cfg.migrationPreviousPCR0AttestationParam(m.pcr0))
-	if err != nil {
-		return nil, err
-	}
-	return &PreviousPCR0Info{PCR0: pcr0, Attestation: attest}, nil
+	return &PreviousPCR0Info{
+		PCR0:        snapshot.predecessorPCR0,
+		Attestation: snapshot.transitionReceipt,
+	}, nil
 }
 
 func (m *migrator) CandidateInfo(ctx context.Context) (*CandidateInfo, error) {
@@ -218,7 +216,7 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 //	  read answers       <--------------  publish attestation
 //	  verify, record intent
 //	  ... cooldown ...
-//	  commit KMSKeyID/<target>  ------->  promote
+//	  commit KMSKeyID/<target>  ------->  adopt, publish snapshot/<target>
 //
 
 func (m *migrator) RunPredecessorHandoff(
@@ -243,26 +241,26 @@ func (m *migrator) RunPredecessorHandoff(
 }
 
 // AwaitCandidateHandoff waits for the predecessor's atomic commit. It returns
-// immediately for an existing generation or a fresh deployment.
+// immediately for a genesis image or a generation whose state is published.
 func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
+	if m.cfg.genesisImage() {
+		return nil
+	}
+	// Published generations no longer need the SSM handoff.
+	snapshot, err := readSnapshot(ctx, m.cfg, m.s3, m.nsm, m.bucket, m.pcr0)
+	if err != nil {
+		return fmt.Errorf("failed to read snapshot: %w", err)
+	}
+	if snapshot != nil {
+		return nil
+	}
+
 	kmsIdParam := m.cfg.kmsKeyIDParam(m.pcr0)
 	keyID, err := m.ssm.MayGet(ctx, kmsIdParam)
 	if err != nil {
 		return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
 	}
 	if keyID != "" {
-		return nil
-	}
-
-	artifact, err := m.genesis.Genesis(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to read deployment genesis: %w", err)
-	}
-	if artifact == nil {
-		return nil
-	}
-
-	if artifact.PCR0 == m.pcr0 {
 		return nil
 	}
 
@@ -316,7 +314,6 @@ func (m *migrator) verifyIntent(
 	return nil
 }
 
-// advanceMigration advances the predecessor state machine once.
 func (m *migrator) advanceMigration(ctx context.Context) error {
 	lease, err := m.tryAcquireMigrationLease(ctx)
 	if err != nil {
@@ -530,7 +527,8 @@ func (m *migrator) verifyChallengeResponses(
 	return "", nil
 }
 
-// mayAbortMigration records a matching abort before the handoff commits.
+// mayAbortMigration records a matching abort, even after the handoff commits, so
+// an inadequate target can always be abandoned.
 func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bool, error) {
 	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
 	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
@@ -541,15 +539,6 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 		return false, nil
 	}
 
-	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
-	if err != nil {
-		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
-	}
-	if targetKmsID != "" {
-		slog.Warn("ignoring migration abort: the handoff has already committed",
-			"target_pcr0", prefix16(targetPCR0))
-		return false, nil
-	}
 	if _, err := m.intent.Abort(ctx, m.pcr0); err != nil {
 		return false, err
 	}
@@ -557,7 +546,6 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bo
 	return true, nil
 }
 
-// eligibleHandOff returns an eligible intent.
 func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error) {
 	status, err := m.MigrationStatus(ctx)
 	if err != nil {
@@ -647,23 +635,6 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		return fmt.Errorf("failed to store TLS key: %w", err)
 	}
 
-	attestDoc, _, err := m.nsm.BuildAttestationDocument()
-	if err != nil {
-		return fmt.Errorf("failed to generate attestation document: %w", err)
-	}
-
-	if err := m.ssm.Set(
-		ctx,
-		m.cfg.migrationPreviousPCR0AttestationParam(targetPCR0),
-		base64.StdEncoding.EncodeToString(attestDoc),
-		WithAdvancedTier(),
-	); err != nil {
-		return fmt.Errorf(
-			"failed to set SSM param %s: %w",
-			m.cfg.migrationPreviousPCR0AttestationParam(targetPCR0), err,
-		)
-	}
-
 	if err := m.ssm.Set(ctx, m.cfg.migrationPreviousPCR0Param(targetPCR0), m.pcr0); err != nil {
 		return fmt.Errorf(
 			"failed to set SSM param %s: %w", m.cfg.migrationPreviousPCR0Param(targetPCR0), err,
@@ -681,7 +652,7 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 		m.cfg,
 		m.nsm,
 		m.ssm,
-		bootSnapshot{
+		Snapshot{
 			kmsKeyID:                  migrationKMS.KeyID(),
 			ownerPCR0:                 targetPCR0,
 			predecessorPCR0:           m.pcr0,

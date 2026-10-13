@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"maps"
 	"math"
 	"slices"
@@ -296,27 +295,6 @@ func (l *migrationIntentLog) writeTimeout() time.Duration {
 	return l.cfg.IntentWriteTimeout
 }
 
-func (l *migrationIntentLog) compliesWithObjectLock(
-	key, versionID string, publishedAt time.Time, out *s3.GetObjectOutput,
-) bool {
-	if out.ObjectLockMode != s3types.ObjectLockModeCompliance {
-		slog.Warn("ignoring migration intent that is not retained under compliance mode",
-			"key", key, "version", versionID, "mode", string(out.ObjectLockMode))
-		return false
-	}
-
-	retainUntil := aws.ToTime(out.ObjectLockRetainUntilDate)
-	minimum := l.retention - l.writeTimeout()
-	minimumDeadline := publishedAt.Add(minimum)
-	if retainUntil.IsZero() || retainUntil.Before(minimumDeadline) {
-		slog.Warn("ignoring migration intent retained for less than the configured period",
-			"key", key, "version", versionID,
-			"retained_for", retainUntil.Sub(publishedAt), "minimum", minimum)
-		return false
-	}
-	return true
-}
-
 // readIntent returns one version if it is a well-formed, non-multipart record at
 // the expected sequence, retained under the Object Lock the runtime writes.
 // It does not verify the attestation.
@@ -327,40 +305,12 @@ func (l *migrationIntentLog) readIntent(
 	publishedAt time.Time,
 ) (migrationIntentObjectV1, bool, error) {
 	var entry migrationIntentObjectV1
-	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket:     aws.String(l.bucket),
-		Key:        aws.String(key),
-		VersionId:  aws.String(versionID),
-		PartNumber: aws.Int32(1), // Exposes res.PartsCount if object was a multipart upload
-	})
-	if err != nil {
-		return entry, false, fmt.Errorf(
-			"%w: get migration intent %q version %q: %w",
-			errMigrationIntentStoreUnavailable,
-			key,
-			versionID,
-			err,
-		)
-	}
-	defer func() { _ = out.Body.Close() }()
-	// Multipart LastModified dates from upload initiation, so a host could
-	// replay an intent into an old upload to bypass the migration cooldown.
-	if out.PartsCount != nil {
-		slog.Warn("ignoring multipart migration intent", "key", key, "version", versionID)
-		return entry, false, nil
-	}
-	if !l.compliesWithObjectLock(key, versionID, publishedAt, out) {
-		return entry, false, nil
-	}
-	body, err := io.ReadAll(out.Body)
-	if err != nil {
-		return entry, false, fmt.Errorf(
-			"%w: read migration intent %q version %q: %w",
-			errMigrationIntentStoreUnavailable,
-			key,
-			versionID,
-			err,
-		)
+	body, ok, err := readLockedVersion(
+		ctx, l.s3, l.bucket, key, versionID, publishedAt,
+		l.retention, l.writeTimeout(), errMigrationIntentStoreUnavailable, "migration intent",
+	)
+	if err != nil || !ok {
+		return entry, false, err
 	}
 	entry, err = decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||

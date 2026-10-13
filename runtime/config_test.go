@@ -21,7 +21,7 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
 		KMSLocked:          true,
 		VerifyClockSource:  true,
-		GenesisRetention:   prodRetention,
+		SnapshotRetention:  prodRetention,
 		IntentRetention:    prodRetention,
 		IntentWriteTimeout: prodIntentWriteTimeout,
 		MigrationCooldown:  defaultMigrationCooldown,
@@ -30,7 +30,7 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 	}
 	if dev {
 		c.KMSLocked = false
-		c.GenesisRetention = devGenesisRetention
+		c.SnapshotRetention = devSnapshotRetention
 		c.IntentRetention = devIntentRetention
 		c.IntentWriteTimeout = devIntentWriteTimeout
 		c.ClockSyncInterval = devClockSyncInterval
@@ -62,6 +62,7 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envNamespace, "prod")
 	t.Setenv(envAppName, "app")
 	t.Setenv(envAppPort, "7074")
+	t.Setenv(envPreviousPCR0, genesisPreviousPCR0)
 	t.Setenv(envDev, strconv.FormatBool(dev))
 	t.Setenv(envMigrationCooldown, "")
 	t.Setenv(envVerifyClockSource, "")
@@ -76,13 +77,13 @@ func TestLoadConfigSecurityDefaults(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
 		dev                bool
-		genesisRetention   time.Duration
+		snapshotRetention  time.Duration
 		intentRetention    time.Duration
 		intentWriteTimeout time.Duration
 		clockSyncInterval  time.Duration
 	}{
 		{"prod", false, prodRetention, prodRetention, prodIntentWriteTimeout, prodClockSyncInterval},
-		{"dev", true, devGenesisRetention, devIntentRetention, devIntentWriteTimeout, devClockSyncInterval},
+		{"dev", true, devSnapshotRetention, devIntentRetention, devIntentWriteTimeout, devClockSyncInterval},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setConfigTestEnv(t, tc.dev)
@@ -97,7 +98,7 @@ func TestLoadConfigSecurityDefaults(t *testing.T) {
 			)
 			require.True(t, cfg.VerifyClockSource)
 			require.Equal(t, 24*time.Hour, cfg.MigrationCooldown)
-			require.Equal(t, tc.genesisRetention, cfg.GenesisRetention)
+			require.Equal(t, tc.snapshotRetention, cfg.SnapshotRetention)
 			require.Equal(t, tc.intentRetention, cfg.IntentRetention)
 			require.Equal(t, tc.intentWriteTimeout, cfg.IntentWriteTimeout)
 			require.Equal(t, tc.clockSyncInterval, cfg.ClockSyncInterval)
@@ -111,6 +112,7 @@ func TestConfigValidate(t *testing.T) {
 	valid := func() *Config {
 		c := newTestConfig("prod", "myapp", false)
 		c.ExtPort, c.IntPort, c.HostProxyPort, c.FQDN = extPort, intPort, hostProxyPort, "localhost"
+		c.PreviousPCR0 = genesisPreviousPCR0
 		return c
 	}
 
@@ -120,6 +122,21 @@ func TestConfigValidate(t *testing.T) {
 		wantErr string
 	}{
 		{name: "all set", mutate: func(*Config) {}},
+		{
+			name:   "successor naming its predecessor",
+			mutate: func(c *Config) { c.PreviousPCR0 = strings.Repeat("AB", 48) },
+		},
+		{
+			// A forgotten setting must not be read as a genesis image.
+			name:    "previous PCR0 missing",
+			mutate:  func(c *Config) { c.PreviousPCR0 = "" },
+			wantErr: "ENCLAVE_PREVIOUS_PCR0 must be",
+		},
+		{
+			name:    "previous PCR0 malformed",
+			mutate:  func(c *Config) { c.PreviousPCR0 = "Genesis" },
+			wantErr: "ENCLAVE_PREVIOUS_PCR0 must be",
+		},
 		{
 			name:    "namespace missing",
 			mutate:  func(c *Config) { c.Namespace = "" },
@@ -322,10 +339,8 @@ func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
 	}
 	unscoped := func(c *Config) []string {
 		return []string{
-			c.stateOriginReceiptParam(keyID, pcr0),
 			c.migrationStateOriginReceiptParam(keyID, pcr0),
 			c.migrationPreviousPCR0Param(pcr0),
-			c.migrationPreviousPCR0AttestationParam(pcr0),
 		}
 	}
 

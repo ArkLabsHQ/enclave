@@ -67,7 +67,7 @@ const (
 	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
 	prodClockSyncInterval = 5 * time.Minute
 
-	devGenesisRetention   = 5 * time.Minute
+	devSnapshotRetention  = 5 * time.Minute
 	devIntentRetention    = 10 * time.Minute
 	devIntentWriteTimeout = 2 * time.Minute
 	devClockSyncInterval  = 5 * time.Second
@@ -157,7 +157,7 @@ type Config struct {
 	KMSLocked             bool
 	InsecureVerifySkipped bool
 	VerifyClockSource     bool
-	GenesisRetention      time.Duration
+	SnapshotRetention     time.Duration // Object Lock on snapshot/<pcr0>, not the intent's
 	IntentRetention       time.Duration
 	IntentWriteTimeout    time.Duration
 	MigrationCooldown     time.Duration
@@ -214,7 +214,7 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
-		GenesisRetention:      prodRetention,
+		SnapshotRetention:     prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
 		MigrationCooldown:     defaultMigrationCooldown,
@@ -228,7 +228,7 @@ func LoadConfig() (*Config, error) {
 
 	if takeEnv(envDev) == "true" {
 		cfg.KMSLocked = false
-		cfg.GenesisRetention = devGenesisRetention
+		cfg.SnapshotRetention = devSnapshotRetention
 		cfg.IntentRetention = devIntentRetention
 		cfg.IntentWriteTimeout = devIntentWriteTimeout
 		cfg.ClockSyncInterval = devClockSyncInterval
@@ -301,6 +301,12 @@ func (c *Config) Validate() error {
 	if strings.HasPrefix(first, "aws") || strings.HasPrefix(first, "ssm") {
 		return fmt.Errorf(
 			"namespace %q: SSM reserves parameter names starting with \"aws\" or \"ssm\"", ns,
+		)
+	}
+	if !c.genesisImage() && !isCanonicalPCR0(strings.ToLower(c.PreviousPCR0)) {
+		return fmt.Errorf(
+			"ENCLAVE_PREVIOUS_PCR0 must be %q or the predecessor's PCR0, got %q",
+			genesisPreviousPCR0, c.PreviousPCR0,
 		)
 	}
 	if c.AppPort == "" {
@@ -406,6 +412,12 @@ func (c *Config) String() string {
 	return string(b)
 }
 
+// genesisImage reports whether this image starts a deployment. It is measured,
+// so no runtime state can turn a successor into a genesis.
+func (c *Config) genesisImage() bool {
+	return c.PreviousPCR0 == genesisPreviousPCR0
+}
+
 func (c *Config) lockSegment() string {
 	if c.KMSLocked {
 		return "locked"
@@ -460,14 +472,6 @@ func (c *Config) tlsKeyCiphertextParam(keyID string) string {
 	return fmt.Sprintf("%s/%s/TLSKey/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
 }
 
-// stateOriginReceiptParam: SSM path for the receipt an enclave writes over its
-// own state at genesis (and after adopting a migration). Scoped by key ID and PCR0.
-func (c *Config) stateOriginReceiptParam(keyID, pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/StateOriginReceipt/%s/%s", c.namespace(), keyID, strings.ToLower(pcr0),
-	)
-}
-
 // migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
 // writes over a successor's state during a migration handoff. Scoped by the
 // successor key ID and the successor PCR0, and written create-only, so a
@@ -489,14 +493,6 @@ func (c *Config) migrationPreviousPCR0Param(pcr0 string) string {
 // migrationPreviousKMSKeyIDParam returns the predecessor key path for a generation.
 func (c *Config) migrationPreviousKMSKeyIDParam(pcr0 string) string {
 	return fmt.Sprintf("%s/MigrationPreviousKMSKeyID/%s", c.namespace(), strings.ToLower(pcr0))
-}
-
-// migrationPreviousPCR0AttestationParam: SSM path for the predecessor enclave's
-// attestation document, scoped by the successor PCR0 that reads it.
-func (c *Config) migrationPreviousPCR0AttestationParam(pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/MigrationPreviousPCR0Attestation/%s", c.namespace(), strings.ToLower(pcr0),
-	)
 }
 
 // migrationChallengeParam: the live challenge published by a predecessor.

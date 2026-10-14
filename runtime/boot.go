@@ -223,9 +223,13 @@ func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, 
 	if err != nil {
 		return bootState{}, fmt.Errorf("failed to decrypt master seed: %w", err)
 	}
-	storageKey, err := deriveKeyBytes(masterSeed, storageDEKDerivationName, 32)
+	storageKey, err := deriveSecret(masterSeed, storageDEKDerivationName)
 	if err != nil {
 		return bootState{}, fmt.Errorf("derive storage DEK: %w", err)
+	}
+	storageKeyBytes, err := hex.DecodeString(storageKey)
+	if err != nil {
+		return bootState{}, fmt.Errorf("decode storage DEK hex: %w", err)
 	}
 	accountKey, err := deriveACMEAccountKey(masterSeed)
 	if err != nil {
@@ -262,7 +266,7 @@ func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, 
 	}
 	return bootState{
 		kms:                       kms,
-		dek:                       &dek{key: storageKey},
+		dek:                       &dek{key: storageKeyBytes},
 		secrets:                   Secrets{Static: staticSecrets},
 		tlsKey:                    tlsKey,
 		masterSeed:                masterSeed,

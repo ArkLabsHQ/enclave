@@ -45,12 +45,13 @@ def console_owners(nodes, needle):
     return [n.name for n in nodes if console_has(n, needle)]
 
 
-def enclave_curl(node, pcr0, path="/health"):
+def enclave_curl(node, pcr0, tls_key_hash, path="/health"):
     # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
     # 39-byte TLS binding, and live certificate pinning remain checked.
     return node.execute(
         f"enclave curl {path} --base-url https://127.0.0.1 "
-        f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify 2>&1"
+        f"--expected-pcr0 {pcr0} --expected-tls-key-hash {tls_key_hash} "
+        "--insecure-skip-cose-verify 2>&1"
     )
 
 
@@ -234,8 +235,7 @@ for node in BLUES:
     leaf_san = served_leaf(node, "-noout -ext subjectAltName")
     assert f"DNS:{FQDN}" in leaf_san, leaf_san
 
-# The fleet shares one self-signed certificate: a client that pinned the leaf
-# from either enclave must reach the other.
+# The fleet shares one self-signed certificate and TLS public key.
 blue_leaf_sha = served_leaf_sha(blue)
 assert served_leaf_sha(blue_peer) == blue_leaf_sha
 tls_public_key = served_leaf(blue, "-noout -pubkey")
@@ -248,10 +248,49 @@ cache_keys = cloud(
     "--query 'Contents[].Key' --output text"
 )
 assert cache_keys == SELF_SIGNED_KEY, cache_keys
+
+# Enroll once through the packaged CLI and retain its stdout across independent
+# invocations, replicas, successor PCR0s, certificate changes, and restarts.
+verification_flags = f"--base-url https://127.0.0.1 --expected-pcr0 {BLUE_PCR0}"
+blue.succeed(
+    f"enclave attest {verification_flags} --insecure-skip-cose-verify "
+    "> /tmp/deployment-tls-key.sha256 2> /tmp/enclave-attest.err"
+)
+fingerprint_output = blue.succeed("cat /tmp/deployment-tls-key.sha256")
+assert len(fingerprint_output) == 65 and fingerprint_output.endswith("\n"), fingerprint_output
+tls_key_hash = fingerprint_output[:-1]
+assert all(c in "0123456789abcdef" for c in tls_key_hash), tls_key_hash
+assert tls_key_hash != "00" * 32
+blue.succeed("grep -q 'WARNING: skipping attestation COSE signature' /tmp/enclave-attest.err")
+
 for node in BLUES:
-    status, out = enclave_curl(node, BLUE_PCR0)
+    assert node.succeed(
+        f"enclave attest {verification_flags} --insecure-skip-cose-verify "
+        f"--expected-tls-key-hash {tls_key_hash.upper()} 2> /tmp/enclave-attest.err"
+    ) == fingerprint_output
+    status, out = enclave_curl(node, BLUE_PCR0, tls_key_hash, "/test/health")
     assert status == 0, out
     assert "WARNING" in out, out
+
+# Both commands fail without emitting a fingerprint or application response.
+wrong_tls_key_hash = f"{int(tls_key_hash, 16) ^ 1:064x}"
+for command in ("attest", "curl /test/env/E2E_SIGNING_KEY"):
+    for flags, error in (
+        (f"--expected-tls-key-hash {wrong_tls_key_hash}", "TLS public-key fingerprint mismatch"),
+        ("--expected-tls-key-hash bad", "64 hex characters"),
+        (f"--expected-tls-key-hash {'00' * 32}", "64 hex characters"),
+        (f"--expected-pcr0 {GREEN_PCR0}", "PCR0 mismatch"),
+        ("--strict-tls", "certificate"),
+        ("--insecure-skip-cose-verify=false", "attestation verification:"),
+    ):
+        status, _ = blue.execute(
+            f"enclave {command} {verification_flags} --insecure-skip-cose-verify "
+            f"{flags} > /tmp/enclave-rejected.out 2> /tmp/enclave-rejected.err"
+        )
+        assert status != 0, (command, flags)
+        blue.succeed("test ! -s /tmp/enclave-rejected.out")
+        out = blue.succeed("cat /tmp/enclave-rejected.err")
+        assert error in out, out
 
 # Verify the CloudWatch Logs destinations.
 log_groups = cloud(
@@ -482,11 +521,14 @@ secret_status, _ = green.execute(
     "curl -skf --http1.1 https://127.0.0.1/test/env/E2E_SIGNING_KEY"
 )
 assert secret_status != 0, "a candidate must serve no application request"
-attestation_code = green.succeed(
-    "curl -sk -o /dev/null -w '%{http_code}' --http1.1 "
-    f"'https://127.0.0.1/enclave/attestation?nonce={'ab' * 20}'"
-).strip()
-assert attestation_code == "503", attestation_code
+status, _ = green.execute(
+    f"enclave attest --base-url https://127.0.0.1 --expected-pcr0 {GREEN_PCR0} "
+    "--insecure-skip-cose-verify "
+    "> /tmp/candidate-fingerprint 2> /tmp/candidate-attest.err"
+)
+assert status != 0, "a candidate must not allow CLI enrollment"
+green.succeed("test ! -s /tmp/candidate-fingerprint")
+assert "attestation status 503" in green.succeed("cat /tmp/candidate-attest.err")
 
 # Check transient candidate details before the AWS calls below, while Green
 # is still awaiting the handoff.
@@ -733,7 +775,10 @@ mgmt_sha = aws.succeed(
 ).strip()
 assert mgmt_sha == served_leaf_sha(green)
 
-status, out = enclave_curl(green, GREEN_PCR0)
+# The successor changed both PCR0 and certificate, but the saved public-key pin
+# still authenticates the deployment without enrolling again.
+assert served_leaf_sha(green) != blue_leaf_sha
+status, out = enclave_curl(green, GREEN_PCR0, tls_key_hash)
 assert status == 0, out
 status, _ = aws.execute(
     f"openssl s_client -connect {FQDN}:443 -servername other.example "
@@ -815,7 +860,7 @@ assert challenge_event_count() == challenge_events_before
 assert challenge_record_count(route53_zone_id) == 0
 
 for node in GREENS:
-    status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
+    status, out = enclave_curl(node, GREEN_PCR0, tls_key_hash, "/test/health")
     assert status == 0, out
     for _ in range(5):
         node.succeed(
@@ -844,7 +889,7 @@ assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
 assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
 assert served_leaf_sha(green_peer) == leaf_sha_before
-status, out = enclave_curl(green_peer, GREEN_PCR0, "/test/health")
+status, out = enclave_curl(green_peer, GREEN_PCR0, tls_key_hash, "/test/health")
 assert status == 0, out
 
 green.succeed("systemctl restart enclave-start")
@@ -864,7 +909,7 @@ assert kms_key_count() == kms_keys_before
 assert cert_etag() == cert_etag_before
 assert challenge_event_count() == challenge_events_before
 assert challenge_record_count(route53_zone_id) == 0
-status, out = enclave_curl(green, GREEN_PCR0, "/test/health")
+status, out = enclave_curl(green, GREEN_PCR0, tls_key_hash, "/test/health")
 assert status == 0, out
 
 # Green and green_peer were checked immediately above. Recheck that their
@@ -894,7 +939,7 @@ blue.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.previous_pcr0 == \"genesis\"'"
 )
-status, out = enclave_curl(blue, BLUE_PCR0)
+status, out = enclave_curl(blue, BLUE_PCR0, tls_key_hash)
 assert status == 0, out
 
 for node in (blue, blue_peer, green, green_peer):

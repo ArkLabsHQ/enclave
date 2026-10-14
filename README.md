@@ -89,9 +89,10 @@ nix build .#eif
 cat result/pcr.json          # {"PCR0":"...","PCR1":"...","PCR2":"..."}
 ```
 
-`PCR0` is the identity of the enclave. It is what the KMS key policy is
-conditioned on and what clients pin. It changes whenever the runtime, the
-application, or the baked environment changes.
+`PCR0` is the enclave image measurement. KMS key policies are conditioned on it,
+and clients check it when verifying a bootstrap attestation. It changes whenever
+the runtime, application, or baked environment changes. The retained TLS
+public-key fingerprint identifies the deployment across accepted image changes.
 
 Provide the resulting EIF to a Nitro-capable host that satisfies the
 [deployment requirements](#deployment). Once it is running, verify it from a
@@ -1121,40 +1122,65 @@ and writes a disjoint generation; the abandoned one is orphaned, not reused.
 
 ## Verifying an enclave
 
-An enclave is only meaningful if clients verify it. Both the CLI and the library
-prove, before returning any response body, that they are talking to an enclave
-running the expected measured image.
+An enclave is only meaningful if clients verify it. The CLI and library verify
+the bootstrap enclave's measured image, then authenticate application traffic
+with the deployment's attested TLS public key. PCR0 identifies the bootstrap
+image; the shared TLS key identifies the deployment, including its replicas and
+accepted successors. A pinned application connection proves possession of that
+key, not the individual serving replica's current PCR0.
 
 ### CLI
 
 ```sh
 nix run github:ArkLabsHQ/enclave -- curl <path> \
-  --base-url <url> --expected-pcr0 <hex>
+  --base-url <url> --expected-pcr0 <hex> --expected-tls-key-hash <saved-hex>
 ```
 
 The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
+
+Enroll once with `enclave attest`. It verifies the Nitro attestation, nonce, and
+expected PCR0, then prints only the attested TLS public-key fingerprint and a
+newline to stdout. The fingerprint is the SHA-256 of the key's DER
+SubjectPublicKeyInfo, encoded as 64 hex characters. Save it for subsequent calls:
+
+```sh
+enclave attest \
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  > deployment-tls-key.sha256
+```
+
+`attest` makes no application request. `curl` verifies the attestation and checks
+the live TLS key before sending the application request. Both commands accept
+`--base-url`, `--expected-pcr0`, `--expected-tls-key-hash`, `--strict-tls`, and
+`--insecure-skip-cose-verify`:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--base-url` | required | Enclave base URL. |
 | `--expected-pcr0` | required | Expected PCR0, compared case-insensitively. |
+| `--expected-tls-key-hash` | empty | Expected nonzero TLS public-key SHA-256, as 64 hex characters, compared case-insensitively. Empty trusts the first verified attestation for this invocation. |
 | `-X`, `--method` | `GET` | HTTP method. |
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 39-byte TLS binding, and live certificate pinning are still checked. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning to stderr). PCR0, nonce, the exact 39-byte TLS binding, and any expected fingerprint are still checked; `curl` also checks the live TLS key. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
 # Runtime and migration status.
 enclave curl /enclave/v1/info \
-  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  --expected-tls-key-hash "$(cat deployment-tls-key.sha256)"
 
 # Authenticated POST.
 enclave curl /v1/orders -X POST -d '{"amount":1000}' \
   -H "Authorization: Bearer $TOKEN" \
-  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9 \
+  --expected-tls-key-hash "$(cat deployment-tls-key.sha256)"
 ```
+
+Keep the saved fingerprint when accepting a successor image's PCR0. Enrolling
+again on every invocation would discard the deployment identity check.
 
 The CLI exits non-zero if attestation or TLS pinning fails, and if the HTTP
 status is 400 or above.
@@ -1190,11 +1216,44 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | Option | Default | Effect |
 |---|---|---|
 | `ExpectedPCR0` | required | `New` fails without it. |
+| `ExpectedTLSKeyHash` | empty | Expected nonzero SHA-256 of the TLS public key's DER SubjectPublicKeyInfo, as 64 hex characters, compared case-insensitively. Empty retains the first fully verified fingerprint for the client's lifetime. |
 | `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
-| `InsecureTLS` | unset | Removes the certificate pin entirely. |
+| `InsecureTLS` | unset | Removes HTTP certificate pinning. Incompatible with `ExpectedTLSKeyHash` and `StrictTLS`; HTTPS is still required. |
+
+Persist the verified fingerprint in caller-managed storage and supply it on
+subsequent runs. This also preserves deployment identity when you explicitly
+accept a successor image's PCR0:
+
+```go
+verified, err := c.VerifyAttestation(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+if err := os.WriteFile("deployment-tls-key.sha256", []byte(verified.TLSKeyHash), 0600); err != nil {
+    log.Fatal(err)
+}
+
+// On a subsequent run, use the saved fingerprint with the accepted image.
+savedHash, err := os.ReadFile("deployment-tls-key.sha256")
+if err != nil {
+    log.Fatal(err)
+}
+c, err = client.New("https://enclave.example.com", client.Options{
+    ExpectedPCR0:       acceptedPCR0,
+    ExpectedTLSKeyHash: strings.TrimSpace(string(savedHash)),
+})
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+Omitting the fingerprint establishes trust on first successful verification;
+PCR0 alone does not distinguish deployments of the same image. After enrollment,
+load the saved value before creating a client. Do not replace it by enrolling
+again on every run. The CLI accepts the saved value through `--expected-tls-key-hash`.
 
 What is verified on the first request, and cached for `CacheTTL`:
 
@@ -1203,16 +1262,25 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
+| Attested TLS fingerprint matches the supplied or previously retained fingerprint | always after first use | nothing |
 | `user_data` is exactly `sha256:` plus the raw 32-byte TLS PublicKey SHA-256, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
 
-The certificate pin is installed from the attestation document before any
-request carrying data is made, so a request issued before verification completes
-fails closed.
+All attestation, nonce, PCR, and fingerprint checks complete before the verified
+state and its pin become active together. Failed verification leaves the prior
+state unchanged. Cache refreshes and reconnects cannot replace the retained key;
+certificate renewal with the same public key continues to work.
+
+Base URLs, application requests, and redirects must use HTTPS. HTTP requests and
+downgrade redirects are rejected before application headers or bodies are sent,
+including redirects that replay POST bodies. `PinnedHTTPClient` enforces the
+same HTTPS requirement. Insecure testing options do not permit plaintext HTTP.
 
 `GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
-but does not perform public CA validation. Applications serving gRPC must set
+retaining the deployment fingerprint on reconnects. Caller dial options cannot
+override its pinned credentials. It does not perform public CA validation.
+Applications serving gRPC must set
 `ENCLAVE_UPSTREAM=h2c`.
 
 ## Testing
@@ -1229,6 +1297,11 @@ nix flake check
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
 available.
+
+The E2E suite exercises the packaged CLI: it saves an `enclave attest`
+fingerprint and reuses it with `enclave curl` across replicas, migration,
+certificate changes, and restarts. It also checks that invalid fingerprints,
+wrong PCR0s, and failed verification leave stdout empty and return an error.
 
 ### Requirements
 
@@ -1386,9 +1459,13 @@ forwarders are available only on the loopback listener.
 `ExpectedPCR0`. Without the pin, attestation proves only that some enclave is
 running, not that it is running your code.
 
-**HTTP and gRPC trust the attested TLS channel.** The client verifies the Nitro
-attestation and PCRs before sending application requests, then pins the live TLS
-leaf to the exact hash carried in `user_data`.
+**HTTP and gRPC retain deployment identity.** The client verifies the Nitro
+bootstrap attestation and PCRs before sending application requests, then pins
+the live TLS public key to the fingerprint carried in `user_data`. That key is
+shared across deployment replicas and migrations; it does not independently
+attest each serving replica's image. Persist `AttestationResult.TLSKeyHash` and
+supply `ExpectedTLSKeyHash` to preserve identity across client lifetimes, even
+when accepting a successor PCR0. Application HTTP traffic always requires HTTPS.
 
 **Never manage `KMSKeyID/<pcr0>` with deployment tooling.** Migration finalisation
 rewrites it as its atomic commit, and genesis claims it create-only. A

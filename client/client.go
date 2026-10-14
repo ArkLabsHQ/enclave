@@ -1,14 +1,16 @@
 // Package client provides a verified HTTP client for AWS Nitro Enclaves.
 //
-// Every request first verifies the enclave's attestation document (PCR0 and
-// optional secret PCRs), then pins the live TLS public key to the attested
-// fingerprint. This ensures the expected code terminates the connection.
+// Requests verify the bootstrap enclave's attestation (PCR0 and optional secret
+// PCRs), then authenticate the deployment using its retained TLS public-key
+// fingerprint. The deployment's shared key survives certificate renewal and
+// migration to an accepted successor image. Application traffic requires HTTPS.
 //
 // Usage:
 //
 //	// Option A: Manual configuration.
 //	c, err := client.New("https://1.2.3.4", client.Options{
 //	    ExpectedPCR0: "79f5fb125b00ad80...",
+//	    ExpectedTLSKeyHash: savedTLSKeyHash, // empty only on first use
 //	    ExpectedPCRs: []string{"sha256-of-secret-pubkey"},
 //	})
 //
@@ -23,12 +25,17 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +48,13 @@ type Options struct {
 	// PCR0 from 'enclave build'.
 	ExpectedPCR0 string
 
+	// ExpectedTLSKeyHash is the hex-encoded SHA-256 of the TLS public key's
+	// DER SubjectPublicKeyInfo. Empty trusts the first fully verified attestation.
+	// The fingerprint is retained for this client's lifetime. Persist the value
+	// returned by VerifyAttestation in TLSKeyHash and supply it to future clients,
+	// including when accepting a successor PCR0. Mutually exclusive with InsecureTLS.
+	ExpectedTLSKeyHash string
+
 	// ExpectedPCRs is a list of hex-encoded SHA256 hashes of secret
 	// compressed public keys, in the same order as secrets are defined
 	// in enclave.yaml. Index 0 maps to PCR16, index 1 to PCR17, etc.
@@ -49,7 +63,7 @@ type Options struct {
 	ExpectedPCRs []string
 
 	// CacheTTL controls how long a verified attestation is cached.
-	// Set to 0 to verify on every request. Default: 60s.
+	// Zero defaults to 60s; a negative duration verifies on every request.
 	CacheTTL time.Duration
 
 	// InsecureTLS, when explicitly true, disables TLS cert pinning (raw,
@@ -93,14 +107,6 @@ type Client struct {
 
 	mu          sync.RWMutex
 	cachedState *AttestationResult
-	pinHash     string // attested TLS leaf hash; read by httpClient's pin callback
-}
-
-// setPinHash records the attested fingerprint the main client pins against.
-func (c *Client) setPinHash(h string) {
-	c.mu.Lock()
-	c.pinHash = h
-	c.mu.Unlock()
 }
 
 // currentTLSHash is read by the pin callback each handshake; empty until the
@@ -108,15 +114,27 @@ func (c *Client) setPinHash(h string) {
 func (c *Client) currentTLSHash() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.pinHash
+	if c.cachedState == nil {
+		return ""
+	}
+	return c.cachedState.TLSKeyHash
 }
 
 // New creates a new enclave client that verifies attestation before
 // making requests. The baseURL should be the HTTPS endpoint of the
 // enclave (e.g. "https://1.2.3.4").
 func New(baseURL string, opts Options) (*Client, error) {
+	endpoint, err := url.Parse(baseURL)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" {
+		return nil, fmt.Errorf("base URL must be an absolute HTTPS URL")
+	}
 	if opts.ExpectedPCR0 == "" {
 		return nil, fmt.Errorf("ExpectedPCR0 is required")
+	}
+	if opts.ExpectedTLSKeyHash != "" {
+		if err := validateTLSKeyHash(opts.ExpectedTLSKeyHash); err != nil {
+			return nil, fmt.Errorf("ExpectedTLSKeyHash: %w", err)
+		}
 	}
 
 	if opts.CacheTTL == 0 {
@@ -127,9 +145,13 @@ func New(baseURL string, opts Options) (*Client, error) {
 	}
 
 	insecure := opts.InsecureTLS != nil && *opts.InsecureTLS
+	if insecure && opts.ExpectedTLSKeyHash != "" {
+		return nil, fmt.Errorf("ExpectedTLSKeyHash and InsecureTLS are mutually exclusive")
+	}
+	opts.ExpectedPCRs = slices.Clone(opts.ExpectedPCRs)
 
 	c := &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		baseURL: strings.TrimRight(endpoint.String(), "/"),
 		opts:    opts,
 	}
 
@@ -140,7 +162,10 @@ func New(baseURL string, opts Options) (*Client, error) {
 		InsecureSkipVerify: !opts.StrictTLS,
 		MinVersion:         tls.VersionTLS12,
 	}
-	c.bootstrapClient = &http.Client{Timeout: 30 * time.Second, Transport: bootstrapTransport}
+	c.bootstrapClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpsTransport{bootstrapTransport},
+	}
 
 	// Main client: pins every connection to the attested tlsKeyHash.
 	mainTransport := http.DefaultTransport.(*http.Transport).Clone()
@@ -155,16 +180,17 @@ func New(baseURL string, opts Options) (*Client, error) {
 			MinVersion: tls.VersionTLS12,
 		}
 	}
-	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: mainTransport}
+	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: httpsTransport{mainTransport}}
 
 	return c, nil
 }
 
 // PinnedHTTPClient returns a client that pins the live certificate's PublicKey
-// to tlsKeyHashHex. strict adds public CA and hostname validation.
+// to tlsKeyHashHex and rejects non-HTTPS requests and redirects. strict adds
+// public CA and hostname validation.
 func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
-	if isAllZeroHex(tlsKeyHashHex) {
-		return nil, fmt.Errorf("no TLS public-key fingerprint to pin against")
+	if err := validateTLSKeyHash(tlsKeyHashHex); err != nil {
+		return nil, err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{
@@ -174,7 +200,38 @@ func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
 		},
 		MinVersion: tls.VersionTLS12,
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
+	return &http.Client{Timeout: 30 * time.Second, Transport: httpsTransport{transport}}, nil
+}
+
+func validateTLSKeyHash(hash string) error {
+	decoded, err := hex.DecodeString(hash)
+	if err != nil || len(decoded) != sha256.Size || isAllZeroHex(hash) {
+		return fmt.Errorf(
+			"TLS public-key fingerprint must be a nonzero SHA-256 hash (64 hex characters)",
+		)
+	}
+	return nil
+}
+
+// httpsTransport checks every hop, including redirects, before any data is sent.
+// Embedding the transport preserves CloseIdleConnections.
+type httpsTransport struct{ *http.Transport }
+
+func requireHTTPS(req *http.Request) error {
+	if req == nil || req.URL == nil || req.URL.Scheme != "https" {
+		if req != nil && req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return fmt.Errorf("request URL must use HTTPS")
+	}
+	return nil
+}
+
+func (t httpsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := requireHTTPS(req); err != nil {
+		return nil, err
+	}
+	return t.Transport.RoundTrip(req)
 }
 
 // Get makes a verified GET request to the enclave.
@@ -199,6 +256,9 @@ func (c *Client) Post(ctx context.Context, path string, body io.Reader) (*Respon
 // Do verifies attestation and activates the attested TLS pin before executing
 // the request over the pinned connection.
 func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
+	if err := requireHTTPS(req); err != nil {
+		return nil, err
+	}
 	if _, err := c.ensureVerified(ctx); err != nil {
 		return nil, fmt.Errorf("attestation verification failed: %w", err)
 	}
@@ -222,9 +282,16 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 }
 
 // VerifyAttestation manually triggers attestation verification,
-// bypassing the cache. Returns the attestation result.
+// bypassing the cache. Returns a copy of the attestation result; TLSKeyHash can
+// be persisted and passed as ExpectedTLSKeyHash when creating another client.
 func (c *Client) VerifyAttestation(ctx context.Context) (*AttestationResult, error) {
-	return c.verify(ctx)
+	result, err := c.verify(ctx)
+	if err != nil {
+		return nil, err
+	}
+	copy := *result
+	copy.PCRs = maps.Clone(result.PCRs)
+	return &copy, nil
 }
 
 // ensureVerified returns cached attestation or re-verifies.
@@ -254,12 +321,11 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 		return nil, err
 	}
 
-	// 2. Extract the attested tlsKeyHash and activate the pin before any further request.
+	// 2. Extract the candidate fingerprint without changing active state.
 	tlsKeyHash, err := extractTLSKeyHash(nitResult)
 	if err != nil {
 		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
 	}
-	c.setPinHash(tlsKeyHash)
 
 	// 3. Verify additional PCRs (secret pubkey hashes).
 	pcrs := make(map[uint]string)
@@ -294,8 +360,19 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 	}
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	expected := c.opts.ExpectedTLSKeyHash
+	if c.cachedState != nil {
+		expected = c.cachedState.TLSKeyHash
+	}
+	if expected != "" && !strings.EqualFold(tlsKeyHash, expected) {
+		return nil, fmt.Errorf(
+			"TLS public-key fingerprint mismatch: expected %s, got %s",
+			expected,
+			tlsKeyHash,
+		)
+	}
 	c.cachedState = result
-	c.mu.Unlock()
 
 	return result, nil
 }

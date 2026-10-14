@@ -87,6 +87,22 @@ func (f *migrationIntentFixture) object(
 	return body
 }
 
+// reattest returns body under a fresh attestation, so its bytes differ while
+// the verified intent stays the same.
+func (f *migrationIntentFixture) reattest(t *testing.T, body []byte) []byte {
+	t.Helper()
+	entry, err := decodeMigrationIntentObject(body)
+	require.NoError(t, err)
+	payload := mustMigrationIntentPayload(t, f.log, entry, f.log.bucket)
+	entry.Attestation = f.signer.build(
+		t, map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
+	).docB64
+	out, err := json.Marshal(entry)
+	require.NoError(t, err)
+	require.NotEqual(t, body, out)
+	return out
+}
+
 func TestMigrationIntentJSON(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	entry, err := decodeMigrationIntentObject([]byte(`{
@@ -445,6 +461,58 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 		head, err = fx.log.Request(context.Background(), fx.source, targetB)
 		require.NoError(t, err)
 		require.Equal(t, uint64(3), head.Sequence)
+	})
+
+	t.Run("equivalent versions at the earliest timestamp are one intent", func(t *testing.T) {
+		for name, reattest := range map[string]bool{"identical": false, "reattested": true} {
+			t.Run(name, func(t *testing.T) {
+				fx := newMigrationIntentFixture(t)
+				key := migrationIntentObjectKey(fx.source, 1)
+				publishedAt := time.Now().Add(-time.Hour).UTC()
+				body := fx.object(
+					t, 1, migrationIntentRequested, targetA, migrationIntentTestBucket, fx.pcr0,
+				)
+				duplicate := body
+				if reattest {
+					duplicate = fx.reattest(t, body)
+				}
+				fx.s3.putRawObjectAt(key, body, publishedAt)
+				fx.s3.putRawObjectAt(key, duplicate, publishedAt)
+
+				head, err := fx.log.Head(context.Background(), fx.source)
+				require.NoError(t, err)
+				require.Equal(t, uint64(1), head.Sequence)
+				require.Equal(t, targetA, head.TargetPCR0)
+				require.Equal(t, publishedAt, head.PublishedAt)
+
+				_, err = fx.log.Request(context.Background(), fx.source, targetB)
+				require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+			})
+		}
+	})
+
+	t.Run("a conflict reports its targets whatever the listing order", func(t *testing.T) {
+		for _, order := range [][]string{{targetA, targetB, targetA}, {targetB, targetA, targetB}} {
+			fx := newMigrationIntentFixture(t)
+			publishedAt := time.Now().Add(-time.Hour).UTC()
+			for _, target := range order {
+				fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1),
+					fx.object(t, 1, migrationIntentRequested, target,
+						migrationIntentTestBucket, fx.pcr0),
+					publishedAt)
+			}
+
+			_, err := fx.log.Head(context.Background(), fx.source)
+			require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+			active, _, err := fx.log.scanIntents(context.Background(), fx.source)
+			require.NoError(t, err)
+			require.Len(t, active, 2, "the equivalent copy is not a third intent")
+			require.ElementsMatch(t, []string{targetA, targetB},
+				[]string{active[0].TargetPCR0, active[1].TargetPCR0})
+
+			_, err = fx.log.Request(context.Background(), fx.source, targetB)
+			require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+		}
 	})
 }
 

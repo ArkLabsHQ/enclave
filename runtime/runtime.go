@@ -45,6 +45,10 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
+	if err := checkAppBinary(cfg.appPath()); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	ctx, err := StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
@@ -263,9 +267,17 @@ func startApp(
 	return app, nil
 }
 
+// checkAppBinary fails unless path is a file the runtime can exec.
+func checkAppBinary(path string) error {
+	if _, err := exec.LookPath(path); err != nil {
+		return fmt.Errorf("app binary: %w", err)
+	}
+	return nil
+}
+
 func (a *execApp) launch() error {
 	rt, cfg := a.rt, a.cfg
-	appPath := "/app/" + cfg.AppBinaryName
+	appPath := cfg.appPath()
 
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout

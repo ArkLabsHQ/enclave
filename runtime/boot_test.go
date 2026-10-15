@@ -148,6 +148,7 @@ func TestLoadUnverifiedState(t *testing.T) {
 					doc: "attestation",
 				},
 				ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: currentPCR0,
+				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
 			planned, err := boot.plan(ctx)
 
@@ -286,7 +287,10 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	kms := &stateOriginTestKMS{keyID: keyID}
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
-	boot := &Boot{cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}
+	boot := &Boot{
+		cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
+	}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
 	readCount := len(fake.calls)
@@ -320,7 +324,10 @@ func TestLoadUnverifiedStateDoesNotInitializeMissingResumeState(t *testing.T) {
 	s3f := newFakeS3()
 	seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 
-	_, err := (&Boot{cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(
+	_, err := (&Boot{
+		cfg: stateOriginTestConfig(), ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
+	}).plan(
 		ctx,
 	)
 
@@ -338,12 +345,13 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	s3f := newFakeS3()
 	boot := &Boot{
-		cfg:  stateOriginTestConfig(),
-		nsm:  nsm,
-		ssm:  ssm,
-		s3:   s3f,
-		sts:  &fakeSTS{},
-		pcr0: pcr0,
+		cfg:             stateOriginTestConfig(),
+		nsm:             nsm,
+		ssm:             ssm,
+		s3:              s3f,
+		sts:             &fakeSTS{},
+		pcr0:            pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 	}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
@@ -382,7 +390,10 @@ func TestEstablishLoadedStateGenesisWithoutLeaseWritesNoReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	s3f := newFakeS3()
-	planned, err := (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0}).plan(
+	planned, err := (&Boot{
+		cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
+	}).plan(
 		ctx,
 	)
 	require.NoError(t, err)
@@ -409,12 +420,13 @@ func TestEstablishLoadedStateCommitsGenesisKeyAfterReceipt(t *testing.T) {
 	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
 	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}}
 	boot := &Boot{
-		cfg:  stateOriginTestConfig(),
-		nsm:  nsm,
-		ssm:  ssm,
-		s3:   newFakeS3(),
-		sts:  &fakeSTS{},
-		pcr0: pcr0,
+		cfg:             stateOriginTestConfig(),
+		nsm:             nsm,
+		ssm:             ssm,
+		s3:              newFakeS3(),
+		sts:             &fakeSTS{},
+		pcr0:            pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 	}
 	planned, err := boot.plan(context.Background())
 	require.NoError(t, err)
@@ -461,11 +473,12 @@ func TestEstablishLoadedStateRejectsStateChangeBeforeDecrypt(t *testing.T) {
 			s3f := newFakeS3()
 			seedGenesisRecord(t, s3f, hex.EncodeToString(pcr0))
 			boot := &Boot{
-				cfg:  stateOriginTestConfig(),
-				ssm:  ssm,
-				s3:   s3f,
-				sts:  &fakeSTS{},
-				pcr0: pcr0,
+				cfg:             stateOriginTestConfig(),
+				ssm:             ssm,
+				s3:              s3f,
+				sts:             &fakeSTS{},
+				pcr0:            pcr0,
+				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
 			planned, err := boot.plan(ctx)
 			require.NoError(t, err)
@@ -592,6 +605,7 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 				NSM: nsm, doc: "previous-attestation",
 			}},
 			ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: currentPCR0,
+			secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 		}
 		kms := &stateOriginTestKMS{keyID: keyID}
 		if assertNoDecryptsOrWrites {
@@ -1310,12 +1324,13 @@ func TestEstablishLoadedStateRefusesCommitWithoutTheLease(t *testing.T) {
 	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
 
 	boot := &Boot{
-		cfg:  stateOriginTestConfig(),
-		nsm:  fx.nsm,
-		ssm:  fx.ssm,
-		s3:   fx.s3f,
-		sts:  fx.sts,
-		pcr0: pcr0,
+		cfg:             stateOriginTestConfig(),
+		nsm:             fx.nsm,
+		ssm:             fx.ssm,
+		s3:              fx.s3f,
+		sts:             fx.sts,
+		pcr0:            pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 	}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)
@@ -1508,12 +1523,13 @@ func TestGenesisIntentFailureLeavesFailClosedKMSClaim(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 	boot := &Boot{
-		cfg:  stateOriginTestConfig(),
-		nsm:  fx.nsm,
-		ssm:  fx.ssm,
-		s3:   fx.s3f,
-		sts:  fx.sts,
-		pcr0: pcr0,
+		cfg:             stateOriginTestConfig(),
+		nsm:             fx.nsm,
+		ssm:             fx.ssm,
+		s3:              fx.s3f,
+		sts:             fx.sts,
+		pcr0:            pcr0,
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 	}
 	planned, err := boot.plan(ctx)
 	require.NoError(t, err)

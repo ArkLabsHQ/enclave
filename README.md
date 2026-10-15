@@ -335,7 +335,7 @@ to 24 hours in both modes. Set `ENCLAVE_VERIFY_CLOCK_SOURCE` and
 | `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
-| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
+| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`, and exits before writing any state if it is missing or not executable. |
 
 The runtime always starts the in-process IMDS forwarder before loading AWS
 credentials. `ENCLAVE_VIPROXY_ENABLED` has been removed; setting it to `false`
@@ -1087,6 +1087,26 @@ Lock posture must not change across a handoff. `ENCLAVE_DEV` selects the
 `locked`/`unlocked` SSM namespace, so a successor that flips it looks in a
 different subtree, finds nothing, and fails to boot. A production image can
 therefore never adopt a deployment created by a dev image, or the reverse.
+
+### Migration compatibility
+
+Two schemas version the handoff, and both are checked before anything is
+committed. Each challenge carries the predecessor's challenge schema
+(`enclave.migration_challenge.v1`) and the successor claim schema it will check
+(`enclave.successor_claim.v1`). A candidate answers only if both match its own;
+otherwise it publishes no response and logs `candidate handoff` with `migration
+challenge is not bound to this state namespace`. A predecessor likewise adopts
+only a response in its own successor claim schema and ignores any other. Either
+way it records no intent and commits nothing.
+
+Bump `migrationChallengeSchemaV1` when what a predecessor's handoff writes
+changes, and `successorClaimSchemaV1` when what a successor reads changes, so a
+runtime on the previous schemas is refused before the commit. That covers where
+a generation is stored as well as how: the `KMSKeyID`, `MasterSeed`, `TLSKey`
+and `MigrationPrevious*` paths and their encodings, the seed derivation, the
+receipts a successor verifies, and the protocol itself. An invalid secrets
+configuration stops the runtime before it answers any challenge; the successor
+still starts its application only after the handoff.
 
 ### Upgrading across the PCR0-scoped receipt change
 

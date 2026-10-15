@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -152,6 +153,21 @@ func (a *fakeAppProcess) Restart() error {
 func (a *fakeAppProcess) Stop() error {
 	a.stops++
 	return a.err
+}
+
+// Run refuses an app it could not exec before writing any state.
+func TestCheckAppBinary(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, mode os.FileMode) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"), mode))
+		return path
+	}
+
+	require.NoError(t, checkAppBinary(write("app", 0o755)))
+	require.Error(t, checkAppBinary(write("not-executable", 0o644)))
+	require.Error(t, checkAppBinary(filepath.Join(dir, "missing")))
+	require.Error(t, checkAppBinary(dir))
 }
 
 func TestSuperviseContextDoneStopsApp(t *testing.T) {

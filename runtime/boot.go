@@ -142,13 +142,14 @@ type migrationBoot struct {
 }
 
 type Boot struct {
-	cfg    *Config
-	nsm    NSM
-	kmsAPI KMSAPI
-	sts    STSAPI
-	ssm    SSM
-	s3     S3API
-	pcr0   []byte
+	cfg             *Config
+	nsm             NSM
+	kmsAPI          KMSAPI
+	sts             STSAPI
+	ssm             SSM
+	s3              S3API
+	pcr0            []byte
+	secretsMetadata SecretsMetadata
 }
 
 type plannedBoot struct {
@@ -166,8 +167,19 @@ func NewBoot(
 	if len(pcr0) != 48 {
 		return nil, fmt.Errorf("current PCR0 must be exactly 48 bytes, got %d", len(pcr0))
 	}
+
+	secretsMetadata, err := LoadSecretsMetadata(*cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
+	}
+
+	if err := secretsMetadata.Validate(cfg.OverrideAllowList); err != nil {
+		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
+	}
+
 	return &Boot{
 		cfg: cfg, nsm: nsm, kmsAPI: kmsAPI, sts: sts, ssm: ssm, s3: s3api, pcr0: pcr0,
+		secretsMetadata: secretsMetadata,
 	}, nil
 }
 
@@ -222,13 +234,6 @@ func (b *Boot) Boot(ctx context.Context) (bootResult, error) {
 
 // plan decides, once, which of the three boots this is.
 func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
-	secretsMetadata, err := LoadSecretsMetadata(*b.cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
-	}
-	if err := secretsMetadata.Validate(b.cfg.OverrideAllowList); err != nil {
-		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
-	}
 	migrationIntentBucketName, err := b.migrationIntentBucket(ctx)
 	if err != nil {
 		return nil, err
@@ -245,7 +250,7 @@ func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
 	state := bootState{
 		cfg:                    b.cfg,
 		currentPCR0:            append([]byte(nil), b.pcr0...),
-		secretsMetadata:        secretsMetadata,
+		secretsMetadata:        b.secretsMetadata,
 		predecessorPCR0:        predecessorPCR0,
 		predecessorKMSKeyID:    predecessorKMSKeyID,
 		predecessorAttestation: predecessorAttestation,

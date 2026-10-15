@@ -24,12 +24,12 @@ const (
 	migrationChallengeSchemaV1 = "enclave.migration_challenge.v1"
 )
 
-// migrationClaimV1 binds an attestation to its state namespace.
-type migrationClaimV1 struct {
-	Schema    string `cbor:"schema"`
-	Namespace string `cbor:"namespace"`
-	AppName   string `cbor:"app_name"`
-	Lock      string `cbor:"lock"`
+// migrationAttestationPayload binds an attestation to its state namespace
+type migrationAttestationPayload struct {
+	Schemas   []string `cbor:"schemas"`
+	Namespace string   `cbor:"namespace"`
+	AppName   string   `cbor:"app_name"`
+	Lock      string   `cbor:"lock"`
 }
 
 // CandidateInfo is reported by an enclave still awaiting a handoff.
@@ -426,7 +426,7 @@ func (m *migrator) issueMigrationChallenge(ctx context.Context) (*migrationChall
 	if _, err := secureRandom(nonce); err != nil {
 		return nil, fmt.Errorf("generate migration challenge: %w", err)
 	}
-	payload, err := m.attestationPayload(migrationChallengeSchemaV1)
+	payload, err := m.attestationPayload(migrationChallengeSchemaV1, successorClaimSchemaV1)
 	if err != nil {
 		return nil, fmt.Errorf("attest migration challenge: %w", err)
 	}
@@ -456,7 +456,9 @@ func (m *migrator) verifyMigrationChallenge(
 	if err != nil {
 		return nil, fmt.Errorf("verify migration challenge: %w", err)
 	}
-	expectedPayload, err := m.attestationPayload(migrationChallengeSchemaV1)
+	expectedPayload, err := m.attestationPayload(
+		migrationChallengeSchemaV1, successorClaimSchemaV1,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("verify migration challenge: %w", err)
 	}
@@ -774,15 +776,15 @@ func (m *migrator) respondToChallenge(ctx context.Context) error {
 	return nil
 }
 
-// attestationPayload encodes the state namespace under schema, so attestations
+// attestationPayload encodes the state namespace under schemas, so attestations
 // made for one purpose or deployment cannot stand in for another.
-func (m *migrator) attestationPayload(schema string) ([]byte, error) {
+func (m *migrator) attestationPayload(schemas ...string) ([]byte, error) {
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		return nil, fmt.Errorf("build canonical CBOR encoder: %w", err)
 	}
-	payload, err := enc.Marshal(migrationClaimV1{
-		Schema:    schema,
+	payload, err := enc.Marshal(migrationAttestationPayload{
+		Schemas:   schemas,
 		Namespace: m.cfg.Namespace,
 		AppName:   m.cfg.AppName,
 		Lock:      m.cfg.lockSegment(),

@@ -44,7 +44,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
-	
+
 	if err := checkAppBinary(cfg.appPath()); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}

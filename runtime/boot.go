@@ -142,13 +142,13 @@ type migrationBoot struct {
 }
 
 type Boot struct {
-	cfg    *Config
-	nsm    NSM
-	kmsAPI KMSAPI
-	sts    STSAPI
-	ssm    SSM
-	s3     S3API
-	pcr0   []byte
+	cfg             *Config
+	nsm             NSM
+	kmsAPI          KMSAPI
+	sts             STSAPI
+	ssm             SSM
+	s3              S3API
+	pcr0            []byte
 	secretsMetadata SecretsMetadata
 }
 

@@ -792,27 +792,33 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
-	// plan validates the secrets config before anything else, so a Boot with
-	// only a config is enough to reach it.
-	t.Run("duplicate env var aborts plan", func(t *testing.T) {
+	// NewBoot runs before a candidate answers any challenge, so it refuses these.
+	newBoot := func(t *testing.T, cfg *Config) error {
+		t.Helper()
+		fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+		_, err := NewBoot(cfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
+		return err
+	}
+
+	t.Run("duplicate env var fails NewBoot", func(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
 		cfg := testConfig()
 		cfg.StaticSecretConfig = `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`
 		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"SIGNING_KEY",` +
 			`"type":"publicKey","value":["` + pubKey + `"],"cutoff":"2030-01-01T00:00:00Z"}]`
 
-		_, err := (&Boot{cfg: cfg}).plan(ctx)
-		require.ErrorContains(t, err, `env_var "SIGNING_KEY" is already used`)
+		require.ErrorContains(t, newBoot(t, cfg), `env_var "SIGNING_KEY" is already used`)
 	})
 
-	t.Run("allowlisted env var aborts plan", func(t *testing.T) {
+	t.Run("allowlisted env var fails NewBoot", func(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
 		cfg := testConfig()
 		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"LEGACY_KEY",` +
 			`"type":"publicKey","value":["` + pubKey + `"]}]`
 		cfg.OverrideAllowList = map[string]bool{"LEGACY_KEY": true}
 
-		_, err := (&Boot{cfg: cfg}).plan(ctx)
-		require.ErrorContains(t, err, `env_var "LEGACY_KEY" is in the override allowlist`)
+		require.ErrorContains(
+			t, newBoot(t, cfg), `env_var "LEGACY_KEY" is in the override allowlist`,
+		)
 	})
 }

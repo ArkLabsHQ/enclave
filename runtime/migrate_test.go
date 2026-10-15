@@ -880,8 +880,8 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
-		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:    "enclave.successor_claim.v2",
+		payload, err := enc.Marshal(migrationAttestationPayload{
+			Schemas:   []string{"enclave.successor_claim.v2"},
 			Namespace: fx.predecessor.cfg.Namespace,
 			AppName:   fx.predecessor.cfg.AppName,
 			Lock:      fx.predecessor.cfg.lockSegment(),
@@ -1401,6 +1401,114 @@ func TestCandidateAnswersOnlyItsPredecessorsChallenge(t *testing.T) {
 	require.Empty(t, ssmf.params[cfg.migrationResponseParam(cfg.PreviousPCR0, fx.source)])
 }
 
+// A candidate answers only a genuine challenge carrying its own schemas.
+func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
+	ctx := context.Background()
+	predecessor := strings.Repeat("11", 48)
+	cfg := successorTestCfg(predecessor)
+	nonce := bytes.Repeat([]byte{0x5a}, 32)
+
+	type challenge struct {
+		claim       migrationAttestationPayload
+		pcr0, nonce []byte
+		signer      *testAttestationSigner
+	}
+	// answer publishes an edited copy of the challenge this runtime issues and
+	// returns whatever response the candidate published.
+	answer := func(t *testing.T, fx *migrationIntentFixture, edit func(*challenge)) (string, error) {
+		t.Helper()
+		ssmf := &fakeSSM{params: map[string]string{}}
+		m := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: fx.source, ssm: NewSSM(ssmf)}
+
+		c := challenge{
+			claim: migrationAttestationPayload{
+				Schemas:   []string{migrationChallengeSchemaV1, successorClaimSchemaV1},
+				Namespace: cfg.Namespace, AppName: cfg.AppName, Lock: cfg.lockSegment(),
+			},
+			pcr0: mustDecodeHex(t, predecessor), nonce: nonce, signer: fx.signer,
+		}
+		edit(&c)
+		enc, err := cbor.CoreDetEncOptions().EncMode()
+		require.NoError(t, err)
+		userData, err := enc.Marshal(c.claim)
+		require.NoError(t, err)
+		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.buildWithNonce(
+			t, map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce,
+		).docB64
+
+		err = m.respondToChallenge(ctx)
+		return ssmf.params[cfg.migrationResponseParam(predecessor, fx.source)], err
+	}
+	// adopts returns the PCR0 the predecessor adopts from response to nonce.
+	adopts := func(t *testing.T, fx *migrationIntentFixture, response string, nonce []byte) string {
+		t.Helper()
+		issuer := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: predecessor}
+		target, err := issuer.verifyChallengeResponses(
+			ctx, &migrationChallenge{Nonce: nonce}, []Param{{Name: "response", Value: response}},
+		)
+		require.NoError(t, err)
+		return target
+	}
+
+	t.Run("answers bound to the nonce", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		response, err := answer(t, fx, func(*challenge) {})
+		require.NoError(t, err)
+		require.Equal(t, fx.source, adopts(t, fx, response, nonce))
+		require.Empty(t, adopts(t, fx, response, bytes.Repeat([]byte{0x5b}, 32)))
+	})
+
+	now := time.Now()
+	unrelated := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
+	for _, tc := range []struct {
+		name   string
+		edit   func(*challenge)
+		reason string
+	}{
+		{"another successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1, "enclave.successor_claim.v2"}
+		}, "not bound to this state namespace"},
+		{"no successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1}
+		}, "not bound to this state namespace"},
+		{"another challenge schema", func(c *challenge) {
+			c.claim.Schemas = []string{"enclave.migration_challenge.v2", successorClaimSchemaV1}
+		}, "not bound to this state namespace"},
+		{
+			"another namespace",
+			func(c *challenge) { c.claim.Namespace = "other" },
+			"not bound to this state namespace",
+		},
+		{
+			"another app",
+			func(c *challenge) { c.claim.AppName = "other-app" },
+			"not bound to this state namespace",
+		},
+		{
+			"another lock posture",
+			func(c *challenge) { c.claim.Lock = "unlocked" },
+			"not bound to this state namespace",
+		},
+		{
+			"another measurement",
+			func(c *challenge) { c.pcr0 = bytes.Repeat([]byte{0x22}, 48) },
+			"verify migration challenge",
+		},
+		{
+			"an unrelated root",
+			func(c *challenge) { c.signer = unrelated },
+			"verify migration challenge",
+		},
+		{"no nonce", func(c *challenge) { c.nonce = nil }, "has no nonce"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			response, err := answer(t, newMigrationIntentFixture(t), tc.edit)
+			require.ErrorContains(t, err, tc.reason)
+			require.Empty(t, response)
+		})
+	}
+}
+
 func predecessorNSM(t *testing.T, currentPCR0 []byte, verifyResult *nitrite.Result) NSM {
 	t.Helper()
 	session := &fakeNSMSession{responses: []response.Response{
@@ -1472,7 +1580,9 @@ func attestedChallenge(
 	issuedAt time.Time,
 ) string {
 	t.Helper()
-	payload, err := (&migrator{cfg: cfg}).attestationPayload(migrationChallengeSchemaV1)
+	payload, err := (&migrator{cfg: cfg}).attestationPayload(
+		migrationChallengeSchemaV1, successorClaimSchemaV1,
+	)
 	require.NoError(t, err)
 	return signer.buildWithNonce(t, map[uint][]byte{0: pcr0}, issuedAt, payload, nonce).docB64
 }

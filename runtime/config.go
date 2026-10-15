@@ -406,6 +406,11 @@ func (c *Config) String() string {
 	return string(b)
 }
 
+// appPath is the application binary the runtime execs.
+func (c *Config) appPath() string {
+	return "/app/" + c.AppBinaryName
+}
+
 func (c *Config) lockSegment() string {
 	if c.KMSLocked {
 		return "locked"

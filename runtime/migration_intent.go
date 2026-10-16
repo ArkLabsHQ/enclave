@@ -39,6 +39,9 @@ var (
 	errMigrationIntentAlreadyRequested = errors.New(
 		"migration intent: already requested, abort first",
 	)
+	errMigrationIntentAbortTargetMismatch = errors.New(
+		"migration intent: abort target is not active",
+	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 	errMigrationIntentSelfTarget       = errors.New(
@@ -122,6 +125,8 @@ func (l *migrationIntentLog) Head(
 	return active[0], nil
 }
 
+// Request records a request. Its returned version confirms persistence; Head
+// determines whether the request is the active authorization.
 func (l *migrationIntentLog) Request(
 	ctx context.Context,
 	sourcePCR0, targetPCR0 string,
@@ -145,10 +150,16 @@ func (l *migrationIntentLog) Request(
 	return l.append(ctx, sourcePCR0, highest, migrationIntentRequested, targetPCR0)
 }
 
+// Abort records a cancellation naming the operator's selected active target.
+// A concurrent request at the same sequence and timestamp can leave Head ambiguous.
 func (l *migrationIntentLog) Abort(
 	ctx context.Context,
-	sourcePCR0 string,
+	sourcePCR0, targetPCR0 string,
 ) (*migrationIntent, error) {
+	targetPCR0, _, err := normalizePCR0(targetPCR0)
+	if err != nil {
+		return nil, fmt.Errorf("target PCR0: %w", err)
+	}
 	active, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
@@ -159,8 +170,13 @@ func (l *migrationIntentLog) Abort(
 	if len(active) == 1 && active[0].Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
+	if !slices.ContainsFunc(active, func(intent *migrationIntent) bool {
+		return intent.TargetPCR0 == targetPCR0
+	}) {
+		return nil, errMigrationIntentAbortTargetMismatch
+	}
 
-	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, active[0].TargetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, targetPCR0)
 }
 
 func (l *migrationIntentLog) append(
@@ -200,9 +216,10 @@ func (l *migrationIntentLog) append(
 	writeCtx, cancel := context.WithTimeout(ctx, l.writeTimeout())
 	defer cancel()
 
+	key := migrationIntentObjectKey(sourcePCR0, sequence)
 	out, err := l.s3.PutObject(writeCtx, &s3.PutObjectInput{
 		Bucket:                    aws.String(l.bucket),
-		Key:                       aws.String(migrationIntentObjectKey(sourcePCR0, sequence)),
+		Key:                       aws.String(key),
 		Body:                      bytes.NewReader(body),
 		ContentType:               aws.String("application/json"),
 		ObjectLockMode:            s3types.ObjectLockModeCompliance,
@@ -224,31 +241,84 @@ func (l *migrationIntentLog) append(
 		)
 	}
 
-	head, err := l.Head(ctx, sourcePCR0)
+	versionID := aws.ToString(out.VersionId)
+	expected := &migrationIntent{
+		SourcePCR0: sourcePCR0, TargetPCR0: targetPCR0, Action: action, Sequence: sequence,
+	}
+	return l.verifyIntentExistence(ctx, versionID, expected)
+}
+
+// verifyIntentExistence verifies the written version independently of the active
+// authorization. A concurrent record can leave Head ambiguous despite this write.
+func (l *migrationIntentLog) verifyIntentExistence(
+	ctx context.Context,
+	versionID string,
+	expected *migrationIntent,
+) (*migrationIntent, error) {
+	key := migrationIntentObjectKey(expected.SourcePCR0, expected.Sequence)
+	var recorded *migrationIntent
+	err := forEachObjectVersion(ctx, l.s3, l.bucket, key,
+		errMigrationIntentStoreUnavailable, "verify appended migration intent",
+		func(listedKey, listedVersion string, publishedAt *time.Time) (bool, error) {
+			if listedKey != key || listedVersion != versionID || publishedAt == nil {
+				return false, nil
+			}
+			intent, valid, err := l.fetchIntent(
+				ctx, key, versionID, expected.SourcePCR0, expected.Sequence, publishedAt.UTC(),
+			)
+			if valid && intent.equivalent(expected) {
+				recorded = intent
+			}
+			return true, err
+		})
 	if err != nil {
 		return nil, err
 	}
-	if head == nil || head.Sequence < sequence {
+	if recorded == nil {
 		return nil, fmt.Errorf(
-			"%w: migration intent sequence %d missing after write",
+			"%w: migration intent sequence %d version %q missing or invalid after write",
 			errMigrationIntentStoreUnavailable,
-			sequence,
+			expected.Sequence,
+			versionID,
 		)
 	}
 
-	return head, nil
+	return recorded, nil
 }
 
-// equivalent reports whether two verified intents authorize the same thing,
-// whatever their S3 versions or attestation bytes.
+// equivalent compares the complete logical record, including an abort's target,
+// regardless of its S3 version or attestation bytes.
 func (i *migrationIntent) equivalent(other *migrationIntent) bool {
 	return i.SourcePCR0 == other.SourcePCR0 && i.Sequence == other.Sequence &&
 		i.Action == other.Action && i.TargetPCR0 == other.TargetPCR0
 }
 
+// collapseTiedAborts selects one representative when every tied intent is an
+// abort. Ties involving a request remain unresolved.
+func collapseTiedAborts(intents []*migrationIntent) []*migrationIntent {
+	if len(intents) < 2 {
+		return intents
+	}
+
+	chosen := intents[0]
+	for _, intent := range intents {
+		if intent.Action != migrationIntentAborted {
+			return intents
+		}
+
+		// Choose consistently, regardless of S3 listing order.
+		if intent.TargetPCR0 < chosen.TargetPCR0 {
+			chosen = intent
+		}
+	}
+
+	return []*migrationIntent{chosen}
+}
+
 // scanIntents returns the active authorization separately from the highest
 // valid sequence, so ignored requests cannot occupy the next abort slot. More
-// than one active intent means distinct intents tied at its earliest timestamp.
+// than one active intent means a tie involving a request. Tied aborts all cancel
+// the same round and resolve to one representative.
 func (l *migrationIntentLog) scanIntents(
 	ctx context.Context,
 	sourcePCR0 string,
@@ -285,7 +355,7 @@ func (l *migrationIntentLog) scanIntents(
 	var highest uint64
 	for _, sequence := range slices.Sorted(maps.Keys(heads)) {
 		highest = sequence
-		next := heads[sequence]
+		next := collapseTiedAborts(heads[sequence])
 		if len(next) > 1 {
 			head = next
 			continue

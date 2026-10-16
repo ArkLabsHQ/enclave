@@ -1014,10 +1014,12 @@ The order is:
    the handoff. The predecessor records the abort in the intent log as soon as
    it sees it. It is the only operator control in the protocol. Stop the aborted
    candidate too, or each new answer it sends is adopted and aborted again.
-   If two different intents are recorded for the same sequence at the same
-   instant, `/enclave/v1/info` reports `migration.state` as `ambiguous` and
-   lists `migration.ambiguous_targets`. The migration stays blocked until an
-   abort names one of them.
+   If different requests, or a request and an abort, are recorded for the same
+   sequence at the same instant, `/enclave/v1/info` reports `migration.state`
+   as `ambiguous` and lists `migration.ambiguous_targets`. The migration stays
+   blocked until an abort names one of them. Tied records that are all aborts
+   resolve as `aborted`, even when they name different targets; another abort
+   is unnecessary and is ignored.
 5. The predecessor commits, on its own, once the intent is eligible and no abort
    names the target. It commits the successor's PCR0 into its own PCR31, creates
    a KMS key admitting the successor's PCR0 alone, re-encrypts the master seed

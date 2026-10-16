@@ -30,9 +30,9 @@ func TestDeploymentGenesisIsNotAMigrationIntent(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, head, "genesis must not appear in the creator's intent chain")
 
-	_, err = fx.log.Abort(ctx, fx.source)
-	require.ErrorIs(t, err, errMigrationIntentAbsent)
 	target := strings.Repeat("cd", 48)
+	_, err = fx.log.Abort(ctx, fx.source, target)
+	require.ErrorIs(t, err, errMigrationIntentAbsent)
 	requested, err := fx.log.Request(ctx, fx.source, target)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), requested.Sequence)

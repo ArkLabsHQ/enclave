@@ -224,7 +224,7 @@ func TestMigratorMigrationStatus(t *testing.T) {
 	t.Run("aborted", func(t *testing.T) {
 		m, fx := setup(t)
 		require.NoError(t, request(t, m, fx))
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, targetPCR0)
 		require.NoError(t, err)
 		status, err := m.MigrationStatus(ctx)
 
@@ -516,7 +516,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("rejects aborted intent", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
 		err = fx.m.handOffToSuccessor(ctx)
@@ -739,7 +739,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 				return
 			}
 			// An operator aborts on a peer while this handoff is mid-flight.
-			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 			require.NoError(t, err)
 		}
 
@@ -793,7 +793,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		_, err = first.Boot(ctx)
 		require.NoError(t, err)
 
-		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
 		restarted, err := successor(session.attestationRoots)
@@ -1191,7 +1191,7 @@ func TestInboundIntentIsReported(t *testing.T) {
 	})
 
 	t.Run("an aborted intent is not reported", func(t *testing.T) {
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, target)
 		require.NoError(t, err)
 
 		info, err := candidate(target, fx.source).CandidateInfo(ctx)
@@ -1392,7 +1392,9 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 
 	t.Run("an operator abort naming either tied target ends the conflict", func(t *testing.T) {
 		for _, order := range [][]string{{newPCR0, otherPCR0}, {otherPCR0, newPCR0}} {
-			for _, aborted := range []string{newPCR0, otherPCR0} {
+			for _, aborted := range []string{
+				newPCR0, otherPCR0, strings.ToUpper(newPCR0), strings.ToUpper(otherPCR0),
+			} {
 				name := "listed " + order[0][:4] + " first, abort " + aborted[:4]
 				t.Run(name, func(t *testing.T) {
 					m, ssmf, session := setup(t)
@@ -1410,7 +1412,8 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, migrationStateAborted, status.State)
 					require.Equal(t, uint64(2), status.Sequence)
-					require.Contains(t, order, status.TargetPCR0, "the abort names a tied target")
+					require.Equal(t, strings.ToLower(aborted), status.TargetPCR0,
+						"the abort names the operator's selected target")
 					require.Len(t, fx.s3.objects[migrationIntentObjectKey(oldPCR0Hex, 1)], 2,
 						"the locked records stay as they were")
 

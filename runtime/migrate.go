@@ -569,10 +569,10 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targets ...string) (bo
 			return false, nil
 		}
 	}
-	if _, err := m.intent.Abort(ctx, m.pcr0); err != nil {
+	if _, err := m.intent.Abort(ctx, m.pcr0, abortedPCR0); err != nil {
 		return false, err
 	}
-	slog.Warn("migration aborted by operator", "target_pcr0", prefix16(abortedPCR0))
+	slog.Warn("migration abort recorded", "target_pcr0", prefix16(abortedPCR0))
 	return true, nil
 }
 

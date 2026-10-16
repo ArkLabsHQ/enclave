@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -11,7 +12,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -135,35 +138,95 @@ func fetchAndVerifyAttestation(
 
 // UserData format embedded in NSM attestation documents:
 //
-//	"sha256:" ++ tlsKeyHash(32)
+//	"sha256:" ++ tlsKeyHash(32) ++ "ed25519:" ++ responseSigningKey(32)
 //
-// Total 39 bytes, with the raw TLS PublicKey hash at bytes 7:39.
+// Total 79 bytes: the raw TLS PublicKey hash at bytes 7:39 and the raw Ed25519
+// response-signing public key at bytes 47:79.
 const (
-	udHashPrefix = "sha256:"
-	udTLSStart   = len(udHashPrefix)
-	udTLSEnd     = udTLSStart + 32
+	udHashPrefix    = "sha256:"
+	udTLSStart      = len(udHashPrefix)
+	udTLSEnd        = udTLSStart + 32
+	udSigningPrefix = "ed25519:"
+	udSigningStart  = udTLSEnd + len(udSigningPrefix)
+	udLen           = udSigningStart + ed25519.PublicKeySize
 )
 
-// extractTLSKeyHash returns the hex-encoded SHA-256 fingerprint of the
-// enclave's TLS PublicKey, taken from bytes 7:39 of user_data.
-func extractTLSKeyHash(attestResult *nitrite.Result) (string, error) {
+// parseUserData returns the hex-encoded SHA-256 fingerprint of the enclave's
+// TLS PublicKey and its response-signing key, which is nil while unset.
+func parseUserData(attestResult *nitrite.Result) (string, ed25519.PublicKey, error) {
 	if attestResult == nil || attestResult.Document == nil {
-		return "", fmt.Errorf("no attestation result")
+		return "", nil, fmt.Errorf("no attestation result")
 	}
 	userData := attestResult.Document.UserData
-	if len(userData) != udTLSEnd {
-		return "", fmt.Errorf(
-			"user_data must be exactly %d bytes (got %d)", udTLSEnd, len(userData),
+	if len(userData) != udLen {
+		return "", nil, fmt.Errorf(
+			"user_data must be exactly %d bytes (got %d)", udLen, len(userData),
 		)
 	}
 	if string(userData[:udTLSStart]) != udHashPrefix {
-		return "", fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
+		return "", nil, fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
+	}
+	if string(userData[udTLSEnd:udSigningStart]) != udSigningPrefix {
+		return "", nil, fmt.Errorf(
+			"user_data missing %q prefix at offset %d", udSigningPrefix, udTLSEnd,
+		)
 	}
 	h := hex.EncodeToString(userData[udTLSStart:udTLSEnd])
 	if isAllZeroHex(h) {
-		return "", fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
+		return "", nil, fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
 	}
-	return h, nil
+	var signingKey ed25519.PublicKey
+	if key := userData[udSigningStart:]; !bytes.Equal(key, make([]byte, len(key))) {
+		signingKey = bytes.Clone(key)
+	}
+	return h, signingKey, nil
+}
+
+// Signed responses; runtime/servers.go holds the signing half.
+const (
+	signNonceHeader = "X-Enclave-Sign-Nonce"
+	signatureHeader = "X-Enclave-Signature"
+)
+
+// prepareResponseSigningContext asks for a signed response under a fresh nonce and
+// captures the authority, headers, and body the response must authenticate.
+func prepareResponseSigningContext(req *http.Request) (responseSigningContext, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		if body, err = io.ReadAll(req.Body); err != nil {
+			return responseSigningContext{}, fmt.Errorf("read request body: %w", err)
+		}
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	// Normalize aliases before HTTP/2 can serialize map keys in a different
+	// order. Preserve repeated values in the same order as HTTP/1 writes them.
+	headers := make(http.Header, len(req.Header)+1)
+	for _, name := range slices.Sorted(maps.Keys(req.Header)) {
+		canonical := http.CanonicalHeaderKey(name)
+		headers[canonical] = append(headers[canonical], req.Header[name]...)
+	}
+	req.Header = headers
+	// Let the transport ask for gzip and decode it, so the body we hash is the
+	// decoded one the runtime signed, even if a proxy compresses it.
+	req.Header.Del("Accept-Encoding")
+	// http.Client adds URL credentials after Do starts; bind them before that.
+	if req.URL != nil && req.URL.User != nil && req.Header.Get("Authorization") == "" {
+		password, _ := req.URL.User.Password()
+		req.SetBasicAuth(req.URL.User.Username(), password)
+	}
+	req.Header.Set(signNonceHeader, rand.Text())
+	return captureResponseSigningContext(req, body)
+}
+
+// verifyResponseSignature checks the X-Enclave-Signature header over msg.
+func verifyResponseSignature(key ed25519.PublicKey, msg []byte, header http.Header) error {
+	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
+	if err != nil || !ed25519.Verify(key, msg, sig) {
+		return fmt.Errorf("missing or invalid %s", signatureHeader)
+	}
+	return nil
 }
 
 // isAllZeroHex reports whether s is empty or all '0' — an uninitialized binding.

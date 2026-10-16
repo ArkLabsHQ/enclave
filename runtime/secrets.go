@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/hkdf"
 	"crypto/sha256"
@@ -30,9 +31,10 @@ const (
 	// application secret names cannot contain '/', so they cannot collide with
 	// current or future internal names, including versioned names such as
 	// runtime/ACMEAccountKey-v2. Preserve this separation when changing name validation.
-	runtimeDerivationPrefix      = "runtime/"
-	storageDEKDerivationName     = runtimeDerivationPrefix + "StorageDEK"
-	acmeAccountKeyDerivationName = runtimeDerivationPrefix + "ACMEAccountKey"
+	runtimeDerivationPrefix          = "runtime/"
+	storageDEKDerivationName         = runtimeDerivationPrefix + "StorageDEK"
+	acmeAccountKeyDerivationName     = runtimeDerivationPrefix + "ACMEAccountKey"
+	responseSigningKeyDerivationName = runtimeDerivationPrefix + "ResponseSigningKey"
 )
 
 // deriveValidScalar uses HKDF-SHA256 extract-and-expand with protocol constants.
@@ -90,6 +92,18 @@ func deriveACMEAccountKey(seed []byte) (*ecdsa.PrivateKey, error) {
 				return nil, false
 			}
 			return key, true
+		},
+	)
+}
+
+func deriveResponseSigningKey(seed []byte, pcr0 []byte) (ed25519.PrivateKey, error) {
+	// Append raw PCR0 bytes; HKDF info need not be valid UTF-8
+	info := responseSigningKeyDerivationName + "\x00" + string(pcr0)
+	return deriveValidScalar(
+		seed,
+		info,
+		func(candidate []byte) (ed25519.PrivateKey, bool) {
+			return ed25519.NewKeyFromSeed(candidate), true
 		},
 	)
 }

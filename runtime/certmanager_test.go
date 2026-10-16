@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -95,8 +96,11 @@ func (f *fakeIssuer) Issue(ctx context.Context, _ string, key crypto.Signer) ([]
 }
 
 // attestedHash is the user_data payload for a leaf: the prefix plus its SHA-256.
+// attestedHash is the user_data for leaf, with no response-signing key set.
 func attestedHash(leaf [sha256.Size]byte) []byte {
-	return append([]byte(hashPrefix), leaf[:]...)
+	ud := append([]byte(hashPrefix), leaf[:]...)
+	ud = append(ud, signingKeyPrefix...)
+	return append(ud, make([]byte, ed25519.PublicKeySize)...)
 }
 
 func certKeyHash(t *testing.T, certDER []byte) [sha256.Size]byte {

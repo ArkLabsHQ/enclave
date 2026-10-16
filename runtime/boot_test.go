@@ -172,20 +172,35 @@ func TestLoadUnverifiedState(t *testing.T) {
 }
 
 func TestNewBootRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
-	fake, ssm := stateOriginTestSSM(nil)
-	session := newStatefulNSMSession(t, map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, 47)})
+	for _, tc := range []struct {
+		size    int
+		wantErr string
+	}{
+		{0, "empty PCR0"},
+		{47, "PCR0 must be exactly 48 bytes"},
+		{49, "PCR0 must be exactly 48 bytes"},
+	} {
+		t.Run(fmt.Sprintf("%d bytes", tc.size), func(t *testing.T) {
+			fake, ssm := stateOriginTestSSM(nil)
+			session := newStatefulNSMSession(
+				t,
+				map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, tc.size)},
+			)
 
-	_, err := NewBoot(
-		stateOriginTestConfig(),
-		&nsmW{nsm: &fakeNSM{session: session}},
-		nil,
-		nil,
-		ssm,
-		nil,
-	)
+			boot, err := NewBoot(
+				stateOriginTestConfig(),
+				&nsmW{nsm: &fakeNSM{session: session}},
+				nil,
+				nil,
+				ssm,
+				nil,
+			)
 
-	require.ErrorContains(t, err, "exactly 48 bytes")
-	require.Empty(t, fake.calls)
+			require.ErrorContains(t, err, tc.wantErr)
+			require.Nil(t, boot)
+			require.Empty(t, fake.calls)
+		})
+	}
 }
 
 func TestVerifyStateOriginReceipt(t *testing.T) {
@@ -299,9 +314,10 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	)
 
 	established, err := (&Boot{
-		cfg: stateOriginTestConfig(),
-		nsm: &nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
-		ssm: ssm,
+		cfg:  stateOriginTestConfig(),
+		nsm:  &nsmW{nsm: &fakeNSM{session: session, verifyRoots: receipt.roots}},
+		ssm:  ssm,
+		pcr0: pcr0,
 	}).establish(ctx, planned, kms)
 
 	require.NoError(t, err)
@@ -310,6 +326,9 @@ func TestEstablishLoadedStateUsesSinglePersistedSnapshot(t *testing.T) {
 	wantDEKBytes, err := hex.DecodeString(wantDEK)
 	require.NoError(t, err)
 	require.Equal(t, wantDEKBytes, established.dek.(*dek).key)
+	wantSigningKey, err := deriveResponseSigningKey(bytes.Repeat([]byte{0x42}, 32), pcr0)
+	require.NoError(t, err)
+	require.Equal(t, wantSigningKey, established.responseSigningKey)
 	require.Len(t, fake.calls, readCount, "establishment must not read SSM")
 }
 
@@ -361,12 +380,15 @@ func TestEstablishLoadedStateGenesisWritesReceipt(t *testing.T) {
 	t.Cleanup(func() { _ = lease.Release(context.Background()) })
 	planned.mode.(*genesisBoot).lease = lease
 
-	established, err := (&Boot{cfg: stateOriginTestConfig(), nsm: nsm, ssm: ssm}).establish(
+	established, err := boot.establish(
 		ctx, planned, &stateOriginTestKMS{keyID: keyID},
 	)
 
 	require.NoError(t, err)
 	require.NotNil(t, established.dek)
+	wantSigningKey, err := deriveResponseSigningKey(bytes.Repeat([]byte{1}, 32), pcr0)
+	require.NoError(t, err)
+	require.Equal(t, wantSigningKey, established.responseSigningKey)
 	require.Len(t, established.secrets.Static, len(stateOriginTestSecrets))
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), established.migrationIntentBucketName)
 	root := mustStateRoot(t, ctx, ssm, keyID)
@@ -625,9 +647,17 @@ func TestEstablishLoadedStateMigration(t *testing.T) {
 			beforeStateAdoptionChecks(s3f)
 		}
 
-		_, err = (&Boot{cfg: cfg, nsm: nsm, ssm: ssm}).establish(
+		established, err := (&Boot{cfg: cfg, nsm: nsm, ssm: ssm, pcr0: currentPCR0}).establish(
 			ctx, planned, kms,
 		)
+		if err == nil {
+			wantSigningKey, err := deriveResponseSigningKey(
+				bytes.Repeat([]byte{0x42}, 32),
+				currentPCR0,
+			)
+			require.NoError(t, err)
+			require.Equal(t, wantSigningKey, established.responseSigningKey)
+		}
 		return fake, root, stateReceipt.roots, err
 	}
 
@@ -1135,9 +1165,14 @@ func TestBootResumesAfterPeerGenesis(t *testing.T) {
 	require.Equal(t, first.dek.(*dek).key, second.dek.(*dek).key, "fleet must share one DEK")
 	require.Equal(t, first.secrets, second.secrets)
 	require.Equal(t, first.acmeAccountKey, second.acmeAccountKey)
+	require.NotEmpty(t, first.responseSigningKey)
+	require.Equal(t, first.responseSigningKey, second.responseSigningKey)
 	require.Equal(t, parentEnv, os.Environ(), "boot must not export keys to the parent environment")
 
-	internalKeys := [][]byte{second.masterSeed, second.dek.(*dek).key}
+	internalKeys := [][]byte{
+		second.masterSeed, second.dek.(*dek).key,
+		second.responseSigningKey, second.responseSigningKey.Seed(),
+	}
 	for _, key := range []*ecdsa.PrivateKey{
 		second.tlsKey.(*ecdsa.PrivateKey), second.acmeAccountKey.(*ecdsa.PrivateKey),
 	} {

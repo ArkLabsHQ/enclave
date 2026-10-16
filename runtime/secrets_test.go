@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -109,6 +110,38 @@ func TestInternalDerivationVectors(t *testing.T) {
 	}
 }
 
+// Replicas and restarts share a signing key, but migration must change it even
+// though the successor inherits the same master seed.
+func TestDeriveResponseSigningKey(t *testing.T) {
+	seed := bytes.Repeat([]byte{0x42}, 32)
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	a, err := deriveResponseSigningKey(seed, pcr0)
+	require.NoError(t, err)
+	// Independent Python hashlib/hmac HKDF vector: info is 0x784b (CBOR text,
+	// 75 bytes), "runtime/ResponseSigningKey", a zero byte, and 48 raw 0xab bytes.
+	require.Equal(t, "243cb3574cda70417595662d5933180383f0b4a5232d6ecc8dc8b017575903d5",
+		hex.EncodeToString(a.Seed()))
+	b, err := deriveResponseSigningKey(bytes.Clone(seed), bytes.Clone(pcr0))
+	require.NoError(t, err)
+	require.Equal(t, a, b)
+
+	other, err := deriveResponseSigningKey(bytes.Repeat([]byte{0x99}, 32), pcr0)
+	require.NoError(t, err)
+	require.NotEqual(t, a, other)
+
+	successorPCR0 := bytes.Clone(pcr0)
+	successorPCR0[len(successorPCR0)-1] ^= 1
+	successor, err := deriveResponseSigningKey(seed, successorPCR0)
+	require.NoError(t, err)
+	require.NotEqual(t, a.Public(), successor.Public())
+
+	message := []byte("response to a fresh client nonce")
+	predecessorSignature := ed25519.Sign(a, message)
+	require.True(t, ed25519.Verify(b.Public().(ed25519.PublicKey), message, predecessorSignature))
+	successorPublicKey := successor.Public().(ed25519.PublicKey)
+	require.False(t, ed25519.Verify(successorPublicKey, message, predecessorSignature))
+}
+
 func TestDeriveValidScalarSelection(t *testing.T) {
 	seed := mustDecodeHex(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
 	// Independent Python hashlib/hmac vectors from one HKDF expansion.
@@ -171,6 +204,9 @@ func TestDerivedSeedLengthAcrossHelpers(t *testing.T) {
 			require.ErrorContains(t, err, "seed must be 32 bytes")
 			_, err = deriveACMEAccountKey(seed)
 			require.ErrorContains(t, err, "seed must be 32 bytes")
+			key, err := deriveResponseSigningKey(seed, make([]byte, 48))
+			require.ErrorContains(t, err, "seed must be 32 bytes")
+			require.Nil(t, key)
 		})
 	}
 }
@@ -233,7 +269,10 @@ func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 		{"restored", []StaticSecretMetadata{a, b}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			boot := &Boot{cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots))}
+			boot := &Boot{
+				cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots)),
+				pcr0: mustDecodeHex(t, snapshot.ownerPCR0),
+			}
 			result, err := boot.establish(t.Context(), &plannedBoot{
 				mode: &resumeBoot{},
 				state: bootState{

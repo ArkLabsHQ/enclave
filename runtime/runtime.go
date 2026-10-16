@@ -174,6 +174,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
 
+	hashes.SetResponseSigningKey(result.responseSigningKey)
+
 	go migrator.RunPredecessorHandoff(
 		ctx,
 		result.kms,

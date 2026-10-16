@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -45,12 +46,13 @@ const (
 
 // bootResult is the boot machine's terminal state
 type bootResult struct {
-	kms            PrimaryKMS
-	dek            DEK
-	secrets        Secrets
-	tlsKey         crypto.Signer
-	masterSeed     []byte
-	acmeAccountKey crypto.Signer
+	kms                PrimaryKMS
+	dek                DEK
+	secrets            Secrets
+	tlsKey             crypto.Signer
+	masterSeed         []byte
+	acmeAccountKey     crypto.Signer
+	responseSigningKey ed25519.PrivateKey
 
 	migrationIntentBucketName string
 	lineage                   stateLineage
@@ -414,6 +416,10 @@ func (b *Boot) establish(
 	if err != nil {
 		return bootResult{}, fmt.Errorf("derive ACME account key: %w", err)
 	}
+	responseSigningKey, err := deriveResponseSigningKey(masterSeed, b.pcr0)
+	if err != nil {
+		return bootResult{}, fmt.Errorf("derive response signing key: %w", err)
+	}
 	tlsKeyPKCS8, err := kms.Decrypt(ctx, snapshot.tlsKeyCiphertext)
 	if err != nil {
 		return bootResult{}, fmt.Errorf("failed to decrypt TLS key: %w", err)
@@ -451,6 +457,7 @@ func (b *Boot) establish(
 		tlsKey:                    tlsKey,
 		masterSeed:                masterSeed,
 		acmeAccountKey:            accountKey,
+		responseSigningKey:        responseSigningKey,
 		migrationIntentBucketName: snapshot.migrationIntentBucketName,
 		lineage:                   snapshot.lineage(),
 	}, nil

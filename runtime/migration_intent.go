@@ -39,6 +39,9 @@ var (
 	errMigrationIntentAlreadyRequested = errors.New(
 		"migration intent: already requested, abort first",
 	)
+	errMigrationIntentAbortTargetMismatch = errors.New(
+		"migration intent: abort target is not active",
+	)
 	errMigrationCooldownActive         = errors.New("migration cooldown: active")
 	errMigrationIntentStoreUnavailable = errors.New("migration intent store: unavailable")
 	errMigrationIntentSelfTarget       = errors.New(
@@ -108,17 +111,22 @@ func (l *migrationIntentLog) Head(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (*migrationIntent, error) {
-	head, tie, _, err := l.scanIntents(ctx, sourcePCR0)
+	active, _, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	if tie {
+	if len(active) > 1 {
 		return nil, errMigrationIntentAmbiguous
 	}
+	if len(active) == 0 {
+		return nil, nil
+	}
 
-	return head, nil
+	return active[0], nil
 }
 
+// Request records a request. Its returned version confirms persistence; Head
+// determines whether the request is the active authorization.
 func (l *migrationIntentLog) Request(
 	ctx context.Context,
 	sourcePCR0, targetPCR0 string,
@@ -132,32 +140,43 @@ func (l *migrationIntentLog) Request(
 	if strings.EqualFold(targetPCR0, sourcePCR0) {
 		return nil, errMigrationIntentSelfTarget
 	}
-	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
+	active, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	if head != nil && (tie || head.Action == migrationIntentRequested) {
+	if len(active) > 1 || (len(active) == 1 && active[0].Action == migrationIntentRequested) {
 		return nil, errMigrationIntentAlreadyRequested
 	}
 	return l.append(ctx, sourcePCR0, highest, migrationIntentRequested, targetPCR0)
 }
 
+// Abort records a cancellation naming the operator's selected active target.
+// A concurrent request at the same sequence and timestamp can leave Head ambiguous.
 func (l *migrationIntentLog) Abort(
 	ctx context.Context,
-	sourcePCR0 string,
+	sourcePCR0, targetPCR0 string,
 ) (*migrationIntent, error) {
-	head, tie, highest, err := l.scanIntents(ctx, sourcePCR0)
+	targetPCR0, _, err := normalizePCR0(targetPCR0)
+	if err != nil {
+		return nil, fmt.Errorf("target PCR0: %w", err)
+	}
+	active, highest, err := l.scanIntents(ctx, sourcePCR0)
 	if err != nil {
 		return nil, err
 	}
-	if head == nil {
+	if len(active) == 0 {
 		return nil, errMigrationIntentAbsent
 	}
-	if !tie && head.Action == migrationIntentAborted {
+	if len(active) == 1 && active[0].Action == migrationIntentAborted {
 		return nil, errMigrationIntentAborted
 	}
+	if !slices.ContainsFunc(active, func(intent *migrationIntent) bool {
+		return intent.TargetPCR0 == targetPCR0
+	}) {
+		return nil, errMigrationIntentAbortTargetMismatch
+	}
 
-	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, head.TargetPCR0)
+	return l.append(ctx, sourcePCR0, highest, migrationIntentAborted, targetPCR0)
 }
 
 func (l *migrationIntentLog) append(
@@ -197,9 +216,10 @@ func (l *migrationIntentLog) append(
 	writeCtx, cancel := context.WithTimeout(ctx, l.writeTimeout())
 	defer cancel()
 
+	key := migrationIntentObjectKey(sourcePCR0, sequence)
 	out, err := l.s3.PutObject(writeCtx, &s3.PutObjectInput{
 		Bucket:                    aws.String(l.bucket),
-		Key:                       aws.String(migrationIntentObjectKey(sourcePCR0, sequence)),
+		Key:                       aws.String(key),
 		Body:                      bytes.NewReader(body),
 		ContentType:               aws.String("application/json"),
 		ObjectLockMode:            s3types.ObjectLockModeCompliance,
@@ -221,29 +241,90 @@ func (l *migrationIntentLog) append(
 		)
 	}
 
-	head, err := l.Head(ctx, sourcePCR0)
+	versionID := aws.ToString(out.VersionId)
+	expected := &migrationIntent{
+		SourcePCR0: sourcePCR0, TargetPCR0: targetPCR0, Action: action, Sequence: sequence,
+	}
+	return l.verifyIntentExistence(ctx, versionID, expected)
+}
+
+// verifyIntentExistence verifies the written version independently of the active
+// authorization. A concurrent record can leave Head ambiguous despite this write.
+func (l *migrationIntentLog) verifyIntentExistence(
+	ctx context.Context,
+	versionID string,
+	expected *migrationIntent,
+) (*migrationIntent, error) {
+	key := migrationIntentObjectKey(expected.SourcePCR0, expected.Sequence)
+	var recorded *migrationIntent
+	err := forEachObjectVersion(ctx, l.s3, l.bucket, key,
+		errMigrationIntentStoreUnavailable, "verify appended migration intent",
+		func(listedKey, listedVersion string, publishedAt *time.Time) (bool, error) {
+			if listedKey != key || listedVersion != versionID || publishedAt == nil {
+				return false, nil
+			}
+			intent, valid, err := l.fetchIntent(
+				ctx, key, versionID, expected.SourcePCR0, expected.Sequence, publishedAt.UTC(),
+			)
+			if valid && intent.equivalent(expected) {
+				recorded = intent
+			}
+			return true, err
+		})
 	if err != nil {
 		return nil, err
 	}
-	if head == nil || head.Sequence < sequence {
+	if recorded == nil {
 		return nil, fmt.Errorf(
-			"%w: migration intent sequence %d missing after write",
+			"%w: migration intent sequence %d version %q missing or invalid after write",
 			errMigrationIntentStoreUnavailable,
-			sequence,
+			expected.Sequence,
+			versionID,
 		)
 	}
 
-	return head, nil
+	return recorded, nil
+}
+
+// equivalent compares the complete logical record, including an abort's target,
+// regardless of its S3 version or attestation bytes.
+func (i *migrationIntent) equivalent(other *migrationIntent) bool {
+	return i.SourcePCR0 == other.SourcePCR0 && i.Sequence == other.Sequence &&
+		i.Action == other.Action && i.TargetPCR0 == other.TargetPCR0
+}
+
+// collapseTiedAborts selects one representative when every tied intent is an
+// abort. Ties involving a request remain unresolved.
+func collapseTiedAborts(intents []*migrationIntent) []*migrationIntent {
+	if len(intents) < 2 {
+		return intents
+	}
+
+	chosen := intents[0]
+	for _, intent := range intents {
+		if intent.Action != migrationIntentAborted {
+			return intents
+		}
+
+		// Choose consistently, regardless of S3 listing order.
+		if intent.TargetPCR0 < chosen.TargetPCR0 {
+			chosen = intent
+		}
+	}
+
+	return []*migrationIntent{chosen}
 }
 
 // scanIntents returns the active authorization separately from the highest
-// valid sequence, so ignored requests cannot occupy the next abort slot.
+// valid sequence, so ignored requests cannot occupy the next abort slot. More
+// than one active intent means a tie involving a request. Tied aborts all cancel
+// the same round and resolve to one representative.
 func (l *migrationIntentLog) scanIntents(
 	ctx context.Context,
 	sourcePCR0 string,
-) (*migrationIntent, bool, uint64, error) {
-	heads := make(map[uint64]*migrationIntent)
-	ties := make(map[uint64]bool)
+) ([]*migrationIntent, uint64, error) {
+	// The distinct intents published first at each sequence.
+	heads := make(map[uint64][]*migrationIntent)
 	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
 		errMigrationIntentStoreUnavailable, "list migration intents",
 		func(key, versionID string, lastModified *time.Time) (bool, error) {
@@ -259,36 +340,35 @@ func (l *migrationIntentLog) scanIntents(
 			}
 			head := heads[sequence]
 			switch {
-			case head == nil || nextHead.PublishedAt.Before(head.PublishedAt):
-				heads[sequence] = nextHead
-				ties[sequence] = false
-			case nextHead.PublishedAt.Equal(head.PublishedAt):
-				ties[sequence] = true
+			case len(head) == 0 || nextHead.PublishedAt.Before(head[0].PublishedAt):
+				heads[sequence] = []*migrationIntent{nextHead}
+			case nextHead.PublishedAt.Equal(head[0].PublishedAt) &&
+				!slices.ContainsFunc(head, nextHead.equivalent):
+				heads[sequence] = append(head, nextHead)
 			}
 			return false, nil
 		})
 	if err != nil {
-		return nil, false, 0, err
+		return nil, 0, err
 	}
-	var head *migrationIntent
-	var tie bool
+	var head []*migrationIntent
 	var highest uint64
 	for _, sequence := range slices.Sorted(maps.Keys(heads)) {
 		highest = sequence
-		next := heads[sequence]
-		if ties[sequence] {
-			head, tie = next, true
+		next := collapseTiedAborts(heads[sequence])
+		if len(next) > 1 {
+			head = next
 			continue
 		}
 		// An abort ends the pending request. Otherwise retain the earliest
 		// request, including expired requests, until an abort follows it.
-		aborts := next.Action == migrationIntentAborted
-		unauthorized := head == nil || head.Action == migrationIntentAborted
-		if aborts || (!tie && unauthorized) {
-			head, tie = next, false
+		aborts := next[0].Action == migrationIntentAborted
+		unauthorized := len(head) == 0 || head[0].Action == migrationIntentAborted
+		if aborts || (len(head) < 2 && unauthorized) {
+			head = next
 		}
 	}
-	return head, tie, highest, nil
+	return head, highest, nil
 }
 
 // writeTimeout bounds upload delay and the corresponding read-side tolerance.

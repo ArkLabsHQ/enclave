@@ -712,7 +712,7 @@ must match the new root.
 | `/N/A/enclave/MigrationStateOriginReceipt/<keyID>/<pcr0>` | runtime | Predecessor's attestation over the successor's state. Written create-only. |
 | `/N/A/enclave/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge: the predecessor's attestation over a fresh nonce, bound to the state namespace. Its attested timestamp drives rotation every minute. Advanced tier. |
 | `/N/A/enclave/MigrationResponse/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
-| `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. The predecessor records the abort in the intent log as soon as it sees it. |
+| `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. While the intent is ambiguous, naming any of the tied targets clears it. The predecessor records the abort in the intent log as soon as it sees it. |
 | `/N/A/enclave/MigrationPreviousPCR0/<pcr0>` | runtime | Predecessor PCR0, written by the predecessor into its successor's scope. |
 | `/N/A/enclave/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Predecessor KMS key ID, committed into the successor's state root. |
 | `/N/A/enclave/MigrationPreviousPCR0Attestation/<pcr0>` | runtime | Predecessor attestation after PCR31 commitment, same scoping. |
@@ -1014,6 +1014,12 @@ The order is:
    the handoff. The predecessor records the abort in the intent log as soon as
    it sees it. It is the only operator control in the protocol. Stop the aborted
    candidate too, or each new answer it sends is adopted and aborted again.
+   If different requests, or a request and an abort, are recorded for the same
+   sequence at the same instant, `/enclave/v1/info` reports `migration.state`
+   as `ambiguous` and lists `migration.ambiguous_targets`. The migration stays
+   blocked until an abort names one of them. Tied records that are all aborts
+   resolve as `aborted`, even when they name different targets; another abort
+   is unnecessary and is ignored.
 5. The predecessor commits, on its own, once the intent is eligible and no abort
    names the target. It commits the successor's PCR0 into its own PCR31, creates
    a KMS key admitting the successor's PCR0 alone, re-encrypts the master seed

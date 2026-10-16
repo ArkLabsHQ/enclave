@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,6 +53,7 @@ type MigrationStatus struct {
 	PublishedAt      *time.Time `json:"published_at,omitempty"`
 	EligibleAt       *time.Time `json:"eligible_at,omitempty"`
 	RemainingSeconds int        `json:"remaining_seconds"`
+	AmbiguousTargets []string   `json:"ambiguous_targets,omitempty"`
 }
 
 // migrationChallenge is the verified content of a predecessor's challenge
@@ -66,6 +68,7 @@ const (
 	migrationStateCoolingDown = "cooling_down"
 	migrationStateEligible    = "eligible"
 	migrationStateAborted     = "aborted"
+	migrationStateAmbiguous   = "ambiguous"
 )
 
 type Migrator interface {
@@ -178,13 +181,21 @@ func (m *migrator) CandidateInfo(ctx context.Context) (*CandidateInfo, error) {
 }
 
 func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
-	head, err := m.intent.Head(ctx, m.pcr0)
+	heads, _, err := m.intent.scanIntents(ctx, m.pcr0)
 	if err != nil {
 		return nil, err
 	}
-	if head == nil {
+	if len(heads) == 0 {
 		return &MigrationStatus{State: migrationStateNone, SourcePCR0: m.pcr0}, nil
 	}
+	if len(heads) > 1 {
+		status := &MigrationStatus{State: migrationStateAmbiguous, SourcePCR0: m.pcr0}
+		for _, intent := range heads {
+			status.AmbiguousTargets = append(status.AmbiguousTargets, intent.TargetPCR0)
+		}
+		return status, nil
+	}
+	head := heads[0]
 
 	status := &MigrationStatus{
 		SourcePCR0:  head.SourcePCR0,
@@ -332,18 +343,21 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 		return err
 	}
 
-	pending := status.State == migrationStateCoolingDown || status.State == migrationStateEligible
-	if pending {
+	switch status.State {
+	case migrationStateAmbiguous:
+		aborted, err := m.mayAbortMigration(ctx, status.AmbiguousTargets...)
+		if err != nil || aborted {
+			return err
+		}
+		return errMigrationIntentAmbiguous
+	case migrationStateCoolingDown:
+		_, err := m.mayAbortMigration(ctx, status.TargetPCR0)
+		return err
+	case migrationStateEligible:
 		aborted, err := m.mayAbortMigration(ctx, status.TargetPCR0)
 		if err != nil || aborted {
 			return err
 		}
-	}
-
-	switch status.State {
-	case migrationStateCoolingDown:
-		return nil
-	case migrationStateEligible:
 		if err := m.handOffToSuccessor(ctx); !errors.Is(err, errMigrationAlreadyFinalised) {
 			return err
 		}
@@ -532,30 +546,35 @@ func (m *migrator) verifyChallengeResponses(
 	return "", nil
 }
 
-// mayAbortMigration records a matching abort before the handoff commits.
-func (m *migrator) mayAbortMigration(ctx context.Context, targetPCR0 string) (bool, error) {
+// mayAbortMigration records an abort naming one of targets before a handoff to
+// any of them commits.
+func (m *migrator) mayAbortMigration(ctx context.Context, targets ...string) (bool, error) {
 	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
 	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
 	if err != nil {
 		return false, fmt.Errorf("read migration abort: %w", err)
 	}
-	if abortedPCR0 == "" || !strings.EqualFold(abortedPCR0, targetPCR0) {
+	if abortedPCR0 == "" || !slices.ContainsFunc(targets, func(target string) bool {
+		return strings.EqualFold(abortedPCR0, target)
+	}) {
 		return false, nil
 	}
 
-	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
-	if err != nil {
-		return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
+	for _, target := range targets {
+		targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(target))
+		if err != nil {
+			return false, fmt.Errorf("failed to read target KMS key ID: %w", err)
+		}
+		if targetKmsID != "" {
+			slog.Warn("ignoring migration abort: the handoff has already committed",
+				"target_pcr0", prefix16(target))
+			return false, nil
+		}
 	}
-	if targetKmsID != "" {
-		slog.Warn("ignoring migration abort: the handoff has already committed",
-			"target_pcr0", prefix16(targetPCR0))
-		return false, nil
-	}
-	if _, err := m.intent.Abort(ctx, m.pcr0); err != nil {
+	if _, err := m.intent.Abort(ctx, m.pcr0, abortedPCR0); err != nil {
 		return false, err
 	}
-	slog.Warn("migration aborted by operator", "target_pcr0", prefix16(targetPCR0))
+	slog.Warn("migration abort recorded", "target_pcr0", prefix16(abortedPCR0))
 	return true, nil
 }
 
@@ -572,6 +591,8 @@ func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error
 		return nil, errMigrationIntentAbsent
 	case migrationStateAborted:
 		return nil, errMigrationIntentAborted
+	case migrationStateAmbiguous:
+		return nil, errMigrationIntentAmbiguous
 	case migrationStateCoolingDown:
 		return nil, fmt.Errorf(
 			"%w: %d seconds remaining",

@@ -103,7 +103,7 @@ func TestMigratorMigrationStatus(t *testing.T) {
 	t.Run("aborted", func(t *testing.T) {
 		m, fx := setup(t)
 		require.NoError(t, request(t, m, fx))
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, targetPCR0)
 		require.NoError(t, err)
 		status, err := m.MigrationStatus(ctx)
 
@@ -121,6 +121,23 @@ func TestMigratorMigrationStatus(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, migrationStateEligible, status.State)
 		require.Zero(t, status.RemainingSeconds)
+		require.Equal(t, published.Add(2*time.Minute), *status.EligibleAt)
+	})
+
+	t.Run("a duplicate does not move the cooldown", func(t *testing.T) {
+		m, fx := setup(t)
+		published := time.Now().UTC().Add(-time.Minute)
+		key := migrationIntentObjectKey(fx.source, 1)
+		body := fx.object(
+			t, 1, migrationIntentRequested, targetPCR0, migrationIntentTestBucket, fx.pcr0,
+		)
+		fx.s3.putRawObjectAt(key, body, published)
+		fx.s3.putRawObjectAt(key, fx.reattest(t, body), published)
+		fx.s3.putRawObjectAt(key, body, time.Now().UTC())
+		status, err := m.MigrationStatus(ctx)
+
+		require.NoError(t, err)
+		require.Equal(t, migrationStateCoolingDown, status.State)
 		require.Equal(t, published.Add(2*time.Minute), *status.EligibleAt)
 	})
 
@@ -369,7 +386,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("rejects aborted intent", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
 		err = fx.m.handOffToSuccessor(ctx)
@@ -588,7 +605,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 				return
 			}
 			// An operator aborts on a peer while this handoff is mid-flight.
-			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 			require.NoError(t, err)
 		}
 
@@ -636,7 +653,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		_, err = first.Boot(ctx)
 		require.NoError(t, err)
 
-		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
 		restarted, err := successor()
@@ -740,8 +757,8 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
-		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:    "enclave.successor_claim.v2",
+		payload, err := enc.Marshal(migrationAttestationPayload{
+			Schemas:   []string{"enclave.successor_claim.v2"},
 			Namespace: fx.predecessor.cfg.Namespace,
 			AppName:   fx.predecessor.cfg.AppName,
 			Lock:      fx.predecessor.cfg.lockSegment(),
@@ -1034,7 +1051,7 @@ func TestInboundIntentIsReported(t *testing.T) {
 	})
 
 	t.Run("an aborted intent is not reported", func(t *testing.T) {
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, target)
 		require.NoError(t, err)
 
 		info, err := candidate(target, fx.source).CandidateInfo(ctx)
@@ -1196,6 +1213,154 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 	})
+
+	otherPCR0 := strings.Repeat("ef", 48)
+	freshPCR0 := strings.Repeat("12", 48)
+	tiedAt := time.Now().Add(-time.Hour).UTC()
+	// intents writes records into m's own log, signed as m would sign them.
+	intents := func(m *migrator, session *fakeNSMSession) *migrationIntentFixture {
+		return &migrationIntentFixture{
+			log: m.intent, s3: m.intent.s3.(*fakeS3), pcr0: oldPCR0, source: oldPCR0Hex,
+			signer: session.attestationSign,
+		}
+	}
+	// tie publishes a request to each target at sequence 1, all at tiedAt.
+	tie := func(t *testing.T, fx *migrationIntentFixture, pcr0 []byte, targets ...string) {
+		t.Helper()
+		for _, target := range targets {
+			fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1),
+				fx.object(t, 1, migrationIntentRequested, target, fx.log.bucket, pcr0), tiedAt)
+		}
+	}
+	requireNothingAppended := func(t *testing.T, fx *migrationIntentFixture) {
+		t.Helper()
+		require.Empty(t, fx.s3.objects[migrationIntentObjectKey(oldPCR0Hex, 2)])
+	}
+
+	t.Run("equivalent duplicate intents still hand off", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		body := fx.object(t, 1, migrationIntentRequested, newPCR0, fx.log.bucket, oldPCR0)
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1), body, tiedAt)
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1), fx.reattest(t, body), tiedAt)
+
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	t.Run("an operator abort naming either tied target ends the conflict", func(t *testing.T) {
+		for _, order := range [][]string{{newPCR0, otherPCR0}, {otherPCR0, newPCR0}} {
+			for _, aborted := range []string{
+				newPCR0, otherPCR0, strings.ToUpper(newPCR0), strings.ToUpper(otherPCR0),
+			} {
+				name := "listed " + order[0][:4] + " first, abort " + aborted[:4]
+				t.Run(name, func(t *testing.T) {
+					m, ssmf, session := setup(t)
+					fx := intents(m, session)
+					tie(t, fx, oldPCR0, order...)
+
+					require.ErrorIs(t, advanceMigrationForTest(t, ctx, m),
+						errMigrationIntentAmbiguous)
+
+					abort := m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
+					ssmf.params[abort] = aborted
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+					status, err := m.MigrationStatus(ctx)
+					require.NoError(t, err)
+					require.Equal(t, migrationStateAborted, status.State)
+					require.Equal(t, uint64(2), status.Sequence)
+					require.Equal(t, strings.ToLower(aborted), status.TargetPCR0,
+						"the abort names the operator's selected target")
+					require.Len(t, fx.s3.objects[migrationIntentObjectKey(oldPCR0Hex, 1)], 2,
+						"the locked records stay as they were")
+
+					// The log is open again: a new candidate is adopted and handed off.
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					answer(t, m, session, freshPCR0)
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(freshPCR0)])
+				})
+			}
+		}
+	})
+
+	t.Run("an absent or unrelated abort leaves the conflict blocked", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+		// Tied as well, but attested by another measurement, so no part of the conflict.
+		tie(t, fx, bytes.Repeat([]byte{0xee}, 48), freshPCR0)
+
+		for _, abort := range []string{"", freshPCR0, strings.Repeat("ee", 48)} {
+			if abort != "" {
+				ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = abort
+			}
+
+			require.ErrorIs(t, advanceMigrationForTest(t, ctx, m), errMigrationIntentAmbiguous)
+		}
+		status, err := m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAmbiguous, status.State)
+		require.ElementsMatch(t, []string{newPCR0, otherPCR0}, status.AmbiguousTargets,
+			"the forged record is not part of the conflict")
+		requireNothingAppended(t, fx)
+	})
+
+	// As after any commit, an inadequate target must never block later migrations.
+	t.Run("a conflict abort is still recorded after a tied target committed", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+		ssmf.params[testCfg.kmsKeyIDParam(otherPCR0)] = "successor-key"
+		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
+
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+		status, err := m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAborted, status.State)
+	})
+
+	t.Run("storage errors surface through conflict recovery", func(t *testing.T) {
+		ssmDown := errors.New("ssm down")
+		for name, tc := range map[string]struct {
+			fail func(ssmf *fakeSSM, s3f *fakeS3, abort string)
+			want error
+		}{
+			"reading the abort": {
+				fail: func(ssmf *fakeSSM, _ *fakeS3, abort string) {
+					ssmf.getErrs = map[string]error{abort: ssmDown}
+				},
+				want: ssmDown,
+			},
+			"recording the abort": {
+				fail: func(_ *fakeSSM, s3f *fakeS3, _ string) { s3f.putErr = errors.New("put failed") },
+				want: errMigrationIntentStoreUnavailable,
+			},
+			"listing intents": {
+				fail: func(_ *fakeSSM, s3f *fakeS3, _ string) { s3f.listErr = errors.New("list failed") },
+				want: errMigrationIntentStoreUnavailable,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				m, ssmf, session := setup(t)
+				fx := intents(m, session)
+				tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+				abort := m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
+				ssmf.params[abort] = newPCR0
+				tc.fail(ssmf, fx.s3, abort)
+
+				err := advanceMigrationForTest(t, ctx, m)
+
+				require.ErrorIs(t, err, tc.want)
+				require.NotErrorIs(t, err, errMigrationIntentAmbiguous)
+				requireNothingAppended(t, fx)
+			})
+		}
+	})
 }
 
 func TestCandidateAnswersPublishedChallenges(t *testing.T) {
@@ -1260,6 +1425,114 @@ func TestCandidateAnswersOnlyItsPredecessorsChallenge(t *testing.T) {
 	require.Empty(t, ssmf.params[cfg.migrationResponseParam(cfg.PreviousPCR0, fx.source)])
 }
 
+// A candidate answers only a genuine challenge carrying its own schemas.
+func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
+	ctx := context.Background()
+	predecessor := strings.Repeat("11", 48)
+	cfg := successorTestCfg(predecessor)
+	nonce := bytes.Repeat([]byte{0x5a}, 32)
+
+	type challenge struct {
+		claim       migrationAttestationPayload
+		pcr0, nonce []byte
+		signer      *testAttestationSigner
+	}
+	// answer publishes an edited copy of the challenge this runtime issues and
+	// returns whatever response the candidate published.
+	answer := func(t *testing.T, fx *migrationIntentFixture, edit func(*challenge)) (string, error) {
+		t.Helper()
+		ssmf := &fakeSSM{params: map[string]string{}}
+		m := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: fx.source, ssm: NewSSM(ssmf)}
+
+		c := challenge{
+			claim: migrationAttestationPayload{
+				Schemas:   []string{migrationChallengeSchemaV1, successorClaimSchemaV1},
+				Namespace: cfg.Namespace, AppName: cfg.AppName, Lock: cfg.lockSegment(),
+			},
+			pcr0: mustDecodeHex(t, predecessor), nonce: nonce, signer: fx.signer,
+		}
+		edit(&c)
+		enc, err := cbor.CoreDetEncOptions().EncMode()
+		require.NoError(t, err)
+		userData, err := enc.Marshal(c.claim)
+		require.NoError(t, err)
+		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.buildWithNonce(
+			t, map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce,
+		).docB64
+
+		err = m.respondToChallenge(ctx)
+		return ssmf.params[cfg.migrationResponseParam(predecessor, fx.source)], err
+	}
+	// adopts returns the PCR0 the predecessor adopts from response to nonce.
+	adopts := func(t *testing.T, fx *migrationIntentFixture, response string, nonce []byte) string {
+		t.Helper()
+		issuer := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: predecessor}
+		target, err := issuer.verifyChallengeResponses(
+			ctx, &migrationChallenge{Nonce: nonce}, []Param{{Name: "response", Value: response}},
+		)
+		require.NoError(t, err)
+		return target
+	}
+
+	t.Run("answers bound to the nonce", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		response, err := answer(t, fx, func(*challenge) {})
+		require.NoError(t, err)
+		require.Equal(t, fx.source, adopts(t, fx, response, nonce))
+		require.Empty(t, adopts(t, fx, response, bytes.Repeat([]byte{0x5b}, 32)))
+	})
+
+	now := time.Now()
+	unrelated := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
+	for _, tc := range []struct {
+		name   string
+		edit   func(*challenge)
+		reason string
+	}{
+		{"another successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1, "enclave.successor_claim.v2"}
+		}, "not bound to this state namespace"},
+		{"no successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1}
+		}, "not bound to this state namespace"},
+		{"another challenge schema", func(c *challenge) {
+			c.claim.Schemas = []string{"enclave.migration_challenge.v2", successorClaimSchemaV1}
+		}, "not bound to this state namespace"},
+		{
+			"another namespace",
+			func(c *challenge) { c.claim.Namespace = "other" },
+			"not bound to this state namespace",
+		},
+		{
+			"another app",
+			func(c *challenge) { c.claim.AppName = "other-app" },
+			"not bound to this state namespace",
+		},
+		{
+			"another lock posture",
+			func(c *challenge) { c.claim.Lock = "unlocked" },
+			"not bound to this state namespace",
+		},
+		{
+			"another measurement",
+			func(c *challenge) { c.pcr0 = bytes.Repeat([]byte{0x22}, 48) },
+			"verify migration challenge",
+		},
+		{
+			"an unrelated root",
+			func(c *challenge) { c.signer = unrelated },
+			"verify migration challenge",
+		},
+		{"no nonce", func(c *challenge) { c.nonce = nil }, "has no nonce"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			response, err := answer(t, newMigrationIntentFixture(t), tc.edit)
+			require.ErrorContains(t, err, tc.reason)
+			require.Empty(t, response)
+		})
+	}
+}
+
 type startMigrationFixture struct {
 	m       *migrator
 	session *fakeNSMSession
@@ -1319,7 +1592,9 @@ func attestedChallenge(
 	issuedAt time.Time,
 ) string {
 	t.Helper()
-	payload, err := (&migrator{cfg: cfg}).attestationPayload(migrationChallengeSchemaV1)
+	payload, err := (&migrator{cfg: cfg}).attestationPayload(
+		migrationChallengeSchemaV1, successorClaimSchemaV1,
+	)
 	require.NoError(t, err)
 	return signer.buildWithNonce(t, map[uint][]byte{0: pcr0}, issuedAt, payload, nonce).docB64
 }

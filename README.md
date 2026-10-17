@@ -352,7 +352,7 @@ to 24 hours in both modes. Set `ENCLAVE_VERIFY_CLOCK_SOURCE` and
 | `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
 | `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
 | `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
-| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`. |
+| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`, and exits before writing any state if it is missing or not executable. |
 
 The runtime always starts the in-process IMDS forwarder before loading AWS
 credentials. `ENCLAVE_VIPROXY_ENABLED` has been removed; setting it to `false`
@@ -715,7 +715,7 @@ must match the new root.
 | `/N/A/enclave/inherit/<name>` | operator | Inherited secret, verified against its baked pin. |
 | `/N/A/enclave/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge: the predecessor's attestation over a fresh nonce, bound to the state namespace. Its attested timestamp drives rotation every minute. Advanced tier. |
 | `/N/A/enclave/MigrationResponse/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
-| `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. The predecessor records the abort in the intent log as soon as it sees it. |
+| `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. While the intent is ambiguous, naming any of the tied targets clears it. The predecessor records the abort in the intent log as soon as it sees it. |
 | `/N/A/enclave/L/KMSKeyID/<pcr0>` | runtime | Handoff pointer: the migration key a predecessor committed for the successor measuring `<pcr0>`. Written create-only and last. Never manage this with deployment tooling. |
 | `/N/A/enclave/L/MasterSeed/Ciphertext/<keyID>` | runtime | Handoff: the master seed under the successor's migration key. |
 | `/N/A/enclave/L/TLSKey/Ciphertext/<keyID>` | runtime | Handoff: the TLS key under the successor's migration key. |
@@ -990,6 +990,12 @@ answer wins. Predecessor replicas share the challenge and intent chain.
    the cooldown. To abort, write that target PCR0 to
    `/<namespace>/<app>/enclave/MigrationResponse/<predecessor PCR0>/abort` and
    stop the candidate. The predecessor records the abort in its intent log.
+   If different requests, or a request and an abort, are recorded for the same
+   sequence at the same instant, `/enclave/v1/info` reports `migration.state`
+   as `ambiguous` and lists `migration.ambiguous_targets`. The migration stays
+   blocked until an abort names one of them. Tied records that are all aborts
+   resolve as `aborted`, even when they name different targets; another abort
+   is unnecessary and is ignored.
 4. After the cooldown, the predecessor commits the target into PCR31, creates
    the successor's KMS key, and writes the encrypted seed, TLS key, lineage and
    transition receipt to SSM. It writes `KMSKeyID/<successor PCR0>` last,
@@ -1035,6 +1041,26 @@ retirement, attach a deny scoped to the retired key before scheduling deletion:
 The deny overrides the key policy's allow. Retain the ancestor's locked snapshot
 so the audit can follow the lineage; missing or unverifiable state makes ancestry
 incomplete and does not prove retirement.
+
+### Migration compatibility
+
+Two schemas version the handoff, and both are checked before anything is
+committed. Each challenge carries the predecessor's challenge schema
+(`enclave.migration_challenge.v1`) and the successor claim schema it will check
+(`enclave.successor_claim.v1`). A candidate answers only if both match its own;
+otherwise it publishes no response and logs `candidate handoff` with `migration
+challenge is not bound to this state namespace`. A predecessor likewise adopts
+only a response in its own successor claim schema and ignores any other. Either
+way it records no intent and commits nothing.
+
+Bump `migrationChallengeSchemaV1` when what a predecessor's handoff writes
+changes, and `successorClaimSchemaV1` when what a successor reads changes, so a
+runtime on the previous schemas is refused before the commit. That covers where
+a generation is stored as well as how: the `KMSKeyID`, `MasterSeed`, `TLSKey`
+and `MigrationPrevious*` paths and their encodings, the seed derivation, the
+receipts a successor verifies, and the protocol itself. An invalid secrets
+configuration stops the runtime before it answers any challenge; the successor
+still starts its application only after the handoff.
 
 ### Compatibility
 

@@ -691,6 +691,10 @@ type fakeS3 struct {
 	// object out from under the condition the caller is about to apply.
 	beforePut func(key string)
 
+	// afterPut fires after a successful write, with mu released so the hook can
+	// use helpers that acquire it, before the caller reads the written version.
+	afterPut func(*s3.PutObjectInput, *s3.PutObjectOutput)
+
 	// getMissing simulates an object disappearing between HeadObject and GetObject.
 	getMissing map[string]bool
 
@@ -755,7 +759,7 @@ func (f *fakeS3) PutObject(
 	ctx context.Context,
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
-) (*s3.PutObjectOutput, error) {
+) (out *s3.PutObjectOutput, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -763,7 +767,12 @@ func (f *fakeS3) PutObject(
 		return nil, f.putErr
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer func() {
+		f.mu.Unlock()
+		if err == nil && out != nil && f.afterPut != nil {
+			f.afterPut(in, out)
+		}
+	}()
 	key := aws.ToString(in.Key)
 	if f.beforePut != nil {
 		// Runs holding f.mu, for races that turn on the object changing between
@@ -793,7 +802,7 @@ func (f *fakeS3) PutObject(
 			lastModified: time.Now().UTC(),
 		},
 	)
-	out := &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
+	out = &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
 	if f.missingVersionID {
 		out.VersionId = nil
 	}

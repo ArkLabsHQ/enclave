@@ -418,6 +418,11 @@ func (c *Config) genesisImage() bool {
 	return c.PreviousPCR0 == genesisPreviousPCR0
 }
 
+// appPath is the application binary the runtime execs.
+func (c *Config) appPath() string {
+	return "/app/" + c.AppBinaryName
+}
+
 func (c *Config) lockSegment() string {
 	if c.KMSLocked {
 		return "locked"

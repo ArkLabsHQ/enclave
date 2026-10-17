@@ -154,6 +154,7 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 			boot := &Boot{
 				cfg: cfg, nsm: &nsmW{nsm: &fakeNSM{verifyRoots: fx.signer.roots}},
 				ssm: ssm, s3: fx.s3f, sts: &fakeSTS{}, pcr0: own,
+				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
 
 			// A migration reads its handoff when it builds the snapshot.
@@ -734,6 +735,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		boot := &Boot{
 			cfg: cfg, nsm: &nsmW{nsm: &fakeNSM{session: session, verifyRoots: signer.roots}},
 			kmsAPI: kmsf, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: current,
+			secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 		}
 		out := outcome{ssm: fake, before: maps.Clone(fake.params), s3: s3f, kms: kmsf}
 		planned, err := boot.plan(ctx)
@@ -1167,6 +1169,7 @@ func (f *genesisFixture) boot() *Boot {
 	return &Boot{
 		cfg: stateOriginTestConfig(), nsm: f.nsm, kmsAPI: f.kmsf, sts: f.sts, ssm: f.ssm,
 		s3: f.s3f, pcr0: mustDecodeHexString(f.pcr0Hex),
+		secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 	}
 }
 

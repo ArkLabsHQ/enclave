@@ -398,13 +398,19 @@ type UpstreamAppInfo struct {
 	Error  string `json:"error,omitempty"`
 }
 
-// healthHandler returns 200 once Ready() is true, 503 otherwise.
+// healthHandler returns 200 once Ready() is true and the app has not exited,
+// 503 otherwise.
 func healthHandler(rt RuntimeState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !rt.Ready() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "initializing"})
+			return
+		}
+		if rt.UpstreamAppInfo().Exited {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "upstream_exited"})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})

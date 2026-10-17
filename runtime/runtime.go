@@ -172,7 +172,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
-	servers.SetAncestry(ctx, NewAncestry(&cfg, nsm, ssm, result.kms, result.lineage))
+	migrator.SetSnapshot(result.snapshot)
+
+	servers.SetAncestry(
+		ctx, NewAncestry(
+			&cfg, aws.S3, nsm, migrationIntentBucket, result.kms, result.snapshot,
+		),
+	)
 
 	go migrator.RunPredecessorHandoff(
 		ctx,

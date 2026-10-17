@@ -38,38 +38,33 @@ func (s *stubAuditor) probes() int {
 }
 
 type ancestryFixture struct {
-	a      *ancestry
-	params map[string]string
-	signer *testAttestationSigner
+	a     *ancestry
+	state *snapshotTestFixture
 }
 
-func newAncestryFixture(t *testing.T, current bootSnapshot, auditor KeyAuditor) *ancestryFixture {
+func newAncestryFixture(t *testing.T, current Snapshot, auditor KeyAuditor) *ancestryFixture {
 	t.Helper()
-	now := time.Now()
-	signer := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
-	params := map[string]string{}
-	nsm := &nsmW{nsm: &fakeNSM{verifyRoots: signer.roots}}
-	a := NewAncestry(testCfg, nsm, NewSSM(&fakeSSM{params: params}), auditor, current.lineage()).(*ancestry)
+	state := newSnapshotTestFixture(t)
+	a := NewAncestry(
+		testCfg, state.s3f, state.boot.nsm, stateOriginTestMigrationIntentBucket(), auditor, current,
+	).(*ancestry)
 	a.ctx = context.Background()
-	return &ancestryFixture{a: a, params: params, signer: signer}
+	return &ancestryFixture{a: a, state: state}
 }
 
-func (f *ancestryFixture) storeOriginReceipt(t *testing.T, snapshot bootSnapshot) {
+// publish lands snapshot as its owner's verified snapshot/<pcr0>.
+func (f *ancestryFixture) publish(t *testing.T, snapshot Snapshot) {
 	t.Helper()
-	root, err := stateRoot(testCfg, snapshot)
-	require.NoError(t, err)
-	payload := originReceiptPayload(t, root, snapshot)
 	pcr0, err := hex.DecodeString(snapshot.ownerPCR0)
 	require.NoError(t, err)
-	doc := f.signer.build(t, map[uint][]byte{0: pcr0}, time.Now(), payload)
-	f.params[testCfg.stateOriginReceiptParam(snapshot.kmsKeyID, snapshot.ownerPCR0)] = doc.docB64
+	f.state.seed(t, pcr0, f.state.body(t, snapshot, nil), time.Now())
 }
 
-func testSnapshot(pcr0, keyID, prevPCR0, prevKeyID string) bootSnapshot {
-	return bootSnapshot{
+func testSnapshot(pcr0, keyID, prevPCR0, prevKeyID string) Snapshot {
+	return Snapshot{
 		ownerPCR0: pcr0, kmsKeyID: keyID,
 		predecessorPCR0: prevPCR0, predecessorKMSKeyID: prevKeyID,
-		migrationIntentBucketName: "intent-bucket",
+		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 		masterSeedCiphertext:      base64.StdEncoding.EncodeToString([]byte("seed-" + keyID)),
 		tlsKeyCiphertext:          base64.StdEncoding.EncodeToString([]byte("tls-" + keyID)),
 	}
@@ -79,8 +74,8 @@ func TestAncestryWalksVerifiedStateRoots(t *testing.T) {
 	p0, p1, p2 := ancestryPCR0(1), ancestryPCR0(2), ancestryPCR0(3)
 	auditor := &stubAuditor{state: keyStateExists}
 	fx := newAncestryFixture(t, testSnapshot(p2, "key-2", p1, "key-1"), auditor)
-	fx.storeOriginReceipt(t, testSnapshot(p1, "key-1", p0, "key-0"))
-	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
+	fx.publish(t, testSnapshot(p1, "key-1", p0, "key-0"))
+	fx.publish(t, testSnapshot(p0, "key-0", "", ""))
 
 	generations, complete, reason := fx.a.walkAncestors(context.Background())
 
@@ -96,14 +91,8 @@ func TestAncestryWalksVerifiedStateRoots(t *testing.T) {
 func TestAncestryRejectsAlteredKeyID(t *testing.T) {
 	p0, p1 := ancestryPCR0(1), ancestryPCR0(2)
 	fx := newAncestryFixture(t, testSnapshot(p1, "key-1", p0, "key-0"), &stubAuditor{})
-	snapshot := testSnapshot(p0, "substituted-key", "", "")
-	root, err := stateRoot(testCfg, snapshot)
-	require.NoError(t, err)
-	payload := originReceiptPayload(t, root, snapshot)
-	pcr0, err := hex.DecodeString(p0)
-	require.NoError(t, err)
-	doc := fx.signer.build(t, map[uint][]byte{0: pcr0}, time.Now(), payload)
-	fx.params[testCfg.stateOriginReceiptParam("key-0", p0)] = doc.docB64
+	// A genuine state for p0, but not the generation the link names.
+	fx.publish(t, testSnapshot(p0, "substituted-key", "", ""))
 
 	_, complete, reason := fx.a.walkAncestors(context.Background())
 
@@ -111,11 +100,9 @@ func TestAncestryRejectsAlteredKeyID(t *testing.T) {
 	require.Contains(t, reason, "missing or invalid")
 }
 
-func TestAncestryMissingReceiptIsIncomplete(t *testing.T) {
+func TestAncestryMissingStateIsIncomplete(t *testing.T) {
 	p0, p1 := ancestryPCR0(1), ancestryPCR0(2)
 	fx := newAncestryFixture(t, testSnapshot(p1, "key-1", p0, "key-0"), &stubAuditor{})
-	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
-	delete(fx.params, testCfg.stateOriginReceiptParam("key-0", p0))
 
 	_, complete, reason := fx.a.walkAncestors(context.Background())
 
@@ -134,7 +121,7 @@ func TestAncestryGenesisHasNoAncestors(t *testing.T) {
 func TestAncestryCycleIsIncomplete(t *testing.T) {
 	p0, p1 := ancestryPCR0(1), ancestryPCR0(2)
 	fx := newAncestryFixture(t, testSnapshot(p1, "key-1", p0, "key-0"), &stubAuditor{})
-	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", p1, "key-1"))
+	fx.publish(t, testSnapshot(p0, "key-0", p1, "key-1"))
 
 	_, complete, reason := fx.a.walkAncestors(context.Background())
 
@@ -146,7 +133,7 @@ func TestAncestrySnapshotDoesNotBlockOnRefresh(t *testing.T) {
 	p0, p1 := ancestryPCR0(1), ancestryPCR0(2)
 	auditor := &stubAuditor{state: keyStateExists, block: make(chan struct{})}
 	fx := newAncestryFixture(t, testSnapshot(p1, "key-1", p0, "key-0"), auditor)
-	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
+	fx.publish(t, testSnapshot(p0, "key-0", "", ""))
 	fx.a.kickRefresh()
 	require.Eventually(
 		t,

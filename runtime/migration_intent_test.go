@@ -291,7 +291,7 @@ func TestMigrationIntentAppendConfirmsItsVersionDespiteConcurrentConflict(t *tes
 		_, err = fx.log.Head(ctx, fx.source)
 		require.ErrorIs(t, err, errMigrationIntentAmbiguous)
 		m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source}
-		require.ErrorIs(t, m.handOffToSuccessor(ctx), errMigrationIntentAmbiguous,
+		require.ErrorIs(t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAmbiguous,
 			"a successful append must not authorize a conflicting handoff")
 
 		// A subsequent abort still resolves the conflict above both writes.
@@ -330,7 +330,7 @@ func TestMigrationIntentAppendConfirmsItsVersionDespiteConcurrentConflict(t *tes
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
 		require.Equal(t, migrationStateAborted, status.State)
-		require.ErrorIs(t, m.handOffToSuccessor(ctx), errMigrationIntentAborted)
+		require.ErrorIs(t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAborted)
 
 		// Both writes cancel the round, so neither target needs another abort.
 		fx.s3.afterPut = nil
@@ -730,7 +730,9 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 				_, err = fx.log.Request(ctx, fx.source, targetB)
 				require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
 				m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source}
-				require.ErrorIs(t, m.handOffToSuccessor(ctx), errMigrationIntentAmbiguous)
+				require.ErrorIs(
+					t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAmbiguous,
+				)
 
 				aborted, err := fx.log.Abort(ctx, fx.source, targetB)
 				require.NoError(t, err)

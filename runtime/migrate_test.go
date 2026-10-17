@@ -248,7 +248,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		// own SSM traffic.
 		fx.ssmf.calls = nil
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.NoError(t, err)
 		require.Equal(
@@ -328,7 +328,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)] = "already-committed"
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
 		require.NotContains(t, err.Error(), "delete")
@@ -346,7 +346,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			fx := setup(t)
 			request(t, fx, newPCR0)
 
-			err := fx.m.handOffToSuccessor(ctx)
+			err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 			require.NoError(t, err)
 
 			predecessorOnMigrationKey := &kmsW{
@@ -364,7 +364,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("requires a published intent with zero cooldown", func(t *testing.T) {
 		fx := setup(t)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAbsent)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -377,7 +377,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, migrationStateCoolingDown, status.State)
 
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationCooldownActive)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -389,7 +389,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -399,7 +399,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx := setup(t)
 		fx.s3f.listErr = errors.New("list failed")
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorContains(t, err, "list failed")
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -417,7 +417,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		restarted.kms, restarted.masterSeed = fx.m.kms, fx.m.masterSeed
 		restarted.tlsKey = fx.m.tlsKey
 
-		err = restarted.handOffToSuccessor(ctx)
+		err = restarted.handOffToSuccessor(ctx, leaseHeld)
 
 		require.NoError(t, err)
 		require.Equal(t, migrationKeyID, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
@@ -428,7 +428,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.session.pcrs[migrationPCRIndex] = pcrExtendFromZero(bytes.Repeat([]byte{0xee}, 48))
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit new PCR0")
@@ -440,7 +440,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to create migration key")
@@ -452,7 +452,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to re-encrypt master seed")
@@ -466,7 +466,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to store master seed")
@@ -482,7 +482,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to write migration-transition receipt")
@@ -503,7 +503,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		}
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
 		require.Equal(
@@ -521,7 +521,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("transition receipt is immutable once written", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
 		param := testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)
@@ -552,7 +552,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.ssmf.putErrs = map[string]error{pointer: errors.New("throttled")}
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
 		require.NotEmpty(
@@ -561,7 +561,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		)
 
 		fx.ssmf.putErrs = nil
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
 		retryKeyID := fx.ssmf.params[pointer]
@@ -609,13 +609,40 @@ func TestHandOffToSuccessor(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 		require.Empty(
 			t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)],
 			"an aborted handoff must leave the successor uncommitted",
 		)
+	})
+
+	// The lease is checked last before each final write, so a replica that lost
+	// it to a peer neither commits nor records an abort.
+	lost := func(context.Context) error { return ErrLeaseLost }
+	t.Run("commits nothing after losing the lease", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+
+		err := fx.m.handOffToSuccessor(ctx, lost)
+
+		require.ErrorIs(t, err, ErrLeaseLost)
+		require.Empty(t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	t.Run("records no abort after losing the lease", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		fx.ssmf.params[testCfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
+
+		aborted, err := fx.m.mayAbortMigration(ctx, lost, newPCR0)
+
+		require.ErrorIs(t, err, ErrLeaseLost)
+		require.False(t, aborted)
+		status, err := fx.m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateEligible, status.State, "the intent log is unchanged")
 	})
 
 	t.Run("fails closed when the intent store is unreadable at commit", func(t *testing.T) {
@@ -628,7 +655,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			}
 		}
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.ErrorContains(t, err, "verify migration intent")
@@ -641,7 +668,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("successor restart is not revalidated against the intent log", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
 		nsm := successorNSM(t, fx, newPCR0Bytes)
@@ -671,7 +698,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
@@ -1649,6 +1676,9 @@ func requestMigrationTo(
 	}
 	return m.MigrationStatus(ctx)
 }
+
+// leaseHeld stands in for a migration lease that is still held.
+func leaseHeld(context.Context) error { return nil }
 
 func advanceMigrationForTest(t *testing.T, ctx context.Context, m *migrator) error {
 	t.Helper()

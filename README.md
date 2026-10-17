@@ -998,8 +998,9 @@ answer wins. Predecessor replicas share the challenge and intent chain.
    is unnecessary and is ignored.
 4. After the cooldown, the predecessor commits the target into PCR31, creates
    the successor's KMS key, and writes the encrypted seed, TLS key, lineage and
-   transition receipt to SSM. It writes `KMSKeyID/<successor PCR0>` last,
-   create-only, so only one predecessor replica can commit the handoff.
+   transition receipt to SSM. It then re-checks the intent and its migration
+   lease, and writes `KMSKeyID/<successor PCR0>` last, create-only, so only one
+   predecessor replica can commit the handoff.
 5. The successor verifies the handoff and key policy before decrypting, then
    publishes its snapshot with both receipts. Check `/enclave/v1/info` for
    `status: "ready"`, the expected `previous_pcr0`, and a non-empty
@@ -1019,9 +1020,12 @@ that lose the create-only write or stop before it may leave unused keys and SSM
 parameters. Do not manage `KMSKeyID/<pcr0>` through deployment tooling.
 
 An abort can also be recorded after handoff. It prevents an unpublished
-successor from adopting, but does not revoke a published snapshot. To migrate
-to a different target afterwards, restart the predecessor: its PCR31 remains
-committed to the earlier target for that boot.
+successor from adopting, but does not revoke a published snapshot. Both the
+commit and an abort re-check the migration lease just before writing, so an
+abort cannot slip between the final intent check and the pointer write unless
+the lease changes hands at that moment. To migrate to a different target
+afterwards, restart the predecessor: its PCR31 remains committed to the earlier
+target for that boot.
 
 **Retiring keys.** Keep a generation's key if you may need to boot it again.
 Otherwise, schedule deletion out of band and check the successor's signed

@@ -939,7 +939,7 @@ func TestMigrationSnapshotOutlivesItsHandoff(t *testing.T) {
 	m.kms, m.masterSeed, m.tlsKey = genesis.kms, genesis.masterSeed, genesis.tlsKey
 	_, err = requestMigrationTo(t, ctx, m, fx.signer, greenHex)
 	require.NoError(t, err)
-	require.NoError(t, m.handOffToSuccessor(ctx))
+	require.NoError(t, m.handOffToSuccessor(ctx, leaseHeld))
 
 	cfg := stateOriginTestConfig()
 	cfg.PreviousPCR0 = blueHex

@@ -210,9 +210,12 @@ the [permission preflight](#aws-requirements), telemetry and `/enclave/v1/info`;
 then, as a candidate, the wait for a handoff and state establishment; then,
 starting, PCR extension, the predecessor side of the migration protocol, TLS,
 static secret export and exec of the application, at which point the enclave is
-ready. Every step is fatal except the preflight: when it fails, the enclave stays
-up, writes nothing, and reports `status: "failed"` with the missing grants on
-`/enclave/v1/info`.
+ready. A failure in any step stops the boot. From the preflight through
+telemetry, the enclave then stays up, writes no state, and reports
+`status: "failed"` with the error on `/enclave/v1/info`; a preflight error names
+the missing grants. A failure after telemetry has started ends the runtime and
+is logged as `runtime failed` in the runtime log group. Earlier failures reach
+only the console.
 
 ## Nix API
 
@@ -742,7 +745,7 @@ preflight to any path in that namespace is answered `204` by the runtime.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
-| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` naming the missing grants when the permission preflight stops the boot), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` when the boot stops at the permission preflight or telemetry, naming the missing grants for the preflight), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before, and `{"status":"upstream_exited"}` with status 503 after the application process exits. |
 | any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
 
@@ -1345,7 +1348,11 @@ Dev deployments keep attestation signature verification enabled by leaving
 
 ### Troubleshooting
 
-**The enclave does not start.** Inspect the QEMU launcher and enclave console on
+**The enclave does not start.** Read `/enclave/v1/info`
+[from the instance](#reaching-the-enclave-from-its-instance): a boot stopped at
+the permission preflight or telemetry reports `status: "failed"` and the error.
+A failure after telemetry has started is logged as `runtime failed` in the
+runtime log group. Otherwise, inspect the QEMU launcher and enclave console on
 the affected enclave node.
 
 **`starting clock sync failed: open /dev/ptp0`.** Nested KVM, invariant TSC
@@ -1395,9 +1402,9 @@ from SSM.
 
 **CloudWatch Logs is a hard boot dependency.** Before starting the application,
 the runtime creates both log groups and streams and writes a probe through the
-OTLP endpoint. Any failure aborts startup. The probe writes only to the runtime
-group: a policy that denies the application group still boots, and the
-application's log uploads then fail, counted in
+OTLP endpoint. Any failure aborts startup and is reported on `/enclave/v1/info`.
+The probe writes only to the runtime group: a policy that denies the application
+group still boots, and the application's log uploads then fail, counted in
 `enclave_otlp_logs_upstream_errors_total`. Span and metric export failures, when
 those signals are enabled, are reported but are not fatal.
 

@@ -40,7 +40,17 @@ type RuntimeState interface {
 	ChildDone() <-chan error
 }
 
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (err error) {
+	// Run logs its own failure, before telemetry shuts down, so the record is
+	// exported rather than dropped.
+	shutdownTelemetry := func() {}
+	defer func() {
+		if err != nil {
+			slog.Error("runtime failed", "error", err)
+		}
+		shutdownTelemetry()
+	}()
+
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
@@ -49,7 +59,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	ctx, err := StartClockSyncer(ctx, &cfg)
+	ctx, err = StartClockSyncer(ctx, &cfg)
 	if err != nil {
 		return fmt.Errorf("clock sync failed: %w", err)
 	}
@@ -101,26 +111,33 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, candidateCertCb))
 
-	pcr0, err := nsm.PCR0()
-	if err != nil {
-		return fmt.Errorf("failed to read PCR0 for permission preflight: %w", err)
-	}
-	if len(pcr0) != 48 {
-		return fmt.Errorf("invalid PCR0 length for permission preflight: %d", len(pcr0))
-	}
-
-	// Check permissions before durable writes; keep failures visible through the API.
-	if err := CheckPermissions(ctx, &cfg, ssm, aws.IAM, aws.STS, pcr0); err != nil {
+	// Before telemetry starts, the API is the only channel an operator can read.
+	bootStopped := func(err error) error {
 		slog.Error("boot stopped", "error", err)
 		servers.ReportBootFailure(err)
 		return waitForRuntime(ctx, rt)
 	}
 
-	if err := telemetry.Start(ctx); err != nil {
-		return err
+	pcr0, err := nsm.PCR0()
+	if err != nil {
+		return bootStopped(fmt.Errorf("failed to read PCR0 for permission preflight: %w", err))
+	}
+	if len(pcr0) != 48 {
+		return bootStopped(
+			fmt.Errorf("invalid PCR0 length for permission preflight: %d", len(pcr0)),
+		)
 	}
 
-	defer telemetry.Shutdown()
+	// Check permissions before durable writes.
+	if err := CheckPermissions(ctx, &cfg, ssm, aws.IAM, aws.STS, pcr0); err != nil {
+		return bootStopped(err)
+	}
+
+	if err := telemetry.Start(ctx); err != nil {
+		return bootStopped(err)
+	}
+
+	shutdownTelemetry = telemetry.Shutdown
 
 	ctx, initSpan := otel.Tracer(runtimeService).Start(ctx, "init")
 	initSpanEnded := false

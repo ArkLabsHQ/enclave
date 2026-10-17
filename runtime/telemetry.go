@@ -559,6 +559,14 @@ func (t *Telemetry) Shutdown() {
 	t.shutdownOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
 		defer cancel()
+		// Logs go first: the last record before exit is usually the one that
+		// explains it, so a stalled span or metric export must not spend its
+		// deadline.
+		if t.lp != nil {
+			if err := t.lp.Shutdown(ctx); err != nil {
+				t.exportFailed(fmt.Errorf("logger provider shutdown: %w", err))
+			}
+		}
 		if t.tp != nil {
 			if err := t.tp.Shutdown(ctx); err != nil {
 				t.exportFailed(fmt.Errorf("tracer provider shutdown: %w", err))
@@ -567,11 +575,6 @@ func (t *Telemetry) Shutdown() {
 		if t.mp != nil {
 			if err := t.mp.Shutdown(ctx); err != nil {
 				t.exportFailed(fmt.Errorf("meter provider shutdown: %w", err))
-			}
-		}
-		if t.lp != nil {
-			if err := t.lp.Shutdown(ctx); err != nil {
-				t.exportFailed(fmt.Errorf("logger provider shutdown: %w", err))
 			}
 		}
 	})

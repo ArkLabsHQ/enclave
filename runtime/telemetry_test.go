@@ -202,6 +202,28 @@ func TestRuntimeLogsArriveAsOTLP(t *testing.T) {
 	require.Equal(t, "test", attrs["component"])
 }
 
+func TestShutdownFlushesLogsWhenATraceExportHangs(t *testing.T) {
+	up := newFakeOTLPEndpoints(t)
+	up.hang("/v1/traces")
+	telemetry := NewTelemetry(
+		testConfigWithLogShipInterval(time.Hour),
+		testAWS(t, newFakeCloudWatchLogs(), up.URL),
+	)
+	startTelemetry(t, context.Background(), telemetry)
+
+	_, span := telemetry.tp.Tracer("test").Start(context.Background(), "hung")
+	span.End()
+	slog.Error("runtime failed", "error", "boom")
+	telemetry.Shutdown()
+	up.CloseClientConnections() // release the hung request
+
+	flushed := false
+	for _, call := range up.callsTo("/v1/logs")[1:] { // [0] is the startup probe
+		flushed = flushed || bytes.Contains(call.body, []byte("runtime failed"))
+	}
+	require.True(t, flushed, "a hung trace export must not cost the fatal log record")
+}
+
 func TestSlogHandlerWithoutAProviderWritesStderrOnly(t *testing.T) {
 	var stderr bytes.Buffer
 	logger := slog.New(newSlogHandler(&stderr, nil))
@@ -420,19 +442,27 @@ type fakeOTLPEndpoints struct {
 	calls      []otlpCall
 	status     map[string]int
 	reply      map[string]string
+	hung       map[string]bool
 	retryAfter string
 }
 
 func newFakeOTLPEndpoints(t *testing.T) *fakeOTLPEndpoints {
 	t.Helper()
-	f := &fakeOTLPEndpoints{status: map[string]int{}, reply: map[string]string{}}
+	f := &fakeOTLPEndpoints{
+		status: map[string]int{}, reply: map[string]string{}, hung: map[string]bool{},
+	}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.calls = append(f.calls, otlpCall{path: r.URL.Path, header: r.Header.Clone(), body: body})
 		status, scripted := f.status[r.URL.Path]
 		reply, retryAfter := f.reply[r.URL.Path], f.retryAfter
+		hung := f.hung[r.URL.Path]
 		f.mu.Unlock()
+		if hung {
+			<-r.Context().Done()
+			return
+		}
 		if !scripted {
 			status = http.StatusOK
 		}
@@ -463,6 +493,13 @@ func (f *fakeOTLPEndpoints) callsTo(path string) []otlpCall {
 func (f *fakeOTLPEndpoints) fail(path string, status int) {
 	f.mu.Lock()
 	f.status[path] = status
+	f.mu.Unlock()
+}
+
+// hang makes path answer nothing until the caller gives up.
+func (f *fakeOTLPEndpoints) hang(path string) {
+	f.mu.Lock()
+	f.hung[path] = true
 	f.mu.Unlock()
 }
 

@@ -941,6 +941,8 @@ green.wait_until_succeeds(
 # it brings blue back on the same key and secret. The emulator does not evaluate
 # key policies, so this proves the recovery, not the role's right to perform it.
 restart_expecting_boot_failure(blue, "KMSInvalidStateException")
+# The fatal error is exported before telemetry shuts down, not only printed.
+wait_for_otlp("logs", "runtime failed", f"{LOG_PREFIX}/logs/runtime")
 cloud(f"kms cancel-key-deletion --key-id {shlex.quote(genesis_key)}")
 restart_expecting_boot_failure(blue, "DisabledException")
 cloud(f"kms enable-key --key-id {shlex.quote(genesis_key)}")

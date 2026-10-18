@@ -1393,39 +1393,51 @@ func (f *snapshotTestFixture) seed(t *testing.T, owner []byte, body []byte, at t
 func (f *snapshotTestFixture) read(t *testing.T, owner []byte) (*Snapshot, error) {
 	t.Helper()
 	return readSnapshot(
-		t.Context(), testCfg, f.s3f, f.boot.nsm, stateOriginTestMigrationIntentBucket(),
+		t.Context(), f.boot.cfg, f.s3f, f.boot.nsm, stateOriginTestMigrationIntentBucket(),
 		hex.EncodeToString(owner),
 	)
 }
 
 func TestSnapshotRoundTrip(t *testing.T) {
-	for _, predecessor := range [][]byte{nil, snapshotTestPredecessor} {
-		fx := newSnapshotTestFixture(t)
-		snapshot := testGenerationSnapshot(snapshotTestOwner, predecessor, "key-1")
-		root, err := snapshot.root(testCfg)
-		require.NoError(t, err)
-		transition, _ := fx.receipts(t, snapshot, root)
+	for _, tc := range []struct {
+		name string
+		dev  bool
+	}{
+		{"prod", false},
+		{"dev", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newTestConfig(testCfg.Namespace, testCfg.AppName, tc.dev)
+			for _, predecessor := range [][]byte{nil, snapshotTestPredecessor} {
+				fx := newSnapshotTestFixture(t)
+				fx.boot.cfg = cfg
+				snapshot := testGenerationSnapshot(snapshotTestOwner, predecessor, "key-1")
+				root, err := snapshot.root(cfg)
+				require.NoError(t, err)
+				transition, _ := fx.receipts(t, snapshot, root)
 
-		published, err := fx.boot.publishSnapshot(t.Context(), withTransition(snapshot, transition))
-		require.NoError(t, err)
+				published, err := fx.boot.publishSnapshot(t.Context(), withTransition(snapshot, transition))
+				require.NoError(t, err)
 
-		require.Equal(t, withTransition(snapshot, transition), *published)
-		publishedRoot, err := (*published).root(testCfg)
-		require.NoError(t, err)
-		require.Equal(t, root, publishedRoot, "the receipts are not part of the root")
-		read, err := fx.read(t, snapshotTestOwner)
-		require.NoError(t, err)
-		require.Equal(t, published, read)
+				require.Equal(t, withTransition(snapshot, transition), *published)
+				publishedRoot, err := (*published).root(cfg)
+				require.NoError(t, err)
+				require.Equal(t, root, publishedRoot, "the receipts are not part of the root")
+				read, err := fx.read(t, snapshotTestOwner)
+				require.NoError(t, err)
+				require.Equal(t, published, read)
 
-		objects := fx.s3f.objects[snapshotObjectKey(snapshot.ownerPCR0)]
-		require.Len(t, objects, 1)
-		require.Equal(t, s3types.ObjectLockModeCompliance, objects[0].lockMode)
-		require.WithinDuration(
-			t,
-			time.Now().Add(prodRetention),
-			objects[0].retainUntil,
-			time.Minute,
-		)
+				objects := fx.s3f.objects[snapshotObjectKey(snapshot.ownerPCR0)]
+				require.Len(t, objects, 1)
+				require.Equal(t, s3types.ObjectLockModeCompliance, objects[0].lockMode)
+				require.WithinDuration(
+					t,
+					time.Now().Add(cfg.SnapshotRetention),
+					objects[0].retainUntil,
+					10*time.Second,
+				)
+			}
+		})
 	}
 }
 
@@ -1466,13 +1478,47 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 		mutate   func(*testing.T, *snapshotTestFixture, *snapshotObjectV1)
 		raw      func(*testing.T, *snapshotTestFixture) []byte
 		lock     func(*fakeS3Object)
+		wantErr  string
 	}{
 		{
-			name: "tampered ciphertext", snapshot: genesis,
-			mutate: func(_ *testing.T, _ *snapshotTestFixture, obj *snapshotObjectV1) {
-				obj.Snapshot = bytes.Clone(obj.Snapshot)
-				obj.Snapshot[len(obj.Snapshot)-1] ^= 0xff
+			name: "tampered master seed ciphertext", snapshot: genesis,
+			mutate: func(t *testing.T, _ *snapshotTestFixture, obj *snapshotObjectV1) {
+				doc := snapshotDoc(t, genesis)
+				doc.MasterSeedCiphertext[0] ^= 0xff
+				var err error
+				obj.Snapshot, err = encodeSnapshotDoc(doc)
+				require.NoError(t, err)
 			},
+			wantErr: "invalid state-origin receipt",
+		},
+		{
+			name: "tampered TLS key ciphertext", snapshot: genesis,
+			mutate: func(t *testing.T, _ *snapshotTestFixture, obj *snapshotObjectV1) {
+				doc := snapshotDoc(t, genesis)
+				doc.TLSKeyCiphertext[0] ^= 0xff
+				var err error
+				obj.Snapshot, err = encodeSnapshotDoc(doc)
+				require.NoError(t, err)
+			},
+			wantErr: "invalid state-origin receipt",
+		},
+		{
+			name: "missing master seed ciphertext",
+			raw: func(t *testing.T, fx *snapshotTestFixture) []byte {
+				snapshot := genesis
+				snapshot.masterSeedCiphertext = ""
+				return fx.body(t, snapshot, nil)
+			},
+			wantErr: "snapshot is incomplete",
+		},
+		{
+			name: "missing TLS key ciphertext",
+			raw: func(t *testing.T, fx *snapshotTestFixture) []byte {
+				snapshot := genesis
+				snapshot.tlsKeyCiphertext = ""
+				return fx.body(t, snapshot, nil)
+			},
+			wantErr: "snapshot is incomplete",
 		},
 		{
 			name: "non-canonical snapshot encoding", snapshot: genesis,
@@ -1648,6 +1694,10 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 						tc.mutate(t, fx, obj)
 					}
 				})
+			}
+			if tc.wantErr != "" {
+				_, err := parseSnapshotObject(testCfg, fx.boot.nsm, body)
+				require.ErrorContains(t, err, tc.wantErr)
 			}
 			fx.seed(t, snapshotTestOwner, body, time.Now())
 			if tc.lock != nil {

@@ -1772,8 +1772,7 @@ func TestSnapshotStoreErrorsFailClosed(t *testing.T) {
 	require.ErrorIs(t, err, errSnapshotUnverifiable, "an unread version is not an absence")
 }
 
-// A host can stack a compliance-locked version S3 will not serve; it must not
-// brick an image whose valid snapshot predates it.
+// An unreadable newer version must not hide a valid snapshot.
 func TestSnapshotUnreadableVersionDoesNotBlockBoot(t *testing.T) {
 	fx := newSnapshotTestFixture(t)
 	base := time.Now().Add(-time.Hour)

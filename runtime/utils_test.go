@@ -698,8 +698,7 @@ type fakeS3 struct {
 	// getMissing simulates an object disappearing between HeadObject and GetObject.
 	getMissing map[string]bool
 
-	// getErrVersions fails GetObject for one version ID, like an object S3 will
-	// not serve (SSE-C, archived).
+	// getErrVersions simulates GetObject failures for specific versions.
 	getErrVersions map[string]error
 
 	// versioned gives DeleteObject without a VersionId AWS's versioned-bucket

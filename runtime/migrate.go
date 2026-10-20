@@ -154,9 +154,7 @@ func (m *migrator) SetSnapshot(snapshot Snapshot) {
 
 func (m *migrator) PreviousPCR0Info(context.Context) (*PreviousPCR0Info, error) {
 	snapshot := m.snapshot.Load()
-	// Without an adopted snapshot, report the predecessor measured into the image:
-	// genesis, or the PCR0 a candidate awaits. Only an adopted snapshot's
-	// transition receipt attests it.
+	// Until a snapshot is adopted, report the measured predecessor without attestation.
 	if snapshot == nil || snapshot.predecessorPCR0 == "" {
 		return &PreviousPCR0Info{PCR0: strings.ToLower(m.cfg.PreviousPCR0)}, nil
 	}

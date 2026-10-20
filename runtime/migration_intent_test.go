@@ -982,6 +982,35 @@ func TestMigrationIntentS3Failures(t *testing.T) {
 		})
 	}
 
+	// Unlike a snapshot, an intent must never be skipped: skipping an abort would
+	// leave the request it cancelled as the head.
+	t.Run("an unreadable abort", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		now := time.Now()
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, 1),
+			fx.object(t, 1, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+			now,
+		)
+		abortKey := migrationIntentObjectKey(fx.source, 2)
+		fx.s3.putRawObjectAt(
+			abortKey,
+			fx.object(t, 2, migrationIntentAborted, target, migrationIntentTestBucket, fx.pcr0),
+			now.Add(time.Second),
+		)
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentAborted, head.Action)
+
+		objects := fx.s3.objects[abortKey]
+		fx.s3.getErrVersions = map[string]error{
+			objects[len(objects)-1].id: errors.New("get failed"),
+		}
+		_, err = fx.log.Head(ctx, fx.source)
+
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+
 	t.Run("put", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
 		fx.s3.putErr = errors.New("put failed")

@@ -1766,7 +1766,27 @@ func TestSnapshotStoreErrorsFailClosed(t *testing.T) {
 		fx.body(t, testGenerationSnapshot(snapshotTestOwner, nil, "key-1"), nil), time.Now())
 	fx.s3f.getErr = errors.New("s3 down")
 	_, err = fx.read(t, snapshotTestOwner)
-	require.ErrorIs(t, err, errSnapshotStoreUnavailable)
+	require.ErrorIs(t, err, errSnapshotUnverifiable, "an unread version is not an absence")
+}
+
+// A host can stack a compliance-locked version S3 will not serve; it must not
+// brick an image whose valid snapshot predates it.
+func TestSnapshotUnreadableVersionDoesNotBlockBoot(t *testing.T) {
+	fx := newSnapshotTestFixture(t)
+	base := time.Now().Add(-time.Hour)
+	key := snapshotObjectKey(hex.EncodeToString(snapshotTestOwner))
+	genuine := testGenerationSnapshot(snapshotTestOwner, nil, "genuine-key")
+	fx.seed(t, snapshotTestOwner, fx.body(t, genuine, nil), base)
+	fx.s3f.putRawObjectAt(key, []byte("unreadable"), base.Add(time.Minute))
+	objects := fx.s3f.objects[key]
+	fx.s3f.getErrVersions = map[string]error{
+		objects[len(objects)-1].id: errors.New("InvalidObjectState"),
+	}
+
+	state, err := fx.read(t, snapshotTestOwner)
+
+	require.NoError(t, err)
+	require.Equal(t, genuine.kmsKeyID, state.kmsKeyID)
 }
 
 // A peer's equivalent publication is accepted on its own receipts; a different
@@ -1862,5 +1882,4 @@ func TestPublishSnapshotRequiresTheLockToHold(t *testing.T) {
 	_, err := fx.boot.publishSnapshot(t.Context(), snapshot)
 
 	require.ErrorIs(t, err, errSnapshotUnverifiable)
-	require.ErrorContains(t, err, "compliance-mode Object Lock")
 }

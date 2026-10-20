@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -431,9 +430,6 @@ func (b *Boot) publishSnapshot(
 	published, err := readSnapshot(
 		ctx, b.cfg, b.s3, b.nsm, snapshot.migrationIntentBucketName, snapshot.ownerPCR0,
 	)
-	if errors.Is(err, errSnapshotUnverifiable) {
-		return nil, fmt.Errorf("%w; the bucket must apply compliance-mode Object Lock", err)
-	}
 	if err != nil {
 		return nil, err
 	}

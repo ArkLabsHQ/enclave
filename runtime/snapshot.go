@@ -231,8 +231,13 @@ func readSnapshot(
 				cfg.SnapshotRetention, cfg.IntentWriteTimeout,
 				errSnapshotStoreUnavailable, "snapshot",
 			)
-			if err != nil || !ok {
-				return false, err
+			if err != nil {
+				slog.Warn("ignoring unreadable snapshot",
+					"key", key, "version", versionID, "error", err)
+				return false, nil
+			}
+			if !ok {
+				return false, nil
 			}
 			snapshot, err := openSnapshot(cfg, nsm, bucket, strings.ToLower(pcr0), body)
 			if err != nil {

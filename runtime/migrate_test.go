@@ -16,36 +16,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The unauthenticated info endpoint is answered from the snapshot boot
-// published, never from SSM or S3.
+// The unauthenticated info endpoint is answered from the measured config and the
+// snapshot boot published, never from SSM or S3.
 func TestMigratorPreviousPCR0Info(t *testing.T) {
 	ctx := context.Background()
 	infoPCR0Bytes := bytes.Repeat([]byte{0x5a}, 48)
 	s3f := newFakeS3()
 	s3f.listErr, s3f.getErr = errors.New("s3 down"), errors.New("s3 down")
-	m, err := NewMigrator(
-		testCfg,
-		kmsTestNSMWithPCR0(t, infoPCR0Bytes), NewSSM(&fakeSSM{err: errors.New("ssm down")}),
-		s3f, migrationIntentTestBucket,
-	)
-	require.NoError(t, err)
+	newInfoMigrator := func(previous string) Migrator {
+		m, err := NewMigrator(
+			successorTestCfg(previous),
+			kmsTestNSMWithPCR0(t, infoPCR0Bytes), NewSSM(&fakeSSM{err: errors.New("ssm down")}),
+			s3f, migrationIntentTestBucket,
+		)
+		require.NoError(t, err)
+		return m
+	}
 
-	info, err := m.PreviousPCR0Info(ctx)
+	genesis := newInfoMigrator(genesisPreviousPCR0)
+	info, err := genesis.PreviousPCR0Info(ctx)
 	require.NoError(t, err)
 	require.Equal(t, &PreviousPCR0Info{PCR0: genesisPreviousPCR0}, info, "nothing established yet")
 
-	m.SetSnapshot(testGenerationSnapshot(infoPCR0Bytes, nil, "key-0"))
-	info, err = m.PreviousPCR0Info(ctx)
+	genesis.SetSnapshot(testGenerationSnapshot(infoPCR0Bytes, nil, "key-0"))
+	info, err = genesis.PreviousPCR0Info(ctx)
 	require.NoError(t, err)
 	require.Equal(t, &PreviousPCR0Info{PCR0: genesisPreviousPCR0}, info)
 
-	migrated := testGenerationSnapshot(infoPCR0Bytes, snapshotTestPredecessor, "key-1")
-	m.SetSnapshot(withTransition(migrated, "transition"))
-	info, err = m.PreviousPCR0Info(ctx)
+	predecessor := hex.EncodeToString(snapshotTestPredecessor)
+	successor := newInfoMigrator(strings.ToUpper(predecessor))
+	info, err = successor.PreviousPCR0Info(ctx)
 	require.NoError(t, err)
-	require.Equal(t, &PreviousPCR0Info{
-		PCR0: hex.EncodeToString(snapshotTestPredecessor), Attestation: "transition",
-	}, info)
+	require.Equal(t, &PreviousPCR0Info{PCR0: predecessor}, info, "candidate: measured, unattested")
+
+	migrated := testGenerationSnapshot(infoPCR0Bytes, snapshotTestPredecessor, "key-1")
+	successor.SetSnapshot(withTransition(migrated, "transition"))
+	info, err = successor.PreviousPCR0Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, &PreviousPCR0Info{PCR0: predecessor, Attestation: "transition"}, info)
 }
 
 func TestMigratorMigrationStatus(t *testing.T) {

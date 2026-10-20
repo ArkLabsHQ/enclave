@@ -698,6 +698,10 @@ type fakeS3 struct {
 	// getMissing simulates an object disappearing between HeadObject and GetObject.
 	getMissing map[string]bool
 
+	// getErrVersions fails GetObject for one version ID, like an object S3 will
+	// not serve (SSE-C, archived).
+	getErrVersions map[string]error
+
 	// versioned gives DeleteObject without a VersionId AWS's versioned-bucket
 	// behaviour: it stacks a delete marker, even over a compliance-locked version.
 	versioned bool
@@ -868,6 +872,9 @@ func (f *fakeS3) GetObject(
 	defer f.mu.Unlock()
 	if f.getMissing[aws.ToString(in.Key)] {
 		return nil, &s3types.NoSuchKey{}
+	}
+	if err := f.getErrVersions[aws.ToString(in.VersionId)]; err != nil {
+		return nil, err
 	}
 	objects := f.objects[aws.ToString(in.Key)]
 	for i := len(objects) - 1; i >= 0; i-- {

@@ -1416,7 +1416,10 @@ func TestSnapshotRoundTrip(t *testing.T) {
 				require.NoError(t, err)
 				transition, _ := fx.receipts(t, snapshot, root)
 
-				published, err := fx.boot.publishSnapshot(t.Context(), withTransition(snapshot, transition))
+				published, err := fx.boot.publishSnapshot(
+					t.Context(),
+					withTransition(snapshot, transition),
+				)
 				require.NoError(t, err)
 
 				require.Equal(t, withTransition(snapshot, transition), *published)

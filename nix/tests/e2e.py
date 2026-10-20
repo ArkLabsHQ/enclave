@@ -284,18 +284,28 @@ blue.succeed(
 blue.succeed("curl -skf --http1.1 https://127.0.0.1/test/health >/dev/null")
 
 
-def otlp(signal):
-    return json.loads(aws.succeed(f"curl -fsS http://127.0.0.1:4318/_otlp/{signal}"))
+# Filter on the aws node: the driver reads output back as base64 over the VM
+# console, and a dump of hundreds of KB can arrive corrupted.
+def otlp(signal, jq_filter, **jq_args):
+    args = " ".join(f"--arg {name} {shlex.quote(value)}" for name, value in jq_args.items())
+    return json.loads(aws.succeed(
+        f"curl -fsS http://127.0.0.1:4318/_otlp/{signal} "
+        f"| jq -c {args} {shlex.quote(jq_filter)}"
+    ))
 
 
 def wait_for_otlp(signal, needle, group=None, timeout=90):
     deadline = time.time() + timeout
     while True:
-        for record in otlp(signal):
-            if group is not None and record["group"] != group:
-                continue
-            if needle in json.dumps(record["body"], separators=(",", ":")):
-                return record
+        matches = otlp(
+            signal,
+            '[.[] | select($group == "" or .group == $group) '
+            "| select(.body | tojson | contains($needle))][:1]",
+            group=group or "",
+            needle=needle,
+        )
+        if matches:
+            return matches[0]
         if time.time() > deadline:
             print(aws.execute("journalctl -u awsmocks --no-pager -n 50")[1])
             raise Exception(f"{needle!r} never reached the {signal} endpoint")
@@ -329,12 +339,14 @@ for signal in ("logs", "traces", "metrics"):
         assert len(point["bucketCounts"]) == len(point["explicitBounds"]) + 1, point
         assert sum(int(n) for n in point["bucketCounts"]) == int(point["count"]), point
 
-for record in otlp("logs"):
-    assert record["stream"] == INSTANCE_ID, record
-    body = json.dumps(record["body"], separators=(",", ":"))
-    if record["group"] == f"{LOG_PREFIX}/logs/app":
-        assert "enclave-runtime" not in body, body
-        assert "child started" not in body, body
+misrouted = otlp(
+    "logs",
+    "[.[] | select(.stream != $stream or (.group == $app and (.body | tojson "
+    '| contains("enclave-runtime") or contains("child started"))))]',
+    stream=INSTANCE_ID,
+    app=f"{LOG_PREFIX}/logs/app",
+)
+assert misrouted == [], misrouted
 
 # Genesis published blue's whole state as one Object-Locked S3 object and wrote
 # nothing about it to SSM: no commit pointer, no ciphertexts, no receipts. The

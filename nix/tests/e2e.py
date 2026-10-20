@@ -586,9 +586,12 @@ for version in versions:
 with subtest("both blues reject the multipart replay"):
     try:
         # Rejection is observable even if the genuine cooldown elapsed while
-        # the AWS CLI prepared and checked the replay.
+        # the AWS CLI prepared and checked the replay. Only the migration lease
+        # holder scans intents on its own ticks, and replicas on synced clocks
+        # can lose that race every tick; the info endpoint scans on each call.
         for node in BLUES:
             node.wait_until_succeeds(
+                "curl -sk --http1.1 -o /dev/null https://127.0.0.1/enclave/v1/info; "
                 "tr -d '\\000' </var/log/enclave-console.log "
                 "| grep -F 'ignoring multipart migration intent'",
                 timeout=30,

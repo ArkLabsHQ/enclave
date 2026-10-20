@@ -94,11 +94,19 @@ func TestHealthHandler(t *testing.T) {
 	tests := []struct {
 		name     string
 		ready    bool
+		exited   bool
 		wantCode int
 		wantBody string
 	}{
-		{"initializing", false, http.StatusServiceUnavailable, `{"status":"initializing"}`},
-		{"ready", true, http.StatusOK, `{"status":"ready"}`},
+		{"initializing", false, false, http.StatusServiceUnavailable, `{"status":"initializing"}`},
+		{"ready", true, false, http.StatusOK, `{"status":"ready"}`},
+		{
+			"ready but exited",
+			true,
+			true,
+			http.StatusServiceUnavailable,
+			`{"status":"upstream_exited"}`,
+		},
 	}
 
 	for _, tc := range tests {
@@ -106,6 +114,10 @@ func TestHealthHandler(t *testing.T) {
 			rt := newRuntimeState()
 			if tc.ready {
 				rt.NotifyReady()
+			}
+			if tc.exited {
+				go func() { <-rt.ChildDone() }()
+				rt.NotifyChildExit(errors.New("killed"))
 			}
 
 			rr := httptest.NewRecorder()

@@ -179,9 +179,12 @@ state even if their receipt bytes differ; a publisher with different state fails
 and can resume the winner's state on restart.
 
 Boot synchronises the clock, starts networking and AWS clients, applies the SSM
-overlay, and runs the [permission preflight](#aws-requirements) before establishing
-state. A failed preflight leaves `/enclave/v1/info` available with status
-`failed` and the missing grants. Other boot failures terminate the runtime.
+overlay, runs the [permission preflight](#aws-requirements) and starts telemetry
+before establishing state. A failure from the preflight through telemetry leaves
+`/enclave/v1/info` available with status `failed` and the error, naming the
+missing grants for the preflight, and writes no state. Later failures terminate
+the runtime and are logged as `runtime failed` in the runtime log group. Earlier
+failures reach only the console.
 
 ### Generation state
 
@@ -746,8 +749,8 @@ preflight to any path in that namespace is answered `204` by the runtime.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 39 bytes: ASCII `sha256:` followed by the raw 32-byte SHA-256 of the TLS PublicKey. `503` until the application has been started, so always on a candidate. |
-| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` naming the missing grants when the permission preflight stops the boot), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
-| GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` when the boot stops at the permission preflight or telemetry, naming the missing grants for the preflight), for a candidate the predecessor offering it a handoff, PCR0, predecessor PCR0 and attestation, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. |
+| GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before, and `{"status":"upstream_exited"}` with status 503 after the application process exits. |
 | any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
 
 Telemetry is forwarded, never stored. The OTLP forwarders live on the internal
@@ -1266,7 +1269,11 @@ a deployment system, host image lifecycle or traffic cutover.
 
 ### Troubleshooting
 
-**The enclave does not start.** Inspect the QEMU launcher and enclave console on
+**The enclave does not start.** Read `/enclave/v1/info`
+[from the instance](#reaching-the-enclave-from-its-instance): a boot stopped at
+the permission preflight or telemetry reports `status: "failed"` and the error.
+A failure after telemetry has started is logged as `runtime failed` in the
+runtime log group. Otherwise, inspect the QEMU launcher and enclave console on
 the affected enclave node.
 
 **`starting clock sync failed: open /dev/ptp0`.** Nested KVM, invariant TSC
@@ -1315,7 +1322,8 @@ prevents replay, but the host chooses which image to launch. Inspect the target
 PCR0 during the cooldown as described in [Blue/green migration](#bluegreen-migration).
 
 **CloudWatch Logs is a boot dependency.** Startup creates both log groups and
-streams and probes the runtime group's OTLP path. The probe does not test
+streams and probes the runtime group's OTLP path. A failure stops the boot and is
+reported on `/enclave/v1/info`. The probe does not test
 application uploads: those can fail later and increment
 `enclave_otlp_logs_upstream_errors_total`. Trace and metric export failures are
 not fatal.

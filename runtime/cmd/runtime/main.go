@@ -28,8 +28,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Run logs its own error, while telemetry can still export it.
 	if err := runtime.Run(ctx, *cfg); err != nil {
-		slog.Error("runtime failed", "error", err)
 		os.Exit(1)
 	}
 }

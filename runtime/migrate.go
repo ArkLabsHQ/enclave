@@ -343,20 +343,21 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 
 	switch status.State {
 	case migrationStateAmbiguous:
-		aborted, err := m.mayAbortMigration(ctx, status.AmbiguousTargets...)
+		aborted, err := m.mayAbortMigration(ctx, lease.Verify, status.AmbiguousTargets...)
 		if err != nil || aborted {
 			return err
 		}
 		return errMigrationIntentAmbiguous
 	case migrationStateCoolingDown:
-		_, err := m.mayAbortMigration(ctx, status.TargetPCR0)
+		_, err := m.mayAbortMigration(ctx, lease.Verify, status.TargetPCR0)
 		return err
 	case migrationStateEligible:
-		aborted, err := m.mayAbortMigration(ctx, status.TargetPCR0)
+		aborted, err := m.mayAbortMigration(ctx, lease.Verify, status.TargetPCR0)
 		if err != nil || aborted {
 			return err
 		}
-		if err := m.handOffToSuccessor(ctx); !errors.Is(err, errMigrationAlreadyFinalised) {
+		err = m.handOffToSuccessor(ctx, lease.Verify)
+		if !errors.Is(err, errMigrationAlreadyFinalised) {
 			return err
 		}
 		return nil
@@ -546,7 +547,9 @@ func (m *migrator) verifyChallengeResponses(
 
 // mayAbortMigration records an abort naming one of targets, even after the
 // handoff commits, so an inadequate target can always be abandoned.
-func (m *migrator) mayAbortMigration(ctx context.Context, targets ...string) (bool, error) {
+func (m *migrator) mayAbortMigration(
+	ctx context.Context, verifyLease func(context.Context) error, targets ...string,
+) (bool, error) {
 	abortParam := m.cfg.migrationResponseParam(m.pcr0, migrationAbortResponse)
 	abortedPCR0, err := m.ssm.MayGet(ctx, abortParam)
 	if err != nil {
@@ -558,6 +561,11 @@ func (m *migrator) mayAbortMigration(ctx context.Context, targets ...string) (bo
 		return false, nil
 	}
 
+	// Only the lease holder records an abort: a replica that lost the lease may be
+	// racing a peer's commit.
+	if err := verifyLease(ctx); err != nil {
+		return false, fmt.Errorf("verify migration lease: %w", err)
+	}
 	if _, err := m.intent.Abort(ctx, m.pcr0, abortedPCR0); err != nil {
 		return false, err
 	}
@@ -590,7 +598,9 @@ func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error
 }
 
 // handOffToSuccessor exports state, then commits the target generation.
-func (m *migrator) handOffToSuccessor(ctx context.Context) error {
+func (m *migrator) handOffToSuccessor(
+	ctx context.Context, verifyLease func(context.Context) error,
+) error {
 	status, err := m.eligibleHandOff(ctx)
 	if err != nil {
 		return err
@@ -690,6 +700,11 @@ func (m *migrator) handOffToSuccessor(ctx context.Context) error {
 
 	if err := m.verifyIntent(ctx, m.pcr0, targetPCR0, status.Sequence); err != nil {
 		return err
+	}
+	// Checked last: a replica that lost the lease to a peer, which may be
+	// recording an abort, must not commit.
+	if err := verifyLease(ctx); err != nil {
+		return fmt.Errorf("verify migration lease: %w", err)
 	}
 
 	// Atomic commit: from here, the successor boots on the migration key.

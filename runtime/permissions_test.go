@@ -102,7 +102,8 @@ func TestPermissionsPreflight(t *testing.T) {
 				"ssm:PutParameter": true, "kms:CreateKey": true,
 			}},
 			wantErr: []string{
-				"SSMParams ssm:PutParameter",
+				"SSMMigrationCoordination ssm:PutParameter on arn:aws:ssm::123456789012:" +
+					"parameter/prod/app/enclave/MigrationChallenge/" + permissionTestPCR0,
 				"KMSAccess kms:CreateKey on * (implicitDeny)",
 			},
 		},
@@ -174,9 +175,25 @@ func TestPermissionsPreflight(t *testing.T) {
 			fake.simulated("s3:PutObject", "arn:aws:s3:::lease-bucket/prod/app/lock/genesis"),
 		)
 		require.True(t, fake.simulated("s3:ListBucketVersions", "arn:aws:s3:::"+intentBucket))
-		require.True(t, fake.simulated(
-			"ssm:PutParameter", "arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/*",
-		))
+		ssmARN := "arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/"
+		require.True(t, fake.simulated("ssm:GetParameter", ssmARN+"*"))
+		require.False(t, fake.simulated("ssm:PutParameter", ssmARN+"*"),
+			"SSM writes are scoped to migration coordination")
+		for _, param := range []string{
+			"MigrationChallenge/" + permissionTestPCR0,
+			"locked/KMSKeyID/*", "locked/MasterSeed/Ciphertext/*", "locked/TLSKey/Ciphertext/*",
+			"MigrationPreviousPCR0/*", "MigrationPreviousKMSKeyID/*",
+			"MigrationStateOriginReceipt/*/*", "MigrationResponse/*/*",
+		} {
+			require.True(t, fake.simulated("ssm:PutParameter", ssmARN+param), param)
+		}
+		for _, key := range []string{
+			snapshotObjectKey(permissionTestPCR0), "migration-intent/" + permissionTestPCR0 + "/*",
+		} {
+			require.True(t, fake.simulated("s3:PutObject", "arn:aws:s3:::"+intentBucket+"/"+key))
+		}
+		require.False(t, fake.simulated("s3:PutObject", "arn:aws:s3:::"+intentBucket+"/*"),
+			"an enclave publishes only its own state and intents")
 		require.True(t, fake.simulated("kms:CreateKey", "*"),
 			"CreateKey has no resource type, so IAM evaluates it against *")
 		require.True(t, fake.simulated(
@@ -329,7 +346,11 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 	p := permissionFixture(true)
 	intentBucket := migrationIntentBucketName(p.cfg, fakeSTSAccountID)
 	tests := []struct{ name, resource, action string }{
-		{"genesis record", "arn:aws:s3:::" + intentBucket + "/deployment-genesis", "s3:PutObject"},
+		{
+			"generation state",
+			"arn:aws:s3:::" + intentBucket + "/" + snapshotObjectKey(permissionTestPCR0),
+			"s3:PutObject",
+		},
 		{"genesis lease", "arn:aws:s3:::lease-bucket/prod/app/lock/genesis", "s3:PutObject"},
 		{
 			"certificate lease",
@@ -348,8 +369,14 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 		},
 		{"ACME account", "arn:aws:s3:::cert-bucket/prod/app/data/acme/account.key", "s3:GetObject"},
 		{
-			"commit pointer",
-			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/locked/KMSKeyID/" + permissionTestPCR0,
+			"migration challenge",
+			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/MigrationChallenge/" +
+				permissionTestPCR0,
+			"ssm:PutParameter",
+		},
+		{
+			"handoff pointer",
+			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/locked/KMSKeyID/*",
 			"ssm:PutParameter",
 		},
 	}
@@ -393,11 +420,11 @@ func TestPermissionsPagination(t *testing.T) {
 			func(t *testing.T) {
 				fake := &fakeIAM{}
 				fake.respond = func(in *iam.SimulatePrincipalPolicyInput) (*iam.SimulatePrincipalPolicyOutput, error) {
-					out, err := (&fakeIAM{denied: map[string]bool{"ssm:PutParameter": denied}}).SimulatePrincipalPolicy(
+					out, err := (&fakeIAM{denied: map[string]bool{"ssm:GetParametersByPath": denied}}).SimulatePrincipalPolicy(
 						context.Background(),
 						in,
 					)
-					if len(in.ActionNames) == 3 && in.ActionNames[0] == "ssm:GetParameter" {
+					if len(in.ActionNames) == 2 && in.ActionNames[0] == "ssm:GetParameter" {
 						if in.Marker == nil {
 							out.EvaluationResults = out.EvaluationResults[:1]
 							out.IsTruncated, out.Marker = true, aws.String("next")
@@ -411,7 +438,7 @@ func TestPermissionsPagination(t *testing.T) {
 				p.iam = fake
 				err := p.preflight(context.Background())
 				if denied {
-					require.ErrorContains(t, err, "ssm:PutParameter")
+					require.ErrorContains(t, err, "ssm:GetParametersByPath")
 				} else {
 					require.NoError(t, err)
 				}
@@ -433,7 +460,6 @@ func TestPermissionsIncompleteSimulation(t *testing.T) {
 		out  *iam.SimulatePrincipalPolicyOutput
 		want string
 	}{
-		{"no response", nil, "no simulation"},
 		{"no results", &iam.SimulatePrincipalPolicyOutput{}, "IAM omitted ssm:GetParameter"},
 		{"missing marker", &iam.SimulatePrincipalPolicyOutput{IsTruncated: true}, "incomplete pagination"},
 		{"repeated marker", &iam.SimulatePrincipalPolicyOutput{IsTruncated: true, Marker: aws.String("same")}, "incomplete pagination"},

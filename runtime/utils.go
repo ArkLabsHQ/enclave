@@ -8,10 +8,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/hf/nsm"
 )
 
@@ -100,4 +103,73 @@ func forEachObjectVersion(
 		}
 		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
 	}
+}
+
+// readLockedVersion returns one exact version's body if it is a single-part
+// upload retained under compliance mode for the configured period. Any other
+// version reports false and is logged as what; a failed read is an error
+// wrapping storeErr.
+func readLockedVersion(
+	ctx context.Context,
+	s3api S3API,
+	bucket, key, versionID string,
+	publishedAt time.Time,
+	retention, writeBudget time.Duration,
+	storeErr error,
+	what string,
+) ([]byte, bool, error) {
+	out, err := s3api.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String(key),
+		VersionId:  aws.String(versionID),
+		PartNumber: aws.Int32(1), // Exposes res.PartsCount if object was a multipart upload
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"%w: get %s %q version %q: %w", storeErr, what, key, versionID, err,
+		)
+	}
+	defer func() { _ = out.Body.Close() }()
+	// Multipart LastModified dates from upload initiation, so a host could
+	// replay a record into an old upload to backdate it.
+	if out.PartsCount != nil {
+		slog.Warn("ignoring multipart "+what, "key", key, "version", versionID)
+		return nil, false, nil
+	}
+	if !compliesWithObjectLock(what, key, versionID, publishedAt, out, retention, writeBudget) {
+		return nil, false, nil
+	}
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"%w: read %s %q version %q: %w", storeErr, what, key, versionID, err,
+		)
+	}
+	return body, true, nil
+}
+
+// compliesWithObjectLock accepts only compliance mode, retained for retention
+// after publishedAt less writeBudget, the allowance for upload delay and for skew
+// between the writer's clock and S3's LastModified.
+func compliesWithObjectLock(
+	what, key, versionID string,
+	publishedAt time.Time,
+	out *s3.GetObjectOutput,
+	retention, writeBudget time.Duration,
+) bool {
+	if out.ObjectLockMode != s3types.ObjectLockModeCompliance {
+		slog.Warn("ignoring "+what+" that is not retained under compliance mode",
+			"key", key, "version", versionID, "mode", string(out.ObjectLockMode))
+		return false
+	}
+
+	retainUntil := aws.ToTime(out.ObjectLockRetainUntilDate)
+	minimum := retention - writeBudget
+	if retainUntil.IsZero() || retainUntil.Before(publishedAt.Add(minimum)) {
+		slog.Warn("ignoring "+what+" retained for less than the configured period",
+			"key", key, "version", versionID,
+			"retained_for", retainUntil.Sub(publishedAt), "minimum", minimum)
+		return false
+	}
+	return true
 }

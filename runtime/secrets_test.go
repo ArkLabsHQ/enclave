@@ -201,24 +201,18 @@ func TestDerivationCBORLengthBoundaries(t *testing.T) {
 
 func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 	const keyID = "key-declarations"
-	params := stateOriginParams(keyID)
-	snapshot := bootSnapshot{
+	kmsf := newFakeKMS()
+	params := handoffParams(t, testCfg, kmsf, keyID)
+	snapshot := Snapshot{
 		kmsKeyID: keyID, ownerPCR0: stateOriginTestPCR0Hex(),
 		masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
 		tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
 		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 	}
-	root, err := stateRoot(testCfg, snapshot)
-	require.NoError(t, err)
-	receipt := signedOriginReceipt(
-		t,
-		map[uint][]byte{0: mustDecodeHex(t, snapshot.ownerPCR0)},
-		root,
-		snapshot,
-	)
 	byName := map[string]string{}
 	for _, name := range []string{"alpha", "beta"} {
-		byName[name], err = deriveSecret(bytes.Repeat([]byte{0x42}, 32), name)
+		var err error
+		byName[name], err = deriveSecret(testHandoffSeed, name)
 		require.NoError(t, err)
 	}
 	a, b := stateOriginTestSecrets[0], stateOriginTestSecrets[1]
@@ -233,14 +227,17 @@ func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 		{"restored", []StaticSecretMetadata{a, b}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			boot := &Boot{cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots))}
+			session := newStatefulNSMSession(
+				t, map[uint][]byte{0: mustDecodeHexString(stateOriginTestPCR0Hex())},
+			)
+			boot := &Boot{
+				cfg: testCfg, nsm: &nsmW{nsm: &fakeNSM{session: session}},
+				kmsAPI: kmsf, sts: &fakeSTS{},
+			}
 			result, err := boot.establish(t.Context(), &plannedBoot{
-				mode: &resumeBoot{},
-				state: bootState{
-					snapshot: snapshot, bootReceipt: receipt.docB64,
-					secretsMetadata: SecretsMetadata{Static: tc.static},
-				},
-			}, &stateOriginTestKMS{keyID: keyID})
+				mode:   &resumeBoot{snapshot: snapshot},
+				config: bootConfig{secretsMetadata: SecretsMetadata{Static: tc.static}},
+			})
 			require.NoError(t, err)
 			want := make([]StaticSecret, 0, len(tc.static))
 			for _, meta := range tc.static {
@@ -759,7 +756,7 @@ func TestValidateChildEnv(t *testing.T) {
 func TestBootResolvesInheritedSecrets(t *testing.T) {
 	ctx := context.Background()
 
-	boot := func(t *testing.T, cutoff, value string) (bootResult, error) {
+	boot := func(t *testing.T, cutoff, value string) (bootState, error) {
 		t.Helper()
 		cfg := stateOriginTestConfig()
 		cfg.InheritSecretConfig = `[{"name":"token","env_var":"LEGACY_TOKEN",` +
@@ -768,7 +765,7 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		fx.ssmf.params[testCfg.inheritSecretPrefix()+"token"] = value
 		b, err := NewBoot(cfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
 		if err != nil {
-			return bootResult{}, err
+			return bootState{}, err
 		}
 		return b.Boot(ctx)
 	}

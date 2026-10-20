@@ -128,9 +128,6 @@ func (p *permissions) simulateGrant(
 		if err != nil {
 			return nil, fmt.Errorf("iam:SimulatePrincipalPolicy on %s: %w", roleARN, err)
 		}
-		if out == nil {
-			return nil, fmt.Errorf("IAM returned no simulation for %s on %s", g.sid, g.resource)
-		}
 		for _, r := range out.EvaluationResults {
 			action := aws.ToString(r.EvalActionName)
 			seenActions[strings.ToLower(action)] = true
@@ -184,37 +181,46 @@ func (p *permissions) requiredGrants(
 ) ([]requiredGrant, error) {
 	intentBucket := migrationIntentBucketName(p.cfg, account)
 	s3ARN := func(resource string) string { return fmt.Sprintf("arn:%s:s3:::%s", partition, resource) }
-	objectRW := []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"}
+	ssmARN := func(param string) string {
+		return fmt.Sprintf(
+			"arn:%s:ssm:%s:%s:parameter%s",
+			partition,
+			p.cfg.AWSRegion,
+			account,
+			param,
+		)
+	}
 
 	grants := []requiredGrant{
 		{
-			sid: "SSMParams",
-			resource: fmt.Sprintf("arn:%s:ssm:%s:%s:parameter%s/*",
-				partition, p.cfg.AWSRegion, account, p.cfg.namespace()),
-			actions: []string{"ssm:GetParameter", "ssm:GetParametersByPath", "ssm:PutParameter"},
+			sid:      "SSMParams",
+			resource: ssmARN(p.cfg.namespace() + "/*"),
+			actions:  []string{"ssm:GetParameter", "ssm:GetParametersByPath"},
 		},
 		{
 			sid:      "S3MigrationIntentObjectLock",
 			resource: s3ARN(intentBucket + "/*"),
-			// GetObjectRetention exposes the lock needed to validate intents.
-			actions: []string{
-				"s3:PutObject", "s3:GetObject", "s3:GetObjectVersion",
-				"s3:PutObjectRetention", "s3:GetObjectRetention",
-			},
+			// GetObjectRetention exposes the lock needed to validate every record.
+			actions: []string{"s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectRetention"},
 		},
 		{
 			sid:      "S3MigrationIntentObjectLock",
 			resource: s3ARN(intentBucket),
 			actions:  []string{"s3:ListBucketVersions"},
 		},
-		{
+	}
+	// An enclave publishes only its own snapshot and its own intent chain.
+	for _, key := range []string{
+		snapshotObjectKey(p.pcr0), migrationIntentPrefix + p.pcr0 + "/*",
+	} {
+		grants = append(grants, requiredGrant{
 			sid:      "S3MigrationIntentObjectLock",
-			resource: s3ARN(intentBucket + "/" + deploymentGenesisKey),
+			resource: s3ARN(intentBucket + "/" + key),
 			actions: []string{
 				"s3:PutObject", "s3:GetObject", "s3:GetObjectVersion",
 				"s3:PutObjectRetention", "s3:GetObjectRetention",
 			},
-		},
+		})
 	}
 
 	leaseBucket, leaseErr := p.ssm.MustGet(ctx, p.cfg.leaseBucketParam())
@@ -228,7 +234,8 @@ func (p *permissions) requiredGrants(
 		for _, name := range []string{genesisLeaseName, certLeaseName, "migration-" + p.pcr0} {
 			grants = append(grants, requiredGrant{
 				sid:      "S3CertAndLeaseReadWrite",
-				resource: s3ARN(leaseBucket + "/" + leaseObjectKey(p.cfg, name)), actions: objectRW,
+				resource: s3ARN(leaseBucket + "/" + leaseObjectKey(p.cfg, name)),
+				actions:  []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
 			})
 		}
 	}
@@ -257,21 +264,22 @@ func (p *permissions) requiredGrants(
 			actions:  []string{"s3:GetObject", "s3:PutObject"},
 		})
 	}
-	for _, param := range []string{
-		p.cfg.kmsKeyIDParam(p.pcr0), p.cfg.migrationChallengeParam(p.pcr0),
-		p.cfg.migrationPreviousPCR0Param(p.pcr0), p.cfg.migrationPreviousKMSKeyIDParam(p.pcr0),
-		p.cfg.migrationPreviousPCR0AttestationParam(p.pcr0),
-	} {
+	// SSM writes are migration coordination only: this enclave's challenge, the
+	// handoff it may write for any successor, and its answer to its predecessor.
+	coordination := []string{
+		p.cfg.migrationChallengeParam(p.pcr0),
+		p.cfg.kmsKeyIDParam("*"),
+		p.cfg.masterSeedCiphertextParam("*"),
+		p.cfg.tlsKeyCiphertextParam("*"),
+		p.cfg.migrationPreviousPCR0Param("*"),
+		p.cfg.migrationPreviousKMSKeyIDParam("*"),
+		p.cfg.migrationStateOriginReceiptParam("*", "*"),
+		p.cfg.migrationResponseParam("*", "*"),
+	}
+	for _, param := range coordination {
 		grants = append(grants, requiredGrant{
-			sid: "SSMParams",
-			resource: fmt.Sprintf(
-				"arn:%s:ssm:%s:%s:parameter%s",
-				partition,
-				p.cfg.AWSRegion,
-				account,
-				param,
-			),
-			actions: []string{"ssm:GetParameter", "ssm:PutParameter"},
+			sid: "SSMMigrationCoordination", resource: ssmARN(param),
+			actions: []string{"ssm:PutParameter"},
 		})
 	}
 

@@ -39,6 +39,8 @@ func (m *migrationControlMigrator) RunPredecessorHandoff(
 
 func (m *migrationControlMigrator) AwaitCandidateHandoff(context.Context) error { return nil }
 
+func (m *migrationControlMigrator) SetSnapshot(Snapshot) {}
+
 func (m *migrationControlMigrator) PreviousPCR0Info(context.Context) (*PreviousPCR0Info, error) {
 	return m.previous, m.previousErr
 }
@@ -263,11 +265,7 @@ func TestAttestationHandler(t *testing.T) {
 
 func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	ctx := context.Background()
-	ownPCR0 := strings.Repeat("ab", 48)
-	ssm := NewSSM(&fakeSSM{params: map[string]string{
-		testCfg.migrationPreviousPCR0Param(ownPCR0):            "previous",
-		testCfg.migrationPreviousPCR0AttestationParam(ownPCR0): "attestation",
-	}})
+	ssm := NewSSM(&fakeSSM{})
 	rt := newRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
@@ -275,6 +273,9 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	})}}
 	migrator, err := NewMigrator(testCfg, nsm, ssm, newFakeS3(), migrationIntentTestBucket)
 	require.NoError(t, err)
+	migrator.SetSnapshot(Snapshot{
+		predecessorPCR0: "previous", transitionReceipt: "attestation",
+	})
 
 	ancestry := &stubAncestry{snap: &AncestryInfo{
 		Generations: []AncestorGeneration{{
@@ -429,8 +430,8 @@ func TestConfigureEnclaveInfoHandlerSurvivesABlindAudit(t *testing.T) {
 	fx := newAncestryFixture(
 		t, testSnapshot(p2, "key-2", p1, "key-1"), &kmsW{cfg: testCfg, kms: kms},
 	)
-	fx.storeOriginReceipt(t, testSnapshot(p1, "key-1", p0, "key-0"))
-	fx.storeOriginReceipt(t, testSnapshot(p0, "key-0", "", ""))
+	fx.publish(t, testSnapshot(p1, "key-1", p0, "key-0"))
+	fx.publish(t, testSnapshot(p0, "key-0", "", ""))
 	ancestry := fx.a
 	ancestry.refresh(context.Background())
 

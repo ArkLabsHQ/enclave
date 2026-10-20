@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/fxamacker/cbor/v2"
 )
 
 const (
@@ -33,12 +31,12 @@ type Ancestry interface {
 	Snapshot() *AncestryInfo
 }
 
-// NewAncestry starts from the lineage already authenticated during boot.
+// NewAncestry starts from the snapshot already authenticated during boot.
 func NewAncestry(
-	cfg *Config, nsm NSM, ssm SSM, keys KeyAuditor, current stateLineage,
+	cfg *Config, s3api S3API, nsm NSM, bucket string, keys KeyAuditor, current Snapshot,
 ) Ancestry {
 	return &ancestry{
-		cfg: cfg, nsm: nsm, ssm: ssm, keys: keys, current: current,
+		cfg: cfg, s3: s3api, nsm: nsm, bucket: bucket, keys: keys, current: current,
 		snap: &AncestryInfo{
 			Generations: []AncestorGeneration{},
 			Reason:      ancestryNotYetProbed,
@@ -48,10 +46,11 @@ func NewAncestry(
 
 type ancestry struct {
 	cfg     *Config
+	s3      S3API
 	nsm     NSM
-	ssm     SSM
+	bucket  string
 	keys    KeyAuditor
-	current stateLineage
+	current Snapshot
 
 	mu         sync.Mutex
 	ctx        context.Context
@@ -106,7 +105,7 @@ func (a *ancestry) refresh(ctx context.Context) {
 	a.mu.Unlock()
 }
 
-// walkAncestors follows predecessor identities in verified state receipts.
+// walkAncestors follows predecessor identities through verified snapshots.
 func (a *ancestry) walkAncestors(ctx context.Context) ([]AncestorGeneration, bool, string) {
 	generations := make([]AncestorGeneration, 0, 8)
 	current := a.current
@@ -133,46 +132,27 @@ func (a *ancestry) walkAncestors(ctx context.Context) ([]AncestorGeneration, boo
 			State: state,
 		})
 
-		previousPCR0, previousKeyID, err := a.loadVerifiedLineage(
-			ctx, current.predecessorPCR0, current.predecessorKMSKeyID,
-		)
+		predecessor, err := a.loadPredecessor(ctx, current)
 		if err != nil {
-			slog.Warn("could not verify ancestor state", "error", err)
-			return generations, false, "ancestor state receipt is missing or invalid"
+			slog.Warn("could not verify ancestor snapshot", "error", err)
+			return generations, false, "ancestor snapshot is missing or invalid"
 		}
-		current = stateLineage{
-			ownerPCR0: current.predecessorPCR0, kmsKeyID: current.predecessorKMSKeyID,
-			predecessorPCR0: previousPCR0, predecessorKMSKeyID: previousKeyID,
-		}
+		current = predecessor
 	}
 	return generations, true, ""
 }
 
-func (a *ancestry) loadVerifiedLineage(
-	ctx context.Context, pcr0, keyID string,
-) (string, string, error) {
-	receipt, err := a.ssm.MustGet(ctx, a.cfg.stateOriginReceiptParam(keyID, pcr0))
+// Verify the predecessor's snapshot and its key ID against the child's lineage.
+func (a *ancestry) loadPredecessor(ctx context.Context, current Snapshot) (Snapshot, error) {
+	predecessor, err := readSnapshot(ctx, a.cfg, a.s3, a.nsm, a.bucket, current.predecessorPCR0)
 	if err != nil {
-		return "", "", err
+		return Snapshot{}, err
 	}
-	result, err := a.nsm.VerifyAttestationDocument(
-		receipt, map[uint]string{0: pcr0},
-	)
-	if err != nil {
-		return "", "", err
+	if predecessor == nil {
+		return Snapshot{}, fmt.Errorf("no snapshot for %s", prefix16(current.predecessorPCR0))
 	}
-	var payload stateOriginPayloadV1
-	if err := cbor.Unmarshal(result.Document.UserData, &payload); err != nil {
-		return "", "", fmt.Errorf("decode state-origin receipt: %w", err)
+	if predecessor.kmsKeyID != current.predecessorKMSKeyID {
+		return Snapshot{}, fmt.Errorf("snapshot has unexpected KMS key ID")
 	}
-	if payload.Purpose != purposeStateOrigin || len(payload.StateRoot) == 0 {
-		return "", "", fmt.Errorf("invalid state-origin receipt payload")
-	}
-	if payload.KMSKeyID != keyID {
-		return "", "", fmt.Errorf("state-origin receipt has unexpected KMS key ID")
-	}
-	if (payload.PredecessorPCR0 == "") != (payload.PredecessorKMSKeyID == "") {
-		return "", "", fmt.Errorf("incomplete predecessor identity")
-	}
-	return payload.PredecessorPCR0, payload.PredecessorKMSKeyID, nil
+	return *predecessor, nil
 }

@@ -197,6 +197,8 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		),
 	)
 
+	hashes.SetResponseSigningKey(result.responseSigningKey)
+
 	go migrator.RunPredecessorHandoff(
 		ctx,
 		result.kms,

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -223,52 +224,71 @@ func TestVerifyAttestationRejectsTamperedDocument(t *testing.T) {
 	require.False(t, err == nil && result != nil && result.SignatureOK)
 }
 
-func TestExtractTLSKeyHashRequiresExactFormat(t *testing.T) {
+// testUserData builds the 79-byte user_data the runtime attests.
+func testUserData(tlsHash [sha256.Size]byte, signingKey []byte) []byte {
+	ud := append([]byte(udHashPrefix), tlsHash[:]...)
+	ud = append(ud, udSigningPrefix...)
+	return append(ud, signingKey...)
+}
+
+func TestParseUserDataRequiresExactFormat(t *testing.T) {
 	digest := sha256.Sum256([]byte("tls leaf"))
-	valid := append([]byte(udHashPrefix), digest[:]...)
+	signingKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public().(ed25519.PublicKey)
+	valid := testUserData(digest, signingKey)
+	unsigned := testUserData(digest, make([]byte, ed25519.PublicKeySize))
 	short := append([]byte(nil), valid[:len(valid)-1]...)
 	long := append(append([]byte(nil), valid...), 0)
-	legacy := append(append([]byte(nil), valid...), ';')
-	legacy = append(legacy, []byte(udHashPrefix)...)
-	legacy = append(legacy, make([]byte, sha256.Size)...)
+	tlsOnly := append([]byte(udHashPrefix), digest[:]...)
 	badPrefix := append([]byte(nil), valid...)
 	badPrefix[0] = 'x'
-	zero := append([]byte(udHashPrefix), make([]byte, sha256.Size)...)
-	require.Len(t, valid, 39)
-	require.Len(t, short, 38)
-	require.Len(t, long, 40)
-	require.Len(t, legacy, 79)
+	badSigningPrefix := append([]byte(nil), valid...)
+	badSigningPrefix[udTLSEnd+1] = 'x'
+	zero := testUserData([sha256.Size]byte{}, signingKey)
+	require.Len(t, valid, 79)
+	require.Len(t, tlsOnly, 39)
 
 	tests := []struct {
 		name        string
 		result      *nitrite.Result
 		want        string
+		wantKey     ed25519.PublicKey
 		errContains string
 	}{
 		{
-			name:   "valid exact payload",
-			result: &nitrite.Result{Document: &nitrite.Document{UserData: valid}},
+			name:    "valid exact payload",
+			result:  &nitrite.Result{Document: &nitrite.Document{UserData: valid}},
+			want:    hex.EncodeToString(digest[:]),
+			wantKey: signingKey,
+		},
+		{
+			name:   "no signing key set",
+			result: &nitrite.Result{Document: &nitrite.Document{UserData: unsigned}},
 			want:   hex.EncodeToString(digest[:]),
 		},
 		{
 			name:        "short payload",
 			result:      &nitrite.Result{Document: &nitrite.Document{UserData: short}},
-			errContains: "exactly 39 bytes",
+			errContains: "exactly 79 bytes",
 		},
 		{
 			name:        "long payload",
 			result:      &nitrite.Result{Document: &nitrite.Document{UserData: long}},
-			errContains: "exactly 39 bytes",
+			errContains: "exactly 79 bytes",
 		},
 		{
-			name:        "legacy two-hash payload",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: legacy}},
-			errContains: "exactly 39 bytes",
+			name:        "TLS-only payload",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: tlsOnly}},
+			errContains: "exactly 79 bytes",
 		},
 		{
 			name:        "bad prefix",
 			result:      &nitrite.Result{Document: &nitrite.Document{UserData: badPrefix}},
 			errContains: "missing \"sha256:\" prefix",
+		},
+		{
+			name:        "bad signing key prefix",
+			result:      &nitrite.Result{Document: &nitrite.Document{UserData: badSigningPrefix}},
+			errContains: "missing \"ed25519:\" prefix",
 		},
 		{
 			name:        "all-zero digest",
@@ -285,7 +305,7 @@ func TestExtractTLSKeyHashRequiresExactFormat(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := extractTLSKeyHash(tc.result)
+			got, key, err := parseUserData(tc.result)
 			if tc.errContains != "" {
 				require.ErrorContains(t, err, tc.errContains)
 				require.Empty(t, got)
@@ -293,6 +313,7 @@ func TestExtractTLSKeyHashRequiresExactFormat(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
+			require.Equal(t, tc.wantKey, key)
 		})
 	}
 }

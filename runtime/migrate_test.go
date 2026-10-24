@@ -12,161 +12,48 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
-	"github.com/hf/nitrite"
 	"github.com/hf/nsm/request"
-	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMigrationBootVerifiesPredecessor(t *testing.T) {
-	prevPCR0Bytes := bytes.Repeat([]byte{0xab}, 48)
-	currentPCR0Bytes := bytes.Repeat([]byte{0xcd}, 48)
-	prevPCR0 := hex.EncodeToString(prevPCR0Bytes)
-	attestation := base64.StdEncoding.EncodeToString([]byte("predecessor attestation"))
-
-	t.Run("SSM predecessor must match the PCR0 baked into the EIF", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        strings.Repeat("0", 96),
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.Error(t, err)
-	})
-
-	t.Run("attested PCR0 must match the claimed predecessor", func(t *testing.T) {
-		claimedPCR0Bytes := bytes.Repeat([]byte{0xef}, 48)
-		claimedPCR0 := hex.EncodeToString(claimedPCR0Bytes)
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(claimedPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        claimedPCR0,
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.Error(t, err)
-	})
-
-	t.Run("wrong PCR31", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: bytes.Repeat([]byte{0xef}, 48),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        prevPCR0,
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.Error(t, err)
-	})
-
-	t.Run("non-empty user data", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, []byte("unexpected")))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        prevPCR0,
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.ErrorContains(t, err, "attested user data does not match")
-	})
-
-	t.Run("success", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 prevPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        strings.ToUpper(prevPCR0),
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.NoError(t, err)
-	})
-
-	t.Run("rejects self as predecessor", func(t *testing.T) {
-		nsm := predecessorNSM(t, currentPCR0Bytes, verifyDocResult(map[uint][]byte{
-			0:                 currentPCR0Bytes,
-			migrationPCRIndex: pcrExtendFromZero(currentPCR0Bytes),
-		}, nil))
-
-		err := (&migrationBoot{}).verify(nsm, &bootState{
-			cfg:                    testConfigWithPreviousPCR0(prevPCR0),
-			currentPCR0:            currentPCR0Bytes,
-			kmsKeyID:               "migration-key",
-			predecessorPCR0:        hex.EncodeToString(currentPCR0Bytes),
-			predecessorAttestation: attestation,
-			migrationReceipt:       "transition",
-		})
-
-		require.ErrorContains(t, err, "cannot be its own predecessor")
-	})
-}
-
+// The unauthenticated info endpoint is answered from the measured config and the
+// snapshot boot published, never from SSM or S3.
 func TestMigratorPreviousPCR0Info(t *testing.T) {
 	ctx := context.Background()
 	infoPCR0Bytes := bytes.Repeat([]byte{0x5a}, 48)
-	infoPCR0 := hex.EncodeToString(infoPCR0Bytes)
-
-	t.Run("genesis", func(t *testing.T) {
+	s3f := newFakeS3()
+	s3f.listErr, s3f.getErr = errors.New("s3 down"), errors.New("s3 down")
+	newInfoMigrator := func(previous string) Migrator {
 		m, err := NewMigrator(
-			testCfg,
-			kmsTestNSMWithPCR0(t, infoPCR0Bytes), NewSSM(&fakeSSM{}),
-			newFakeS3(), migrationIntentTestBucket,
+			successorTestCfg(previous),
+			kmsTestNSMWithPCR0(t, infoPCR0Bytes), NewSSM(&fakeSSM{err: errors.New("ssm down")}),
+			s3f, migrationIntentTestBucket,
 		)
 		require.NoError(t, err)
-		info, err := m.PreviousPCR0Info(ctx)
+		return m
+	}
 
-		require.NoError(t, err)
-		require.Equal(t, &PreviousPCR0Info{PCR0: "genesis"}, info)
-	})
+	genesis := newInfoMigrator(genesisPreviousPCR0)
+	info, err := genesis.PreviousPCR0Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, &PreviousPCR0Info{PCR0: genesisPreviousPCR0}, info, "nothing established yet")
 
-	t.Run("recorded predecessor", func(t *testing.T) {
-		m, err := NewMigrator(
-			testCfg,
-			kmsTestNSMWithPCR0(t, infoPCR0Bytes), NewSSM(&fakeSSM{params: map[string]string{
-				testCfg.migrationPreviousPCR0Param(infoPCR0):            "abc123",
-				testCfg.migrationPreviousPCR0AttestationParam(infoPCR0): "attestation",
-			}}), newFakeS3(), migrationIntentTestBucket,
-		)
-		require.NoError(t, err)
-		info, err := m.PreviousPCR0Info(ctx)
+	genesis.SetSnapshot(testGenerationSnapshot(infoPCR0Bytes, nil, "key-0"))
+	info, err = genesis.PreviousPCR0Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, &PreviousPCR0Info{PCR0: genesisPreviousPCR0}, info)
 
-		require.NoError(t, err)
-		require.Equal(t, &PreviousPCR0Info{PCR0: "abc123", Attestation: "attestation"}, info)
-	})
+	predecessor := hex.EncodeToString(snapshotTestPredecessor)
+	successor := newInfoMigrator(strings.ToUpper(predecessor))
+	info, err = successor.PreviousPCR0Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, &PreviousPCR0Info{PCR0: predecessor}, info, "candidate: measured, unattested")
+
+	migrated := testGenerationSnapshot(infoPCR0Bytes, snapshotTestPredecessor, "key-1")
+	successor.SetSnapshot(withTransition(migrated, "transition"))
+	info, err = successor.PreviousPCR0Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, &PreviousPCR0Info{PCR0: predecessor, Attestation: "transition"}, info)
 }
 
 func TestMigratorMigrationStatus(t *testing.T) {
@@ -224,7 +111,7 @@ func TestMigratorMigrationStatus(t *testing.T) {
 	t.Run("aborted", func(t *testing.T) {
 		m, fx := setup(t)
 		require.NoError(t, request(t, m, fx))
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, targetPCR0)
 		require.NoError(t, err)
 		status, err := m.MigrationStatus(ctx)
 
@@ -242,6 +129,23 @@ func TestMigratorMigrationStatus(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, migrationStateEligible, status.State)
 		require.Zero(t, status.RemainingSeconds)
+		require.Equal(t, published.Add(2*time.Minute), *status.EligibleAt)
+	})
+
+	t.Run("a duplicate does not move the cooldown", func(t *testing.T) {
+		m, fx := setup(t)
+		published := time.Now().UTC().Add(-time.Minute)
+		key := migrationIntentObjectKey(fx.source, 1)
+		body := fx.object(
+			t, 1, migrationIntentRequested, targetPCR0, migrationIntentTestBucket, fx.pcr0,
+		)
+		fx.s3.putRawObjectAt(key, body, published)
+		fx.s3.putRawObjectAt(key, fx.reattest(t, body), published)
+		fx.s3.putRawObjectAt(key, body, time.Now().UTC())
+		status, err := m.MigrationStatus(ctx)
+
+		require.NoError(t, err)
+		require.Equal(t, migrationStateCoolingDown, status.State)
 		require.Equal(t, published.Add(2*time.Minute), *status.EligibleAt)
 	})
 
@@ -317,10 +221,6 @@ func TestHandOffToSuccessor(t *testing.T) {
 		}}
 		ssm := NewSSM(ssmf)
 		s3f := newFakeS3()
-		genesis, err := newGenesisLog(testCfg, s3f, nsm, migrationIntentBucketName)
-		require.NoError(t, err)
-		_, err = genesis.CommitGenesis(ctx, oldPCR0Hex)
-		require.NoError(t, err)
 		kmsf := newFakeKMS()
 		sts := &fakeSTS{arn: testRoleARN}
 		fx := &startMigrationFixture{
@@ -356,7 +256,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		// own SSM traffic.
 		fx.ssmf.calls = nil
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.NoError(t, err)
 		require.Equal(
@@ -373,7 +273,10 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.Equal(
 			t, "old-key", fx.ssmf.params[testCfg.migrationPreviousKMSKeyIDParam(newPCR0)],
 		)
-		require.NotEmpty(t, fx.ssmf.params[testCfg.migrationPreviousPCR0AttestationParam(newPCR0)])
+		for name := range fx.ssmf.params {
+			require.NotContains(t, name, "MigrationPreviousPCR0Attestation",
+				"the transition receipt carries the predecessor's post-PCR31 measurement")
+		}
 		require.Equal(t, migrationKeyID, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 		require.Equal(
 			t, "old-key", fx.ssmf.params[testCfg.kmsKeyIDParam(oldPCR0Hex)],
@@ -398,13 +301,9 @@ func TestHandOffToSuccessor(t *testing.T) {
 		requireKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), newPCR0, true)
 		require.NotNil(t, fx.session.attestationRoots)
 
-		newNSM := &nsmW{nsm: &fakeNSM{
-			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
-			verifyRoots: fx.session.attestationRoots,
-		}}
 		newBoot, err := NewBoot(
 			successorCfg,
-			newNSM,
+			successorNSM(t, fx, newPCR0Bytes),
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
 			fx.ssm,
@@ -420,20 +319,16 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.Equal(t, accountKey, established.acmeAccountKey)
 		require.Equal(t, fx.m.tlsKey, established.tlsKey)
 		require.Equal(t, migrationIntentBucketName, established.migrationIntentBucketName)
-		newReceipt := testCfg.stateOriginReceiptParam(migrationKeyID, newPCR0)
-		require.NotEmpty(t, fx.ssmf.params[newReceipt])
+		require.Equal(t, oldPCR0Hex, established.snapshot.predecessorPCR0)
+		require.Len(t, fx.s3f.objects[snapshotObjectKey(newPCR0)], 1,
+			"the successor publishes its adopted state")
 
-		// The predecessor never adopts the migration key: it has no receipt
-		// under it, and the key's policy does not admit its PCR0.
-		require.Empty(
-			t,
-			fx.ssmf.params[testCfg.stateOriginReceiptParam(migrationKeyID, oldPCR0Hex)],
-		)
+		// The predecessor never adopts the migration key: the key's policy does not
+		// admit its PCR0.
 		require.Error(
 			t,
 			verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true),
 		)
-		require.NotEmpty(t, fx.ssmf.params[newReceipt])
 	})
 
 	t.Run("refuses to re-finalise onto an existing target pointer", func(t *testing.T) {
@@ -441,7 +336,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)] = "already-committed"
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
 		require.NotContains(t, err.Error(), "delete")
@@ -459,7 +354,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			fx := setup(t)
 			request(t, fx, newPCR0)
 
-			err := fx.m.handOffToSuccessor(ctx)
+			err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 			require.NoError(t, err)
 
 			predecessorOnMigrationKey := &kmsW{
@@ -477,7 +372,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("requires a published intent with zero cooldown", func(t *testing.T) {
 		fx := setup(t)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAbsent)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -490,7 +385,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, migrationStateCoolingDown, status.State)
 
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationCooldownActive)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -499,10 +394,10 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("rejects aborted intent", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -512,7 +407,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx := setup(t)
 		fx.s3f.listErr = errors.New("list failed")
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorContains(t, err, "list failed")
 		requireNoMigrationSideEffects(t, fx, newPCR0)
@@ -530,7 +425,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		restarted.kms, restarted.masterSeed = fx.m.kms, fx.m.masterSeed
 		restarted.tlsKey = fx.m.tlsKey
 
-		err = restarted.handOffToSuccessor(ctx)
+		err = restarted.handOffToSuccessor(ctx, leaseHeld)
 
 		require.NoError(t, err)
 		require.Equal(t, migrationKeyID, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
@@ -541,7 +436,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.session.pcrs[migrationPCRIndex] = pcrExtendFromZero(bytes.Repeat([]byte{0xee}, 48))
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit new PCR0")
@@ -553,7 +448,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to create migration key")
@@ -565,7 +460,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to re-encrypt master seed")
@@ -579,7 +474,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to store master seed")
@@ -595,7 +490,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to write migration-transition receipt")
@@ -616,7 +511,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		}
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
 		require.Equal(
@@ -634,14 +529,14 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("transition receipt is immutable once written", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
 		param := testCfg.migrationStateOriginReceiptParam(migrationKeyID, newPCR0)
 		first := fx.ssmf.params[param]
 		require.NotEmpty(t, first)
 
-		err = WriteTransitionReceipt(ctx, testCfg, fx.m.nsm, fx.ssm, bootSnapshot{
+		err = WriteTransitionReceipt(ctx, testCfg, fx.m.nsm, fx.ssm, Snapshot{
 			kmsKeyID:                  migrationKeyID,
 			ownerPCR0:                 newPCR0,
 			predecessorPCR0:           oldPCR0Hex,
@@ -665,7 +560,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		fx.ssmf.putErrs = map[string]error{pointer: errors.New("throttled")}
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
 		require.NotEmpty(
@@ -674,7 +569,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		)
 
 		fx.ssmf.putErrs = nil
-		err = fx.m.handOffToSuccessor(ctx)
+		err = fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
 		retryKeyID := fx.ssmf.params[pointer]
@@ -694,13 +589,9 @@ func TestHandOffToSuccessor(t *testing.T) {
 		)
 
 		// The successor adopts the retry's generation and recovers its state.
-		newNSM := &nsmW{nsm: &fakeNSM{
-			session:     newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes}),
-			verifyRoots: fx.session.attestationRoots,
-		}}
 		newBoot, err := NewBoot(
 			successorCfg,
-			newNSM,
+			successorNSM(t, fx, newPCR0Bytes),
 			fx.kmsf,
 			&fakeSTS{arn: testRoleARN},
 			fx.ssm,
@@ -722,17 +613,44 @@ func TestHandOffToSuccessor(t *testing.T) {
 				return
 			}
 			// An operator aborts on a peer while this handoff is mid-flight.
-			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex)
+			_, err := fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 			require.NoError(t, err)
 		}
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.ErrorIs(t, err, errMigrationIntentAborted)
 		require.Empty(
 			t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)],
 			"an aborted handoff must leave the successor uncommitted",
 		)
+	})
+
+	// The lease is checked last before each final write, so a replica that lost
+	// it to a peer neither commits nor records an abort.
+	lost := func(context.Context) error { return ErrLeaseLost }
+	t.Run("commits nothing after losing the lease", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+
+		err := fx.m.handOffToSuccessor(ctx, lost)
+
+		require.ErrorIs(t, err, ErrLeaseLost)
+		require.Empty(t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	t.Run("records no abort after losing the lease", func(t *testing.T) {
+		fx := setup(t)
+		request(t, fx, newPCR0)
+		fx.ssmf.params[testCfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
+
+		aborted, err := fx.m.mayAbortMigration(ctx, lost, newPCR0)
+
+		require.ErrorIs(t, err, ErrLeaseLost)
+		require.False(t, aborted)
+		status, err := fx.m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateEligible, status.State, "the intent log is unchanged")
 	})
 
 	t.Run("fails closed when the intent store is unreadable at commit", func(t *testing.T) {
@@ -745,41 +663,35 @@ func TestHandOffToSuccessor(t *testing.T) {
 			}
 		}
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.ErrorContains(t, err, "verify migration intent")
 		require.Empty(t, fx.ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 	})
 
-	// Adoption is a one-time event. Once the successor has written its own
-	// state-origin receipt it resumes from that, so a later abort — which the
-	// log accepts at any time — cannot invalidate a running generation.
+	// Adoption is a one-time event. Once the successor has published its state
+	// it resumes from that, so a later abort - which the log accepts at any time -
+	// cannot invalidate a running generation.
 	t.Run("successor restart is not revalidated against the intent log", func(t *testing.T) {
 		fx := setup(t)
 		request(t, fx, newPCR0)
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 		require.NoError(t, err)
 
-		session := newStatefulNSMSession(t, map[uint][]byte{0: newPCR0Bytes})
-		successor := func(roots *x509.CertPool) (*Boot, error) {
-			return NewBoot(
-				successorCfg,
-				&nsmW{nsm: &fakeNSM{session: session, verifyRoots: roots}},
-				fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f,
-			)
+		nsm := successorNSM(t, fx, newPCR0Bytes)
+		successor := func() (*Boot, error) {
+			return NewBoot(successorCfg, nsm, fx.kmsf, &fakeSTS{arn: testRoleARN}, fx.ssm, fx.s3f)
 		}
-		// Adopting verifies the predecessor's receipt; restarting verifies the
-		// successor's own, which this session signed during adoption.
-		first, err := successor(fx.session.attestationRoots)
+		first, err := successor()
 		require.NoError(t, err)
 		_, err = first.Boot(ctx)
 		require.NoError(t, err)
 
-		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex)
+		_, err = fx.m.intent.Abort(ctx, oldPCR0Hex, newPCR0)
 		require.NoError(t, err)
 
-		restarted, err := successor(session.attestationRoots)
+		restarted, err := successor()
 		require.NoError(t, err)
 		established, err := restarted.Boot(ctx)
 		require.NoError(t, err, "a committed generation must survive a later abort")
@@ -794,7 +706,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 		})
 		request(t, fx, newPCR0)
 
-		err := fx.m.handOffToSuccessor(ctx)
+		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "failed to commit successor KMS key ID")
@@ -880,8 +792,8 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 
 		enc, err := cbor.CoreDetEncOptions().EncMode()
 		require.NoError(t, err)
-		payload, err := enc.Marshal(migrationClaimV1{
-			Schema:    "enclave.successor_claim.v2",
+		payload, err := enc.Marshal(migrationAttestationPayload{
+			Schemas:   []string{"enclave.successor_claim.v2"},
 			Namespace: fx.predecessor.cfg.Namespace,
 			AppName:   fx.predecessor.cfg.AppName,
 			Lock:      fx.predecessor.cfg.lockSegment(),
@@ -1174,7 +1086,7 @@ func TestInboundIntentIsReported(t *testing.T) {
 	})
 
 	t.Run("an aborted intent is not reported", func(t *testing.T) {
-		_, err := m.intent.Abort(ctx, fx.source)
+		_, err := m.intent.Abort(ctx, fx.source, target)
 		require.NoError(t, err)
 
 		info, err := candidate(target, fx.source).CandidateInfo(ctx)
@@ -1304,7 +1216,7 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		require.Equal(t, migrationStateAborted, status.State)
 	})
 
-	t.Run("an abort after the commit is not recorded", func(t *testing.T) {
+	t.Run("an abort after the commit is still recorded", func(t *testing.T) {
 		m, ssmf, session := setup(t)
 
 		require.NoError(t, advanceMigrationForTest(t, ctx, m))
@@ -1313,14 +1225,13 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
 
-		// Too late: the successor holds the state, so the log must not claim the
-		// handoff was aborted.
+		// An inadequate target must never block every later migration.
 		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
 		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		status, err := m.MigrationStatus(ctx)
 		require.NoError(t, err)
-		require.Equal(t, migrationStateEligible, status.State)
+		require.Equal(t, migrationStateAborted, status.State)
 	})
 
 	t.Run("an abort naming a different target does not apply", func(t *testing.T) {
@@ -1336,6 +1247,154 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		require.NoError(t, advanceMigrationForTest(t, ctx, m))
 
 		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	otherPCR0 := strings.Repeat("ef", 48)
+	freshPCR0 := strings.Repeat("12", 48)
+	tiedAt := time.Now().Add(-time.Hour).UTC()
+	// intents writes records into m's own log, signed as m would sign them.
+	intents := func(m *migrator, session *fakeNSMSession) *migrationIntentFixture {
+		return &migrationIntentFixture{
+			log: m.intent, s3: m.intent.s3.(*fakeS3), pcr0: oldPCR0, source: oldPCR0Hex,
+			signer: session.attestationSign,
+		}
+	}
+	// tie publishes a request to each target at sequence 1, all at tiedAt.
+	tie := func(t *testing.T, fx *migrationIntentFixture, pcr0 []byte, targets ...string) {
+		t.Helper()
+		for _, target := range targets {
+			fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1),
+				fx.object(t, 1, migrationIntentRequested, target, fx.log.bucket, pcr0), tiedAt)
+		}
+	}
+	requireNothingAppended := func(t *testing.T, fx *migrationIntentFixture) {
+		t.Helper()
+		require.Empty(t, fx.s3.objects[migrationIntentObjectKey(oldPCR0Hex, 2)])
+	}
+
+	t.Run("equivalent duplicate intents still hand off", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		body := fx.object(t, 1, migrationIntentRequested, newPCR0, fx.log.bucket, oldPCR0)
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1), body, tiedAt)
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(oldPCR0Hex, 1), fx.reattest(t, body), tiedAt)
+
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+		require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(newPCR0)])
+	})
+
+	t.Run("an operator abort naming either tied target ends the conflict", func(t *testing.T) {
+		for _, order := range [][]string{{newPCR0, otherPCR0}, {otherPCR0, newPCR0}} {
+			for _, aborted := range []string{
+				newPCR0, otherPCR0, strings.ToUpper(newPCR0), strings.ToUpper(otherPCR0),
+			} {
+				name := "listed " + order[0][:4] + " first, abort " + aborted[:4]
+				t.Run(name, func(t *testing.T) {
+					m, ssmf, session := setup(t)
+					fx := intents(m, session)
+					tie(t, fx, oldPCR0, order...)
+
+					require.ErrorIs(t, advanceMigrationForTest(t, ctx, m),
+						errMigrationIntentAmbiguous)
+
+					abort := m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
+					ssmf.params[abort] = aborted
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+					status, err := m.MigrationStatus(ctx)
+					require.NoError(t, err)
+					require.Equal(t, migrationStateAborted, status.State)
+					require.Equal(t, uint64(2), status.Sequence)
+					require.Equal(t, strings.ToLower(aborted), status.TargetPCR0,
+						"the abort names the operator's selected target")
+					require.Len(t, fx.s3.objects[migrationIntentObjectKey(oldPCR0Hex, 1)], 2,
+						"the locked records stay as they were")
+
+					// The log is open again: a new candidate is adopted and handed off.
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					answer(t, m, session, freshPCR0)
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					require.NoError(t, advanceMigrationForTest(t, ctx, m))
+					require.NotEmpty(t, ssmf.params[testCfg.kmsKeyIDParam(freshPCR0)])
+				})
+			}
+		}
+	})
+
+	t.Run("an absent or unrelated abort leaves the conflict blocked", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+		// Tied as well, but attested by another measurement, so no part of the conflict.
+		tie(t, fx, bytes.Repeat([]byte{0xee}, 48), freshPCR0)
+
+		for _, abort := range []string{"", freshPCR0, strings.Repeat("ee", 48)} {
+			if abort != "" {
+				ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = abort
+			}
+
+			require.ErrorIs(t, advanceMigrationForTest(t, ctx, m), errMigrationIntentAmbiguous)
+		}
+		status, err := m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAmbiguous, status.State)
+		require.ElementsMatch(t, []string{newPCR0, otherPCR0}, status.AmbiguousTargets,
+			"the forged record is not part of the conflict")
+		requireNothingAppended(t, fx)
+	})
+
+	// As after any commit, an inadequate target must never block later migrations.
+	t.Run("a conflict abort is still recorded after a tied target committed", func(t *testing.T) {
+		m, ssmf, session := setup(t)
+		fx := intents(m, session)
+		tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+		ssmf.params[testCfg.kmsKeyIDParam(otherPCR0)] = "successor-key"
+		ssmf.params[m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)] = newPCR0
+
+		require.NoError(t, advanceMigrationForTest(t, ctx, m))
+
+		status, err := m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAborted, status.State)
+	})
+
+	t.Run("storage errors surface through conflict recovery", func(t *testing.T) {
+		ssmDown := errors.New("ssm down")
+		for name, tc := range map[string]struct {
+			fail func(ssmf *fakeSSM, s3f *fakeS3, abort string)
+			want error
+		}{
+			"reading the abort": {
+				fail: func(ssmf *fakeSSM, _ *fakeS3, abort string) {
+					ssmf.getErrs = map[string]error{abort: ssmDown}
+				},
+				want: ssmDown,
+			},
+			"recording the abort": {
+				fail: func(_ *fakeSSM, s3f *fakeS3, _ string) { s3f.putErr = errors.New("put failed") },
+				want: errMigrationIntentStoreUnavailable,
+			},
+			"listing intents": {
+				fail: func(_ *fakeSSM, s3f *fakeS3, _ string) { s3f.listErr = errors.New("list failed") },
+				want: errMigrationIntentStoreUnavailable,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				m, ssmf, session := setup(t)
+				fx := intents(m, session)
+				tie(t, fx, oldPCR0, newPCR0, otherPCR0)
+				abort := m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
+				ssmf.params[abort] = newPCR0
+				tc.fail(ssmf, fx.s3, abort)
+
+				err := advanceMigrationForTest(t, ctx, m)
+
+				require.ErrorIs(t, err, tc.want)
+				require.NotErrorIs(t, err, errMigrationIntentAmbiguous)
+				requireNothingAppended(t, fx)
+			})
+		}
 	})
 }
 
@@ -1401,15 +1460,112 @@ func TestCandidateAnswersOnlyItsPredecessorsChallenge(t *testing.T) {
 	require.Empty(t, ssmf.params[cfg.migrationResponseParam(cfg.PreviousPCR0, fx.source)])
 }
 
-func predecessorNSM(t *testing.T, currentPCR0 []byte, verifyResult *nitrite.Result) NSM {
-	t.Helper()
-	session := &fakeNSMSession{responses: []response.Response{
-		attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: currentPCR0})),
-	}}
-	return &nsmW{nsm: &fakeNSM{
-		session:      session,
-		verifyResult: verifyResult,
-	}}
+// A candidate answers only a genuine challenge carrying its own schemas.
+func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
+	ctx := context.Background()
+	predecessor := strings.Repeat("11", 48)
+	cfg := successorTestCfg(predecessor)
+	nonce := bytes.Repeat([]byte{0x5a}, 32)
+
+	type challenge struct {
+		claim       migrationAttestationPayload
+		pcr0, nonce []byte
+		signer      *testAttestationSigner
+	}
+	// answer publishes an edited copy of the challenge this runtime issues and
+	// returns whatever response the candidate published.
+	answer := func(t *testing.T, fx *migrationIntentFixture, edit func(*challenge)) (string, error) {
+		t.Helper()
+		ssmf := &fakeSSM{params: map[string]string{}}
+		m := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: fx.source, ssm: NewSSM(ssmf)}
+
+		c := challenge{
+			claim: migrationAttestationPayload{
+				Schemas:   []string{migrationChallengeSchemaV1, successorClaimSchemaV1},
+				Namespace: cfg.Namespace, AppName: cfg.AppName, Lock: cfg.lockSegment(),
+			},
+			pcr0: mustDecodeHex(t, predecessor), nonce: nonce, signer: fx.signer,
+		}
+		edit(&c)
+		enc, err := cbor.CoreDetEncOptions().EncMode()
+		require.NoError(t, err)
+		userData, err := enc.Marshal(c.claim)
+		require.NoError(t, err)
+		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.buildWithNonce(
+			t, map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce,
+		).docB64
+
+		err = m.respondToChallenge(ctx)
+		return ssmf.params[cfg.migrationResponseParam(predecessor, fx.source)], err
+	}
+	// adopts returns the PCR0 the predecessor adopts from response to nonce.
+	adopts := func(t *testing.T, fx *migrationIntentFixture, response string, nonce []byte) string {
+		t.Helper()
+		issuer := &migrator{cfg: cfg, nsm: fx.nsm, pcr0: predecessor}
+		target, err := issuer.verifyChallengeResponses(
+			ctx, &migrationChallenge{Nonce: nonce}, []Param{{Name: "response", Value: response}},
+		)
+		require.NoError(t, err)
+		return target
+	}
+
+	t.Run("answers bound to the nonce", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		response, err := answer(t, fx, func(*challenge) {})
+		require.NoError(t, err)
+		require.Equal(t, fx.source, adopts(t, fx, response, nonce))
+		require.Empty(t, adopts(t, fx, response, bytes.Repeat([]byte{0x5b}, 32)))
+	})
+
+	now := time.Now()
+	unrelated := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
+	for _, tc := range []struct {
+		name   string
+		edit   func(*challenge)
+		reason string
+	}{
+		{"another successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1, "enclave.successor_claim.v2"}
+		}, "not bound to this state namespace"},
+		{"no successor claim schema", func(c *challenge) {
+			c.claim.Schemas = []string{migrationChallengeSchemaV1}
+		}, "not bound to this state namespace"},
+		{"another challenge schema", func(c *challenge) {
+			c.claim.Schemas = []string{"enclave.migration_challenge.v2", successorClaimSchemaV1}
+		}, "not bound to this state namespace"},
+		{
+			"another namespace",
+			func(c *challenge) { c.claim.Namespace = "other" },
+			"not bound to this state namespace",
+		},
+		{
+			"another app",
+			func(c *challenge) { c.claim.AppName = "other-app" },
+			"not bound to this state namespace",
+		},
+		{
+			"another lock posture",
+			func(c *challenge) { c.claim.Lock = "unlocked" },
+			"not bound to this state namespace",
+		},
+		{
+			"another measurement",
+			func(c *challenge) { c.pcr0 = bytes.Repeat([]byte{0x22}, 48) },
+			"verify migration challenge",
+		},
+		{
+			"an unrelated root",
+			func(c *challenge) { c.signer = unrelated },
+			"verify migration challenge",
+		},
+		{"no nonce", func(c *challenge) { c.nonce = nil }, "has no nonce"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			response, err := answer(t, newMigrationIntentFixture(t), tc.edit)
+			require.ErrorContains(t, err, tc.reason)
+			require.Empty(t, response)
+		})
+	}
 }
 
 type startMigrationFixture struct {
@@ -1438,7 +1594,6 @@ func requireNoMigrationSideEffects(
 	require.Empty(t, fx.ssmf.params[testCfg.kmsKeyIDParam(targetPCR0)])
 	require.Empty(t, fx.ssmf.params[testCfg.migrationPreviousPCR0Param(targetPCR0)])
 	require.Empty(t, fx.ssmf.params[testCfg.migrationPreviousKMSKeyIDParam(targetPCR0)])
-	require.Empty(t, fx.ssmf.params[testCfg.migrationPreviousPCR0AttestationParam(targetPCR0)])
 	for name := range fx.ssmf.params {
 		require.NotContains(t, name, "/Ciphertext/")
 		require.NotContains(t, name, "StateOriginReceipt/")
@@ -1472,7 +1627,9 @@ func attestedChallenge(
 	issuedAt time.Time,
 ) string {
 	t.Helper()
-	payload, err := (&migrator{cfg: cfg}).attestationPayload(migrationChallengeSchemaV1)
+	payload, err := (&migrator{cfg: cfg}).attestationPayload(
+		migrationChallengeSchemaV1, successorClaimSchemaV1,
+	)
 	require.NoError(t, err)
 	return signer.buildWithNonce(t, map[uint][]byte{0: pcr0}, issuedAt, payload, nonce).docB64
 }
@@ -1493,6 +1650,15 @@ func successorAttestation(m *migrator, challenge []byte) (string, error) {
 // requestMigrationTo drives the real initiation exchange through SSM: the
 // predecessor publishes a challenge, a candidate answers it, and the predecessor
 // records the migration to it. Nothing here names the target to the predecessor.
+// successorNSM is a successor enclave signing under the predecessor's root, as
+// real enclaves share the AWS Nitro root.
+func successorNSM(t *testing.T, fx *startMigrationFixture, pcr0 []byte) NSM {
+	t.Helper()
+	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	session.attestationSign = fx.session.attestationSign
+	return &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.session.attestationSign.roots}}
+}
+
 func requestMigrationTo(
 	t *testing.T,
 	ctx context.Context,
@@ -1518,6 +1684,9 @@ func requestMigrationTo(
 	}
 	return m.MigrationStatus(ctx)
 }
+
+// leaseHeld stands in for a migration lease that is still held.
+func leaseHeld(context.Context) error { return nil }
 
 func advanceMigrationForTest(t *testing.T, ctx context.Context, m *migrator) error {
 	t.Helper()
@@ -1614,16 +1783,13 @@ func TestCandidateIgnoresUnrelatedAndCommittedChallenges(t *testing.T) {
 	}
 }
 
-// handoffPredecessorPCR0 created the deployment the candidate fixtures join.
+// handoffPredecessorPCR0 is the predecessor the candidate fixtures' images name.
 var handoffPredecessorPCR0 = strings.Repeat("ab", 48)
 
 // newCandidateMigrator creates an uncommitted successor.
 func newCandidateMigrator(t *testing.T) (*genesisFixture, *migrator) {
 	t.Helper()
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
-	seedGenesisRecord(t, fx.s3f, handoffPredecessorPCR0)
-	fx.nsm = seededGenesisNSM{NSM: fx.nsm}
-	fx.ssmf.params[testCfg.kmsKeyIDParam(handoffPredecessorPCR0)] = "predecessor-key"
 
 	m, err := newMigrator(
 		testConfigWithPreviousPCR0(handoffPredecessorPCR0),
@@ -1680,10 +1846,22 @@ func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
 		)
 	})
 
-	t.Run("fresh deployment", func(t *testing.T) {
+	t.Run("published state", func(t *testing.T) {
+		fx, m := newCandidateMigrator(t)
+		pcr0 := mustDecodeHex(t, fx.pcr0Hex)
+		state := &snapshotTestFixture{signer: fx.signer}
+		fx.s3f.putRawObject(snapshotObjectKey(fx.pcr0Hex), state.body(t, testGenerationSnapshot(
+			pcr0, mustDecodeHex(t, handoffPredecessorPCR0), "adopted-key",
+		), nil))
+
+		require.NoError(t, m.AwaitCandidateHandoff(contextFor(t, 5*time.Second)))
+	})
+
+	t.Run("genesis image", func(t *testing.T) {
 		fx := newGenesisFixture(t, bytes.Repeat([]byte{0xcd}, 48))
+		fx.ssmf.err = errors.New("a genesis image reads nothing to decide")
 		m, err := newMigrator(
-			testConfigWithPreviousPCR0(handoffPredecessorPCR0),
+			testConfigWithPreviousPCR0(genesisPreviousPCR0),
 			fx.nsm, fx.ssm, fx.s3f, stateOriginTestMigrationIntentBucket(),
 		)
 		require.NoError(t, err)
@@ -1695,8 +1873,7 @@ func TestAwaitCandidateHandoffReturnsWhenThereIsNothingToWaitFor(t *testing.T) {
 // Partial artifacts do not end candidacy; the final pointer does.
 func TestCandidateWaitsForPartiallyWrittenHandoff(t *testing.T) {
 	fx, m := newCandidateMigrator(t)
-	attestation := testCfg.migrationPreviousPCR0AttestationParam(fx.pcr0Hex)
-	fx.ssmf.params[attestation] = "handoff-in-progress"
+	fx.ssmf.params[testCfg.migrationPreviousPCR0Param(fx.pcr0Hex)] = handoffPredecessorPCR0
 
 	err := m.AwaitCandidateHandoff(contextFor(t, 50*time.Millisecond))
 	require.ErrorIs(t, err, context.DeadlineExceeded)
@@ -1727,14 +1904,11 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
-	seedGenesisRecord(t, fx.s3, fx.source)
-	_, ssm := stateOriginTestSSM(map[string]string{
-		testCfg.kmsKeyIDParam(fx.source): "predecessor-key",
-	})
+	_, ssm := stateOriginTestSSM(nil)
 	session := newStatefulNSMSession(t, map[uint][]byte{0: mustDecodeHex(t, target)})
 	m, err := newMigrator(
 		testConfigWithPreviousPCR0(fx.source),
-		seededGenesisNSM{NSM: &nsmW{nsm: &fakeNSM{session: session}}},
+		&nsmW{nsm: &fakeNSM{session: session}},
 		ssm, fx.s3, migrationIntentTestBucket,
 	)
 	require.NoError(t, err)
@@ -1757,7 +1931,7 @@ func TestAwaitCandidateHandoffDoesNotRetryFatalErrors(t *testing.T) {
 			want: "ssm unavailable",
 		},
 		{
-			name: "genesis record unreadable",
+			name: "generation state unreadable",
 			fail: func(fx *genesisFixture) { fx.s3f.listErr = errors.New("s3 unavailable") },
 			want: "s3 unavailable",
 		},

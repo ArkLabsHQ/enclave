@@ -1,0 +1,47 @@
+--- a/init.go
++++ b/init.go
+@@ -272,18 +272,34 @@
+ 	return contents, nil
+ }
+ 
+-func enclaveReady() error {
+-	socket, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+-	if err != nil {
+-		return newErr(err, "failed open socket")
++// connectParent retries a connect interrupted by a signal on a fresh socket.
++// vsock connect has a finite timeout, so the kernel returns EINTR instead of
++// restarting it, and init exiting here panics the kernel.
++func connectParent() (int, error) {
++	for {
++		socket, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
++		if err != nil {
++			return -1, newErr(err, "failed open socket")
++		}
++		err = unix.Connect(socket, &unix.SockaddrVM{
++			CID:   VSOCK_CID,
++			Port:  VSOCK_PORT,
++			Flags: 0,
++		})
++		if err == nil {
++			return socket, nil
++		}
++		_ = unix.Close(socket)
++		if !errors.Is(err, unix.EINTR) {
++			return -1, newErr(err, "failed to connect")
++		}
+ 	}
+-	err = unix.Connect(socket, &unix.SockaddrVM{
+-		CID:   VSOCK_CID,
+-		Port:  VSOCK_PORT,
+-		Flags: 0,
+-	})
++}
++
++func enclaveReady() error {
++	socket, err := connectParent()
+ 	if err != nil {
+-		return newErr(err, "failed to connect")
++		return err
+ 	}
+ 	_, err = unix.Write(socket, []byte{HEART_BEAT})
+ 	if err != nil {

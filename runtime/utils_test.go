@@ -268,6 +268,11 @@ type fakeKMS struct {
 	encryptErr   error
 	createKeyErr error
 
+	// dataKey and encrypted, when set, replace the material GenerateDataKey
+	// mints and Encrypt seals, so an authentic key can hand boot malformed input.
+	dataKey, encrypted          []byte
+	generateCalls, decryptCalls int
+
 	// Key-audit surface.
 	keyStates           map[string]*kmstypes.KeyMetadata
 	describeErr         error
@@ -275,6 +280,24 @@ type fakeKMS struct {
 	getKeyPolicyErr     error
 	describeCalls       int
 	policyCalls         int
+
+	// deleted keys refuse every operation, as KMS does once deletion completes.
+	deleted map[string]bool
+}
+
+func (f *fakeKMS) deleteKey(keyID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	delete(f.keys, keyID)
+	if f.deleted == nil {
+		f.deleted = map[string]bool{}
+	}
+	f.deleted[keyID] = true
+}
+
+func fakeKMSNotFound() error {
+	return &kmstypes.NotFoundException{Message: aws.String("fake kms key not found")}
 }
 
 func newFakeKMS() *fakeKMS { return &fakeKMS{keys: map[string]string{}, blobs: map[string][]byte{}} }
@@ -312,9 +335,16 @@ func (f *fakeKMS) Encrypt(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
+	if f.deleted[aws.ToString(in.KeyId)] {
+		return nil, fakeKMSNotFound()
+	}
 	f.seq++
 	blob := []byte(fmt.Sprintf("fake-kms-blob-%d", f.seq))
-	f.blobs[string(blob)] = append([]byte(nil), in.Plaintext...)
+	plaintext := in.Plaintext
+	if f.encrypted != nil {
+		plaintext = f.encrypted
+	}
+	f.blobs[string(blob)] = append([]byte(nil), plaintext...)
 	return &kms.EncryptOutput{KeyId: in.KeyId, CiphertextBlob: blob}, nil
 }
 
@@ -328,6 +358,7 @@ func (f *fakeKMS) Decrypt(
 	}
 	f.mu.Lock()
 	f.init()
+	f.decryptCalls++
 	plaintext, ok := f.blobs[string(in.CiphertextBlob)]
 	plaintext = append([]byte(nil), plaintext...)
 	f.mu.Unlock()
@@ -363,6 +394,10 @@ func (f *fakeKMS) GenerateDataKey(
 
 	f.mu.Lock()
 	f.init()
+	f.generateCalls++
+	if f.dataKey != nil {
+		plaintext = append([]byte(nil), f.dataKey...)
+	}
 	f.seq++
 	blob := []byte(fmt.Sprintf("fake-kms-data-key-%d", f.seq))
 	f.blobs[string(blob)] = append([]byte(nil), plaintext...)
@@ -385,7 +420,11 @@ func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientI
 	f.mu.Lock()
 	f.init()
 	policy, ok := f.keys[keyID]
+	deleted := f.deleted[keyID]
 	f.mu.Unlock()
+	if deleted {
+		return fakeKMSNotFound()
+	}
 	if !ok || policy == "" || recipient == nil {
 		return nil
 	}
@@ -631,6 +670,7 @@ type fakeS3Object struct {
 	retainUntil  time.Time
 	lastModified time.Time
 	partsCount   *int32
+	deleteMarker bool
 }
 
 type fakeS3 struct {
@@ -651,8 +691,19 @@ type fakeS3 struct {
 	// object out from under the condition the caller is about to apply.
 	beforePut func(key string)
 
+	// afterPut fires after a successful write, with mu released so the hook can
+	// use helpers that acquire it, before the caller reads the written version.
+	afterPut func(*s3.PutObjectInput, *s3.PutObjectOutput)
+
 	// getMissing simulates an object disappearing between HeadObject and GetObject.
 	getMissing map[string]bool
+
+	// getErrVersions simulates GetObject failures for specific versions.
+	getErrVersions map[string]error
+
+	// versioned gives DeleteObject without a VersionId AWS's versioned-bucket
+	// behaviour: it stacks a delete marker, even over a compliance-locked version.
+	versioned bool
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]fakeS3Object{}} }
@@ -711,7 +762,7 @@ func (f *fakeS3) PutObject(
 	ctx context.Context,
 	in *s3.PutObjectInput,
 	_ ...func(*s3.Options),
-) (*s3.PutObjectOutput, error) {
+) (out *s3.PutObjectOutput, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -719,7 +770,12 @@ func (f *fakeS3) PutObject(
 		return nil, f.putErr
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer func() {
+		f.mu.Unlock()
+		if err == nil && out != nil && f.afterPut != nil {
+			f.afterPut(in, out)
+		}
+	}()
 	key := aws.ToString(in.Key)
 	if f.beforePut != nil {
 		// Runs holding f.mu, for races that turn on the object changing between
@@ -749,7 +805,7 @@ func (f *fakeS3) PutObject(
 			lastModified: time.Now().UTC(),
 		},
 	)
-	out := &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
+	out = &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
 	if f.missingVersionID {
 		out.VersionId = nil
 	}
@@ -783,7 +839,7 @@ func (f *fakeS3) checkConditions(key string, ifMatch, ifNoneMatch *string) error
 
 func (f *fakeS3) currentLocked(key string) (fakeS3Object, bool) {
 	objects := f.objects[key]
-	if len(objects) == 0 {
+	if len(objects) == 0 || objects[len(objects)-1].deleteMarker {
 		return fakeS3Object{}, false
 	}
 	return objects[len(objects)-1], true
@@ -816,9 +872,15 @@ func (f *fakeS3) GetObject(
 	if f.getMissing[aws.ToString(in.Key)] {
 		return nil, &s3types.NoSuchKey{}
 	}
+	if err := f.getErrVersions[aws.ToString(in.VersionId)]; err != nil {
+		return nil, err
+	}
 	objects := f.objects[aws.ToString(in.Key)]
 	for i := len(objects) - 1; i >= 0; i-- {
 		if in.VersionId == nil || objects[i].id == aws.ToString(in.VersionId) {
+			if objects[i].deleteMarker {
+				return nil, &s3types.NoSuchKey{}
+			}
 			body := io.NopCloser(bytes.NewReader(objects[i].body))
 			if f.readErr != nil {
 				body = io.NopCloser(iotest.ErrReader(f.readErr))
@@ -875,12 +937,20 @@ func (f *fakeS3) ListObjectVersions(
 	defer f.mu.Unlock()
 	prefix := aws.ToString(in.Prefix)
 	var out []s3types.ObjectVersion
+	var markers []s3types.DeleteMarkerEntry
 	for key, objects := range f.objects {
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		for _, obj := range objects {
 			lastModified := obj.lastModified
+			if obj.deleteMarker {
+				markers = append(markers, s3types.DeleteMarkerEntry{
+					Key: aws.String(key), VersionId: aws.String(obj.id),
+					LastModified: &lastModified,
+				})
+				continue
+			}
 			out = append(
 				out,
 				s3types.ObjectVersion{
@@ -891,7 +961,9 @@ func (f *fakeS3) ListObjectVersions(
 			)
 		}
 	}
-	return &s3.ListObjectVersionsOutput{Versions: out, IsTruncated: aws.Bool(false)}, nil
+	return &s3.ListObjectVersionsOutput{
+		Versions: out, DeleteMarkers: markers, IsTruncated: aws.Bool(false),
+	}, nil
 }
 
 func (f *fakeS3) ListObjectsV2(
@@ -921,6 +993,14 @@ func (f *fakeS3) DeleteObject(
 	objects := f.objects[key]
 	if len(objects) == 0 {
 		return &s3.DeleteObjectOutput{}, nil
+	}
+
+	if f.versioned && in.VersionId == nil {
+		f.seq++
+		f.objects[key] = append(objects, fakeS3Object{
+			id: strconv.Itoa(f.seq), deleteMarker: true, lastModified: time.Now().UTC(),
+		})
+		return &s3.DeleteObjectOutput{DeleteMarker: aws.Bool(true)}, nil
 	}
 
 	target := len(objects) - 1

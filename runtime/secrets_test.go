@@ -237,24 +237,18 @@ func TestDerivationCBORLengthBoundaries(t *testing.T) {
 
 func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 	const keyID = "key-declarations"
-	params := stateOriginParams(keyID)
-	snapshot := bootSnapshot{
+	kmsf := newFakeKMS()
+	params := handoffParams(t, testCfg, kmsf, keyID)
+	snapshot := Snapshot{
 		kmsKeyID: keyID, ownerPCR0: stateOriginTestPCR0Hex(),
 		masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
 		tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
 		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 	}
-	root, err := stateRoot(testCfg, snapshot)
-	require.NoError(t, err)
-	receipt := signedOriginReceipt(
-		t,
-		map[uint][]byte{0: mustDecodeHex(t, snapshot.ownerPCR0)},
-		root,
-		snapshot,
-	)
 	byName := map[string]string{}
 	for _, name := range []string{"alpha", "beta"} {
-		byName[name], err = deriveSecret(bytes.Repeat([]byte{0x42}, 32), name)
+		var err error
+		byName[name], err = deriveSecret(testHandoffSeed, name)
 		require.NoError(t, err)
 	}
 	a, b := stateOriginTestSecrets[0], stateOriginTestSecrets[1]
@@ -269,17 +263,18 @@ func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 		{"restored", []StaticSecretMetadata{a, b}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			session := newStatefulNSMSession(
+				t, map[uint][]byte{0: mustDecodeHexString(stateOriginTestPCR0Hex())},
+			)
 			boot := &Boot{
-				cfg: testCfg, nsm: NewNSM(WithAttestationRoots(receipt.roots)),
+				cfg: testCfg, nsm: &nsmW{nsm: &fakeNSM{session: session}},
+				kmsAPI: kmsf, sts: &fakeSTS{},
 				pcr0: mustDecodeHex(t, snapshot.ownerPCR0),
 			}
 			result, err := boot.establish(t.Context(), &plannedBoot{
-				mode: &resumeBoot{},
-				state: bootState{
-					snapshot: snapshot, bootReceipt: receipt.docB64,
-					secretsMetadata: SecretsMetadata{Static: tc.static},
-				},
-			}, &stateOriginTestKMS{keyID: keyID})
+				mode:   &resumeBoot{snapshot: snapshot},
+				config: bootConfig{secretsMetadata: SecretsMetadata{Static: tc.static}},
+			})
 			require.NoError(t, err)
 			want := make([]StaticSecret, 0, len(tc.static))
 			for _, meta := range tc.static {
@@ -798,7 +793,7 @@ func TestValidateChildEnv(t *testing.T) {
 func TestBootResolvesInheritedSecrets(t *testing.T) {
 	ctx := context.Background()
 
-	boot := func(t *testing.T, cutoff, value string) (bootResult, error) {
+	boot := func(t *testing.T, cutoff, value string) (bootState, error) {
 		t.Helper()
 		cfg := stateOriginTestConfig()
 		cfg.InheritSecretConfig = `[{"name":"token","env_var":"LEGACY_TOKEN",` +
@@ -807,7 +802,7 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		fx.ssmf.params[testCfg.inheritSecretPrefix()+"token"] = value
 		b, err := NewBoot(cfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
 		if err != nil {
-			return bootResult{}, err
+			return bootState{}, err
 		}
 		return b.Boot(ctx)
 	}
@@ -831,27 +826,33 @@ func TestBootResolvesInheritedSecrets(t *testing.T) {
 		require.ErrorContains(t, err, `"token": value 0 does not match an unused pinned hash`)
 	})
 
-	// plan validates the secrets config before anything else, so a Boot with
-	// only a config is enough to reach it.
-	t.Run("duplicate env var aborts plan", func(t *testing.T) {
+	// NewBoot runs before a candidate answers any challenge, so it refuses these.
+	newBoot := func(t *testing.T, cfg *Config) error {
+		t.Helper()
+		fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
+		_, err := NewBoot(cfg, fx.nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
+		return err
+	}
+
+	t.Run("duplicate env var fails NewBoot", func(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
 		cfg := testConfig()
 		cfg.StaticSecretConfig = `[{"name":"signing-key","env_var":"SIGNING_KEY"}]`
 		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"SIGNING_KEY",` +
 			`"type":"publicKey","value":["` + pubKey + `"],"cutoff":"2030-01-01T00:00:00Z"}]`
 
-		_, err := (&Boot{cfg: cfg}).plan(ctx)
-		require.ErrorContains(t, err, `env_var "SIGNING_KEY" is already used`)
+		require.ErrorContains(t, newBoot(t, cfg), `env_var "SIGNING_KEY" is already used`)
 	})
 
-	t.Run("allowlisted env var aborts plan", func(t *testing.T) {
+	t.Run("allowlisted env var fails NewBoot", func(t *testing.T) {
 		_, pubKey := inheritTestKey(t)
 		cfg := testConfig()
 		cfg.InheritSecretConfig = `[{"name":"legacy","env_var":"LEGACY_KEY",` +
 			`"type":"publicKey","value":["` + pubKey + `"]}]`
 		cfg.OverrideAllowList = map[string]bool{"LEGACY_KEY": true}
 
-		_, err := (&Boot{cfg: cfg}).plan(ctx)
-		require.ErrorContains(t, err, `env_var "LEGACY_KEY" is in the override allowlist`)
+		require.ErrorContains(
+			t, newBoot(t, cfg), `env_var "LEGACY_KEY" is in the override allowlist`,
+		)
 	})
 }

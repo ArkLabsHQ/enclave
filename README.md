@@ -790,6 +790,17 @@ body, and its `Authorization`, `Content-Type`, and `X-Enclave-Sign-Nonce`
 headers; the nonce is bound through the header hash. Adding, removing, or
 changing a covered header invalidates verification. A gateway must preserve the
 authority and the covered headers; rewriting the path also breaks verification.
+A Go server that clients reach instead of the enclave can serve
+`relay.New(enclaveURL, "/emulator/v1/")` from the `relay` package: it forwards
+`/enclave/attestation` and the routes it is given, and nothing else, with the
+request target, authority, headers, and body unchanged, so the attestation and
+signed responses verify end to end; it refuses a pattern matching arbitrary
+paths. The application must serve the paths clients call, since the signed
+message carries the path: a relay that rewrote `/emulator/v1/info` to
+`/v1/info` would break verification. It relays HTTP as HTTP: a server that
+turns a client's request into a different call to the enclave, such as gRPC,
+cannot be verified this way. The hop to the enclave is not authenticated, so
+relayed requests must carry no secrets.
 
 No other request header is covered. Browsers, proxies, and CDNs add and rewrite
 headers such as `Origin`, `Cookie`, `X-Forwarded-For`, and tracing IDs in

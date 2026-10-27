@@ -28,9 +28,8 @@ import (
 )
 
 const (
-	nonceNumDigits          = 40 // 20-byte nonce, hex-encoded
-	enclavePrefix           = "/enclave/"
-	externalRuntimeV1Prefix = enclavePrefix + "v1/"
+	nonceNumDigits = 40 // 20-byte nonce, hex-encoded
+	enclavePrefix  = "/enclave/"
 
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"

@@ -256,7 +256,8 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 			}
 			c.mu.Unlock()
 			// The status is unauthenticated; it only says what answered.
-			return nil, fmt.Errorf("response signature (HTTP %d): %w", resp.StatusCode, err)
+			return nil, fmt.Errorf("response signature (HTTP %d) for nonce %s: %w",
+				resp.StatusCode, req.Header.Get(signNonceHeader), err)
 		}
 	}
 

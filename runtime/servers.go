@@ -33,6 +33,8 @@ const (
 
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
+
+	maxLoggedNonce = 128
 )
 
 var (
@@ -449,6 +451,16 @@ func signResponses(hashes *AttestationHashes, next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(rec.status)
 		_, _ = w.Write(rec.body.Bytes())
+
+		path, _, _ := strings.Cut(signingContext.uri, "?")
+		slog.Info(
+			"signed response",
+			"nonce", nonce[:min(len(nonce), maxLoggedNonce)],
+			"method", signingContext.method,
+			"path", path,
+			"authority", signingContext.authority,
+			"status", rec.status,
+		)
 	})
 }
 

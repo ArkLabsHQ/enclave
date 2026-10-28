@@ -3,6 +3,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -198,6 +200,10 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	)
 
 	hashes.SetResponseSigningKey(result.responseSigningKey)
+	slog.Info(
+		"response signing key",
+		"public_key", hex.EncodeToString(result.responseSigningKey.Public().(ed25519.PublicKey)),
+	)
 
 	go migrator.RunPredecessorHandoff(
 		ctx,

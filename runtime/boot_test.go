@@ -304,7 +304,10 @@ func TestGenesisPublishesItsSnapshotAndNothingToSSM(t *testing.T) {
 	require.Len(t, fx.s3f.objects[snapshotObjectKey(fx.pcr0Hex)], 1)
 	require.NotContains(t, fx.s3f.objects, "deployment-genesis")
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), result.migrationIntentBucketName)
-	wantSigningKey, err := deriveResponseSigningKey(result.masterSeed, mustDecodeHexString(fx.pcr0Hex))
+	wantSigningKey, err := deriveResponseSigningKey(
+		result.masterSeed,
+		mustDecodeHexString(fx.pcr0Hex),
+	)
 	require.NoError(t, err)
 	require.Equal(t, wantSigningKey, result.responseSigningKey)
 }

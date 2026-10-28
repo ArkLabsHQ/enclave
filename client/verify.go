@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 )
@@ -190,12 +191,12 @@ const (
 
 // prepareResponseSigningContext asks for a signed response under a fresh nonce and
 // captures the authority, headers, and body the response must authenticate.
-func prepareResponseSigningContext(req *http.Request) (responseSigningContext, error) {
+func prepareResponseSigningContext(req *http.Request) (signing.ResponseSigningContext, error) {
 	var body []byte
 	if req.Body != nil {
 		var err error
 		if body, err = io.ReadAll(req.Body); err != nil {
-			return responseSigningContext{}, fmt.Errorf("read request body: %w", err)
+			return signing.ResponseSigningContext{}, fmt.Errorf("read request body: %w", err)
 		}
 		_ = req.Body.Close()
 		req.Body = io.NopCloser(bytes.NewReader(body))
@@ -217,7 +218,7 @@ func prepareResponseSigningContext(req *http.Request) (responseSigningContext, e
 		req.SetBasicAuth(req.URL.User.Username(), password)
 	}
 	req.Header.Set(signNonceHeader, rand.Text())
-	return captureResponseSigningContext(req, body)
+	return signing.CaptureResponseSigningContext(req, body)
 }
 
 // verifyResponseSignature checks the X-Enclave-Signature header over msg.

@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/net/http2"
 )
@@ -426,7 +427,7 @@ func signResponses(hashes *AttestationHashes, next http.Handler) http.Handler {
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(reqBody))
-		signingContext, err := captureResponseSigningContext(r, reqBody)
+		signingContext, err := signing.CaptureResponseSigningContext(r, reqBody)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -442,7 +443,7 @@ func signResponses(hashes *AttestationHashes, next http.Handler) http.Handler {
 		if r.Method == http.MethodHead {
 			rec.body.Reset()
 		}
-		msg := signingContext.responseMessage(sha256.Sum256(rec.body.Bytes()), rec.status)
+		msg := signingContext.ResponseMessage(sha256.Sum256(rec.body.Bytes()), rec.status)
 		maps.Copy(w.Header(), rec.header)
 		w.Header().Set(signatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg)))
 		// Lets cross-origin browser code read the signature.
@@ -452,13 +453,13 @@ func signResponses(hashes *AttestationHashes, next http.Handler) http.Handler {
 		w.WriteHeader(rec.status)
 		_, _ = w.Write(rec.body.Bytes())
 
-		path, _, _ := strings.Cut(signingContext.uri, "?")
+		path, _, _ := strings.Cut(signingContext.URI, "?")
 		slog.Info(
 			"signed response",
 			"nonce", nonce[:min(len(nonce), maxLoggedNonce)],
-			"method", signingContext.method,
+			"method", signingContext.Method,
 			"path", path,
-			"authority", signingContext.authority,
+			"authority", signingContext.Authority,
 			"status", rec.status,
 		)
 	})

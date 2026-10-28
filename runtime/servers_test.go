@@ -23,6 +23,7 @@ import (
 	"testing/iotest"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
@@ -782,7 +783,7 @@ func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
 			req.Header.Set(signNonceHeader, "nonce")
 			req.Header.Set("Authorization", "Bearer alice")
-			expected, err := captureResponseSigningContext(req, nil)
+			expected, err := signing.CaptureResponseSigningContext(req, nil)
 			require.NoError(t, err)
 			if tc.mutate != nil {
 				tc.mutate(req)
@@ -792,7 +793,7 @@ func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
 			require.Equal(t, http.StatusOK, rr.Code)
 			sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
 			require.NoError(t, err)
-			msg := expected.responseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
+			msg := expected.ResponseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
 			valid := ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig)
 			require.Equal(t, !tc.detected, valid)
 		})
@@ -860,21 +861,21 @@ func TestSignedEnclaveInfo(t *testing.T) {
 	hashes.SetResponseSigningKey(key)
 	req, rr := get("n2")
 	require.Equal(t, http.StatusOK, rr.Code)
-	signingContext, err := captureResponseSigningContext(req, nil)
+	signingContext, err := signing.CaptureResponseSigningContext(req, nil)
 	require.NoError(t, err)
 	sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
 	require.NoError(t, err)
-	msg := signingContext.responseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
+	msg := signingContext.ResponseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 
 	// GET patterns also serve HEAD, whose response reaches the client bodiless.
 	req, rr = request(http.MethodHead, "n3")
 	require.Equal(t, http.StatusOK, rr.Code)
-	signingContext, err = captureResponseSigningContext(req, nil)
+	signingContext, err = signing.CaptureResponseSigningContext(req, nil)
 	require.NoError(t, err)
 	sig, err = base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
 	require.NoError(t, err)
-	msg = signingContext.responseMessage(sha256.Sum256(nil), rr.Code)
+	msg = signingContext.ResponseMessage(sha256.Sum256(nil), rr.Code)
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }
 

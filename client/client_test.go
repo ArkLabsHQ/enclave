@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/stretchr/testify/require"
@@ -91,12 +92,12 @@ func (f *fakeEnclave) handler() http.Handler {
 		}
 		if nonce := r.Header.Get(signNonceHeader); nonce != "" && f.signingKey != nil {
 			reqBody, _ := io.ReadAll(r.Body)
-			signingContext, err := captureResponseSigningContext(r, reqBody)
+			signingContext, err := signing.CaptureResponseSigningContext(r, reqBody)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			msg := signingContext.responseMessage(sha256.Sum256(body), status)
+			msg := signingContext.ResponseMessage(sha256.Sum256(body), status)
 			w.Header().Set(signatureHeader,
 				base64.StdEncoding.EncodeToString(ed25519.Sign(f.signingKey, msg)))
 			if f.tamper {

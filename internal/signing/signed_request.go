@@ -1,4 +1,6 @@
-package runtime
+// Package signing is the signed-response wire format: the runtime signs with it
+// and the client verifies with it.
+package signing
 
 import (
 	"crypto/sha256"
@@ -20,24 +22,25 @@ const signedResponse = "enclave-signed-response"
 // must not rely on it in a signed request.
 var signedHeaders = []string{"authorization", "content-type", "x-enclave-sign-nonce"}
 
-// responseSigningContext holds the request details bound to a response signature.
-// Keep this wire format and canonicalization identical in client and runtime.
-type responseSigningContext struct {
-	method      string
-	uri         string
-	authority   string
+// ResponseSigningContext holds the request details bound to a response signature.
+// Browser verifiers implement this wire format and canonicalization from the
+// README, so keep it in step with the README.
+type ResponseSigningContext struct {
+	Method      string
+	URI         string
+	Authority   string
 	headersHash [sha256.Size]byte
 	bodyHash    [sha256.Size]byte
 }
 
-// captureResponseSigningContext snapshots the request before transport/proxy
+// CaptureResponseSigningContext snapshots the request before transport/proxy
 // code can mutate it. It does not create a signature.
-func captureResponseSigningContext(r *http.Request, body []byte) (responseSigningContext, error) {
+func CaptureResponseSigningContext(r *http.Request, body []byte) (ResponseSigningContext, error) {
 	if r.URL == nil {
-		return responseSigningContext{}, fmt.Errorf("signed request has no URL")
+		return ResponseSigningContext{}, fmt.Errorf("signed request has no URL")
 	}
 	if len(r.Trailer) != 0 || r.Header.Get("Trailer") != "" {
-		return responseSigningContext{}, fmt.Errorf("signed requests do not support trailers")
+		return ResponseSigningContext{}, fmt.Errorf("signed requests do not support trailers")
 	}
 	// ReverseProxy removes headers nominated by Connection. Do not attest an
 	// Authorization (or other application header) that the app will never see.
@@ -46,7 +49,7 @@ func captureResponseSigningContext(r *http.Request, body []byte) (responseSignin
 			switch strings.ToLower(strings.TrimSpace(token)) {
 			case "", "close", "keep-alive":
 			default:
-				return responseSigningContext{}, fmt.Errorf(
+				return ResponseSigningContext{}, fmt.Errorf(
 					"signed requests do not support Connection header options",
 				)
 			}
@@ -58,24 +61,24 @@ func captureResponseSigningContext(r *http.Request, body []byte) (responseSignin
 	}
 	authority, err := httpguts.PunycodeHostPort(removeZone(authority))
 	if err != nil || authority == "" || !httpguts.ValidHostHeader(authority) {
-		return responseSigningContext{}, fmt.Errorf("invalid signed request authority")
+		return ResponseSigningContext{}, fmt.Errorf("invalid signed request authority")
 	}
 	method := r.Method
 	if method == "" {
 		method = http.MethodGet
 	}
-	return responseSigningContext{
-		method: method, uri: requestTarget(r),
-		authority:   strings.ToLower(authority),
+	return ResponseSigningContext{
+		Method: method, URI: requestTarget(r),
+		Authority:   strings.ToLower(authority),
 		headersHash: hashHeaders(r.Header), bodyHash: sha256.Sum256(body),
 	}, nil
 }
 
-// responseMessage builds the message to sign or verify, binding the captured
+// ResponseMessage builds the message to sign or verify, binding the captured
 // request details to the response body hash and status.
-func (r responseSigningContext) responseMessage(bodyHash [sha256.Size]byte, status int) []byte {
+func (r ResponseSigningContext) ResponseMessage(bodyHash [sha256.Size]byte, status int) []byte {
 	return fmt.Appendf(nil, "%s\n%s %s\n%s\n%x\n%x\n%d\n%x",
-		signedResponse, r.method, r.uri, r.authority,
+		signedResponse, r.Method, r.URI, r.Authority,
 		r.headersHash, r.bodyHash, status, bodyHash)
 }
 

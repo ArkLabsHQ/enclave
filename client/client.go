@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 )
 
 // Options configures the enclave client.
@@ -166,8 +168,8 @@ func New(baseURL string, opts Options) (*Client, error) {
 	}
 	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: mainTransport}
 	if opts.SignedResponses {
-		// A redirect is signed for the request that drew it, so return it to
-		// the caller instead of following it.
+		// Don't follow redirects: signature verification uses the original request.
+		// Verify and return the redirect response so the caller can handle it.
 		c.httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
@@ -221,7 +223,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 		return nil, fmt.Errorf("attestation verification failed: %w", err)
 	}
 
-	var signingContext responseSigningContext
+	var signingContext signing.ResponseSigningContext
 	if c.opts.SignedResponses {
 		if attest.SigningKey == nil {
 			return nil, fmt.Errorf("enclave attests no response signing key")
@@ -246,7 +248,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	}
 
 	if c.opts.SignedResponses {
-		msg := signingContext.responseMessage(sha256.Sum256(body), resp.StatusCode)
+		msg := signingContext.ResponseMessage(sha256.Sum256(body), resp.StatusCode)
 		if err := verifyResponseSignature(attest.SigningKey, msg, resp.Header); err != nil {
 			// The key may have changed (a fresh genesis, or the other generation
 			// during a migration): attest again on the next call.

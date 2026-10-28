@@ -33,6 +33,7 @@ development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 |---|---|
 | `runtime/` | The Go runtime that runs as PID 1 inside the enclave. Separate Go module, `github.com/ArkLabsHQ/enclave/runtime`. |
 | `client/` | Go client library for attestation-verified requests. Part of the root module. |
+| `internal/signing/` | The signed-response wire format, shared by `client/` and `runtime/`. Separate Go module, `github.com/ArkLabsHQ/enclave/internal/signing`. |
 | `cmd/enclave/` | The `enclave` CLI. |
 | `nix/` | `buildEif` function |
 | `nix/tests/` | EIF construction and full blue/green runtime checks. |

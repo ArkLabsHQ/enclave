@@ -42,9 +42,17 @@
               runtime = pkgs.buildGoModule (finalAttrs: {
                 pname = "runtime";
                 version = "0.1.0";
-                src = ./runtime;
+                # Only these two directories, so unrelated edits do not rebuild the runtime.
+                src = pkgs.lib.fileset.toSource {
+                  root = ./.;
+                  fileset = pkgs.lib.fileset.unions [
+                    ./runtime
+                    ./internal/signing
+                  ];
+                };
+                modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-DLL7mCtn2hKbKWAAwZuAHQygHLMRw7wgEIoGbib/Lo0=";
+                vendorHash = "sha256-7X5P+Ge+qBypKPAAH++oGkNkej3JI4+ZYxGshm5ihTw=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -71,7 +79,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-UpYTFzOGPnETUaftmz0SwC/gDKbeUWj5zeYULCAsyf8=";
+                  vendorHash = "sha256-+rOrv+GKRtpm1rOv1SrQNycrKHFXJGI99rbCUz4s6Iw=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"

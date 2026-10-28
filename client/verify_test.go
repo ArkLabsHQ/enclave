@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/stretchr/testify/require"
@@ -379,5 +380,25 @@ func TestVerifyLeafCertPin(t *testing.T) {
 		t,
 		verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)),
 		"no attested TLS public-key fingerprint",
+	)
+}
+
+func TestPrepareResponseSigningContextCapturesURLCredentials(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://alice:password@api.example/orders", nil)
+	require.NoError(t, err)
+	signingContext, err := prepareResponseSigningContext(req)
+	require.NoError(t, err)
+	require.Equal(t, "Basic YWxpY2U6cGFzc3dvcmQ=", req.Header.Get("Authorization"))
+	recaptured, err := signing.CaptureResponseSigningContext(req, nil)
+	require.NoError(t, err)
+	require.Equal(t, recaptured, signingContext)
+	req.Header.Set("Authorization", "Bearer substituted")
+	recaptured, err = signing.CaptureResponseSigningContext(req, nil)
+	require.NoError(t, err)
+	require.NotEqual(
+		t,
+		recaptured,
+		signingContext,
+		"verification must use the pre-transport snapshot",
 	)
 }

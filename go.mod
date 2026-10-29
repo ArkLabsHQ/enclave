@@ -3,6 +3,7 @@ module github.com/ArkLabsHQ/enclave
 go 1.25.0
 
 require (
+	github.com/ArkLabsHQ/enclave/internal/signing v0.0.0-00010101000000-000000000000
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/hf/nitrite v0.0.0-20241225144000-c2d5d3c4f303
 	github.com/spf13/cobra v1.10.2
@@ -23,3 +24,5 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/ArkLabsHQ/enclave/internal/signing => ./internal/signing

@@ -1,44 +1,72 @@
 package runtime
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestAttestationUserData(t *testing.T) {
-	t.Run("zero value serializes fixed user_data format", func(t *testing.T) {
-		h := &AttestationHashes{}
+	const (
+		sha256TagHex  = "7368613235363a"   // "sha256:"
+		ed25519TagHex = "656432353531393a" // "ed25519:"
+		zeroHex       = "0000000000000000000000000000000000000000000000000000000000000000"
+		tlsHashHex    = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+		signingKeyHex = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+	)
 
-		var zero [sha256.Size]byte
-		want := append([]byte(hashPrefix), zero[:]...)
+	var tlsKeyHash [sha256.Size]byte
+	for i := range tlsKeyHash {
+		tlsKeyHash[i] = 0xff
+	}
+	signingKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
 
-		require.Equal(t, want, h.Serialize())
-	})
+	for _, tc := range []struct {
+		name       string
+		tlsKeyHash *[sha256.Size]byte
+		signingKey ed25519.PrivateKey
+		wantHex    string
+	}{
+		{
+			name:    "zero value",
+			wantHex: sha256TagHex + zeroHex + ed25519TagHex + zeroHex,
+		},
+		{
+			name:       "TLS hash only",
+			tlsKeyHash: &tlsKeyHash,
+			wantHex:    sha256TagHex + tlsHashHex + ed25519TagHex + zeroHex,
+		},
+		{
+			name:       "Signing key only",
+			signingKey: signingKey,
+			wantHex:    sha256TagHex + zeroHex + ed25519TagHex + signingKeyHex,
+		},
+		{
+			name:       "TLS hash and signing key",
+			tlsKeyHash: &tlsKeyHash,
+			signingKey: signingKey,
+			wantHex:    sha256TagHex + tlsHashHex + ed25519TagHex + signingKeyHex,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &AttestationData{}
+			if tc.tlsKeyHash != nil {
+				h.SetTLSKeyHashSource(staticKeyHash(*tc.tlsKeyHash))
+			}
+			if tc.signingKey != nil {
+				h.SetResponseSigningKey(tc.signingKey)
+			}
 
-	t.Run("set hash serializes exact raw bytes", func(t *testing.T) {
-		h := &AttestationHashes{}
-		var tlsHash [sha256.Size]byte
-		for i := range tlsHash {
-			tlsHash[i] = byte(i)
-		}
-
-		h.SetTLSKeyHashSource(staticKeyHash(tlsHash))
-
-		want := append([]byte(hashPrefix), tlsHash[:]...)
-
-		require.Equal(t, want, h.Serialize())
-	})
-
-	// The wire format is fixed-width and clients slice it by offset, so its
-	// length is part of the contract.
-	t.Run("user_data is 39 bytes", func(t *testing.T) {
-		h := &AttestationHashes{}
-		h.SetTLSKeyHashSource(staticKeyHash(sha256.Sum256([]byte("leaf"))))
-
-		require.Len(t, h.Serialize(), 39)
-	})
+			got := h.Serialize()
+			// Clients slice the fixed-width wire format by offset.
+			require.Len(t, got, 79)
+			require.Equal(t, tc.wantHex, hex.EncodeToString(got))
+		})
+	}
 }
 
 // staticKeyHash is the source for a certificate that never changes.

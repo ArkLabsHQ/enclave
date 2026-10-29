@@ -7,10 +7,12 @@ ROOT_PACKAGES := ./client/... ./cmd/enclave/...
 test:
 	go test $(ROOT_PACKAGES)
 	cd runtime && go test ./...
+	cd internal/signing && go test ./...
 
 lint:
 	CGO_ENABLED=0 GOOS=linux golangci-lint run $(ROOT_PACKAGES)
 	cd runtime && CGO_ENABLED=0 GOOS=linux golangci-lint run ./...
+	cd internal/signing && CGO_ENABLED=0 GOOS=linux golangci-lint run ./...
 
 fmt:
 	cd client && golines -w --max-len=100 .
@@ -19,3 +21,5 @@ fmt:
 	cd cmd/enclave && gofumpt -w .
 	cd runtime && golines -w --max-len=100 .
 	cd runtime && gofumpt -w .
+	cd internal/signing && golines -w --max-len=100 .
+	cd internal/signing && gofumpt -w .

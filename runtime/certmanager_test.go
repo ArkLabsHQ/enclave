@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -95,8 +96,11 @@ func (f *fakeIssuer) Issue(ctx context.Context, _ string, key crypto.Signer) ([]
 }
 
 // attestedHash is the user_data payload for a leaf: the prefix plus its SHA-256.
+// attestedHash is the user_data for leaf, with no response-signing key set.
 func attestedHash(leaf [sha256.Size]byte) []byte {
-	return append([]byte(hashPrefix), leaf[:]...)
+	ud := append([]byte(hashPrefix), leaf[:]...)
+	ud = append(ud, signingKeyPrefix...)
+	return append(ud, make([]byte, ed25519.PublicKeySize)...)
 }
 
 func certKeyHash(t *testing.T, certDER []byte) [sha256.Size]byte {
@@ -229,14 +233,14 @@ func TestACMEDoesNotAdoptTheSelfSignedCertificate(t *testing.T) {
 	// The fleet ran self-signed first.
 	selfSignedStore := newSelfSignedCertStore(testCfg, s3f, d, key, certTestBucket, "enclave.test")
 	_, err := newCertManager(ctx, testCfg, selfSignedStore, selfSignedIssuer{},
-		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
+		s3f, certTestBucket, "enclave.test", key, &AttestationData{})
 	require.NoError(t, err)
 
 	// Then ACME was switched on.
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
 	acmeStore := newCertStore(testCfg, s3f, d, key, certTestBucket, "enclave.test")
 	withACME, err := newCertManager(ctx, testCfg, acmeStore, issuer,
-		s3f, certTestBucket, "enclave.test", key, &AttestationHashes{})
+		s3f, certTestBucket, "enclave.test", key, &AttestationData{})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, issuer.calls,
@@ -273,40 +277,40 @@ func newTestTLSKey(t *testing.T) crypto.Signer {
 func tryNewCertTestManager(
 	s3f *fakeS3,
 	issuer certIssuer,
-) (*certManager, *AttestationHashes, error) {
-	hashes := &AttestationHashes{}
+) (*certManager, *AttestationData, error) {
+	attData := &AttestationData{}
 	store := newCertTestStore(s3f)
 	m, err := newCertManager(
 		context.Background(), testCfg, store, issuer,
-		s3f, certTestBucket, "enclave.test", store.key, hashes,
+		s3f, certTestBucket, "enclave.test", store.key, attData,
 	)
-	return m, hashes, err
+	return m, attData, err
 }
 
 func newCertTestManager(
 	t *testing.T,
 	s3f *fakeS3,
 	issuer certIssuer,
-) (*certManager, *AttestationHashes) {
+) (*certManager, *AttestationData) {
 	t.Helper()
-	m, hashes, err := tryNewCertTestManager(s3f, issuer)
+	m, attData, err := tryNewCertTestManager(s3f, issuer)
 	require.NoError(t, err)
-	return m, hashes
+	return m, attData
 }
 
 func newCertTestManagerForStore(
 	t *testing.T,
 	store *certStore,
 	issuer certIssuer,
-) (*certManager, *AttestationHashes) {
+) (*certManager, *AttestationData) {
 	t.Helper()
-	hashes := &AttestationHashes{}
+	attData := &AttestationData{}
 	m, err := newCertManager(
 		context.Background(), testCfg, store, issuer,
-		store.s3, store.bucket, store.fqdn, store.key, hashes,
+		store.s3, store.bucket, store.fqdn, store.key, attData,
 	)
 	require.NoError(t, err)
-	return m, hashes
+	return m, attData
 }
 
 // A peer that finishes renewing between our read and our lease must be adopted,
@@ -367,7 +371,7 @@ func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {
 	setCertTestEnv(t)
 	s3f := newFakeS3()
 	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	m, attData := newCertTestManager(t, s3f, issuer)
 
 	require.Equal(t, 1, issuer.calls)
 	cert, err := m.GetCertificate(nil)
@@ -376,7 +380,7 @@ func TestCertManagerBootstrapIssuesWhenNone(t *testing.T) {
 
 	// The attested fingerprint must describe the leaf actually served.
 	served := certKeyHash(t, cert.Certificate[0])
-	require.Equal(t, attestedHash(served), hashes.Serialize())
+	require.Equal(t, attestedHash(served), attData.Serialize())
 
 	// The lease is released, so a peer is not blocked behind us.
 	require.Empty(t, s3f.currentETag(leaseObjectKey(testCfg, certLeaseName)))
@@ -393,7 +397,7 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, stored.etag)
 
-	m, hashes := newCertTestManagerForStore(t, store, issuer)
+	m, attData := newCertTestManagerForStore(t, store, issuer)
 
 	require.Zero(t, issuer.calls, "a stored certificate must not trigger an order")
 	// Adopting must record the version too, or the first poll re-downloads a
@@ -402,7 +406,7 @@ func TestCertManagerBootstrapAdoptsStoredCert(t *testing.T) {
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	served := certKeyHash(t, cert.Certificate[0])
-	require.Equal(t, attestedHash(served), hashes.Serialize())
+	require.Equal(t, attestedHash(served), attData.Serialize())
 }
 
 // The headline case: an enclave whose lease lapsed while it was descheduled
@@ -437,7 +441,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 		peerKeyHash = certKeyHash(t, block.Bytes)
 	}
 
-	m, hashes := newCertTestManagerForStore(t, store, issuer)
+	m, attData := newCertTestManagerForStore(t, store, issuer)
 
 	// The store must still hold the peer's certificate: ours was rejected.
 	stored, err := store.LoadCert(ctx)
@@ -449,7 +453,7 @@ func TestCertManagerZombieWriteIsRejected(t *testing.T) {
 	cert, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	require.Equal(t, peerLeaf, sha256.Sum256(cert.Certificate[0]))
-	require.Equal(t, attestedHash(peerKeyHash), hashes.Serialize())
+	require.Equal(t, attestedHash(peerKeyHash), attData.Serialize())
 
 	require.Equal(t, 1, issuer.calls, "a rejected write must not re-run the order")
 }
@@ -511,13 +515,13 @@ func TestRoutineRenewalKeepsFleetTLSIdentity(t *testing.T) {
 		cn:       "enclave.test",
 		notAfter: time.Now().Add(time.Hour),
 	}
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	m, attData := newCertTestManager(t, s3f, issuer)
 
 	before, err := m.GetCertificate(nil)
 	require.NoError(t, err)
 	beforeDER := append([]byte(nil), before.Certificate[0]...)
 	beforeKeyHash := certKeyHash(t, beforeDER)
-	beforeAttestation := append([]byte(nil), hashes.Serialize()...)
+	beforeAttestation := append([]byte(nil), attData.Serialize()...)
 
 	require.NoError(t, m.tick(context.Background()))
 
@@ -526,7 +530,7 @@ func TestRoutineRenewalKeepsFleetTLSIdentity(t *testing.T) {
 	require.NotEqual(t, beforeDER, after.Certificate[0], "renewal must install a new certificate")
 	require.Equal(t, beforeKeyHash, certKeyHash(t, after.Certificate[0]),
 		"routine renewal must reuse the fleet TLS key")
-	require.Equal(t, beforeAttestation, hashes.Serialize(),
+	require.Equal(t, beforeAttestation, attData.Serialize(),
 		"certificate renewal must not change the attested fleet identity")
 	require.Equal(t, 2, issuer.calls)
 }
@@ -673,14 +677,14 @@ func TestAttestedHashAlwaysMatchesServedLeaf(t *testing.T) {
 	require.Equal(
 		t,
 		attestedHash([sha256.Size]byte{}),
-		(&AttestationHashes{}).Serialize(),
+		(&AttestationData{}).Serialize(),
 	)
 
-	m, hashes := newCertTestManager(t, s3f, issuer)
+	m, attData := newCertTestManager(t, s3f, issuer)
 
 	attested := func() [sha256.Size]byte {
 		var h [sha256.Size]byte
-		copy(h[:], hashes.Serialize()[len(hashPrefix):])
+		copy(h[:], attData.Serialize()[len(hashPrefix):])
 		return h
 	}
 	served := func() [sha256.Size]byte {

@@ -3,14 +3,19 @@ package runtime
 // servers.go wires public/private muxes, admin handlers, reverse proxy, and listeners.
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -18,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"golang.org/x/net/http2"
 )
@@ -25,6 +31,11 @@ import (
 const (
 	nonceNumDigits = 40 // 20-byte nonce, hex-encoded
 	enclavePrefix  = "/enclave/"
+
+	signNonceHeader = "X-Enclave-Sign-Nonce"
+	signatureHeader = "X-Enclave-Signature"
+
+	maxLoggedNonce = 128
 )
 
 var (
@@ -69,6 +80,7 @@ type servers struct {
 	em  *http.ServeMux
 	rt  RuntimeState
 
+	attData  *AttestationData
 	ancestry atomic.Value // Ancestry, set once state is established
 }
 
@@ -77,7 +89,7 @@ func SetupHttpServers(
 	cfg Config,
 	nsm NSM,
 	telemetry *Telemetry,
-	hashes *AttestationHashes,
+	attData *AttestationData,
 	authToken string,
 ) Servers {
 	metricsMW := metricsMiddleware(telemetry)
@@ -104,14 +116,14 @@ func SetupHttpServers(
 
 	// OTLP forwarding stays on loopback because requests use instance credentials.
 	rm := http.NewServeMux()
-	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, hashes)))
+	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, attData)))
 
 	em := http.NewServeMux()
 	em.Handle(enclavePrefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
 
-	em.Handle("/", whenReady(rt, revProxy))
+	em.Handle("/", whenReady(rt, signResponses(attData, revProxy)))
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
@@ -132,12 +144,13 @@ func SetupHttpServers(
 	}
 
 	return &servers{
-		cfg: &cfg,
-		ext: ext,
-		int: int,
-		rm:  rm,
-		em:  em,
-		rt:  rt,
+		cfg:     &cfg,
+		ext:     ext,
+		int:     int,
+		rm:      rm,
+		em:      em,
+		rt:      rt,
+		attData: attData,
 	}
 }
 
@@ -206,7 +219,7 @@ func (s *servers) SetAncestry(ctx context.Context, ancestry Ancestry) {
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
-	s.rm.HandleFunc("GET /enclave/v1/info", func(w http.ResponseWriter, r *http.Request) {
+	info := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		migrationStatus, err := migrator.MigrationStatus(r.Context())
@@ -251,7 +264,9 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 			KMSKeyLocked:             s.cfg.KMSLocked,
 			Ancestry:                 ancestryInfo,
 		})
-	})
+	}
+	// Signed on request like application responses, once the signing key exists.
+	s.rm.Handle("GET /enclave/v1/info", signResponses(s.attData, http.HandlerFunc(info)))
 
 	return nil
 }
@@ -359,7 +374,7 @@ func whenReady(rt RuntimeState, next http.Handler) http.Handler {
 }
 
 // attestationHandler serves NSM attestation bound to the currently served TLS leaf.
-func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
+func attestationHandler(nsm NSM, attData *AttestationData) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, errBadForm, http.StatusBadRequest)
@@ -379,7 +394,7 @@ func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 
 		doc, _, err := nsm.BuildAttestationDocument(
 			WithNonce(rawNonce),
-			WithUserData(hashes.Serialize()),
+			WithUserData(attData.Serialize()),
 		)
 		if err != nil {
 			http.Error(w, errFailedAttestation, http.StatusInternalServerError)
@@ -389,6 +404,77 @@ func attestationHandler(nsm NSM, hashes *AttestationHashes) http.HandlerFunc {
 		_, _ = fmt.Fprintln(w, base64.StdEncoding.EncodeToString(doc))
 	}
 }
+
+// signResponses signs the response to a request carrying signNonceHeader with
+// the attested response-signing key, over the request as received and the
+// response as sent. Other requests pass through unbuffered.
+func signResponses(attData *AttestationData, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce := r.Header.Get(signNonceHeader)
+		if nonce == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Refuse before the app acts on the request, not after.
+		key := attData.responseSigningKey()
+		if key == nil {
+			http.Error(w, "no response signing key", http.StatusServiceUnavailable)
+			return
+		}
+		reqBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		signingContext, err := signing.CaptureResponseSigningContext(r, reqBody)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Sign the decoded body: browsers always decompress and cannot opt out.
+		// Without the header, the upstream transport requests gzip itself and
+		// decodes it before we see the body.
+		r.Header.Del("Accept-Encoding")
+
+		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		// A HEAD response carries no body on the wire; sign the empty one sent.
+		if r.Method == http.MethodHead {
+			rec.body.Reset()
+		}
+		msg := signingContext.ResponseMessage(sha256.Sum256(rec.body.Bytes()), rec.status)
+		maps.Copy(w.Header(), rec.header)
+		w.Header().Set(signatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg)))
+		// Lets cross-origin browser code read the signature.
+		w.Header().Add("Access-Control-Expose-Headers", signatureHeader)
+		// The signature answers one nonce; a cached copy could only fail verification.
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(rec.status)
+		_, _ = w.Write(rec.body.Bytes())
+
+		path, _, _ := strings.Cut(signingContext.URI, "?")
+		slog.Info(
+			"signed response",
+			"nonce", nonce[:min(len(nonce), maxLoggedNonce)],
+			"method", signingContext.Method,
+			"path", path,
+			"authority", signingContext.Authority,
+			"status", rec.status,
+		)
+	})
+}
+
+// bufferedResponse holds a response until it is signed.
+type bufferedResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *bufferedResponse) Header() http.Header         { return b.header }
+func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
+func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
 // so, the error from its exit. The runtime stays alive after app exit so

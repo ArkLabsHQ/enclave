@@ -63,10 +63,10 @@ func ConfigureTLS(
 	ssm SSM,
 	r53 Route53API,
 	tlsKey, accountKey crypto.Signer,
-	hashes *AttestationHashes,
+	attData *AttestationData,
 ) (TLSCertCallback, error) {
 	if !cfg.UseACME {
-		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, hashes)
+		return configureSelfSigned(ctx, cfg, s3, dek, ssm, tlsKey, attData)
 	}
 
 	zoneID, err := ssm.MayGet(ctx, cfg.route53ZoneIDParam())
@@ -81,7 +81,7 @@ func ConfigureTLS(
 				"and needs a Route53 hosted zone", cfg.route53ZoneIDParam(),
 		)
 	}
-	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, accountKey, hashes)
+	return configureDNS01Cert(ctx, cfg, s3, dek, ssm, r53, zoneID, tlsKey, accountKey, attData)
 }
 
 func configureDNS01Cert(
@@ -93,7 +93,7 @@ func configureDNS01Cert(
 	r53 Route53API,
 	zoneID string,
 	tlsKey, accountKey crypto.Signer,
-	hashes *AttestationHashes,
+	attData *AttestationData,
 ) (TLSCertCallback, error) {
 	certBucket, err := ssm.MustGet(ctx, cfg.certBucketParam())
 	if err != nil {
@@ -125,7 +125,7 @@ func configureDNS01Cert(
 
 	manager, err := newCertManager(
 		ctx, cfg, store, issuer,
-		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
+		s3, leaseBucket, cfg.FQDN, tlsKey, attData,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)
@@ -145,7 +145,7 @@ func configureSelfSigned(
 	dek DEK,
 	ssm SSM,
 	tlsKey crypto.Signer,
-	hashes *AttestationHashes,
+	attData *AttestationData,
 ) (TLSCertCallback, error) {
 	certBucket, err := ssm.MayGet(ctx, cfg.certBucketParam())
 	if err != nil {
@@ -165,7 +165,7 @@ func configureSelfSigned(
 	store := newSelfSignedCertStore(cfg, s3, dek, tlsKey, certBucket, cfg.FQDN)
 	manager, err := newCertManager(
 		ctx, cfg, store, selfSignedIssuer{},
-		s3, leaseBucket, cfg.FQDN, tlsKey, hashes,
+		s3, leaseBucket, cfg.FQDN, tlsKey, attData,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish shared certificate: %w", err)

@@ -186,20 +186,35 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 }
 
 func TestNewBootRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
-	fake, ssm := stateOriginTestSSM(nil)
-	session := newStatefulNSMSession(t, map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, 47)})
+	for _, tc := range []struct {
+		size    int
+		wantErr string
+	}{
+		{0, "empty PCR0"},
+		{47, "PCR0 must be exactly 48 bytes"},
+		{49, "PCR0 must be exactly 48 bytes"},
+	} {
+		t.Run(fmt.Sprintf("%d bytes", tc.size), func(t *testing.T) {
+			fake, ssm := stateOriginTestSSM(nil)
+			session := newStatefulNSMSession(
+				t,
+				map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, tc.size)},
+			)
 
-	_, err := NewBoot(
-		stateOriginTestConfig(),
-		&nsmW{nsm: &fakeNSM{session: session}},
-		nil,
-		nil,
-		ssm,
-		nil,
-	)
+			boot, err := NewBoot(
+				stateOriginTestConfig(),
+				&nsmW{nsm: &fakeNSM{session: session}},
+				nil,
+				nil,
+				ssm,
+				nil,
+			)
 
-	require.ErrorContains(t, err, "exactly 48 bytes")
-	require.Empty(t, fake.calls)
+			require.ErrorContains(t, err, tc.wantErr)
+			require.Nil(t, boot)
+			require.Empty(t, fake.calls)
+		})
+	}
 }
 
 func TestVerifyStateOriginReceipt(t *testing.T) {
@@ -289,6 +304,12 @@ func TestGenesisPublishesItsSnapshotAndNothingToSSM(t *testing.T) {
 	require.Len(t, fx.s3f.objects[snapshotObjectKey(fx.pcr0Hex)], 1)
 	require.NotContains(t, fx.s3f.objects, "deployment-genesis")
 	require.Equal(t, stateOriginTestMigrationIntentBucket(), result.migrationIntentBucketName)
+	wantSigningKey, err := deriveResponseSigningKey(
+		result.masterSeed,
+		mustDecodeHexString(fx.pcr0Hex),
+	)
+	require.NoError(t, err)
+	require.Equal(t, wantSigningKey, result.responseSigningKey)
 }
 
 // A live peer lease must stop genesis before any KMS key is minted
@@ -327,9 +348,14 @@ func TestBootResumesAfterPeerGenesis(t *testing.T) {
 	require.Equal(t, first.dek.(*dek).key, second.dek.(*dek).key, "fleet must share one DEK")
 	require.Equal(t, first.secrets, second.secrets)
 	require.Equal(t, first.acmeAccountKey, second.acmeAccountKey)
+	require.NotEmpty(t, first.responseSigningKey)
+	require.Equal(t, first.responseSigningKey, second.responseSigningKey)
 	require.Equal(t, parentEnv, os.Environ(), "boot must not export keys to the parent environment")
 
-	internalKeys := [][]byte{second.masterSeed, second.dek.(*dek).key}
+	internalKeys := [][]byte{
+		second.masterSeed, second.dek.(*dek).key,
+		second.responseSigningKey, second.responseSigningKey.Seed(),
+	}
 	for _, key := range []*ecdsa.PrivateKey{
 		second.tlsKey.(*ecdsa.PrivateKey), second.acmeAccountKey.(*ecdsa.PrivateKey),
 	} {
@@ -364,6 +390,7 @@ func TestEstablishResumeUsesThePlannedSnapshot(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, first.masterSeed, resumed.masterSeed)
+	require.Equal(t, first.responseSigningKey, resumed.responseSigningKey)
 }
 
 // The lease is released once genesis commits, so it never wedges later boots.
@@ -770,6 +797,9 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			"the predecessor's receipt is published as it was written")
 		require.Len(t, out.s3.objects[snapshotObjectKey(currentHex)], 1)
 		require.Equal(t, out.before, out.ssm.params, "adoption writes nothing to SSM")
+		wantSigningKey, err := deriveResponseSigningKey(out.result.masterSeed, current)
+		require.NoError(t, err)
+		require.Equal(t, wantSigningKey, out.result.responseSigningKey)
 	})
 
 	for _, tc := range []struct {

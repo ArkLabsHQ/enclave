@@ -197,7 +197,7 @@ func TestConfigureTLSRegistersACMEWithBootAccountKey(t *testing.T) {
 		&fakeRoute53{},
 		boot.tlsKey,
 		boot.acmeAccountKey,
-		&AttestationHashes{},
+		&AttestationData{},
 	)
 	require.ErrorContains(t, err, "test stops after account registration")
 

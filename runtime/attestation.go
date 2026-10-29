@@ -19,28 +19,28 @@ type attestationDocument struct {
 	PCRs map[uint][]byte `cbor:"pcrs"`
 }
 
-// AttestationHashes is the user_data payload of NSM attestation documents,
+// AttestationData is the user_data payload of NSM attestation documents,
 // binding them to the served TLS public key and the response-signing key. Its
 // zero value attests all-zero values.
-type AttestationHashes struct {
+type AttestationData struct {
 	tlsKeyHash  atomic.Pointer[TLSKeyHashFunc]
 	responseKey atomic.Pointer[ed25519.PrivateKey]
 }
 
 // SetTLSKeyHashSource makes the attested hash track the certificate src reports,
 // so a certificate swap can never leave the two disagreeing.
-func (a *AttestationHashes) SetTLSKeyHashSource(src TLSKeyHashFunc) {
+func (a *AttestationData) SetTLSKeyHashSource(src TLSKeyHashFunc) {
 	a.tlsKeyHash.Store(&src)
 }
 
 // SetResponseSigningKey sets the key that signs proxied responses. Holding it
 // here keeps the attested public key and the signing key one value.
-func (a *AttestationHashes) SetResponseSigningKey(key ed25519.PrivateKey) {
+func (a *AttestationData) SetResponseSigningKey(key ed25519.PrivateKey) {
 	a.responseKey.Store(&key)
 }
 
 // responseSigningKey returns the key set by SetResponseSigningKey, or nil.
-func (a *AttestationHashes) responseSigningKey() ed25519.PrivateKey {
+func (a *AttestationData) responseSigningKey() ed25519.PrivateKey {
 	if key := a.responseKey.Load(); key != nil {
 		return *key
 	}
@@ -49,7 +49,7 @@ func (a *AttestationHashes) responseSigningKey() ed25519.PrivateKey {
 
 // Serialize returns "sha256:" followed by the TLS PublicKey hash, then
 // "ed25519:" followed by the raw response-signing public key: 79 bytes.
-func (a *AttestationHashes) Serialize() []byte {
+func (a *AttestationData) Serialize() []byte {
 	var tlsHash [sha256.Size]byte
 	if src := a.tlsKeyHash.Load(); src != nil {
 		if live, ok := (*src)(); ok {

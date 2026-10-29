@@ -214,7 +214,7 @@ func TestCorsWildcard(t *testing.T) {
 func TestAttestationHandler(t *testing.T) {
 	t.Run("missing nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationData{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -224,7 +224,7 @@ func TestAttestationHandler(t *testing.T) {
 
 	t.Run("bad nonce", func(t *testing.T) {
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationHashes{}).ServeHTTP(rr,
+		attestationHandler(&nsmW{nsm: &fakeNSM{}}, &AttestationData{}).ServeHTTP(rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce=not-hex", nil))
 
 		if rr.Code != http.StatusBadRequest {
@@ -235,13 +235,13 @@ func TestAttestationHandler(t *testing.T) {
 	t.Run("returns document bound to nonce and user data", func(t *testing.T) {
 		doc := []byte("attestation document")
 		session := &fakeNSMSession{responses: []response.Response{attestationDocumentResponse(doc)}}
-		hashes := &AttestationHashes{}
+		attData := &AttestationData{}
 		tlsHash := sha256.Sum256([]byte("tls"))
-		hashes.SetTLSKeyHashSource(staticKeyHash(tlsHash))
+		attData.SetTLSKeyHashSource(staticKeyHash(tlsHash))
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 
 		rr := httptest.NewRecorder()
-		attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, hashes).ServeHTTP(
+		attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, attData).ServeHTTP(
 			rr,
 			httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce="+hex.EncodeToString(rawNonce), nil),
 		)
@@ -262,8 +262,8 @@ func TestAttestationHandler(t *testing.T) {
 		if !bytes.Equal(req.Nonce, rawNonce) {
 			t.Fatalf("nonce: got %x, want %x", req.Nonce, rawNonce)
 		}
-		if !bytes.Equal(req.UserData, hashes.Serialize()) {
-			t.Fatalf("user_data: got %x, want %x", req.UserData, hashes.Serialize())
+		if !bytes.Equal(req.UserData, attData.Serialize()) {
+			t.Fatalf("user_data: got %x, want %x", req.UserData, attData.Serialize())
 		}
 		require.Len(t, req.UserData, 79)
 	})
@@ -515,7 +515,7 @@ func TestInternalMuxRoutesOTLPToTheForwarders(t *testing.T) {
 		Config{AppWebSrv: appURL},
 		&nsmW{},
 		NewTelemetry(testCfg, testAWS(t, newFakeCloudWatchLogs(), up.URL)),
-		&AttestationHashes{},
+		&AttestationData{},
 		"token",
 	).(*servers)
 
@@ -555,7 +555,7 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 		Config{AppWebSrv: appURL},
 		&nsmW{},
 		NewTelemetry(testCfg, nil),
-		&AttestationHashes{},
+		&AttestationData{},
 		"token",
 	).(*servers)
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
@@ -684,10 +684,10 @@ func TestSignedProxiedResponse(t *testing.T) {
 
 	rt := newRuntimeState()
 	rt.NotifyReady()
-	hashes := &AttestationHashes{}
+	attData := &AttestationData{}
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
 	s := SetupHttpServers(
-		rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), hashes, "token",
+		rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), attData, "token",
 	).(*servers)
 
 	serveURI := func(uri, nonce string, header http.Header) *httptest.ResponseRecorder {
@@ -722,7 +722,7 @@ func TestSignedProxiedResponse(t *testing.T) {
 		require.Nil(t, received)
 	})
 
-	hashes.SetResponseSigningKey(key)
+	attData.SetResponseSigningKey(key)
 
 	t.Run("signs request and response when asked", func(t *testing.T) {
 		rr := serve("n1")
@@ -759,10 +759,10 @@ func TestSignedProxiedResponse(t *testing.T) {
 }
 
 func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
-	hashes := &AttestationHashes{}
+	attData := &AttestationData{}
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
-	hashes.SetResponseSigningKey(key)
-	h := signResponses(hashes, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	attData.SetResponseSigningKey(key)
+	h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 	for _, tc := range []struct {
@@ -801,10 +801,10 @@ func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
 }
 
 func TestSignedResponseRejectsConnectionHeaderStripping(t *testing.T) {
-	hashes := &AttestationHashes{}
-	hashes.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	attData := &AttestationData{}
+	attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
 	called := false
-	h := signResponses(hashes, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		called = true
 	}))
 	req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
@@ -818,9 +818,9 @@ func TestSignedResponseRejectsConnectionHeaderStripping(t *testing.T) {
 }
 
 func TestSignedRequestBodyReadError(t *testing.T) {
-	hashes := &AttestationHashes{}
-	hashes.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
-	h := signResponses(hashes, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	attData := &AttestationData{}
+	attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("the app must not see a signed request whose body could not be read")
 	}))
 	body := iotest.ErrReader(errors.New("client went away"))
@@ -832,8 +832,8 @@ func TestSignedRequestBodyReadError(t *testing.T) {
 }
 
 func TestSignedEnclaveInfo(t *testing.T) {
-	hashes := &AttestationHashes{}
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), hashes: hashes}
+	attData := &AttestationData{}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), attData: attData}
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
 		previous: &PreviousPCR0Info{},
 		status:   &MigrationStatus{},
@@ -858,7 +858,7 @@ func TestSignedEnclaveInfo(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
 
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
-	hashes.SetResponseSigningKey(key)
+	attData.SetResponseSigningKey(key)
 	req, rr := get("n2")
 	require.Equal(t, http.StatusOK, rr.Code)
 	signingContext, err := signing.CaptureResponseSigningContext(req, nil)

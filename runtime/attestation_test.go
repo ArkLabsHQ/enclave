@@ -53,7 +53,7 @@ func TestAttestationUserData(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := &AttestationHashes{}
+			h := &AttestationData{}
 			if tc.tlsKeyHash != nil {
 				h.SetTLSKeyHashSource(staticKeyHash(*tc.tlsKeyHash))
 			}

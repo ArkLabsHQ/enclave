@@ -82,7 +82,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	cfg.InstanceID = aws.InstanceID
 	telemetry := NewTelemetry(&cfg, aws)
 
-	hashes := &AttestationHashes{}
+	attData := &AttestationData{}
 
 	authToken, err := generateRuntimeToken()
 	if err != nil {
@@ -98,7 +98,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		cfg,
 		nsm,
 		telemetry,
-		hashes,
+		attData,
 		authToken,
 	)
 
@@ -199,7 +199,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		),
 	)
 
-	hashes.SetResponseSigningKey(result.responseSigningKey)
+	attData.SetResponseSigningKey(result.responseSigningKey)
 	slog.Info(
 		"response signing key",
 		"public_key", hex.EncodeToString(result.responseSigningKey.Public().(ed25519.PublicKey)),
@@ -221,7 +221,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		aws.Route53,
 		result.tlsKey,
 		result.acmeAccountKey,
-		hashes,
+		attData,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure TLS: %w", err)

@@ -49,7 +49,7 @@ type certManager struct {
 	s3          S3API
 	leaseBucket string
 	fqdn        string
-	hashes      *AttestationHashes
+	attData     *AttestationData
 	key         crypto.Signer
 
 	currentCert atomic.Pointer[certBundle]
@@ -63,7 +63,7 @@ func newCertManager(
 	s3api S3API,
 	leaseBucket, fqdn string,
 	key crypto.Signer,
-	hashes *AttestationHashes,
+	attData *AttestationData,
 ) (*certManager, error) {
 	m := &certManager{
 		cfg:         cfg,
@@ -72,7 +72,7 @@ func newCertManager(
 		s3:          s3api,
 		leaseBucket: leaseBucket,
 		fqdn:        fqdn,
-		hashes:      hashes,
+		attData:     attData,
 		key:         key,
 	}
 
@@ -82,7 +82,7 @@ func newCertManager(
 	}
 	m.currentCert.Store(bundle)
 
-	hashes.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
+	attData.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
 		return m.currentCert.Load().keyHash, true
 	})
 	return m, nil

@@ -68,15 +68,6 @@ func TestResolveInstanceIDReportsTheIMDSFailure(t *testing.T) {
 	require.ErrorContains(t, err, "503")
 }
 
-// bodyIMDS answers every metadata request with the given body.
-type bodyIMDS struct{ body io.Reader }
-
-func (b bodyIMDS) GetMetadata(
-	context.Context, *imds.GetMetadataInput, ...func(*imds.Options),
-) (*imds.GetMetadataOutput, error) {
-	return &imds.GetMetadataOutput{Content: io.NopCloser(b.body)}, nil
-}
-
 type failingReader struct{ err error }
 
 func (r failingReader) Read([]byte) (int, error) { return 0, r.err }

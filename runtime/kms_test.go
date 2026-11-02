@@ -193,7 +193,7 @@ func kmsTestNSMWithPCR0(t *testing.T, pcr0 []byte) NSM {
 	t.Helper()
 	return &nsmW{nsm: &fakeNSM{session: &fakeNSMSession{
 		responses: []response.Response{
-			attestationDocumentResponse(buildForgedAttestation(t, map[uint][]byte{0: pcr0})),
+			attestationDocumentResponse(newFakeNSM(t).forge(map[uint][]byte{0: pcr0}, nil)),
 		},
 	}}}
 }
@@ -201,11 +201,12 @@ func kmsTestNSMWithPCR0(t *testing.T, pcr0 []byte) NSM {
 func kmsTestNSMWithRecipient(t *testing.T) NSM {
 	t.Helper()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	forger := newFakeNSM(t)
 	return &nsmW{nsm: &fakeNSM{session: &fakeNSMSession{
 		sendFunc: func(req request.Request) (response.Response, error) {
 			att := req.(*request.Attestation)
 			return attestationDocumentResponse(
-				buildForgedAttestationWithPublicKey(t, map[uint][]byte{0: pcr0}, att.PublicKey),
+				forger.forge(map[uint][]byte{0: pcr0}, att.PublicKey),
 			), nil
 		},
 	}}}

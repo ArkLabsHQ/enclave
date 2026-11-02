@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"strings"
@@ -152,7 +153,7 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 			cfg := stateOriginTestConfig()
 			cfg.PreviousPCR0 = tc.previous
 			boot := &Boot{
-				cfg: cfg, nsm: &nsmW{nsm: &fakeNSM{verifyRoots: fx.signer.roots}},
+				cfg: cfg, nsm: &nsmW{nsm: fx.signer.peer()},
 				ssm: ssm, s3: fx.s3f, sts: &fakeSTS{}, pcr0: own,
 				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
@@ -196,10 +197,9 @@ func TestNewBootRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%d bytes", tc.size), func(t *testing.T) {
 			fake, ssm := stateOriginTestSSM(nil)
-			session := newStatefulNSMSession(
-				t,
+			session := newFakeNSM(t).withPCRs(
 				map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, tc.size)},
-			)
+			).session
 
 			boot, err := NewBoot(
 				stateOriginTestConfig(),
@@ -250,7 +250,7 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 		{
 			name: "forged receipt",
 			receipt: base64.StdEncoding.EncodeToString(
-				buildForgedAttestation(t, map[uint][]byte{0: pcr0}),
+				newFakeNSM(t).forge(map[uint][]byte{0: pcr0}, nil),
 			),
 			root: stateRoot, snapshot: snapshot,
 		},
@@ -720,7 +720,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 	adopt := func(t *testing.T, a adoption) outcome {
 		t.Helper()
 		ctx := t.Context()
-		signer := newTestAttestationSigner(t, bootAt.Add(-24*time.Hour), bootAt.Add(24*time.Hour))
+		signer := newFakeNSMValid(t, bootAt.Add(-24*time.Hour), bootAt.Add(24*time.Hour))
 		kmsf := newFakeKMS()
 		params := handoffParams(t, testCfg, kmsf, keyID)
 		params[testCfg.migrationPreviousPCR0Param(currentHex)] = a.predecessor
@@ -734,8 +734,8 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		}.root(testCfg)
 
 		require.NoError(t, err)
-		params[testCfg.migrationStateOriginReceiptParam(keyID, currentHex)] = signer.build(
-			t, a.pcrs, bootAt, receiptPayload(t, purposeMigrationTransition, root),
+		params[testCfg.migrationStateOriginReceiptParam(keyID, currentHex)] = signer.attest(
+			a.pcrs, bootAt, receiptPayload(t, purposeMigrationTransition, root),
 		).docB64
 		if a.tamper != nil {
 			a.tamper(params)
@@ -754,13 +754,11 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 				seed.weaken(&objects[len(objects)-1])
 			}
 		}
-		session := newStatefulNSMSession(t, map[uint][]byte{0: current})
-		session.attestationSign = signer
 		cfg := stateOriginTestConfig()
 		cfg.MigrationCooldown = 0
 		cfg.PreviousPCR0 = a.eif
 		boot := &Boot{
-			cfg: cfg, nsm: &nsmW{nsm: &fakeNSM{session: session, verifyRoots: signer.roots}},
+			cfg: cfg, nsm: &nsmW{nsm: signer.peer().withPCRs(map[uint][]byte{0: current})},
 			kmsAPI: kmsf, ssm: ssm, s3: s3f, sts: &fakeSTS{}, pcr0: current,
 			secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 		}
@@ -973,9 +971,7 @@ func TestMigrationSnapshotOutlivesItsHandoff(t *testing.T) {
 
 	cfg := stateOriginTestConfig()
 	cfg.PreviousPCR0 = blueHex
-	session := newStatefulNSMSession(t, map[uint][]byte{0: green})
-	session.attestationSign = fx.signer
-	nsm := &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.signer.roots}}
+	nsm := &nsmW{nsm: fx.signer.peer().withPCRs(map[uint][]byte{0: green})}
 	newGreen := func() *Boot {
 		b, err := NewBoot(cfg, nsm, fx.kmsf, fx.sts, fx.ssm, fx.s3f)
 		require.NoError(t, err)
@@ -1129,15 +1125,7 @@ func signedReceipt(
 	stateRoot []byte,
 ) signedAttestation {
 	t.Helper()
-	now := time.Now()
-	return buildSignedAttestationCustom(
-		t,
-		pcrs,
-		now.Add(-time.Hour),
-		now.Add(time.Hour),
-		now,
-		receiptPayload(t, purpose, stateRoot),
-	)
+	return newFakeNSM(t).attest(pcrs, time.Now(), receiptPayload(t, purpose, stateRoot))
 }
 
 func originReceiptPayload(t *testing.T, stateRoot []byte, snapshot Snapshot) []byte {
@@ -1151,11 +1139,7 @@ func signedOriginReceipt(
 	t *testing.T, pcrs map[uint][]byte, stateRoot []byte, snapshot Snapshot,
 ) signedAttestation {
 	t.Helper()
-	now := time.Now()
-	return buildSignedAttestationCustom(
-		t, pcrs, now.Add(-time.Hour), now.Add(time.Hour), now,
-		originReceiptPayload(t, stateRoot, snapshot),
-	)
+	return newFakeNSM(t).attest(pcrs, time.Now(), originReceiptPayload(t, stateRoot, snapshot))
 }
 
 // genesisFixture builds the shared AWS surface N enclaves of one PCR0 boot
@@ -1168,7 +1152,7 @@ type genesisFixture struct {
 	s3f     *fakeS3
 	kmsf    *fakeKMS
 	sts     *fakeSTS
-	signer  *testAttestationSigner
+	signer  *fakeNSM
 	pcr0Hex string
 }
 
@@ -1177,21 +1161,21 @@ func (f *genesisFixture) keyIDParam() string { return testCfg.kmsKeyIDParam(f.pc
 
 func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 	t.Helper()
-	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
+	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
 	ssmf, ssm := stateOriginTestSSM(map[string]string{
 		testCfg.leaseBucketParam(): testLeaseBucket,
 	})
 	s3f := newFakeS3()
 	s3f.versioned = true
 	return &genesisFixture{
-		nsm:     &nsmW{nsm: &fakeNSM{session: session, verifyRoots: session.attestationSign.roots}},
+		nsm:     &nsmW{nsm: session.nsm},
 		pcr0Hex: hex.EncodeToString(pcr0),
 		ssmf:    ssmf,
 		ssm:     ssm,
 		s3f:     s3f,
 		kmsf:    newFakeKMS(),
 		sts:     &fakeSTS{arn: testRoleARN},
-		signer:  session.attestationSign,
+		signer:  session.nsm,
 	}
 }
 
@@ -1269,7 +1253,7 @@ func mustDecodeHexString(s string) []byte {
 func seedMigrationIntent(
 	t *testing.T,
 	s3f *fakeS3,
-	signer *testAttestationSigner,
+	signer *fakeNSM,
 	sourcePCR0 []byte,
 	action, targetPCR0 string,
 	sequence uint64,
@@ -1287,7 +1271,7 @@ func seedMigrationIntent(
 	})
 	require.NoError(t, err)
 
-	attestation := signer.build(t, map[uint][]byte{0: sourcePCR0}, publishedAt, payload)
+	attestation := signer.attest(map[uint][]byte{0: sourcePCR0}, publishedAt, payload)
 	body, err := json.Marshal(migrationIntentObjectV1{
 		Schema:      migrationIntentSchemaV1,
 		Sequence:    sequence,
@@ -1312,7 +1296,7 @@ var (
 // receipts, so every check under test is the real verification.
 type snapshotTestFixture struct {
 	s3f    *fakeS3
-	signer *testAttestationSigner
+	signer *fakeNSM
 	boot   *Boot
 }
 
@@ -1320,8 +1304,7 @@ type snapshotTestFixture struct {
 // concurrent publishers can share it.
 type ownerNSM struct {
 	NSM
-	t      *testing.T
-	signer *testAttestationSigner
+	signer *fakeNSM
 	pcr0   []byte
 }
 
@@ -1332,17 +1315,16 @@ func (n ownerNSM) BuildAttestationDocument(
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return n.signer.build(n.t, map[uint][]byte{0: n.pcr0}, time.Now(), o.userData).doc, nil, nil
+	return n.signer.attest(map[uint][]byte{0: n.pcr0}, time.Now(), o.userData).doc, nil, nil
 }
 
 func newSnapshotTestFixture(t *testing.T) *snapshotTestFixture {
 	t.Helper()
-	now := time.Now()
-	signer := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
+	signer := newFakeNSM(t)
 	s3f := newFakeS3()
 	s3f.versioned = true
 	nsm := ownerNSM{
-		NSM: &nsmW{nsm: &awsNSM{roots: signer.roots}}, t: t, signer: signer,
+		NSM: &nsmW{nsm: &awsNSM{roots: signer.roots}}, signer: signer,
 		pcr0: snapshotTestOwner,
 	}
 	boot := &Boot{cfg: testCfg, s3: s3f, nsm: nsm}
@@ -1373,9 +1355,9 @@ func (f *snapshotTestFixture) receipts(
 	owner := mustDecodeHex(t, snapshot.ownerPCR0)
 	payload, err := cbor.Marshal(snapshot.originPayload(root))
 	require.NoError(t, err)
-	origin = f.signer.build(t, map[uint][]byte{0: owner}, time.Now(), payload).docB64
+	origin = f.signer.attest(map[uint][]byte{0: owner}, time.Now(), payload).docB64
 	if snapshot.predecessorPCR0 != "" {
-		transition = f.signer.build(t, map[uint][]byte{
+		transition = f.signer.attest(map[uint][]byte{
 			0:                 mustDecodeHex(t, snapshot.predecessorPCR0),
 			migrationPCRIndex: pcrExtendFromZero(owner),
 		}, time.Now(), receiptPayload(t, purposeMigrationTransition, root)).docB64
@@ -1625,7 +1607,7 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 			name: "forged origin receipt", snapshot: genesis,
 			mutate: func(t *testing.T, _ *snapshotTestFixture, obj *snapshotObjectV1) {
 				obj.OriginAttestation = base64.StdEncoding.EncodeToString(
-					buildForgedAttestation(t, map[uint][]byte{0: snapshotTestOwner}),
+					newFakeNSM(t).forge(map[uint][]byte{0: snapshotTestOwner}, nil),
 				)
 			},
 		},
@@ -1636,8 +1618,8 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 					genesis.originPayload(snapshotRootOf(obj.Snapshot)),
 				)
 				require.NoError(t, err)
-				obj.OriginAttestation = fx.signer.build(
-					t, map[uint][]byte{0: otherPCR0}, time.Now(), payload,
+				obj.OriginAttestation = fx.signer.attest(
+					map[uint][]byte{0: otherPCR0}, time.Now(), payload,
 				).docB64
 			},
 		},
@@ -1664,7 +1646,7 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 		{
 			name: "transition receipt with the wrong PCR31", snapshot: migrated,
 			mutate: func(t *testing.T, fx *snapshotTestFixture, obj *snapshotObjectV1) {
-				obj.TransitionAttestation = fx.signer.build(t, map[uint][]byte{
+				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 snapshotTestPredecessor,
 					migrationPCRIndex: pcrExtendFromZero(otherPCR0),
 				}, time.Now(), receiptPayload(
@@ -1675,7 +1657,7 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 		{
 			name: "transition receipt from another predecessor", snapshot: migrated,
 			mutate: func(t *testing.T, fx *snapshotTestFixture, obj *snapshotObjectV1) {
-				obj.TransitionAttestation = fx.signer.build(t, map[uint][]byte{
+				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 otherPCR0,
 					migrationPCRIndex: pcrExtendFromZero(snapshotTestOwner),
 				}, time.Now(), receiptPayload(
@@ -1686,7 +1668,7 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 		{
 			name: "transition receipt with the origin purpose", snapshot: migrated,
 			mutate: func(t *testing.T, fx *snapshotTestFixture, obj *snapshotObjectV1) {
-				obj.TransitionAttestation = fx.signer.build(t, map[uint][]byte{
+				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 snapshotTestPredecessor,
 					migrationPCRIndex: pcrExtendFromZero(snapshotTestOwner),
 				}, time.Now(), receiptPayload(
@@ -1914,4 +1896,40 @@ func TestPublishSnapshotRequiresTheLockToHold(t *testing.T) {
 	_, err := fx.boot.publishSnapshot(t.Context(), snapshot)
 
 	require.ErrorIs(t, err, errSnapshotUnverifiable)
+}
+
+func TestFakeS3DeleteObjectRespectsCompliance(t *testing.T) {
+	ctx := context.Background()
+	s3f := newFakeS3()
+
+	_, err := s3f.PutObject(
+		ctx,
+		&s3.PutObjectInput{Key: aws.String("unlocked"), Body: bytes.NewReader([]byte("x"))},
+	)
+	require.NoError(t, err)
+
+	_, err = s3f.DeleteObject(ctx, &s3.DeleteObjectInput{Key: aws.String("unlocked")})
+	require.NoError(t, err)
+
+	_, err = s3f.GetObject(ctx, &s3.GetObjectInput{Key: aws.String("unlocked")})
+	require.Error(t, err)
+	require.True(t, isNoSuchKey(err))
+
+	_, err = s3f.PutObject(ctx, &s3.PutObjectInput{
+		Key:            aws.String("locked"),
+		Body:           bytes.NewReader([]byte("x")),
+		ObjectLockMode: s3types.ObjectLockModeCompliance,
+	})
+	require.NoError(t, err)
+
+	_, err = s3f.DeleteObject(ctx, &s3.DeleteObjectInput{Key: aws.String("locked")})
+	require.NoError(t, err)
+
+	obj, err := s3f.GetObject(ctx, &s3.GetObjectInput{Key: aws.String("locked")})
+	require.NoError(t, err)
+
+	got, err := io.ReadAll(obj.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, "x", string(got))
 }

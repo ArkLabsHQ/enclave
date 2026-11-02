@@ -26,7 +26,7 @@ type migrationIntentFixture struct {
 	nsm    *nsmW
 	pcr0   []byte
 	source string
-	signer *testAttestationSigner
+	signer *fakeNSM
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
@@ -38,11 +38,8 @@ func newMigrationIntentFixtureWithConfig(
 ) *migrationIntentFixture {
 	t.Helper()
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
-	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
-	nsm := &nsmW{nsm: &fakeNSM{
-		session:     session,
-		verifyRoots: session.attestationSign.roots,
-	}}
+	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
+	nsm := &nsmW{nsm: session.nsm}
 	s3f := newFakeS3()
 	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
 	require.NoError(t, err)
@@ -52,7 +49,7 @@ func newMigrationIntentFixtureWithConfig(
 		nsm:    nsm,
 		pcr0:   pcr0,
 		source: strings.Repeat("ab", 48),
-		signer: session.attestationSign,
+		signer: session.nsm,
 	}
 }
 
@@ -71,7 +68,7 @@ func (f *migrationIntentFixture) object(
 		TargetPCR0: targetPCR0,
 	})
 	require.NoError(t, err)
-	attestation := f.signer.build(t, map[uint][]byte{0: pcr0}, time.Now(), payload)
+	attestation := f.signer.attest(map[uint][]byte{0: pcr0}, time.Now(), payload)
 	body, err := json.Marshal(migrationIntentObjectV1{
 		Schema:      migrationIntentSchemaV1,
 		Sequence:    sequence,
@@ -90,8 +87,8 @@ func (f *migrationIntentFixture) reattest(t *testing.T, body []byte) []byte {
 	entry, err := decodeMigrationIntentObject(body)
 	require.NoError(t, err)
 	payload := mustMigrationIntentPayload(t, f.log, entry, f.log.bucket)
-	entry.Attestation = f.signer.build(
-		t, map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
+	entry.Attestation = f.signer.attest(
+		map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
 	).docB64
 	out, err := json.Marshal(entry)
 	require.NoError(t, err)
@@ -842,9 +839,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 				TargetPCR0: target,
 			})
 			require.NoError(t, err)
-			now := time.Now()
-			other := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour)).
-				build(t, map[uint][]byte{0: fx.pcr0}, now, payload)
+			other := newFakeNSM(t).attest(map[uint][]byte{0: fx.pcr0}, time.Now(), payload)
 			body, err := json.Marshal(migrationIntentObjectV1{
 				Schema:      migrationIntentSchemaV1,
 				Sequence:    2,
@@ -896,7 +891,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.NotEqual(t, canonical, payload)
-			attestation := fx.signer.build(t, map[uint][]byte{0: fx.pcr0}, time.Now(), payload)
+			attestation := fx.signer.attest(map[uint][]byte{0: fx.pcr0}, time.Now(), payload)
 			body, err := json.Marshal(migrationIntentObjectV1{
 				Schema:      migrationIntentSchemaV1,
 				Sequence:    2,

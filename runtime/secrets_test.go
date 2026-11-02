@@ -263,9 +263,9 @@ func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 		{"restored", []StaticSecretMetadata{a, b}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session := newStatefulNSMSession(
-				t, map[uint][]byte{0: mustDecodeHexString(stateOriginTestPCR0Hex())},
-			)
+			session := newFakeNSM(t).withPCRs(
+				map[uint][]byte{0: mustDecodeHexString(stateOriginTestPCR0Hex())},
+			).session
 			boot := &Boot{
 				cfg: testCfg, nsm: &nsmW{nsm: &fakeNSM{session: session}},
 				kmsAPI: kmsf, sts: &fakeSTS{},
@@ -291,7 +291,7 @@ func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 func TestExtendPCRRegistersWithStaticSecrets(t *testing.T) {
 	keyA, pubA := inheritTestKeyFrom(t, "pcr-a")
 	keyB, pubB := inheritTestKeyFrom(t, "pcr-b")
-	session := newStatefulNSMSession(t, nil)
+	session := newFakeNSM(t).withPCRs(nil).session
 	nsm := &nsmW{nsm: &fakeNSM{session: session}}
 	require.NoError(t, ExtendPCRRegistersWithStaticSecrets(nsm, nil))
 	require.Empty(t, session.requests)
@@ -307,7 +307,7 @@ func TestExtendPCRRegistersWithStaticSecrets(t *testing.T) {
 	require.Len(t, session.requests, 4)
 
 	t.Run("too many secrets", func(t *testing.T) {
-		session := newStatefulNSMSession(t, nil)
+		session := newFakeNSM(t).withPCRs(nil).session
 		require.Error(t, ExtendPCRRegistersWithStaticSecrets(
 			&nsmW{nsm: &fakeNSM{session: session}}, make([]StaticSecret, 16),
 		))

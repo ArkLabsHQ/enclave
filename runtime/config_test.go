@@ -69,6 +69,7 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envInsecureVerifySkipped, "")
 	t.Setenv(envTraces, "")
 	t.Setenv(envMetrics, "")
+	t.Setenv(envUseACME, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")
 }

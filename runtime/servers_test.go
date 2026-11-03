@@ -274,9 +274,9 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	ssm := NewSSM(&fakeSSM{})
 	rt := newRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
-	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
+	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
-	})}}
+	})}
 	migrator, err := NewMigrator(testCfg, nsm, ssm, newFakeS3(), migrationIntentTestBucket)
 	require.NoError(t, err)
 	migrator.SetSnapshot(Snapshot{
@@ -463,9 +463,9 @@ func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
 		rm:  http.NewServeMux(),
 		rt:  newRuntimeState(),
 	}
-	nsm := &nsmW{nsm: &fakeNSM{session: newStatefulNSMSession(t, map[uint][]byte{
+	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
-	})}}
+	})}
 	migrator, err := NewMigrator(
 		testCfg, nsm, NewSSM(&fakeSSM{}), newFakeS3(), migrationIntentTestBucket,
 	)

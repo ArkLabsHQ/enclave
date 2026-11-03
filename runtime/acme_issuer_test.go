@@ -3,69 +3,13 @@ package runtime
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/route53"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"github.com/stretchr/testify/require"
 )
-
-// fakeRoute53 records change batches and reports PENDING until pendingCalls
-// GetChange calls have been made.
-type fakeRoute53 struct {
-	mu            sync.Mutex
-	changes       []*route53.ChangeResourceRecordSetsInput
-	getCalls      int
-	pendingCalls  int
-	changeErr     error
-	nilChangeInfo bool
-}
-
-func (f *fakeRoute53) ChangeResourceRecordSets(
-	_ context.Context,
-	in *route53.ChangeResourceRecordSetsInput,
-	_ ...func(*route53.Options),
-) (*route53.ChangeResourceRecordSetsOutput, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.changeErr != nil {
-		return nil, f.changeErr
-	}
-	f.changes = append(f.changes, in)
-	return &route53.ChangeResourceRecordSetsOutput{
-		ChangeInfo: &r53types.ChangeInfo{Id: aws.String("/change/C1")},
-	}, nil
-}
-
-func (f *fakeRoute53) GetChange(
-	_ context.Context,
-	_ *route53.GetChangeInput,
-	_ ...func(*route53.Options),
-) (*route53.GetChangeOutput, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.getCalls++
-	if f.nilChangeInfo {
-		return &route53.GetChangeOutput{}, nil
-	}
-	status := r53types.ChangeStatusInsync
-	if f.getCalls <= f.pendingCalls {
-		status = r53types.ChangeStatusPending
-	}
-	return &route53.GetChangeOutput{ChangeInfo: &r53types.ChangeInfo{Status: status}}, nil
-}
-
-func (f *fakeRoute53) lastChange() *route53.ChangeResourceRecordSetsInput {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.changes) == 0 {
-		return nil
-	}
-	return f.changes[len(f.changes)-1]
-}
 
 func TestAcmeChallengeName(t *testing.T) {
 	require.Equal(t, "_acme-challenge.enclave.test.", acmeChallengeName("enclave.test"))

@@ -3,7 +3,6 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -208,14 +207,11 @@ func TestHandOffToSuccessor(t *testing.T) {
 	ctx := context.Background()
 	setup := func(t *testing.T, opts ...func(*startMigrationFixture)) *startMigrationFixture {
 		t.Helper()
-		session := newStatefulNSMSession(t, map[uint][]byte{
+		session := newFakeNSM(t).withPCRs(map[uint][]byte{
 			0:                 oldPCR0,
 			migrationPCRIndex: make([]byte, 48),
-		})
-		nsm := &nsmW{nsm: &fakeNSM{
-			session:     session,
-			verifyRoots: session.attestationSign.roots,
-		}}
+		}).session
+		nsm := &nsmW{nsm: session.nsm}
 		ssmf := &fakeSSM{params: map[string]string{
 			testCfg.kmsKeyIDParam(oldPCR0Hex): "old-key",
 		}}
@@ -244,7 +240,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	}
 	request := func(t *testing.T, fx *startMigrationFixture, targetPCR0 string) {
 		t.Helper()
-		status, err := requestMigrationTo(t, ctx, fx.m, fx.session.attestationSign, targetPCR0)
+		status, err := requestMigrationTo(t, ctx, fx.m, fx.session.nsm, targetPCR0)
 		require.NoError(t, err)
 		require.Equal(t, migrationStateEligible, status.State)
 	}
@@ -381,7 +377,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 	t.Run("rejects active cooldown", func(t *testing.T) {
 		fx := setup(t)
 		fx.m.cfg.MigrationCooldown = 2 * time.Minute
-		status, err := requestMigrationTo(t, ctx, fx.m, fx.session.attestationSign, newPCR0)
+		status, err := requestMigrationTo(t, ctx, fx.m, fx.session.nsm, newPCR0)
 		require.NoError(t, err)
 		require.Equal(t, migrationStateCoolingDown, status.State)
 
@@ -810,10 +806,7 @@ func TestVerifySuccessorAttestation(t *testing.T) {
 	t.Run("rejects a document signed by an unrelated root", func(t *testing.T) {
 		fx := newSuccessorTestFixture(t)
 
-		now := time.Now()
-		stranger := successorMigrator(t, testCfg, newTestAttestationSigner(
-			t, now.Add(-time.Hour), now.Add(time.Hour),
-		), bytes.Repeat([]byte{0xcd}, 48))
+		stranger := successorMigrator(t, testCfg, newFakeNSM(t), bytes.Repeat([]byte{0xcd}, 48))
 		doc, err := successorAttestation(stranger, challenge)
 		require.NoError(t, err)
 
@@ -1106,14 +1099,11 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	ctx := context.Background()
 	setup := func(t *testing.T) (*migrator, *fakeSSM, *fakeNSMSession) {
 		t.Helper()
-		session := newStatefulNSMSession(t, map[uint][]byte{
+		session := newFakeNSM(t).withPCRs(map[uint][]byte{
 			0:                 oldPCR0,
 			migrationPCRIndex: make([]byte, 48),
-		})
-		nsm := &nsmW{nsm: &fakeNSM{
-			session:     session,
-			verifyRoots: session.attestationSign.roots,
-		}}
+		}).session
+		nsm := &nsmW{nsm: session.nsm}
 		ssmf := &fakeSSM{params: map[string]string{
 			testCfg.kmsKeyIDParam(oldPCR0Hex): "old-key",
 		}}
@@ -1139,7 +1129,7 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 		challenge, err := m.verifyMigrationChallenge(published, oldPCR0Hex)
 		require.NoError(t, err)
 
-		candidate := successorMigrator(t, m.cfg, session.attestationSign, mustDecodeHex(t, target))
+		candidate := successorMigrator(t, m.cfg, session.nsm, mustDecodeHex(t, target))
 		doc, err := successorAttestation(candidate, challenge.Nonce)
 		require.NoError(t, err)
 		require.NoError(t, m.ssm.Set(
@@ -1256,7 +1246,7 @@ func TestPredecessorHandoffCommitsAndAborts(t *testing.T) {
 	intents := func(m *migrator, session *fakeNSMSession) *migrationIntentFixture {
 		return &migrationIntentFixture{
 			log: m.intent, s3: m.intent.s3.(*fakeS3), pcr0: oldPCR0, source: oldPCR0Hex,
-			signer: session.attestationSign,
+			signer: session.nsm,
 		}
 	}
 	// tie publishes a request to each target at sequence 1, all at tiedAt.
@@ -1470,7 +1460,7 @@ func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
 	type challenge struct {
 		claim       migrationAttestationPayload
 		pcr0, nonce []byte
-		signer      *testAttestationSigner
+		signer      *fakeNSM
 	}
 	// answer publishes an edited copy of the challenge this runtime issues and
 	// returns whatever response the candidate published.
@@ -1491,8 +1481,8 @@ func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
 		require.NoError(t, err)
 		userData, err := enc.Marshal(c.claim)
 		require.NoError(t, err)
-		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.buildWithNonce(
-			t, map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce,
+		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.attestWithNonce(
+			map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce, nil,
 		).docB64
 
 		err = m.respondToChallenge(ctx)
@@ -1517,8 +1507,7 @@ func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
 		require.Empty(t, adopts(t, fx, response, bytes.Repeat([]byte{0x5b}, 32)))
 	})
 
-	now := time.Now()
-	unrelated := newTestAttestationSigner(t, now.Add(-time.Hour), now.Add(time.Hour))
+	unrelated := newFakeNSM(t)
 	for _, tc := range []struct {
 		name   string
 		edit   func(*challenge)
@@ -1605,24 +1594,16 @@ func requireNoMigrationSideEffects(
 // the same AWS Nitro root — otherwise the predecessor could not verify any
 // document but its own, and the exchange would be untestable for the wrong
 // reason. Only cfg and nsm are populated, which is all the claim methods reach for.
-func successorMigrator(
-	t *testing.T, cfg *Config, signer *testAttestationSigner, pcr0 []byte,
-) *migrator {
+func successorMigrator(t *testing.T, cfg *Config, signer *fakeNSM, pcr0 []byte) *migrator {
 	t.Helper()
-	return &migrator{cfg: cfg, nsm: &nsmW{nsm: &fakeNSM{session: &fakeNSMSession{
-		t:                t,
-		pcrs:             map[uint][]byte{0: append([]byte(nil), pcr0...)},
-		locks:            map[uint]bool{},
-		attestationSign:  signer,
-		attestationRoots: x509.NewCertPool(),
-	}, verifyRoots: signer.roots}}}
+	return &migrator{cfg: cfg, nsm: &nsmW{nsm: signer.peer().withPCRs(map[uint][]byte{0: pcr0})}}
 }
 
 // attestedChallenge builds the challenge an enclave measuring pcr0 publishes.
 func attestedChallenge(
 	t *testing.T,
 	cfg *Config,
-	signer *testAttestationSigner,
+	signer *fakeNSM,
 	pcr0, nonce []byte,
 	issuedAt time.Time,
 ) string {
@@ -1631,7 +1612,7 @@ func attestedChallenge(
 		migrationChallengeSchemaV1, successorClaimSchemaV1,
 	)
 	require.NoError(t, err)
-	return signer.buildWithNonce(t, map[uint][]byte{0: pcr0}, issuedAt, payload, nonce).docB64
+	return signer.attestWithNonce(map[uint][]byte{0: pcr0}, issuedAt, payload, nonce, nil).docB64
 }
 
 // successorAttestation builds a candidate response.
@@ -1654,16 +1635,14 @@ func successorAttestation(m *migrator, challenge []byte) (string, error) {
 // real enclaves share the AWS Nitro root.
 func successorNSM(t *testing.T, fx *startMigrationFixture, pcr0 []byte) NSM {
 	t.Helper()
-	session := newStatefulNSMSession(t, map[uint][]byte{0: pcr0})
-	session.attestationSign = fx.session.attestationSign
-	return &nsmW{nsm: &fakeNSM{session: session, verifyRoots: fx.session.attestationSign.roots}}
+	return &nsmW{nsm: fx.session.nsm.peer().withPCRs(map[uint][]byte{0: pcr0})}
 }
 
 func requestMigrationTo(
 	t *testing.T,
 	ctx context.Context,
 	m *migrator,
-	predecessorSigner *testAttestationSigner,
+	predecessorSigner *fakeNSM,
 	targetPCR0 string,
 ) (*MigrationStatus, error) {
 	t.Helper()
@@ -1714,16 +1693,13 @@ type successorTestFixture struct {
 
 func newSuccessorTestFixture(t *testing.T) *successorTestFixture {
 	t.Helper()
-	session := newStatefulNSMSession(t, map[uint][]byte{0: bytes.Repeat([]byte{0xab}, 48)})
-	predecessor := &migrator{cfg: testCfg, nsm: &nsmW{nsm: &fakeNSM{
-		session:     session,
-		verifyRoots: session.attestationSign.roots,
-	}}}
+	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: bytes.Repeat([]byte{0xab}, 48)}).session
+	predecessor := &migrator{cfg: testCfg, nsm: &nsmW{nsm: session.nsm}}
 	target := bytes.Repeat([]byte{0xcd}, 48)
 
 	return &successorTestFixture{
 		predecessor: predecessor,
-		successor:   successorMigrator(t, testCfg, session.attestationSign, target),
+		successor:   successorMigrator(t, testCfg, session.nsm, target),
 		targetPCR0:  hex.EncodeToString(target),
 	}
 }
@@ -1905,10 +1881,9 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 	require.NotNil(t, info)
 
 	_, ssm := stateOriginTestSSM(nil)
-	session := newStatefulNSMSession(t, map[uint][]byte{0: mustDecodeHex(t, target)})
 	m, err := newMigrator(
 		testConfigWithPreviousPCR0(fx.source),
-		&nsmW{nsm: &fakeNSM{session: session}},
+		&nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{0: mustDecodeHex(t, target)})},
 		ssm, fx.s3, migrationIntentTestBucket,
 	)
 	require.NoError(t, err)

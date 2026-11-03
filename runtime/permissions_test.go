@@ -17,52 +17,6 @@ import (
 
 var permissionTestPCR0 = strings.Repeat("ab", 48)
 
-// fakeIAM allows actions unless a test supplies a denial or response.
-type fakeIAM struct {
-	denied   map[string]bool
-	err      error
-	calls    []*iam.SimulatePrincipalPolicyInput
-	respond  func(*iam.SimulatePrincipalPolicyInput) (*iam.SimulatePrincipalPolicyOutput, error)
-	evaluate func(string, string, []iamtypes.ContextEntry) iamtypes.PolicyEvaluationDecisionType
-}
-
-func (f *fakeIAM) SimulatePrincipalPolicy(
-	_ context.Context,
-	in *iam.SimulatePrincipalPolicyInput,
-	_ ...func(*iam.Options),
-) (*iam.SimulatePrincipalPolicyOutput, error) {
-	f.calls = append(f.calls, in)
-	if f.err != nil {
-		return nil, f.err
-	}
-	if f.respond != nil {
-		return f.respond(in)
-	}
-	out := &iam.SimulatePrincipalPolicyOutput{}
-	for _, action := range in.ActionNames {
-		decision := iamtypes.PolicyEvaluationDecisionTypeAllowed
-		if f.denied[action] {
-			decision = iamtypes.PolicyEvaluationDecisionTypeImplicitDeny
-		}
-		if f.evaluate != nil {
-			decision = f.evaluate(action, in.ResourceArns[0], in.ContextEntries)
-		}
-		out.EvaluationResults = append(out.EvaluationResults, iamtypes.EvaluationResult{
-			EvalActionName:   aws.String(action),
-			EvalResourceName: aws.String(in.ResourceArns[0]),
-			EvalDecision:     decision,
-		})
-	}
-	return out, nil
-}
-
-// simulated reports whether any call asked about action on resource.
-func (f *fakeIAM) simulated(action, resource string) bool {
-	return slices.ContainsFunc(f.calls, func(in *iam.SimulatePrincipalPolicyInput) bool {
-		return slices.Contains(in.ActionNames, action) && slices.Contains(in.ResourceArns, resource)
-	})
-}
-
 func TestPermissionsPreflight(t *testing.T) {
 	sts := &fakeSTS{
 		arn: "arn:aws:sts::" + fakeSTSAccountID + ":assumed-role/enclave/i-0e2ce2ce2ce2ce2ce",

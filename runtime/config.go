@@ -40,7 +40,7 @@ const (
 	envTraces           = "ENCLAVE_TRACES"
 	envMetrics          = "ENCLAVE_METRICS"
 
-	// ACME settings accepted by the SSM overlay.
+	// ACME settings: baked defaults the SSM overlay may replace.
 	envUseACME       = "ENCLAVE_USE_ACME"
 	envACMEDirectory = "ENCLAVE_ACME_DIRECTORY"
 	envACMEEmail     = "ENCLAVE_ACME_EMAIL"
@@ -207,6 +207,9 @@ func LoadConfig() (*Config, error) {
 		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
 		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),
 		FQDN:                  takeEnvDefault(envFQDN, defaultFQDN),
+		ACMEDirectory:         takeEnv(envACMEDirectory),
+		ACMEEmail:             takeEnv(envACMEEmail),
+		ACMECA:                takeEnv(envACMECA),
 		ExtPort:               extPort,
 		IntPort:               intPort,
 		HostProxyPort:         hostProxyPort,
@@ -242,6 +245,9 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 	if cfg.ExportMetrics, err = takeEnvBool(envMetrics); err != nil {
+		return nil, err
+	}
+	if cfg.UseACME, err = takeEnvBool(envUseACME); err != nil {
 		return nil, err
 	}
 

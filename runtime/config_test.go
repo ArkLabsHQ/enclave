@@ -69,6 +69,7 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envInsecureVerifySkipped, "")
 	t.Setenv(envTraces, "")
 	t.Setenv(envMetrics, "")
+	t.Setenv(envUseACME, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")
 }
@@ -446,6 +447,65 @@ func TestLoadConfigTelemetrySignals(t *testing.T) {
 			require.Equal(t, tc.wantMetrics, cfg.ExportMetrics)
 		})
 	}
+}
+
+// Baked ACME settings are boot defaults the SSM overlay may replace, and are
+// consumed so they never reach the application.
+func TestLoadConfigACME(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        bool
+		wantErr     string
+	}{
+		{name: "unset"},
+		{name: "blank", value: "  "},
+		{name: "enabled", value: "true", want: true},
+		{name: "disabled", value: "false"},
+		{name: "padded uppercase", value: " TRUE ", want: true},
+		{name: "not a boolean", value: "yes", wantErr: "invalid ENCLAVE_USE_ACME"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envUseACME, tc.value)
+
+			cfg, err := LoadConfig()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cfg.UseACME)
+		})
+	}
+
+	t.Run("baked values are consumed and the overlay replaces them", func(t *testing.T) {
+		setConfigTestEnv(t, false)
+		t.Setenv(envUseACME, "true")
+		t.Setenv(envACMEDirectory, "https://baked.example.com/directory")
+		t.Setenv(envACMEEmail, "baked@example.com")
+		t.Setenv(envACMECA, "baked-ca")
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.True(t, cfg.UseACME)
+		require.Equal(t, "https://baked.example.com/directory", cfg.ACMEDirectory)
+		require.Equal(t, "baked@example.com", cfg.ACMEEmail)
+		require.Equal(t, "baked-ca", cfg.ACMECA)
+		require.Empty(t, os.Getenv(envUseACME))
+		require.Empty(t, os.Getenv(envACMEDirectory))
+		require.Empty(t, os.Getenv(envACMEEmail))
+		require.Empty(t, os.Getenv(envACMECA))
+
+		err = cfg.ApplySSMOverlay(context.Background(), NewSSM(&fakeSSM{params: map[string]string{
+			"/prod/app/enclave/env/" + envUseACME:   "false",
+			"/prod/app/enclave/env/" + envACMEEmail: "ssm@example.com",
+		}}))
+		require.NoError(t, err)
+		require.False(t, cfg.UseACME)
+		require.Equal(t, "ssm@example.com", cfg.ACMEEmail)
+		require.Equal(t, "https://baked.example.com/directory", cfg.ACMEDirectory)
+		require.Equal(t, "baked-ca", cfg.ACMECA)
+	})
 }
 
 func TestLoadConfigInsecureVerifySkipped(t *testing.T) {

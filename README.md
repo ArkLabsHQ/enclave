@@ -659,8 +659,10 @@ passes the final application port to the child as described in
 | `ENCLAVE_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
 
-The four ACME settings are read only from this overlay. `ENCLAVE_FQDN` starts
-with the baked value (default `localhost`), which the overlay may replace.
+`ENCLAVE_FQDN` and the four ACME settings start with their baked values, which
+the overlay may replace; `ENCLAVE_FQDN` defaults to `localhost` and ACME to off.
+A baked `ENCLAVE_USE_ACME` that is not a boolean fails the boot, while the
+overlay treats anything but `true`, in any case, as off.
 
 Applications that need the same value must use a separate variable. For example,
 allowlist `APP_PUBLIC_HOSTNAME` and set

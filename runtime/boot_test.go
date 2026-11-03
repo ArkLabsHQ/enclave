@@ -197,13 +197,12 @@ func TestNewBootRejectsInvalidPCR0BeforeStateReads(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%d bytes", tc.size), func(t *testing.T) {
 			fake, ssm := stateOriginTestSSM(nil)
-			session := newFakeNSM(t).withPCRs(
-				map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, tc.size)},
-			).session
 
 			boot, err := NewBoot(
 				stateOriginTestConfig(),
-				&nsmW{nsm: &fakeNSM{session: session}},
+				&nsmW{nsm: newFakeNSM(t).withPCRs(
+					map[uint][]byte{0: bytes.Repeat([]byte{0xaa}, tc.size)},
+				)},
 				nil,
 				nil,
 				ssm,
@@ -1161,21 +1160,21 @@ func (f *genesisFixture) keyIDParam() string { return testCfg.kmsKeyIDParam(f.pc
 
 func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 	t.Helper()
-	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
+	signer := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0})
 	ssmf, ssm := stateOriginTestSSM(map[string]string{
 		testCfg.leaseBucketParam(): testLeaseBucket,
 	})
 	s3f := newFakeS3()
 	s3f.versioned = true
 	return &genesisFixture{
-		nsm:     &nsmW{nsm: session.nsm},
+		nsm:     &nsmW{nsm: signer},
 		pcr0Hex: hex.EncodeToString(pcr0),
 		ssmf:    ssmf,
 		ssm:     ssm,
 		s3f:     s3f,
 		kmsf:    newFakeKMS(),
 		sts:     &fakeSTS{arn: testRoleARN},
-		signer:  session.nsm,
+		signer:  signer,
 	}
 }
 

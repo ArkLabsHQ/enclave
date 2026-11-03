@@ -31,7 +31,9 @@ type signedAttestation struct {
 
 // fakeNSM stands in for the Nitro Security Module and the AWS Nitro PKI behind
 // it: documents it attests chain to roots, and VerifyAttestationSig trusts them.
-// A struct literal has no PKI; build one with newFakeNSM to attest.
+// A struct literal has no PKI: it cannot attest, and unless verifyResult or
+// verifyErr is set VerifyAttestationSig returns nil, nil, which its callers
+// dereference. Build one with newFakeNSM to attest or verify for real.
 type fakeNSM struct {
 	t       *testing.T
 	caDER   []byte
@@ -112,6 +114,8 @@ func (f *fakeNSM) peer() *fakeNSM {
 }
 
 // withPCRs gives f a stateful session measuring pcrs that signs with f's PKI.
+// Call it at most once per fakeNSM: a second call silently replaces the session.
+// For another enclave, call it on a peer.
 func (f *fakeNSM) withPCRs(pcrs map[uint][]byte) *fakeNSM {
 	f.session = &fakeNSMSession{
 		nsm:              f,
@@ -127,10 +131,9 @@ func (f *fakeNSM) attest(
 	pcrs map[uint][]byte,
 	timestamp time.Time,
 	userData []byte,
-	publicKey ...[]byte,
 ) signedAttestation {
 	f.t.Helper()
-	return f.attestWithNonce(pcrs, timestamp, userData, nil, publicKey...)
+	return f.attestWithNonce(pcrs, timestamp, userData, nil, nil)
 }
 
 func (f *fakeNSM) attestWithNonce(
@@ -138,7 +141,7 @@ func (f *fakeNSM) attestWithNonce(
 	timestamp time.Time,
 	userData []byte,
 	nonce []byte,
-	publicKey ...[]byte,
+	publicKey []byte,
 ) signedAttestation {
 	f.t.Helper()
 
@@ -151,9 +154,7 @@ func (f *fakeNSM) attestWithNonce(
 		CABundle:    [][]byte{f.caDER},
 		UserData:    userData,
 		Nonce:       nonce,
-	}
-	if len(publicKey) > 0 {
-		document.PublicKey = publicKey[0]
+		PublicKey:   publicKey,
 	}
 
 	payload, err := cbor.Marshal(document)

@@ -1482,7 +1482,7 @@ func TestCandidateChecksChallengeBeforeAnswering(t *testing.T) {
 		userData, err := enc.Marshal(c.claim)
 		require.NoError(t, err)
 		ssmf.params[cfg.migrationChallengeParam(predecessor)] = c.signer.attestWithNonce(
-			map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce,
+			map[uint][]byte{0: c.pcr0}, time.Now(), userData, c.nonce, nil,
 		).docB64
 
 		err = m.respondToChallenge(ctx)
@@ -1612,7 +1612,7 @@ func attestedChallenge(
 		migrationChallengeSchemaV1, successorClaimSchemaV1,
 	)
 	require.NoError(t, err)
-	return signer.attestWithNonce(map[uint][]byte{0: pcr0}, issuedAt, payload, nonce).docB64
+	return signer.attestWithNonce(map[uint][]byte{0: pcr0}, issuedAt, payload, nonce, nil).docB64
 }
 
 // successorAttestation builds a candidate response.
@@ -1881,10 +1881,9 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 	require.NotNil(t, info)
 
 	_, ssm := stateOriginTestSSM(nil)
-	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: mustDecodeHex(t, target)}).session
 	m, err := newMigrator(
 		testConfigWithPreviousPCR0(fx.source),
-		&nsmW{nsm: &fakeNSM{session: session}},
+		&nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{0: mustDecodeHex(t, target)})},
 		ssm, fx.s3, migrationIntentTestBucket,
 	)
 	require.NoError(t, err)

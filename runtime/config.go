@@ -270,6 +270,9 @@ func LoadConfig() (*Config, error) {
 		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
 	}
 
+	// Warn about any unrecognized ENCLAVE_* variables left unconsumed in the environment.
+	// This runs on the success path only: if earlier parsing fails, the fatal boot error
+	// is immediately actionable and partial consumption makes warning incomplete.
 	warnUnrecognizedEnclaveEnv(os.Environ())
 
 	return cfg, nil

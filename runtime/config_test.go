@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -795,8 +797,48 @@ func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
 	setConfigTestEnv(t, false)
 	t.Setenv("ENCLAVE_TRACING", "true")
 
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 	require.Equal(t, "true", os.Getenv("ENCLAVE_TRACING"))
+	require.Contains(t, buf.String(), "unrecognized ENCLAVE_* environment variable")
+	require.Contains(t, buf.String(), "ENCLAVE_TRACING")
+	require.Contains(t, buf.String(), "ENCLAVE_TRACES")
+}
+
+func TestKnownVarsCoversLoadConfig(t *testing.T) {
+	setConfigTestEnv(t, false)
+	for _, envVar := range knownEnclaveEnvVars {
+		switch envVar {
+		case envDev, envInsecureVerifySkipped, envVerifyClockSource, envTraces, envMetrics, envUseACME:
+			t.Setenv(envVar, "false")
+		case envAppPort:
+			t.Setenv(envVar, "7074")
+		case envLogRetentionDays:
+			t.Setenv(envVar, "365")
+		case envLogShipInterval, envMigrationCooldown:
+			t.Setenv(envVar, "10s")
+		case envSecretsConfig, envInheritSecretsConfig:
+			t.Setenv(envVar, "[]")
+		default:
+			t.Setenv(envVar, "sentinel")
+		}
+	}
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	environ := os.Environ()
+	for _, envVar := range knownEnclaveEnvVars {
+		for _, e := range environ {
+			key, _, _ := strings.Cut(e, "=")
+			require.NotEqual(t, envVar, key, "expected LoadConfig to consume %s from environment", envVar)
+		}
+	}
 }

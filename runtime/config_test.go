@@ -766,3 +766,37 @@ func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, metadata, after, "boot must parse the captured secret definitions")
 }
+
+func TestWarnUnrecognizedEnclaveEnv(t *testing.T) {
+	environ := []string{
+		"PORT=8080",
+		"APP_BINARY_NAME=my-app",
+		"AWS_REGION=us-east-1",
+		"ENCLAVE_TRACING=true",
+		"ENCLAVE_APP_PORTS=9000",
+		"ENCLAVE_SOMETHING_COMPLETELY_UNKNOWN=1",
+	}
+
+	unrecognized := warnUnrecognizedEnclaveEnv(environ)
+	require.Equal(t, []string{
+		"ENCLAVE_APP_PORTS",
+		"ENCLAVE_SOMETHING_COMPLETELY_UNKNOWN",
+		"ENCLAVE_TRACING",
+	}, unrecognized)
+
+	// Check suggestions
+	require.Equal(t, "ENCLAVE_TRACES", suggestEnclaveEnv("ENCLAVE_TRACING"))
+	require.Equal(t, "ENCLAVE_APP_PORT", suggestEnclaveEnv("ENCLAVE_APP_PORTS"))
+	require.Equal(t, "ENCLAVE_METRICS", suggestEnclaveEnv("ENCLAVE_METRIC"))
+	require.Equal(t, "", suggestEnclaveEnv("ENCLAVE_SOMETHING_COMPLETELY_UNKNOWN"))
+}
+
+func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
+	setConfigTestEnv(t, false)
+	t.Setenv("ENCLAVE_TRACING", "true")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	require.Equal(t, "true", os.Getenv("ENCLAVE_TRACING"))
+}

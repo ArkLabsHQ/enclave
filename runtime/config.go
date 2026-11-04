@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -239,6 +240,8 @@ func LoadConfig() (*Config, error) {
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
 		// It is false by default unless explicitly overridden
 		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
+	} else {
+		_ = takeEnv(envInsecureVerifySkipped)
 	}
 
 	if cfg.ExportTraces, err = takeEnvBool(envTraces); err != nil {
@@ -266,6 +269,8 @@ func LoadConfig() (*Config, error) {
 	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
 		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
 	}
+
+	warnUnrecognizedEnclaveEnv(os.Environ())
 
 	return cfg, nil
 }
@@ -574,4 +579,87 @@ func logRetentionDays() int32 {
 		return defaultLogRetentionDays
 	}
 	return int32(days)
+}
+
+// knownEnclaveEnvVars lists all ENCLAVE_* environment variable names parsed by LoadConfig.
+var knownEnclaveEnvVars = []string{
+	envNamespace,
+	envAppName,
+	envAppPort,
+	envPreviousPCR0,
+	envSecretsConfig,
+	envInheritSecretsConfig,
+	envOverrideAllowList,
+	envDev,
+	envInsecureVerifySkipped,
+	envVerifyClockSource,
+	envMigrationCooldown,
+	envFQDN,
+	envUpstream,
+	envViproxyInAddrs,
+	envViproxyOutAddrs,
+	envLogShipInterval,
+	envLogRetentionDays,
+	envTraces,
+	envMetrics,
+	envUseACME,
+	envACMEDirectory,
+	envACMEEmail,
+	envACMECA,
+	envAWSRegion,
+}
+
+func levenshtein(a, b string) int {
+	la, lb := len(a), len(b)
+	d := make([]int, lb+1)
+	for j := range d {
+		d[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		prev := d[0]
+		d[0] = i
+		for j := 1; j <= lb; j++ {
+			temp := d[j]
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			d[j] = min(d[j]+1, min(d[j-1]+1, prev+cost))
+			prev = temp
+		}
+	}
+	return d[lb]
+}
+
+func suggestEnclaveEnv(name string) string {
+	best := ""
+	minDist := 4
+	for _, known := range knownEnclaveEnvVars {
+		if name == known {
+			continue
+		}
+		dist := levenshtein(name, known)
+		if dist < minDist {
+			minDist = dist
+			best = known
+		}
+	}
+	return best
+}
+
+func warnUnrecognizedEnclaveEnv(environ []string) []string {
+	var unrecognized []string
+	for _, env := range environ {
+		key, _, _ := strings.Cut(env, "=")
+		if strings.HasPrefix(key, "ENCLAVE_") {
+			unrecognized = append(unrecognized, key)
+			if suggestion := suggestEnclaveEnv(key); suggestion != "" {
+				slog.Warn("unrecognized ENCLAVE_* environment variable", "key", key, "suggestion", suggestion)
+			} else {
+				slog.Warn("unrecognized ENCLAVE_* environment variable", "key", key)
+			}
+		}
+	}
+	sort.Strings(unrecognized)
+	return unrecognized
 }

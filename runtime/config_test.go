@@ -806,7 +806,11 @@ func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 	require.Equal(t, "true", os.Getenv("ENCLAVE_TRACING"))
-	require.Contains(t, buf.String(), "unrecognized ENCLAVE_* environment variable")
+	require.Contains(
+		t,
+		buf.String(),
+		"unrecognized ENCLAVE_* environment variable",
+	)
 	require.Contains(t, buf.String(), "ENCLAVE_TRACING")
 	require.Contains(t, buf.String(), "ENCLAVE_TRACES")
 }
@@ -815,7 +819,12 @@ func TestKnownVarsCoversLoadConfig(t *testing.T) {
 	setConfigTestEnv(t, false)
 	for _, envVar := range knownEnclaveEnvVars {
 		switch envVar {
-		case envDev, envInsecureVerifySkipped, envVerifyClockSource, envTraces, envMetrics, envUseACME:
+		case envDev,
+			envInsecureVerifySkipped,
+			envVerifyClockSource,
+			envTraces,
+			envMetrics,
+			envUseACME:
 			t.Setenv(envVar, "false")
 		case envAppPort:
 			t.Setenv(envVar, "7074")
@@ -838,7 +847,13 @@ func TestKnownVarsCoversLoadConfig(t *testing.T) {
 	for _, envVar := range knownEnclaveEnvVars {
 		for _, e := range environ {
 			key, _, _ := strings.Cut(e, "=")
-			require.NotEqual(t, envVar, key, "expected LoadConfig to consume %s from environment", envVar)
+			require.NotEqual(
+				t,
+				envVar,
+				key,
+				"expected LoadConfig to consume %s from environment",
+				envVar,
+			)
 		}
 	}
 }

@@ -8,13 +8,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
@@ -53,13 +56,15 @@ func TestPinnedHTTPClient(t *testing.T) {
 }
 
 // fakeEnclave serves a COSE-skip attestation whose user_data carries attestedTLS,
-// and records every non-attestation path it receives.
+// and records every non-attestation path it receives. mu guards the fields the
+// handler reads, so a test can change the enclave's identity mid-run.
 type fakeEnclave struct {
+	mu          sync.Mutex
 	pcr0Hex     string
+	pcr16Hex    string             // first secret-PCR slot; omitted from the document when empty
 	attestedTLS [32]byte           // tlsKeyHash embedded in user_data
 	signingKey  ed25519.PrivateKey // attested and used to sign when asked; nil attests none
 	tamper      bool               // alter the body after signing it
-	mu          sync.Mutex
 	appPaths    []string
 }
 
@@ -68,14 +73,20 @@ func (f *fakeEnclave) handler() http.Handler {
 		if r.URL.Path == "/enclave/attestation" {
 			nonceHex := r.URL.Query().Get("nonce")
 			nonce, _ := hex.DecodeString(nonceHex)
+			f.mu.Lock()
 			pcr0, _ := hex.DecodeString(f.pcr0Hex)
+			pcrs := map[uint][]byte{0: pcr0}
+			if f.pcr16Hex != "" {
+				pcrs[16], _ = hex.DecodeString(f.pcr16Hex)
+			}
 			signingPub := make([]byte, ed25519.PublicKeySize)
 			if f.signingKey != nil {
 				signingPub = f.signingKey.Public().(ed25519.PublicKey)
 			}
 			ud := testUserData(f.attestedTLS, signingPub)
+			f.mu.Unlock()
 			_, _ = w.Write([]byte(buildInsecureCOSEDoc(nitrite.Document{
-				PCRs:     map[uint][]byte{0: pcr0},
+				PCRs:     pcrs,
 				Nonce:    nonce,
 				UserData: ud,
 			})))
@@ -167,6 +178,172 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		defer fe.mu.Unlock()
 		require.Empty(t, fe.appPaths, "no app request must be sent on a pin mismatch")
 	})
+}
+
+func TestNewRequiresHTTPSBaseURL(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+
+	for _, raw := range []string{
+		"http://1.2.3.4",
+		"HTTP://1.2.3.4",
+		"1.2.3.4:8443",
+		"1.2.3.4",
+		"//1.2.3.4",
+		"/enclave",
+		"https://",
+		"",
+		"ws://1.2.3.4",
+	} {
+		t.Run("reject "+raw, func(t *testing.T) {
+			c, err := New(raw, Options{ExpectedPCR0: pcr0})
+			require.ErrorContains(t, err, "https")
+			require.Nil(t, c)
+		})
+	}
+
+	for _, raw := range []string{
+		"https://1.2.3.4",
+		"https://enclave.example:8443/",
+		"https://enclave.example",
+	} {
+		t.Run("accept "+raw, func(t *testing.T) {
+			_, err := New(raw, Options{ExpectedPCR0: pcr0})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestPlaintextEndpointGetsNoRequest(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+	fe := &fakeEnclave{pcr0Hex: pcr0}
+	enclave := fe.handler()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		enclave.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true})
+	require.ErrorContains(t, err, "https")
+	require.Nil(t, c)
+	require.Zero(t, hits.Load(), "nothing may be sent to a plaintext endpoint")
+}
+
+func TestDoRejectsPlaintextRequestURL(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+	fe := &fakeEnclave{pcr0Hex: pcr0}
+	srv := httptest.NewTLSServer(fe.handler())
+	defer srv.Close()
+	fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
+
+	victim := &fakeEnclave{pcr0Hex: pcr0}
+	plain := httptest.NewServer(victim.handler())
+	defer plain.Close()
+
+	c, err := New(srv.URL, Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodGet, plain.URL+"/orders", nil)
+	require.NoError(t, err)
+	_, err = c.Do(context.Background(), req)
+	require.ErrorContains(t, err, "https")
+
+	victim.mu.Lock()
+	defer victim.mu.Unlock()
+	require.Empty(t, victim.appPaths, "no application request may leave in plaintext")
+}
+
+func TestDoRejectsDowngradeRedirect(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+	victim := &fakeEnclave{pcr0Hex: pcr0}
+	plain := httptest.NewServer(victim.handler())
+	defer plain.Close()
+
+	fe := &fakeEnclave{pcr0Hex: pcr0}
+	enclave := fe.handler()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/downgrade" {
+			http.Redirect(w, r, plain.URL+"/orders", http.StatusFound)
+			return
+		}
+		enclave.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
+
+	c, err := New(srv.URL, Options{ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true})
+	require.NoError(t, err)
+	_, err = c.Get(context.Background(), "/downgrade")
+	require.ErrorContains(t, err, "https")
+
+	victim.mu.Lock()
+	defer victim.mu.Unlock()
+	require.Empty(t, victim.appPaths, "a downgrade redirect must not reach a plaintext host")
+}
+
+func TestManifestRequiresHTTPSBaseURL(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"base_url":"http://1.2.3.4","pcr0":%q}`, pcr0)
+	}))
+	defer srv.Close()
+
+	_, err := FetchManifest(context.Background(), srv.URL)
+	require.ErrorContains(t, err, "https")
+
+	c, err := NewFromManifest(context.Background(), srv.URL, Options{})
+	require.ErrorContains(t, err, "https")
+	require.Nil(t, c)
+}
+
+func TestVerifyFailureKeepsPinAndCache(t *testing.T) {
+	pcr0 := strings.Repeat("ab", 48)
+	goodPCR16 := strings.Repeat("11", 32)
+	fe := &fakeEnclave{pcr0Hex: pcr0, pcr16Hex: goodPCR16}
+	srv := httptest.NewTLSServer(fe.handler())
+	defer srv.Close()
+	fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
+
+	c, err := New(srv.URL, Options{
+		ExpectedPCR0:           pcr0,
+		ExpectedPCRs:           []string{goodPCR16},
+		InsecureSkipCOSEVerify: true,
+		CacheTTL:               time.Hour,
+	})
+	require.NoError(t, err)
+	resp, err := c.Get(context.Background(), "/enclave/v1/info")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	verified, pin := c.cachedState, c.currentTLSHash()
+	require.NotEmpty(t, pin)
+
+	// Same build measurement, wrong secret PCR, different TLS identity.
+	fe.mu.Lock()
+	fe.pcr16Hex = strings.Repeat("22", 32)
+	fe.attestedTLS = sha256.Sum256([]byte("rejected enclave TLS key"))
+	fe.mu.Unlock()
+
+	_, err = c.VerifyAttestation(context.Background())
+	require.ErrorContains(t, err, "PCR16 mismatch")
+	require.Equal(t, pin, c.currentTLSHash(), "a failed verify must not move the pin")
+	require.Same(t, verified, c.cachedState, "a failed verify must not drop the cache")
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.VerifyAttestation(context.Background())
+			require.Error(t, err)
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, pin, c.currentTLSHash(), "concurrent failed verifies must not move the pin")
+	require.Same(t, verified, c.cachedState)
+
+	resp, err = c.Get(context.Background(), "/enclave/v1/info")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 func TestClientSignedResponses(t *testing.T) {

@@ -654,9 +654,16 @@ func warnUnrecognizedEnclaveEnv(environ []string) []string {
 		if strings.HasPrefix(key, "ENCLAVE_") {
 			unrecognized = append(unrecognized, key)
 			if suggestion := suggestEnclaveEnv(key); suggestion != "" {
-				slog.Warn("unrecognized ENCLAVE_* environment variable", "key", key, "suggestion", suggestion)
+				slog.Warn(
+					"unrecognized ENCLAVE_* environment variable",
+					"key", key,
+					"suggestion", suggestion,
+				)
 			} else {
-				slog.Warn("unrecognized ENCLAVE_* environment variable", "key", key)
+				slog.Warn(
+					"unrecognized ENCLAVE_* environment variable",
+					"key", key,
+				)
 			}
 		}
 	}

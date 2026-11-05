@@ -150,7 +150,6 @@ func TestLeaseHeartbeatRenews(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return s3.currentETag(key) != first
 	}, 2*time.Second, 10*time.Millisecond, "heartbeat should rewrite the lease")
-
 	require.NoError(t, lease.Context().Err(), "renewing lease stays live")
 	require.NoError(t, lease.Release(ctx))
 }
@@ -265,7 +264,7 @@ func TestLeaseClaimRetriesWhenHolderReleasesMidSteal(t *testing.T) {
 func TestAcquireLeaseBlocksUntilContextEnds(t *testing.T) {
 	setLeaseTestEnv(t)
 	s3 := newFakeS3()
-	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(time.Minute))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -293,6 +292,19 @@ func TestLeaseUnparseableObjectIsStealable(t *testing.T) {
 	s3 := newFakeS3()
 	// A corrupt lease must not wedge the lock forever.
 	s3.putRawObject(leaseObjectKey(testCfg, "genesis"), []byte("not json"))
+
+	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	require.NoError(t, lease.Release(ctx))
+}
+
+func TestLeaseStealsWhenExpiresAtFarInFuture(t *testing.T) {
+	setLeaseTestEnv(t)
+	ctx := context.Background()
+	s3 := newFakeS3()
+	// A lease held with expires_at far in the future (e.g. from clock skew) must be treated as lapsed.
+	writeLeaseDoc(t, s3, leaseObjectKey(testCfg, "genesis"), time.Now().Add(time.Hour))
 
 	lease, err := TryAcquireLease(ctx, testCfg, s3, testLeaseBucket, "genesis", time.Minute)
 	require.NoError(t, err)

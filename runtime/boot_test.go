@@ -314,7 +314,7 @@ func TestGenesisPublishesItsSnapshotAndNothingToSSM(t *testing.T) {
 // A live peer lease must stop genesis before any KMS key is minted
 func TestBootGenesisBlocksOnPeerLease(t *testing.T) {
 	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
-	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Minute))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -413,7 +413,7 @@ func TestAwaitGenesisSkipsLeaseWhenPeerCommitted(t *testing.T) {
 	require.NoError(t, err)
 
 	// A peer still holds the genesis lease, but the work is already published.
-	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Minute))
 
 	// Far shorter than leasePollInterval: passing proves we never waited on it.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -476,7 +476,7 @@ func TestAwaitGenesisWaitsOnLiveHolder(t *testing.T) {
 	pcr0 := bytes.Repeat([]byte{0xab}, 48)
 	fx := newGenesisFixture(t, pcr0)
 
-	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Minute))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -511,7 +511,7 @@ func TestEstablishGenesisRefusesToPublishAfterLosingTheLease(t *testing.T) {
 	planned.mode.(*genesisBoot).lease = lease
 
 	// A peer takes the lock over while this enclave is mid-genesis.
-	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, fx.s3f, leaseObjectKey(testCfg, genesisLeaseName), time.Now().Add(time.Minute))
 
 	_, err = fx.boot().establish(ctx, planned)
 

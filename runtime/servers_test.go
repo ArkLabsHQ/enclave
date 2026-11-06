@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -892,4 +893,50 @@ func TestReportBootFailure(t *testing.T) {
 	require.Equal(t, runtimeStatusFailed, info.Status)
 	require.Equal(t, "permission preflight: role is missing SSMParams", info.Error)
 	require.Equal(t, Version, info.Version)
+}
+
+func TestMetricsMiddleware(t *testing.T) {
+	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
+
+	for _, tc := range []struct {
+		public         bool
+		status         int
+		client, server int64
+		level          string
+	}{
+		{true, http.StatusOK, 0, 0, "INFO"},
+		{true, http.StatusNotFound, 1, 0, "DEBUG"},
+		{true, http.StatusUnauthorized, 1, 0, "INFO"},
+		{true, 499, 1, 0, "INFO"},
+		{true, http.StatusInternalServerError, 0, 1, "WARN"},
+		{true, http.StatusServiceUnavailable, 0, 1, "WARN"},
+		{false, http.StatusNotFound, 1, 0, "INFO"},
+		{false, http.StatusForbidden, 1, 0, "INFO"},
+	} {
+		t.Run(fmt.Sprintf("public=%t/%d", tc.public, tc.status), func(t *testing.T) {
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(
+				slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}),
+			))
+			telemetry := NewTelemetry(testCfg, nil)
+			reader := testMetrics(t, telemetry)
+
+			app := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			metricsMiddleware(telemetry, tc.public)(app).ServeHTTP(
+				httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/.env", nil),
+			)
+
+			require.Equal(t, int64(1), counterValue(t, reader, metricHTTPRequests))
+			require.Equal(t, tc.client, counterValue(t, reader, metricHTTPClientErrors))
+			require.Equal(t, tc.server, counterValue(t, reader, metricHTTPServerErrors))
+
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &record))
+			require.Equal(t, "http request", record["msg"])
+			require.Equal(t, tc.level, record["level"])
+		})
+	}
 }

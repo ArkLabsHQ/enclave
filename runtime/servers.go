@@ -92,8 +92,6 @@ func SetupHttpServers(
 	attData *AttestationData,
 	authToken string,
 ) Servers {
-	metricsMW := metricsMiddleware(telemetry)
-
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
 
@@ -130,7 +128,7 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMW(em),
+		Handler: metricsMiddleware(telemetry, true)(em),
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
@@ -140,7 +138,7 @@ func SetupHttpServers(
 
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
-		Handler: metricsMW(im),
+		Handler: metricsMiddleware(telemetry, false)(im),
 	}
 
 	return &servers{
@@ -297,13 +295,30 @@ func migrationHTTPStatus(err error) int {
 	}
 }
 
-func metricsMiddleware(telemetry *Telemetry) func(http.Handler) http.Handler {
+// metricsMiddleware counts and logs each request. On the public listener, a 404
+// is almost always a scanner probing for a path, so it is counted but not logged;
+// other 4xx, and every 4xx on the internal listener, are real client errors and
+// stay logged.
+func metricsMiddleware(telemetry *Telemetry, public bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
-			slog.Info(
+			level := slog.LevelInfo
+			switch {
+			case sw.status >= 500:
+				level = slog.LevelWarn
+				telemetry.Inc(metricHTTPServerErrors)
+			case sw.status >= 400:
+				if public && sw.status == http.StatusNotFound {
+					level = slog.LevelDebug
+				}
+				telemetry.Inc(metricHTTPClientErrors)
+			}
+			slog.Log(
+				context.Background(),
+				level,
 				"http request",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -311,9 +326,6 @@ func metricsMiddleware(telemetry *Telemetry) func(http.Handler) http.Handler {
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
 			telemetry.Inc(metricHTTPRequests)
-			if sw.status >= 400 {
-				telemetry.Inc(metricHTTPErrors)
-			}
 		})
 	}
 }

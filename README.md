@@ -431,6 +431,21 @@ runtime does not decode or retry uploads; it returns the AWS status,
 The runtime exports its own telemetry with the OpenTelemetry SDK and identifies
 it with the `service.name=enclave-runtime` resource.
 
+With `ENCLAVE_TRACES=true`, the runtime records a server span for each external
+request, named for its route: `proxy`, `enclave-info` or `enclave-attestation`.
+`/health`, unmatched `/enclave/` paths and `/enclave/` CORS preflights have none.
+Proxied requests add an `upstream` client span, which ends when the app's response
+headers arrive, so each one costs two spans in Transaction Search.
+
+The runtime sends the app a W3C `traceparent` naming the `upstream` span. To join
+the trace, the app must extract it with a TraceContext propagator. Trace context
+from the internet is untrusted: each request starts a new root span that only links
+the caller's trace and span IDs, and the caller's `traceparent` and `tracestate` do
+not reach the app. With `ENCLAVE_TRACES=false`, the proxy forwards them unchanged.
+
+These spans carry only the method, response status and app host. They carry no path,
+query or client headers, because the operator can read X-Ray but not the TLS traffic.
+
 Log groups are named `/<namespace>/<app>/enclave/logs/<source>`, under the same
 namespace as the [SSM parameters](#ssm-parameters), where `<namespace>` is
 `ENCLAVE_NAMESPACE`:

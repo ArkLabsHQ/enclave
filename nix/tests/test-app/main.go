@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
@@ -130,7 +131,9 @@ func handleClockSet(w http.ResponseWriter, r *http.Request) {
 
 func observe(t *telemetry, route string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, span := t.tracer.Start(r.Context(), route)
+		// Join the trace the runtime's proxy started.
+		ctx := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := t.tracer.Start(ctx, route)
 		defer span.End()
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}

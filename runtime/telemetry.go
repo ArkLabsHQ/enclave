@@ -101,7 +101,8 @@ var (
 
 const (
 	metricHTTPRequests          = "enclave_http_requests_total"
-	metricHTTPErrors            = "enclave_http_errors_total"
+	metricHTTPClientErrors      = "enclave_http_client_errors_total"
+	metricHTTPServerErrors      = "enclave_http_server_errors_total"
 	metricAppProxiedRequests    = "enclave_app_proxied_requests_total"
 	metricAppProxiedErrors      = "enclave_app_proxied_errors_total"
 	metricTelemetryExportErrors = "enclave_telemetry_export_errors_total"
@@ -737,7 +738,7 @@ func newForwardDurations(
 
 func counterNames() []string {
 	return []string{
-		metricHTTPRequests, metricHTTPErrors,
+		metricHTTPRequests, metricHTTPClientErrors, metricHTTPServerErrors,
 		metricAppProxiedRequests, metricAppProxiedErrors,
 		metricTelemetryExportErrors,
 		otlpLogs.metricForwarded, otlpLogs.metricErrors,

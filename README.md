@@ -476,7 +476,8 @@ CloudWatch account settings, and metrics require `cloudwatch:PutMetricData`. Exp
 abort startup. Metrics are queried with PromQL by their OTLP attributes.
 
 With `ENCLAVE_METRICS=true`, the runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
-`enclave_http_errors_total`, `enclave_app_proxied_requests_total`,
+`enclave_http_client_errors_total` (`4xx` responses), `enclave_http_server_errors_total`
+(`5xx`), `enclave_app_proxied_requests_total`,
 `enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`
 (uploads accepted with a `2xx`, by AWS or, for a signal that is off, by the enclave
 dropping them),
@@ -484,12 +485,26 @@ dropping them),
 `429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
 and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
 
+The public listener receives internet scanner traffic, so client errors are mostly
+probes for paths such as `/.env` and `/.git/config`. Alarm on
+`enclave_http_server_errors_total` and on `enclave_app_proxied_errors_total`, which counts
+the proxy failing to reach the app; that `502` is also a server error. `404`s on the
+public listener are counted but not written to the access log; other `4xx`, such as a
+real client's `400` or `401`, still are. Apps should create spans only for the routes
+they serve, for example by skipping requests whose `r.Pattern` is empty with Go's
+`ServeMux`, or sample them.
+
 `enclave_otlp_<logs|traces|metrics>_forward_duration_seconds` is a histogram of
 each upload's full exchange with AWS, from sending the request to the end of the
 response body, failed ones included, whether relayed for the application or
 exported by the runtime. Both leave the enclave over the vsock
 proxy, so a slowing egress path shows here as rising latency long before uploads
 fail at the 30-second timeout. Buckets run from 5 ms to 30 s.
+
+**Changed:** `enclave_http_errors_total` is replaced by `enclave_http_client_errors_total`
+and `enclave_http_server_errors_total`, 
+The access log no longer records `404`s on the public listener and records `5xx`
+responses at `WARN`.
 
 **Changed:** traces and metrics are opt-in. Set `ENCLAVE_TRACES=true` and
 `ENCLAVE_METRICS=true` to keep exporting them; without them only logs leave the

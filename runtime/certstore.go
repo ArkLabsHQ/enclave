@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,13 +39,14 @@ type certBundle struct {
 }
 
 type certStore struct {
-	cfg    *Config
-	s3     S3API
-	dek    DEK
-	key    crypto.Signer
-	bucket string
-	fqdn   string
-	prefix string
+	cfg       *Config
+	s3        S3API
+	dek       DEK
+	key       crypto.Signer
+	bucket    string
+	fqdn      string
+	prefix    string
+	staleETag string
 }
 
 const (
@@ -125,6 +127,7 @@ func (c *certStore) get(ctx context.Context, key string) ([]byte, string, error)
 		Key:    aws.String(key),
 	})
 	if err != nil {
+		c.staleETag = ""
 		if isNoSuchKey(err) {
 			return nil, "", nil
 		}
@@ -134,12 +137,17 @@ func (c *certStore) get(ctx context.Context, key string) ([]byte, string, error)
 
 	sealed, err := io.ReadAll(out.Body)
 	if err != nil {
+		c.staleETag = ""
 		return nil, "", fmt.Errorf("read %q: %w", key, err)
 	}
 	plaintext, err := c.dek.Open(sealed, []byte(key))
 	if err != nil {
-		return nil, "", fmt.Errorf("open %q: %w", key, err)
+		slog.Warn("stored certificate object cannot be decrypted with current DEK, treating as absent",
+			"key", key, "error", err)
+		c.staleETag = aws.ToString(out.ETag)
+		return nil, "", nil
 	}
+	c.staleETag = ""
 	return plaintext, aws.ToString(out.ETag), nil
 }
 
@@ -160,15 +168,20 @@ func (c *certStore) putConditional(
 		Body:   bytes.NewReader(sealed),
 	}
 	if expectedETag == "" {
-		in.IfNoneMatch = aws.String("*")
+		if c.staleETag != "" {
+			in.IfMatch = aws.String(c.staleETag)
+		} else {
+			in.IfNoneMatch = aws.String("*")
+		}
 	} else {
 		in.IfMatch = aws.String(expectedETag)
 	}
 
 	out, err := c.s3.PutObject(ctx, in)
+	c.staleETag = ""
 	if err != nil {
 		// 412 means a peer moved the object. 409 is S3 losing an internal race
-		// between concurrent conditional writes — different cause, same response
+		// between concurrent conditional writes: different cause, same response
 		// here: adopt whatever is there now rather than reporting a broken
 		// issuance and burning another duplicate-certificate slot on a retry.
 		if isPreconditionFailed(err) || isConditionalConflict(err) || isNoSuchKey(err) {

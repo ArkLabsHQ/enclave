@@ -37,19 +37,24 @@ func (c *Client) GRPCConn(ctx context.Context, opts ...grpc.DialOption) (*grpc.C
 		return nil, fmt.Errorf("attestation result has no TLS public-key fingerprint")
 	}
 
+	// Unlike the HTTP client, which reads the current pin on every handshake,
+	// this pins the fingerprint from the attestation just verified. A ClientConn
+	// is long-lived and reconnects on its own, so binding it to that identity
+	// stops a later re-verification from silently moving an open conn to a
+	// different enclave; the conn fails instead and the caller re-dials.
 	tlsCfg := &tls.Config{
 		// Disable the default chain check: nitriding's self-signed cert has
 		// no PKI chain. Trust comes from the shared pin below.
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyLeafCertPin(rawCerts, attest.TLSKeyHash)
+			return verifyLeafKeyHash(rawCerts, attest.TLSKeyHash)
 		},
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2"},
 	}
 
+	// New rejects any other scheme, so the host is all that is left to strip.
 	host := strings.TrimPrefix(c.baseURL, "https://")
-	host = strings.TrimPrefix(host, "http://")
 
 	dialOpts := append([]grpc.DialOption{
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),

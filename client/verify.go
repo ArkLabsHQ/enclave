@@ -243,10 +243,10 @@ func isAllZeroHex(s string) bool {
 	return true
 }
 
-// verifyLeafCertPin returns nil iff SHA-256 of the live leaf certificate's
+// verifyLeafKeyHash returns nil iff SHA-256 of the live leaf certificate's
 // PublicKey equals expectedHashHex. The public key remains
 // stable across routine certificate renewal. Shared by HTTP and gRPC.
-func verifyLeafCertPin(rawCerts [][]byte, expectedHashHex string) error {
+func verifyLeafKeyHash(rawCerts [][]byte, expectedHashHex string) error {
 	if isAllZeroHex(expectedHashHex) {
 		return fmt.Errorf("no attested TLS public-key fingerprint to pin against")
 	}

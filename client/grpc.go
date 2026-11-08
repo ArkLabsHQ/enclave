@@ -47,7 +47,7 @@ func (c *Client) GRPCConn(ctx context.Context, opts ...grpc.DialOption) (*grpc.C
 		// no PKI chain. Trust comes from the shared pin below.
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyLeafCertPin(rawCerts, attest.TLSKeyHash)
+			return verifyLeafKeyHash(rawCerts, attest.TLSKeyHash)
 		},
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2"},

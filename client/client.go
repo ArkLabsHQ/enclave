@@ -165,7 +165,7 @@ func New(baseURL string, opts Options) (*Client, error) {
 		mainTransport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: !opts.StrictTLS,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				return verifyLeafCertPin(rawCerts, c.currentTLSHash())
+				return verifyLeafKeyHash(rawCerts, c.currentTLSHash())
 			},
 			MinVersion: tls.VersionTLS12,
 		}
@@ -226,7 +226,7 @@ func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
 	transport.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: !strict,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyLeafCertPin(rawCerts, tlsKeyHashHex)
+			return verifyLeafKeyHash(rawCerts, tlsKeyHashHex)
 		},
 		MinVersion: tls.VersionTLS12,
 	}

@@ -898,7 +898,8 @@ func TestMetricsCounters(t *testing.T) {
 		telemetry.Inc(metricHTTPRequests)
 
 		require.Equal(t, int64(2), counterValue(t, reader, metricHTTPRequests))
-		require.Zero(t, counterValue(t, reader, metricHTTPErrors))
+		require.Zero(t, counterValue(t, reader, metricHTTPClientErrors))
+		require.Zero(t, counterValue(t, reader, metricHTTPServerErrors))
 	})
 
 	t.Run("concurrent inc", func(t *testing.T) {

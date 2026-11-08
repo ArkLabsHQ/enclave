@@ -317,7 +317,7 @@ func metricsMiddleware(telemetry *Telemetry, public bool) func(http.Handler) htt
 				telemetry.Inc(metricHTTPClientErrors)
 			}
 			slog.Log(
-				context.Background(),
+				r.Context(),
 				level,
 				"http request",
 				"method", r.Method,

@@ -487,7 +487,7 @@ proxy, so a slowing egress path shows here as rising latency long before uploads
 fail at the 30-second timeout. Buckets run from 5 ms to 30 s.
 
 **Changed:** `enclave_http_errors_total` is replaced by `enclave_http_client_errors_total`
-and `enclave_http_server_errors_total`, 
+and `enclave_http_server_errors_total`.
 The access log no longer records `404`s on the public listener and records `5xx`
 responses at `WARN`.
 

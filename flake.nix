@@ -42,17 +42,20 @@
               runtime = pkgs.buildGoModule (finalAttrs: {
                 pname = "runtime";
                 version = "0.1.0";
-                # Only these two directories, so unrelated edits do not rebuild the runtime.
+                # Only what the runtime module needs, so unrelated edits do not rebuild
+                # it. The client and the root go.mod are for the runtime's tests.
                 src = pkgs.lib.fileset.toSource {
                   root = ./.;
                   fileset = pkgs.lib.fileset.unions [
                     ./runtime
                     ./internal/signing
+                    ./go.mod
+                    ./client
                   ];
                 };
                 modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-7X5P+Ge+qBypKPAAH++oGkNkej3JI4+ZYxGshm5ihTw=";
+                vendorHash = "sha256-aV6Et7SNxb+LEn4FjN4ko+UUkc2BRjXYXqs983K4Cew=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -79,7 +82,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-+rOrv+GKRtpm1rOv1SrQNycrKHFXJGI99rbCUz4s6Iw=";
+                  vendorHash = "sha256-u/wUE93hfcUDW0w/RvqEk/KxFhedNIkFDcQFXdhFlEk=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"

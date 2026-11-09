@@ -1922,3 +1922,45 @@ func TestAwaitCandidateHandoffDoesNotRetryFatalErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestMigrationStatusSerialize(t *testing.T) {
+	const (
+		cooldownTagHex = "636f6f6c646f776e3a" // "cooldown:"
+		pcr0TagHex     = "706372303a"         // "pcr0:"
+	)
+	targetHex := strings.Repeat("ab", 48)
+	zeroHex := strings.Repeat("00", 48)
+	for _, tc := range []struct {
+		status MigrationStatus
+		want   string
+	}{
+		{
+			MigrationStatus{State: migrationStateNone},
+			cooldownTagHex + "0000000000000000" + pcr0TagHex + zeroHex,
+		},
+		{
+			MigrationStatus{State: migrationStateCoolingDown, TargetPCR0: targetHex, RemainingSeconds: 60},
+			cooldownTagHex + "000000000000003c" + pcr0TagHex + targetHex,
+		},
+		{
+			MigrationStatus{State: migrationStateEligible, TargetPCR0: targetHex},
+			cooldownTagHex + "0000000000000000" + pcr0TagHex + targetHex,
+		},
+		{
+			MigrationStatus{State: migrationStateAborted, TargetPCR0: targetHex},
+			cooldownTagHex + "0000000000000000" + pcr0TagHex + zeroHex,
+		},
+		// Cannot hand off until an abort resolves it.
+		{
+			MigrationStatus{State: migrationStateAmbiguous},
+			cooldownTagHex + "0000000000000000" + pcr0TagHex + zeroHex,
+		},
+	} {
+		got, err := tc.status.Serialize()
+		require.NoError(t, err, tc.status.State)
+		require.Len(t, got, 70, tc.status.State)
+		require.Equal(t, tc.want, hex.EncodeToString(got), tc.status.State)
+	}
+	_, err := (&MigrationStatus{State: migrationStateCoolingDown, TargetPCR0: "ab"}).Serialize()
+	require.Error(t, err)
+}

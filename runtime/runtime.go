@@ -171,6 +171,8 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
+	attData.SetMigrationSource(migrator.MigrationStatus)
+
 	if err := servers.ConfigureEnclaveInfoHandler(migrator); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}

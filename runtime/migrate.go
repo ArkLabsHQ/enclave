@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -55,6 +57,26 @@ type MigrationStatus struct {
 	EligibleAt       *time.Time `json:"eligible_at,omitempty"`
 	RemainingSeconds int        `json:"remaining_seconds"`
 	AmbiguousTargets []string   `json:"ambiguous_targets,omitempty"`
+}
+
+// Serialize is the migration part of attestation user_data: "cooldown:"
+// followed by the seconds left of the cooldown, rounded up, as a big-endian
+// uint64, then "pcr0:" followed by the target PCR0: 70 bytes. The target is
+// set only for a migration that can still hand off, and the cooldown only while
+// it is cooling down. None, aborted, and ambiguous intents attest zero: an
+// ambiguous one cannot hand off until an abort resolves it.
+func (s *MigrationStatus) Serialize() ([]byte, error) {
+	var target [sha512.Size384]byte
+	if s.State == migrationStateCoolingDown || s.State == migrationStateEligible {
+		_, raw, err := normalizePCR0(s.TargetPCR0)
+		if err != nil {
+			return nil, fmt.Errorf("pending migration target PCR0: %w", err)
+		}
+		copy(target[:], raw)
+	}
+	payload := binary.BigEndian.AppendUint64([]byte(cooldownPrefix), uint64(s.RemainingSeconds))
+	payload = append(payload, pcr0Prefix...)
+	return append(payload, target[:]...), nil
 }
 
 // migrationChallenge is the verified content of a predecessor's challenge

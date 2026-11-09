@@ -48,7 +48,7 @@ def console_owners(nodes, needle):
 
 def enclave_curl(node, pcr0, path="/health", signed=False):
     # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
-    # 79-byte user_data binding, and live certificate pinning remain checked.
+    # 149-byte user_data binding, and live certificate pinning remain checked.
     return node.execute(
         f"enclave curl {path} --base-url https://127.0.0.1 "
         f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify "
@@ -61,7 +61,7 @@ def health_signature(node):
     # replicas, restarts, and migration, without decoding attestation CBOR.
     body, status, signature = node.succeed(
         "curl -skf --http1.1 https://127.0.0.1/test/health "
-        "-H 'X-Enclave-Sign-Nonce: key-lifecycle' "
+        f"-H 'X-Enclave-Sign-Nonce: {'00' * 20}' "
         "-w '\\n%{http_code}\\n%header{x-enclave-signature}'"
     ).strip().rsplit("\n", 2)
     assert status == "200", status

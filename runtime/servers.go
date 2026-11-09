@@ -6,9 +6,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -34,8 +35,6 @@ const (
 
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
-
-	maxLoggedNonce = 128
 )
 
 var (
@@ -392,9 +391,16 @@ func attestationHandler(nsm NSM, attData *AttestationData) http.HandlerFunc {
 			return
 		}
 
+		userData, err := attData.UserData(r.Context())
+		if err != nil {
+			slog.Error("attestation user_data", "error", err)
+			http.Error(w, errFailedAttestation, http.StatusInternalServerError)
+			return
+		}
+
 		doc, _, err := nsm.BuildAttestationDocument(
 			WithNonce(rawNonce),
-			WithUserData(attData.Serialize()),
+			WithUserData(userData),
 		)
 		if err != nil {
 			http.Error(w, errFailedAttestation, http.StatusInternalServerError)
@@ -406,12 +412,13 @@ func attestationHandler(nsm NSM, attData *AttestationData) http.HandlerFunc {
 }
 
 // signResponses signs the response to a request carrying signNonceHeader with
-// the attested response-signing key, over the request as received and the
-// response as sent. Other requests pass through unbuffered.
+// the attested response-signing key, over the request's method, target, nonce,
+// and body and the response's status and body. Other requests pass through
+// unbuffered.
 func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonce := r.Header.Get(signNonceHeader)
-		if nonce == "" {
+		nonces := r.Header.Values(signNonceHeader)
+		if len(nonces) == 0 {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -421,17 +428,24 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 			http.Error(w, "no response signing key", http.StatusServiceUnavailable)
 			return
 		}
+		// One nonce, shaped like the attestation's, so a caller can bind both.
+		if len(nonces) != 1 || len(nonces[0]) != nonceNumDigits {
+			http.Error(w, errBadNonceFormat, http.StatusBadRequest)
+			return
+		}
+		nonce, err := hex.DecodeString(nonces[0])
+		if err != nil {
+			http.Error(w, errBadNonceFormat, http.StatusBadRequest)
+			return
+		}
+		// The request body is signed too, so read it before the app does.
 		reqBody, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "read request body", http.StatusBadRequest)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(reqBody))
-		signingContext, err := signing.CaptureResponseSigningContext(r, reqBody)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		target := signing.RequestTarget(r)
 		// Sign the decoded body: browsers always decompress and cannot opt out.
 		// Without the header, the upstream transport requests gzip itself and
 		// decodes it before we see the body.
@@ -443,26 +457,78 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 		if r.Method == http.MethodHead {
 			rec.body.Reset()
 		}
-		msg := signingContext.ResponseMessage(sha256.Sum256(rec.body.Bytes()), rec.status)
+		rec.normalizeTrailers()
 		maps.Copy(w.Header(), rec.header)
-		w.Header().Set(signatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg)))
-		// Lets cross-origin browser code read the signature.
-		w.Header().Add("Access-Control-Expose-Headers", signatureHeader)
-		// The signature answers one nonce; a cached copy could only fail verification.
-		w.Header().Set("Cache-Control", "no-store")
+		request, status, response, ok := signedPayload(r, reqBody, rec)
+		if ok {
+			msg := signing.ResponseMessage(r.Method, target, nonce, request, status, response)
+			signature := base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg))
+			w.Header().Set(signatureHeader, signature)
+			// Lets cross-origin browser code read the signature.
+			w.Header().Add("Access-Control-Expose-Headers", signatureHeader)
+			// The signature answers one nonce; a cached copy could only fail verification.
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		w.WriteHeader(rec.status)
 		_, _ = w.Write(rec.body.Bytes())
 
-		path, _, _ := strings.Cut(signingContext.URI, "?")
-		slog.Info(
-			"signed response",
-			"nonce", nonce[:min(len(nonce), maxLoggedNonce)],
-			"method", signingContext.Method,
-			"path", path,
-			"authority", signingContext.Authority,
-			"status", rec.status,
-		)
+		if ok {
+			path, _, _ := strings.Cut(target, "?")
+			slog.Info(
+				"signed response",
+				"nonce", nonces[0],
+				"method", r.Method,
+				"path", path,
+				"status", rec.status,
+			)
+		}
 	})
+}
+
+// signedPayload returns what a signature covers: for HTTP the request body,
+// the status code, and the response body; for gRPC the request and response
+// messages without their framing and the grpc-status. A gRPC exchange is not
+// signed unless each side is exactly one uncompressed message and the
+// response has a grpc-status trailer.
+func signedPayload(
+	r *http.Request, reqBody []byte, rec *bufferedResponse,
+) (request []byte, status int, response []byte, ok bool) {
+	if !isGRPC(r.Header.Get("Content-Type")) {
+		return reqBody, rec.status, rec.body.Bytes(), true
+	}
+	if request, ok = grpcMessage(reqBody); !ok {
+		return nil, 0, nil, false
+	}
+	if response, ok = grpcMessage(rec.body.Bytes()); !ok {
+		return nil, 0, nil, false
+	}
+	values := rec.header[http.TrailerPrefix+"Grpc-Status"]
+	if len(values) != 1 {
+		return nil, 0, nil, false
+	}
+	status, err := strconv.Atoi(values[0])
+	if err != nil {
+		return nil, 0, nil, false
+	}
+	return request, status, response, true
+}
+
+// grpcMessage returns the message in body if body is exactly one uncompressed
+// gRPC message: a zero compressed-flag byte, a 4-byte big-endian length, and
+// the message.
+func grpcMessage(body []byte) ([]byte, bool) {
+	if len(body) < 5 || body[0] != 0 ||
+		uint64(binary.BigEndian.Uint32(body[1:5])) != uint64(len(body)-5) {
+		return nil, false
+	}
+	return body[5:], true
+}
+
+// isGRPC matches application/grpc and its +codec and ;parameter forms, not
+// grpc-web.
+func isGRPC(contentType string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(contentType), "application/grpc")
+	return ok && (rest == "" || rest[0] == '+' || rest[0] == ';')
 }
 
 // bufferedResponse holds a response until it is signed.
@@ -470,6 +536,25 @@ type bufferedResponse struct {
 	header http.Header
 	status int
 	body   bytes.Buffer
+}
+
+// normalizeTrailers makes trailers go out once, at the end of the response.
+// gRPC sends grpc-status as a trailer, a header after the body. Some servers
+// name their trailers first in a Trailer header; replayed from the buffer as
+// is, grpc-status would also go out with the headers, so it would be sent
+// twice. Moving each named trailer to a TrailerPrefix key sends it only at the end.
+func (b *bufferedResponse) normalizeTrailers() {
+	for _, value := range b.header.Values("Trailer") {
+		for name := range strings.SplitSeq(value, ",") {
+			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if values, ok := b.header[name]; ok {
+				trailer := http.TrailerPrefix + name
+				b.header[trailer] = append(b.header[trailer], values...)
+				delete(b.header, name)
+			}
+		}
+	}
+	b.header.Del("Trailer")
 }
 
 func (b *bufferedResponse) Header() http.Header         { return b.header }

@@ -361,7 +361,7 @@ func TestIsAllZeroHex(t *testing.T) {
 	}
 }
 
-func TestVerifyLeafCertPin(t *testing.T) {
+func TestVerifyLeafKeyHash(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	tmpl := &x509.Certificate{
@@ -379,7 +379,7 @@ func TestVerifyLeafCertPin(t *testing.T) {
 	good := hex.EncodeToString(sum[:])
 
 	// Match (case-insensitive).
-	require.NoError(t, verifyLeafCertPin([][]byte{cert}, strings.ToUpper(good)))
+	require.NoError(t, verifyLeafKeyHash([][]byte{cert}, strings.ToUpper(good)))
 
 	// A renewed certificate with different DER but the same key keeps the same pin.
 	renewedTemplate := *tmpl
@@ -390,24 +390,24 @@ func TestVerifyLeafCertPin(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NotEqual(t, cert, renewed)
-	require.NoError(t, verifyLeafCertPin([][]byte{renewed}, good))
+	require.NoError(t, verifyLeafKeyHash([][]byte{renewed}, good))
 	// Mismatch.
 	require.ErrorContains(
 		t,
-		verifyLeafCertPin([][]byte{cert}, strings.Repeat("ab", 32)),
+		verifyLeafKeyHash([][]byte{cert}, strings.Repeat("ab", 32)),
 		"TLS public-key fingerprint mismatch",
 	)
 	// No peer cert.
-	require.ErrorContains(t, verifyLeafCertPin(nil, good), "no peer certificate presented")
+	require.ErrorContains(t, verifyLeafKeyHash(nil, good), "no peer certificate presented")
 	// Empty / all-zero expected hash (uninitialized binding).
 	require.ErrorContains(
 		t,
-		verifyLeafCertPin([][]byte{cert}, ""),
+		verifyLeafKeyHash([][]byte{cert}, ""),
 		"no attested TLS public-key fingerprint",
 	)
 	require.ErrorContains(
 		t,
-		verifyLeafCertPin([][]byte{cert}, strings.Repeat("0", 64)),
+		verifyLeafKeyHash([][]byte{cert}, strings.Repeat("0", 64)),
 		"no attested TLS public-key fingerprint",
 	)
 }

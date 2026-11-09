@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -116,22 +117,18 @@ type Client struct {
 
 	mu          sync.RWMutex
 	cachedState *AttestationResult
-	pinHash     string // attested TLS leaf hash; read by httpClient's pin callback
 }
 
-// setPinHash records the attested fingerprint the main client pins against.
-func (c *Client) setPinHash(h string) {
-	c.mu.Lock()
-	c.pinHash = h
-	c.mu.Unlock()
-}
-
-// currentTLSHash is read by the pin callback each handshake; empty until the
-// bootstrap attestation is verified, so a pre-pin request fails closed.
+// currentTLSHash is read by the pin callback each handshake. The pin lives in
+// cachedState so it cannot disagree with the verify that produced it, and stays
+// empty until one passes every check, so a pre-pin request fails closed.
 func (c *Client) currentTLSHash() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.pinHash
+	if c.cachedState == nil {
+		return ""
+	}
+	return c.cachedState.TLSKeyHash
 }
 
 // New creates a new enclave client that verifies attestation before
@@ -140,6 +137,10 @@ func (c *Client) currentTLSHash() string {
 func New(baseURL string, opts Options) (*Client, error) {
 	if opts.ExpectedPCR0 == "" {
 		return nil, fmt.Errorf("ExpectedPCR0 is required")
+	}
+	endpoint, err := requireHTTPSURL(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("base URL %w", err)
 	}
 
 	if opts.CacheTTL == 0 {
@@ -152,7 +153,7 @@ func New(baseURL string, opts Options) (*Client, error) {
 	insecure := opts.InsecureTLS != nil && *opts.InsecureTLS
 
 	c := &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		baseURL: endpoint,
 		opts:    opts,
 	}
 
@@ -163,7 +164,10 @@ func New(baseURL string, opts Options) (*Client, error) {
 		InsecureSkipVerify: !opts.StrictTLS,
 		MinVersion:         tls.VersionTLS12,
 	}
-	c.bootstrapClient = &http.Client{Timeout: 30 * time.Second, Transport: bootstrapTransport}
+	c.bootstrapClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpsTransport{bootstrapTransport},
+	}
 
 	// Main client: pins every connection to the attested tlsKeyHash.
 	mainTransport := http.DefaultTransport.(*http.Transport).Clone()
@@ -173,12 +177,15 @@ func New(baseURL string, opts Options) (*Client, error) {
 		mainTransport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: !opts.StrictTLS,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				return verifyLeafCertPin(rawCerts, c.currentTLSHash())
+				return verifyLeafKeyHash(rawCerts, c.currentTLSHash())
 			},
 			MinVersion: tls.VersionTLS12,
 		}
 	}
-	c.httpClient = &http.Client{Timeout: 30 * time.Second, Transport: mainTransport}
+	c.httpClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpsTransport{mainTransport},
+	}
 	if opts.SignedResponses {
 		// Don't follow redirects: signature verification uses the original request.
 		// Verify and return the redirect response so the caller can handle it.
@@ -190,8 +197,39 @@ func New(baseURL string, opts Options) (*Client, error) {
 	return c, nil
 }
 
+// requireHTTPSURL returns rawURL without its trailing slash, rejecting anything
+// that is not an absolute https URL with a host: the pin is only consulted
+// during a TLS handshake, so a plaintext endpoint bypasses it entirely.
+func requireHTTPSURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return "", fmt.Errorf(
+			"must be an absolute https:// URL with a host, got %q", rawURL,
+		)
+	}
+	return strings.TrimRight(rawURL, "/"), nil
+}
+
+// httpsTransport refuses a plaintext hop before anything is written, covering
+// the first request and every redirect. Embedding keeps CloseIdleConnections
+// promoted. Closing the body is the RoundTripper contract ("RoundTrip must
+// always close the body, including on errors"), which http.Client.do relies on;
+// doing it here keeps the public Do from closing a body the caller owns.
+type httpsTransport struct{ *http.Transport }
+
+func (t httpsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL != nil && req.URL.Scheme == "https" {
+		return t.Transport.RoundTrip(req)
+	}
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return nil, fmt.Errorf("request URL must use https")
+}
+
 // PinnedHTTPClient returns a client that pins the live certificate's PublicKey
-// to tlsKeyHashHex. strict adds public CA and hostname validation.
+// to tlsKeyHashHex and rejects plaintext requests and redirects. strict adds
+// public CA and hostname validation.
 func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
 	if isAllZeroHex(tlsKeyHashHex) {
 		return nil, fmt.Errorf("no TLS public-key fingerprint to pin against")
@@ -200,11 +238,11 @@ func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
 	transport.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: !strict,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyLeafCertPin(rawCerts, tlsKeyHashHex)
+			return verifyLeafKeyHash(rawCerts, tlsKeyHashHex)
 		},
 		MinVersion: tls.VersionTLS12,
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
+	return &http.Client{Timeout: 30 * time.Second, Transport: httpsTransport{transport}}, nil
 }
 
 // Get makes a verified GET request to the enclave.
@@ -335,12 +373,12 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 		return nil, err
 	}
 
-	// 2. Extract the attested tlsKeyHash and activate the pin before any further request.
+	// 2. Extract the attested tlsKeyHash. It is published with cachedState at the
+	// end, so a failure below leaves the last good pin in place.
 	userData, err := parseUserData(nitResult)
 	if err != nil {
 		return nil, fmt.Errorf("parse user_data: %w", err)
 	}
-	c.setPinHash(userData.tlsKeyHash)
 
 	// 3. Verify additional PCRs (secret pubkey hashes).
 	pcrs, err := verifyPCRs(nitResult.Document.PCRs, c.opts.ExpectedPCRs)
@@ -429,8 +467,8 @@ func FetchManifest(ctx context.Context, manifestURL string) (*Manifest, error) {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 
-	if m.BaseURL == "" {
-		return nil, fmt.Errorf("manifest missing base_url")
+	if _, err := requireHTTPSURL(m.BaseURL); err != nil {
+		return nil, fmt.Errorf("manifest base_url %w", err)
 	}
 	if m.PCR0 == "" {
 		return nil, fmt.Errorf("manifest missing pcr0")

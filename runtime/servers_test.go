@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -29,6 +30,10 @@ import (
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type migrationControlMigrator struct {
@@ -687,6 +692,223 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	})
 }
 
+type recordedSpans struct {
+	spans []sdktrace.ReadOnlySpan
+}
+
+func (e *recordedSpans) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.spans = append(e.spans, spans...)
+	return nil
+}
+
+func (e *recordedSpans) Shutdown(context.Context) error { return nil }
+
+func (e *recordedSpans) named(t *testing.T, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+	for _, span := range e.spans {
+		if span.Name() == name {
+			return span
+		}
+	}
+	require.Failf(t, "span not recorded", "%q", name)
+	return nil
+}
+
+func spanAttributes(span sdktrace.ReadOnlySpan) map[string]string {
+	attrs := map[string]string{}
+	for _, kv := range span.Attributes() {
+		attrs[string(kv.Key)] = kv.Value.String()
+	}
+	return attrs
+}
+
+func TestRuntimeSpans(t *testing.T) {
+	const (
+		callerTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+		callerSpanID  = "00f067aa0ba902b7"
+		callerParent  = "00-" + callerTraceID + "-" + callerSpanID + "-01"
+	)
+
+	var received http.Header
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer app.Close()
+	appURL, err := url.Parse(app.URL)
+	require.NoError(t, err)
+
+	recorded := &recordedSpans{}
+	previous := otel.GetTracerProvider()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(recorded))
+	otel.SetTracerProvider(provider)
+	// The global delegate keeps pointing at provider after previous is restored,
+	// so shut it down to stop later tests' spans reaching recorded.
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previous)
+		_ = provider.Shutdown(context.Background())
+	})
+
+	setup := func(t *testing.T, traced bool, rt *runtimeState) *servers {
+		t.Helper()
+		s := SetupHttpServers(
+			rt,
+			Config{AppWebSrv: appURL, ExportTraces: traced},
+			&nsmW{},
+			NewTelemetry(testCfg, nil),
+			&AttestationData{},
+			"token",
+		).(*servers)
+		require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
+			previous: &PreviousPCR0Info{},
+			status:   &MigrationStatus{},
+		}))
+		return s
+	}
+	ready := func() *runtimeState {
+		rt := newRuntimeState()
+		rt.NotifyReady()
+		return rt
+	}
+	serve := func(s *servers, r *http.Request) *httptest.ResponseRecorder {
+		recorded.spans = nil
+		rr := httptest.NewRecorder()
+		s.em.ServeHTTP(rr, r)
+		return rr
+	}
+	fromCaller := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/orders/42?token=secret", nil)
+		r.Header.Set("Traceparent", callerParent)
+		r.Header.Set("Tracestate", "vendor=secret")
+		r.Header.Set("User-Agent", "secret-agent")
+		r.Header.Set("X-Forwarded-For", "203.0.113.7")
+		return r
+	}
+
+	t.Run("does nothing unless traces are exported", func(t *testing.T) {
+		rr := serve(setup(t, false, ready()), fromCaller())
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Empty(t, recorded.spans)
+		require.Equal(t, callerParent, received.Get("Traceparent"))
+		require.Equal(t, "vendor=secret", received.Get("Tracestate"))
+	})
+
+	t.Run("a proxied request is a new root that only links the caller", func(t *testing.T) {
+		rr := serve(setup(t, true, ready()), fromCaller())
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Len(t, recorded.spans, 2)
+
+		proxy := recorded.named(t, "proxy")
+		require.Equal(t, trace.SpanKindServer, proxy.SpanKind())
+		require.False(t, proxy.Parent().IsValid())
+		require.NotEqual(t, callerTraceID, proxy.SpanContext().TraceID().String())
+		require.Len(t, proxy.Links(), 1)
+		link := proxy.Links()[0].SpanContext
+		require.Equal(t, callerTraceID, link.TraceID().String())
+		require.Equal(t, callerSpanID, link.SpanID().String())
+		require.Empty(t, link.TraceState().String(), "tracestate must not reach X-Ray")
+
+		upstream := recorded.named(t, "upstream")
+		require.Equal(t, trace.SpanKindClient, upstream.SpanKind())
+		require.Equal(t, proxy.SpanContext().TraceID(), upstream.SpanContext().TraceID())
+		require.Equal(t, proxy.SpanContext().SpanID(), upstream.Parent().SpanID())
+
+		require.Equal(t,
+			"00-"+upstream.SpanContext().TraceID().String()+"-"+
+				upstream.SpanContext().SpanID().String()+"-01",
+			received.Get("Traceparent"),
+			"the app's spans must become children of the runtime's",
+		)
+		require.Empty(t, received.Get("Tracestate"))
+
+		// Exact, so a new attribute can't export request data unnoticed.
+		require.Equal(t, map[string]string{
+			"http.request.method":       http.MethodGet,
+			"http.response.status_code": "200",
+		}, spanAttributes(proxy))
+		require.Equal(t, map[string]string{
+			"http.request.method":       http.MethodGet,
+			"http.response.status_code": "200",
+			"server.address":            appURL.Hostname(),
+		}, spanAttributes(upstream))
+	})
+
+	t.Run("a request without trace context has no link", func(t *testing.T) {
+		serve(setup(t, true, ready()), httptest.NewRequest(http.MethodGet, "/orders", nil))
+
+		require.Empty(t, recorded.named(t, "proxy").Links())
+	})
+
+	t.Run("a non-standard method is not exported", func(t *testing.T) {
+		serve(setup(t, true, ready()), httptest.NewRequest("BREW", "/orders", nil))
+
+		require.Equal(
+			t,
+			"_OTHER",
+			spanAttributes(recorded.named(t, "proxy"))["http.request.method"],
+		)
+		require.Equal(
+			t,
+			"_OTHER",
+			spanAttributes(recorded.named(t, "upstream"))["http.request.method"],
+		)
+	})
+
+	t.Run("runtime routes are named by route class", func(t *testing.T) {
+		s := setup(t, true, ready())
+		for path, name := range map[string]string{
+			"/enclave/v1/info":     "enclave-info",
+			"/enclave/attestation": "enclave-attestation",
+		} {
+			serve(s, httptest.NewRequest(http.MethodGet, path, nil))
+			require.Len(t, recorded.spans, 1, path)
+			require.Equal(t, name, recorded.spans[0].Name())
+			require.Equal(t, trace.SpanKindServer, recorded.spans[0].SpanKind())
+		}
+	})
+
+	t.Run("polled and unmatched runtime routes have no span", func(t *testing.T) {
+		s := setup(t, true, ready())
+		for _, r := range []*http.Request{
+			httptest.NewRequest(http.MethodGet, "/health", nil),
+			httptest.NewRequest(http.MethodGet, "/enclave/unknown", nil),
+			httptest.NewRequest(http.MethodOptions, "/enclave/v1/info", nil),
+		} {
+			serve(s, r)
+			require.Empty(t, recorded.spans, r.URL.Path)
+		}
+	})
+
+	t.Run("the runtime's own 503 is recorded", func(t *testing.T) {
+		rr := serve(
+			setup(t, true, newRuntimeState()),
+			httptest.NewRequest(http.MethodGet, "/orders", nil),
+		)
+
+		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+		require.Len(t, recorded.spans, 1)
+		proxy := recorded.named(t, "proxy")
+		require.Equal(t, codes.Error, proxy.Status().Code)
+		require.Equal(t, "503", spanAttributes(proxy)["http.response.status_code"])
+	})
+
+	t.Run("the proxy's own 502 is recorded", func(t *testing.T) {
+		app.Close()
+
+		rr := serve(setup(t, true, ready()), fromCaller())
+
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		proxy := recorded.named(t, "proxy")
+		require.Equal(t, codes.Error, proxy.Status().Code)
+		require.Equal(t, "502", spanAttributes(proxy)["http.response.status_code"])
+		upstream := recorded.named(t, "upstream")
+		require.Equal(t, codes.Error, upstream.Status().Code)
+		require.Equal(t, "upstream request failed", upstream.Status().Description)
+		require.NotContains(t, spanAttributes(upstream), "http.response.status_code")
+	})
+}
+
 func TestSignedProxiedResponse(t *testing.T) {
 	var received []byte
 	status := http.StatusCreated
@@ -1013,4 +1235,50 @@ func TestReportBootFailure(t *testing.T) {
 	require.Equal(t, runtimeStatusFailed, info.Status)
 	require.Equal(t, "permission preflight: role is missing SSMParams", info.Error)
 	require.Equal(t, Version, info.Version)
+}
+
+func TestMetricsMiddleware(t *testing.T) {
+	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
+
+	for _, tc := range []struct {
+		public         bool
+		status         int
+		client, server int64
+		level          string
+	}{
+		{true, http.StatusOK, 0, 0, "INFO"},
+		{true, http.StatusNotFound, 1, 0, "DEBUG"},
+		{true, http.StatusUnauthorized, 1, 0, "INFO"},
+		{true, 499, 1, 0, "INFO"},
+		{true, http.StatusInternalServerError, 0, 1, "WARN"},
+		{true, http.StatusServiceUnavailable, 0, 1, "WARN"},
+		{false, http.StatusNotFound, 1, 0, "INFO"},
+		{false, http.StatusForbidden, 1, 0, "INFO"},
+	} {
+		t.Run(fmt.Sprintf("public=%t/%d", tc.public, tc.status), func(t *testing.T) {
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(
+				slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}),
+			))
+			telemetry := NewTelemetry(testCfg, nil)
+			reader := testMetrics(t, telemetry)
+
+			app := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			metricsMiddleware(telemetry, tc.public)(app).ServeHTTP(
+				httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/.env", nil),
+			)
+
+			require.Equal(t, int64(1), counterValue(t, reader, metricHTTPRequests))
+			require.Equal(t, tc.client, counterValue(t, reader, metricHTTPClientErrors))
+			require.Equal(t, tc.server, counterValue(t, reader, metricHTTPServerErrors))
+
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &record))
+			require.Equal(t, "http request", record["msg"])
+			require.Equal(t, tc.level, record["level"])
+		})
+	}
 }

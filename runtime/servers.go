@@ -26,6 +26,11 @@ import (
 
 	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 )
 
@@ -91,14 +96,15 @@ func SetupHttpServers(
 	attData *AttestationData,
 	authToken string,
 ) Servers {
-	metricsMW := metricsMiddleware(telemetry)
-
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
 
 	revProxy := httputil.NewSingleHostReverseProxy(cfg.AppWebSrv)
 	revProxy.BufferPool = nitriding.NewBufPool()
 	revProxy.Transport = upstreamTransport(cfg.UpstreamProtocol)
+	if cfg.ExportTraces {
+		revProxy.Transport = tracedTransport{next: revProxy.Transport}
+	}
 	revProxy.FlushInterval = -1
 	revProxy.ModifyResponse = func(*http.Response) error {
 		telemetry.Inc(metricAppProxiedRequests)
@@ -115,21 +121,25 @@ func SetupHttpServers(
 
 	// OTLP forwarding stays on loopback because requests use instance credentials.
 	rm := http.NewServeMux()
-	rm.Handle("GET /enclave/attestation", whenReady(rt, attestationHandler(nsm, attData)))
+	rm.Handle("GET /enclave/attestation", routeSpan(
+		cfg.ExportTraces, "enclave-attestation", whenReady(rt, attestationHandler(nsm, attData)),
+	))
 
 	em := http.NewServeMux()
 	em.Handle(enclavePrefix, corsWildcard(rm))
 
 	em.Handle("/health", sm)
 
-	em.Handle("/", whenReady(rt, signResponses(attData, revProxy)))
+	em.Handle("/", routeSpan(
+		cfg.ExportTraces, "proxy", whenReady(rt, signResponses(attData, revProxy)),
+	))
 
 	im := http.NewServeMux()
 	im.Handle("/v1/", sm)
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMW(em),
+		Handler: metricsMiddleware(telemetry, true)(em),
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
@@ -139,7 +149,7 @@ func SetupHttpServers(
 
 	int := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.IntPort),
-		Handler: metricsMW(im),
+		Handler: metricsMiddleware(telemetry, false)(im),
 	}
 
 	return &servers{
@@ -265,7 +275,9 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 		})
 	}
 	// Signed on request like application responses, once the signing key exists.
-	s.rm.Handle("GET /enclave/v1/info", signResponses(s.attData, http.HandlerFunc(info)))
+	s.rm.Handle("GET /enclave/v1/info", routeSpan(
+		s.cfg.ExportTraces, "enclave-info", signResponses(s.attData, http.HandlerFunc(info)),
+	))
 
 	return nil
 }
@@ -296,13 +308,30 @@ func migrationHTTPStatus(err error) int {
 	}
 }
 
-func metricsMiddleware(telemetry *Telemetry) func(http.Handler) http.Handler {
+// metricsMiddleware counts and logs each request. On the public listener, a 404
+// is almost always a scanner probing for a path, so it is counted but not logged;
+// other 4xx, and every 4xx on the internal listener, are real client errors and
+// stay logged.
+func metricsMiddleware(telemetry *Telemetry, public bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
-			slog.Info(
+			level := slog.LevelInfo
+			switch {
+			case sw.status >= 500:
+				level = slog.LevelWarn
+				telemetry.Inc(metricHTTPServerErrors)
+			case sw.status >= 400:
+				if public && sw.status == http.StatusNotFound {
+					level = slog.LevelDebug
+				}
+				telemetry.Inc(metricHTTPClientErrors)
+			}
+			slog.Log(
+				r.Context(),
+				level,
 				"http request",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -310,10 +339,65 @@ func metricsMiddleware(telemetry *Telemetry) func(http.Handler) http.Handler {
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
 			telemetry.Inc(metricHTTPRequests)
-			if sw.status >= 400 {
-				telemetry.Inc(metricHTTPErrors)
-			}
 		})
+	}
+}
+
+// routeSpan records a server span named for its route. It exports no path, query
+// or client header, because the operator can read X-Ray but not this TLS traffic.
+// Trace context from the internet is untrusted: it only becomes a link on a new
+// root, so a caller cannot join an existing trace or force sampling.
+func routeSpan(traced bool, route string, next http.Handler) http.Handler {
+	if !traced {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		opts := []trace.SpanStartOption{
+			trace.WithNewRoot(),
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(spanMethod(r.Method)),
+		}
+		incoming := propagation.TraceContext{}.Extract(
+			r.Context(), propagation.HeaderCarrier(r.Header),
+		)
+		if sc := trace.SpanContextFromContext(incoming); sc.IsValid() {
+			opts = append(opts, trace.WithLinks(trace.Link{
+				SpanContext: sc.WithTraceState(trace.TraceState{}),
+			}))
+		}
+		ctx, span := otel.Tracer(runtimeService).Start(r.Context(), route, opts...)
+		defer span.End()
+
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			if p := recover(); p != nil {
+				// ReverseProxy panics with http.ErrAbortHandler when the app's response
+				// breaks off; re-panic so net/http still cuts the connection.
+				setSpanStatus(span, sw.status)
+				span.SetStatus(codes.Error, "response aborted")
+				panic(p)
+			}
+		}()
+		next.ServeHTTP(sw, r.WithContext(ctx))
+		setSpanStatus(span, sw.status)
+	})
+}
+
+// spanMethod bounds a client-chosen method to the standard ones.
+func spanMethod(method string) attribute.KeyValue {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace:
+	default:
+		method = "_OTHER"
+	}
+	return attribute.String("http.request.method", method)
+}
+
+func setSpanStatus(span trace.Span, status int) {
+	span.SetAttributes(attribute.Int("http.response.status_code", status))
+	if status >= http.StatusInternalServerError {
+		span.SetStatus(codes.Error, http.StatusText(status))
 	}
 }
 
@@ -624,6 +708,37 @@ func upstreamTransport(mode string) http.RoundTripper {
 	default:
 		return &protocolSwitchTransport{h1: h1, h2c: h2c}
 	}
+}
+
+// tracedTransport records the runtime->app hop until response headers arrive and
+// makes it the parent of the app's spans. The client's tracestate goes too, because
+// Inject leaves that header alone when it has nothing to write.
+type tracedTransport struct {
+	next http.RoundTripper
+}
+
+func (t tracedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	ctx, span := otel.Tracer(runtimeService).Start(r.Context(), "upstream",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			spanMethod(r.Method),
+			attribute.String("server.address", r.URL.Hostname()),
+		),
+	)
+	defer span.End()
+
+	r = r.Clone(ctx)
+	r.Header.Del("Tracestate")
+	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(r.Header))
+
+	res, err := t.next.RoundTrip(r)
+	if err != nil {
+		// Not err's text, which could quote the request.
+		span.SetStatus(codes.Error, "upstream request failed")
+		return nil, err
+	}
+	setSpanStatus(span, res.StatusCode)
+	return res, nil
 }
 
 // corsWildcard adds permissive CORS to external runtime API endpoints.

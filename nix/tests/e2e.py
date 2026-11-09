@@ -332,10 +332,36 @@ def wait_for_otlp(signal, needle, group=None, timeout=90):
         time.sleep(2)
 
 
+def spans_named(name):
+    return otlp(
+        "traces",
+        "[.[].body.resourceSpans[]?.scopeSpans[]?.spans[]? "
+        "| select(.name == $name) | {traceId, spanId, parentSpanId}]",
+        name=name,
+    )
+
+
 wait_for_otlp("logs", "handled health", f"{LOG_PREFIX}/logs/app")
 wait_for_otlp("logs", "child started", f"{LOG_PREFIX}/logs/runtime")
 wait_for_otlp("traces", '"name":"health"')
 wait_for_otlp("traces", '"name":"init"')
+wait_for_otlp("traces", '"name":"proxy"')
+wait_for_otlp("traces", '"name":"upstream"')
+
+# The app's span must be a child of the runtime's. Polled because the two
+# processes ship their spans in separate batches.
+deadline = time.time() + 90
+while True:
+    upstream_spans = {(s["traceId"], s["spanId"]) for s in spans_named("upstream")}
+    app_spans = spans_named("health")
+    if any((s["traceId"], s["parentSpanId"]) in upstream_spans for s in app_spans):
+        break
+    if time.time() > deadline:
+        raise Exception(
+            f"no app span is a child of an upstream span: {upstream_spans} {app_spans}"
+        )
+    time.sleep(2)
+
 wait_for_otlp("metrics", "testapp_requests_total")
 wait_for_otlp("metrics", "enclave_http_requests_total")
 

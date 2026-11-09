@@ -38,19 +38,26 @@ func NewKMSPolicy(callerARN, pcr0, recoveryARN string) (*KMSPolicy, error) {
 		return nil, fmt.Errorf("empty PCR0")
 	}
 
-	condition := &kmsPolicyConditions{}
-	condition.StringEqualsIgnoreCase.PCR0 = policyStrings{strings.ToLower(pcr0)}
-
 	policy := &KMSPolicy{
 		Version: kmsPolicyVersion,
 		attested: newKMSPolicyStatement(
 			"EnclaveAttestedOperations",
-			role,
+			"*",
 			attestedActions,
-			condition,
+			roleCondition(role, pcr0),
 		),
-		operations: newKMSPolicyStatement("EnclaveOperations", role, operationsActions, nil),
-		deletion:   newKMSPolicyStatement("AllowKeyDeletion", role, deletionActions, nil),
+		operations: newKMSPolicyStatement(
+			"EnclaveOperations",
+			"*",
+			operationsActions,
+			roleCondition(role, ""),
+		),
+		deletion: newKMSPolicyStatement(
+			"AllowKeyDeletion",
+			"*",
+			deletionActions,
+			roleCondition(role, ""),
+		),
 	}
 	if recoveryARN != "" {
 		account, err := arnAccount(recoveryARN)
@@ -221,9 +228,24 @@ type kmsPolicyStatement struct {
 }
 
 type kmsPolicyConditions struct {
+	ArnEquals struct {
+		PrincipalARN policyStrings `json:"aws:PrincipalArn"`
+	} `json:"ArnEquals,omitzero"`
 	StringEqualsIgnoreCase struct {
 		PCR0 policyStrings `json:"kms:RecipientAttestation:PCR0"`
-	} `json:"StringEqualsIgnoreCase"`
+	} `json:"StringEqualsIgnoreCase,omitzero"`
+}
+
+// roleCondition admits the role by ARN, plus pcr0 when set. AWS keeps a role
+// principal as the role's unique ID, so a recreated role would not match it;
+// aws:PrincipalArn is compared as written.
+func roleCondition(role, pcr0 string) *kmsPolicyConditions {
+	condition := &kmsPolicyConditions{}
+	condition.ArnEquals.PrincipalARN = policyStrings{role}
+	if pcr0 != "" {
+		condition.StringEqualsIgnoreCase.PCR0 = policyStrings{strings.ToLower(pcr0)}
+	}
+	return condition
 }
 
 // verifyStatement compares permissions, ignoring Sid.
@@ -247,7 +269,13 @@ func (stmt *kmsPolicyStatement) verifyStatement(want *kmsPolicyStatement) error 
 		return nil
 	}
 	if stmt.Condition == nil {
-		return fmt.Errorf("missing attestation condition")
+		return fmt.Errorf("missing condition")
+	}
+	if !slices.Equal(
+		stmt.Condition.ArnEquals.PrincipalARN,
+		want.Condition.ArnEquals.PrincipalARN,
+	) {
+		return fmt.Errorf("principal ARN does not match caller identity")
 	}
 	if !sameActions(
 		stmt.Condition.StringEqualsIgnoreCase.PCR0,
@@ -286,15 +314,25 @@ func (stmt *kmsPolicyStatement) normalize() error {
 			return fmt.Errorf("wildcard action %q is unsupported", action)
 		}
 	}
-	if strings.ContainsAny(stmt.Principal.AWS[0], "*?") {
+	if p := stmt.Principal.AWS[0]; p != "*" && strings.ContainsAny(p, "*?") {
 		return fmt.Errorf("wildcard principal is unsupported")
 	}
-	if stmt.Condition != nil {
-		if err := stmt.Condition.StringEqualsIgnoreCase.PCR0.normalize(true); err != nil {
-			return fmt.Errorf("PCR0: %w", err)
+	if c := stmt.Condition; c != nil {
+		if c.ArnEquals.PrincipalARN == nil && c.StringEqualsIgnoreCase.PCR0 == nil {
+			return fmt.Errorf("empty condition")
 		}
-		if len(stmt.Condition.StringEqualsIgnoreCase.PCR0) != 1 {
-			return fmt.Errorf("expected exactly one PCR0")
+		if c.ArnEquals.PrincipalARN != nil {
+			if err := c.ArnEquals.PrincipalARN.normalize(false); err != nil {
+				return fmt.Errorf("principal ARN: %w", err)
+			}
+		}
+		if c.StringEqualsIgnoreCase.PCR0 != nil {
+			if err := c.StringEqualsIgnoreCase.PCR0.normalize(true); err != nil {
+				return fmt.Errorf("PCR0: %w", err)
+			}
+			if len(c.StringEqualsIgnoreCase.PCR0) != 1 {
+				return fmt.Errorf("expected exactly one PCR0")
+			}
 		}
 	}
 	return nil
@@ -486,7 +524,7 @@ func validatePolicyJSONSyntax(d *json.Decoder) error {
 			switch key {
 			case "Version", "Statement", "Sid", "Effect", "Principal", "AWS",
 				"Action", "Resource", "Condition", "StringEqualsIgnoreCase",
-				"kms:RecipientAttestation:PCR0":
+				"kms:RecipientAttestation:PCR0", "ArnEquals", "aws:PrincipalArn":
 			default:
 				return fmt.Errorf("unsupported policy field %q", key)
 			}

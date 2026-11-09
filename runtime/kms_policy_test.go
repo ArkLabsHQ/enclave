@@ -27,7 +27,7 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
       "Sid": "EnclaveAttestedOperations",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:Decrypt",
@@ -35,6 +35,9 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
       ],
       "Resource": ["*"],
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        },
         "StringEqualsIgnoreCase": {
           "kms:RecipientAttestation:PCR0": [
             "abc123"
@@ -46,27 +49,37 @@ func TestBuildKMSPolicy_LockedGolden(t *testing.T) {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:Encrypt",
         "kms:GetKeyPolicy",
         "kms:DescribeKey"
       ],
-      "Resource": ["*"]
+      "Resource": ["*"],
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        }
+      }
     },
     {
       "Sid": "AllowKeyDeletion",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:ScheduleKeyDeletion",
         "kms:CancelKeyDeletion",
         "kms:EnableKey"
       ],
-      "Resource": ["*"]
+      "Resource": ["*"],
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        }
+      }
     }
   ]
 }`
@@ -84,7 +97,7 @@ func TestBuildKMSPolicy_RecoveryGolden(t *testing.T) {
       "Sid": "EnclaveAttestedOperations",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:Decrypt",
@@ -92,6 +105,9 @@ func TestBuildKMSPolicy_RecoveryGolden(t *testing.T) {
       ],
       "Resource": ["*"],
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        },
         "StringEqualsIgnoreCase": {
           "kms:RecipientAttestation:PCR0": [
             "newpcr0"
@@ -103,27 +119,37 @@ func TestBuildKMSPolicy_RecoveryGolden(t *testing.T) {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:Encrypt",
         "kms:GetKeyPolicy",
         "kms:DescribeKey"
       ],
-      "Resource": ["*"]
+      "Resource": ["*"],
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        }
+      }
     },
     {
       "Sid": "AllowKeyDeletion",
       "Effect": "Allow",
       "Principal": {
-        "AWS": ["arn:aws:iam::123456789012:role/ec2"]
+        "AWS": ["*"]
       },
       "Action": [
         "kms:ScheduleKeyDeletion",
         "kms:CancelKeyDeletion",
         "kms:EnableKey"
       ],
-      "Resource": ["*"]
+      "Resource": ["*"],
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": ["arn:aws:iam::123456789012:role/ec2"]
+        }
+      }
     },
     {
       "Sid": "RootRecovery",
@@ -245,25 +271,34 @@ func ppStmt(effect string, action, principal any, condition map[string]any) map[
 	return s
 }
 
-// ppPCR0Cond is a RecipientAttestation:PCR0 condition admitting the given
-// value(s) — pass a string or a []string/[]any.
+// ppRoleCond admits ppRole by aws:PrincipalArn.
+func ppRoleCond() map[string]any {
+	return map[string]any{"ArnEquals": map[string]any{"aws:PrincipalArn": ppRole}}
+}
+
+// ppPCR0Cond is ppRoleCond plus a RecipientAttestation:PCR0 condition
+// admitting the given value(s) — pass a string or a []string/[]any.
 func ppPCR0Cond(values any) map[string]any {
-	return map[string]any{
-		"StringEqualsIgnoreCase": map[string]any{
-			"kms:RecipientAttestation:PCR0": values,
-		},
+	condition := ppRoleCond()
+	condition["StringEqualsIgnoreCase"] = map[string]any{
+		"kms:RecipientAttestation:PCR0": values,
 	}
+	return condition
 }
 
 func ppOps() map[string]any {
-	return ppAllow([]string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"}, ppRole, nil)
+	return ppAllow(
+		[]string{"kms:Encrypt", "kms:GetKeyPolicy", "kms:DescribeKey"},
+		"*",
+		ppRoleCond(),
+	)
 }
 
 func ppDelete() map[string]any {
 	return ppAllow(
 		[]string{"kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion", "kms:EnableKey"},
-		ppRole,
-		nil,
+		"*",
+		ppRoleCond(),
 	)
 }
 
@@ -301,7 +336,7 @@ func verifyKMSPolicy(raw, callerARN, pcr0 string, locked bool) error {
 func verifyKeyPolicyPosture(t *testing.T, raw, pcr0 string, locked bool) error {
 	t.Helper()
 	policy := mustDecodeKMSPolicy(t, raw)
-	return policy.Verify(policy.attested.Principal.AWS[0], pcr0, locked)
+	return policy.Verify(policy.attested.Condition.ArnEquals.PrincipalARN[0], pcr0, locked)
 }
 
 func requireKeyPolicyPosture(t *testing.T, raw, pcr0 string, locked bool) {
@@ -398,10 +433,6 @@ func TestKMSPolicyStructure(t *testing.T) {
 		{
 			"changed principal",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Principal"] = map[string]any{"AWS": ppRoot} },
-		},
-		{
-			"wildcard principal",
-			func(_ map[string]any, s []any) { s[0].(map[string]any)["Principal"] = map[string]any{"AWS": "*"} },
 		},
 		{"wildcard in all role principals", func(_ map[string]any, s []any) {
 			for _, value := range s {
@@ -505,7 +536,7 @@ func TestKMSPolicyStructure(t *testing.T) {
 						t,
 						ppAllow(
 							[]string{"kms:Decrypt", "kms:GenerateDataKey"},
-							ppRole,
+							"*",
 							ppPCR0Cond(ppPCR0),
 						),
 						ppOps(),
@@ -519,6 +550,34 @@ func TestKMSPolicyStructure(t *testing.T) {
 	}
 }
 
+// Each role statement must name the caller's role ARN exactly.
+func TestKMSPolicyRoleARN(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*KMSPolicy)
+	}{
+		{"attested without role ARN", func(p *KMSPolicy) {
+			p.attested.Condition.ArnEquals.PrincipalARN = nil
+		}},
+		{"other role ARN", func(p *KMSPolicy) {
+			p.deletion.Condition.ArnEquals.PrincipalARN[0] = ppRole + "-other"
+		}},
+		{"wildcard role ARN", func(p *KMSPolicy) {
+			p.operations.Condition.ArnEquals.PrincipalARN[0] = "arn:aws:iam::111122223333:role/*"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy, err := NewKMSPolicy(ppRole, ppPCR0, "")
+			require.NoError(t, err)
+			tc.mutate(policy)
+			raw, err := policy.Encode()
+			require.NoError(t, err)
+			require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, true))
+		})
+	}
+}
+
 func TestKMSPolicyNormalization(t *testing.T) {
 	raw := ppPolicy(
 		t,
@@ -526,12 +585,12 @@ func TestKMSPolicyNormalization(t *testing.T) {
 		ppDelete(),
 		ppAllow(
 			[]string{"KMS:DescribeKey", "kms:GetKeyPolicy", "kms:Encrypt", "kms:Encrypt"},
-			[]string{ppRole},
-			nil,
+			[]string{"*"},
+			ppRoleCond(),
 		),
 		ppAllow(
 			[]string{"kms:GenerateDataKey", "KMS:Decrypt"},
-			ppRole,
+			"*",
 			ppPCR0Cond([]string{strings.ToUpper(ppPCR0), ppPCR0}),
 		),
 	)
@@ -546,6 +605,9 @@ func TestKMSPolicyNormalization(t *testing.T) {
 
 func TestKMSPolicyStrictJSON(t *testing.T) {
 	valid := mustBuildKMSPolicy(t, ppRole, ppPCR0, "")
+	// The operations statement's condition; the attested one continues past it.
+	opsCondition := `"Condition":{"ArnEquals":{"aws:PrincipalArn":["` + ppRole + `"]}}`
+	require.Contains(t, valid, opsCondition)
 	for _, raw := range []string{
 		"", "null", "{", valid + "{}",
 		strings.Replace(valid, `"Effect":"Allow"`, `"Effect":"Deny","Effect":"Allow"`, 1),
@@ -557,12 +619,15 @@ func TestKMSPolicyStrictJSON(t *testing.T) {
 		strings.Replace(valid, `"Action":`, `"action":`, 1),
 		strings.Replace(valid, `"Effect":"Allow"`, `"Effect":null`, 1),
 		strings.Replace(valid, `"Sid":"EnclaveOperations"`, `"Sid":null`, 1),
-		strings.Replace(valid, `"Sid":"EnclaveOperations"`, `"Condition":null`, 1),
-		strings.Replace(valid, `"Sid":"EnclaveOperations"`, `"Condition":{}`, 1),
+		strings.Replace(valid, opsCondition, `"Condition":null`, 1),
+		strings.Replace(valid, opsCondition, `"Condition":{}`, 1),
+		strings.Replace(valid, opsCondition, `"Condition":{"ArnEquals":{}}`, 1),
 		strings.Replace(valid, `"Version":`, `"Action":"kms:Encrypt","Version":`, 1),
 		strings.Replace(valid, `"AWS":`, `"Version":"2012-10-17","AWS":`, 1),
 		strings.Replace(valid, `"kms:Decrypt"`, `"kms:Decrypt",null`, 1),
 		strings.Replace(valid, `"kms:RecipientAttestation:PCR0":`, `"kms:recipientattestation:pcr0":`, 1),
+		strings.Replace(valid, `"aws:PrincipalArn":`, `"aws:principalarn":`, 1),
+		strings.Replace(valid, `"ArnEquals":`, `"ArnLike":`, 1),
 	} {
 		require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false), raw)
 	}

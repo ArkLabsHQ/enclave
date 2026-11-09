@@ -1053,6 +1053,12 @@ operations are authorised by the enclave-created key's own PCR0-conditioned
 policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
+The key policy admits the role by its ARN: each statement allows principal `*`
+only where `aws:PrincipalArn` equals the role's ARN, so a role recreated under
+the same name and path keeps access to its keys. Anyone who can create and
+assume a role with that ARN gets the role's key permissions, but decrypting
+still requires the PCR0 attestation.
+
 `DescribeKey` is read-only and only reports whether ancestor keys were deleted.
 Each key's `EnclaveOperations` statement already grants it to the role that
 created the key, so this grant only matters for unlocked ancestor keys created

@@ -318,8 +318,8 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 		err := verifyResponseSignature(attest.SigningKey, resp.Header,
 			func(timestamp time.Time) []byte {
 				return signing.ResponseMessage(
-					cmp.Or(req.Method, http.MethodGet), signing.RequestTarget(req), nonce, timestamp,
-					reqBody, resp.StatusCode, body,
+					cmp.Or(req.Method, http.MethodGet), signing.RequestTarget(req),
+					nonce, timestamp, reqBody, resp.StatusCode, body,
 				)
 			})
 		if err != nil {

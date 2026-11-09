@@ -974,6 +974,7 @@ func TestSignedProxiedResponse(t *testing.T) {
 	})
 
 	t.Run("signs the response when asked", func(t *testing.T) {
+		before := time.Now().Truncate(time.Millisecond)
 		rr := serve(nonce)
 		require.Equal(t, http.StatusCreated, rr.Code)
 		require.Equal(t, "amount=10", string(received), "the app still gets the body")
@@ -982,7 +983,11 @@ func TestSignedProxiedResponse(t *testing.T) {
 			t, key, rr.Header(),
 			http.MethodPost, "/orders?x=1", nonce, []byte("amount=10"), rr.Code, rr.Body.Bytes(),
 		)
-		require.Contains(t, rr.Header().Values("Access-Control-Expose-Headers"), signatureHeader)
+		ms, err := strconv.ParseInt(rr.Header().Get(timestampHeader), 10, 64)
+		require.NoError(t, err)
+		require.WithinRange(t, time.UnixMilli(ms), before, time.Now())
+		require.Subset(t, rr.Header().Values("Access-Control-Expose-Headers"),
+			[]string{signatureHeader, timestampHeader})
 		require.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
 	})
 
@@ -1218,7 +1223,11 @@ func requireSigned(
 	require.NoError(t, err)
 	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
 	require.NoError(t, err)
-	msg := signing.ResponseMessage(method, target, rawNonce, request, status, response)
+	ms, err := strconv.ParseInt(header.Get(timestampHeader), 10, 64)
+	require.NoError(t, err)
+	msg := signing.ResponseMessage(
+		method, target, rawNonce, time.UnixMilli(ms), request, status, response,
+	)
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }
 

@@ -40,6 +40,7 @@ const (
 
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
+	timestampHeader = "X-Enclave-Timestamp"
 )
 
 var (
@@ -497,8 +498,8 @@ func attestationHandler(nsm NSM, attData *AttestationData) http.HandlerFunc {
 
 // signResponses signs the response to a request carrying signNonceHeader with
 // the attested response-signing key, over the request's method, target, nonce,
-// and body and the response's status and body. Other requests pass through
-// unbuffered.
+// and body, the time it passed the request to the app, and the response's
+// status and body. Other requests pass through unbuffered.
 func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		nonces := r.Header.Values(signNonceHeader)
@@ -535,6 +536,8 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 		// decodes it before we see the body.
 		r.Header.Del("Accept-Encoding")
 
+		// Taken before the app answers, so the response is no older.
+		timestamp := time.Now()
 		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		// A HEAD response carries no body on the wire; sign the empty one sent.
@@ -545,11 +548,15 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 		maps.Copy(w.Header(), rec.header)
 		request, status, response, ok := signedPayload(r, reqBody, rec)
 		if ok {
-			msg := signing.ResponseMessage(r.Method, target, nonce, request, status, response)
+			msg := signing.ResponseMessage(
+				r.Method, target, nonce, timestamp, request, status, response,
+			)
 			signature := base64.StdEncoding.EncodeToString(ed25519.Sign(key, msg))
 			w.Header().Set(signatureHeader, signature)
-			// Lets cross-origin browser code read the signature.
+			w.Header().Set(timestampHeader, strconv.FormatInt(timestamp.UnixMilli(), 10))
+			// Lets cross-origin browser code read the signature and timestamp.
 			w.Header().Add("Access-Control-Expose-Headers", signatureHeader)
+			w.Header().Add("Access-Control-Expose-Headers", timestampHeader)
 			// The signature answers one nonce; a cached copy could only fail verification.
 			w.Header().Set("Cache-Control", "no-store")
 		}

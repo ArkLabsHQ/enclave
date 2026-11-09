@@ -15,6 +15,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,12 +267,25 @@ func parseUserData(attestResult *nitrite.Result) (*attestedUserData, error) {
 const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
+	timestampHeader = "X-Enclave-Timestamp"
 )
 
-// verifyResponseSignature checks the X-Enclave-Signature header over msg.
-func verifyResponseSignature(key ed25519.PublicKey, msg []byte, header http.Header) error {
+// verifyResponseSignature checks the X-Enclave-Signature header over the
+// message for the X-Enclave-Timestamp header, the enclave's time in Unix
+// milliseconds when it passed the request to the app. A missing header is
+// named in the error.
+func verifyResponseSignature(
+	key ed25519.PublicKey, header http.Header, message func(timestamp time.Time) []byte,
+) error {
 	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
-	if err != nil || !ed25519.Verify(key, msg, sig) {
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("missing or invalid %s", signatureHeader)
+	}
+	ms, err := strconv.ParseInt(header.Get(timestampHeader), 10, 64)
+	if err != nil {
+		return fmt.Errorf("missing or invalid %s", timestampHeader)
+	}
+	if !ed25519.Verify(key, message(time.UnixMilli(ms)), sig) {
 		return fmt.Errorf("missing or invalid %s", signatureHeader)
 	}
 	return nil

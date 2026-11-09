@@ -315,11 +315,14 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	}
 
 	if c.opts.SignedResponses {
-		msg := signing.ResponseMessage(
-			cmp.Or(req.Method, http.MethodGet), signing.RequestTarget(req), nonce, reqBody,
-			resp.StatusCode, body,
-		)
-		if err := verifyResponseSignature(attest.SigningKey, msg, resp.Header); err != nil {
+		err := verifyResponseSignature(attest.SigningKey, resp.Header,
+			func(timestamp time.Time) []byte {
+				return signing.ResponseMessage(
+					cmp.Or(req.Method, http.MethodGet), signing.RequestTarget(req), nonce, timestamp,
+					reqBody, resp.StatusCode, body,
+				)
+			})
+		if err != nil {
 			// The key may have changed (a fresh genesis, or the other generation
 			// during a migration): attest again on the next call.
 			c.mu.Lock()

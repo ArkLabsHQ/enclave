@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,9 +44,10 @@ import (
 //	caller ◀─ {signerPubkey, signerEvidence} ─ proxy
 //
 // The proxy chooses the nonce, and the runtime signs the signer's response for
-// it. The caller checks the evidence with client.VerifyProxyEvidence, which
-// also requires the attestation to be no older than the caller's request, then
-// decodes the signed response.
+// it with the runtime's time. The caller checks the evidence with
+// client.VerifyProxyEvidence, which also requires the attestation and the
+// signed response to be no older than the caller's request, then decodes the
+// signed response.
 
 const getPubkeyMethod = "/signer.v1.SignerService/GetPubkey"
 
@@ -65,15 +67,17 @@ type getPubkeyResponse struct {
 }
 
 // getInfoResponse is the part of the proxy's GetInfo response that carries
-// the signer evidence. Bytes are base64 in JSON.
+// the signer evidence. Bytes are base64 in JSON; timestamp is Unix
+// milliseconds.
 type getInfoResponse struct {
 	SignerPubkey   string `json:"signerPubkey"`
 	SignerEvidence struct {
 		Attestation string `json:"attestation"`
 		Payload     struct {
-			Method   string `json:"method"`
-			Nonce    []byte `json:"nonce"`
-			Response []byte `json:"response"`
+			Method    string `json:"method"`
+			Nonce     []byte `json:"nonce"`
+			Timestamp int64  `json:"timestamp"`
+			Response  []byte `json:"response"`
 		} `json:"payload"`
 		Signature []byte `json:"signature"`
 	} `json:"signerEvidence"`
@@ -180,7 +184,7 @@ func (p *proxy) getInfo(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Call GetPubkey with the same nonce, keeping the response bytes as
 	// received: the signature covers them.
-	response, signature, err := p.callGetPubkey(r.Context(), nonceHex)
+	response, timestamp, signature, err := p.callGetPubkey(r.Context(), nonceHex)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -197,6 +201,7 @@ func (p *proxy) getInfo(w http.ResponseWriter, r *http.Request) {
 	info.SignerEvidence.Attestation = attestation
 	info.SignerEvidence.Payload.Method = getPubkeyMethod
 	info.SignerEvidence.Payload.Nonce = nonce
+	info.SignerEvidence.Payload.Timestamp = timestamp
 	info.SignerEvidence.Payload.Response = response
 	info.SignerEvidence.Signature = signature
 	_ = json.NewEncoder(w).Encode(info)
@@ -227,25 +232,29 @@ func (p *proxy) fetchAttestation(ctx context.Context, nonceHex string) (string, 
 }
 
 // callGetPubkey calls the signer's GetPubkey through the runtime with
-// nonceHex. It returns the response bytes and the runtime's signature over
-// them, read from the response headers.
+// nonceHex. It returns the response bytes and, read from the response headers,
+// the runtime's timestamp and its signature over both.
 func (p *proxy) callGetPubkey(
 	ctx context.Context, nonceHex string,
-) (response, signature []byte, err error) {
+) (response []byte, timestamp int64, signature []byte, err error) {
 	var header metadata.MD
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-enclave-sign-nonce", nonceHex)
 	err = p.conn.Invoke(ctx, getPubkeyMethod, []byte{}, &response,
 		grpc.ForceCodec(rawCodec{}), grpc.Header(&header))
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
+	}
+	timestamp, err = strconv.ParseInt(strings.Join(header.Get("x-enclave-timestamp"), ""), 10, 64)
+	if err != nil {
+		return nil, 0, nil, err
 	}
 	signature, err = base64.StdEncoding.DecodeString(
 		strings.Join(header.Get("x-enclave-signature"), ""),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
-	return response, signature, nil
+	return response, timestamp, signature, nil
 }
 
 // Caller: what a client of the proxy does.
@@ -263,9 +272,9 @@ func fetchInfo(t *testing.T, proxyURL string) getInfoResponse {
 }
 
 // verifyInfo checks GetInfo's evidence and returns the signer's response it
-// authenticates. The client checks the attestation, that it is no older than
-// notBefore, and the signature; then the signed response is decoded and must
-// carry the pubkey GetInfo reports.
+// authenticates. The client checks the attestation, the signature, and that
+// neither is older than notBefore; then the signed response is decoded and
+// must carry the pubkey GetInfo reports.
 func verifyInfo(
 	info getInfoResponse, notBefore time.Time, opts client.Options,
 ) (getPubkeyResponse, *client.AttestationResult, error) {
@@ -274,6 +283,7 @@ func verifyInfo(
 		Attestation: evidence.Attestation,
 		Method:      evidence.Payload.Method,
 		Nonce:       evidence.Payload.Nonce,
+		Timestamp:   time.UnixMilli(evidence.Payload.Timestamp),
 		Response:    evidence.Payload.Response,
 		Signature:   evidence.Signature,
 	}, getPubkeyMethod, nil, notBefore, opts) // GetPubkey's request is empty
@@ -313,8 +323,8 @@ func TestProxyGetInfo(t *testing.T) {
 	proxyURL := startProxy(t, enclave)
 	opts := client.Options{ExpectedPCR0: hex.EncodeToString(pcr0), InsecureSkipCOSEVerify: true}
 
-	// The caller notes when it asked: the evidence must be attested no
-	// earlier. The attestation timestamp is in milliseconds.
+	// The caller notes when it asked: the evidence must be attested and signed
+	// no earlier. Both timestamps are in milliseconds.
 	notBefore := time.Now().Truncate(time.Millisecond)
 	info := fetchInfo(t, proxyURL)
 
@@ -324,6 +334,8 @@ func TestProxyGetInfo(t *testing.T) {
 		require.Equal(t, pubkey, response)
 		require.Equal(t, pubkey.Pubkey, info.SignerPubkey)
 		require.False(t, attested.Timestamp.Before(notBefore), "attested after the caller asked")
+		require.False(t, time.UnixMilli(info.SignerEvidence.Payload.Timestamp).Before(notBefore),
+			"signed after the caller asked")
 	})
 
 	t.Run("caller sees the pending migration", func(t *testing.T) {
@@ -370,6 +382,13 @@ func TestProxyGetInfo(t *testing.T) {
 		require.ErrorContains(t, err, "evidence is for method")
 	})
 
+	t.Run("caller rejects evidence whose timestamp was changed", func(t *testing.T) {
+		_, _, err := verifyInfo(tampered(func(i *getInfoResponse) {
+			i.SignerEvidence.Payload.Timestamp++
+		}), notBefore, opts)
+		require.ErrorContains(t, err, "invalid enclave signature")
+	})
+
 	t.Run("caller rejects evidence whose nonce was changed", func(t *testing.T) {
 		_, _, err := verifyInfo(tampered(func(i *getInfoResponse) {
 			i.SignerEvidence.Payload.Nonce = bytes.Repeat([]byte{1}, 20)
@@ -390,6 +409,21 @@ func TestProxyGetInfo(t *testing.T) {
 			i.SignerEvidence.Signature = make([]byte, ed25519.SignatureSize)
 		}), notBefore, opts)
 		require.ErrorContains(t, err, "invalid enclave signature")
+	})
+
+	// A proxy that reuses the nonce can get a fresh attestation for an old
+	// response; the response's own timestamp gives it away.
+	t.Run("caller rejects a response signed before it asked", func(t *testing.T) {
+		later := time.UnixMilli(info.SignerEvidence.Payload.Timestamp + 1)
+		time.Sleep(time.Until(later))
+		attestation, err := (&proxy{enclave: enclave}).fetchAttestation(
+			context.Background(), hex.EncodeToString(info.SignerEvidence.Payload.Nonce),
+		)
+		require.NoError(t, err)
+		_, _, err = verifyInfo(tampered(func(i *getInfoResponse) {
+			i.SignerEvidence.Attestation = attestation
+		}), later, opts)
+		require.ErrorContains(t, err, "response from")
 	})
 }
 

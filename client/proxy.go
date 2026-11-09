@@ -14,7 +14,7 @@ import (
 // ProxyEvidence is a signed gRPC response relayed by a service that called
 // the enclave for its caller, such as arkd's GetInfo: the attestation fetched
 // with a nonce the service chose, and the call the runtime signed with that
-// nonce.
+// nonce and its time.
 type ProxyEvidence struct {
 	// Attestation is the base64 document from /enclave/attestation.
 	Attestation string
@@ -23,6 +23,9 @@ type ProxyEvidence struct {
 	Method string
 	// Nonce is the nonce the service chose for the attestation and the call.
 	Nonce []byte
+	// Timestamp is the runtime's X-Enclave-Timestamp: when it passed the call
+	// to the app.
+	Timestamp time.Time
 	// Response is the response message, without gRPC framing.
 	Response []byte
 	// Signature is the runtime's X-Enclave-Signature, decoded.
@@ -33,15 +36,13 @@ type ProxyEvidence struct {
 // request, the request message the caller expects without gRPC framing (empty
 // for GetPubkey), so the relaying service need not be trusted. The attestation
 // must come from the enclave opts expects (ExpectedPCR0, ExpectedPCRs,
-// InsecureSkipCOSEVerify), answer the evidence's nonce, and be timestamped no
-// earlier than notBefore, typically when the caller asked. The attested
-// signing key must have signed Response for method, request, and that nonce as
-// a call that succeeded, grpc-status 0. Only Response is authenticated: decode
-// it once this returns. The result is what the enclave attests, including any
-// pending migration.
-//
-// The timestamp dates the attestation, not the response: a service that
-// reuses a nonce can pair a fresh attestation with a response signed earlier.
+// InsecureSkipCOSEVerify) and answer the evidence's nonce. The attested
+// signing key must have signed Response for method, request, that nonce, and
+// Timestamp as a call that succeeded, grpc-status 0. The attestation and the
+// call must both be timestamped no earlier than notBefore, typically when the
+// caller asked, so neither is replayed from before. Only Response is
+// authenticated: decode it once this returns. The result is what the enclave
+// attests, including any pending migration.
 func VerifyProxyEvidence(
 	evidence ProxyEvidence, method string, request []byte, notBefore time.Time, opts Options,
 ) (*AttestationResult, error) {
@@ -73,13 +74,16 @@ func VerifyProxyEvidence(
 
 	// A gRPC call is a POST to the method's path; grpc-status 0 is OK.
 	msg := signing.ResponseMessage(
-		http.MethodPost, method, evidence.Nonce, request, 0, evidence.Response,
+		http.MethodPost, method, evidence.Nonce, evidence.Timestamp, request, 0, evidence.Response,
 	)
 	if !ed25519.Verify(userData.signingKey, msg, evidence.Signature) {
 		return nil, fmt.Errorf("invalid enclave signature")
 	}
 	if evidence.Method != method {
 		return nil, fmt.Errorf("evidence is for method %q, not %q", evidence.Method, method)
+	}
+	if evidence.Timestamp.Before(notBefore) {
+		return nil, fmt.Errorf("response from %s, before %s", evidence.Timestamp, notBefore)
 	}
 
 	return &AttestationResult{

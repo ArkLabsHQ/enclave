@@ -55,7 +55,7 @@
                 };
                 modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-ZwN/7ddQhqbACEL5sdIFkn9tzkkTdKIf9BCe6vuDqik=";
+                vendorHash = "sha256-zDTTNaci5cMKrfUHtbxhGbKrw76WYtagUB/KVkOsHms=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -82,7 +82,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-u/wUE93hfcUDW0w/RvqEk/KxFhedNIkFDcQFXdhFlEk=";
+                  vendorHash = "sha256-ZrRnAJMhtkx+rtJdW1yNK3yS38ndbRMFCUScXZDFR1M=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"

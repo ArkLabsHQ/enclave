@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const signedResponse = "enclave-signed-response"
@@ -17,17 +18,19 @@ const signedResponse = "enclave-signed-response"
 const NonceSize = 20
 
 // ResponseMessage builds the message to sign or verify, binding the request's
-// method, target, nonce, and body to the response's status and body: for HTTP
-// the request body, the status code, and the decoded response body; for gRPC
-// the request and response messages without gRPC framing and the grpc-status.
-// Browser verifiers implement this wire format from the README, so keep it in
-// step with the README.
+// method, target, nonce, and body and the enclave's time when it passed the
+// request to the app, in Unix milliseconds, to the response's status and body:
+// for HTTP the request body, the status code, and the decoded response body;
+// for gRPC the request and response messages without gRPC framing and the
+// grpc-status. Browser verifiers implement this wire format from the README,
+// so keep it in step with the README.
 func ResponseMessage(
-	method, target string, nonce, request []byte, status int, response []byte,
+	method, target string, nonce []byte, timestamp time.Time,
+	request []byte, status int, response []byte,
 ) []byte {
-	return fmt.Appendf(nil, "%s\n%s %s\n%x\n%x\n%d\n%x",
-		signedResponse, method, target, nonce, sha256.Sum256(request),
-		status, sha256.Sum256(response))
+	return fmt.Appendf(nil, "%s\n%s %s\n%x\n%d\n%x\n%d\n%x",
+		signedResponse, method, target, nonce, timestamp.UnixMilli(),
+		sha256.Sum256(request), status, sha256.Sum256(response))
 }
 
 // RequestTarget is the path and query as sent; for gRPC, the :path naming the

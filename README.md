@@ -804,14 +804,16 @@ application endpoint.
 A proxy in front of the enclave defeats TLS pinning, so a client can instead ask
 for each application response to be signed. A request carrying
 `X-Enclave-Sign-Nonce: <nonce>` (exactly 40 hex digits: a fresh random 20 bytes
-per request) gets back `X-Enclave-Signature`, a base64 Ed25519 signature by the
-key in the attestation `user_data` over these lines joined by `\n`, with no
-trailing newline:
+per request) gets back `X-Enclave-Timestamp`, the enclave's time in Unix
+milliseconds when the runtime passed the request to the application, and
+`X-Enclave-Signature`, a base64 Ed25519 signature by the key in the attestation
+`user_data` over these lines joined by `\n`, with no trailing newline:
 
 ```
 enclave-signed-response
 <METHOD> <path as received, then ?query only if the query is non-empty>
 <lowercase hex of the 20-byte nonce>
+<X-Enclave-Timestamp, in decimal>
 <hex SHA-256 of the request>
 <status, in decimal>
 <hex SHA-256 of the response>
@@ -820,13 +822,17 @@ enclave-signed-response
 Any other nonce value, or a repeated header, is answered `400` before the
 application sees the request. The nonce has the attestation nonce's shape, so a
 service relaying for an end client can bind the attestation document and the
-signature to the client's one nonce.
+signature to the client's one nonce. When the service chooses the nonce
+instead, the client checks freshness by time: the response was produced no
+earlier than its timestamp, so a client rejects one older than its own request,
+even if the service pairs it with a fresh attestation.
 
 For HTTP the request and the response are the bodies, and the status is the
 response's status code. For gRPC they are the request's and the response's one
 uncompressed message without its 5-byte gRPC prefix, the request's empty for
 `GetPubkey`, and the status is the `grpc-status` trailer, `0` for success; the
-signature arrives as `x-enclave-signature` header metadata, and the method line
+timestamp and signature arrive as `x-enclave-timestamp` and
+`x-enclave-signature` header metadata, and the method line
 reads, for example, `POST /signer.v1.SignerService/GetPubkey`. A gRPC exchange
 without exactly one uncompressed message each way and a `grpc-status` trailer
 is forwarded unsigned, so verification rejects it.
@@ -866,9 +872,9 @@ The response body is signed decoded: for a signed request the runtime drops
 decodes it, and clients verify the body after their own decompression (the Go
 client also lets its transport handle compression). An application that sends a
 compressed body regardless of `Accept-Encoding`, such as pre-compressed `br`
-assets, fails verification. Signed responses carry
-`Access-Control-Expose-Headers: X-Enclave-Signature`; a cross-origin page also
-needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
+assets, fails verification. Signed responses expose `X-Enclave-Signature` and
+`X-Enclave-Timestamp` through `Access-Control-Expose-Headers`; a cross-origin
+page also needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
 
 ##### Verifying in a browser
 
@@ -893,7 +899,8 @@ async function signedFetch(url, init = {}, signingKey) {
   const resp = await fetch(req);
   const body = new Uint8Array(await resp.arrayBuffer());
   const msg = `enclave-signed-response\n${req.method} ${u.pathname}${u.search}\n` +
-    `${nonce}\n${await sha256(reqBody)}\n${resp.status}\n${await sha256(body)}`;
+    `${nonce}\n${resp.headers.get("X-Enclave-Timestamp")}\n` +
+    `${await sha256(reqBody)}\n${resp.status}\n${await sha256(body)}`;
 
   const key = await crypto.subtle.importKey("raw", signingKey, { name: "Ed25519" }, false, ["verify"]);
   const sig = Uint8Array.from(atob(resp.headers.get("X-Enclave-Signature") ?? ""), (c) => c.charCodeAt(0));

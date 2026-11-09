@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -18,11 +19,13 @@ func TestSignedRequestWireFormat(t *testing.T) {
 	response := []byte{0x0a, 0x02, 'p', 'k'}
 	respHash := sha256.Sum256(response)
 	msg := ResponseMessage(
-		http.MethodPost, "/signer.v1.SignerService/GetPubkey", nonce, nil, 0, response,
+		http.MethodPost, "/signer.v1.SignerService/GetPubkey", nonce,
+		time.UnixMilli(1793491200123), nil, 0, response,
 	)
 	require.Equal(t,
 		"enclave-signed-response\nPOST /signer.v1.SignerService/GetPubkey\n"+
 			"00112233445566778899aabbccddeeff00112233\n"+
+			"1793491200123\n"+
 			// SHA-256 of the empty request.
 			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"+
 			"0\n"+hex.EncodeToString(respHash[:]),

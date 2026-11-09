@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ type fakeEnclave struct {
 	signingKey  ed25519.PrivateKey // attested and used to sign when asked; nil attests none
 	tamper      bool               // alter the body after signing it
 	relabel     int                // if set, the status sent instead of the one signed
+	retime      bool               // send a timestamp other than the one signed
+	omit        string             // a header to leave out of a signed response
 	appPaths    []string
 }
 
@@ -110,11 +113,17 @@ func (f *fakeEnclave) handler() http.Handler {
 				return
 			}
 			reqBody, _ := io.ReadAll(r.Body)
+			timestamp := time.Now()
 			msg := signing.ResponseMessage(
-				r.Method, signing.RequestTarget(r), rawNonce, reqBody, status, body,
+				r.Method, signing.RequestTarget(r), rawNonce, timestamp, reqBody, status, body,
 			)
 			w.Header().Set(signatureHeader,
 				base64.StdEncoding.EncodeToString(ed25519.Sign(f.signingKey, msg)))
+			if f.retime {
+				timestamp = timestamp.Add(-time.Hour)
+			}
+			w.Header().Set(timestampHeader, strconv.FormatInt(timestamp.UnixMilli(), 10))
+			w.Header().Del(f.omit)
 			if f.tamper {
 				body = []byte(`{"version":"forged","previous_pcr0":"genesis"}`)
 			}
@@ -477,6 +486,18 @@ func TestClientSignedResponses(t *testing.T) {
 	t.Run("tampered body fails", func(t *testing.T) {
 		_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, tamper: true})
 		require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
+	})
+
+	t.Run("a changed timestamp fails", func(t *testing.T) {
+		_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, retime: true})
+		require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
+	})
+
+	t.Run("a missing header is named", func(t *testing.T) {
+		for _, header := range []string{signatureHeader, timestampHeader} {
+			_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, omit: header})
+			require.ErrorContains(t, err, "missing or invalid "+header)
+		}
 	})
 
 	// A proxy that changes what the enclave answers cannot pass the answer off

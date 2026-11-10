@@ -785,12 +785,6 @@ func TestWarnUnrecognizedEnclaveEnv(t *testing.T) {
 		"ENCLAVE_SOMETHING_COMPLETELY_UNKNOWN",
 		"ENCLAVE_TRACING",
 	}, unrecognized)
-
-	// Check suggestions
-	require.Equal(t, "ENCLAVE_TRACES", suggestEnclaveEnv("ENCLAVE_TRACING"))
-	require.Equal(t, "ENCLAVE_APP_PORT", suggestEnclaveEnv("ENCLAVE_APP_PORTS"))
-	require.Equal(t, "ENCLAVE_METRICS", suggestEnclaveEnv("ENCLAVE_METRIC"))
-	require.Equal(t, "", suggestEnclaveEnv("ENCLAVE_SOMETHING_COMPLETELY_UNKNOWN"))
 }
 
 func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
@@ -812,7 +806,6 @@ func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
 		"unrecognized ENCLAVE_* environment variable",
 	)
 	require.Contains(t, buf.String(), "ENCLAVE_TRACING")
-	require.Contains(t, buf.String(), "ENCLAVE_TRACES")
 }
 
 func TestKnownVarsCoversLoadConfig(t *testing.T) {

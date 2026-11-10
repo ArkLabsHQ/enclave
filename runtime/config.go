@@ -613,62 +613,16 @@ var knownEnclaveEnvVars = []string{
 	envAWSRegion,
 }
 
-func levenshtein(a, b string) int {
-	la, lb := len(a), len(b)
-	d := make([]int, lb+1)
-	for j := range d {
-		d[j] = j
-	}
-	for i := 1; i <= la; i++ {
-		prev := d[0]
-		d[0] = i
-		for j := 1; j <= lb; j++ {
-			temp := d[j]
-			cost := 0
-			if a[i-1] != b[j-1] {
-				cost = 1
-			}
-			d[j] = min(d[j]+1, min(d[j-1]+1, prev+cost))
-			prev = temp
-		}
-	}
-	return d[lb]
-}
-
-func suggestEnclaveEnv(name string) string {
-	best := ""
-	minDist := 4
-	for _, known := range knownEnclaveEnvVars {
-		if name == known {
-			continue
-		}
-		dist := levenshtein(name, known)
-		if dist < minDist {
-			minDist = dist
-			best = known
-		}
-	}
-	return best
-}
-
 func warnUnrecognizedEnclaveEnv(environ []string) []string {
 	var unrecognized []string
 	for _, env := range environ {
 		key, _, _ := strings.Cut(env, "=")
 		if strings.HasPrefix(key, "ENCLAVE_") {
 			unrecognized = append(unrecognized, key)
-			if suggestion := suggestEnclaveEnv(key); suggestion != "" {
-				slog.Warn(
-					"unrecognized ENCLAVE_* environment variable",
-					"key", key,
-					"suggestion", suggestion,
-				)
-			} else {
-				slog.Warn(
-					"unrecognized ENCLAVE_* environment variable",
-					"key", key,
-				)
-			}
+			slog.Warn(
+				"unrecognized ENCLAVE_* environment variable",
+				"key", key,
+			)
 		}
 	}
 	sort.Strings(unrecognized)

@@ -40,6 +40,9 @@ const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
 
+	maxSignedRequestBytes  = 1 << 20 // 1 MiB
+	maxSignedResponseBytes = 4 << 20 // 4 MiB
+
 	maxLoggedNonce = 128
 )
 

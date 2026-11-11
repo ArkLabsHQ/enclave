@@ -218,13 +218,18 @@ func TestKMSPolicyVerifyPosture(t *testing.T) {
 	locked := mustBuildKMSPolicy(t, testRoleARN, pcr0, "")
 	unlocked := mustBuildKMSPolicy(t, testRoleARN, pcr0, testRecoveryRootARN)
 
-	requireKeyPolicyPosture(t, locked, pcr0, true)
-	requireKeyPolicyPosture(t, locked, strings.ToUpper(pcr0), true)
-	requireKeyPolicyPosture(t, unlocked, pcr0, false)
-	requireKeyPolicyPosture(t, locked, pcr0, false)
-	require.Error(t, verifyKeyPolicyPosture(t, unlocked, pcr0, true))
-	require.Error(t, verifyKeyPolicyPosture(t, locked, otherPCR0, false))
-	require.Error(t, verifyKeyPolicyPosture(t, locked, "", false))
+	requireKeyPolicyPosture(t, locked, testRoleARN, pcr0, true)
+	requireKeyPolicyPosture(t, locked, testRoleARN, strings.ToUpper(pcr0), true)
+	requireKeyPolicyPosture(t, unlocked, testRoleARN, pcr0, false)
+	requireKeyPolicyPosture(t, locked, testRoleARN, pcr0, false)
+	require.Error(t, verifyKeyPolicyPosture(t, unlocked, testRoleARN, pcr0, true))
+	require.Error(t, verifyKeyPolicyPosture(t, locked, testRoleARN, otherPCR0, false))
+	require.Error(t, verifyKeyPolicyPosture(t, locked, testRoleARN, "", false))
+	require.ErrorContains(
+		t,
+		verifyKeyPolicyPosture(t, locked, ppRole, pcr0, true),
+		"caller identity",
+	)
 }
 
 func TestKMSPolicyRoundTrip(t *testing.T) {
@@ -332,16 +337,16 @@ func verifyKMSPolicy(raw, callerARN, pcr0 string, locked bool) error {
 	return err
 }
 
-// verifyKeyPolicyPosture checks PCR0 and lock state using the policy's role.
-func verifyKeyPolicyPosture(t *testing.T, raw, pcr0 string, locked bool) error {
+// verifyKeyPolicyPosture checks the expected caller, PCR0, and lock state.
+func verifyKeyPolicyPosture(t *testing.T, raw, callerARN, pcr0 string, locked bool) error {
 	t.Helper()
 	policy := mustDecodeKMSPolicy(t, raw)
-	return policy.Verify(policy.attested.Condition.ArnEquals.PrincipalARN[0], pcr0, locked)
+	return policy.Verify(callerARN, pcr0, locked)
 }
 
-func requireKeyPolicyPosture(t *testing.T, raw, pcr0 string, locked bool) {
+func requireKeyPolicyPosture(t *testing.T, raw, callerARN, pcr0 string, locked bool) {
 	t.Helper()
-	require.NoError(t, verifyKeyPolicyPosture(t, raw, pcr0, locked))
+	require.NoError(t, verifyKeyPolicyPosture(t, raw, callerARN, pcr0, locked))
 }
 
 // Policy mutations must not alter permission templates.
@@ -416,23 +421,32 @@ func TestKMSPolicyUnsupportedStoredVersion(t *testing.T) {
 
 func TestKMSPolicyStructure(t *testing.T) {
 	cases := []struct {
-		name   string
-		mutate func(map[string]any, []any)
+		name    string
+		mutate  func(map[string]any, []any)
+		wantErr string
 	}{
 		{"extra data key grant", func(d map[string]any, s []any) {
 			d["Statement"] = append(s, ppAllow("kms:GenerateDataKey", ppRole, nil))
-		}},
+		}, "unexpected statement with actions [kms:generatedatakey]"},
 		{"extra deny", func(d map[string]any, s []any) {
-			d["Statement"] = append(s, ppStmt("Deny", "kms:Decrypt", ppRole, nil))
-		}},
-		{"missing statement", func(d map[string]any, s []any) { d["Statement"] = s[:2] }},
+			denied := ppOps()
+			denied["Effect"] = "Deny"
+			d["Statement"] = append(s, denied)
+		}, "operations statement: effect does not match"},
+		{
+			"missing statement",
+			func(d map[string]any, s []any) { d["Statement"] = s[:2] },
+			"missing key deletion statement",
+		},
 		{
 			"duplicate statement",
 			func(d map[string]any, s []any) { d["Statement"] = append(s, s[0]) },
+			"duplicate statement with actions",
 		},
 		{
 			"changed principal",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Principal"] = map[string]any{"AWS": ppRoot} },
+			"principal does not match caller identity",
 		},
 		{"wildcard in all role principals", func(_ map[string]any, s []any) {
 			for _, value := range s {
@@ -440,75 +454,106 @@ func TestKMSPolicyStructure(t *testing.T) {
 					"AWS": "arn:aws:iam::111122223333:role/*",
 				}
 			}
-		}},
+		}, "wildcard principal is unsupported"},
 		{"STS principal in all role statements", func(_ map[string]any, s []any) {
 			for _, value := range s {
 				value.(map[string]any)["Principal"] = map[string]any{
 					"AWS": "arn:aws:sts::111122223333:assumed-role/enclave/session",
 				}
 			}
-		}},
+		}, "principal does not match caller identity"},
 		{"second conditional statement", func(_ map[string]any, s []any) {
 			s[1].(map[string]any)["Condition"] = ppPCR0Cond(ppPCR0)
-		}},
+		}, "operations statement: PCR0 does not match"},
 		{"extra principal", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Principal"] = map[string]any{"AWS": []string{ppRole, ppRoot}}
-		}},
+		}, "expected one principal per statement"},
+		{"empty principal", func(_ map[string]any, s []any) {
+			s[0].(map[string]any)["Principal"] = map[string]any{"AWS": []string{}}
+		}, "principal: empty or missing string set"},
 		{
 			"missing condition",
 			func(_ map[string]any, s []any) { delete(s[0].(map[string]any), "Condition") },
+			"attested statement: missing condition",
 		},
+		{"missing PCR0", func(_ map[string]any, s []any) {
+			delete(s[0].(map[string]any)["Condition"].(map[string]any), "StringEqualsIgnoreCase")
+		}, "attested statement: PCR0 does not match"},
+		{"empty role ARN", func(_ map[string]any, s []any) {
+			condition := s[0].(map[string]any)["Condition"].(map[string]any)
+			condition["ArnEquals"] = map[string]any{"aws:PrincipalArn": []string{}}
+		}, "principal ARN: empty or missing string set"},
 		{"extra condition", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Condition"].(map[string]any)["Bool"] = map[string]any{
 				"aws:SecureTransport": "true",
 			}
-		}},
+		}, `unsupported policy field "Bool"`},
 		{"changed operator", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Condition"] = map[string]any{
 				"StringEquals": map[string]any{"kms:RecipientAttestation:PCR0": ppPCR0},
 			}
-		}},
+		}, `unsupported policy field "StringEquals"`},
 		{
 			"extra resource",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = []string{"*", "other"} },
+			"expected one resource per statement",
 		},
+		{"empty resource", func(_ map[string]any, s []any) {
+			s[1].(map[string]any)["Resource"] = []string{}
+		}, "resource: empty or missing string set"},
 		{
 			"changed resource",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Resource"] = "other" },
+			"resource does not match",
 		},
 		{
 			"missing data key action",
 			func(_ map[string]any, s []any) { s[0].(map[string]any)["Action"] = "kms:Decrypt" },
+			"unexpected statement with actions [kms:decrypt]",
 		},
 		{
 			"NotAction",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = "kms:Decrypt" },
+			`unsupported policy field "NotAction"`,
 		},
 		{
 			"null NotAction",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotAction"] = nil },
+			`unsupported policy field "NotAction"`,
 		},
 		{
 			"NotPrincipal",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["NotPrincipal"] = map[string]any{"AWS": ppRoot} },
+			`unsupported policy field "NotPrincipal"`,
 		},
-		{"unknown field", func(d map[string]any, _ []any) { d["Unknown"] = true }},
-		{"wrong version", func(d map[string]any, _ []any) { d["Version"] = "2008-10-17" }},
+		{
+			"unknown field",
+			func(d map[string]any, _ []any) { d["Unknown"] = true },
+			`unsupported policy field "Unknown"`,
+		},
+		{
+			"wrong version",
+			func(d map[string]any, _ []any) { d["Version"] = "2008-10-17" },
+			`unsupported policy version "2008-10-17"`,
+		},
 		{
 			"empty action",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{} },
+			"action: empty or missing string set",
 		},
 		{
 			"null action entry",
 			func(_ map[string]any, s []any) { s[1].(map[string]any)["Action"] = []any{nil} },
+			"null policy values are unsupported",
 		},
 		{
 			"empty PCR0",
 			func(_ map[string]any, s []any) { s[0].(map[string]any)["Condition"] = ppPCR0Cond("") },
+			"PCR0: empty string value",
 		},
 		{"two PCR0s", func(_ map[string]any, s []any) {
 			s[0].(map[string]any)["Condition"] = ppPCR0Cond([]string{ppPCR0, ppOther})
-		}},
+		}, "expected exactly one PCR0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,10 +565,18 @@ func TestKMSPolicyStructure(t *testing.T) {
 			tc.mutate(doc, doc["Statement"].([]any))
 			raw, err := json.Marshal(doc)
 			require.NoError(t, err)
-			require.Error(t, verifyKMSPolicy(string(raw), ppRole, ppPCR0, false))
+			require.ErrorContains(
+				t,
+				verifyKMSPolicy(string(raw), ppRole, ppPCR0, false),
+				tc.wantErr,
+			)
 		})
 	}
 	for _, action := range []string{"kms:Dec*", "kms:Put*", "kms:Decryp?", "KMS:*", "*", "kms:CreateGrant"} {
+		wantErr := "wildcard action"
+		if action == "kms:CreateGrant" {
+			wantErr = "unexpected statement with actions [kms:creategrant]"
+		}
 		for _, array := range []bool{false, true} {
 			t.Run(
 				action+map[bool]string{false: "/string", true: "/array"}[array],
@@ -543,7 +596,7 @@ func TestKMSPolicyStructure(t *testing.T) {
 						ppDelete(),
 						ppAllow(value, ppRoot, nil),
 					)
-					require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false))
+					require.ErrorContains(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false), wantErr)
 				},
 			)
 		}
@@ -565,6 +618,12 @@ func TestKMSPolicyRoleARN(t *testing.T) {
 		{"wildcard role ARN", func(p *KMSPolicy) {
 			p.operations.Condition.ArnEquals.PrincipalARN[0] = "arn:aws:iam::111122223333:role/*"
 		}},
+		{"additional role ARN", func(p *KMSPolicy) {
+			p.attested.Condition.ArnEquals.PrincipalARN = policyStrings{ppRole, ppRole + "-other"}
+		}},
+		{"role ARN case mismatch", func(p *KMSPolicy) {
+			p.attested.Condition.ArnEquals.PrincipalARN[0] = "arn:aws:iam::111122223333:role/Enclave"
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -573,7 +632,11 @@ func TestKMSPolicyRoleARN(t *testing.T) {
 			tc.mutate(policy)
 			raw, err := policy.Encode()
 			require.NoError(t, err)
-			require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, true))
+			require.ErrorContains(
+				t,
+				verifyKMSPolicy(raw, ppRole, ppPCR0, true),
+				"principal ARN does not match caller identity",
+			)
 		})
 	}
 }
@@ -608,28 +671,76 @@ func TestKMSPolicyStrictJSON(t *testing.T) {
 	// The operations statement's condition; the attested one continues past it.
 	opsCondition := `"Condition":{"ArnEquals":{"aws:PrincipalArn":["` + ppRole + `"]}}`
 	require.Contains(t, valid, opsCondition)
-	for _, raw := range []string{
-		"", "null", "{", valid + "{}",
-		strings.Replace(valid, `"Effect":"Allow"`, `"Effect":"Deny","Effect":"Allow"`, 1),
-		strings.Replace(valid, `"Version":"2012-10-17"`, `"Version":"2012-10-17","Version":"2012-10-17"`, 1),
-		strings.Replace(valid, `"Statement":`, `"Statement":[],"Statement":`, 1),
-		strings.Replace(valid, `"Version":"2012-10-17"`, `"Version":null`, 1),
-		`{"Version":"2012-10-17","Statement":null}`,
-		`{"Version":"2012-10-17","Statement":[null]}`,
-		strings.Replace(valid, `"Action":`, `"action":`, 1),
-		strings.Replace(valid, `"Effect":"Allow"`, `"Effect":null`, 1),
-		strings.Replace(valid, `"Sid":"EnclaveOperations"`, `"Sid":null`, 1),
-		strings.Replace(valid, opsCondition, `"Condition":null`, 1),
-		strings.Replace(valid, opsCondition, `"Condition":{}`, 1),
-		strings.Replace(valid, opsCondition, `"Condition":{"ArnEquals":{}}`, 1),
-		strings.Replace(valid, `"Version":`, `"Action":"kms:Encrypt","Version":`, 1),
-		strings.Replace(valid, `"AWS":`, `"Version":"2012-10-17","AWS":`, 1),
-		strings.Replace(valid, `"kms:Decrypt"`, `"kms:Decrypt",null`, 1),
-		strings.Replace(valid, `"kms:RecipientAttestation:PCR0":`, `"kms:recipientattestation:pcr0":`, 1),
-		strings.Replace(valid, `"aws:PrincipalArn":`, `"aws:principalarn":`, 1),
-		strings.Replace(valid, `"ArnEquals":`, `"ArnLike":`, 1),
+	for _, tc := range []struct {
+		raw     string
+		wantErr string
+	}{
+		{"", "EOF"},
+		{"null", "expected policy object"},
+		{"{", "EOF"},
+		{valid + "{}", "unexpected trailing JSON"},
+		{
+			strings.Replace(valid, `"Effect":"Allow"`, `"Effect":"Deny","Effect":"Allow"`, 1),
+			`duplicate JSON key "Effect"`,
+		},
+		{
+			strings.Replace(valid, `"Version":"2012-10-17"`, `"Version":"2012-10-17","Version":"2012-10-17"`, 1),
+			`duplicate JSON key "Version"`,
+		},
+		{
+			strings.Replace(valid, `"Statement":`, `"Statement":[],"Statement":`, 1),
+			`duplicate JSON key "Statement"`,
+		},
+		{
+			strings.Replace(valid, `"Version":"2012-10-17"`, `"Version":null`, 1),
+			"null policy values are unsupported",
+		},
+		{`{"Version":"2012-10-17","Statement":null}`, "null policy values are unsupported"},
+		{`{"Version":"2012-10-17","Statement":[null]}`, "null policy values are unsupported"},
+		{
+			strings.Replace(valid, `"Action":`, `"action":`, 1),
+			`unsupported policy field "action"`,
+		},
+		{
+			strings.Replace(valid, `"Effect":"Allow"`, `"Effect":null`, 1),
+			"null policy values are unsupported",
+		},
+		{
+			strings.Replace(valid, `"Sid":"EnclaveOperations"`, `"Sid":null`, 1),
+			"null policy values are unsupported",
+		},
+		{
+			strings.Replace(valid, opsCondition, `"Condition":null`, 1),
+			"null policy values are unsupported",
+		},
+		{strings.Replace(valid, opsCondition, `"Condition":{}`, 1), "empty condition"},
+		{strings.Replace(valid, opsCondition, `"Condition":{"ArnEquals":{}}`, 1), "empty condition"},
+		{
+			strings.Replace(valid, `"Version":`, `"Action":"kms:Encrypt","Version":`, 1),
+			`unsupported policy field "Action"`,
+		},
+		{
+			strings.Replace(valid, `"AWS":`, `"Version":"2012-10-17","AWS":`, 1),
+			`json: unknown field "Version"`,
+		},
+		{
+			strings.Replace(valid, `"kms:Decrypt"`, `"kms:Decrypt",null`, 1),
+			"null policy values are unsupported",
+		},
+		{
+			strings.Replace(valid, `"kms:RecipientAttestation:PCR0":`, `"kms:recipientattestation:pcr0":`, 1),
+			`unsupported policy field "kms:recipientattestation:pcr0"`,
+		},
+		{
+			strings.Replace(valid, `"aws:PrincipalArn":`, `"aws:principalarn":`, 1),
+			`unsupported policy field "aws:principalarn"`,
+		},
+		{
+			strings.Replace(valid, `"ArnEquals":`, `"ArnLike":`, 1),
+			`unsupported policy field "ArnLike"`,
+		},
 	} {
-		require.Error(t, verifyKMSPolicy(raw, ppRole, ppPCR0, false), raw)
+		require.ErrorContains(t, verifyKMSPolicy(tc.raw, ppRole, ppPCR0, false), tc.wantErr, tc.raw)
 	}
 }
 
@@ -666,7 +777,7 @@ func TestKMSPolicyRepresentation(t *testing.T) {
 	statements[0].(map[string]any)["Condition"] = ppPCR0Cond(ppPCR0)
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	require.NoError(t, err)
-	requireKeyPolicyPosture(t, string(raw), ppPCR0, true)
+	requireKeyPolicyPosture(t, string(raw), ppRole, ppPCR0, true)
 }
 
 func TestKMSPolicyRejectsNonASCIIActions(t *testing.T) {

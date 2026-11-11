@@ -1078,6 +1078,27 @@ func TestSignedRequestSizeLimit(t *testing.T) {
 }
 
 func TestSignedResponseSizeLimit(t *testing.T) {
+	t.Run("exact limits are accepted", func(t *testing.T) {
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.Len(t, body, maxSignedRequestBytes)
+			n, err := w.Write(make([]byte, maxSignedResponseBytes))
+			require.NoError(t, err)
+			require.Equal(t, maxSignedResponseBytes, n)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/orders",
+			bytes.NewReader(make([]byte, maxSignedRequestBytes)))
+		req.Header.Set(signNonceHeader, "n")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, maxSignedResponseBytes, rr.Body.Len())
+		require.NotEmpty(t, rr.Header().Get(signatureHeader))
+	})
+
 	t.Run("ignored write errors remain fatal", func(t *testing.T) {
 		attData := &AttestationData{}
 		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
@@ -1122,10 +1143,11 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		require.NoError(t, err)
 		req.Header.Set(signNonceHeader, "n")
 		res, err := client.Do(req)
-		require.NoError(t, err, "overflow must return an error response despite ReverseProxy's abort")
-		defer func() { _ = res.Body.Close() }()
-		require.Equal(t, http.StatusBadGateway, res.StatusCode)
-		require.Empty(t, res.Header.Get(signatureHeader))
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		require.ErrorIs(t, err, io.EOF, "ReverseProxy aborts before a signed response is sent")
+		require.Nil(t, res)
 	})
 }
 

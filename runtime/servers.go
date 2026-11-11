@@ -508,8 +508,13 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 			http.Error(w, "no response signing key", http.StatusServiceUnavailable)
 			return
 		}
-		reqBody, err := io.ReadAll(r.Body)
+		reqBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedRequestBytes))
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "read request body", http.StatusBadRequest)
 			return
 		}
@@ -526,6 +531,10 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 
 		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		if rec.tooLarge {
+			http.Error(w, "response body too large", http.StatusBadGateway)
+			return
+		}
 		// A HEAD response carries no body on the wire; sign the empty one sent.
 		if r.Method == http.MethodHead {
 			rec.body.Reset()
@@ -554,14 +563,21 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 
 // bufferedResponse holds a response until it is signed.
 type bufferedResponse struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
+	header   http.Header
+	status   int
+	body     bytes.Buffer
+	tooLarge bool
 }
 
-func (b *bufferedResponse) Header() http.Header         { return b.header }
-func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
-func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
+func (b *bufferedResponse) Header() http.Header    { return b.header }
+func (b *bufferedResponse) WriteHeader(status int) { b.status = status }
+func (b *bufferedResponse) Write(p []byte) (int, error) {
+	if b.tooLarge || len(p) > maxSignedResponseBytes-b.body.Len() {
+		b.tooLarge = true
+		return 0, errors.New("response body too large")
+	}
+	return b.body.Write(p)
+}
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
 // so, the error from its exit. The runtime stays alive after app exit so

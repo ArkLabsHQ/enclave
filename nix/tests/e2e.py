@@ -74,36 +74,6 @@ def kms_key_count():
     return int(cloud("kms list-keys --query 'length(Keys)' --output text"))
 
 
-def ssm_ciphertexts(key_id):
-    prefix = "/ark/e2e/dev/testapp/enclave/unlocked"
-    parameters = json.loads(
-        cloud(f"ssm get-parameters-by-path --path {prefix}/ --recursive --output json")
-    )["Parameters"]
-    return {
-        p["Name"]: p["Value"]
-        for p in parameters
-        if p["Name"].endswith(f"/Ciphertext/{key_id}")
-    }
-
-
-def secret_ciphertexts(key_id):
-    # The handoff a predecessor writes for its successor. Filter by the committed
-    # key: a losing concurrent handoff may leave an orphan KMS key and its
-    # artifacts behind.
-    prefix = "/ark/e2e/dev/testapp/enclave/unlocked"
-    ciphertexts = ssm_ciphertexts(key_id)
-    expected = {
-        f"{prefix}/MasterSeed/Ciphertext/{key_id}",
-        f"{prefix}/TLSKey/Ciphertext/{key_id}",
-    }
-    assert set(ciphertexts) == expected, (
-        f"a handoff must carry only MasterSeed and TLSKey ciphertexts: "
-        f"{sorted(ciphertexts)}"
-    )
-    assert all(ciphertexts.values()), "committed secret ciphertexts must be nonempty"
-    return ciphertexts
-
-
 def cert_etag():
     return cloud(
         f"s3api head-object --bucket {CERT_BUCKET} --key {CERT_KEY} "
@@ -395,8 +365,8 @@ misrouted = otlp(
 assert misrouted == [], misrouted
 
 # Genesis published blue's whole state as one Object-Locked S3 object and wrote
-# nothing about it to SSM: no commit pointer, no ciphertexts, no receipts. The
-# blues' live migration challenge is the only parameter the runtime has written.
+# nothing about it to SSM. The blues' live migration challenge is the only
+# parameter the runtime has written.
 blue_snapshot = snapshot_versions(BLUE_PCR0)
 assert len(blue_snapshot) == 1, blue_snapshot
 blue_lock = json.loads(
@@ -409,8 +379,6 @@ assert blue_lock["Mode"] == "COMPLIANCE", blue_lock
 assert set(runtime_ssm_params()) <= {
     f"/ark/e2e/dev/testapp/enclave/MigrationChallenge/{BLUE_PCR0}"
 }, runtime_ssm_params()
-# Green's handoff pointer is created by a blue when it commits; not yet.
-assert get_param(key_param(GREEN_PCR0)) == ""
 assert cloud(
     f"s3api list-object-versions --bucket {INTENT_BUCKET} --prefix deployment-genesis "
     "--query 'length(Versions || `[]`)' --output text"
@@ -427,7 +395,6 @@ print(f"genesis race: minted={minted} resumed={resumed}")
 genesis_key = console_field(
     next(n for n in BLUES if n.name == minted[0]), "created primary KMS key", "key_id"
 )
-assert ssm_ciphertexts(genesis_key) == {}
 
 # And it is not a migration intent: the creator's own intent chain stays empty.
 intent_records = cloud(
@@ -583,7 +550,8 @@ for node in BLUES:
         "'.migration.state == \"cooling_down\" and .migration.target_pcr0 == $p'",
         timeout=180,
     )
-assert get_param(key_param(GREEN_PCR0)) == ""
+# A request releases nothing: the handoff exists only once it is finalised.
+assert finalised_handoffs(BLUE_PCR0) == []
 
 # Both blues may publish the same request. Replay the earliest genuine version
 # byte-for-byte; it is the one that determines the cooldown's start.
@@ -649,24 +617,45 @@ with subtest("both blues reject the multipart replay"):
 
 print("e2e-summary: both blues rejected the multipart replay")
 
-# A blue commits on its own once eligible.
-migration_key = ""
-for _ in range(MIGRATION_COOLDOWN_SECONDS + 120):
-    migration_key = get_param(key_param(GREEN_PCR0))
-    if migration_key not in ("", "UNSET", "None"):
-        break
-    time.sleep(1)
-else:
+# A blue commits on its own once eligible: one finalised record in its intent
+# log, which every blue then reports.
+try:
+    for node in BLUES:
+        node.wait_until_succeeds(
+            "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
+            f"| jq -e --arg t '{GREEN_PCR0}' "
+            "'.migration.state == \"finalised\" and .migration.target_pcr0 == $t'",
+            timeout=MIGRATION_COOLDOWN_SECONDS + 120,
+        )
+except Exception:
     for node in BLUES:
         print_enclave_diagnostics(node)
-    raise Exception("no blue committed the handoff")
+    raise
 
-assert migration_key != genesis_key
-assert console_field(
+migration_key = console_field(
     next(n for n in BLUES if console_has(n, "committed successor KMSKeyID")),
     "committed successor KMSKeyID", "key_id",
-) == migration_key
-green_ciphertexts = secret_ciphertexts(migration_key)
+)
+assert migration_key != genesis_key
+# The record is the whole handoff: the snapshot with its ciphertexts, attested
+# by blue and locked like every other intent. Nothing went to SSM.
+green_handoffs = finalised_handoffs(BLUE_PCR0)
+assert len(green_handoffs) == 1, green_handoffs
+handoff_version, handoff = green_handoffs[0]
+assert handoff["target_pcr0"] == GREEN_PCR0, handoff
+assert handoff["finalised_snapshot"] and handoff["attestation"], handoff
+handoff_lock = json.loads(
+    cloud(
+        f"s3api get-object-retention --bucket {INTENT_BUCKET} "
+        f"--key {handoff_version['Key']} --version-id {handoff_version['VersionId']} "
+        "--output json"
+    )
+)["Retention"]
+assert handoff_lock["Mode"] == "COMPLIANCE", handoff_lock
+assert all(
+    "/MigrationChallenge/" in name or "/MigrationResponse/" in name
+    for name in runtime_ssm_params()
+), runtime_ssm_params()
 # The handoff writes only into green's scope: blue's state is untouched, which
 # is what lets blue keep serving and reboot without any rollback machinery.
 assert snapshot_versions(BLUE_PCR0) == blue_snapshot
@@ -687,28 +676,10 @@ aws.succeed(
     "| . == [$g]' /tmp/migration-key-policy.json"
 )
 
-# The handoff receipt lives at the PCR0-scoped path, not the legacy key-only one.
-# A create-only write onto it must be refused: that is exactly the collision a
-# competing predecessor would hit. (This does not prove an *overwriting* write
-# is refused — that is an IAM property, which LocalStack does not model.)
-receipt_param = migration_receipt_param(migration_key, GREEN_PCR0)
-assert get_param(receipt_param) not in ("", "UNSET", "None")
-assert get_param(f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{migration_key}") == ""
-receipt_before = get_param(receipt_param)
-create_only_status, _ = aws.execute(
-    f"{CLOUD} ssm put-parameter --name {receipt_param} "
-    "--type String --value tampered"
-)
-assert create_only_status != 0, "a create-only write must lose to the published receipt"
-assert get_param(receipt_param) == receipt_before
-
 # `blue_peer` shares BLUE_PCR0, so both blues run the control loop against the
-# same intent chain and both reach the commit. The create-only write elects
-# exactly one; the other observes an already-finalised migration and must not
-# displace the pointer green is about to adopt.
+# same intent chain. The migration lease lets one finalise; the other observes
+# an already-finalised migration and releases nothing more.
 assert len(console_owners(BLUES, "committed successor KMSKeyID")) == 1
-assert get_param(key_param(GREEN_PCR0)) == migration_key
-assert get_param(receipt_param) == receipt_before
 
 # The blue fleet outlives the handoff it performed. Exactly one generation is
 # committed for green; `blue_peer` keeps serving from state it established under
@@ -724,11 +695,11 @@ for node in BLUES:
     node.wait_until_succeeds(
         "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
         f"| jq -e --arg t '{GREEN_PCR0}' "
-        "'.previous_pcr0 == \"genesis\" and .migration.state == \"eligible\" "
+        "'.previous_pcr0 == \"genesis\" and .migration.state == \"finalised\" "
         "and .migration.target_pcr0 == $t'"
     )
-# A replica that raced past the pointer guard mints a key before losing the
-# commit. It is an orphan, never referenced, but it does exist.
+# A replica that lost the lease mid-handoff mints a key it never releases. It
+# is an orphan, never referenced, but it does exist.
 assert kms_key_count() in (
     kms_keys_before_handoff + 1,
     kms_keys_before_handoff + 2,
@@ -746,6 +717,15 @@ for node in GREENS:
 green_snapshot = snapshot_versions(GREEN_PCR0)
 assert len(green_snapshot) == 1, green_snapshot
 assert console_owners(GREENS, "published adopted snapshot"), "no green published its snapshot"
+# Green adopted exactly what blue released: its published snapshot carries the
+# handoff's snapshot, with blue's attestation of it as the transition receipt.
+cloud(
+    f"s3api get-object --bucket {INTENT_BUCKET} --key {snapshot_key(GREEN_PCR0)} "
+    f"--version-id {green_snapshot[0]} /tmp/green-snapshot.json >/dev/null"
+)
+green_object = json.loads(aws.succeed("cat /tmp/green-snapshot.json"))
+assert green_object["snapshot"] == handoff["finalised_snapshot"]
+assert green_object["transition_attestation"] == handoff["attestation"]
 print(
     "e2e-summary: green snapshot race: "
     f"published={console_owners(GREENS, 'published adopted snapshot')} "
@@ -871,9 +851,6 @@ leaf_serial_before = leaf_serial
 cert_etag_before = cert_etag()
 challenge_events_before = challenge_event_count()
 kms_keys_before = kms_key_count()
-assert cloud(
-    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
-) == migration_key
 
 green_peer.succeed("kill $(cat /run/enclave-qemu.pid)")
 green_peer.succeed("systemctl restart enclave-start")
@@ -881,9 +858,7 @@ wait_enclave_healthy(green_peer)
 
 # Joining must resume the published state, not adopt again, perform genesis or
 # issue a cert.
-assert cloud(
-    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
-) == migration_key
+assert finalised_handoffs(BLUE_PCR0) == green_handoffs
 assert snapshot_versions(GREEN_PCR0) == green_snapshot
 assert kms_key_count() == kms_keys_before
 assert secret_value(green_peer) == blue_secret
@@ -954,11 +929,7 @@ assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_ser
 assert secret_value(green) == blue_secret
 assert env_value(green, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
 assert env_value(green, "E2E_THIRD_KEY") == green_third_secret
-assert secret_ciphertexts(migration_key) == green_ciphertexts
-assert cloud(
-    f"ssm get-parameter --name {key_param(GREEN_PCR0)} --query Parameter.Value --output text"
-) == migration_key
-assert get_param(receipt_param) == receipt_before
+assert finalised_handoffs(BLUE_PCR0) == green_handoffs
 assert snapshot_versions(GREEN_PCR0) == green_snapshot
 assert kms_key_count() == kms_keys_before
 assert cert_etag() == cert_etag_before
@@ -1013,30 +984,7 @@ for node in (*BLUES, *GREENS):
     assert served_leaf(node, "-noout -pubkey") == tls_public_key
 assert snapshot_versions(BLUE_PCR0) == blue_snapshot
 assert snapshot_versions(GREEN_PCR0) == green_snapshot
-assert get_param(key_param(GREEN_PCR0)) == migration_key
-assert get_param(receipt_param) == receipt_before
-assert secret_ciphertexts(migration_key) == green_ciphertexts
-
-# The handoff in SSM is transport, not state. Delete every parameter it left for
-# green, then plant corrupted ones - a handoff pointer naming blue's key, and a
-# bogus predecessor. Green's published state alone decides how it boots. The
-# pointer is overwritten, never deleted: a live blue that finds it gone hands
-# off again, which would only mint an unused key.
-cloud(
-    f"ssm put-parameter --name {key_param(GREEN_PCR0)} --type String "
-    f"--value {genesis_key} --overwrite"
-)
-for name in [
-    receipt_param,
-    *ssm_ciphertexts(migration_key),
-    f"/ark/e2e/dev/testapp/enclave/MigrationPreviousPCR0/{GREEN_PCR0}",
-    f"/ark/e2e/dev/testapp/enclave/MigrationPreviousKMSKeyID/{GREEN_PCR0}",
-]:
-    cloud(f"ssm delete-parameter --name {name}")
-cloud(
-    f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/MigrationPreviousPCR0/{GREEN_PCR0} "
-    f"--type String --value {'00' * 48}"
-)
+assert finalised_handoffs(BLUE_PCR0) == green_handoffs
 
 # Object Lock protects versions, not the key. Stack garbage and blue's genuine
 # state on top of green's, then try to delete it. The emulator refuses a plain

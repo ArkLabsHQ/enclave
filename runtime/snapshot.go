@@ -22,8 +22,7 @@ const (
 	snapshotSchemaV1       = "enclave.snapshot.v1"
 	snapshotRootDomainV1   = "enclave.snapshot_root.v1\x00" // SHA256 domain separator
 
-	purposeStateOrigin         = "enclave.state_origin"
-	purposeMigrationTransition = "enclave.state_origin.migration_transition"
+	purposeStateOrigin = "enclave.state_origin"
 )
 
 var (
@@ -99,72 +98,26 @@ func transitionPCRs(predecessorPCR0 string, owner []byte) map[uint]string {
 	}
 }
 
-// verifyStateReceipt checks receipt PCRs and user_data {purpose,snapshot_root}.
+// verifyStateReceipt checks a transition receipt: the attestation of the
+// predecessor's finalised intent, with the expected PCRs and snapshot root.
 func verifyStateReceipt(
 	nsm NSM,
 	receiptB64 string,
-	purpose string,
 	expectedSnapshotRoot []byte,
 	expectedPCRs map[uint]string,
 ) error {
-	expectedUserData, err := cbor.Marshal(snapshotRootPayloadV1{
-		Purpose:      purpose,
-		SnapshotRoot: expectedSnapshotRoot,
-	})
+	result, err := nsm.VerifyAttestationDocument(receiptB64, expectedPCRs)
 	if err != nil {
-		return fmt.Errorf("failed to encode state origin payload: %w", err)
+		return err
 	}
-
-	return verifyAttestationUserData(nsm, receiptB64, expectedPCRs, expectedUserData)
-}
-
-// WriteTransitionReceipt is called by the predecessor during a handoff; PCR31
-// must already commit to the successor PCR0.
-func WriteTransitionReceipt(
-	ctx context.Context,
-	cfg *Config,
-	nsm NSM,
-	ssm SSM,
-	snapshot Snapshot,
-) error {
-	root, err := snapshot.root(cfg)
-	if err != nil {
-		return fmt.Errorf("compute successor snapshot root: %w", err)
+	var intent migrationIntentUserDataV1
+	if err := cbor.Unmarshal(result.Document.UserData, &intent); err != nil {
+		return fmt.Errorf("decode attested migration intent: %w", err)
 	}
-	return writeReceipt(
-		ctx,
-		nsm,
-		ssm,
-		snapshotRootPayloadV1{
-			Purpose: purposeMigrationTransition, SnapshotRoot: root,
-		},
-		cfg.migrationStateOriginReceiptParam(snapshot.kmsKeyID, snapshot.ownerPCR0),
-		WithoutOverwrite(),
-	)
-}
-
-// writeReceipt attests over receipt and stores it at param. Advanced tier: an
-// attestation doc exceeds the 4 KB Standard-tier limit.
-func writeReceipt(
-	ctx context.Context,
-	nsm NSM,
-	ssm SSM,
-	receipt snapshotRootPayloadV1,
-	param string,
-	opts ...SSMSetOption,
-) error {
-	payload, err := cbor.Marshal(receipt)
-	if err != nil {
-		return fmt.Errorf("serialize receipt payload: %w", err)
+	if !bytes.Equal(intent.FinalisedSnapshotRoot, expectedSnapshotRoot) {
+		return errors.New("attested migration intent finalises another snapshot")
 	}
-
-	doc, _, err := nsm.BuildAttestationDocument(WithUserData(payload))
-	if err != nil {
-		return fmt.Errorf("failed to build attestation: %w", err)
-	}
-
-	b64 := base64.StdEncoding.EncodeToString(doc)
-	return ssm.Set(ctx, param, b64, append([]SSMSetOption{WithAdvancedTier()}, opts...)...)
+	return nil
 }
 
 // Both receipts attest the root of this canonical snapshot encoding.
@@ -320,7 +273,7 @@ func parseSnapshotObject(cfg *Config, nsm NSM, body []byte) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	if err := verifyStateReceipt(
-		nsm, snapshot.transitionReceipt, purposeMigrationTransition, root,
+		nsm, snapshot.transitionReceipt, root,
 		transitionPCRs(snapshot.predecessorPCR0, owner),
 	); err != nil {
 		return Snapshot{}, fmt.Errorf("invalid transition receipt: %w", err)

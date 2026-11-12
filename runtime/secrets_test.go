@@ -238,13 +238,13 @@ func TestDerivationCBORLengthBoundaries(t *testing.T) {
 func TestStaticSecretDeclarationsUsePersistedSeed(t *testing.T) {
 	const keyID = "key-declarations"
 	kmsf := newFakeKMS()
-	params := handoffParams(t, testCfg, kmsf, keyID)
 	snapshot := Snapshot{
 		kmsKeyID: keyID, ownerPCR0: stateOriginTestPCR0Hex(),
-		masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
-		tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
 		migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
 	}
+	snapshot.masterSeedCiphertext, snapshot.tlsKeyCiphertext = handoffCiphertexts(
+		t, testCfg, kmsf, keyID,
+	)
 	byName := map[string]string{}
 	for _, name := range []string{"alpha", "beta"} {
 		var err error

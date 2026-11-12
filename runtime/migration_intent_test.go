@@ -60,7 +60,7 @@ func (f *migrationIntentFixture) object(
 	pcr0 []byte,
 ) []byte {
 	t.Helper()
-	payload, err := f.log.enc.Marshal(migrationIntentV1{
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
 		Schema:     migrationIntentSchemaV1,
 		BucketName: bucket,
 		Sequence:   sequence,
@@ -126,6 +126,59 @@ func (f *migrationIntentFixture) injectConflictAfterPut(
 	return written
 }
 
+// handoff is a snapshot fx's enclave could hand to targetPCR0 under keyID.
+func (f *migrationIntentFixture) handoff(t *testing.T, targetPCR0, keyID string) Snapshot {
+	t.Helper()
+	snapshot := testGenerationSnapshot(mustDecodeHex(t, targetPCR0), f.pcr0, keyID)
+	snapshot.migrationIntentBucketName = f.log.bucket
+	return snapshot
+}
+
+// finalised is the stored record that hands snapshot to its owner.
+func (f *migrationIntentFixture) finalised(
+	t *testing.T, sequence uint64, snapshot Snapshot,
+) []byte {
+	t.Helper()
+	return f.finalisedObject(t, sequence, snapshot.ownerPCR0, snapshot, nil)
+}
+
+// finalisedObject attests snapshot's root in a finalised record naming
+// targetPCR0; mutate runs after signing, to forge what a host could write.
+func (f *migrationIntentFixture) finalisedObject(
+	t *testing.T,
+	sequence uint64,
+	targetPCR0 string,
+	snapshot Snapshot,
+	mutate func(*migrationIntentObjectV1),
+) []byte {
+	t.Helper()
+	raw, err := snapshot.encode(f.log.cfg)
+	require.NoError(t, err)
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:                migrationIntentSchemaV1,
+		BucketName:            f.log.bucket,
+		Sequence:              sequence,
+		Action:                migrationIntentFinalised,
+		TargetPCR0:            targetPCR0,
+		FinalisedSnapshotRoot: snapshotRootOf(raw),
+	})
+	require.NoError(t, err)
+	entry := migrationIntentObjectV1{
+		Schema:            migrationIntentSchemaV1,
+		Sequence:          sequence,
+		Action:            migrationIntentFinalised,
+		TargetPCR0:        targetPCR0,
+		Attestation:       f.signer.attest(map[uint][]byte{0: f.pcr0}, time.Now(), payload).docB64,
+		FinalisedSnapshot: raw,
+	}
+	if mutate != nil {
+		mutate(&entry)
+	}
+	body, err := json.Marshal(entry)
+	require.NoError(t, err)
+	return body
+}
+
 func TestMigrationIntentJSON(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	entry, err := decodeMigrationIntentObject([]byte(`{
@@ -139,11 +192,22 @@ func TestMigrationIntentJSON(t *testing.T) {
 	require.Equal(t, uint64(1), entry.Sequence)
 	require.Equal(t, target, entry.TargetPCR0)
 
+	// Only a finalised intent carries a snapshot.
+	entry, err = decodeMigrationIntentObject([]byte(
+		`{"schema":"x","sequence":2,"action":"finalised","target_pcr0":"x","attestation":"x",` +
+			`"finalised_snapshot":"c25hcA=="}`,
+	))
+	require.NoError(t, err)
+	require.Equal(t, []byte("snap"), entry.FinalisedSnapshot)
+
 	for name, body := range map[string]string{
-		"missing":   `{"schema":"x"}`,
-		"duplicate": `{"schema":"x","schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"}`,
-		"unknown":   `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x","extra":true}`,
-		"trailing":  `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"} true`,
+		"missing":                      `{"schema":"x"}`,
+		"duplicate":                    `{"schema":"x","schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"}`,
+		"unknown":                      `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x","extra":true}`,
+		"trailing":                     `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"} true`,
+		"finalised without a snapshot": `{"schema":"x","sequence":1,"action":"finalised","target_pcr0":"x","attestation":"x"}`,
+		"request carrying a snapshot": `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x",` +
+			`"finalised_snapshot":"c25hcA=="}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := decodeMigrationIntentObject([]byte(body))
@@ -413,8 +477,7 @@ func TestMigrationIntentAppendRequiresItsPersistedVersion(t *testing.T) {
 func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
 	fx := newMigrationIntentFixture(t)
 
-	// A self-targeted handoff would overwrite this enclave's own commit pointer
-	// and satisfy the PCR31 check trivially.
+	// A self-targeted handoff would satisfy the PCR31 check trivially.
 	_, err := fx.log.Request(context.Background(), fx.source, strings.ToUpper(fx.source))
 
 	require.ErrorIs(t, err, errMigrationIntentSelfTarget)
@@ -781,11 +844,11 @@ func TestMigrationIntentCanonicalHead(t *testing.T) {
 
 			_, err := fx.log.Head(context.Background(), fx.source)
 			require.ErrorIs(t, err, errMigrationIntentAmbiguous)
-			active, _, err := fx.log.scanIntents(context.Background(), fx.source)
+			state, _, err := fx.log.scanIntents(context.Background(), fx.source)
 			require.NoError(t, err)
-			require.Len(t, active, 2, "the equivalent copy is not a third intent")
+			require.Len(t, state.ambiguous, 2, "the equivalent copy is not a third intent")
 			require.ElementsMatch(t, []string{targetA, targetB},
-				[]string{active[0].TargetPCR0, active[1].TargetPCR0})
+				[]string{state.ambiguous[0].TargetPCR0, state.ambiguous[1].TargetPCR0})
 
 			_, err = fx.log.Request(context.Background(), fx.source, targetB)
 			require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
@@ -831,7 +894,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			)
 		},
 		"untrusted root": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			payload, err := fx.log.enc.Marshal(migrationIntentV1{
+			payload, err := fx.log.enc.Marshal(migrationIntentUserDataV1{
 				Schema:     migrationIntentSchemaV1,
 				BucketName: migrationIntentTestBucket,
 				Sequence:   2,
@@ -874,7 +937,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 			)
 		},
 		"noncanonical CBOR": func(t *testing.T, fx *migrationIntentFixture) []byte {
-			payload, err := cbor.Marshal(migrationIntentV1{
+			payload, err := cbor.Marshal(migrationIntentUserDataV1{
 				Schema:     migrationIntentSchemaV1,
 				BucketName: migrationIntentTestBucket,
 				Sequence:   2,
@@ -882,7 +945,7 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 				TargetPCR0: target,
 			})
 			require.NoError(t, err)
-			canonical, err := fx.log.enc.Marshal(migrationIntentV1{
+			canonical, err := fx.log.enc.Marshal(migrationIntentUserDataV1{
 				Schema:     migrationIntentSchemaV1,
 				BucketName: migrationIntentTestBucket,
 				Sequence:   2,
@@ -1113,7 +1176,7 @@ func mustMigrationIntentPayload(
 	bucket string,
 ) []byte {
 	t.Helper()
-	payload, err := log.enc.Marshal(migrationIntentV1{
+	payload, err := log.enc.Marshal(migrationIntentUserDataV1{
 		Schema:     entry.Schema,
 		BucketName: bucket,
 		Sequence:   entry.Sequence,
@@ -1305,4 +1368,336 @@ func TestAbortAdvancesPastIgnoredRequests(t *testing.T) {
 	head, err = fx.log.Request(ctx, fx.source, target)
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), head.Sequence)
+}
+
+func TestMigrationIntentFinalise(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+
+	t.Run("records the handoff on the request it answers", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		snapshot := fx.handoff(t, targetA, "key-a")
+
+		finalised, err := fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentFinalised, finalised.Action)
+		require.Equal(t, requested.Sequence+1, finalised.Sequence)
+		require.True(t, finalised.FinalisedSnapshot.sameState(snapshot))
+		require.NotEmpty(t, finalised.FinalisedSnapshot.transitionReceipt,
+			"the record's attestation is the handoff's transition receipt")
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, finalised, head)
+
+		// The handoff stays active until an abort: nothing else is requested or
+		// released meanwhile.
+		_, err = fx.log.Request(ctx, fx.source, targetB)
+		require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+		_, err = fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
+		require.Equal(t, 1, finalisedIntentCount(fx.s3))
+
+		aborted, err := fx.log.Abort(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		require.Equal(t, finalised.Sequence+1, aborted.Sequence)
+		head, err = fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, aborted, head)
+	})
+
+	for name, tc := range map[string]struct {
+		// prepare returns the sequence of the request Finalise is asked to answer.
+		prepare func(*testing.T, *migrationIntentFixture) uint64
+		want    error
+	}{
+		"without a request": {
+			prepare: func(*testing.T, *migrationIntentFixture) uint64 { return 1 },
+			want:    errMigrationIntentAbsent,
+		},
+		"an aborted request": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Abort(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"a request for another target": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetB)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"a request that a newer one replaced": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Abort(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"an ambiguous request": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				tiedAt := time.Now().Add(-time.Hour).UTC()
+				for _, target := range []string{targetA, targetB} {
+					fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1), fx.object(
+						t, 1, migrationIntentRequested, target, fx.log.bucket, fx.pcr0,
+					), tiedAt)
+				}
+				return 1
+			},
+			want: errMigrationIntentAmbiguous,
+		},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			sequence := tc.prepare(t, fx)
+
+			_, err := fx.log.Finalise(
+				ctx, fx.source, targetA, sequence, fx.handoff(t, targetA, "key-a"),
+			)
+
+			require.ErrorIs(t, err, tc.want)
+			require.Zero(t, finalisedIntentCount(fx.s3), "a refused handoff releases nothing")
+		})
+	}
+}
+
+// Which record is the active intent once a finalised record is in the log.
+func TestMigrationIntentFinalisedHead(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+	base := time.Now().Add(-time.Hour).UTC()
+
+	type record struct {
+		sequence uint64
+		action   string
+		target   string
+		after    time.Duration
+	}
+	seed := func(t *testing.T, fx *migrationIntentFixture, records ...record) {
+		t.Helper()
+		for _, r := range records {
+			body := fx.object(t, r.sequence, r.action, r.target, fx.log.bucket, fx.pcr0)
+			if r.action == migrationIntentFinalised {
+				body = fx.finalised(t, r.sequence, fx.handoff(t, r.target, "key"))
+			}
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, r.sequence), body, base.Add(r.after),
+			)
+		}
+	}
+	requested := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentRequested, target, after}
+	}
+	aborted := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentAborted, target, after}
+	}
+	finalised := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentFinalised, target, after}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		records []record
+		want    *record // the head; nil for none
+	}{
+		{
+			name:    "finalised answers its request",
+			records: []record{requested(1, targetA, 0), finalised(2, targetA, time.Minute)},
+			want:    &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name:    "finalised without a request is ignored",
+			records: []record{finalised(1, targetA, 0)},
+		},
+		{
+			name: "finalised after an abort is ignored",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, time.Minute),
+				finalised(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name:    "finalised for another target is ignored",
+			records: []record{requested(1, targetA, 0), finalised(2, targetB, time.Minute)},
+			want:    &record{sequence: 1, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "a request is ignored while a handoff is finalised",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				requested(3, targetB, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "a later finalised does not replace the handoff",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				finalised(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "an abort withdraws a finalised handoff",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 3, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name: "a new request after the abort starts over",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(3, targetA, 2*time.Minute), requested(4, targetA, 3*time.Minute),
+			},
+			want: &record{sequence: 4, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "an abort outranks an earlier finalised at its sequence",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name: "an abort outranks a later finalised at its sequence",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, time.Minute),
+				finalised(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			// A finalise that started before the abort lands after the next request.
+			name: "a delayed finalised cannot bury an abort or revive its target",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, 2*time.Minute),
+				requested(3, targetA, 3*time.Minute), finalised(2, targetA, time.Minute),
+			},
+			want: &record{sequence: 3, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "a finalised outranks a request at its sequence",
+			records: []record{
+				requested(1, targetA, 0), requested(2, targetB, time.Minute),
+				finalised(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "an abort after a request at its sequence is ignored",
+			records: []record{
+				requested(1, targetA, 0), requested(2, targetB, time.Minute),
+				aborted(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 1, action: migrationIntentRequested, target: targetA},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			seed(t, fx, tc.records...)
+
+			head, err := fx.log.Head(ctx, fx.source)
+
+			require.NoError(t, err)
+			if tc.want == nil {
+				require.Nil(t, head)
+				return
+			}
+			require.NotNil(t, head)
+			require.Equal(t,
+				record{tc.want.sequence, tc.want.action, tc.want.target, 0},
+				record{head.Sequence, head.Action, head.TargetPCR0, 0},
+			)
+		})
+	}
+
+	// Replicas racing one request each mint a key. Either record would do, so
+	// the choice only has to be the same for every reader.
+	t.Run("tied finalised records resolve to one whatever the listing order", func(t *testing.T) {
+		for _, keys := range [][]string{{"key-1", "key-2"}, {"key-2", "key-1"}} {
+			fx := newMigrationIntentFixture(t)
+			seed(t, fx, requested(1, targetA, 0))
+			for _, key := range keys {
+				fx.s3.putRawObjectAt(
+					migrationIntentObjectKey(fx.source, 2),
+					fx.finalised(t, 2, fx.handoff(t, targetA, key)), base.Add(time.Minute),
+				)
+			}
+
+			head, err := fx.log.Head(ctx, fx.source)
+
+			require.NoError(t, err)
+			require.Equal(t, migrationIntentFinalised, head.Action)
+			require.Equal(
+				t, "key-1", head.FinalisedSnapshot.kmsKeyID, "the smallest key ID is chosen",
+			)
+		}
+	})
+
+	t.Run("an ignored finalised still occupies its sequence", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		seed(t, fx, finalised(1, targetA, 0))
+
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), requested.Sequence)
+	})
+}
+
+// A finalised record is only as good as the snapshot its attestation binds.
+func TestMigrationIntentInvalidFinalisedVersionsAreIgnored(t *testing.T) {
+	ctx := context.Background()
+	targetA := strings.Repeat("cd", 48)
+
+	for name, forge := range map[string]func(*testing.T, *migrationIntentFixture) []byte{
+		"a snapshot swapped after it was attested": func(
+			t *testing.T, fx *migrationIntentFixture,
+		) []byte {
+			swapped, err := fx.handoff(t, targetA, "key-b").encode(fx.log.cfg)
+			require.NoError(t, err)
+			return fx.finalisedObject(t, 2, targetA, fx.handoff(t, targetA, "key-a"),
+				func(entry *migrationIntentObjectV1) { entry.FinalisedSnapshot = swapped })
+		},
+		"a snapshot that is not canonical": func(
+			t *testing.T, fx *migrationIntentFixture,
+		) []byte {
+			return fx.finalisedObject(t, 2, targetA, fx.handoff(t, targetA, "key-a"),
+				func(entry *migrationIntentObjectV1) {
+					entry.FinalisedSnapshot = append(entry.FinalisedSnapshot, 0)
+				})
+		},
+		"a record without its snapshot": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(t, 2, migrationIntentFinalised, targetA, fx.log.bucket, fx.pcr0)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			requested, err := fx.log.Request(ctx, fx.source, targetA)
+			require.NoError(t, err)
+			fx.s3.putRawObject(migrationIntentObjectKey(fx.source, 2), forge(t, fx))
+
+			head, err := fx.log.Head(ctx, fx.source)
+
+			require.NoError(t, err)
+			require.Equal(t, requested, head, "the request stays the active intent")
+		})
+	}
 }

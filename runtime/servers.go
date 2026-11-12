@@ -41,6 +41,10 @@ const (
 	signatureHeader = "X-Enclave-Signature"
 
 	maxLoggedNonce = 128
+
+	publicReadHeaderTimeout = 5 * time.Second
+	publicIdleTimeout       = 60 * time.Second
+	maxPublicConnections    = 1024
 )
 
 var (

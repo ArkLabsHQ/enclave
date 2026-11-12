@@ -294,7 +294,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 			fx.ssmf.params[testCfg.masterSeedCiphertextParam(migrationKeyID)],
 			masterSeed,
 		)
-		requireKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), newPCR0, true)
+		requireKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), testRoleARN, newPCR0, true)
 		require.NotNil(t, fx.session.attestationRoots)
 
 		newBoot, err := NewBoot(
@@ -323,7 +323,13 @@ func TestHandOffToSuccessor(t *testing.T) {
 		// admit its PCR0.
 		require.Error(
 			t,
-			verifyKeyPolicyPosture(t, fx.kmsf.keyPolicy(migrationKeyID), oldPCR0Hex, true),
+			verifyKeyPolicyPosture(
+				t,
+				fx.kmsf.keyPolicy(migrationKeyID),
+				testRoleARN,
+				oldPCR0Hex,
+				true,
+			),
 		)
 	})
 

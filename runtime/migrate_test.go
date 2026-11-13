@@ -175,6 +175,24 @@ func TestMigratorMigrationStatus(t *testing.T) {
 	})
 }
 
+func TestAwaitCandidateHandoffWaitsOnAmbiguousIntent(t *testing.T) {
+	fx, m := newCandidateMigrator(t)
+	predecessor := mustDecodeHex(t, handoffPredecessorPCR0)
+	publishedAt := time.Now()
+	for _, target := range []string{fx.pcr0Hex, strings.Repeat("ef", 48)} {
+		seedMigrationIntent(
+			t, fx.s3f, fx.signer, predecessor,
+			migrationIntentRequested, target, 1, publishedAt,
+		)
+	}
+	_, err := m.intent.Head(t.Context(), handoffPredecessorPCR0)
+	require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+
+	err = m.AwaitCandidateHandoff(contextFor(t, 50*time.Millisecond))
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
 func migrationTestCfg() *Config {
 	cfg := newTestConfig("prod", "app", false)
 	cfg.MigrationCooldown = 0

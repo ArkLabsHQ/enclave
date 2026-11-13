@@ -21,177 +21,6 @@ import (
 
 const migrationIntentTestBucket = "migration-intent-test"
 
-type migrationIntentFixture struct {
-	log    *migrationIntentLog
-	s3     *fakeS3
-	nsm    *nsmW
-	pcr0   []byte
-	source string
-	signer *fakeNSM
-}
-
-type migrationIntentBeforePutS3 struct {
-	S3API
-	beforePut func()
-}
-
-func (s migrationIntentBeforePutS3) PutObject(
-	ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options),
-) (*s3.PutObjectOutput, error) {
-	s.beforePut()
-	return s.S3API.PutObject(ctx, in, opts...)
-}
-
-func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
-	return newMigrationIntentFixtureWithConfig(t, testCfg)
-}
-
-func newMigrationIntentFixtureWithConfig(
-	t *testing.T, cfg *Config,
-) *migrationIntentFixture {
-	t.Helper()
-	pcr0 := bytes.Repeat([]byte{0xab}, 48)
-	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
-	nsm := &nsmW{nsm: session.nsm}
-	s3f := newFakeS3()
-	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
-	require.NoError(t, err)
-	return &migrationIntentFixture{
-		log:    log,
-		s3:     s3f,
-		nsm:    nsm,
-		pcr0:   pcr0,
-		source: strings.Repeat("ab", 48),
-		signer: session.nsm,
-	}
-}
-
-func (f *migrationIntentFixture) object(
-	t *testing.T,
-	sequence uint64,
-	action, targetPCR0, bucket string,
-	pcr0 []byte,
-) []byte {
-	t.Helper()
-	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
-		Schema:     migrationIntentSchemaV1,
-		BucketName: bucket,
-		Sequence:   sequence,
-		Action:     action,
-		TargetPCR0: targetPCR0,
-	})
-	require.NoError(t, err)
-	attestation := f.signer.attest(map[uint][]byte{0: pcr0}, time.Now(), payload)
-	body, err := json.Marshal(migrationIntentObjectV1{
-		Schema:      migrationIntentSchemaV1,
-		Sequence:    sequence,
-		Action:      action,
-		TargetPCR0:  targetPCR0,
-		Attestation: attestation.docB64,
-	})
-	require.NoError(t, err)
-	return body
-}
-
-// reattest returns body under a fresh attestation, so its bytes differ while
-// the verified intent stays the same.
-func (f *migrationIntentFixture) reattest(t *testing.T, body []byte) []byte {
-	t.Helper()
-	entry, err := decodeMigrationIntentObject(body)
-	require.NoError(t, err)
-	payload := mustMigrationIntentPayload(t, f.log, entry, f.log.bucket)
-	entry.Attestation = f.signer.attest(
-		map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
-	).docB64
-	out, err := json.Marshal(entry)
-	require.NoError(t, err)
-	require.NotEqual(t, body, out)
-	return out
-}
-
-// injectConflictAfterPut installs a hook that adds a competing intent after a write.
-// The returned record is populated with the original version when the hook runs.
-func (f *migrationIntentFixture) injectConflictAfterPut(
-	t *testing.T, targetPCR0, conflictingTargetPCR0 string,
-) *migrationIntent {
-	t.Helper()
-	written := new(migrationIntent)
-	f.s3.afterPut = func(in *s3.PutObjectInput, out *s3.PutObjectOutput) {
-		key := aws.ToString(in.Key)
-		f.s3.mu.Lock()
-		versions := f.s3.objects[key]
-		stored := versions[len(versions)-1]
-		f.s3.mu.Unlock()
-		entry, err := decodeMigrationIntentObject(stored.body)
-		require.NoError(t, err)
-		require.Equal(t, targetPCR0, entry.TargetPCR0)
-		*written = migrationIntent{
-			SourcePCR0: f.source, TargetPCR0: entry.TargetPCR0,
-			Action: entry.Action, Sequence: entry.Sequence,
-			PublishedAt: stored.lastModified, VersionID: aws.ToString(out.VersionId),
-		}
-		// Another writer lands a distinct intent at the same sequence and
-		// timestamp after our put but before its verification read.
-		f.s3.putRawObjectAt(key,
-			f.object(t, entry.Sequence, entry.Action, conflictingTargetPCR0, f.log.bucket, f.pcr0),
-			stored.lastModified)
-	}
-	return written
-}
-
-// handoff is a snapshot fx's enclave could hand to targetPCR0 under keyID.
-func (f *migrationIntentFixture) handoff(t *testing.T, targetPCR0, keyID string) Snapshot {
-	t.Helper()
-	snapshot := testGenerationSnapshot(mustDecodeHex(t, targetPCR0), f.pcr0, keyID)
-	snapshot.migrationIntentBucketName = f.log.bucket
-	return snapshot
-}
-
-// finalised is the stored record that hands snapshot to its owner.
-func (f *migrationIntentFixture) finalised(
-	t *testing.T, sequence uint64, snapshot Snapshot,
-) []byte {
-	t.Helper()
-	return f.finalisedObject(t, sequence, snapshot.ownerPCR0, snapshot, nil)
-}
-
-// finalisedObject attests snapshot's root in a finalised record naming
-// targetPCR0; mutate runs after signing, to forge what a host could write.
-func (f *migrationIntentFixture) finalisedObject(
-	t *testing.T,
-	sequence uint64,
-	targetPCR0 string,
-	snapshot Snapshot,
-	mutate func(*migrationIntentObjectV1),
-) []byte {
-	t.Helper()
-	raw, err := snapshot.encode(f.log.cfg)
-	require.NoError(t, err)
-	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
-		Schema:                migrationIntentSchemaV1,
-		BucketName:            f.log.bucket,
-		Sequence:              sequence,
-		Action:                migrationIntentFinalised,
-		TargetPCR0:            targetPCR0,
-		FinalisedSnapshotRoot: snapshotRootOf(raw),
-	})
-	require.NoError(t, err)
-	entry := migrationIntentObjectV1{
-		Schema:            migrationIntentSchemaV1,
-		Sequence:          sequence,
-		Action:            migrationIntentFinalised,
-		TargetPCR0:        targetPCR0,
-		Attestation:       f.signer.attest(map[uint][]byte{0: f.pcr0}, time.Now(), payload).docB64,
-		FinalisedSnapshot: raw,
-	}
-	if mutate != nil {
-		mutate(&entry)
-	}
-	body, err := json.Marshal(entry)
-	require.NoError(t, err)
-	return body
-}
-
 func TestMigrationIntentJSON(t *testing.T) {
 	target := strings.Repeat("cd", 48)
 	entry, err := decodeMigrationIntentObject([]byte(`{
@@ -1741,4 +1570,175 @@ func TestMigrationIntentInvalidFinalisedVersionsAreIgnored(t *testing.T) {
 			require.Equal(t, requested.Sequence, highest)
 		})
 	}
+}
+
+type migrationIntentFixture struct {
+	log    *migrationIntentLog
+	s3     *fakeS3
+	nsm    *nsmW
+	pcr0   []byte
+	source string
+	signer *fakeNSM
+}
+
+type migrationIntentBeforePutS3 struct {
+	S3API
+	beforePut func()
+}
+
+func (s migrationIntentBeforePutS3) PutObject(
+	ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options),
+) (*s3.PutObjectOutput, error) {
+	s.beforePut()
+	return s.S3API.PutObject(ctx, in, opts...)
+}
+
+func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
+	return newMigrationIntentFixtureWithConfig(t, testCfg)
+}
+
+func newMigrationIntentFixtureWithConfig(
+	t *testing.T, cfg *Config,
+) *migrationIntentFixture {
+	t.Helper()
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
+	nsm := &nsmW{nsm: session.nsm}
+	s3f := newFakeS3()
+	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
+	require.NoError(t, err)
+	return &migrationIntentFixture{
+		log:    log,
+		s3:     s3f,
+		nsm:    nsm,
+		pcr0:   pcr0,
+		source: strings.Repeat("ab", 48),
+		signer: session.nsm,
+	}
+}
+
+func (f *migrationIntentFixture) object(
+	t *testing.T,
+	sequence uint64,
+	action, targetPCR0, bucket string,
+	pcr0 []byte,
+) []byte {
+	t.Helper()
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:     migrationIntentSchemaV1,
+		BucketName: bucket,
+		Sequence:   sequence,
+		Action:     action,
+		TargetPCR0: targetPCR0,
+	})
+	require.NoError(t, err)
+	attestation := f.signer.attest(map[uint][]byte{0: pcr0}, time.Now(), payload)
+	body, err := json.Marshal(migrationIntentObjectV1{
+		Schema:      migrationIntentSchemaV1,
+		Sequence:    sequence,
+		Action:      action,
+		TargetPCR0:  targetPCR0,
+		Attestation: attestation.docB64,
+	})
+	require.NoError(t, err)
+	return body
+}
+
+// reattest returns body under a fresh attestation, so its bytes differ while
+// the verified intent stays the same.
+func (f *migrationIntentFixture) reattest(t *testing.T, body []byte) []byte {
+	t.Helper()
+	entry, err := decodeMigrationIntentObject(body)
+	require.NoError(t, err)
+	payload := mustMigrationIntentPayload(t, f.log, entry, f.log.bucket)
+	entry.Attestation = f.signer.attest(
+		map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
+	).docB64
+	out, err := json.Marshal(entry)
+	require.NoError(t, err)
+	require.NotEqual(t, body, out)
+	return out
+}
+
+// injectConflictAfterPut installs a hook that adds a competing intent after a write.
+// The returned record is populated with the original version when the hook runs.
+func (f *migrationIntentFixture) injectConflictAfterPut(
+	t *testing.T, targetPCR0, conflictingTargetPCR0 string,
+) *migrationIntent {
+	t.Helper()
+	written := new(migrationIntent)
+	f.s3.afterPut = func(in *s3.PutObjectInput, out *s3.PutObjectOutput) {
+		key := aws.ToString(in.Key)
+		f.s3.mu.Lock()
+		versions := f.s3.objects[key]
+		stored := versions[len(versions)-1]
+		f.s3.mu.Unlock()
+		entry, err := decodeMigrationIntentObject(stored.body)
+		require.NoError(t, err)
+		require.Equal(t, targetPCR0, entry.TargetPCR0)
+		*written = migrationIntent{
+			SourcePCR0: f.source, TargetPCR0: entry.TargetPCR0,
+			Action: entry.Action, Sequence: entry.Sequence,
+			PublishedAt: stored.lastModified, VersionID: aws.ToString(out.VersionId),
+		}
+		// Another writer lands a distinct intent at the same sequence and
+		// timestamp after our put but before its verification read.
+		f.s3.putRawObjectAt(key,
+			f.object(t, entry.Sequence, entry.Action, conflictingTargetPCR0, f.log.bucket, f.pcr0),
+			stored.lastModified)
+	}
+	return written
+}
+
+// handoff is a snapshot fx's enclave could hand to targetPCR0 under keyID.
+func (f *migrationIntentFixture) handoff(t *testing.T, targetPCR0, keyID string) Snapshot {
+	t.Helper()
+	snapshot := testGenerationSnapshot(mustDecodeHex(t, targetPCR0), f.pcr0, keyID)
+	snapshot.migrationIntentBucketName = f.log.bucket
+	return snapshot
+}
+
+// finalised is the stored record that hands snapshot to its owner.
+func (f *migrationIntentFixture) finalised(
+	t *testing.T, sequence uint64, snapshot Snapshot,
+) []byte {
+	t.Helper()
+	return f.finalisedObject(t, sequence, snapshot.ownerPCR0, snapshot, nil)
+}
+
+// finalisedObject attests snapshot's root in a finalised record naming
+// targetPCR0; mutate runs after signing, to forge what a host could write.
+func (f *migrationIntentFixture) finalisedObject(
+	t *testing.T,
+	sequence uint64,
+	targetPCR0 string,
+	snapshot Snapshot,
+	mutate func(*migrationIntentObjectV1),
+) []byte {
+	t.Helper()
+	raw, err := snapshot.encode(f.log.cfg)
+	require.NoError(t, err)
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:                migrationIntentSchemaV1,
+		BucketName:            f.log.bucket,
+		Sequence:              sequence,
+		Action:                migrationIntentFinalised,
+		TargetPCR0:            targetPCR0,
+		FinalisedSnapshotRoot: snapshotRootOf(raw),
+	})
+	require.NoError(t, err)
+	entry := migrationIntentObjectV1{
+		Schema:            migrationIntentSchemaV1,
+		Sequence:          sequence,
+		Action:            migrationIntentFinalised,
+		TargetPCR0:        targetPCR0,
+		Attestation:       f.signer.attest(map[uint][]byte{0: f.pcr0}, time.Now(), payload).docB64,
+		FinalisedSnapshot: raw,
+	}
+	if mutate != nil {
+		mutate(&entry)
+	}
+	body, err := json.Marshal(entry)
+	require.NoError(t, err)
+	return body
 }

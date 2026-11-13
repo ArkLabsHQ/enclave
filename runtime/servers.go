@@ -31,6 +31,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/netutil"
 )
 
 const (
@@ -41,6 +42,10 @@ const (
 	signatureHeader = "X-Enclave-Signature"
 
 	maxLoggedNonce = 128
+
+	publicReadHeaderTimeout = 5 * time.Second
+	publicIdleTimeout       = 60 * time.Second
+	maxPublicConnections    = 1024
 )
 
 var (
@@ -140,7 +145,9 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMiddleware(telemetry, true)(em),
+		Handler:           metricsMiddleware(telemetry, true)(em),
+		ReadHeaderTimeout: publicReadHeaderTimeout,
+		IdleTimeout:       publicIdleTimeout,
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
@@ -184,7 +191,7 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 
 	go func() {
 		if err := s.ext.ServeTLS(
-			public,
+			netutil.LimitListener(public, maxPublicConnections),
 			"",
 			"",
 		); err != nil &&

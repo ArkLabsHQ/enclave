@@ -52,7 +52,7 @@
                 };
                 modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-7X5P+Ge+qBypKPAAH++oGkNkej3JI4+ZYxGshm5ihTw=";
+                vendorHash = "sha256-v8II7XFhbzEP/uVpR4+Rj7DBGedy8N7nhTgVYpa82Uw=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"

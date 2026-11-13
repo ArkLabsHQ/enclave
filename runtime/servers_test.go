@@ -1,15 +1,18 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -98,6 +101,122 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 		}
 		err := s.Start(context.Background(), Config{ExtPort: uint16(port)})
 		require.ErrorContains(t, err, "public listener")
+	})
+}
+
+func TestPublicServerConnectionLimits(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(logger) })
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "first\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(2 * timeout):
+			_, _ = io.WriteString(w, "second\n")
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(app.Close)
+	appURL, err := url.Parse(app.URL)
+	require.NoError(t, err)
+
+	rt := newRuntimeState()
+	key := newTestTLSKey(t)
+	certPEM := issueTestCertWithKey(t, "localhost", time.Now().Add(time.Hour), key)
+	certDER, _ := pem.Decode(certPEM)
+	require.NotNil(t, certDER)
+	rt.SetTLSCertCallback(func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return &tls.Certificate{Certificate: [][]byte{certDER.Bytes}, PrivateKey: key}, nil
+	})
+	rt.NotifyReady()
+	s := SetupHttpServers(rt, Config{AppWebSrv: appURL}, &nsmW{},
+		NewTelemetry(testCfg, nil), &AttestationData{}, "token").(*servers)
+	require.Equal(t, publicReadHeaderTimeout, s.ext.ReadHeaderTimeout)
+	require.Equal(t, publicIdleTimeout, s.ext.IdleTimeout)
+	require.Zero(t, s.ext.ReadTimeout)
+	require.Zero(t, s.ext.WriteTimeout)
+	s.ext.ReadHeaderTimeout = timeout
+	s.em.HandleFunc("/hold", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+
+	port, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := port.Addr().String()
+	cfg := Config{ExtPort: uint16(port.Addr().(*net.TCPAddr).Port)}
+	require.NoError(t, port.Close())
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(func() {
+		cancel()
+		_ = s.ext.Close()
+		_ = s.int.Close()
+	})
+	require.NoError(t, s.Start(ctx, cfg))
+
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true, // The server uses a test certificate.
+		NextProtos:         []string{"http/1.1"},
+	}
+	dial := func(t *testing.T, useTLS bool) net.Conn {
+		t.Helper()
+		d := &net.Dialer{Timeout: 2 * time.Second}
+		var conn net.Conn
+		var err error
+		if useTLS {
+			conn, err = tls.DialWithDialer(d, "tcp", addr, clientTLS)
+		} else {
+			conn, err = d.Dial("tcp", addr)
+		}
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		return conn
+	}
+	get := func(t *testing.T, conn net.Conn, path string) *http.Response {
+		t.Helper()
+		_, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", path)
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return resp
+	}
+
+	t.Run("proxy_stream_survives_header_timeout", func(t *testing.T) {
+		resp := get(t, dial(t, true), "/stream")
+		defer func() { _ = resp.Body.Close() }()
+		reader := bufio.NewReader(resp.Body)
+		for _, want := range []string{"first\n", "second\n"} {
+			got, err := reader.ReadString('\n')
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		}
+	})
+
+	t.Run("connection_cap_releases_a_slot", func(t *testing.T) {
+		var first net.Conn
+		for i := range maxPublicConnections {
+			conn := dial(t, true)
+			// An active response holds a slot without a header or idle timeout.
+			_ = get(t, conn, "/hold")
+			if i == 0 {
+				first = conn
+			}
+		}
+		overflow := tls.Client(dial(t, false), clientTLS)
+		handshake := make(chan error, 1)
+		go func() { handshake <- overflow.HandshakeContext(t.Context()) }()
+		select {
+		case err := <-handshake:
+			t.Fatalf("connection beyond the cap reached TLS; handshake error: %v", err)
+		case <-time.After(timeout):
+		}
+		require.NoError(t, first.Close())
+		require.NoError(t, <-handshake, "closing a connection must release its slot")
 	})
 }
 

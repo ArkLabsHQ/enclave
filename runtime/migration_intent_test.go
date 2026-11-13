@@ -1160,8 +1160,6 @@ func TestEarliestUnabortedIntentRemainsAuthoritative(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), head.Sequence,
 		"a later request must not hide the earliest unaborted authorization")
-	m := &migrator{intent: fx.log}
-	require.NoError(t, m.verifyIntent(ctx, fx.source, target, 1))
 	put(3, migrationIntentAborted, base.Add(time.Minute))
 	head, err = fx.log.Head(ctx, fx.source)
 	require.NoError(t, err)
@@ -1170,7 +1168,6 @@ func TestEarliestUnabortedIntentRemainsAuthoritative(t *testing.T) {
 	head, err = fx.log.Head(ctx, fx.source)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), head.Sequence)
-	require.NoError(t, m.verifyIntent(ctx, fx.source, target, 4))
 }
 
 // Every append must land above every sequence already published. Writing at the

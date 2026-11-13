@@ -572,8 +572,7 @@ func TestHandOffToSuccessor(t *testing.T) {
 
 		err := fx.m.handOffToSuccessor(ctx, leaseHeld)
 
-		require.Error(t, err)
-		require.ErrorContains(t, err, "verify migration intent")
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
 		fx.s3f.listErr = nil
 		requireNothingAdoptable(t, fx)
 	})

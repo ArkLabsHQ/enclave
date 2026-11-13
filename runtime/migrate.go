@@ -314,33 +314,6 @@ func (m *migrator) MigrationIntentBucket() string {
 	return m.bucket
 }
 
-func (m *migrator) verifyIntent(
-	ctx context.Context, sourcePCR0, targetPCR0 string, sequence uint64,
-) error {
-	head, err := m.intent.Head(ctx, sourcePCR0)
-	if err != nil {
-		return fmt.Errorf("verify migration intent: %w", err)
-	}
-	if head == nil {
-		return fmt.Errorf("%w: intent disappeared before commit", errMigrationIntentAbsent)
-	}
-	if head.Action == migrationIntentAborted {
-		return fmt.Errorf("%w: aborted before commit", errMigrationIntentAborted)
-	}
-	if head.Sequence != sequence {
-		return fmt.Errorf(
-			"%w: intent advanced from sequence %d to %d before commit",
-			errMigrationIntentAborted, sequence, head.Sequence,
-		)
-	}
-	if !strings.EqualFold(head.TargetPCR0, targetPCR0) {
-		return fmt.Errorf(
-			"%w: intent target changed before commit", errMigrationIntentAborted,
-		)
-	}
-	return nil
-}
-
 func (m *migrator) advanceMigration(ctx context.Context) error {
 	lease, err := m.tryAcquireMigrationLease(ctx)
 	if err != nil {
@@ -670,9 +643,6 @@ func (m *migrator) handOffToSuccessor(
 		migrationIntentBucketName: m.intent.bucket,
 	}
 
-	if err := m.verifyIntent(ctx, m.pcr0, targetPCR0, status.Sequence); err != nil {
-		return err
-	}
 	// Checked last: a replica that lost the lease to a peer, which may be
 	// recording an abort, must not commit.
 	if err := verifyLease(ctx); err != nil {

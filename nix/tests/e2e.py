@@ -48,7 +48,7 @@ def console_owners(nodes, needle):
 
 def enclave_curl(node, pcr0, path="/health", signed=False):
     # QEMU's NSM cannot sign or supply an AWS chain. PCR0, nonce, the exact
-    # 79-byte user_data binding, and live certificate pinning remain checked.
+    # 149-byte user_data binding, and live certificate pinning remain checked.
     return node.execute(
         f"enclave curl {path} --base-url https://127.0.0.1 "
         f"--expected-pcr0 {pcr0} --insecure-skip-cose-verify "
@@ -56,18 +56,20 @@ def enclave_curl(node, pcr0, path="/health", signed=False):
     )
 
 
-def health_signature(node):
-    # A fixed request and response make Ed25519 signatures comparable across
-    # replicas, restarts, and migration, without decoding attestation CBOR.
-    body, status, signature = node.succeed(
-        "curl -skf --http1.1 https://127.0.0.1/test/health "
-        "-H 'X-Enclave-Sign-Nonce: key-lifecycle' "
-        "-w '\\n%{http_code}\\n%header{x-enclave-signature}'"
-    ).strip().rsplit("\n", 2)
-    assert status == "200", status
-    assert json.loads(body) == {"status": "ok"}, body
-    assert len(base64.b64decode(signature, validate=True)) == 64, signature
-    return signature
+def signing_key(node):
+    # Compares the response-signing key across replicas, restarts, and
+    # migration. Signatures cover a timestamp, so they differ per request; the
+    # attested key follows "ed25519:" in user_data, read without decoding CBOR.
+    doc = base64.b64decode(
+        node.succeed(
+            f"curl -skf --http1.1 'https://127.0.0.1/enclave/attestation?nonce={'00' * 20}'"
+        ).strip(),
+        validate=True,
+    )
+    start = doc.index(b"ed25519:") + len(b"ed25519:")
+    key = doc[start : start + 32]
+    assert key != bytes(32), "no response-signing key attested"
+    return key.hex()
 
 
 def kms_key_count():
@@ -214,8 +216,8 @@ for node in BLUES:
     )
 blue_secret = secret_value(blue)
 assert secret_value(blue_peer) == blue_secret
-blue_signature = health_signature(blue)
-assert health_signature(blue_peer) == blue_signature
+blue_signing_key = signing_key(blue)
+assert signing_key(blue_peer) == blue_signing_key
 blue_second_secret = env_value(blue, "E2E_SECOND_KEY")
 assert env_value(blue_peer, "E2E_SECOND_KEY") == blue_second_secret
 assert REPLACEMENT_SECRET != blue_second_secret
@@ -844,8 +846,8 @@ cloud(
 assert env_value(green, "E2E_SECOND_KEY") == ""
 
 # Snapshot the established fleet state before a same-EIF peer rejoins.
-green_signature = health_signature(green)
-assert green_signature != blue_signature, "migration must change the signing key"
+green_signing_key = signing_key(green)
+assert green_signing_key != blue_signing_key, "migration must change the signing key"
 leaf_sha_before = served_leaf_sha(green)
 leaf_serial_before = leaf_serial
 cert_etag_before = cert_etag()
@@ -889,7 +891,7 @@ for node in GREENS:
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health")
     assert status == 0, out
     # The migrated master seed and current PCR0 determine the signing key.
-    assert health_signature(node) == green_signature
+    assert signing_key(node) == green_signing_key
     status, out = enclave_curl(node, GREEN_PCR0, "/test/health", signed=True)
     assert status == 0, out
     status, out = enclave_curl(node, GREEN_PCR0, "/enclave/v1/info", signed=True)
@@ -923,7 +925,7 @@ assert status == 0, out
 
 green.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(green)
-assert health_signature(green) == green_signature
+assert signing_key(green) == green_signing_key
 assert served_leaf_sha(green) == leaf_sha_before
 assert served_leaf(green, "-noout -serial").split("=", 1)[1].lower() == leaf_serial_before
 assert secret_value(green) == blue_secret
@@ -955,7 +957,7 @@ for node in BLUES:
 blue.succeed("kill $(cat /run/enclave-qemu.pid)")
 blue.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(blue)
-assert health_signature(blue) == blue_signature
+assert signing_key(blue) == blue_signing_key
 assert secret_value(blue) == blue_secret
 assert env_value(blue, "E2E_SECOND_KEY") == blue_second_secret
 assert env_value(blue, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET

@@ -22,11 +22,14 @@
 package client
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,10 +75,11 @@ type Options struct {
 	// signature. Never set this against a real production enclave.
 	InsecureSkipCOSEVerify bool
 
-	// SignedResponses asks the enclave to sign each response with its attested
-	// response-signing key, bound to this request, and fails any response whose
-	// signature is missing or invalid. It is checked on top of the TLS pin;
-	// behind a proxy that terminates TLS, also set InsecureTLS.
+	// SignedResponses asks the enclave to sign each response's status and body
+	// with its attested response-signing key, bound to this request's method,
+	// target, body, and a fresh nonce, and fails any response whose signature
+	// is missing or invalid. It is checked on top of the TLS pin; behind a proxy
+	// that terminates TLS, also set InsecureTLS.
 	SignedResponses bool
 }
 
@@ -92,6 +96,14 @@ type AttestationResult struct {
 	PCRs       map[uint]string
 	TLSKeyHash string            // hex-encoded SHA-256 of the enclave TLS PublicKey
 	SigningKey ed25519.PublicKey // response-signing key; nil if the enclave attests none
+	// MigrationCooldown is how long after the attestation the enclave may hand
+	// off to MigrationTargetPCR0; zero once it may, or when none is pending.
+	MigrationCooldown time.Duration
+	// MigrationTargetPCR0 is the hex PCR0 of the image the enclave has a
+	// pending intent to migrate to; empty when none is pending.
+	MigrationTargetPCR0 string
+	// Timestamp is when the NSM produced the attestation document.
+	Timestamp  time.Time
 	Verified   bool
 	VerifiedAt time.Time
 }
@@ -261,17 +273,34 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 		return nil, fmt.Errorf("attestation verification failed: %w", err)
 	}
 
-	var signingContext signing.ResponseSigningContext
+	var nonce, reqBody []byte
 	if c.opts.SignedResponses {
 		if attest.SigningKey == nil {
 			return nil, fmt.Errorf("enclave attests no response signing key")
 		}
+		nonce = make([]byte, signing.NonceSize)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, fmt.Errorf("generate nonce: %w", err)
+		}
 		// Sign a copy so the caller's headers stay unchanged; the body is still
 		// consumed, as by any Do.
 		req = req.Clone(req.Context())
-		if signingContext, err = prepareResponseSigningContext(req); err != nil {
-			return nil, err
+		// Clone keeps a nil header map, which Set below would panic on.
+		if req.Header == nil {
+			req.Header = http.Header{}
 		}
+		// The request body is signed too: keep a copy to hash.
+		if req.Body != nil {
+			if reqBody, err = io.ReadAll(req.Body); err != nil {
+				return nil, fmt.Errorf("read request body: %w", err)
+			}
+			_ = req.Body.Close()
+			req.Body = io.NopCloser(bytes.NewReader(reqBody))
+		}
+		// Let the transport ask for gzip and decode it, so the body we hash is the
+		// decoded one the runtime signed, even if a proxy compresses it.
+		req.Header.Del("Accept-Encoding")
+		req.Header.Set(signNonceHeader, hex.EncodeToString(nonce))
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -286,8 +315,14 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 	}
 
 	if c.opts.SignedResponses {
-		msg := signingContext.ResponseMessage(sha256.Sum256(body), resp.StatusCode)
-		if err := verifyResponseSignature(attest.SigningKey, msg, resp.Header); err != nil {
+		err := verifyResponseSignature(attest.SigningKey, resp.Header,
+			func(timestamp time.Time) []byte {
+				return signing.ResponseMessage(
+					cmp.Or(req.Method, http.MethodGet), signing.RequestTarget(req),
+					nonce, timestamp, reqBody, resp.StatusCode, body,
+				)
+			})
+		if err != nil {
 			// The key may have changed (a fresh genesis, or the other generation
 			// during a migration): attest again on the next call.
 			c.mu.Lock()
@@ -343,42 +378,27 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 
 	// 2. Extract the attested tlsKeyHash. It is published with cachedState at the
 	// end, so a failure below leaves the last good pin in place.
-	tlsKeyHash, signingKey, err := parseUserData(nitResult)
+	userData, err := parseUserData(nitResult)
 	if err != nil {
 		return nil, fmt.Errorf("parse user_data: %w", err)
 	}
 
 	// 3. Verify additional PCRs (secret pubkey hashes).
-	pcrs := make(map[uint]string)
-	for idx, pcrBytes := range nitResult.Document.PCRs {
-		if len(pcrBytes) > 0 {
-			pcrs[idx] = fmt.Sprintf("%x", pcrBytes)
-		}
-	}
-
-	for i, expectedHash := range c.opts.ExpectedPCRs {
-		pcrIndex := uint(16) + uint(i)
-		actual, ok := pcrs[pcrIndex]
-		if !ok {
-			return nil, fmt.Errorf("PCR%d not found in attestation document", pcrIndex)
-		}
-		if !strings.EqualFold(actual, expectedHash) {
-			return nil, fmt.Errorf(
-				"PCR%d mismatch: expected %s, got %s",
-				pcrIndex,
-				expectedHash,
-				actual,
-			)
-		}
+	pcrs, err := verifyPCRs(nitResult.Document.PCRs, c.opts.ExpectedPCRs)
+	if err != nil {
+		return nil, err
 	}
 
 	result := &AttestationResult{
-		PCR0:       c.opts.ExpectedPCR0,
-		PCRs:       pcrs,
-		TLSKeyHash: tlsKeyHash,
-		SigningKey: signingKey,
-		Verified:   true,
-		VerifiedAt: time.Now(),
+		PCR0:                c.opts.ExpectedPCR0,
+		PCRs:                pcrs,
+		TLSKeyHash:          userData.tlsKeyHash,
+		SigningKey:          userData.signingKey,
+		MigrationCooldown:   userData.migrationCooldown,
+		MigrationTargetPCR0: userData.migrationTargetPCR0,
+		Timestamp:           time.UnixMilli(int64(nitResult.Document.Timestamp)),
+		Verified:            true,
+		VerifiedAt:          time.Now(),
 	}
 
 	c.mu.Lock()

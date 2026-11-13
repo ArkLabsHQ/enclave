@@ -13,6 +13,8 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +67,9 @@ type fakeEnclave struct {
 	attestedTLS [32]byte           // tlsKeyHash embedded in user_data
 	signingKey  ed25519.PrivateKey // attested and used to sign when asked; nil attests none
 	tamper      bool               // alter the body after signing it
+	relabel     int                // if set, the status sent instead of the one signed
+	retime      bool               // send a timestamp other than the one signed
+	omit        string             // a header to leave out of a signed response
 	appPaths    []string
 }
 
@@ -102,17 +107,28 @@ func (f *fakeEnclave) handler() http.Handler {
 			status = http.StatusSeeOther
 		}
 		if nonce := r.Header.Get(signNonceHeader); nonce != "" && f.signingKey != nil {
-			reqBody, _ := io.ReadAll(r.Body)
-			signingContext, err := signing.CaptureResponseSigningContext(r, reqBody)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			rawNonce, err := hex.DecodeString(nonce)
+			if err != nil || len(rawNonce) != signing.NonceSize {
+				http.Error(w, "bad nonce", http.StatusBadRequest)
 				return
 			}
-			msg := signingContext.ResponseMessage(sha256.Sum256(body), status)
+			reqBody, _ := io.ReadAll(r.Body)
+			timestamp := time.Now()
+			msg := signing.ResponseMessage(
+				r.Method, signing.RequestTarget(r), rawNonce, timestamp, reqBody, status, body,
+			)
 			w.Header().Set(signatureHeader,
 				base64.StdEncoding.EncodeToString(ed25519.Sign(f.signingKey, msg)))
+			if f.retime {
+				timestamp = timestamp.Add(-time.Hour)
+			}
+			w.Header().Set(timestampHeader, strconv.FormatInt(timestamp.UnixMilli(), 10))
+			w.Header().Del(f.omit)
 			if f.tamper {
 				body = []byte(`{"version":"forged","previous_pcr0":"genesis"}`)
+			}
+			if f.relabel != 0 {
+				status = f.relabel
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -153,6 +169,10 @@ func TestClientBootstrapPinSequencing(t *testing.T) {
 		resp, err := c.Get(context.Background(), "/enclave/v1/info")
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
+		attest, err := c.VerifyAttestation(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, 24*time.Hour, attest.MigrationCooldown)
+		require.Empty(t, attest.MigrationTargetPCR0, "no migration pending")
 		fe.mu.Lock()
 		defer fe.mu.Unlock()
 		require.Equal(t, []string{"/enclave/v1/info"}, fe.appPaths)
@@ -380,6 +400,24 @@ func TestClientSignedResponses(t *testing.T) {
 		require.Empty(t, req.Header, "no nonce or Authorization added to the caller's request")
 	})
 
+	t.Run("signs a request built without a header map", func(t *testing.T) {
+		fe := &fakeEnclave{pcr0Hex: pcr0, signingKey: key}
+		srv := httptest.NewTLSServer(fe.handler())
+		t.Cleanup(srv.Close)
+		fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
+		c, err := New(srv.URL, Options{
+			ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SignedResponses: true,
+		})
+		require.NoError(t, err)
+		u, err := url.Parse(srv.URL + "/orders")
+		require.NoError(t, err)
+		req := &http.Request{Method: http.MethodGet, URL: u}
+		resp, err := c.Do(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Nil(t, req.Header, "the caller's request is left as it was")
+	})
+
 	t.Run("verifies a body a proxy compressed", func(t *testing.T) {
 		fe := &fakeEnclave{pcr0Hex: pcr0, signingKey: key}
 		enclave := fe.handler()
@@ -439,9 +477,59 @@ func TestClientSignedResponses(t *testing.T) {
 		require.Equal(t, []string{"/redirect"}, fe.appPaths)
 	})
 
+	t.Run("a relabelled status fails", func(t *testing.T) {
+		fe := &fakeEnclave{pcr0Hex: pcr0, signingKey: key, relabel: http.StatusOK}
+		_, err := postTo(t, fe, "/redirect")
+		require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
+	})
+
 	t.Run("tampered body fails", func(t *testing.T) {
 		_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, tamper: true})
 		require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
+	})
+
+	t.Run("a changed timestamp fails", func(t *testing.T) {
+		_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, retime: true})
+		require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
+	})
+
+	t.Run("a missing header is named", func(t *testing.T) {
+		for _, header := range []string{signatureHeader, timestampHeader} {
+			_, err := post(t, &fakeEnclave{pcr0Hex: pcr0, signingKey: key, omit: header})
+			require.ErrorContains(t, err, "missing or invalid "+header)
+		}
+	})
+
+	// A proxy that changes what the enclave answers cannot pass the answer off
+	// as the response to the request the client sent.
+	t.Run("a response to another method, target or body fails", func(t *testing.T) {
+		for name, mutate := range map[string]func(*http.Request){
+			"method": func(r *http.Request) { r.Method = http.MethodPut },
+			"path":   func(r *http.Request) { r.RequestURI, r.URL.Path = "/refunds?x=1", "/refunds" },
+			"query":  func(r *http.Request) { r.RequestURI, r.URL.RawQuery = "/orders?x=2", "x=2" },
+			"body": func(r *http.Request) {
+				r.Body = io.NopCloser(strings.NewReader(`{"amount":1000}`))
+			},
+		} {
+			fe := &fakeEnclave{pcr0Hex: pcr0, signingKey: key}
+			enclave := fe.handler()
+			srv := httptest.NewTLSServer(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/enclave/attestation" {
+						mutate(r)
+					}
+					enclave.ServeHTTP(w, r)
+				}),
+			)
+			t.Cleanup(srv.Close)
+			fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
+			c, err := New(srv.URL, Options{
+				ExpectedPCR0: pcr0, InsecureSkipCOSEVerify: true, SignedResponses: true,
+			})
+			require.NoError(t, err)
+			_, err = c.Post(context.Background(), "/orders?x=1", strings.NewReader(`{"amount":10}`))
+			require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature", name)
+		}
 	})
 
 	t.Run("no attested signing key fails before the request", func(t *testing.T) {
@@ -505,104 +593,4 @@ func TestClientSignedResponsesAcrossGenerations(t *testing.T) {
 			require.Empty(t, current.appPaths)
 		})
 	}
-}
-
-func TestClientRejectsRequestHeaderTampering(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		mutate   func(*http.Request)
-		detected bool
-	}{
-		{name: "unchanged"},
-		{"authorization replaced", func(r *http.Request) { r.Header.Set("Authorization", "Bearer bob") }, true},
-		{"authorization removed", func(r *http.Request) { r.Header.Del("Authorization") }, true},
-		{"authorization duplicated", func(r *http.Request) {
-			r.Header.Add("Authorization", "Bearer bob")
-		}, true},
-		{"content type", func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") }, true},
-		{"authority changed", func(r *http.Request) { r.Host = "other.example:443" }, true},
-		{"authority port changed", func(r *http.Request) { r.Host = "api.example:8443" }, true},
-		// Not covered: browsers, proxies and CDNs add and rewrite these.
-		{"cookie replaced", func(r *http.Request) { r.Header.Set("Cookie", "session=bob") }, false},
-		{"origin changed", func(r *http.Request) { r.Header.Set("Origin", "https://evil.example") }, false},
-		{"tenant changed", func(r *http.Request) { r.Header.Set("X-Tenant-ID", "bob") }, false},
-		{"forwarding header added", func(r *http.Request) {
-			r.Header.Set("X-Forwarded-For", "10.0.0.1")
-		}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, ed25519.SeedSize))
-			fe := &fakeEnclave{pcr0Hex: strings.Repeat("ab", 48), signingKey: key}
-			fe.attestedTLS = sha256.Sum256([]byte("enclave TLS key behind proxy"))
-			enclave := fe.handler()
-			proxy := httptest.NewTLSServer(
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path != "/enclave/attestation" && tc.mutate != nil {
-						tc.mutate(r)
-					}
-					enclave.ServeHTTP(w, r)
-				}),
-			)
-			t.Cleanup(proxy.Close)
-			insecureTLS := true
-			c, err := New(proxy.URL, Options{
-				ExpectedPCR0: fe.pcr0Hex, InsecureTLS: &insecureTLS,
-				InsecureSkipCOSEVerify: true, SignedResponses: true,
-			})
-			require.NoError(t, err)
-			req, err := http.NewRequest(
-				http.MethodPost,
-				proxy.URL+"/orders",
-				strings.NewReader("amount=10"),
-			)
-			require.NoError(t, err)
-			req.Host = "api.example:443"
-			req.Header.Set("Authorization", "Bearer alice")
-			req.Header.Set("Cookie", "session=alice")
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Origin", "https://app.example")
-			req.Header.Set("X-Tenant-ID", "alice")
-			resp, err := c.Do(context.Background(), req)
-			if tc.detected {
-				require.ErrorContains(t, err, "missing or invalid X-Enclave-Signature")
-				require.Nil(t, resp)
-			} else {
-				require.NoError(t, err)
-				require.Equal(t, http.StatusOK, resp.StatusCode)
-			}
-			require.Equal(t, []string{"/orders"}, fe.appPaths)
-		})
-	}
-}
-
-func TestClientSignedHTTP2Headers(t *testing.T) {
-	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, ed25519.SeedSize))
-	fe := &fakeEnclave{pcr0Hex: strings.Repeat("ab", 48), signingKey: key}
-	enclave := fe.handler()
-	srv := httptest.NewUnstartedServer(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			require.Equal(t, 2, r.ProtoMajor)
-			enclave.ServeHTTP(w, r)
-		}),
-	)
-	srv.EnableHTTP2 = true
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
-	fe.attestedTLS = sha256.Sum256(srv.Certificate().RawSubjectPublicKeyInfo)
-	c, err := New(srv.URL, Options{
-		ExpectedPCR0: fe.pcr0Hex, InsecureSkipCOSEVerify: true, SignedResponses: true,
-	})
-	require.NoError(t, err)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/orders", strings.NewReader("amount=10"))
-	require.NoError(t, err)
-	req.Header = http.Header{
-		"authorization": {"Bearer alice"},
-		"Cookie":        {"a=1", "b=2"},
-		"X-Tenant":      {"one"},
-		"x-tenant":      {"two"},
-		"Content-Type":  {"application/json"},
-	}
-	resp, err := c.Do(context.Background(), req)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
 }

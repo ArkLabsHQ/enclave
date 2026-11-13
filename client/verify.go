@@ -8,17 +8,17 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
+	"math"
 	"net/http"
-	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 )
@@ -87,7 +87,22 @@ func fetchAndVerifyAttestation(
 		return nil, fmt.Errorf("decode attestation document: %w", err)
 	}
 
-	var result *nitrite.Result
+	return verifyAttestationDocument(docBytes, nonce, expectedPCR0, insecureSkipCOSEVerify)
+}
+
+// verifyAttestationDocument verifies an attestation document against the AWS
+// Nitro root certificate chain, checks that it answers nonce, and validates
+// PCR0 against the expected value. insecureSkipCOSEVerify is as for
+// fetchAndVerifyAttestation.
+func verifyAttestationDocument(
+	docBytes, nonce []byte,
+	expectedPCR0 string,
+	insecureSkipCOSEVerify bool,
+) (*nitrite.Result, error) {
+	var (
+		result *nitrite.Result
+		err    error
+	)
 	if insecureSkipCOSEVerify {
 		// Manual parse — extract Document from the COSE Sign1 payload without
 		// validating the AWS Nitro chain. PCR0 + tlsKeyHash pinning below still
@@ -110,14 +125,10 @@ func fetchAndVerifyAttestation(
 	}
 
 	// Verify the nonce to confirm freshness.
-	expectedNonce, err := hex.DecodeString(nonceHex)
-	if err != nil {
-		return nil, fmt.Errorf("decode nonce: %w", err)
-	}
 	if len(result.Document.Nonce) == 0 {
 		return nil, fmt.Errorf("attestation missing nonce")
 	}
-	if !bytes.Equal(result.Document.Nonce, expectedNonce) {
+	if !bytes.Equal(result.Document.Nonce, nonce) {
 		return nil, fmt.Errorf("attestation nonce mismatch")
 	}
 
@@ -137,94 +148,144 @@ func fetchAndVerifyAttestation(
 	return result, nil
 }
 
+// verifyPCRs returns the document's non-empty PCRs in hex, after checking that
+// PCR16 onwards match expected, the secrets' public key hashes in order.
+func verifyPCRs(docPCRs map[uint][]byte, expected []string) (map[uint]string, error) {
+	pcrs := make(map[uint]string)
+	for idx, pcrBytes := range docPCRs {
+		if len(pcrBytes) > 0 {
+			pcrs[idx] = fmt.Sprintf("%x", pcrBytes)
+		}
+	}
+
+	for i, expectedHash := range expected {
+		pcrIndex := uint(16) + uint(i)
+		actual, ok := pcrs[pcrIndex]
+		if !ok {
+			return nil, fmt.Errorf("PCR%d not found in attestation document", pcrIndex)
+		}
+		if !strings.EqualFold(actual, expectedHash) {
+			return nil, fmt.Errorf(
+				"PCR%d mismatch: expected %s, got %s",
+				pcrIndex,
+				expectedHash,
+				actual,
+			)
+		}
+	}
+	return pcrs, nil
+}
+
 // UserData format embedded in NSM attestation documents:
 //
-//	"sha256:" ++ tlsKeyHash(32) ++ "ed25519:" ++ responseSigningKey(32)
+//	"sha256:" ++ tlsKeyHash(32) ++ "ed25519:" ++ responseSigningKey(32) ++
+//	"cooldown:" ++ migrationCooldownLeftSeconds(8) ++ "pcr0:" ++ migrationTargetPCR0(48)
 //
-// Total 79 bytes: the raw TLS PublicKey hash at bytes 7:39 and the raw Ed25519
-// response-signing public key at bytes 47:79.
+// Total 149 bytes: the raw TLS PublicKey hash at bytes 7:39, the raw Ed25519
+// response-signing public key at bytes 47:79, the seconds left of the pending
+// migration's cooldown as a big-endian uint64 at bytes 88:96, and the pending
+// migration's target PCR0 at bytes 101:149, all zero when none is pending.
 const (
-	udHashPrefix    = "sha256:"
-	udTLSStart      = len(udHashPrefix)
-	udTLSEnd        = udTLSStart + 32
-	udSigningPrefix = "ed25519:"
-	udSigningStart  = udTLSEnd + len(udSigningPrefix)
-	udLen           = udSigningStart + ed25519.PublicKeySize
+	udHashPrefix     = "sha256:"
+	udTLSStart       = len(udHashPrefix)
+	udTLSEnd         = udTLSStart + 32
+	udSigningPrefix  = "ed25519:"
+	udSigningStart   = udTLSEnd + len(udSigningPrefix)
+	udSigningEnd     = udSigningStart + ed25519.PublicKeySize
+	udCooldownPrefix = "cooldown:"
+	udCooldownStart  = udSigningEnd + len(udCooldownPrefix)
+	udCooldownEnd    = udCooldownStart + 8
+	udPCR0Prefix     = "pcr0:"
+	udPCR0Start      = udCooldownEnd + len(udPCR0Prefix)
+	udLen            = udPCR0Start + 48
 )
 
+// attestedUserData is the parsed attestation user_data.
+type attestedUserData struct {
+	tlsKeyHash          string            // hex-encoded SHA-256 of the TLS PublicKey
+	signingKey          ed25519.PublicKey // nil while unset
+	migrationCooldown   time.Duration
+	migrationTargetPCR0 string // hex; empty when no migration is pending
+}
+
 // parseUserData returns the hex-encoded SHA-256 fingerprint of the enclave's
-// TLS PublicKey and its response-signing key, which is nil while unset.
-func parseUserData(attestResult *nitrite.Result) (string, ed25519.PublicKey, error) {
+// TLS PublicKey, its response-signing key, which is nil while unset, and what
+// it discloses about migration.
+func parseUserData(attestResult *nitrite.Result) (*attestedUserData, error) {
 	if attestResult == nil || attestResult.Document == nil {
-		return "", nil, fmt.Errorf("no attestation result")
+		return nil, fmt.Errorf("no attestation result")
 	}
 	userData := attestResult.Document.UserData
 	if len(userData) != udLen {
-		return "", nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"user_data must be exactly %d bytes (got %d)", udLen, len(userData),
 		)
 	}
 	if string(userData[:udTLSStart]) != udHashPrefix {
-		return "", nil, fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
+		return nil, fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
 	}
 	if string(userData[udTLSEnd:udSigningStart]) != udSigningPrefix {
-		return "", nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"user_data missing %q prefix at offset %d", udSigningPrefix, udTLSEnd,
+		)
+	}
+	if string(userData[udSigningEnd:udCooldownStart]) != udCooldownPrefix {
+		return nil, fmt.Errorf(
+			"user_data missing %q prefix at offset %d", udCooldownPrefix, udSigningEnd,
+		)
+	}
+	if string(userData[udCooldownEnd:udPCR0Start]) != udPCR0Prefix {
+		return nil, fmt.Errorf(
+			"user_data missing %q prefix at offset %d", udPCR0Prefix, udCooldownEnd,
 		)
 	}
 	h := hex.EncodeToString(userData[udTLSStart:udTLSEnd])
 	if isAllZeroHex(h) {
-		return "", nil, fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
+		return nil, fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
 	}
 	var signingKey ed25519.PublicKey
-	if key := userData[udSigningStart:]; !bytes.Equal(key, make([]byte, len(key))) {
+	if key := userData[udSigningStart:udSigningEnd]; !bytes.Equal(key, make([]byte, len(key))) {
 		signingKey = bytes.Clone(key)
 	}
-	return h, signingKey, nil
+	cooldown := binary.BigEndian.Uint64(userData[udCooldownStart:udCooldownEnd])
+	if cooldown > uint64(math.MaxInt64/int64(time.Second)) {
+		return nil, fmt.Errorf("attested migration cooldown out of range: %ds", cooldown)
+	}
+	var targetPCR0 string
+	if target := hex.EncodeToString(userData[udPCR0Start:]); !isAllZeroHex(target) {
+		targetPCR0 = target
+	}
+	return &attestedUserData{
+		tlsKeyHash:          h,
+		signingKey:          signingKey,
+		migrationCooldown:   time.Duration(cooldown) * time.Second,
+		migrationTargetPCR0: targetPCR0,
+	}, nil
 }
 
 // Signed responses; runtime/servers.go holds the signing half.
 const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
+	timestampHeader = "X-Enclave-Timestamp"
 )
 
-// prepareResponseSigningContext asks for a signed response under a fresh nonce and
-// captures the authority, headers, and body the response must authenticate.
-func prepareResponseSigningContext(req *http.Request) (signing.ResponseSigningContext, error) {
-	var body []byte
-	if req.Body != nil {
-		var err error
-		if body, err = io.ReadAll(req.Body); err != nil {
-			return signing.ResponseSigningContext{}, fmt.Errorf("read request body: %w", err)
-		}
-		_ = req.Body.Close()
-		req.Body = io.NopCloser(bytes.NewReader(body))
-	}
-	// Normalize aliases before HTTP/2 can serialize map keys in a different
-	// order. Preserve repeated values in the same order as HTTP/1 writes them.
-	headers := make(http.Header, len(req.Header)+1)
-	for _, name := range slices.Sorted(maps.Keys(req.Header)) {
-		canonical := http.CanonicalHeaderKey(name)
-		headers[canonical] = append(headers[canonical], req.Header[name]...)
-	}
-	req.Header = headers
-	// Let the transport ask for gzip and decode it, so the body we hash is the
-	// decoded one the runtime signed, even if a proxy compresses it.
-	req.Header.Del("Accept-Encoding")
-	// http.Client adds URL credentials after Do starts; bind them before that.
-	if req.URL != nil && req.URL.User != nil && req.Header.Get("Authorization") == "" {
-		password, _ := req.URL.User.Password()
-		req.SetBasicAuth(req.URL.User.Username(), password)
-	}
-	req.Header.Set(signNonceHeader, rand.Text())
-	return signing.CaptureResponseSigningContext(req, body)
-}
-
-// verifyResponseSignature checks the X-Enclave-Signature header over msg.
-func verifyResponseSignature(key ed25519.PublicKey, msg []byte, header http.Header) error {
+// verifyResponseSignature checks the X-Enclave-Signature header over the
+// message for the X-Enclave-Timestamp header, the enclave's time in Unix
+// milliseconds when it passed the request to the app. A missing header is
+// named in the error.
+func verifyResponseSignature(
+	key ed25519.PublicKey, header http.Header, message func(timestamp time.Time) []byte,
+) error {
 	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
-	if err != nil || !ed25519.Verify(key, msg, sig) {
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("missing or invalid %s", signatureHeader)
+	}
+	ms, err := strconv.ParseInt(header.Get(timestampHeader), 10, 64)
+	if err != nil {
+		return fmt.Errorf("missing or invalid %s", timestampHeader)
+	}
+	if !ed25519.Verify(key, message(time.UnixMilli(ms)), sig) {
 		return fmt.Errorf("missing or invalid %s", signatureHeader)
 	}
 	return nil

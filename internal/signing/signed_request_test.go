@@ -7,156 +7,29 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-const signNonceHeader = "X-Enclave-Sign-Nonce"
-
 // This literal pins the wire contract the README documents.
 func TestSignedRequestWireFormat(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://API.Example:443/orders?x=1", nil)
+	nonce, err := hex.DecodeString("00112233445566778899aabbccddeeff00112233")
 	require.NoError(t, err)
-	req.Header = http.Header{
-		"Authorization": {" Bearer alice\t"},
-		"Content-Type":  {"application/json"},
-		signNonceHeader: {"n1"},
-		"X-Tenant":      {"one", "two"},
-	}
-	signingContext, err := CaptureResponseSigningContext(req, []byte("amount=10"))
-	require.NoError(t, err)
-	// X-Tenant is not a covered header.
-	canonical := "authorization:QmVhcmVyIGFsaWNl\n" +
-		"content-type:YXBwbGljYXRpb24vanNvbg==\n" +
-		"x-enclave-sign-nonce:bjE=\n"
-	headersHash := sha256.Sum256([]byte(canonical))
-	reqHash := sha256.Sum256([]byte("amount=10"))
-	respHash := sha256.Sum256([]byte("echo:amount=10"))
-	msg := signingContext.ResponseMessage(respHash, http.StatusCreated)
+	response := []byte{0x0a, 0x02, 'p', 'k'}
+	respHash := sha256.Sum256(response)
+	msg := ResponseMessage(
+		http.MethodPost, "/signer.v1.SignerService/GetPubkey", nonce,
+		time.UnixMilli(1793491200123), nil, 0, response,
+	)
 	require.Equal(t,
-		"enclave-signed-response\nPOST /orders?x=1\napi.example:443\n"+
-			hex.EncodeToString(headersHash[:])+"\n"+hex.EncodeToString(reqHash[:])+
-			"\n201\n"+hex.EncodeToString(respHash[:]),
+		"enclave-signed-response\nPOST /signer.v1.SignerService/GetPubkey\n"+
+			"00112233445566778899aabbccddeeff00112233\n"+
+			"1793491200123\n"+
+			// SHA-256 of the empty request.
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"+
+			"0\n"+hex.EncodeToString(respHash[:]),
 		string(msg))
-	req.Header["Authorization"][0] = "Bearer bob"
-	req.Header.Del("X-Tenant")
-	req.Header.Set("X-Admin", "true")
-	require.Equal(t, msg, signingContext.ResponseMessage(respHash, http.StatusCreated),
-		"later changes to header values and names must not change the captured message")
-}
-
-func TestSignedRequestHeaderCanonicalization(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		a, b  http.Header
-		equal bool
-	}{
-		{
-			"name case and edge whitespace",
-			http.Header{"authorization": {" \tBearer alice\t "}},
-			http.Header{"Authorization": {"Bearer alice"}},
-			true,
-		},
-		{
-			"internal whitespace matters",
-			http.Header{"Authorization": {"Bearer  alice"}},
-			http.Header{"Authorization": {"Bearer alice"}},
-			false,
-		},
-		{
-			"empty is not absent",
-			http.Header{"Authorization": {""}},
-			http.Header{},
-			false,
-		},
-		{
-			"nil values are absent",
-			http.Header{"Authorization": nil},
-			http.Header{},
-			true,
-		},
-		{
-			"duplicates are not comma folding",
-			http.Header{"Authorization": {"alice", "bob"}},
-			http.Header{"Authorization": {"alice,bob"}},
-			false,
-		},
-		{
-			"duplicate order matters",
-			http.Header{"Authorization": {"alice", "bob"}},
-			http.Header{"Authorization": {"bob", "alice"}},
-			false,
-		},
-		{
-			"differently cased keys preserve wire order",
-			http.Header{"Authorization": {"one"}, "authorization": {"two"}},
-			http.Header{"Authorization": {"one", "two"}},
-			true,
-		},
-		{
-			"uncovered headers are ignored",
-			http.Header{
-				"Cookie": {"session=bob"}, "Origin": {"https://evil.example"},
-				"X-Forwarded-For": {"10.0.0.1"}, "X-Tenant-ID": {"bob"},
-				"User-Agent": {"browser"}, "Connection": {"close"},
-			},
-			http.Header{},
-			true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := hashHeaders(tc.a)
-			b := hashHeaders(tc.b)
-			require.Equal(t, tc.equal, a == b)
-		})
-	}
-}
-
-func TestSignedRequestCoversListedHeaders(t *testing.T) {
-	for _, name := range []string{"Authorization", "Content-Type", signNonceHeader} {
-		t.Run(name, func(t *testing.T) {
-			before := hashHeaders(nil)
-			present := hashHeaders(http.Header{name: {"alice"}})
-			changed := hashHeaders(http.Header{name: {"bob"}})
-			duplicate := hashHeaders(http.Header{name: {"alice", "bob"}})
-			require.NotEqual(t, before, present, "insertion/removal must change the signature")
-			require.NotEqual(t, present, changed)
-			require.NotEqual(t, present, duplicate)
-		})
-	}
-}
-
-func TestSignedRequestAuthority(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "https://backend.example/orders?", nil)
-	require.NoError(t, err)
-	req.Host = "Bücher.Example:8443"
-	signingContext, err := CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	require.Equal(t, "xn--bcher-kva.example:8443", signingContext.Authority)
-	require.Equal(t, "/orders", signingContext.URI)
-	req.Header.Set("Host", "untrusted.example")
-	again, err := CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	respHash := sha256.Sum256(nil)
-	require.Equal(t, signingContext.ResponseMessage(respHash, http.StatusOK),
-		again.ResponseMessage(respHash, http.StatusOK), "Host in Header is not the HTTP authority")
-}
-
-func TestSignedRequestRejectsAmbiguousForwarding(t *testing.T) {
-	for _, option := range []string{"Authorization", "Cookie", "X-Tenant-ID", "upgrade"} {
-		t.Run(option, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodGet, "https://api.example/", nil)
-			require.NoError(t, err)
-			req.Header.Set("Connection", "keep-alive, "+option)
-			_, err = CaptureResponseSigningContext(req, nil)
-			require.ErrorContains(t, err, "Connection")
-		})
-	}
-	req, err := http.NewRequest(http.MethodPost, "https://api.example/", strings.NewReader("body"))
-	require.NoError(t, err)
-	req.Trailer = http.Header{"Authorization": {"Bearer alice"}}
-	_, err = CaptureResponseSigningContext(req, nil)
-	require.ErrorContains(t, err, "trailers")
 }
 
 func TestSignedRequestTarget(t *testing.T) {
@@ -170,16 +43,11 @@ func TestSignedRequestTarget(t *testing.T) {
 		raw := "GET " + target + " HTTP/1.1\r\nHost: api.example\r\n\r\n"
 		req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
 		require.NoError(t, err)
-		signingContext, err := CaptureResponseSigningContext(req, nil)
-		require.NoError(t, err)
-		require.Equal(t, want, signingContext.URI, target)
+		require.Equal(t, want, RequestTarget(req), target)
 	}
 
 	// Client requests: sign what Go's transport sends, without an empty "?".
 	req, err := http.NewRequest(http.MethodGet, "https://[fe80::1%25eth0]:8443/items/a|b?", nil)
 	require.NoError(t, err)
-	signingContext, err := CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	require.Equal(t, "/items/a%7Cb", signingContext.URI)
-	require.Equal(t, "[fe80::1]:8443", signingContext.Authority, "the transport drops the zone")
+	require.Equal(t, "/items/a%7Cb", RequestTarget(req))
 }

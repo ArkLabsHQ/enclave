@@ -775,7 +775,7 @@ preflight to any path in that namespace is answered `204` by the runtime.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 79 bytes: ASCII `sha256:`, the raw 32-byte SHA-256 of the TLS PublicKey, ASCII `ed25519:`, then the raw 32-byte Ed25519 response-signing public key (all zero until state is established). `503` until the application has been started, so always on a candidate. |
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 149 bytes: ASCII `sha256:`, the raw 32-byte SHA-256 of the TLS PublicKey, ASCII `ed25519:`, the raw 32-byte Ed25519 response-signing public key (all zero until state is established), ASCII `cooldown:`, the seconds left of the pending migration's cooldown, rounded up, as a big-endian uint64 (zero unless an intent is cooling down), then ASCII `pcr0:` and the raw 48-byte target PCR0 of a pending migration (all zero unless an intent is cooling down or eligible). While the intent log cannot be read the endpoint answers `500` rather than attest that no migration is pending. `503` until the application has been started, so always on a candidate. |
 | GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` when the boot stops at the permission preflight or telemetry, naming the missing grants for the preflight), for a candidate the predecessor offering it a handoff, PCR0, the predecessor PCR0 measured into the image, with its attestation once an adopted snapshot is published, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. Signed on request; see [Signed responses](#signed-responses). |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before, and `{"status":"upstream_exited"}` with status 503 after the application process exits. |
 | any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
@@ -797,47 +797,49 @@ application endpoint.
 
 A proxy in front of the enclave defeats TLS pinning, so a client can instead ask
 for each application response to be signed. A request carrying
-`X-Enclave-Sign-Nonce: <nonce>` (any non-empty value; use a fresh random one per
-request) gets back `X-Enclave-Signature`, a base64 Ed25519 signature by the key
-in the attestation `user_data` over these lines joined by `\n`, with no trailing
-newline:
+`X-Enclave-Sign-Nonce: <nonce>` (exactly 40 hex digits: a fresh random 20 bytes
+per request) gets back `X-Enclave-Timestamp`, the enclave's time in Unix
+milliseconds when the runtime passed the request to the application, and
+`X-Enclave-Signature`, a base64 Ed25519 signature by the key in the attestation
+`user_data` over these lines joined by `\n`, with no trailing newline:
 
 ```
 enclave-signed-response
 <METHOD> <path as received, then ?query only if the query is non-empty>
-<lowercase authority: Host / HTTP/2 :authority, including any explicit port>
-<hex SHA-256 of the canonical request headers>
-<hex SHA-256 of the request body>
-<status code, decimal>
-<hex SHA-256 of the response body>
+<lowercase hex of the 20-byte nonce>
+<X-Enclave-Timestamp, in decimal>
+<hex SHA-256 of the request>
+<status, in decimal>
+<hex SHA-256 of the response>
 ```
 
-The signature binds the response to the request's method, path/query, authority,
-body, and its `Authorization`, `Content-Type`, and `X-Enclave-Sign-Nonce`
-headers; the nonce is bound through the header hash. Adding, removing, or
-changing a covered header invalidates verification. A gateway must preserve the
-authority and the covered headers; rewriting the path also breaks verification.
+Any other nonce value, or a repeated header, is answered `400` before the
+application sees the request. The nonce has the attestation nonce's shape, so a
+service relaying for an end client can bind the attestation document and the
+signature to the client's one nonce. When the service chooses the nonce
+instead, the client checks freshness by time: the response was produced no
+earlier than its timestamp, so a client rejects one older than its own request,
+even if the service pairs it with a fresh attestation.
 
-No other request header is covered. Browsers, proxies, and CDNs add and rewrite
-headers such as `Origin`, `Cookie`, `X-Forwarded-For`, and tracing IDs in
-transit, and page JavaScript cannot read `HttpOnly` cookies, so covering them
-would fail legitimate requests. In a signed request an application must not rely
-on any other header for identity or authority, cookies and custom headers such
-as `X-API-Key` or `X-Tenant-ID` included: a proxy can add or change them
-unnoticed.
+For HTTP the request and the response are the bodies, and the status is the
+response's status code. For gRPC they are the request's and the response's one
+uncompressed message without its 5-byte gRPC prefix, the request's empty for
+`GetPubkey`, and the status is the `grpc-status` trailer, `0` for success; the
+timestamp and signature arrive as `x-enclave-timestamp` and
+`x-enclave-signature` header metadata, and the method line
+reads, for example, `POST /signer.v1.SignerService/GetPubkey`. A gRPC exchange
+without exactly one uncompressed message each way and a `grpc-status` trailer
+is forwarded unsigned, so verification rejects it.
 
-The canonical headers are the covered names that are present, lowercase and
-sorted. Each is a record `name:base64(value1),base64(value2)\n`, including its
-final newline. Values are raw HTTP header bytes, with only leading/trailing
-spaces and tabs trimmed. Repeated values preserve their order and remain
-distinct from comma-folded values. An absent header has no record; a present
-empty value has one. Signed requests reject trailers and `Connection` options
-other than `close`/`keep-alive`, so a proxy cannot hide a covered header from
-the application by marking it hop-by-hop.
-
-Verification detects tampering when the response arrives; it does not prevent
-an altered request from executing. Response headers are not authenticated.
-Unsigned requests do not use this signature format.
+The signature binds the response and its status to the request's method, path
+and query, nonce, and body. Nothing else is covered: not the request's
+authority or headers, and not response headers. A proxy can change those
+unnoticed, so in a signed request an application must not let anything but the
+method, target, and body, such as `Authorization` or cookies, decide what it
+answers. Likewise, a client must not rely on response headers, such as
+`Content-Type`, `Location`, or `Set-Cookie`, for anything it needs to trust:
+only the status and the body are verified. Verification detects tampering when
+the response arrives; it does not prevent an altered request from executing.
 
 Boot derives the key from the deployment's master seed and the current PCR0
 read from NSM using HKDF-SHA256 with salt `enclave.derived-secret.v1`. The
@@ -850,23 +852,23 @@ key. This separates responses by measured image; a holder of
 the shared master seed can still derive keys for other PCR0 values.
 
 Requests without the header are proxied unchanged and stream as before.
-Signed request and response bodies are buffered whole before the signature is
-sent, so signed requests suit bounded bodies, not uploads, downloads or streams. Signed responses carry `Cache-Control: no-store`, since each
-answers a single nonce. The `502` for an unreachable application is signed like
-any other response. `/enclave/v1/info` is signed the same way once the runtime
-holds its signing key; before that, as a candidate, a signed request to it is
-answered `503` while unsigned requests are served as usual. Other `/enclave/*`
-endpoints, `/health`, the `503` served before the application starts, and gRPC
-are not signed.
+Signed requests and their responses are buffered whole before the signature is
+sent, so signed requests suit bounded bodies and unary gRPC calls, not uploads,
+downloads or streams. Signed responses carry `Cache-Control: no-store`, since each answers a
+single nonce. The `502` for an unreachable application is signed like any other
+response. `/enclave/v1/info` is signed the same way once the runtime holds
+its signing key; before that, as a candidate, a signed request to it is answered
+`503` while unsigned requests are served as usual. Other `/enclave/*` endpoints,
+`/health`, and the `503` served before the application starts are not signed.
 
 The response body is signed decoded: for a signed request the runtime drops
 `Accept-Encoding` before proxying, so Go's upstream transport requests gzip and
 decodes it, and clients verify the body after their own decompression (the Go
 client also lets its transport handle compression). An application that sends a
 compressed body regardless of `Accept-Encoding`, such as pre-compressed `br`
-assets, fails verification. Signed responses carry
-`Access-Control-Expose-Headers: X-Enclave-Signature`; a cross-origin page also
-needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
+assets, fails verification. Signed responses expose `X-Enclave-Signature` and
+`X-Enclave-Timestamp` through `Access-Control-Expose-Headers`; a cross-origin
+page also needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
 
 ##### Verifying in a browser
 
@@ -882,23 +884,17 @@ async function signedFetch(url, init = {}, signingKey) {
   const headers = new Headers(init.headers);
   headers.set("X-Enclave-Sign-Nonce", nonce);
 
-  // Build once: Request captures the automatic Content-Type and the body bytes.
   const req = new Request(new URL(url, location.href), {
     ...init, headers, redirect: "error", cache: "no-store",
   });
   const u = new URL(req.url);
   const reqBody = await req.clone().arrayBuffer();
-  const canonical = ["authorization", "content-type", "x-enclave-sign-nonce"]
-    .filter((name) => req.headers.has(name))
-    .map((name) => `${name}:${btoa(req.headers.get(name).replace(/^[ \t]+|[ \t]+$/g, ""))}\n`)
-    .join("");
-  const headerHash = await sha256(new TextEncoder().encode(canonical));
 
   const resp = await fetch(req);
   const body = new Uint8Array(await resp.arrayBuffer());
   const msg = `enclave-signed-response\n${req.method} ${u.pathname}${u.search}\n` +
-    `${u.host.toLowerCase()}\n${headerHash}\n${await sha256(reqBody)}\n` +
-    `${resp.status}\n${await sha256(body)}`;
+    `${nonce}\n${resp.headers.get("X-Enclave-Timestamp")}\n` +
+    `${await sha256(reqBody)}\n${resp.status}\n${await sha256(body)}`;
 
   const key = await crypto.subtle.importKey("raw", signingKey, { name: "Ed25519" }, false, ["verify"]);
   const sig = Uint8Array.from(atob(resp.headers.get("X-Enclave-Signature") ?? ""), (c) => c.charCodeAt(0));
@@ -908,9 +904,6 @@ async function signedFetch(url, init = {}, signingKey) {
   return { status: resp.status, headers: resp.headers, body };
 }
 ```
-
-Cookies, if the page sends them, are not covered; authenticate signed requests
-with an `Authorization` header.
 
 #### Ancestor-key audit
 
@@ -1258,7 +1251,7 @@ The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 | `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
 | `-H`, `--header` | none | `Name: value`, repeatable. |
 | `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
-| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 79-byte `user_data` binding, and live certificate pinning are still checked. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 149-byte `user_data` binding, and live certificate pinning are still checked. |
 | `--signed` | `false` | Require a [signed response](#signed-responses), verified against the attested signing key. Covers application routes and `/enclave/v1/info`. |
 | `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
@@ -1321,7 +1314,7 @@ What is verified on the first request, and cached for `CacheTTL`:
 | Fresh 20-byte nonce echoed in the attestation document | always | nothing |
 | COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
 | PCR0 equals `ExpectedPCR0` | always | nothing |
-| `user_data` is exactly the 79-byte TLS PublicKey hash and signing key layout, and the live certificate contains that public key | on | `InsecureTLS` |
+| `user_data` is exactly the 149-byte TLS PublicKey hash, signing key, and migration layout, and the live certificate contains that public key | on | `InsecureTLS` |
 | Public CA and hostname validation | off | enabled by `StrictTLS` |
 | PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
 | Each response's signature verifies under the attested signing key (per response, not cached) | off | enabled by `SignedResponses` |
@@ -1329,6 +1322,11 @@ What is verified on the first request, and cached for `CacheTTL`:
 The certificate pin is installed from the attestation document before any
 request carrying data is made, so a request issued before verification completes
 fails closed.
+
+The `AttestationResult` from `VerifyAttestation` also carries what the enclave
+attests about migration: `MigrationTargetPCR0`, the hex PCR0 a pending migration
+would hand off to, empty when none is pending, and `MigrationCooldown`, how long
+after the attestation the enclave may hand off to it, zero once it may.
 
 `GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
 but does not perform public CA validation. Applications serving gRPC must set

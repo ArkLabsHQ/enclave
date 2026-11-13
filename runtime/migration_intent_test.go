@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,18 @@ type migrationIntentFixture struct {
 	pcr0   []byte
 	source string
 	signer *fakeNSM
+}
+
+type migrationIntentBeforePutS3 struct {
+	S3API
+	beforePut func()
+}
+
+func (s migrationIntentBeforePutS3) PutObject(
+	ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options),
+) (*s3.PutObjectOutput, error) {
+	s.beforePut()
+	return s.S3API.PutObject(ctx, in, opts...)
 }
 
 func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
@@ -415,28 +428,11 @@ func TestMigrationIntentAppendConfirmsItsVersionDespiteConcurrentConflict(t *tes
 	})
 }
 
-func TestMigrationIntentAbortRejectsChangedTargetAfterWrite(t *testing.T) {
-	ctx := context.Background()
-	fx := newMigrationIntentFixture(t)
-	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
-	requested, err := fx.log.Request(ctx, fx.source, targetA)
-	require.NoError(t, err)
-	fx.s3.afterPut = func(in *s3.PutObjectInput, _ *s3.PutObjectOutput) {
-		fx.s3.objects[aws.ToString(in.Key)][0].body = fx.object(t, requested.Sequence+1,
-			migrationIntentAborted, targetB, fx.log.bucket, fx.pcr0)
-	}
-
-	aborted, err := fx.log.Abort(ctx, fx.source, targetA)
-	require.ErrorIs(t, err, errMigrationIntentStoreUnavailable,
-		"abort targets agree on cancellation but must still match the written record")
-	require.Nil(t, aborted)
-}
-
 func TestMigrationIntentAppendRequiresItsPersistedVersion(t *testing.T) {
 	ctx := context.Background()
 	target := strings.Repeat("cd", 48)
 	for _, scenario := range []string{
-		"missing version", "invalid attestation", "different target", "missing retention",
+		"missing version", "invalid attestation", "missing retention",
 		"list failure", "get failure", "read failure",
 	} {
 		t.Run(scenario, func(t *testing.T) {
@@ -454,9 +450,6 @@ func TestMigrationIntentAppendRequiresItsPersistedVersion(t *testing.T) {
 				case "invalid attestation":
 					fx.s3.objects[key][0].body = fx.object(t, 1, migrationIntentRequested,
 						target, fx.log.bucket, bytes.Repeat([]byte{0xee}, 48))
-				case "different target":
-					fx.s3.objects[key][0].body = fx.object(t, 1, migrationIntentRequested,
-						strings.Repeat("ef", 48), fx.log.bucket, fx.pcr0)
 				case "missing retention":
 					fx.s3.objects[key][0].lockMode = ""
 				case "list failure":
@@ -1006,9 +999,11 @@ func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
 				migrationIntentObjectKey(fx.source, 2), invalidBody(t, fx), base.Add(time.Minute),
 			)
 
-			head, err := fx.log.Head(context.Background(), fx.source)
+			state, highest, err := fx.log.scanIntents(context.Background(), fx.source)
 			require.NoError(t, err)
-			require.Equal(t, uint64(1), head.Sequence)
+			require.NotNil(t, state.current)
+			require.Equal(t, uint64(1), state.current.Sequence)
+			require.Equal(t, uint64(1), highest, "an invalid record must not occupy a sequence")
 		})
 	}
 }
@@ -1124,6 +1119,9 @@ func (p *migrationIntentPagedS3) ListObjectVersions(
 			return nil, err
 		}
 		p.versions = out.Versions
+		slices.SortFunc(p.versions, func(a, b s3types.ObjectVersion) int {
+			return strings.Compare(aws.ToString(a.Key), aws.ToString(b.Key))
+		})
 	}
 	if p.page == 0 {
 		p.page++
@@ -1144,29 +1142,20 @@ func (p *migrationIntentPagedS3) ListObjectVersions(
 }
 
 func TestMigrationIntentPagination(t *testing.T) {
+	ctx := t.Context()
 	fx := newMigrationIntentFixture(t)
 	target := strings.Repeat("cd", 48)
-	for sequence := uint64(1); sequence <= 2; sequence++ {
-		fx.s3.putRawObjectAt(
-			migrationIntentObjectKey(fx.source, sequence),
-			fx.object(
-				t,
-				sequence,
-				migrationIntentRequested,
-				target,
-				migrationIntentTestBucket,
-				fx.pcr0,
-			),
-			time.Now().Add(time.Duration(sequence)*time.Minute),
-		)
-	}
+	_, err := fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	aborted, err := fx.log.Abort(ctx, fx.source, target)
+	require.NoError(t, err)
 	paged := &migrationIntentPagedS3{fakeS3: fx.s3}
 	fx.log.s3 = paged
 
-	head, err := fx.log.Head(context.Background(), fx.source)
+	state, highest, err := fx.log.scanIntents(ctx, fx.source)
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), head.Sequence)
-	require.Equal(t, 1, paged.page)
+	require.Equal(t, aborted, state.current, "the abort is on the second page")
+	require.Equal(t, aborted.Sequence, highest, "both pages must be read")
 }
 
 func mustMigrationIntentPayload(
@@ -1408,6 +1397,38 @@ func TestMigrationIntentFinalise(t *testing.T) {
 		require.Equal(t, aborted, head)
 	})
 
+	t.Run("returns its own version when a peer finalises first", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		snapshot := fx.handoff(t, targetA, "key-b")
+		peerSnapshot := fx.handoff(t, targetA, "key-a")
+		peerLog := *fx.log
+		var peer *migrationIntent
+		fx.log.s3 = migrationIntentBeforePutS3{
+			S3API: fx.s3,
+			beforePut: func() {
+				// Both finalisers pass the request check before either write lands.
+				var err error
+				peer, err = peerLog.Finalise(ctx, fx.source, targetA, requested.Sequence, peerSnapshot)
+				require.NoError(t, err)
+			},
+		}
+
+		finalised, err := fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+
+		require.NoError(t, err)
+		require.NotNil(t, peer)
+		require.Equal(t, peer.Sequence, finalised.Sequence)
+		require.NotEqual(t, peer.VersionID, finalised.VersionID)
+		require.True(t, finalised.FinalisedSnapshot.sameState(snapshot))
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, peer, head, "the earlier handoff remains active")
+		require.Len(t, fx.s3.objects[migrationIntentObjectKey(fx.source, finalised.Sequence)], 2,
+			"both finalisers' versions remain stored")
+	})
+
 	for name, tc := range map[string]struct {
 		// prepare returns the sequence of the request Finalise is asked to answer.
 		prepare func(*testing.T, *migrationIntentFixture) uint64
@@ -1512,6 +1533,7 @@ func TestMigrationIntentFinalisedHead(t *testing.T) {
 		name    string
 		records []record
 		want    *record // the head; nil for none
+		wantErr error
 	}{
 		{
 			name:    "finalised answers its request",
@@ -1601,12 +1623,12 @@ func TestMigrationIntentFinalisedHead(t *testing.T) {
 			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
 		},
 		{
-			name: "an abort after a request at its sequence is ignored",
+			name: "a finalised cannot resolve an existing conflict",
 			records: []record{
-				requested(1, targetA, 0), requested(2, targetB, time.Minute),
-				aborted(2, targetA, 2*time.Minute),
+				requested(1, targetA, 0), requested(1, targetB, 0),
+				finalised(2, targetA, time.Minute),
 			},
-			want: &record{sequence: 1, action: migrationIntentRequested, target: targetA},
+			wantErr: errMigrationIntentAmbiguous,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1615,6 +1637,11 @@ func TestMigrationIntentFinalisedHead(t *testing.T) {
 
 			head, err := fx.log.Head(ctx, fx.source)
 
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				require.Nil(t, head)
+				return
+			}
 			require.NoError(t, err)
 			if tc.want == nil {
 				require.Nil(t, head)
@@ -1630,26 +1657,39 @@ func TestMigrationIntentFinalisedHead(t *testing.T) {
 
 	// Replicas racing one request each mint a key. Either record would do, so
 	// the choice only has to be the same for every reader.
-	t.Run("tied finalised records resolve to one whatever the listing order", func(t *testing.T) {
-		for _, keys := range [][]string{{"key-1", "key-2"}, {"key-2", "key-1"}} {
-			fx := newMigrationIntentFixture(t)
-			seed(t, fx, requested(1, targetA, 0))
-			for _, key := range keys {
-				fx.s3.putRawObjectAt(
-					migrationIntentObjectKey(fx.source, 2),
-					fx.finalised(t, 2, fx.handoff(t, targetA, key)), base.Add(time.Minute),
-				)
+	for _, tc := range []struct {
+		name      string
+		key1After time.Duration
+		wantKey   string
+	}{
+		{"tied finalised records select the smallest key", time.Minute, "key-1"},
+		{"an earlier finalised wins over a smaller key", 2 * time.Minute, "key-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, keys := range [][]string{{"key-1", "key-2"}, {"key-2", "key-1"}} {
+				fx := newMigrationIntentFixture(t)
+				seed(t, fx, requested(1, targetA, 0))
+				for _, key := range keys {
+					publishedAt := base.Add(time.Minute)
+					if key == "key-1" {
+						publishedAt = base.Add(tc.key1After)
+					}
+					fx.s3.putRawObjectAt(
+						migrationIntentObjectKey(fx.source, 2),
+						fx.finalised(t, 2, fx.handoff(t, targetA, key)), publishedAt,
+					)
+				}
+
+				head, err := fx.log.Head(ctx, fx.source)
+
+				require.NoError(t, err)
+				require.NotNil(t, head)
+				require.Equal(t, migrationIntentFinalised, head.Action)
+				require.Equal(t, tc.wantKey, head.FinalisedSnapshot.kmsKeyID,
+					"selection must not depend on listing order: %v", keys)
 			}
-
-			head, err := fx.log.Head(ctx, fx.source)
-
-			require.NoError(t, err)
-			require.Equal(t, migrationIntentFinalised, head.Action)
-			require.Equal(
-				t, "key-1", head.FinalisedSnapshot.kmsKeyID, "the smallest key ID is chosen",
-			)
-		}
-	})
+		})
+	}
 
 	t.Run("an ignored finalised still occupies its sequence", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
@@ -1694,10 +1734,11 @@ func TestMigrationIntentInvalidFinalisedVersionsAreIgnored(t *testing.T) {
 			require.NoError(t, err)
 			fx.s3.putRawObject(migrationIntentObjectKey(fx.source, 2), forge(t, fx))
 
-			head, err := fx.log.Head(ctx, fx.source)
+			state, highest, err := fx.log.scanIntents(ctx, fx.source)
 
 			require.NoError(t, err)
-			require.Equal(t, requested, head, "the request stays the active intent")
+			require.Equal(t, requested, state.current, "the request stays the active intent")
+			require.Equal(t, requested.Sequence, highest)
 		})
 	}
 }

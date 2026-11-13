@@ -541,6 +541,14 @@ func (m *migrationBoot) verifySnapshot(
 			"handoff predecessor does not match previous PCR0 committed in the EIF",
 		)
 	}
+	if snapshot.ownerPCR0 != hex.EncodeToString(config.currentPCR0) {
+		return Snapshot{}, fmt.Errorf("handoff snapshot owner does not match current PCR0")
+	}
+	if snapshot.migrationIntentBucketName != config.snapshotBucket {
+		return Snapshot{}, fmt.Errorf(
+			"handoff snapshot bucket does not match configured snapshot bucket",
+		)
+	}
 	return snapshot, nil
 }
 

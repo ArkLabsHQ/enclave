@@ -664,6 +664,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		eif             string          // ENCLAVE_PREVIOUS_PCR0
 		pcrs            map[uint][]byte // attested by the finalised intent
 		intents         []intentSeed
+		owner, bucket   string
 		beforeEstablish func(*fakeS3, *fakeNSM)
 	}
 	valid := func() adoption {
@@ -671,6 +672,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			predecessor: prevHex, eif: prevHex,
 			pcrs:    map[uint][]byte{0: prev, migrationPCRIndex: pcrExtendFromZero(current)},
 			intents: finalised(prev, currentHex),
+			owner:   currentHex, bucket: stateOriginTestMigrationIntentBucket(),
 		}
 	}
 	type outcome struct {
@@ -687,9 +689,9 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		signer := newFakeNSMValid(t, bootAt.Add(-24*time.Hour), bootAt.Add(24*time.Hour))
 		kmsf := newFakeKMS()
 		handoff := Snapshot{
-			kmsKeyID: keyID, ownerPCR0: currentHex,
+			kmsKeyID: keyID, ownerPCR0: a.owner,
 			predecessorPCR0: a.predecessor, predecessorKMSKeyID: "previous-key",
-			migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
+			migrationIntentBucketName: a.bucket,
 		}
 		handoff.masterSeedCiphertext, handoff.tlsKeyCiphertext = handoffCiphertexts(
 			t, testCfg, kmsf, keyID,
@@ -700,7 +702,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		for _, seed := range a.intents {
 			if seed.action == migrationIntentFinalised {
 				seedMigrationFinalisedIntent(
-					t, s3f, signer, a.pcrs, handoff, seed.sequence, seed.at,
+					t, s3f, signer, a.pcrs, seed.target, handoff, seed.sequence, seed.at,
 				)
 			} else {
 				seedMigrationIntent(
@@ -739,8 +741,10 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		require.Error(t, out.err)
 		require.Zero(t, out.kms.decryptCalls, "nothing may decrypt before the handoff verifies")
 		require.Equal(t, out.before, out.ssm.params, "a refused adoption writes nothing to SSM")
-		require.Empty(t, out.s3.objects[snapshotObjectKey(currentHex)],
-			"a refused adoption publishes nothing")
+		for key := range out.s3.objects {
+			require.False(t, strings.HasPrefix(key, snapshotObjectPrefix),
+				"a refused adoption must not publish %s", key)
+		}
 	}
 
 	t.Run("accepts a valid handoff and publishes both receipts", func(t *testing.T) {
@@ -768,6 +772,16 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		is     error
 		msg    string
 	}{
+		{
+			name:   "rejects an authenticated snapshot naming another owner",
+			modify: func(a *adoption) { a.owner = otherHex },
+			msg:    "handoff snapshot owner does not match current PCR0",
+		},
+		{
+			name:   "rejects an authenticated snapshot naming another bucket",
+			modify: func(a *adoption) { a.bucket = "other-snapshot-bucket" },
+			msg:    "handoff snapshot bucket does not match configured snapshot bucket",
+		},
 		{
 			name: "rejects a transition receipt with the wrong PCR31",
 			modify: func(a *adoption) {
@@ -1247,14 +1261,14 @@ func seedMigrationIntent(
 	)
 }
 
-// seedMigrationFinalisedIntent writes the record that hands snapshot to its
-// owner. predecessorPCRs are what the predecessor attests: PCR0 is its own
-// measurement and PCR31 its commitment to the owner.
+// seedMigrationFinalisedIntent signs snapshot and targetPCR0 independently so
+// tests can model an authenticated handoff with inconsistent contents.
 func seedMigrationFinalisedIntent(
 	t *testing.T,
 	s3f *fakeS3,
 	signer *fakeNSM,
 	predecessorPCRs map[uint][]byte,
+	targetPCR0 string,
 	snapshot Snapshot,
 	sequence uint64,
 	publishedAt time.Time,
@@ -1270,7 +1284,7 @@ func seedMigrationFinalisedIntent(
 		BucketName:            stateOriginTestMigrationIntentBucket(),
 		Sequence:              sequence,
 		Action:                migrationIntentFinalised,
-		TargetPCR0:            snapshot.ownerPCR0,
+		TargetPCR0:            targetPCR0,
 		FinalisedSnapshotRoot: snapshotRootOf(encodedSnapshot),
 	})
 	require.NoError(t, err)
@@ -1280,7 +1294,7 @@ func seedMigrationFinalisedIntent(
 		Schema:            migrationIntentSchemaV1,
 		Sequence:          sequence,
 		Action:            migrationIntentFinalised,
-		TargetPCR0:        snapshot.ownerPCR0,
+		TargetPCR0:        targetPCR0,
 		Attestation:       attestation.docB64,
 		FinalisedSnapshot: encodedSnapshot,
 	})
@@ -1310,7 +1324,7 @@ func seedHandoff(
 	seedMigrationFinalisedIntent(t, s3f, signer, map[uint][]byte{
 		0:                 sourcePCR0,
 		migrationPCRIndex: pcrExtendFromZero(mustDecodeHexString(snapshot.ownerPCR0)),
-	}, snapshot, 2, finalisedAt)
+	}, snapshot.ownerPCR0, snapshot, 2, finalisedAt)
 }
 
 var (

@@ -327,7 +327,7 @@ func (l *migrationIntentLog) verifyIntentExistence(
 			if listedKey != key || listedVersion != versionID || publishedAt == nil {
 				return false, nil
 			}
-			intent, valid, err := l.fetchIntent(
+			intent, valid, err := l.fetchAttestedIntent(
 				ctx, key, versionID, expected.SourcePCR0, expected.Sequence, publishedAt.UTC(),
 			)
 			if valid && intent.equivalent(expected) {
@@ -389,7 +389,7 @@ func (l *migrationIntentLog) scanIntents(
 				return false, nil
 			}
 
-			nextHead, valid, err := l.fetchIntent(
+			nextHead, valid, err := l.fetchAttestedIntent(
 				ctx, key, versionID, keySourcePCR0, sequence, lastModified.UTC(),
 			)
 			if err != nil || !valid {
@@ -436,7 +436,7 @@ func (l *migrationIntentLog) readIntent(
 	return entry, true, nil
 }
 
-func (l *migrationIntentLog) fetchIntent(
+func (l *migrationIntentLog) fetchAttestedIntent(
 	ctx context.Context,
 	key, versionID, sourcePCR0 string,
 	sequence uint64,

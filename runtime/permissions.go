@@ -264,16 +264,10 @@ func (p *permissions) requiredGrants(
 			actions:  []string{"s3:GetObject", "s3:PutObject"},
 		})
 	}
-	// SSM writes are migration coordination only: this enclave's challenge, the
-	// handoff it may write for any successor, and its answer to its predecessor.
+	// SSM writes are migration coordination only: this enclave's challenge and
+	// its answer to its predecessor. The handoff itself is an intent-log record.
 	coordination := []string{
 		p.cfg.migrationChallengeParam(p.pcr0),
-		p.cfg.kmsKeyIDParam("*"),
-		p.cfg.masterSeedCiphertextParam("*"),
-		p.cfg.tlsKeyCiphertextParam("*"),
-		p.cfg.migrationPreviousPCR0Param("*"),
-		p.cfg.migrationPreviousKMSKeyIDParam("*"),
-		p.cfg.migrationStateOriginReceiptParam("*", "*"),
 		p.cfg.migrationResponseParam("*", "*"),
 	}
 	for _, param := range coordination {

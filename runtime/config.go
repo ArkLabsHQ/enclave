@@ -460,50 +460,10 @@ func (c *Config) route53ZoneIDParam() string {
 	return c.namespace() + "/Route53ZoneID"
 }
 
-func (c *Config) kmsKeyIDParam(pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/%s/KMSKeyID/%s", c.namespace(), c.lockSegment(), strings.ToLower(pcr0),
-	)
-}
-
 // inheritSecretPrefix: SSM path prefix under which the operator places inherited
 // secrets, one parameter per configured name.
 func (c *Config) inheritSecretPrefix() string {
 	return c.namespace() + "/inherit/"
-}
-
-// masterSeedCiphertextParam: SSM path for the master seed's KMS ciphertext,
-// lock-scoped and key-scoped.
-func (c *Config) masterSeedCiphertextParam(keyID string) string {
-	return fmt.Sprintf("%s/%s/MasterSeed/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
-}
-
-// tlsKeyCiphertextParam returns the encrypted TLS key path.
-func (c *Config) tlsKeyCiphertextParam(keyID string) string {
-	return fmt.Sprintf("%s/%s/TLSKey/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
-}
-
-// migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
-// writes over a successor's state during a migration handoff. Scoped by the
-// successor key ID and the successor PCR0, and written create-only, so a
-// published handoff artifact is immutable. The key ID is minted fresh per
-// finalisation attempt, so this path is private to one attempt; the atomic
-// commitment point for a handoff is kmsKeyIDParam, not this receipt.
-func (c *Config) migrationStateOriginReceiptParam(keyID, pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/MigrationStateOriginReceipt/%s/%s", c.namespace(), keyID, strings.ToLower(pcr0),
-	)
-}
-
-// migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0,
-// scoped by the successor PCR0 that reads it.
-func (c *Config) migrationPreviousPCR0Param(pcr0 string) string {
-	return fmt.Sprintf("%s/MigrationPreviousPCR0/%s", c.namespace(), strings.ToLower(pcr0))
-}
-
-// migrationPreviousKMSKeyIDParam returns the predecessor key path for a generation.
-func (c *Config) migrationPreviousKMSKeyIDParam(pcr0 string) string {
-	return fmt.Sprintf("%s/MigrationPreviousKMSKeyID/%s", c.namespace(), strings.ToLower(pcr0))
 }
 
 // migrationChallengeParam: the live challenge published by a predecessor.

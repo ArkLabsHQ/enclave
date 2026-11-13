@@ -52,13 +52,7 @@ type bootConfig struct {
 }
 
 type bootMode interface {
-	buildSnapshot(ctx context.Context, b *Boot, config *bootConfig) (Snapshot, error)
-
-	verifySnapshot(
-		ctx context.Context,
-		config *bootConfig, nsm NSM, snapshot Snapshot, snapshotRoot []byte,
-	) error
-
+	verifySnapshot(ctx context.Context, b *Boot, config *bootConfig) (Snapshot, error)
 	commitSnapshot(ctx context.Context, b *Boot, snapshot Snapshot) (Snapshot, error)
 }
 
@@ -186,38 +180,19 @@ func (b *Boot) determineMode(
 		return &genesisBoot{}, nil
 	}
 
-	keyID, err := b.ssm.MayGet(ctx, b.cfg.kmsKeyIDParam(ownPCR0))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
-	}
-	if keyID == "" {
-		return nil, fmt.Errorf(
-			"no snapshot for this PCR0 and %s holds no handoff",
-			b.cfg.kmsKeyIDParam(ownPCR0),
-		)
-	}
 	intent, err := newMigrationIntentLog(b.cfg, b.s3, b.nsm, config.snapshotBucket)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open migration intent log: %w", err)
 	}
-	return &migrationBoot{intent: intent, kmsKeyID: keyID}, nil
+	return &migrationBoot{intent: intent}, nil
 }
 
 // establish verifies the snapshot before decrypting any state.
 func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, error) {
 	config := &planned.config
 
-	snapshot, err := planned.mode.buildSnapshot(ctx, b, config)
+	snapshot, err := planned.mode.verifySnapshot(ctx, b, config)
 	if err != nil {
-		return bootState{}, err
-	}
-	snapshotRoot, err := snapshot.root(b.cfg)
-	if err != nil {
-		return bootState{}, fmt.Errorf("failed to build snapshot root: %v", err)
-	}
-	if err := planned.mode.verifySnapshot(
-		ctx, config, b.nsm, snapshot, snapshotRoot,
-	); err != nil {
 		return bootState{}, err
 	}
 
@@ -293,25 +268,6 @@ func (b *Boot) primaryKMS(ctx context.Context, keyID string) (PrimaryKMS, error)
 		return nil, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
 	}
 	return kms, nil
-}
-
-func (b *Boot) loadPredecessor(ctx context.Context) (pcr0, keyID string, err error) {
-	ownPCR0 := hex.EncodeToString(b.pcr0)
-	pcr0, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousPCR0Param(ownPCR0))
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get predecessor PCR0 SSM param: %w", err)
-	}
-	keyID, err = b.ssm.MayGet(ctx, b.cfg.migrationPreviousKMSKeyIDParam(ownPCR0))
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get predecessor KMS key ID: %w", err)
-	}
-	if (pcr0 == "") != (keyID == "") {
-		return "", "", fmt.Errorf(
-			"inconsistent migration predecessor artifacts (pcr0 present=%v, key present=%v)",
-			pcr0 != "", keyID != "",
-		)
-	}
-	return pcr0, keyID, nil
 }
 
 func (b *Boot) migrationIntentBucket(ctx context.Context) (string, error) {
@@ -495,16 +451,20 @@ func (g *genesisBoot) buildSnapshot(
 
 // Validate genesis against the same format that later boots will read.
 func (g *genesisBoot) verifySnapshot(
-	_ context.Context, config *bootConfig, _ NSM, snapshot Snapshot, _ []byte,
-) error {
+	ctx context.Context, b *Boot, config *bootConfig,
+) (Snapshot, error) {
+	snapshot, err := g.buildSnapshot(ctx, b, config)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	raw, err := snapshot.encode(config.cfg)
 	if err != nil {
-		return err
+		return Snapshot{}, err
 	}
 	if _, err := decodeSnapshot(config.cfg, raw); err != nil {
-		return fmt.Errorf("genesis snapshot would be refused on read: %w", err)
+		return Snapshot{}, fmt.Errorf("genesis snapshot would be refused on read: %w", err)
 	}
-	return nil
+	return snapshot, nil
 }
 
 func (g *genesisBoot) commitSnapshot(
@@ -528,15 +488,11 @@ type resumeBoot struct {
 	snapshot Snapshot // as published
 }
 
-func (r *resumeBoot) buildSnapshot(context.Context, *Boot, *bootConfig) (Snapshot, error) {
-	return r.snapshot, nil
-}
-
 // A resumed boot's state was verified as it was read.
 func (r *resumeBoot) verifySnapshot(
-	context.Context, *bootConfig, NSM, Snapshot, []byte,
-) error {
-	return nil
+	context.Context, *Boot, *bootConfig,
+) (Snapshot, error) {
+	return r.snapshot, nil
 }
 
 func (r *resumeBoot) commitSnapshot(
@@ -546,104 +502,56 @@ func (r *resumeBoot) commitSnapshot(
 }
 
 type migrationBoot struct {
-	intent   *migrationIntentLog
-	kmsKeyID string // the handoff pointer
+	intent *migrationIntentLog
 }
 
-// SSM handoff values remain untrusted until the transition receipt verifies.
-func (m *migrationBoot) buildSnapshot(
+// Handoff values remain untrusted until the transition receipt verifies.
+func (m *migrationBoot) verifySnapshot(
 	ctx context.Context, b *Boot, config *bootConfig,
 ) (Snapshot, error) {
-	ownPCR0 := hex.EncodeToString(config.currentPCR0)
-	predecessorPCR0, predecessorKMSKeyID, err := b.loadPredecessor(ctx)
-	if err != nil {
-		return Snapshot{}, err
-	}
-	if predecessorPCR0 == "" {
-		return Snapshot{}, fmt.Errorf(
-			"no snapshot for this PCR0 and no predecessor to migrate from",
-		)
-	}
-	if strings.EqualFold(predecessorPCR0, ownPCR0) {
-		return Snapshot{}, fmt.Errorf("an enclave cannot be its own predecessor")
-	}
-	transitionReceipt, err := b.ssm.MayGet(
-		ctx, b.cfg.migrationStateOriginReceiptParam(m.kmsKeyID, ownPCR0),
-	)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("failed to get migration receipt SSM param: %w", err)
-	}
-	if transitionReceipt == "" {
-		return Snapshot{}, fmt.Errorf(
-			"predecessor artifacts present but no migration transition receipt",
-		)
-	}
-	masterSeedCiphertext, err := b.ssm.MustGet(ctx, b.cfg.masterSeedCiphertextParam(m.kmsKeyID))
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("required master seed SSM param missing: %w", err)
-	}
-	tlsKeyCiphertext, err := b.ssm.MustGet(ctx, b.cfg.tlsKeyCiphertextParam(m.kmsKeyID))
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("required TLS key SSM param missing: %w", err)
-	}
-	return Snapshot{
-		kmsKeyID:                  m.kmsKeyID,
-		ownerPCR0:                 ownPCR0,
-		predecessorPCR0:           predecessorPCR0,
-		predecessorKMSKeyID:       predecessorKMSKeyID,
-		masterSeedCiphertext:      masterSeedCiphertext,
-		tlsKeyCiphertext:          tlsKeyCiphertext,
-		migrationIntentBucketName: config.snapshotBucket,
-		transitionReceipt:         transitionReceipt,
-	}, nil
-}
-
-func (m *migrationBoot) verifySnapshot(
-	ctx context.Context,
-	config *bootConfig, nsm NSM, snapshot Snapshot, snapshotRoot []byte,
-) error {
-	if err := verifyStateReceipt(
-		nsm, snapshot.transitionReceipt, purposeMigrationTransition,
-		snapshotRoot, transitionPCRs(snapshot.predecessorPCR0, config.currentPCR0),
-	); err != nil {
-		return fmt.Errorf("invalid transition receipt: %w", err)
-	}
-
 	if m.intent == nil {
-		return fmt.Errorf("migration authorization: no intent log")
+		return Snapshot{}, fmt.Errorf("migration authorization: no intent log")
 	}
-	head, err := m.intent.Head(ctx, snapshot.predecessorPCR0)
+	// NOTE: Authorization is decided by this head read. A later abort does not
+	// cancel adoption, even if the snapshot has not yet been published.
+	head, err := m.intent.Head(ctx, strings.ToLower(b.cfg.PreviousPCR0))
 	if err != nil {
-		return err
+		return Snapshot{}, fmt.Errorf("failed to read predecessor migration intent: %w", err)
 	}
-	if head == nil {
-		return fmt.Errorf(
-			"%w: predecessor %s recorded no intent",
-			errMigrationIntentAbsent, prefix16(snapshot.predecessorPCR0),
+	if head == nil || head.Action != migrationIntentFinalised ||
+		!strings.EqualFold(head.TargetPCR0, hex.EncodeToString(config.currentPCR0)) {
+		return Snapshot{}, fmt.Errorf(
+			"no snapshot for this PCR0 and predecessor %s holds no handoff",
+			prefix16(b.cfg.PreviousPCR0),
 		)
 	}
-	if head.Action != migrationIntentRequested {
-		return fmt.Errorf(
-			"%w: intent from %s is %s",
-			errMigrationIntentAborted, prefix16(snapshot.predecessorPCR0), head.Action,
-		)
+	snapshot := *head.FinalisedSnapshot
+	snapshotRoot, err := snapshot.root(b.cfg)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to build snapshot root: %w", err)
 	}
-	if !strings.EqualFold(head.TargetPCR0, hex.EncodeToString(config.currentPCR0)) {
-		return fmt.Errorf(
-			"%w: intent from %s targets %s, not this enclave",
-			errMigrationIntentAborted, prefix16(snapshot.predecessorPCR0),
-			prefix16(head.TargetPCR0),
-		)
+	if err := verifyStateReceipt(
+		b.nsm, snapshot.transitionReceipt, snapshotRoot,
+		transitionPCRs(snapshot.predecessorPCR0, config.currentPCR0),
+	); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid transition receipt: %w", err)
 	}
 	if !strings.EqualFold(config.cfg.PreviousPCR0, snapshot.predecessorPCR0) {
-		return fmt.Errorf(
-			"previous PCR0 SSM param does not match previous PCR0 committed in the EIF",
+		return Snapshot{}, fmt.Errorf(
+			"handoff predecessor does not match previous PCR0 committed in the EIF",
 		)
 	}
-	return nil
+	if snapshot.ownerPCR0 != hex.EncodeToString(config.currentPCR0) {
+		return Snapshot{}, fmt.Errorf("handoff snapshot owner does not match current PCR0")
+	}
+	if snapshot.migrationIntentBucketName != config.snapshotBucket {
+		return Snapshot{}, fmt.Errorf(
+			"handoff snapshot bucket does not match configured snapshot bucket",
+		)
+	}
+	return snapshot, nil
 }
 
-// Adoption still depends on the SSM handoff until this publication succeeds.
 func (m *migrationBoot) commitSnapshot(
 	ctx context.Context, b *Boot, snapshot Snapshot,
 ) (Snapshot, error) {

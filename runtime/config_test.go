@@ -324,38 +324,6 @@ func TestConfigLogGroup(t *testing.T) {
 	require.Equal(t, "/prod/app/enclave/logs/runtime", cfg.logGroup(signalRuntimeLogs))
 }
 
-// The lock posture is an IAM-enforceable boundary, so it must move exactly the
-// KMS-subtree paths and nothing else.
-func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
-	pcr0, keyID := strings.Repeat("ab", 48), "key-1"
-	locked, unlocked := testConfig(), testConfig()
-	unlocked.KMSLocked = false
-
-	scoped := func(c *Config) []string {
-		return []string{
-			c.kmsKeyIDParam(pcr0),
-			c.masterSeedCiphertextParam(keyID),
-			c.tlsKeyCiphertextParam(keyID),
-		}
-	}
-	unscoped := func(c *Config) []string {
-		return []string{
-			c.migrationStateOriginReceiptParam(keyID, pcr0),
-			c.migrationPreviousPCR0Param(pcr0),
-		}
-	}
-
-	require.Equal(t, "locked", locked.lockSegment())
-	require.Equal(t, "unlocked", unlocked.lockSegment())
-	for i, p := range scoped(locked) {
-		require.Contains(t, p, "/locked/")
-		require.Contains(t, scoped(unlocked)[i], "/unlocked/")
-		require.NotEqual(t, p, scoped(unlocked)[i], "the posture must move this path")
-	}
-	require.Equal(t, unscoped(locked), unscoped(unlocked),
-		"these paths must not be lock-scoped")
-}
-
 func TestLoadConfigMigrationCooldown(t *testing.T) {
 	for _, dev := range []bool{false, true} {
 		for _, tc := range []struct {

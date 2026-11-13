@@ -68,6 +68,7 @@ const (
 	migrationStateNone        = "none"
 	migrationStateCoolingDown = "cooling_down"
 	migrationStateEligible    = "eligible"
+	migrationStateFinalised   = "finalised"
 	migrationStateAborted     = "aborted"
 	migrationStateAmbiguous   = "ambiguous"
 )
@@ -180,21 +181,21 @@ func (m *migrator) CandidateInfo(ctx context.Context) (*CandidateInfo, error) {
 }
 
 func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error) {
-	heads, _, err := m.intent.scanIntents(ctx, m.pcr0)
+	state, _, err := m.intent.scanIntents(ctx, m.pcr0)
 	if err != nil {
 		return nil, err
 	}
-	if len(heads) == 0 {
-		return &MigrationStatus{State: migrationStateNone, SourcePCR0: m.pcr0}, nil
-	}
-	if len(heads) > 1 {
+	if len(state.ambiguous) > 0 {
 		status := &MigrationStatus{State: migrationStateAmbiguous, SourcePCR0: m.pcr0}
-		for _, intent := range heads {
+		for _, intent := range state.ambiguous {
 			status.AmbiguousTargets = append(status.AmbiguousTargets, intent.TargetPCR0)
 		}
 		return status, nil
 	}
-	head := heads[0]
+	if state.current == nil {
+		return &MigrationStatus{State: migrationStateNone, SourcePCR0: m.pcr0}, nil
+	}
+	head := state.current
 
 	status := &MigrationStatus{
 		SourcePCR0:  head.SourcePCR0,
@@ -205,6 +206,10 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 	}
 	if head.Action == migrationIntentAborted {
 		status.State = migrationStateAborted
+		return status, nil
+	}
+	if head.Action == migrationIntentFinalised {
+		status.State = migrationStateFinalised
 		return status, nil
 	}
 
@@ -221,14 +226,15 @@ func (m *migrator) MigrationStatus(ctx context.Context) (*MigrationStatus, error
 	return status, nil
 }
 
-// Migration is coordinated through SSM; candidates attest their own PCR0.
+// Challenges are coordinated through SSM; candidates attest their own PCR0.
+// The handoff itself is one locked record in the intent log.
 //
 //	predecessor                              candidate
 //	  publish challenge  -------------->  read it
 //	  read answers       <--------------  publish attestation
 //	  verify, record intent
 //	  ... cooldown ...
-//	  commit KMSKeyID/<target>  ------->  adopt, publish snapshot/<target>
+//	  record finalised intent  -------->  adopt, publish snapshot/<target>
 //
 
 func (m *migrator) RunPredecessorHandoff(
@@ -258,7 +264,7 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 	if m.cfg.genesisImage() {
 		return nil
 	}
-	// Published generations no longer need the SSM handoff.
+	// Published generations no longer need the handoff.
 	snapshot, err := readSnapshot(ctx, m.cfg, m.s3, m.nsm, m.bucket, m.pcr0)
 	if err != nil {
 		return fmt.Errorf("failed to read snapshot: %w", err)
@@ -267,19 +273,19 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 		return nil
 	}
 
-	kmsIdParam := m.cfg.kmsKeyIDParam(m.pcr0)
-	keyID, err := m.ssm.MayGet(ctx, kmsIdParam)
+	finalised, err := m.isHandOffFinalised(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+		return err
 	}
-	if keyID != "" {
+	if finalised {
 		return nil
 	}
 
-	slog.Info("candidate: awaiting migration handoff", "pointer", kmsIdParam)
+	slog.Info("candidate: awaiting migration handoff",
+		"predecessor_pcr0", prefix16(m.cfg.PreviousPCR0))
 	ticker := time.NewTicker(migrationPollInterval)
 	defer ticker.Stop()
-	for keyID == "" {
+	for !finalised {
 		if err := m.respondToChallenge(ctx); err != nil {
 			slog.Warn("candidate handoff", "error", err)
 		}
@@ -288,42 +294,24 @@ func (m *migrator) AwaitCandidateHandoff(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		if keyID, err = m.ssm.MayGet(ctx, kmsIdParam); err != nil {
-			return fmt.Errorf("failed to get KMS key ID SSM param: %w", err)
+		if finalised, err = m.isHandOffFinalised(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (m *migrator) MigrationIntentBucket() string {
-	return m.bucket
+func (m *migrator) isHandOffFinalised(ctx context.Context) (bool, error) {
+	head, err := m.intent.Head(ctx, strings.ToLower(m.cfg.PreviousPCR0))
+	if errors.Is(err, errMigrationIntentStoreUnavailable) {
+		return false, fmt.Errorf("failed to read predecessor migration intent: %w", err)
+	}
+	return err == nil && head != nil && head.Action == migrationIntentFinalised &&
+		strings.EqualFold(head.TargetPCR0, m.pcr0), nil
 }
 
-func (m *migrator) verifyIntent(
-	ctx context.Context, sourcePCR0, targetPCR0 string, sequence uint64,
-) error {
-	head, err := m.intent.Head(ctx, sourcePCR0)
-	if err != nil {
-		return fmt.Errorf("verify migration intent: %w", err)
-	}
-	if head == nil {
-		return fmt.Errorf("%w: intent disappeared before commit", errMigrationIntentAbsent)
-	}
-	if head.Action == migrationIntentAborted {
-		return fmt.Errorf("%w: aborted before commit", errMigrationIntentAborted)
-	}
-	if head.Sequence != sequence {
-		return fmt.Errorf(
-			"%w: intent advanced from sequence %d to %d before commit",
-			errMigrationIntentAborted, sequence, head.Sequence,
-		)
-	}
-	if !strings.EqualFold(head.TargetPCR0, targetPCR0) {
-		return fmt.Errorf(
-			"%w: intent target changed before commit", errMigrationIntentAborted,
-		)
-	}
-	return nil
+func (m *migrator) MigrationIntentBucket() string {
+	return m.bucket
 }
 
 func (m *migrator) advanceMigration(ctx context.Context) error {
@@ -348,7 +336,7 @@ func (m *migrator) advanceMigration(ctx context.Context) error {
 			return err
 		}
 		return errMigrationIntentAmbiguous
-	case migrationStateCoolingDown:
+	case migrationStateCoolingDown, migrationStateFinalised:
 		_, err := m.mayAbortMigration(ctx, lease.Verify, status.TargetPCR0)
 		return err
 	case migrationStateEligible:
@@ -581,6 +569,8 @@ func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error
 	switch status.State {
 	case migrationStateEligible:
 		return status, nil
+	case migrationStateFinalised:
+		return nil, errMigrationAlreadyFinalised
 	case migrationStateNone:
 		return nil, errMigrationIntentAbsent
 	case migrationStateAborted:
@@ -597,7 +587,8 @@ func (m *migrator) eligibleHandOff(ctx context.Context) (*MigrationStatus, error
 	return nil, fmt.Errorf("migration intent has unexpected state %q", status.State)
 }
 
-// handOffToSuccessor exports state, then commits the target generation.
+// handOffToSuccessor exports state and commits the target generation in one
+// locked record. Nothing leaves the enclave before that record.
 func (m *migrator) handOffToSuccessor(
 	ctx context.Context, verifyLease func(context.Context) error,
 ) error {
@@ -611,18 +602,8 @@ func (m *migrator) handOffToSuccessor(
 		return fmt.Errorf("migration intent has invalid target PCR0: %w", err)
 	}
 
-	targetKmsID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(targetPCR0))
-	if err != nil {
-		return fmt.Errorf("failed to read target KMS key ID: %w", err)
-	}
-	if targetKmsID != "" {
-		return fmt.Errorf(
-			"%w: %s already has a committed generation",
-			errMigrationAlreadyFinalised,
-			m.cfg.kmsKeyIDParam(targetPCR0),
-		)
-	}
-
+	// The finalised intent's attestation is the transition receipt, so PCR31
+	// must be committed before it.
 	if err := m.nsm.CommitPCR(migrationPCRIndex, targetPCR0Bytes); err != nil {
 		return fmt.Errorf("failed to commit new PCR0 to PCR31: %w", err)
 	}
@@ -643,13 +624,6 @@ func (m *migrator) handOffToSuccessor(
 	if err != nil {
 		return fmt.Errorf("failed to re-encrypt master seed: %w", err)
 	}
-	if err := m.ssm.Set(
-		ctx,
-		m.cfg.masterSeedCiphertextParam(migrationKMS.KeyID()),
-		seedCiphertext,
-	); err != nil {
-		return fmt.Errorf("failed to store master seed: %w", err)
-	}
 	tlsKey, err := x509.MarshalPKCS8PrivateKey(m.tlsKey)
 	if err != nil {
 		return fmt.Errorf("failed to marshal TLS key: %w", err)
@@ -658,72 +632,29 @@ func (m *migrator) handOffToSuccessor(
 	if err != nil {
 		return fmt.Errorf("failed to re-encrypt TLS key: %w", err)
 	}
-	if err := m.ssm.Set(
-		ctx,
-		m.cfg.tlsKeyCiphertextParam(migrationKMS.KeyID()),
-		tlsKeyCiphertext,
-	); err != nil {
-		return fmt.Errorf("failed to store TLS key: %w", err)
+
+	snapshot := Snapshot{
+		kmsKeyID:                  migrationKMS.KeyID(),
+		ownerPCR0:                 targetPCR0,
+		predecessorPCR0:           m.pcr0,
+		predecessorKMSKeyID:       m.kms.KeyID(),
+		masterSeedCiphertext:      seedCiphertext,
+		tlsKeyCiphertext:          tlsKeyCiphertext,
+		migrationIntentBucketName: m.intent.bucket,
 	}
 
-	if err := m.ssm.Set(ctx, m.cfg.migrationPreviousPCR0Param(targetPCR0), m.pcr0); err != nil {
-		return fmt.Errorf(
-			"failed to set SSM param %s: %w", m.cfg.migrationPreviousPCR0Param(targetPCR0), err,
-		)
-	}
-	if err := m.ssm.Set(
-		ctx, m.cfg.migrationPreviousKMSKeyIDParam(targetPCR0), m.kms.KeyID(),
-	); err != nil {
-		return fmt.Errorf("failed to store predecessor KMS key ID: %w", err)
-	}
-
-	// Write handoff receipt before committing KMSKeyID.
-	if err := WriteTransitionReceipt(
-		ctx,
-		m.cfg,
-		m.nsm,
-		m.ssm,
-		Snapshot{
-			kmsKeyID:                  migrationKMS.KeyID(),
-			ownerPCR0:                 targetPCR0,
-			predecessorPCR0:           m.pcr0,
-			predecessorKMSKeyID:       m.kms.KeyID(),
-			masterSeedCiphertext:      seedCiphertext,
-			tlsKeyCiphertext:          tlsKeyCiphertext,
-			migrationIntentBucketName: m.intent.bucket,
-		},
-	); err != nil {
-		return fmt.Errorf(
-			"failed to write migration-transition receipt: %w", err,
-		)
-	}
-
-	if err := m.verifyIntent(ctx, m.pcr0, targetPCR0, status.Sequence); err != nil {
-		return err
-	}
 	// Checked last: a replica that lost the lease to a peer, which may be
 	// recording an abort, must not commit.
 	if err := verifyLease(ctx); err != nil {
 		return fmt.Errorf("verify migration lease: %w", err)
 	}
 
-	// Atomic commit: from here, the successor boots on the migration key.
-	if err := m.ssm.Set(
-		ctx,
-		m.cfg.kmsKeyIDParam(targetPCR0),
-		migrationKMS.KeyID(),
-		WithoutOverwrite(),
+	// Atomic commit: the finalised record releases the ciphertexts and is
+	// what the successor adopts.
+	if _, err := m.intent.Finalise(
+		ctx, m.pcr0, targetPCR0, status.Sequence, snapshot,
 	); err != nil {
-		if isParameterAlreadyExists(err) {
-			return fmt.Errorf(
-				"%w: %s was committed by a concurrent finaliser",
-				errMigrationAlreadyFinalised,
-				m.cfg.kmsKeyIDParam(targetPCR0),
-			)
-		}
-		return fmt.Errorf(
-			"failed to commit successor KMS key ID: %w", err,
-		)
+		return fmt.Errorf("failed to finalise migration intent: %w", err)
 	}
 
 	slog.Info(
@@ -736,15 +667,6 @@ func (m *migrator) handOffToSuccessor(
 
 func (m *migrator) respondToChallenge(ctx context.Context) error {
 	predecessor := m.cfg.PreviousPCR0
-
-	// Restarting an established generation must not offer another handoff.
-	keyID, err := m.ssm.MayGet(ctx, m.cfg.kmsKeyIDParam(m.pcr0))
-	if err != nil {
-		return fmt.Errorf("read candidate KMS key ID: %w", err)
-	}
-	if keyID != "" {
-		return nil
-	}
 
 	published, err := m.ssm.MayGet(ctx, m.cfg.migrationChallengeParam(predecessor))
 	if err != nil {

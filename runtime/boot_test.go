@@ -135,12 +135,12 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
 
-			// A migration reads its handoff when it builds the snapshot.
+			// A migration reads its handoff when it verifies the snapshot.
 			planned, err := boot.plan(t.Context())
 			var adoptedSnapshot Snapshot
 			if err == nil {
 				if migration, ok := planned.mode.(*migrationBoot); ok {
-					adoptedSnapshot, err = migration.buildSnapshot(
+					adoptedSnapshot, err = migration.verifySnapshot(
 						t.Context(), boot, &planned.config,
 					)
 				}
@@ -603,7 +603,11 @@ func TestBootRejectsInvalidMaterialBeforeCommit(t *testing.T) {
 				planned, err := boot.plan(t.Context())
 				require.NoError(t, err)
 				if mode == "resume" {
-					snapshot, err := planned.mode.buildSnapshot(t.Context(), boot, &planned.config)
+					snapshot, err := (&genesisBoot{}).buildSnapshot(
+						t.Context(),
+						boot,
+						&planned.config,
+					)
 					require.NoError(t, err)
 					planned.mode = &resumeBoot{snapshot: snapshot}
 				}
@@ -660,7 +664,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		eif             string          // ENCLAVE_PREVIOUS_PCR0
 		pcrs            map[uint][]byte // attested by the finalised intent
 		intents         []intentSeed
-		beforeEstablish func(*fakeS3)
+		beforeEstablish func(*fakeS3, *fakeNSM)
 	}
 	valid := func() adoption {
 		return adoption{
@@ -725,7 +729,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			return out
 		}
 		if a.beforeEstablish != nil {
-			a.beforeEstablish(s3f)
+			a.beforeEstablish(s3f, signer)
 		}
 		out.result, out.err = boot.establish(ctx, planned)
 		return out
@@ -802,9 +806,23 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			msg: "holds no handoff",
 		},
 		{
+			name: "refuses adoption after an abort between planning and verification",
+			modify: func(a *adoption) {
+				a.beforeEstablish = func(s3f *fakeS3, signer *fakeNSM) {
+					seedMigrationIntent(
+						t, s3f, signer, prev, migrationIntentAborted, currentHex,
+						3, time.Now(),
+					)
+				}
+			},
+			msg: "holds no handoff",
+		},
+		{
 			name: "fails closed when the intent store is unreadable",
 			modify: func(a *adoption) {
-				a.beforeEstablish = func(s3f *fakeS3) { s3f.listErr = errors.New("s3 unavailable") }
+				a.beforeEstablish = func(s3f *fakeS3, _ *fakeNSM) {
+					s3f.listErr = errors.New("s3 unavailable")
+				}
 			},
 			is: errMigrationIntentStoreUnavailable,
 		},

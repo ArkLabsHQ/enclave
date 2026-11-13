@@ -52,13 +52,7 @@ type bootConfig struct {
 }
 
 type bootMode interface {
-	buildSnapshot(ctx context.Context, b *Boot, config *bootConfig) (Snapshot, error)
-
-	verifySnapshot(
-		ctx context.Context,
-		config *bootConfig, nsm NSM, snapshot Snapshot, snapshotRoot []byte,
-	) error
-
+	verifySnapshot(ctx context.Context, b *Boot, config *bootConfig) (Snapshot, error)
 	commitSnapshot(ctx context.Context, b *Boot, snapshot Snapshot) (Snapshot, error)
 }
 
@@ -197,17 +191,8 @@ func (b *Boot) determineMode(
 func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, error) {
 	config := &planned.config
 
-	snapshot, err := planned.mode.buildSnapshot(ctx, b, config)
+	snapshot, err := planned.mode.verifySnapshot(ctx, b, config)
 	if err != nil {
-		return bootState{}, err
-	}
-	snapshotRoot, err := snapshot.root(b.cfg)
-	if err != nil {
-		return bootState{}, fmt.Errorf("failed to build snapshot root: %v", err)
-	}
-	if err := planned.mode.verifySnapshot(
-		ctx, config, b.nsm, snapshot, snapshotRoot,
-	); err != nil {
 		return bootState{}, err
 	}
 
@@ -466,16 +451,20 @@ func (g *genesisBoot) buildSnapshot(
 
 // Validate genesis against the same format that later boots will read.
 func (g *genesisBoot) verifySnapshot(
-	_ context.Context, config *bootConfig, _ NSM, snapshot Snapshot, _ []byte,
-) error {
+	ctx context.Context, b *Boot, config *bootConfig,
+) (Snapshot, error) {
+	snapshot, err := g.buildSnapshot(ctx, b, config)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	raw, err := snapshot.encode(config.cfg)
 	if err != nil {
-		return err
+		return Snapshot{}, err
 	}
 	if _, err := decodeSnapshot(config.cfg, raw); err != nil {
-		return fmt.Errorf("genesis snapshot would be refused on read: %w", err)
+		return Snapshot{}, fmt.Errorf("genesis snapshot would be refused on read: %w", err)
 	}
-	return nil
+	return snapshot, nil
 }
 
 func (g *genesisBoot) commitSnapshot(
@@ -499,15 +488,11 @@ type resumeBoot struct {
 	snapshot Snapshot // as published
 }
 
-func (r *resumeBoot) buildSnapshot(context.Context, *Boot, *bootConfig) (Snapshot, error) {
-	return r.snapshot, nil
-}
-
 // A resumed boot's state was verified as it was read.
 func (r *resumeBoot) verifySnapshot(
-	context.Context, *bootConfig, NSM, Snapshot, []byte,
-) error {
-	return nil
+	context.Context, *Boot, *bootConfig,
+) (Snapshot, error) {
+	return r.snapshot, nil
 }
 
 func (r *resumeBoot) commitSnapshot(
@@ -521,9 +506,14 @@ type migrationBoot struct {
 }
 
 // Handoff values remain untrusted until the transition receipt verifies.
-func (m *migrationBoot) buildSnapshot(
+func (m *migrationBoot) verifySnapshot(
 	ctx context.Context, b *Boot, config *bootConfig,
 ) (Snapshot, error) {
+	if m.intent == nil {
+		return Snapshot{}, fmt.Errorf("migration authorization: no intent log")
+	}
+	// NOTE: Authorization is decided by this head read. A later abort does not
+	// cancel adoption, even if the snapshot has not yet been published.
 	head, err := m.intent.Head(ctx, strings.ToLower(b.cfg.PreviousPCR0))
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("failed to read predecessor migration intent: %w", err)
@@ -535,56 +525,25 @@ func (m *migrationBoot) buildSnapshot(
 			prefix16(b.cfg.PreviousPCR0),
 		)
 	}
-	return *head.FinalisedSnapshot, nil
-}
-
-func (m *migrationBoot) verifySnapshot(
-	ctx context.Context,
-	config *bootConfig, nsm NSM, snapshot Snapshot, snapshotRoot []byte,
-) error {
+	snapshot := *head.FinalisedSnapshot
+	snapshotRoot, err := snapshot.root(b.cfg)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to build snapshot root: %w", err)
+	}
 	if err := verifyStateReceipt(
-		nsm, snapshot.transitionReceipt, snapshotRoot,
+		b.nsm, snapshot.transitionReceipt, snapshotRoot,
 		transitionPCRs(snapshot.predecessorPCR0, config.currentPCR0),
 	); err != nil {
-		return fmt.Errorf("invalid transition receipt: %w", err)
-	}
-
-	if m.intent == nil {
-		return fmt.Errorf("migration authorization: no intent log")
-	}
-	// An abort or a newer request withdraws the handoff until it is adopted.
-	head, err := m.intent.Head(ctx, snapshot.predecessorPCR0)
-	if err != nil {
-		return err
-	}
-	if head == nil {
-		return fmt.Errorf(
-			"%w: predecessor %s recorded no intent",
-			errMigrationIntentAbsent, prefix16(snapshot.predecessorPCR0),
-		)
-	}
-	if head.Action != migrationIntentFinalised {
-		return fmt.Errorf(
-			"%w: intent from %s is %s",
-			errMigrationIntentAborted, prefix16(snapshot.predecessorPCR0), head.Action,
-		)
-	}
-	if !strings.EqualFold(head.TargetPCR0, hex.EncodeToString(config.currentPCR0)) {
-		return fmt.Errorf(
-			"%w: intent from %s targets %s, not this enclave",
-			errMigrationIntentAborted, prefix16(snapshot.predecessorPCR0),
-			prefix16(head.TargetPCR0),
-		)
+		return Snapshot{}, fmt.Errorf("invalid transition receipt: %w", err)
 	}
 	if !strings.EqualFold(config.cfg.PreviousPCR0, snapshot.predecessorPCR0) {
-		return fmt.Errorf(
+		return Snapshot{}, fmt.Errorf(
 			"handoff predecessor does not match previous PCR0 committed in the EIF",
 		)
 	}
-	return nil
+	return snapshot, nil
 }
 
-// Adoption still depends on the finalised intent until this publication succeeds.
 func (m *migrationBoot) commitSnapshot(
 	ctx context.Context, b *Boot, snapshot Snapshot,
 ) (Snapshot, error) {

@@ -330,7 +330,7 @@ func (l *migrationIntentLog) verifyIntentExistence(
 			intent, valid, err := l.fetchAttestedIntent(
 				ctx, key, versionID, expected.SourcePCR0, expected.Sequence, publishedAt.UTC(),
 			)
-			if valid && intent.equivalent(expected) {
+			if valid {
 				recorded = intent
 			}
 			return true, err
@@ -342,6 +342,14 @@ func (l *migrationIntentLog) verifyIntentExistence(
 		return nil, fmt.Errorf(
 			"%w: migration intent sequence %d version %q missing or invalid after write",
 			errMigrationIntentStoreUnavailable,
+			expected.Sequence,
+			versionID,
+		)
+	}
+	if !recorded.equivalent(expected) {
+		return nil, fmt.Errorf(
+			"migration intent sequence %d version %q: "+
+				"stored record does not match the submitted intent",
 			expected.Sequence,
 			versionID,
 		)

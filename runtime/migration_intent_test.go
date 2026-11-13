@@ -1239,7 +1239,13 @@ func TestMigrationIntentFinalise(t *testing.T) {
 			beforePut: func() {
 				// Both finalisers pass the request check before either write lands.
 				var err error
-				peer, err = peerLog.Finalise(ctx, fx.source, targetA, requested.Sequence, peerSnapshot)
+				peer, err = peerLog.Finalise(
+					ctx,
+					fx.source,
+					targetA,
+					requested.Sequence,
+					peerSnapshot,
+				)
 				require.NoError(t, err)
 			},
 		}

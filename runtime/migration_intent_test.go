@@ -931,6 +931,73 @@ func TestMigrationIntentSequenceOverflow(t *testing.T) {
 	require.ErrorContains(t, err, "overflow")
 }
 
+// For the same source and target: 1 requested -> 2 finalised -> 3 aborted -> 4 requested.
+// Replaying finalisation 2 must not finalise request 4.
+func TestMigrationIntentFinalisedReplayCannotAuthoriseNewRequest(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	for _, tc := range []struct {
+		name            string
+		keySequence     uint64
+		rewriteSequence bool
+	}{
+		{name: "reupload at key 2 stays before the abort", keySequence: 2},
+		{name: "copy to key 5 mismatches the embedded sequence", keySequence: 5},
+		{
+			name:            "rewriting the sequence breaks the attestation binding",
+			keySequence:     5,
+			rewriteSequence: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			fx := newMigrationIntentFixture(t)
+			requested, err := fx.log.Request(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), requested.Sequence)
+			finalised, err := fx.log.Finalise(
+				ctx, fx.source, target, requested.Sequence, fx.handoff(t, target, "key-a"),
+			)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), finalised.Sequence)
+			head, err := fx.log.Head(ctx, fx.source)
+			require.NoError(t, err)
+			require.Equal(t, finalised, head, "the original finalisation must be valid and active")
+			// Reuse the exact stored record, including its original attestation and snapshot.
+			replayBody := bytes.Clone(fx.s3.latestBody(migrationIntentObjectKey(fx.source, 2)))
+
+			aborted, err := fx.log.Abort(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(3), aborted.Sequence)
+			freshRequest, err := fx.log.Request(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(4), freshRequest.Sequence)
+			head, err = fx.log.Head(ctx, fx.source)
+			require.NoError(t, err)
+			require.Equal(t, freshRequest, head, "request 4 must be active before the replay")
+
+			if tc.rewriteSequence {
+				entry, err := decodeMigrationIntentObject(replayBody)
+				require.NoError(t, err)
+				// Change only the outer sequence; the attestation still binds sequence 2.
+				entry.Sequence = 5
+				replayBody, err = json.Marshal(entry)
+				require.NoError(t, err)
+			}
+			// A later upload must not make the old finalisation answer request 4.
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, tc.keySequence), replayBody,
+				freshRequest.PublishedAt.Add(time.Second),
+			)
+
+			state, highest, err := fx.log.scanIntents(ctx, fx.source)
+			require.NoError(t, err)
+			require.Empty(t, state.ambiguous)
+			require.Equal(t, freshRequest, state.current, "request 4 must stay active")
+			require.Equal(t, uint64(4), highest, "the replay must not occupy a new sequence")
+		})
+	}
+}
+
 type migrationIntentPagedS3 struct {
 	*fakeS3
 	versions []s3types.ObjectVersion

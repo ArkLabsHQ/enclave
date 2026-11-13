@@ -601,11 +601,12 @@ func TestHandOffToSuccessor(t *testing.T) {
 	// Issue #236. The host has the handoff released, aborts it, clears the abort
 	// and lets the same target be requested again. The release stays in the log,
 	// but the target must wait out the fresh cooldown for a new one.
-	t.Run("an aborted target cannot adopt its leftover handoff during a fresh cooldown",
+	t.Run("an aborted target needs a fresh finalised handoff to adopt",
 		func(t *testing.T) {
 			fx := setup(t)
 			request(t, fx, newPCR0)
 			require.NoError(t, fx.m.handOffToSuccessor(ctx, leaseHeld))
+			originalKeyID := handoff(t, fx).kmsKeyID
 
 			abort := fx.m.cfg.migrationResponseParam(oldPCR0Hex, migrationAbortResponse)
 			fx.ssmf.params[abort] = newPCR0
@@ -627,6 +628,18 @@ func TestHandOffToSuccessor(t *testing.T) {
 			require.Equal(t, 1, finalisedIntentCount(fx.s3f), "the release stays on record")
 			require.Zero(t, fx.kmsf.decryptCalls, "nothing may decrypt during the cooldown")
 			require.Empty(t, fx.s3f.objects[snapshotObjectKey(newPCR0)])
+
+			// Make the fresh request eligible without waiting for the cooldown.
+			fx.m.cfg.MigrationCooldown = 0
+			require.NoError(t, advanceMigrationForTest(t, ctx, fx.m))
+			snapshot := handoff(t, fx)
+			require.NotEqual(t, originalKeyID, snapshot.kmsKeyID)
+			require.Equal(t, 2, finalisedIntentCount(fx.s3f))
+
+			established, err := successor(t, fx)
+			require.NoError(t, err)
+			require.Equal(t, snapshot.kmsKeyID, established.kms.KeyID())
+			require.Equal(t, dekKeyBytes, established.dek.(*dek).key)
 		})
 }
 

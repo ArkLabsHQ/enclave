@@ -1778,19 +1778,17 @@ func TestInboundIntentDoesNotEndCandidacy(t *testing.T) {
 
 	_, err := fx.log.Request(ctx, fx.source, target)
 	require.NoError(t, err)
-	info, err := (&migrator{
-		cfg: testConfigWithPreviousPCR0(fx.source), pcr0: target, intent: fx.log,
-	}).CandidateInfo(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, info)
 
 	_, ssm := stateOriginTestSSM(nil)
 	m, err := newMigrator(
 		testConfigWithPreviousPCR0(fx.source),
-		&nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{0: mustDecodeHex(t, target)})},
+		&nsmW{nsm: fx.signer.peer().withPCRs(map[uint][]byte{0: mustDecodeHex(t, target)})},
 		ssm, fx.s3, migrationIntentTestBucket,
 	)
 	require.NoError(t, err)
+	info, err := m.CandidateInfo(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, info)
 
 	err = m.AwaitCandidateHandoff(contextFor(t, 50*time.Millisecond))
 

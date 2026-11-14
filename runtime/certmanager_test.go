@@ -470,7 +470,7 @@ func TestCertManagerRenewSkipsWhenLeaseIsUnavailable(t *testing.T) {
 
 	m, _ := newCertTestManagerForStore(t, store, issuer)
 
-	writeLeaseDoc(t, s3f, leaseObjectKey(testCfg, certLeaseName), time.Now().Add(time.Hour))
+	writeLeaseDoc(t, s3f, leaseObjectKey(testCfg, certLeaseName), time.Now().Add(time.Minute))
 
 	renewed, err := m.renewUnderLease(context.Background(), "")
 	require.NoError(t, err)
@@ -748,4 +748,74 @@ func TestCertManagerTickSurvivesVanishedCert(t *testing.T) {
 
 	require.NoError(t, m.tick(ctx), "a vanished object must not fail the poll")
 	require.Same(t, served, m.currentCert.Load(), "the previous certificate stays in service")
+}
+
+func TestCertStoreUndecryptableObjectTreatedAsAbsentAndOverwritten(t *testing.T) {
+	setCertTestEnv(t)
+	ctx := context.Background()
+	s3f := newFakeS3()
+
+	// 1. First store saves with DEK A.
+	storeA := newCertStore(testCfg, s3f, &dek{key: []byte("01234567890123456789012345678901")}, newTestTLSKey(t), certTestBucket, "enclave.test")
+	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
+	certPEMA := issueTestCertWithKey(t, "enclave.test", notAfter, storeA.key)
+	_, err := storeA.SaveCert(ctx, certPEMA, "")
+	require.NoError(t, err)
+
+	// 2. Second store has DEK B (simulating bucket reuse across genesis).
+	keyB := newTestTLSKey(t)
+	storeB := newCertStore(testCfg, s3f, &dek{key: []byte("abcdefghijklmnopqrstuvwxyz012345")}, keyB, certTestBucket, "enclave.test")
+
+	// LoadCert should treat undecryptable object as absent (nil, nil) instead of failing.
+	bundle, err := storeB.LoadCert(ctx)
+	require.NoError(t, err)
+	require.Nil(t, bundle)
+
+	// SaveCert with empty expectedETag should overwrite the stale undecryptable object.
+	certPEMB := issueTestCertWithKey(t, "enclave.test", notAfter, keyB)
+	savedB, err := storeB.SaveCert(ctx, certPEMB, "")
+	require.NoError(t, err)
+	require.NotEmpty(t, savedB.etag)
+
+	// Now storeB can load it cleanly.
+	loadedB, err := storeB.LoadCert(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, loadedB)
+	require.Equal(t, savedB.etag, loadedB.etag)
+}
+
+func TestCertManagerRecoversFromUndecryptableStoredCert(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+
+	// Write an undecryptable cert with an old DEK
+	oldStore := newCertStore(testCfg, s3f, &dek{key: []byte("01234567890123456789012345678901")}, newTestTLSKey(t), certTestBucket, "enclave.test")
+	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
+	oldCertPEM := issueTestCertWithKey(t, "enclave.test", notAfter, oldStore.key)
+	_, err := oldStore.SaveCert(context.Background(), oldCertPEM, "")
+	require.NoError(t, err)
+
+	// Start manager with new DEK
+	issuer := &fakeIssuer{t: t, cn: "enclave.test"}
+	m, _, err := tryNewCertTestManager(s3f, issuer)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	require.Equal(t, 1, issuer.calls, "should issue new cert to replace undecryptable one")
+}
+
+func TestCertManagerTickLogsNearExpiryWhenRenewalFails(t *testing.T) {
+	setCertTestEnv(t)
+	s3f := newFakeS3()
+	// Cert expires in 2 days (less than certHardFloor of 7 days)
+	issuer := &fakeIssuer{t: t, cn: "enclave.test", notAfter: time.Now().Add(48 * time.Hour)}
+	m, _ := newCertTestManager(t, s3f, issuer)
+	ctx := context.Background()
+
+	// Now make future issuances fail
+	issuer.err = errors.New("renewal failed")
+
+	// tick should attempt renewal and return the error
+	err := m.tick(ctx)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "renewal failed")
 }

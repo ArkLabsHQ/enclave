@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -239,6 +240,8 @@ func LoadConfig() (*Config, error) {
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
 		// It is false by default unless explicitly overridden
 		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
+	} else {
+		_ = takeEnv(envInsecureVerifySkipped)
 	}
 
 	if cfg.ExportTraces, err = takeEnvBool(envTraces); err != nil {
@@ -266,6 +269,12 @@ func LoadConfig() (*Config, error) {
 	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
 		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
 	}
+
+	// Warn about any unrecognized ENCLAVE_* variables left unconsumed
+	// in the environment. This runs on the success path only: if earlier
+	// parsing fails, the fatal boot error is immediately actionable
+	// and partial consumption makes warning incomplete.
+	warnUnrecognizedEnclaveEnv(os.Environ())
 
 	return cfg, nil
 }
@@ -534,4 +543,48 @@ func logRetentionDays() int32 {
 		return defaultLogRetentionDays
 	}
 	return int32(days)
+}
+
+// knownEnclaveEnvVars lists all ENCLAVE_* environment variable names parsed by LoadConfig.
+var knownEnclaveEnvVars = []string{
+	envNamespace,
+	envAppName,
+	envAppPort,
+	envPreviousPCR0,
+	envSecretsConfig,
+	envInheritSecretsConfig,
+	envOverrideAllowList,
+	envDev,
+	envInsecureVerifySkipped,
+	envVerifyClockSource,
+	envMigrationCooldown,
+	envFQDN,
+	envUpstream,
+	envViproxyInAddrs,
+	envViproxyOutAddrs,
+	envLogShipInterval,
+	envLogRetentionDays,
+	envTraces,
+	envMetrics,
+	envUseACME,
+	envACMEDirectory,
+	envACMEEmail,
+	envACMECA,
+	envAWSRegion,
+}
+
+func warnUnrecognizedEnclaveEnv(environ []string) []string {
+	var unrecognized []string
+	for _, env := range environ {
+		key, _, _ := strings.Cut(env, "=")
+		if strings.HasPrefix(key, "ENCLAVE_") {
+			unrecognized = append(unrecognized, key)
+			slog.Warn(
+				"unrecognized ENCLAVE_* environment variable",
+				"key", key,
+			)
+		}
+	}
+	sort.Strings(unrecognized)
+	return unrecognized
 }

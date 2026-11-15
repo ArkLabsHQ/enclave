@@ -1310,7 +1310,7 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | Option | Default | Effect |
 |---|---|---|
 | `ExpectedPCR0` | required | `New` fails without it. |
-| `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
+| `ExpectedPCRs` | empty | Hex SHA-256 of each static secret's compressed public key, in `ENCLAVE_SECRETS_CONFIG` order. Entry *i* is checked against PCR(16+i) as `SHA-384(48 zero bytes ‖ hash)`, the value the runtime extends it to. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |

@@ -1062,7 +1062,7 @@ func TestSignedRequestSizeLimit(t *testing.T) {
 			h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 				called = true
 			}))
-			body := strings.NewReader(strings.Repeat("x", maxSignedRequestBytes+1))
+			body := strings.NewReader(strings.Repeat("x", maxSignedBytes+1))
 			req := httptest.NewRequest(http.MethodPost, "/orders", body)
 			if unknownLength {
 				req.ContentLength = -1
@@ -1078,34 +1078,34 @@ func TestSignedRequestSizeLimit(t *testing.T) {
 }
 
 func TestSignedResponseSizeLimit(t *testing.T) {
-	t.Run("exact limits are accepted", func(t *testing.T) {
+	t.Run("bodies at the limit are accepted", func(t *testing.T) {
 		attData := &AttestationData{}
 		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
 		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, err := io.ReadAll(r.Body)
 			require.NoError(t, err)
-			require.Len(t, body, maxSignedRequestBytes)
-			n, err := w.Write(make([]byte, maxSignedResponseBytes))
+			require.Len(t, body, maxSignedBytes)
+			n, err := w.Write(make([]byte, maxSignedBytes))
 			require.NoError(t, err)
-			require.Equal(t, maxSignedResponseBytes, n)
+			require.Equal(t, maxSignedBytes, n)
 		}))
 		req := httptest.NewRequest(http.MethodPost, "/orders",
-			bytes.NewReader(make([]byte, maxSignedRequestBytes)))
+			bytes.NewReader(make([]byte, maxSignedBytes)))
 		req.Header.Set(signNonceHeader, "n")
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code)
-		require.Equal(t, maxSignedResponseBytes, rr.Body.Len())
+		require.Equal(t, maxSignedBytes, rr.Body.Len())
 		require.NotEmpty(t, rr.Header().Get(signatureHeader))
 	})
 
-	t.Run("ignored write errors remain fatal", func(t *testing.T) {
+	t.Run("an oversized response that skips the proxy gets a 502", func(t *testing.T) {
 		attData := &AttestationData{}
 		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
 		var overflowErr, laterErr error
 		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte("prefix"))
-			_, overflowErr = w.Write(make([]byte, maxSignedResponseBytes))
+			_, overflowErr = w.Write(make([]byte, maxSignedBytes))
 			// This fits if overflow merely rejects the previous Write and forgets it.
 			_, laterErr = w.Write([]byte("tail"))
 		}))
@@ -1120,9 +1120,9 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		require.NotContains(t, rr.Body.String(), "prefix")
 	})
 
-	t.Run("reverse proxy copy abort", func(t *testing.T) {
+	t.Run("an oversized proxied response drops the connection", func(t *testing.T) {
 		app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxSignedResponseBytes+1)))
+			_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxSignedBytes+1)))
 		}))
 		t.Cleanup(app.Close)
 		appURL, err := url.Parse(app.URL)
@@ -1146,7 +1146,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		if res != nil {
 			_ = res.Body.Close()
 		}
-		require.ErrorIs(t, err, io.EOF, "ReverseProxy aborts before a signed response is sent")
+		require.ErrorIs(t, err, io.EOF, "ReverseProxy drops the connection")
 		require.Nil(t, res)
 	})
 }

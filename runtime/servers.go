@@ -40,8 +40,8 @@ const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
 
-	maxSignedRequestBytes  = 1 << 20 // 1 MiB
-	maxSignedResponseBytes = 4 << 20 // 4 MiB
+	// Caps each buffered signed body; 4 MiB is gRPC's default receive limit.
+	maxSignedBytes = 4 << 20
 
 	maxLoggedNonce = 128
 )
@@ -508,7 +508,7 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 			http.Error(w, "no response signing key", http.StatusServiceUnavailable)
 			return
 		}
-		reqBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedRequestBytes))
+		reqBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedBytes))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
@@ -531,6 +531,8 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 
 		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		// Only oversized responses that don't go through the proxy, like enclave
+		// info, get the 502: ReverseProxy drops the connection when its write fails.
 		if rec.tooLarge {
 			http.Error(w, "response body too large", http.StatusBadGateway)
 			return
@@ -572,7 +574,7 @@ type bufferedResponse struct {
 func (b *bufferedResponse) Header() http.Header    { return b.header }
 func (b *bufferedResponse) WriteHeader(status int) { b.status = status }
 func (b *bufferedResponse) Write(p []byte) (int, error) {
-	if b.tooLarge || len(p) > maxSignedResponseBytes-b.body.Len() {
+	if b.tooLarge || len(p) > maxSignedBytes-b.body.Len() {
 		b.tooLarge = true
 		return 0, errors.New("response body too large")
 	}

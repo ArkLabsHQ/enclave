@@ -851,7 +851,10 @@ the shared master seed can still derive keys for other PCR0 values.
 
 Requests without the header are proxied unchanged and stream as before.
 Signed request and response bodies are buffered whole before the signature is
-sent, so signed requests suit bounded bodies, not uploads, downloads or streams. Signed responses carry `Cache-Control: no-store`, since each
+sent, so signed requests suit bounded bodies, not uploads, downloads or streams.
+Each is capped at 4 MiB, gRPC's default receive limit: a larger request body is
+answered `413` before the application sees it, and a larger application
+response is aborted, so the client gets no response. Signed responses carry `Cache-Control: no-store`, since each
 answers a single nonce. The `502` for an unreachable application is signed like
 any other response. `/enclave/v1/info` is signed the same way once the runtime
 holds its signing key; before that, as a candidate, a signed request to it is

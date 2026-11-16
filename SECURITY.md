@@ -20,8 +20,6 @@ The policy applies to the source in this public repository, release artifacts an
 
 Documented alpha, testnet, or unaudited status is severity context, not a blanket exclusion. A testnet-only issue is still relevant when it exposes a flaw that can reach a supported mainnet or published release path.
 
-
-
 ## Threat Model and Trust Boundaries
 
 This repository uses the **Infrastructure and signing** profile. The security boundary includes key material, signing policy, attestation, KMS access, deployment configuration, encrypted state, backups, migration, service isolation, and build provenance.

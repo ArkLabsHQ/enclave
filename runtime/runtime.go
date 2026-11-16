@@ -276,13 +276,19 @@ func appEnv(cfg Config, authToken string, secrets Secrets) []string {
 			env = append(env, secret.EnvVar+"="+secret.Plaintext)
 		}
 	}
-	return append(
+	env = append(
 		env,
 		"ENCLAVE_APP_PORT="+cfg.AppPort,
 		"PORT="+cfg.AppPort,
 		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-		"ENCLAVE_RUNTIME_TOKEN="+authToken,
 	)
+	if cfg.OtelEndpointEnv != "" {
+		env = append(env, cfg.OtelEndpointEnv+"=http://127.0.0.1:"+strconv.Itoa(int(cfg.IntPort)))
+	}
+	if cfg.OtelTokenEnv != "" {
+		env = append(env, cfg.OtelTokenEnv+"="+authToken)
+	}
+	return env
 }
 
 func startApp(

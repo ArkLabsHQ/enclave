@@ -88,7 +88,7 @@ func NewBoot(
 		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
 	}
 
-	if err := secretsMetadata.Validate(cfg.OverrideAllowList); err != nil {
+	if err := secretsMetadata.Validate(*cfg); err != nil {
 		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
 	}
 

@@ -39,6 +39,8 @@ const (
 	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
 	envTraces           = "ENCLAVE_TRACES"
 	envMetrics          = "ENCLAVE_METRICS"
+	envOtelEndpointEnv  = "ENCLAVE_OTEL_ENDPOINT_ENV"
+	envOtelTokenEnv     = "ENCLAVE_OTEL_TOKEN_ENV"
 
 	// ACME settings: baked defaults the SSM overlay may replace.
 	envUseACME       = "ENCLAVE_USE_ACME"
@@ -75,6 +77,8 @@ const (
 	defaultMigrationCooldown = 24 * time.Hour
 	defaultLogShipInterval   = 10 * time.Second
 	defaultLogRetentionDays  = int32(30)
+	defaultOtelEndpointEnv   = "ENCLAVE_OTEL_ENDPOINT"
+	defaultOtelTokenEnv      = "ENCLAVE_RUNTIME_TOKEN"
 
 	otlpHTTPTimeout = 30 * time.Second
 
@@ -166,6 +170,8 @@ type Config struct {
 	LogRetentionDays      int32
 	ExportTraces          bool // Logs always ship; traces and metrics only when enabled.
 	ExportMetrics         bool
+	OtelEndpointEnv       string // Child variable for the OTLP base URL; empty skips export.
+	OtelTokenEnv          string // Child variable for the bearer token; empty skips export.
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
@@ -217,6 +223,8 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
+		OtelEndpointEnv:       takeEnvDefaultIfUnset(envOtelEndpointEnv, defaultOtelEndpointEnv),
+		OtelTokenEnv:          takeEnvDefaultIfUnset(envOtelTokenEnv, defaultOtelTokenEnv),
 		SnapshotRetention:     prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
@@ -321,6 +329,29 @@ func (c *Config) Validate() error {
 	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
+	return c.validateTelemetryEnv()
+}
+
+func (c *Config) validateTelemetryEnv() error {
+	for _, setting := range []struct{ key, value, fallback string }{
+		{envOtelEndpointEnv, c.OtelEndpointEnv, defaultOtelEndpointEnv},
+		{envOtelTokenEnv, c.OtelTokenEnv, defaultOtelTokenEnv},
+	} {
+		if setting.value == "" {
+			continue
+		}
+		if !envVarNamePattern.MatchString(setting.value) {
+			return fmt.Errorf(
+				"%s: invalid environment variable name %q", setting.key, setting.value,
+			)
+		}
+		if childReservedEnv[setting.value] && setting.value != setting.fallback {
+			return fmt.Errorf("%s: environment variable %q is reserved", setting.key, setting.value)
+		}
+	}
+	if c.OtelEndpointEnv != "" && c.OtelEndpointEnv == c.OtelTokenEnv {
+		return fmt.Errorf("%s and %s must use different names", envOtelEndpointEnv, envOtelTokenEnv)
+	}
 	return nil
 }
 
@@ -393,6 +424,10 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 			c.ACMEEmail = p.Value
 		case envACMECA:
 			c.ACMECA = p.Value
+		case envOtelEndpointEnv:
+			c.OtelEndpointEnv = p.Value
+		case envOtelTokenEnv:
+			c.OtelTokenEnv = p.Value
 		// key is not an overridable env var, check if overriding is allowed by the app
 		default:
 			if _, allowed := c.OverrideAllowList[key]; !allowed {
@@ -405,6 +440,9 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 		applied++
 	}
 
+	if err := c.validateTelemetryEnv(); err != nil {
+		return err
+	}
 	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
 
 	return nil
@@ -500,6 +538,16 @@ func takeEnvDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// An explicitly empty name disables the child export.
+func takeEnvDefaultIfUnset(key, fallback string) string {
+	_, set := os.LookupEnv(key)
+	value := takeEnvRaw(key)
+	if !set {
+		return fallback
+	}
+	return value
 }
 
 // takeEnvBool consumes an optional boolean: unset is false, and a value

@@ -18,11 +18,13 @@ import (
 func TestAppEnv(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
+		config    map[string]string
 		parent    map[string]string
 		allowlist string
 		overrides map[string]string
 		secrets   []StaticSecret
 		want      map[string]string
+		absent    []string
 	}{
 		{
 			name:   "missing SSM override preserves baked values",
@@ -85,12 +87,74 @@ func TestAppEnv(t *testing.T) {
 			overrides: map[string]string{"CHILD_ENV_TEST_SETTING": "  café\nkey=value \t"},
 			want:      map[string]string{"CHILD_ENV_TEST_SETTING": "  café\nkey=value \t"},
 		},
+		{
+			name: "baked telemetry names replace defaults and override child settings",
+			config: map[string]string{
+				envOtelEndpointEnv: "APP_OTEL_ENDPOINT", envOtelTokenEnv: "APP_OTEL_TOKEN",
+			},
+			parent: map[string]string{
+				"APP_OTEL_ENDPOINT": "https://baked.example.com", "APP_OTEL_TOKEN": "baked-token",
+			},
+			allowlist: "APP_OTEL_ENDPOINT,APP_OTEL_TOKEN",
+			overrides: map[string]string{
+				"APP_OTEL_ENDPOINT": "https://ssm.example.com", "APP_OTEL_TOKEN": "ssm-token",
+			},
+			want: map[string]string{
+				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
+			},
+			absent: []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
+		},
+		{
+			name: "SSM telemetry names override baked names without an allowlist",
+			config: map[string]string{
+				envOtelEndpointEnv: "BAKED_ENDPOINT", envOtelTokenEnv: "BAKED_TOKEN",
+			},
+			overrides: map[string]string{
+				envOtelEndpointEnv: "APP_OTEL_ENDPOINT", envOtelTokenEnv: "APP_OTEL_TOKEN",
+			},
+			want: map[string]string{
+				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
+			},
+			absent: []string{
+				defaultOtelEndpointEnv, defaultOtelTokenEnv, "BAKED_ENDPOINT", "BAKED_TOKEN",
+			},
+		},
+		{
+			name:   "empty baked names disable telemetry exports",
+			config: map[string]string{envOtelEndpointEnv: "", envOtelTokenEnv: ""},
+			absent: []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
+		},
+		{
+			name:      "empty SSM names disable telemetry exports",
+			overrides: map[string]string{envOtelEndpointEnv: "", envOtelTokenEnv: ""},
+			absent:    []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
+		},
+		{
+			name:   "endpoint export can be disabled independently",
+			config: map[string]string{envOtelEndpointEnv: ""},
+			absent: []string{defaultOtelEndpointEnv},
+		},
+		{
+			name:   "token export can be disabled independently",
+			config: map[string]string{envOtelTokenEnv: ""},
+			absent: []string{defaultOtelTokenEnv},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setConfigTestEnv(t, false)
+			for _, key := range []string{
+				envOtelEndpointEnv, envOtelTokenEnv, defaultOtelEndpointEnv, defaultOtelTokenEnv,
+			} {
+				t.Setenv(key, "")
+				require.NoError(t, os.Unsetenv(key))
+			}
+			for key, value := range tc.config {
+				t.Setenv(key, value)
+			}
 			t.Setenv(envOverrideAllowList, tc.allowlist)
 			cfg, err := LoadConfig()
 			require.NoError(t, err)
+			require.NoError(t, cfg.Validate())
 			for key, value := range tc.parent {
 				t.Setenv(key, value)
 			}
@@ -116,7 +180,14 @@ func TestAppEnv(t *testing.T) {
 			want := map[string]string{
 				envAppPort: "7074", "PORT": "7074",
 				"ENCLAVE_PROXY_PORT": "8080", "ENCLAVE_RUNTIME_TOKEN": "runtime-token",
+				defaultOtelEndpointEnv: "http://127.0.0.1:8080",
 			}
+			for _, key := range tc.absent {
+				delete(want, key)
+				require.NotContains(t, values, key)
+			}
+			require.NotContains(t, values, envOtelEndpointEnv)
+			require.NotContains(t, values, envOtelTokenEnv)
 			maps.Copy(want, tc.want)
 			for key, value := range want {
 				require.Equal(

@@ -377,7 +377,7 @@ func TestValidateStaticSecrets(t *testing.T) {
 			"15 secrets":     {Static: fifteen},
 		} {
 			t.Run(name, func(t *testing.T) {
-				require.NoError(t, meta.Validate(nil))
+				require.NoError(t, meta.Validate(Config{}))
 			})
 		}
 	})
@@ -458,7 +458,7 @@ func TestValidateStaticSecrets(t *testing.T) {
 			}, "PCR16–PCR30"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				require.ErrorContains(t, tc.meta.Validate(nil), tc.want)
+				require.ErrorContains(t, tc.meta.Validate(Config{}), tc.want)
 			})
 		}
 	})
@@ -478,7 +478,7 @@ func TestValidateInheritSecrets(t *testing.T) {
 	}
 	static := []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}
 	validate := func(inherited []InheritSecretMetadata) error {
-		return SecretsMetadata{Static: static, Inherited: inherited}.Validate(nil)
+		return SecretsMetadata{Static: static, Inherited: inherited}.Validate(Config{})
 	}
 
 	require.NoError(t, validate(nil))

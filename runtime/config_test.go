@@ -269,9 +269,6 @@ func TestTelemetryEnvValidation(t *testing.T) {
 		{"digit", "ENDPOINT", "1TOKEN", "invalid environment variable name"},
 		{"newline", "ENDPOINT", "TOKEN\n", "invalid environment variable name"},
 		{"port collision", "PORT", "TOKEN", "reserved"},
-		{"proxy port collision", "ENDPOINT", "ENCLAVE_PROXY_PORT", "reserved"},
-		{"legacy token collision", "ENCLAVE_RUNTIME_TOKEN", "TOKEN", "reserved"},
-		{"legacy runtime port collision", "ENCLAVE_RUNTIME_PORT", "TOKEN", "reserved"},
 		{"application port collision", "ENCLAVE_APP_PORT", "TOKEN", "reserved"},
 		{"duplicate names", "SAME", "SAME", "must use different names"},
 	} {

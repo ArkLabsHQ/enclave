@@ -740,7 +740,7 @@ The bearer token authenticates the application to the runtime's OTLP forwarders.
 
 Set both telemetry variable names in the image to match the application's configuration.
 The names must be valid environment identifiers, must differ, and must not
-collide with another runtime export, a legacy name, or a secret.
+collide with another runtime export or a secret.
 
 ```text
 ENCLAVE_OTEL_ENDPOINT_ENV=ARKD_SIGNER_OTEL_COLLECTOR_ENDPOINT
@@ -751,10 +751,6 @@ The application must accept a full HTTP URL and a raw bearer token. It appends
 the signal path, such as `/v1/logs`, and sends `Authorization: Bearer <token>`.
 The runtime sets these values after baked variables, SSM application overrides
 and secrets. SSM can replace either name but cannot clear it.
-
-The runtime strips `ENCLAVE_PROXY_PORT`, `ENCLAVE_RUNTIME_PORT`, and
-`ENCLAVE_RUNTIME_TOKEN` from the child environment, regardless of their source.
-These legacy names remain reserved.
 
 ### SSM parameters
 

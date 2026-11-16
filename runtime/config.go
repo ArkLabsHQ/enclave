@@ -353,16 +353,13 @@ func (c *Config) validateTelemetryEnv() error {
 	return nil
 }
 
-// reservedEnv includes runtime exports and legacy names that must never reach the child.
+// reservedEnv includes environment variables exported by the runtime.
 func (c Config) reservedEnv() map[string]bool {
 	return map[string]bool{
-		envAppPort:              true,
-		"PORT":                  true,
-		"ENCLAVE_PROXY_PORT":    true,
-		"ENCLAVE_RUNTIME_PORT":  true,
-		"ENCLAVE_RUNTIME_TOKEN": true,
-		c.OtelEndpointEnv:       true,
-		c.OtelTokenEnv:          true,
+		envAppPort:        true,
+		"PORT":            true,
+		c.OtelEndpointEnv: true,
+		c.OtelTokenEnv:    true,
 	}
 }
 

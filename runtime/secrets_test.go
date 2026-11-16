@@ -574,7 +574,7 @@ func TestValidateInheritSecrets(t *testing.T) {
 func TestTelemetryEnvSecretCollisions(t *testing.T) {
 	cfg := Config{OtelEndpointEnv: "APP_ENDPOINT", OtelTokenEnv: "APP_TOKEN"}
 	for _, name := range []string{
-		envAppPort, "PORT", "ENCLAVE_PROXY_PORT", "ENCLAVE_RUNTIME_PORT", "ENCLAVE_RUNTIME_TOKEN",
+		envAppPort, "PORT",
 		cfg.OtelEndpointEnv, cfg.OtelTokenEnv,
 	} {
 		t.Run(name, func(t *testing.T) {

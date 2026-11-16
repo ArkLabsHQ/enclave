@@ -118,23 +118,6 @@ func TestAppEnv(t *testing.T) {
 				"BAKED_ENDPOINT", "BAKED_TOKEN",
 			},
 		},
-		{
-			name: "legacy names are stripped from every source",
-			parent: map[string]string{
-				"ENCLAVE_PROXY_PORT": "8080", "ENCLAVE_RUNTIME_PORT": "8080",
-				"ENCLAVE_RUNTIME_TOKEN": "baked-token",
-			},
-			allowlist: "ENCLAVE_PROXY_PORT,ENCLAVE_RUNTIME_PORT,ENCLAVE_RUNTIME_TOKEN",
-			overrides: map[string]string{
-				"ENCLAVE_PROXY_PORT": "8081", "ENCLAVE_RUNTIME_PORT": "8081",
-				"ENCLAVE_RUNTIME_TOKEN": "ssm-token",
-			},
-			secrets: []StaticSecret{
-				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_PROXY_PORT"}, Plaintext: "8082"},
-				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_RUNTIME_PORT"}, Plaintext: "8082"},
-				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_RUNTIME_TOKEN"}, Plaintext: "secret-token"},
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setConfigTestEnv(t, false)
@@ -173,9 +156,6 @@ func TestAppEnv(t *testing.T) {
 			}
 			for _, key := range tc.absent {
 				delete(want, key)
-				require.NotContains(t, values, key)
-			}
-			for _, key := range []string{"ENCLAVE_PROXY_PORT", "ENCLAVE_RUNTIME_PORT", "ENCLAVE_RUNTIME_TOKEN"} {
 				require.NotContains(t, values, key)
 			}
 			require.NotContains(t, values, envOtelEndpointEnv)

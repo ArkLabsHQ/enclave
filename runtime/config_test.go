@@ -18,6 +18,8 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
 		ExportTraces: true, ExportMetrics: true,
+		OtelEndpointEnv:    "APP_OTEL_ENDPOINT",
+		OtelTokenEnv:       "APP_OTEL_TOKEN",
 		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
 		KMSLocked:          true,
 		VerifyClockSource:  true,
@@ -69,6 +71,8 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envInsecureVerifySkipped, "")
 	t.Setenv(envTraces, "")
 	t.Setenv(envMetrics, "")
+	t.Setenv(envOtelEndpointEnv, "APP_OTEL_ENDPOINT")
+	t.Setenv(envOtelTokenEnv, "APP_OTEL_TOKEN")
 	t.Setenv(envUseACME, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")
@@ -247,6 +251,34 @@ func TestConfigValidate(t *testing.T) {
 				return
 			}
 			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestTelemetryEnvValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		token    string
+		wantErr  string
+	}{
+		{"empty endpoint", "", "TOKEN", envOtelEndpointEnv + " must be set"},
+		{"empty token", "ENDPOINT", "", envOtelTokenEnv + " must be set"},
+		{"equals", "BAD=NAME", "TOKEN", "invalid environment variable name"},
+		{"whitespace", " ENDPOINT", "TOKEN", "invalid environment variable name"},
+		{"digit", "ENDPOINT", "1TOKEN", "invalid environment variable name"},
+		{"newline", "ENDPOINT", "TOKEN\n", "invalid environment variable name"},
+		{"port collision", "PORT", "TOKEN", "reserved"},
+		{"application port collision", "ENCLAVE_APP_PORT", "TOKEN", "reserved"},
+		{"duplicate names", "SAME", "SAME", "must use different names"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envOtelEndpointEnv, tc.endpoint)
+			t.Setenv(envOtelTokenEnv, tc.token)
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.ErrorContains(t, cfg.Validate(), tc.wantErr)
 		})
 	}
 }
@@ -570,6 +602,14 @@ func TestApplySSMOverlay(t *testing.T) {
 
 		require.ErrorContains(t, err, "invalid application port")
 		require.Equal(t, testCfg.AppPort, cfg.AppPort)
+	})
+
+	t.Run("rejects colliding telemetry names", func(t *testing.T) {
+		cfg := testConfig()
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envOtelTokenEnv): cfg.OtelEndpointEnv,
+		}))
+		require.ErrorContains(t, err, "must use different names")
 	})
 
 	t.Run("skips empty and nested keys", func(t *testing.T) {

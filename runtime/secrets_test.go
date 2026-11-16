@@ -377,7 +377,7 @@ func TestValidateStaticSecrets(t *testing.T) {
 			"15 secrets":     {Static: fifteen},
 		} {
 			t.Run(name, func(t *testing.T) {
-				require.NoError(t, meta.Validate(nil))
+				require.NoError(t, meta.Validate(Config{}))
 			})
 		}
 	})
@@ -427,18 +427,6 @@ func TestValidateStaticSecrets(t *testing.T) {
 			{"equals in env var", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "BAD=KEY"},
 			}}, "cannot use invalid env_var"},
-			{"PORT", SecretsMetadata{Static: []StaticSecretMetadata{
-				{Name: "key", EnvVar: "PORT"},
-			}}, "cannot use reserved env_var"},
-			{"ENCLAVE_RUNTIME_TOKEN", SecretsMetadata{Static: []StaticSecretMetadata{
-				{Name: "key", EnvVar: "ENCLAVE_RUNTIME_TOKEN"},
-			}}, "cannot use reserved env_var"},
-			{"ENCLAVE_APP_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
-				{Name: "key", EnvVar: "ENCLAVE_APP_PORT"},
-			}}, "cannot use reserved env_var"},
-			{"ENCLAVE_PROXY_PORT", SecretsMetadata{Static: []StaticSecretMetadata{
-				{Name: "key", EnvVar: "ENCLAVE_PROXY_PORT"},
-			}}, "cannot use reserved env_var"},
 			{"duplicate name", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "duplicate", EnvVar: "ONE"},
 				{Name: "duplicate", EnvVar: "TWO"},
@@ -458,7 +446,7 @@ func TestValidateStaticSecrets(t *testing.T) {
 			}, "PCR16–PCR30"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				require.ErrorContains(t, tc.meta.Validate(nil), tc.want)
+				require.ErrorContains(t, tc.meta.Validate(Config{}), tc.want)
 			})
 		}
 	})
@@ -478,7 +466,7 @@ func TestValidateInheritSecrets(t *testing.T) {
 	}
 	static := []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}
 	validate := func(inherited []InheritSecretMetadata) error {
-		return SecretsMetadata{Static: static, Inherited: inherited}.Validate(nil)
+		return SecretsMetadata{Static: static, Inherited: inherited}.Validate(Config{})
 	}
 
 	require.NoError(t, validate(nil))
@@ -538,7 +526,6 @@ func TestValidateInheritSecrets(t *testing.T) {
 			with(func(m *InheritSecretMetadata) { m.EnvVar = "A=B" }),
 			"invalid env_var",
 		},
-		{"child env var", with(func(m *InheritSecretMetadata) { m.EnvVar = "PORT" }), "reserved"},
 		{
 			"static secret env var",
 			with(func(m *InheritSecretMetadata) { m.EnvVar = "SIGNING_KEY" }),
@@ -580,6 +567,25 @@ func TestValidateInheritSecrets(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require.ErrorContains(t, validate(tt.meta), tt.want)
+		})
+	}
+}
+
+func TestTelemetryEnvSecretCollisions(t *testing.T) {
+	cfg := Config{OtelEndpointEnv: "APP_ENDPOINT", OtelTokenEnv: "APP_TOKEN"}
+	for _, name := range []string{
+		envAppPort, "PORT",
+		cfg.OtelEndpointEnv, cfg.OtelTokenEnv,
+	} {
+		t.Run(name, func(t *testing.T) {
+			static := SecretsMetadata{
+				Static: []StaticSecretMetadata{{Name: "key", EnvVar: name}},
+			}
+			require.ErrorContains(t, static.Validate(cfg), "reserved")
+			inherited := SecretsMetadata{
+				Inherited: []InheritSecretMetadata{{Name: "key", EnvVar: name}},
+			}
+			require.ErrorContains(t, inherited.Validate(cfg), "reserved")
 		})
 	}
 }

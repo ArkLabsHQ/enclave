@@ -228,6 +228,8 @@ let
     ENCLAVE_UPSTREAM = "h1";
     ENCLAVE_TRACES = "true";
     ENCLAVE_METRICS = "true";
+    ENCLAVE_OTEL_ENDPOINT_ENV = "APP_OTEL_ENDPOINT";
+    ENCLAVE_OTEL_TOKEN_ENV = "APP_OTEL_TOKEN";
     # e2e.py places the inherited values in SSM, hex-encoded; each hash pin is
     # the SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
     # only verified. The second is already past its cutoff. The third's cutoff

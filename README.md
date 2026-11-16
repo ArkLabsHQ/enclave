@@ -72,6 +72,8 @@ derivation.
           ENCLAVE_APP_NAME = "myapp";
           ENCLAVE_AWS_REGION = "eu-west-1";
           ENCLAVE_PREVIOUS_PCR0 = "genesis";
+          ENCLAVE_OTEL_ENDPOINT_ENV = "MYAPP_OTEL_ENDPOINT";
+          ENCLAVE_OTEL_TOKEN_ENV = "MYAPP_OTEL_TOKEN";
         };
       };
     in
@@ -408,6 +410,8 @@ is disabled; the boot fails without it.
 | `ENCLAVE_MIGRATION_COOLDOWN` | `24h` | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Can be set in either production or dev mode; unset defaults to 24 hours in both. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Export cadence for the runtime's own logs, spans and metrics. The application's cadence is its own exporter's. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required | Child environment variable that receives the OTLP/HTTP base URL. Must be set in the image. SSM-overridable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required | Child environment variable that receives the per-boot bearer token. Must be set in the image. SSM-overridable. |
 | `ENCLAVE_TRACES` | `false` | `true` exports spans to X-Ray: the runtime's own and the application's, relayed from `/v1/traces`. Needs Transaction Search and the `XRayAccess` statement. Otherwise the application's uploads and the runtime's own spans are dropped inside the enclave with an empty success response. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
 | `ENCLAVE_METRICS` | `false` | `true` exports metrics to CloudWatch: the runtime's own counters, `/proc` readings and forward-duration histograms, and the application's, relayed from `/v1/metrics`. Needs the `CloudWatchMetricsAccess` statement. Otherwise the application's uploads and the runtime's own metrics are dropped inside the enclave with an empty success response, so export failures show only on `stderr`. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
 
@@ -691,6 +695,8 @@ passes the final application port to the child as described in
 | `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
 | `ENCLAVE_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required name of the child's OTLP endpoint variable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required name of the child's OTLP bearer-token variable. |
 
 `ENCLAVE_FQDN` and the four ACME settings start with their baked values, which
 the overlay may replace; `ENCLAVE_FQDN` defaults to `localhost` and ACME to off.
@@ -726,11 +732,25 @@ secrets and inherited secrets, plus these explicit runtime exports:
 |---|---|
 | `PORT` | `ENCLAVE_APP_PORT`, default `7074` |
 | `ENCLAVE_APP_PORT` | the same value |
-| `ENCLAVE_PROXY_PORT` | the internal API port, default `8080` |
-| `ENCLAVE_RUNTIME_TOKEN` | a 32-byte hex bearer token, regenerated each boot |
+| value of `ENCLAVE_OTEL_ENDPOINT_ENV` | the OTLP/HTTP base URL, `http://127.0.0.1:8080` |
+| value of `ENCLAVE_OTEL_TOKEN_ENV` | a 32-byte hex bearer token, regenerated each boot |
 
-`ENCLAVE_RUNTIME_TOKEN` authenticates the application to the runtime's OTLP
-forwarders on the internal listener. `stdout` and `stderr` are inherited.
+The bearer token authenticates the application to the runtime's OTLP forwarders.
+`stdout` and `stderr` are inherited.
+
+Set both telemetry variable names in the image to match the application's configuration.
+The names must be valid environment identifiers, must differ, and must not
+collide with another runtime export or a secret.
+
+```text
+ENCLAVE_OTEL_ENDPOINT_ENV=ARKD_SIGNER_OTEL_COLLECTOR_ENDPOINT
+ENCLAVE_OTEL_TOKEN_ENV=ARKD_SIGNER_OTEL_TOKEN
+```
+
+The application must accept a full HTTP URL and a raw bearer token. It appends
+the signal path, such as `/v1/logs`, and sends `Authorization: Bearer <token>`.
+The runtime sets these values after baked variables, SSM application overrides
+and secrets. SSM can replace either name but cannot clear it.
 
 ### SSM parameters
 
@@ -952,12 +972,14 @@ PCR0/key identity stops the walk and is reported through `complete` and
 ### Internal listener, TCP 127.0.0.1:8080
 
 Serves `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces` and `GET /health`
-only. The three forwarders expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`,
-accept OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
+only. The three forwarders expect `Authorization: Bearer <token>` with the
+per-boot token supplied through the configured child variable. They accept
+OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
 `gzip`-encoded, and answer with whatever AWS answered. When traces or metrics
 are off, that forwarder answers with an empty success and forwards nothing. This is the endpoint
-advertised to the application through `ENCLAVE_PROXY_PORT`. It does not serve
-`/enclave/v1/info`, the `/enclave/*` endpoints, or the application proxy.
+advertised through the configured endpoint variable.
+It does not serve `/enclave/v1/info`, the `/enclave/*` endpoints, or the
+application proxy.
 
 ## Deployment
 
@@ -1489,5 +1511,5 @@ application uploads: those can fail later and increment
 not fatal.
 
 **Telemetry forwarding uses the instance role.** The loopback-only forwarders
-require a per-boot `ENCLAVE_RUNTIME_TOKEN`, expose no read endpoints, and keep no
+require the per-boot telemetry bearer token, expose no read endpoints, and keep no
 local history. Their IAM permissions are write-only.

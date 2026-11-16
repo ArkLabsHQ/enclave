@@ -255,6 +255,37 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestTelemetryEnvValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		token    string
+		wantErr  string
+	}{
+		{"empty endpoint", "", "TOKEN", envOtelEndpointEnv + " must be set"},
+		{"empty token", "ENDPOINT", "", envOtelTokenEnv + " must be set"},
+		{"equals", "BAD=NAME", "TOKEN", "invalid environment variable name"},
+		{"whitespace", " ENDPOINT", "TOKEN", "invalid environment variable name"},
+		{"digit", "ENDPOINT", "1TOKEN", "invalid environment variable name"},
+		{"newline", "ENDPOINT", "TOKEN\n", "invalid environment variable name"},
+		{"port collision", "PORT", "TOKEN", "reserved"},
+		{"proxy port collision", "ENDPOINT", "ENCLAVE_PROXY_PORT", "reserved"},
+		{"legacy token collision", "ENCLAVE_RUNTIME_TOKEN", "TOKEN", "reserved"},
+		{"legacy runtime port collision", "ENCLAVE_RUNTIME_PORT", "TOKEN", "reserved"},
+		{"application port collision", "ENCLAVE_APP_PORT", "TOKEN", "reserved"},
+		{"duplicate names", "SAME", "SAME", "must use different names"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envOtelEndpointEnv, tc.endpoint)
+			t.Setenv(envOtelTokenEnv, tc.token)
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.ErrorContains(t, cfg.Validate(), tc.wantErr)
+		})
+	}
+}
+
 func TestLoadConfigTelemetrySettings(t *testing.T) {
 	setConfigTestEnv(t, false)
 	t.Setenv(envLogShipInterval, "250ms")
@@ -574,6 +605,14 @@ func TestApplySSMOverlay(t *testing.T) {
 
 		require.ErrorContains(t, err, "invalid application port")
 		require.Equal(t, testCfg.AppPort, cfg.AppPort)
+	})
+
+	t.Run("rejects colliding telemetry names", func(t *testing.T) {
+		cfg := testConfig()
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envOtelTokenEnv): cfg.OtelEndpointEnv,
+		}))
+		require.ErrorContains(t, err, "must use different names")
 	})
 
 	t.Run("skips empty and nested keys", func(t *testing.T) {

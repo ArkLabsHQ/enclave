@@ -98,7 +98,7 @@ func SetupHttpServers(
 	nsm NSM,
 	telemetry *Telemetry,
 	attData *AttestationData,
-	authToken string,
+	otelToken string,
 ) Servers {
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -120,7 +120,7 @@ func SetupHttpServers(
 	}
 
 	sm := http.NewServeMux()
-	registerRuntimeV1Handlers(sm, "/v1/", telemetry, authToken)
+	registerRuntimeV1Handlers(sm, "/v1/", telemetry, otelToken)
 	sm.Handle("GET /health", healthHandler(rt))
 
 	// OTLP forwarding stays on loopback because requests use instance credentials.
@@ -209,19 +209,19 @@ func registerRuntimeV1Handlers(
 	mux *http.ServeMux,
 	prefix string,
 	telemetry *Telemetry,
-	authToken string,
+	otelToken string,
 ) {
 	mux.HandleFunc(
 		"POST "+prefix+"metrics",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpMetrics)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpMetrics)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"logs",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpLogs)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpLogs)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"traces",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpTraces)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpTraces)),
 	)
 }
 

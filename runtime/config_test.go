@@ -18,6 +18,8 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
 		ExportTraces: true, ExportMetrics: true,
+		OtelEndpointEnv:    "APP_OTEL_ENDPOINT",
+		OtelTokenEnv:       "APP_OTEL_TOKEN",
 		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
 		KMSLocked:          true,
 		VerifyClockSource:  true,
@@ -69,6 +71,8 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envInsecureVerifySkipped, "")
 	t.Setenv(envTraces, "")
 	t.Setenv(envMetrics, "")
+	t.Setenv(envOtelEndpointEnv, "APP_OTEL_ENDPOINT")
+	t.Setenv(envOtelTokenEnv, "APP_OTEL_TOKEN")
 	t.Setenv(envUseACME, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")

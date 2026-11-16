@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"regexp"
 	"slices"
@@ -130,12 +129,7 @@ func LoadSecretsMetadata(cfg Config) (SecretsMetadata, error) {
 }
 
 func (sm SecretsMetadata) Validate(cfg Config) error {
-	reserved := maps.Clone(childReservedEnv)
-	for _, name := range []string{cfg.OtelEndpointEnv, cfg.OtelTokenEnv} {
-		if name != "" {
-			reserved[name] = true
-		}
-	}
+	reserved := cfg.reservedEnv()
 	if err := sm.validateStatic(reserved); err != nil {
 		return fmt.Errorf("invalid static secret metadata: %w", err)
 	}
@@ -293,15 +287,6 @@ func (m InheritSecretMetadata) pastCutoff(now time.Time) bool {
 type InheritedSecret struct {
 	InheritSecretMetadata
 	Plaintext string
-}
-
-// childReservedEnv reserves fixed exports and the default telemetry names.
-var childReservedEnv = map[string]bool{
-	"ENCLAVE_APP_PORT":      true,
-	"PORT":                  true,
-	"ENCLAVE_PROXY_PORT":    true,
-	"ENCLAVE_RUNTIME_TOKEN": true,
-	"ENCLAVE_OTEL_ENDPOINT": true,
 }
 
 var (

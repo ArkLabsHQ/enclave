@@ -53,20 +53,20 @@ func TestAppEnv(t *testing.T) {
 			},
 		},
 		{
-			name: "runtime ports and token override every other source",
+			name: "runtime exports override every other source",
 			parent: map[string]string{
 				envAppPort: "1111", "PORT": "1111",
-				"ENCLAVE_PROXY_PORT": "1112", "ENCLAVE_RUNTIME_TOKEN": "baked-token",
+				"APP_OTEL_ENDPOINT": "https://baked.example.com", "APP_OTEL_TOKEN": "baked-token",
 			},
-			allowlist: "PORT,ENCLAVE_PROXY_PORT,ENCLAVE_RUNTIME_TOKEN",
+			allowlist: "PORT,APP_OTEL_ENDPOINT,APP_OTEL_TOKEN",
 			overrides: map[string]string{
-				"PORT": "2222", "ENCLAVE_PROXY_PORT": "2223", "ENCLAVE_RUNTIME_TOKEN": "host-token",
+				"PORT": "2222", "APP_OTEL_ENDPOINT": "https://ssm.example.com", "APP_OTEL_TOKEN": "host-token",
 			},
 			secrets: []StaticSecret{
 				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: envAppPort}, Plaintext: "3333"},
 				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "PORT"}, Plaintext: "3333"},
-				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_PROXY_PORT"}, Plaintext: "3334"},
-				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_RUNTIME_TOKEN"}, Plaintext: "secret-token"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "APP_OTEL_ENDPOINT"}, Plaintext: "3334"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "APP_OTEL_TOKEN"}, Plaintext: "secret-token"},
 			},
 		},
 		{
@@ -88,7 +88,7 @@ func TestAppEnv(t *testing.T) {
 			want:      map[string]string{"CHILD_ENV_TEST_SETTING": "  café\nkey=value \t"},
 		},
 		{
-			name: "baked telemetry names replace defaults and override child settings",
+			name: "baked telemetry names override child settings",
 			config: map[string]string{
 				envOtelEndpointEnv: "APP_OTEL_ENDPOINT", envOtelTokenEnv: "APP_OTEL_TOKEN",
 			},
@@ -102,7 +102,6 @@ func TestAppEnv(t *testing.T) {
 			want: map[string]string{
 				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
 			},
-			absent: []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
 		},
 		{
 			name: "SSM telemetry names override baked names without an allowlist",
@@ -116,38 +115,29 @@ func TestAppEnv(t *testing.T) {
 				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
 			},
 			absent: []string{
-				defaultOtelEndpointEnv, defaultOtelTokenEnv, "BAKED_ENDPOINT", "BAKED_TOKEN",
+				"BAKED_ENDPOINT", "BAKED_TOKEN",
 			},
 		},
 		{
-			name:   "empty baked names disable telemetry exports",
-			config: map[string]string{envOtelEndpointEnv: "", envOtelTokenEnv: ""},
-			absent: []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
-		},
-		{
-			name:      "empty SSM names disable telemetry exports",
-			overrides: map[string]string{envOtelEndpointEnv: "", envOtelTokenEnv: ""},
-			absent:    []string{defaultOtelEndpointEnv, defaultOtelTokenEnv},
-		},
-		{
-			name:   "endpoint export can be disabled independently",
-			config: map[string]string{envOtelEndpointEnv: ""},
-			absent: []string{defaultOtelEndpointEnv},
-		},
-		{
-			name:   "token export can be disabled independently",
-			config: map[string]string{envOtelTokenEnv: ""},
-			absent: []string{defaultOtelTokenEnv},
+			name: "legacy names are stripped from every source",
+			parent: map[string]string{
+				"ENCLAVE_PROXY_PORT": "8080", "ENCLAVE_RUNTIME_PORT": "8080",
+				"ENCLAVE_RUNTIME_TOKEN": "baked-token",
+			},
+			allowlist: "ENCLAVE_PROXY_PORT,ENCLAVE_RUNTIME_PORT,ENCLAVE_RUNTIME_TOKEN",
+			overrides: map[string]string{
+				"ENCLAVE_PROXY_PORT": "8081", "ENCLAVE_RUNTIME_PORT": "8081",
+				"ENCLAVE_RUNTIME_TOKEN": "ssm-token",
+			},
+			secrets: []StaticSecret{
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_PROXY_PORT"}, Plaintext: "8082"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_RUNTIME_PORT"}, Plaintext: "8082"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "ENCLAVE_RUNTIME_TOKEN"}, Plaintext: "secret-token"},
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setConfigTestEnv(t, false)
-			for _, key := range []string{
-				envOtelEndpointEnv, envOtelTokenEnv, defaultOtelEndpointEnv, defaultOtelTokenEnv,
-			} {
-				t.Setenv(key, "")
-				require.NoError(t, os.Unsetenv(key))
-			}
 			for key, value := range tc.config {
 				t.Setenv(key, value)
 			}
@@ -179,11 +169,13 @@ func TestAppEnv(t *testing.T) {
 			}
 			want := map[string]string{
 				envAppPort: "7074", "PORT": "7074",
-				"ENCLAVE_PROXY_PORT": "8080", "ENCLAVE_RUNTIME_TOKEN": "runtime-token",
-				defaultOtelEndpointEnv: "http://127.0.0.1:8080",
+				cfg.OtelEndpointEnv: "http://127.0.0.1:8080", cfg.OtelTokenEnv: "runtime-token",
 			}
 			for _, key := range tc.absent {
 				delete(want, key)
+				require.NotContains(t, values, key)
+			}
+			for _, key := range []string{"ENCLAVE_PROXY_PORT", "ENCLAVE_RUNTIME_PORT", "ENCLAVE_RUNTIME_TOKEN"} {
 				require.NotContains(t, values, key)
 			}
 			require.NotContains(t, values, envOtelEndpointEnv)
@@ -363,7 +355,7 @@ func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
 	require.False(t, time.Now().Before(now.Add(50*time.Millisecond)), "restarted before the cutoff")
 
 	// The relaunched app's environment is built at relaunch.
-	relaunched := appEnv(Config{}, "runtime-token", secrets)
+	relaunched := appEnv(*testConfig(), "runtime-token", secrets)
 	require.Subset(t, relaunched, []string{"LEGACY_TOKEN=inherited", "LEGACY_FOREVER=inherited"})
 	require.NotContains(t, relaunched, "LEGACY_KEY=inherited",
 		"the expired secret must be gone before the app comes back")

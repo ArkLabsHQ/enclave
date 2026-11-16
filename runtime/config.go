@@ -77,8 +77,6 @@ const (
 	defaultMigrationCooldown = 24 * time.Hour
 	defaultLogShipInterval   = 10 * time.Second
 	defaultLogRetentionDays  = int32(30)
-	defaultOtelEndpointEnv   = "ENCLAVE_OTEL_ENDPOINT"
-	defaultOtelTokenEnv      = "ENCLAVE_RUNTIME_TOKEN"
 
 	otlpHTTPTimeout = 30 * time.Second
 
@@ -100,8 +98,7 @@ const (
 	// extPort is the public TLS listener. Fixed: the host's routing, the README
 	// and every client URL assume 443.
 	extPort = 443
-	// intPort is the loopback API listener, handed to the application as
-	// ENCLAVE_PROXY_PORT so it does not have to assume the value.
+	// intPort is the loopback API listener, included in the child's OTLP URL.
 	intPort = 8080
 	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
 	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
@@ -170,8 +167,8 @@ type Config struct {
 	LogRetentionDays      int32
 	ExportTraces          bool // Logs always ship; traces and metrics only when enabled.
 	ExportMetrics         bool
-	OtelEndpointEnv       string // Child variable for the OTLP base URL; empty skips export.
-	OtelTokenEnv          string // Child variable for the bearer token; empty skips export.
+	OtelEndpointEnv       string // Required child variable for the OTLP base URL.
+	OtelTokenEnv          string // Required child variable for the bearer token.
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
@@ -223,8 +220,8 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
-		OtelEndpointEnv:       takeEnvDefaultIfUnset(envOtelEndpointEnv, defaultOtelEndpointEnv),
-		OtelTokenEnv:          takeEnvDefaultIfUnset(envOtelTokenEnv, defaultOtelTokenEnv),
+		OtelEndpointEnv:       takeEnvRaw(envOtelEndpointEnv),
+		OtelTokenEnv:          takeEnvRaw(envOtelTokenEnv),
 		SnapshotRetention:     prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
@@ -333,26 +330,40 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) validateTelemetryEnv() error {
-	for _, setting := range []struct{ key, value, fallback string }{
-		{envOtelEndpointEnv, c.OtelEndpointEnv, defaultOtelEndpointEnv},
-		{envOtelTokenEnv, c.OtelTokenEnv, defaultOtelTokenEnv},
+	reserved := (Config{}).reservedEnv()
+	for _, setting := range []struct{ key, value string }{
+		{envOtelEndpointEnv, c.OtelEndpointEnv},
+		{envOtelTokenEnv, c.OtelTokenEnv},
 	} {
 		if setting.value == "" {
-			continue
+			return fmt.Errorf("%s must be set", setting.key)
 		}
 		if !envVarNamePattern.MatchString(setting.value) {
 			return fmt.Errorf(
 				"%s: invalid environment variable name %q", setting.key, setting.value,
 			)
 		}
-		if childReservedEnv[setting.value] && setting.value != setting.fallback {
+		if reserved[setting.value] {
 			return fmt.Errorf("%s: environment variable %q is reserved", setting.key, setting.value)
 		}
 	}
-	if c.OtelEndpointEnv != "" && c.OtelEndpointEnv == c.OtelTokenEnv {
+	if c.OtelEndpointEnv == c.OtelTokenEnv {
 		return fmt.Errorf("%s and %s must use different names", envOtelEndpointEnv, envOtelTokenEnv)
 	}
 	return nil
+}
+
+// reservedEnv includes runtime exports and legacy names that must never reach the child.
+func (c Config) reservedEnv() map[string]bool {
+	return map[string]bool{
+		envAppPort:              true,
+		"PORT":                  true,
+		"ENCLAVE_PROXY_PORT":    true,
+		"ENCLAVE_RUNTIME_PORT":  true,
+		"ENCLAVE_RUNTIME_TOKEN": true,
+		c.OtelEndpointEnv:       true,
+		c.OtelTokenEnv:          true,
+	}
 }
 
 func validateNamespaceName(name, value string, multiSegment bool) error {
@@ -538,16 +549,6 @@ func takeEnvDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// An explicitly empty name disables the child export.
-func takeEnvDefaultIfUnset(key, fallback string) string {
-	_, set := os.LookupEnv(key)
-	value := takeEnvRaw(key)
-	if !set {
-		return fallback
-	}
-	return value
 }
 
 // takeEnvBool consumes an optional boolean: unset is false, and a value

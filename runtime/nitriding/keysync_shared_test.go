@@ -7,9 +7,7 @@ import (
 	"time"
 )
 
-var (
-	null = make([]byte, 48) // An empty PCR value.
-)
+var null = make([]byte, 48) // An empty PCR value.
 
 // remoteAttInfo contains everything that we need to verify a remote enclave's
 // attestation information.

@@ -1,9 +1,8 @@
 // Package client provides a verified HTTP client for AWS Nitro Enclaves.
 //
-// Every request first verifies the enclave's attestation document (PCR0,
-// optional secret PCRs, attestation key binding) and then verifies the
-// Schnorr response signature. This ensures the enclave is running the
-// expected code and that responses haven't been tampered with.
+// Every request first verifies the enclave's attestation document (PCR0 and
+// optional secret PCRs), then pins the live TLS public key to the attested
+// fingerprint. This ensures the expected code terminates the connection.
 //
 // Usage:
 //
@@ -24,14 +23,20 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 )
 
 // Options configures the enclave client.
@@ -52,9 +57,13 @@ type Options struct {
 	// Set to 0 to verify on every request. Default: 60s.
 	CacheTTL time.Duration
 
-	// InsecureTLS skips TLS certificate verification. Default: true.
-	// Nitriding uses self-signed certificates, so this is typically needed.
+	// InsecureTLS, when explicitly true, disables TLS cert pinning (raw,
+	// unverified TLS). Default pins to the attested tlsKeyHash.
 	InsecureTLS *bool
+
+	// StrictTLS adds public CA + hostname validation on top of the pin (it
+	// does not replace it). Mutually exclusive with InsecureTLS.
+	StrictTLS bool
 
 	// InsecureSkipCOSEVerify skips COSE Sign1 signature + AWS Nitro root cert
 	// chain verification of the attestation document, while keeping PCR0 and
@@ -63,44 +72,51 @@ type Options struct {
 	// signature. Never set this against a real production enclave.
 	InsecureSkipCOSEVerify bool
 
-	// VerifyProvenance enables GitHub artifact attestation verification
-	// for the deployment manifest. When true, NewFromManifest checks that
-	// deployment.json has a valid build provenance attestation from GitHub
-	// Actions, proving it was produced by CI — not manually uploaded.
-	// Requires the repo to be public, or GitHubToken to be set for private repos.
-	VerifyProvenance bool
-
-	// GitHubToken is an optional GitHub API token for verifying attestations
-	// on private repositories. Not needed for public repos.
-	GitHubToken string
+	// SignedResponses asks the enclave to sign each response with its attested
+	// response-signing key, bound to this request, and fails any response whose
+	// signature is missing or invalid. It is checked on top of the TLS pin;
+	// behind a proxy that terminates TLS, also set InsecureTLS.
+	SignedResponses bool
 }
 
 // Response wraps an HTTP response with attestation verification metadata.
 type Response struct {
-	StatusCode        int
-	Header            http.Header
-	Body              []byte
-	SignatureVerified bool
+	StatusCode int
+	Header     http.Header
+	Body       []byte
 }
 
 // AttestationResult contains the verified attestation state.
 type AttestationResult struct {
-	PCR0           string
-	PCRs           map[uint]string
-	AttestationKey string // hex-encoded compressed secp256k1 pubkey
-	TLSKeyHash     string // hex-encoded SHA-256 of the enclave's TLS leaf cert (from user_data)
-	Verified       bool
-	VerifiedAt     time.Time
+	PCR0       string
+	PCRs       map[uint]string
+	TLSKeyHash string            // hex-encoded SHA-256 of the enclave TLS PublicKey
+	SigningKey ed25519.PublicKey // response-signing key; nil if the enclave attests none
+	Verified   bool
+	VerifiedAt time.Time
 }
 
 // Client is a verified HTTP client for an AWS Nitro Enclave.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	opts       Options
+	baseURL         string
+	httpClient      *http.Client // pins the live cert to the attested tlsKeyHash
+	bootstrapClient *http.Client // unpinned; only for GET /enclave/attestation
+	opts            Options
 
 	mu          sync.RWMutex
 	cachedState *AttestationResult
+}
+
+// currentTLSHash is read by the pin callback each handshake. The pin lives in
+// cachedState so it cannot disagree with the verify that produced it, and stays
+// empty until one passes every check, so a pre-pin request fails closed.
+func (c *Client) currentTLSHash() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cachedState == nil {
+		return ""
+	}
+	return c.cachedState.TLSKeyHash
 }
 
 // New creates a new enclave client that verifies attestation before
@@ -110,29 +126,111 @@ func New(baseURL string, opts Options) (*Client, error) {
 	if opts.ExpectedPCR0 == "" {
 		return nil, fmt.Errorf("ExpectedPCR0 is required")
 	}
+	endpoint, err := requireHTTPSURL(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("base URL %w", err)
+	}
 
 	if opts.CacheTTL == 0 {
 		opts.CacheTTL = 60 * time.Second
 	}
-
-	insecure := true
-	if opts.InsecureTLS != nil {
-		insecure = *opts.InsecureTLS
+	if opts.StrictTLS && opts.InsecureTLS != nil && *opts.InsecureTLS {
+		return nil, fmt.Errorf("StrictTLS and InsecureTLS are mutually exclusive")
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	insecure := opts.InsecureTLS != nil && *opts.InsecureTLS
+
+	c := &Client{
+		baseURL: endpoint,
+		opts:    opts,
+	}
+
+	// Bootstrap client: only GET /enclave/attestation (no secrets) runs before
+	// the pin. The self-signed cert is accepted; strict mode applies public PKI.
+	bootstrapTransport := http.DefaultTransport.(*http.Transport).Clone()
+	bootstrapTransport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: !opts.StrictTLS,
+		MinVersion:         tls.VersionTLS12,
+	}
+	c.bootstrapClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpsTransport{bootstrapTransport},
+	}
+
+	// Main client: pins every connection to the attested tlsKeyHash.
+	mainTransport := http.DefaultTransport.(*http.Transport).Clone()
 	if insecure {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		mainTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		mainTransport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: !opts.StrictTLS,
+			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				return verifyLeafKeyHash(rawCerts, c.currentTLSHash())
+			},
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	c.httpClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpsTransport{mainTransport},
+	}
+	if opts.SignedResponses {
+		// Don't follow redirects: signature verification uses the original request.
+		// Verify and return the redirect response so the caller can handle it.
+		c.httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
 	}
 
-	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
+	return c, nil
+}
+
+// requireHTTPSURL returns rawURL without its trailing slash, rejecting anything
+// that is not an absolute https URL with a host: the pin is only consulted
+// during a TLS handshake, so a plaintext endpoint bypasses it entirely.
+func requireHTTPSURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return "", fmt.Errorf(
+			"must be an absolute https:// URL with a host, got %q", rawURL,
+		)
+	}
+	return strings.TrimRight(rawURL, "/"), nil
+}
+
+// httpsTransport refuses a plaintext hop before anything is written, covering
+// the first request and every redirect. Embedding keeps CloseIdleConnections
+// promoted. Closing the body is the RoundTripper contract ("RoundTrip must
+// always close the body, including on errors"), which http.Client.do relies on;
+// doing it here keeps the public Do from closing a body the caller owns.
+type httpsTransport struct{ *http.Transport }
+
+func (t httpsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL != nil && req.URL.Scheme == "https" {
+		return t.Transport.RoundTrip(req)
+	}
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return nil, fmt.Errorf("request URL must use https")
+}
+
+// PinnedHTTPClient returns a client that pins the live certificate's PublicKey
+// to tlsKeyHashHex and rejects plaintext requests and redirects. strict adds
+// public CA and hostname validation.
+func PinnedHTTPClient(tlsKeyHashHex string, strict bool) (*http.Client, error) {
+	if isAllZeroHex(tlsKeyHashHex) {
+		return nil, fmt.Errorf("no TLS public-key fingerprint to pin against")
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: !strict,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return verifyLeafKeyHash(rawCerts, tlsKeyHashHex)
 		},
-		opts: opts,
-	}, nil
+		MinVersion: tls.VersionTLS12,
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: httpsTransport{transport}}, nil
 }
 
 // Get makes a verified GET request to the enclave.
@@ -154,18 +252,28 @@ func (c *Client) Post(ctx context.Context, path string, body io.Reader) (*Respon
 	return c.Do(ctx, req)
 }
 
-// Do makes a verified HTTP request to the enclave. It:
-//  1. Verifies attestation (PCR0, optional PCRs, key binding)
-//  2. Executes the request
-//  3. Verifies the response signature (Schnorr)
+// Do verifies attestation and activates the attested TLS pin before executing
+// the request over the pinned connection. With SignedResponses it also
+// verifies the response signature.
 func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
-	// Step 1: Verify attestation (uses cache if valid).
-	attestResult, err := c.ensureVerified(ctx)
+	attest, err := c.ensureVerified(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("attestation verification failed: %w", err)
 	}
 
-	// Step 2: Execute the actual request.
+	var signingContext signing.ResponseSigningContext
+	if c.opts.SignedResponses {
+		if attest.SigningKey == nil {
+			return nil, fmt.Errorf("enclave attests no response signing key")
+		}
+		// Sign a copy so the caller's headers stay unchanged; the body is still
+		// consumed, as by any Do.
+		req = req.Clone(req.Context())
+		if signingContext, err = prepareResponseSigningContext(req); err != nil {
+			return nil, err
+		}
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -177,22 +285,26 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*Response, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	// Step 3: Verify response signature.
-	sigVerified := false
-	if attestResult.AttestationKey != "" {
-		sigHex := resp.Header.Get("X-Attestation-Signature")
-		if sigHex != "" {
-			if err := verifySchnorrSignature(body, sigHex, attestResult.AttestationKey); err == nil {
-				sigVerified = true
+	if c.opts.SignedResponses {
+		msg := signingContext.ResponseMessage(sha256.Sum256(body), resp.StatusCode)
+		if err := verifyResponseSignature(attest.SigningKey, msg, resp.Header); err != nil {
+			// The key may have changed (a fresh genesis, or the other generation
+			// during a migration): attest again on the next call.
+			c.mu.Lock()
+			if c.cachedState == attest {
+				c.cachedState = nil
 			}
+			c.mu.Unlock()
+			// The status is unauthenticated; it only says what answered.
+			return nil, fmt.Errorf("response signature (HTTP %d) for nonce %s: %w",
+				resp.StatusCode, req.Header.Get(signNonceHeader), err)
 		}
 	}
 
 	return &Response{
-		StatusCode:        resp.StatusCode,
-		Header:            resp.Header,
-		Body:              body,
-		SignatureVerified: sigVerified,
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+		Body:       body,
 	}, nil
 }
 
@@ -217,13 +329,26 @@ func (c *Client) ensureVerified(ctx context.Context) (*AttestationResult, error)
 
 // verify performs full attestation verification and caches the result.
 func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
-	// 1. Fetch and verify attestation document.
-	nitResult, err := fetchAndVerifyAttestation(ctx, c.httpClient, c.baseURL, c.opts.ExpectedPCR0, c.opts.InsecureSkipCOSEVerify)
+	// 1. Bootstrap over the unpinned client (carries no secrets).
+	nitResult, err := fetchAndVerifyAttestation(
+		ctx,
+		c.bootstrapClient,
+		c.baseURL,
+		c.opts.ExpectedPCR0,
+		c.opts.InsecureSkipCOSEVerify,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Verify additional PCRs (secret pubkey hashes).
+	// 2. Extract the attested tlsKeyHash. It is published with cachedState at the
+	// end, so a failure below leaves the last good pin in place.
+	tlsKeyHash, signingKey, err := parseUserData(nitResult)
+	if err != nil {
+		return nil, fmt.Errorf("parse user_data: %w", err)
+	}
+
+	// 3. Verify additional PCRs (secret pubkey hashes).
 	pcrs := make(map[uint]string)
 	for idx, pcrBytes := range nitResult.Document.PCRs {
 		if len(pcrBytes) > 0 {
@@ -238,29 +363,22 @@ func (c *Client) verify(ctx context.Context) (*AttestationResult, error) {
 			return nil, fmt.Errorf("PCR%d not found in attestation document", pcrIndex)
 		}
 		if !strings.EqualFold(actual, expectedHash) {
-			return nil, fmt.Errorf("PCR%d mismatch: expected %s, got %s", pcrIndex, expectedHash, actual)
+			return nil, fmt.Errorf(
+				"PCR%d mismatch: expected %s, got %s",
+				pcrIndex,
+				expectedHash,
+				actual,
+			)
 		}
 	}
 
-	// 3. Verify attestation key binding.
-	attestKey, err := verifyKeyBinding(ctx, c.httpClient, c.baseURL, nitResult)
-	if err != nil {
-		return nil, fmt.Errorf("key binding verification: %w", err)
-	}
-
-	// 4. Extract tlsKeyHash from user_data so gRPC callers can pin the TLS cert.
-	tlsKeyHash, err := extractTLSKeyHash(nitResult)
-	if err != nil {
-		return nil, fmt.Errorf("extract tlsKeyHash: %w", err)
-	}
-
 	result := &AttestationResult{
-		PCR0:           c.opts.ExpectedPCR0,
-		PCRs:           pcrs,
-		AttestationKey: attestKey,
-		TLSKeyHash:     tlsKeyHash,
-		Verified:       true,
-		VerifiedAt:     time.Now(),
+		PCR0:       c.opts.ExpectedPCR0,
+		PCRs:       pcrs,
+		TLSKeyHash: tlsKeyHash,
+		SigningKey: signingKey,
+		Verified:   true,
+		VerifiedAt: time.Now(),
 	}
 
 	c.mu.Lock()
@@ -286,7 +404,6 @@ type Manifest struct {
 	PCR2      string `json:"pcr2"`
 	Timestamp string `json:"timestamp"`
 	Commit    string `json:"commit"`
-	Repo      string `json:"repo"`
 }
 
 // ManifestURL returns the GitHub Releases URL for a repo's deployment manifest.
@@ -303,72 +420,62 @@ func ManifestURL(repo, tag string) string {
 //
 //	m, err := client.FetchManifest(ctx, client.ManifestURL("myorg/my-app", "latest"))
 func FetchManifest(ctx context.Context, manifestURL string) (*Manifest, error) {
-	m, _, err := fetchManifestRaw(ctx, manifestURL)
-	return m, err
-}
-
-// fetchManifestRaw fetches manifest and returns both parsed struct and raw bytes.
-func fetchManifestRaw(ctx context.Context, manifestURL string) (*Manifest, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fetch manifest: %w", err)
+		return nil, fmt.Errorf("fetch manifest: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, nil, fmt.Errorf("manifest status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf(
+			"manifest status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read manifest: %w", err)
+		return nil, fmt.Errorf("read manifest: %w", err)
 	}
 
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, nil, fmt.Errorf("decode manifest: %w", err)
+		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 
-	if m.BaseURL == "" {
-		return nil, nil, fmt.Errorf("manifest missing base_url")
+	if _, err := requireHTTPSURL(m.BaseURL); err != nil {
+		return nil, fmt.Errorf("manifest base_url %w", err)
 	}
 	if m.PCR0 == "" {
-		return nil, nil, fmt.Errorf("manifest missing pcr0")
+		return nil, fmt.Errorf("manifest missing pcr0")
 	}
 
-	return &m, raw, nil
+	return &m, nil
 }
 
 // NewFromManifest creates a client by fetching deployment metadata from a URL.
 // The manifest provides the enclave's base URL and PCR0, so callers only need
 // to know the manifest endpoint. Additional options (ExpectedPCRs, CacheTTL)
 // can be set to augment verification.
-//
-// When opts.VerifyProvenance is true, verifies that the manifest has a valid
-// GitHub artifact attestation before trusting its PCR values.
 func NewFromManifest(ctx context.Context, manifestURL string, opts Options) (*Client, error) {
-	m, raw, err := fetchManifestRaw(ctx, manifestURL)
+	m, err := FetchManifest(ctx, manifestURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest: %w", err)
 	}
 
-	if opts.VerifyProvenance {
-		if m.Repo == "" {
-			return nil, fmt.Errorf("manifest missing repo field, cannot verify provenance")
-		}
-		if err := VerifyManifestProvenance(ctx, m.Repo, raw, opts.GitHubToken); err != nil {
-			return nil, fmt.Errorf("manifest provenance: %w", err)
-		}
-	}
-
 	if opts.ExpectedPCR0 != "" && !strings.EqualFold(opts.ExpectedPCR0, m.PCR0) {
-		return nil, fmt.Errorf("manifest PCR0 %s does not match expected %s", m.PCR0, opts.ExpectedPCR0)
+		return nil, fmt.Errorf(
+			"manifest PCR0 %s does not match expected %s",
+			m.PCR0,
+			opts.ExpectedPCR0,
+		)
 	}
 	opts.ExpectedPCR0 = m.PCR0
 

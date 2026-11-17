@@ -1,0 +1,570 @@
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	stscmd "github.com/aws/aws-sdk-go-v2/service/sts"
+)
+
+const (
+	genesisPreviousPCR0 = "genesis"
+
+	genesisLeaseName = "genesis"
+
+	// genesisLeaseWait bounds how long we queue behind a peer's genesis.
+	genesisLeaseWait = 10 * time.Minute
+)
+
+type bootState struct {
+	kms                PrimaryKMS
+	dek                DEK
+	secrets            Secrets
+	tlsKey             crypto.Signer
+	masterSeed         []byte
+	acmeAccountKey     crypto.Signer
+	responseSigningKey ed25519.PrivateKey
+
+	migrationIntentBucketName string
+	snapshot                  Snapshot // as published
+}
+
+type bootConfig struct {
+	cfg             *Config
+	currentPCR0     []byte
+	secretsMetadata SecretsMetadata
+	snapshotBucket  string
+}
+
+type bootMode interface {
+	verifySnapshot(ctx context.Context, b *Boot, config *bootConfig) (Snapshot, error)
+	commitSnapshot(ctx context.Context, b *Boot, snapshot Snapshot) (Snapshot, error)
+}
+
+type plannedBoot struct {
+	config bootConfig
+	mode   bootMode
+}
+
+type Boot struct {
+	cfg             *Config
+	nsm             NSM
+	kmsAPI          KMSAPI
+	sts             STSAPI
+	ssm             SSM
+	s3              S3API
+	pcr0            []byte
+	secretsMetadata SecretsMetadata
+}
+
+func NewBoot(
+	cfg *Config, nsm NSM, kmsAPI KMSAPI, sts STSAPI, ssm SSM, s3api S3API,
+) (*Boot, error) {
+	pcr0, err := nsm.PCR0()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read current PCR0: %w", err)
+	}
+	if len(pcr0) != 48 {
+		return nil, fmt.Errorf("current PCR0 must be exactly 48 bytes, got %d", len(pcr0))
+	}
+
+	secretsMetadata, err := LoadSecretsMetadata(*cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load secrets metadata: %w", err)
+	}
+
+	if err := secretsMetadata.Validate(*cfg); err != nil {
+		return nil, fmt.Errorf("invalid secrets metadata: %w", err)
+	}
+
+	return &Boot{
+		cfg: cfg, nsm: nsm, kmsAPI: kmsAPI, sts: sts, ssm: ssm, s3: s3api, pcr0: pcr0,
+		secretsMetadata: secretsMetadata,
+	}, nil
+}
+
+// Boot establishes state for this enclave.
+func (b *Boot) Boot(ctx context.Context) (bootState, error) {
+	planned, err := b.plan(ctx)
+	if err != nil {
+		return bootState{}, err
+	}
+
+	if _, ok := planned.mode.(*genesisBoot); ok {
+		lease, err := b.awaitGenesisLease(ctx, &planned.config)
+		if err != nil {
+			return bootState{}, err
+		}
+		if lease != nil {
+			defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+		}
+
+		planned, err = b.plan(ctx)
+		if err != nil {
+			return bootState{}, fmt.Errorf("failed to replan boot after genesis wait: %w", err)
+		}
+		if genesis, stillGenesis := planned.mode.(*genesisBoot); stillGenesis {
+			genesis.lease = lease
+		}
+	}
+
+	config := &planned.config
+
+	// Reject invalid inherited secrets before creating keys or writing state.
+	inheritedSecrets, err := resolveInheritedSecrets(
+		ctx, b.cfg, b.ssm, config.secretsMetadata.Inherited, time.Now(),
+	)
+	if err != nil {
+		return bootState{}, err
+	}
+
+	result, err := b.establish(ctx, planned)
+	if err != nil {
+		return bootState{}, err
+	}
+	result.secrets.Inherited = inheritedSecrets
+
+	return result, nil
+}
+
+func (b *Boot) plan(ctx context.Context) (*plannedBoot, error) {
+	bucket, err := b.migrationIntentBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	config := bootConfig{
+		cfg:             b.cfg,
+		currentPCR0:     append([]byte(nil), b.pcr0...),
+		secretsMetadata: b.secretsMetadata,
+		snapshotBucket:  bucket,
+	}
+
+	mode, err := b.determineMode(ctx, &config)
+	if err != nil {
+		return nil, err
+	}
+	return &plannedBoot{config: config, mode: mode}, nil
+}
+
+// Without a snapshot, the measured PreviousPCR0 selects genesis or adoption.
+// Deleting stored state cannot turn a successor into a genesis.
+func (b *Boot) determineMode(
+	ctx context.Context, config *bootConfig,
+) (bootMode, error) {
+	ownPCR0 := hex.EncodeToString(b.pcr0)
+	snapshot, err := readSnapshot(ctx, b.cfg, b.s3, b.nsm, config.snapshotBucket, ownPCR0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read snapshot: %w", err)
+	}
+	if snapshot != nil {
+		return &resumeBoot{snapshot: *snapshot}, nil
+	}
+
+	if b.cfg.genesisImage() {
+		return &genesisBoot{}, nil
+	}
+
+	intent, err := newMigrationIntentLog(b.cfg, b.s3, b.nsm, config.snapshotBucket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open migration intent log: %w", err)
+	}
+	return &migrationBoot{intent: intent}, nil
+}
+
+// establish verifies the snapshot before decrypting any state.
+func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, error) {
+	config := &planned.config
+
+	snapshot, err := planned.mode.verifySnapshot(ctx, b, config)
+	if err != nil {
+		return bootState{}, err
+	}
+
+	kms, err := b.primaryKMS(ctx, snapshot.kmsKeyID)
+	if err != nil {
+		return bootState{}, err
+	}
+	masterSeed, err := kms.Decrypt(ctx, snapshot.masterSeedCiphertext)
+	if err != nil {
+		return bootState{}, fmt.Errorf("failed to decrypt master seed: %w", err)
+	}
+	storageKey, err := deriveSecret(masterSeed, storageDEKDerivationName)
+	if err != nil {
+		return bootState{}, fmt.Errorf("derive storage DEK: %w", err)
+	}
+	storageKeyBytes, err := hex.DecodeString(storageKey)
+	if err != nil {
+		return bootState{}, fmt.Errorf("decode storage DEK hex: %w", err)
+	}
+	accountKey, err := deriveACMEAccountKey(masterSeed)
+	if err != nil {
+		return bootState{}, fmt.Errorf("derive ACME account key: %w", err)
+	}
+	responseSigningKey, err := deriveResponseSigningKey(masterSeed, b.pcr0)
+	if err != nil {
+		return bootState{}, fmt.Errorf("derive response signing key: %w", err)
+	}
+	tlsKeyPKCS8, err := kms.Decrypt(ctx, snapshot.tlsKeyCiphertext)
+	if err != nil {
+		return bootState{}, fmt.Errorf("failed to decrypt TLS key: %w", err)
+	}
+	tlsKeyAny, err := x509.ParsePKCS8PrivateKey(tlsKeyPKCS8)
+	if err != nil {
+		return bootState{}, fmt.Errorf("failed to parse TLS key: %w", err)
+	}
+	tlsKey, ok := tlsKeyAny.(*ecdsa.PrivateKey)
+	if !ok || tlsKey.Curve != elliptic.P256() {
+		return bootState{}, fmt.Errorf("TLS key must be an ECDSA P-256 private key")
+	}
+
+	staticSecrets := make([]StaticSecret, 0, len(config.secretsMetadata.Static))
+	for _, meta := range config.secretsMetadata.Static {
+		if meta.IsSigning() && b.cfg.ScalingRole == scalingRoleFollower {
+			// A follower's signing secret is the share the leader's group gives it.
+			staticSecrets = append(staticSecrets, StaticSecret{StaticSecretMetadata: meta})
+			continue
+		}
+		plaintext, err := deriveSecret(masterSeed, meta.Name)
+		if err != nil {
+			return bootState{}, fmt.Errorf("derive static secret %s: %w", meta.Name, err)
+		}
+		staticSecrets = append(staticSecrets, StaticSecret{
+			StaticSecretMetadata: meta,
+			Plaintext:            plaintext,
+		})
+	}
+
+	published, err := planned.mode.commitSnapshot(ctx, b, snapshot)
+	if err != nil {
+		return bootState{}, err
+	}
+	return bootState{
+		kms:                       kms,
+		dek:                       &dek{key: storageKeyBytes},
+		secrets:                   Secrets{Static: staticSecrets},
+		tlsKey:                    tlsKey,
+		masterSeed:                masterSeed,
+		acmeAccountKey:            accountKey,
+		responseSigningKey:        responseSigningKey,
+		migrationIntentBucketName: snapshot.migrationIntentBucketName,
+		snapshot:                  published,
+	}, nil
+}
+
+func (b *Boot) primaryKMS(ctx context.Context, keyID string) (PrimaryKMS, error) {
+	kms, err := FetchOrCreatePrimaryKMS(ctx, b.cfg, b.nsm, b.kmsAPI, b.sts, keyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch/create primary KMS key: %w", err)
+	}
+	return kms, nil
+}
+
+func (b *Boot) migrationIntentBucket(ctx context.Context) (string, error) {
+	identity, err := b.sts.GetCallerIdentity(ctx, &stscmd.GetCallerIdentityInput{})
+	if err != nil {
+		return "", fmt.Errorf("sts get-caller-identity: %w", err)
+	}
+	accountID := aws.ToString(identity.Account)
+	if accountID == "" {
+		return "", fmt.Errorf("sts get-caller-identity returned no account ID")
+	}
+	return migrationIntentBucketName(b.cfg, accountID), nil
+}
+
+// awaitGenesisLease queues behind a replica of this image already running
+// genesis, and returns no lease once that replica has published.
+func (b *Boot) awaitGenesisLease(ctx context.Context, config *bootConfig) (*Lease, error) {
+	leaseBucket, err := b.ssm.MustGet(ctx, b.cfg.leaseBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease bucket name for genesis lease: %w", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, genesisLeaseWait)
+	defer cancel()
+
+	ownPCR0 := hex.EncodeToString(config.currentPCR0)
+	published := func() (bool, error) {
+		snapshot, err := readSnapshot(waitCtx, b.cfg, b.s3, b.nsm, config.snapshotBucket, ownPCR0)
+		if err != nil {
+			return false, fmt.Errorf("failed to read snapshot: %w", err)
+		}
+		return snapshot != nil, nil
+	}
+
+	for {
+		done, err := published()
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			slog.Info("genesis completed by a peer, resuming")
+			return nil, nil
+		}
+
+		lease, err := TryAcquireLease(
+			waitCtx, b.cfg, b.s3, leaseBucket, genesisLeaseName, leaseTTL,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to acquire genesis lease: %w", err)
+		}
+		if lease != nil {
+			done, err := published()
+			if err != nil {
+				_ = lease.Release(context.WithoutCancel(ctx))
+				return nil, err
+			}
+			if done {
+				_ = lease.Release(context.WithoutCancel(ctx))
+				slog.Info("genesis completed by a peer while we queued, resuming")
+				return nil, nil
+			}
+			return lease, nil
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return nil, fmt.Errorf(
+				"genesis did not complete: lock s3://%s/%s held for the whole wait: %w",
+				leaseBucket, leaseObjectKey(b.cfg, genesisLeaseName), waitCtx.Err(),
+			)
+		case <-time.After(leasePollInterval):
+		}
+	}
+}
+
+// publishSnapshot accepts a concurrent publication only if its state matches;
+// independently valid receipts may differ. Read-back also verifies the lock,
+// which IAM preflight cannot check.
+func (b *Boot) publishSnapshot(
+	ctx context.Context, snapshot Snapshot,
+) (*Snapshot, error) {
+	origin, err := snapshot.attestOrigin(b.cfg, b.nsm)
+	if err != nil {
+		return nil, err
+	}
+	body, err := snapshot.marshalObject(b.cfg, origin)
+	if err != nil {
+		return nil, err
+	}
+	key := snapshotObjectKey(snapshot.ownerPCR0)
+
+	writeCtx, cancel := context.WithTimeout(ctx, b.cfg.IntentWriteTimeout)
+	defer cancel()
+	var out *s3.PutObjectOutput
+	for attempt := 0; ; attempt++ {
+		out, err = b.s3.PutObject(writeCtx, &s3.PutObjectInput{
+			Bucket:                    aws.String(snapshot.migrationIntentBucketName),
+			Key:                       aws.String(key),
+			Body:                      bytes.NewReader(body),
+			ContentType:               aws.String("application/json"),
+			IfNoneMatch:               aws.String("*"),
+			ObjectLockMode:            s3types.ObjectLockModeCompliance,
+			ObjectLockRetainUntilDate: aws.Time(time.Now().Add(b.cfg.SnapshotRetention)),
+		})
+		if !isConditionalConflict(err) || attempt == leaseConflictRetries {
+			break
+		}
+		if err := backoff(writeCtx, attempt); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case isPreconditionFailed(err):
+		slog.Info("snapshot already published; verifying it", "key", key)
+	case err != nil:
+		return nil, fmt.Errorf("%w: put %s: %w", errSnapshotStoreUnavailable, key, err)
+	case out == nil || aws.ToString(out.VersionId) == "":
+		return nil, fmt.Errorf(
+			"%w: put %s: S3 returned no version ID", errSnapshotStoreUnavailable, key,
+		)
+	}
+
+	published, err := readSnapshot(
+		ctx, b.cfg, b.s3, b.nsm, snapshot.migrationIntentBucketName, snapshot.ownerPCR0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if published == nil {
+		return nil, fmt.Errorf(
+			"%w: %s is missing after the write", errSnapshotStoreUnavailable, key,
+		)
+	}
+	if !published.sameState(snapshot) {
+		return nil, fmt.Errorf(
+			"%w: %s is %s's generation under key %s",
+			errSnapshotConflict, key, prefix16(snapshot.ownerPCR0), published.kmsKeyID,
+		)
+	}
+	return published, nil
+}
+
+type genesisBoot struct {
+	lease *Lease
+}
+
+// Ciphertexts stay in memory until commitSnapshot publishes them together.
+func (g *genesisBoot) buildSnapshot(
+	ctx context.Context, b *Boot, config *bootConfig,
+) (Snapshot, error) {
+	kms, err := b.primaryKMS(ctx, "")
+	if err != nil {
+		return Snapshot{}, err
+	}
+	seedData, err := kms.GenerateDataKey(ctx)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("generate master seed: %w", err)
+	}
+
+	tlsKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("generate TLS key: %w", err)
+	}
+	tlsKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(tlsKey)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("marshal TLS key: %w", err)
+	}
+	tlsKeyCiphertext, err := kms.Encrypt(ctx, tlsKeyPKCS8)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("encrypt TLS key: %w", err)
+	}
+
+	return Snapshot{
+		kmsKeyID:                  kms.KeyID(),
+		ownerPCR0:                 hex.EncodeToString(config.currentPCR0),
+		masterSeedCiphertext:      base64.StdEncoding.EncodeToString(seedData.Ciphertext),
+		tlsKeyCiphertext:          tlsKeyCiphertext,
+		migrationIntentBucketName: config.snapshotBucket,
+	}, nil
+}
+
+// Validate genesis against the same format that later boots will read.
+func (g *genesisBoot) verifySnapshot(
+	ctx context.Context, b *Boot, config *bootConfig,
+) (Snapshot, error) {
+	snapshot, err := g.buildSnapshot(ctx, b, config)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	raw, err := snapshot.encode(config.cfg)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if _, err := decodeSnapshot(config.cfg, raw); err != nil {
+		return Snapshot{}, fmt.Errorf("genesis snapshot would be refused on read: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (g *genesisBoot) commitSnapshot(
+	ctx context.Context, b *Boot, snapshot Snapshot,
+) (Snapshot, error) {
+	if g.lease == nil {
+		return Snapshot{}, fmt.Errorf("refusing to commit genesis without lease")
+	}
+	if err := g.lease.Verify(ctx); err != nil {
+		return Snapshot{}, fmt.Errorf("refusing to commit genesis: %w", err)
+	}
+	published, err := b.publishSnapshot(ctx, snapshot)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to publish genesis snapshot: %w", err)
+	}
+	slog.Info("published genesis snapshot", "key_id", prefix16(snapshot.kmsKeyID))
+	return *published, nil
+}
+
+type resumeBoot struct {
+	snapshot Snapshot // as published
+}
+
+// A resumed boot's state was verified as it was read.
+func (r *resumeBoot) verifySnapshot(
+	context.Context, *Boot, *bootConfig,
+) (Snapshot, error) {
+	return r.snapshot, nil
+}
+
+func (r *resumeBoot) commitSnapshot(
+	_ context.Context, _ *Boot, snapshot Snapshot,
+) (Snapshot, error) {
+	return snapshot, nil
+}
+
+type migrationBoot struct {
+	intent *migrationIntentLog
+}
+
+// Handoff values remain untrusted until the transition receipt verifies.
+func (m *migrationBoot) verifySnapshot(
+	ctx context.Context, b *Boot, config *bootConfig,
+) (Snapshot, error) {
+	if m.intent == nil {
+		return Snapshot{}, fmt.Errorf("migration authorization: no intent log")
+	}
+	// NOTE: Authorization is decided by this head read. A later abort does not
+	// cancel adoption, even if the snapshot has not yet been published.
+	head, err := m.intent.Head(ctx, strings.ToLower(b.cfg.PreviousPCR0))
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to read predecessor migration intent: %w", err)
+	}
+	if head == nil || head.Action != migrationIntentFinalised ||
+		!strings.EqualFold(head.TargetPCR0, hex.EncodeToString(config.currentPCR0)) {
+		return Snapshot{}, fmt.Errorf(
+			"no snapshot for this PCR0 and predecessor %s holds no handoff",
+			prefix16(b.cfg.PreviousPCR0),
+		)
+	}
+	snapshot := *head.FinalisedSnapshot
+	snapshotRoot, err := snapshot.root(b.cfg)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to build snapshot root: %w", err)
+	}
+	if err := verifyStateReceipt(
+		b.nsm, snapshot.transitionReceipt, snapshotRoot,
+		transitionPCRs(snapshot.predecessorPCR0, config.currentPCR0),
+	); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid transition receipt: %w", err)
+	}
+	if !strings.EqualFold(config.cfg.PreviousPCR0, snapshot.predecessorPCR0) {
+		return Snapshot{}, fmt.Errorf(
+			"handoff predecessor does not match previous PCR0 committed in the EIF",
+		)
+	}
+	if snapshot.ownerPCR0 != hex.EncodeToString(config.currentPCR0) {
+		return Snapshot{}, fmt.Errorf("handoff snapshot owner does not match current PCR0")
+	}
+	if snapshot.migrationIntentBucketName != config.snapshotBucket {
+		return Snapshot{}, fmt.Errorf(
+			"handoff snapshot bucket does not match configured snapshot bucket",
+		)
+	}
+	return snapshot, nil
+}
+
+func (m *migrationBoot) commitSnapshot(
+	ctx context.Context, b *Boot, snapshot Snapshot,
+) (Snapshot, error) {
+	published, err := b.publishSnapshot(ctx, snapshot)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("failed to publish adopted snapshot: %w", err)
+	}
+	slog.Info("published adopted snapshot", "key_id", prefix16(snapshot.kmsKeyID),
+		"predecessor_pcr0", prefix16(snapshot.predecessorPCR0))
+	return *published, nil
+}

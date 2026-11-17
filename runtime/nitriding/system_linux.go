@@ -88,13 +88,13 @@ func writeResolvconf() error {
 	dir := "/run/resolvconf/"
 	file := dir + "resolv.conf"
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create directories: %w", err)
 	}
 
 	// Our default gateway -- gvproxy -- also operates a DNS resolver.
 	c := fmt.Sprintf("nameserver %s\n", defaultGw)
-	if err := os.WriteFile(file, []byte(c), 0644); err != nil {
+	if err := os.WriteFile(file, []byte(c), 0o644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 

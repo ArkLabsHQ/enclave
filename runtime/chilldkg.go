@@ -10,21 +10,24 @@ import (
 	sdk "github.com/ArkLabsHQ/threshold-magic/threshold_sdk"
 )
 
-// thresholdRecoveryPrefix namespaces threshold recovery blobs in Storage.
+// thresholdRecoveryPrefix namespaces threshold recovery blobs in thresholdStore.
 const thresholdRecoveryPrefix = "threshold/recovery/"
 
-// DkgStore implements thresholdsdk.Store over the enclave's encrypted
-// Storage.
+// DkgStore implements thresholdsdk.Store over the enclave's sealed
+// thresholdStore.
 type DkgStore struct {
-	storage *Storage
+	storage *thresholdStore
 
 	getLeaderSecret func(label string) ([]byte, error)
 }
 
-// newDKGStore builds the adapter over the enclave's encrypted Storage.
+// newDKGStore builds the adapter over the enclave's sealed thresholdStore.
 // getLeaderSecret is nil on a follower; on a leader it points at the in-memory
 // leader-secret cache.
-func newDKGStore(storage *Storage, getLeaderSecret func(label string) ([]byte, error)) *DkgStore {
+func newDKGStore(
+	storage *thresholdStore,
+	getLeaderSecret func(label string) ([]byte, error),
+) *DkgStore {
 	return &DkgStore{storage: storage, getLeaderSecret: getLeaderSecret}
 }
 
@@ -79,7 +82,7 @@ func (s *DkgStore) GetLeaderSecret(label string) ([]byte, error) {
 	return s.getLeaderSecret(label)
 }
 
-// Close is a no-op: the underlying Storage lifecycle is owned by the Runtime.
+// Close is a no-op: the store holds no open resources.
 func (s *DkgStore) Close() error { return nil }
 
 // compile-time assertion that the adapter satisfies the SDK interface.

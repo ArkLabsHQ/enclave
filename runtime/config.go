@@ -1,45 +1,513 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
-// =============================================================================
-// Public types
-// =============================================================================
+// Configuration input names shared by the environment loader and SSM overlay.
+const (
+	// Application and identity.
+	envNamespace            = "ENCLAVE_NAMESPACE"
+	envAppName              = "ENCLAVE_APP_NAME"
+	envAppPort              = "ENCLAVE_APP_PORT"
+	envAppBinaryName        = "APP_BINARY_NAME"
+	envPreviousPCR0         = "ENCLAVE_PREVIOUS_PCR0"
+	envSecretsConfig        = "ENCLAVE_SECRETS_CONFIG"
+	envInheritSecretsConfig = "ENCLAVE_INHERIT_SECRETS_CONFIG"
+	envOverrideAllowList    = "ENCLAVE_OVERRIDE_ALLOWLIST"
 
-// Config is the runtime's HTTP and networking configuration, populated from
-// ENCLAVE_* environment variables by BuildNitridingConfig.
+	// Security and migration.
+	envDev                   = "ENCLAVE_DEV"
+	envInsecureVerifySkipped = "ENCLAVE_INSECURE_VERIFY_SKIPPED"
+	envVerifyClockSource     = "ENCLAVE_VERIFY_CLOCK_SOURCE"
+	envMigrationCooldown     = "ENCLAVE_MIGRATION_COOLDOWN"
+
+	// Networking and telemetry.
+	envFQDN             = "ENCLAVE_FQDN"
+	envUpstream         = "ENCLAVE_UPSTREAM"
+	envViproxyInAddrs   = "ENCLAVE_VIPROXY_IN_ADDRS"
+	envViproxyOutAddrs  = "ENCLAVE_VIPROXY_OUT_ADDRS"
+	envLogShipInterval  = "ENCLAVE_LOG_SHIP_INTERVAL"
+	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
+	envTraces           = "ENCLAVE_TRACES"
+	envMetrics          = "ENCLAVE_METRICS"
+	envOtelEndpointEnv  = "ENCLAVE_OTEL_ENDPOINT_ENV"
+	envOtelTokenEnv     = "ENCLAVE_OTEL_TOKEN_ENV"
+
+	// ACME settings: baked defaults the SSM overlay may replace.
+	envUseACME       = "ENCLAVE_USE_ACME"
+	envACMEDirectory = "ENCLAVE_ACME_DIRECTORY"
+	envACMEEmail     = "ENCLAVE_ACME_EMAIL"
+	envACMECA        = "ENCLAVE_ACME_CA"
+
+	// Threshold scaling. Baked, except the leader address the SSM overlay may replace.
+	envScalingRole              = "ENCLAVE_SCALING_ROLE"
+	envScalingFollowerPCR0s     = "ENCLAVE_SCALING_FOLLOWER_PCR0S"
+	envScalingLeaderAddr        = "ENCLAVE_SCALING_LEADER_ADDR"
+	envScalingListenPort        = "ENCLAVE_SCALING_LISTEN_PORT"
+	envScalingHeartbeatInterval = "ENCLAVE_SCALING_HEARTBEAT_INTERVAL"
+	envScalingLivenessTimeout   = "ENCLAVE_SCALING_LIVENESS_TIMEOUT"
+	envScalingMonitorTick       = "ENCLAVE_SCALING_MONITOR_TICK"
+
+	// AWS configuration.
+	envAWSRegion           = "ENCLAVE_AWS_REGION"
+	envEC2MetadataEndpoint = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
+	envRoute53Endpoint     = "AWS_ENDPOINT_URL_ROUTE53"
+	envKMSEndpoint         = "AWS_ENDPOINT_URL_KMS"
+	envSSMEndpoint         = "AWS_ENDPOINT_URL_SSM"
+	envSTSEndpoint         = "AWS_ENDPOINT_URL_STS"
+	envS3Endpoint          = "AWS_ENDPOINT_URL_S3"
+	envCloudWatchEndpoint  = "AWS_ENDPOINT_URL_LOGS"
+	envIAMEndpoint         = "AWS_ENDPOINT_URL_IAM"
+	envXRayEndpoint        = "AWS_ENDPOINT_URL_XRAY"
+	envMonitoringEndpoint  = "AWS_ENDPOINT_URL_MONITORING"
+)
+
+const (
+	prodRetention          = 10 * 365 * 24 * time.Hour
+	prodIntentWriteTimeout = 10 * time.Minute
+	// 5 min matches Evervault's /dev/ptp0 sync cadence:
+	// https://evervault.com/blog/how-we-built-enclaves-resolving-clock-drift-in-nitro-enclaves.
+	prodClockSyncInterval = 5 * time.Minute
+
+	devSnapshotRetention  = 5 * time.Minute
+	devIntentRetention    = 10 * time.Minute
+	devIntentWriteTimeout = 2 * time.Minute
+	devClockSyncInterval  = 5 * time.Second
+
+	defaultMigrationCooldown = 24 * time.Hour
+	defaultLogShipInterval   = 10 * time.Second
+	defaultLogRetentionDays  = int32(30)
+
+	defaultScalingHeartbeatInterval = 10 * time.Second
+	defaultScalingLivenessTimeout   = 60 * time.Second
+	defaultScalingMonitorTick       = 15 * time.Second
+
+	otlpHTTPTimeout = 30 * time.Second
+
+	namespaceSegment = "enclave"
+
+	namespaceNameChars = "_.-"
+	// SSM allows 15 levels and the deepest runtime path adds 6 below the namespace:
+	// <app>/enclave/<lock>/<secret>/Ciphertext/<keyID>.
+	maxNamespaceDepth = 9
+	maxNamespaceLen   = 256
+
+	migrationPollInterval    = 5 * time.Second
+	migrationChallengeRotate = time.Minute
+
+	inheritCutoffPollInterval = 30 * time.Second
+
+	migrationAbortResponse = "abort"
+
+	// extPort is the public TLS listener. Fixed: the host's routing, the README
+	// and every client URL assume 443.
+	extPort = 443
+	// intPort is the loopback API listener, included in the child's OTLP URL.
+	intPort = 8080
+	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
+	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
+	// alone silently breaks all networking.
+	hostProxyPort = 1024
+
+	defaultViproxyIn  = "127.0.0.1:80"
+	defaultViproxyOut = "3:8002"
+	// Default IMDS proxy: 127.0.0.1:80 -> vsock 3:8002.
+	defaultIMDSEndpoint = "http://127.0.0.1:80"
+	defaultAWSRegion    = "us-east-1"
+	defaultFQDN         = "localhost"
+	defaultAppName      = "app"
+)
+
+// Config holds runtime HTTP/network settings, the enclave's identity, and the
+// security settings the measured image settles rather than an operator.
 type Config struct {
-	FQDN               string   // Hostname the TLS cert is issued for.
-	ExtPort            uint16   // External TLS listener.
-	UseVsockForExtPort bool     // Listen on AF_VSOCK instead of AF_INET.
-	DisableKeepAlives  bool     // Disable HTTP keep-alives on the TLS server.
-	IntPort            uint16   // Internal loopback HTTP listener.
-	HostProxyPort      uint32   // Vsock port the host-side gvproxy listens on.
-	UseProfiling       bool     // Mount net/http/pprof at /enclave/debug.
-	UseACME            bool     // Use ACME (Let's Encrypt) instead of a self-signed cert.
-	ACMEDirectory      string   // ACME directory: keyword (letsencrypt | letsencrypt-staging | self-signed) or a literal https:// directory URL.
-	ACMEEmail          string   // Optional ACME account contact email.
-	ACMECA             string   // Optional PEM CA bundle trusted for the ACME directory's HTTPS API (private/test ACME servers).
-	Debug              bool     // Verbose chi request logging.
-	FdCur, FdMax       uint64   // File-descriptor soft/hard limits.
-	AppURL             *url.URL // Public source URL of the user app (informational).
-	AppWebSrv          *url.URL // Loopback URL the catch-all revProxy forwards to.
-	UpstreamProtocol   string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
-	WaitForApp         bool     // Block TLS listener until the app POSTs /enclave/ready.
-	MockCertFp         string   // Test-only override for the TLS cert fingerprint.
+	// Identity. EIF-baked and part of PCR0, so it cannot change once loaded —
+	// which is the point: every SSM path is derived from these, and a later
+	// os.Setenv (the SSM overlay, or a static secret's env var) must not be able
+	// to move the namespace out from under a running enclave.
+	Namespace           string
+	AppName             string
+	AppPort             string
+	AppBinaryName       string
+	PreviousPCR0        string
+	StaticSecretConfig  string
+	InheritSecretConfig string
+
+	// AWS config, EIF-baked and only overridable via in dev mode
+	Route53Endpoint     string
+	KMSEndpoint         string
+	SSMEndpoint         string
+	STSEndpoint         string
+	S3Endpoint          string
+	CloudWatchEndpoint  string
+	IAMEndpoint         string
+	XRayEndpoint        string
+	MonitoringEndpoint  string
+	AWSRegion           string
+	EC2MetadataEndpoint string
+
+	FQDN             string   // Hostname the TLS cert is issued for.
+	ExtPort          uint16   // External TLS listener.
+	IntPort          uint16   // Internal loopback HTTP listener.
+	HostProxyPort    uint32   // Vsock port the host-side gvproxy listens on.
+	UseACME          bool     // Use ACME instead of self-signed TLS.
+	ACMEDirectory    string   // ACME dir override: "letsencrypt-staging" or https:// URL.
+	ACMEEmail        string   // Optional ACME account contact email.
+	ACMECA           string   // PEM CA bundle for private/test ACME HTTPS.
+	AppWebSrv        *url.URL // Loopback URL the catch-all revProxy forwards to.
+	UpstreamProtocol string   // revProxy-to-app HTTP version: auto (match inbound), h2c, or h1.
+	ViproxyInAddr    string
+	ViproxyOutAddr   string
+
+	KMSLocked             bool
+	InsecureVerifySkipped bool
+	VerifyClockSource     bool
+	SnapshotRetention     time.Duration // Object Lock on snapshot/<pcr0>, not the intent's
+	IntentRetention       time.Duration
+	IntentWriteTimeout    time.Duration
+	MigrationCooldown     time.Duration
+	ClockSyncInterval     time.Duration
+	LogShipInterval       time.Duration
+	LogRetentionDays      int32
+	ExportTraces          bool // Logs always ship; traces and metrics only when enabled.
+	ExportMetrics         bool
+	OtelEndpointEnv       string // Required child variable for the OTLP base URL.
+	OtelTokenEnv          string // Required child variable for the bearer token.
+	InstanceID            string
+
+	ScalingRole              string   // "", "leader" or "follower"
+	ScalingFollowerPCR0s     []string // Leader: lowercase PCR0s of the follower images it admits.
+	ScalingLeaderAddr        string   // Follower: leader handshake base URL.
+	ScalingListenPort        string   // Leader: port its relay binds and advertises.
+	ScalingHeartbeatInterval time.Duration
+	ScalingLivenessTimeout   time.Duration
+	ScalingMonitorTick       time.Duration
+
+	OverrideAllowList map[string]bool
+	ChildEnv          map[string]string
 }
 
-// Validate returns an error if any required field is unset.
+// LoadConfig captures runtime configuration and unsets each environment variable
+// it reads.
+func LoadConfig() (*Config, error) {
+	// Point the reverse proxy directly at the user app.
+	appPort := takeEnvDefault(envAppPort, "7074")
+	appWebSrv, err := url.Parse("http://127.0.0.1:" + appPort)
+	if err != nil {
+		return nil, fmt.Errorf("parse app web srv url: %w", err)
+	}
+
+	cfg := &Config{
+		Namespace:           takeEnvRaw(envNamespace),
+		AppName:             takeEnvRaw(envAppName),
+		AppBinaryName:       takeEnvDefault(envAppBinaryName, defaultAppName),
+		AppPort:             appPort,
+		PreviousPCR0:        takeEnv(envPreviousPCR0),
+		StaticSecretConfig:  takeEnv(envSecretsConfig),
+		InheritSecretConfig: takeEnv(envInheritSecretsConfig),
+		EC2MetadataEndpoint: takeEnvDefault(
+			envEC2MetadataEndpoint,
+			defaultIMDSEndpoint,
+		),
+		Route53Endpoint:       takeEnv(envRoute53Endpoint),
+		KMSEndpoint:           takeEnv(envKMSEndpoint),
+		SSMEndpoint:           takeEnv(envSSMEndpoint),
+		STSEndpoint:           takeEnv(envSTSEndpoint),
+		S3Endpoint:            takeEnv(envS3Endpoint),
+		CloudWatchEndpoint:    takeEnv(envCloudWatchEndpoint),
+		IAMEndpoint:           takeEnv(envIAMEndpoint),
+		XRayEndpoint:          takeEnv(envXRayEndpoint),
+		MonitoringEndpoint:    takeEnv(envMonitoringEndpoint),
+		AWSRegion:             takeEnvDefault(envAWSRegion, defaultAWSRegion),
+		ViproxyInAddr:         takeEnvDefault(envViproxyInAddrs, defaultViproxyIn),
+		ViproxyOutAddr:        takeEnvDefault(envViproxyOutAddrs, defaultViproxyOut),
+		FQDN:                  takeEnvDefault(envFQDN, defaultFQDN),
+		ACMEDirectory:         takeEnv(envACMEDirectory),
+		ACMEEmail:             takeEnv(envACMEEmail),
+		ACMECA:                takeEnv(envACMECA),
+		ExtPort:               extPort,
+		IntPort:               intPort,
+		HostProxyPort:         hostProxyPort,
+		AppWebSrv:             appWebSrv,
+		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
+		LogShipInterval:       logShipInterval(),
+		LogRetentionDays:      logRetentionDays(),
+		OtelEndpointEnv:       takeEnvRaw(envOtelEndpointEnv),
+		OtelTokenEnv:          takeEnvRaw(envOtelTokenEnv),
+		SnapshotRetention:     prodRetention,
+		IntentRetention:       prodRetention,
+		IntentWriteTimeout:    prodIntentWriteTimeout,
+		MigrationCooldown:     defaultMigrationCooldown,
+		ClockSyncInterval:     prodClockSyncInterval,
+		VerifyClockSource:     takeEnv(envVerifyClockSource) != "false",
+		InsecureVerifySkipped: false,
+		KMSLocked:             true,
+		ScalingRole:           takeEnv(envScalingRole),
+		ScalingLeaderAddr:     takeEnv(envScalingLeaderAddr),
+		ScalingListenPort:     takeEnvDefault(envScalingListenPort, defaultRelayPort),
+		ScalingHeartbeatInterval: scalingDuration(
+			envScalingHeartbeatInterval, defaultScalingHeartbeatInterval,
+		),
+		ScalingLivenessTimeout: scalingDuration(
+			envScalingLivenessTimeout, defaultScalingLivenessTimeout,
+		),
+		ScalingMonitorTick: scalingDuration(envScalingMonitorTick, defaultScalingMonitorTick),
+		OverrideAllowList:  make(map[string]bool),
+		ChildEnv:           make(map[string]string),
+	}
+
+	if takeEnv(envDev) == "true" {
+		cfg.KMSLocked = false
+		cfg.SnapshotRetention = devSnapshotRetention
+		cfg.IntentRetention = devIntentRetention
+		cfg.IntentWriteTimeout = devIntentWriteTimeout
+		cfg.ClockSyncInterval = devClockSyncInterval
+
+		// only allow overriding cfg.InsecureVerifySkipped in dev mode
+		// It is false by default unless explicitly overridden
+		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
+	}
+
+	if cfg.ExportTraces, err = takeEnvBool(envTraces); err != nil {
+		return nil, err
+	}
+	if cfg.ExportMetrics, err = takeEnvBool(envMetrics); err != nil {
+		return nil, err
+	}
+	if cfg.UseACME, err = takeEnvBool(envUseACME); err != nil {
+		return nil, err
+	}
+
+	if cooldown := takeEnv(envMigrationCooldown); cooldown != "" {
+		d, err := time.ParseDuration(cooldown)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ENCLAVE_MIGRATION_COOLDOWN %q: %w", cooldown, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("ENCLAVE_MIGRATION_COOLDOWN must not be negative")
+		}
+
+		cfg.MigrationCooldown = d
+	}
+
+	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
+		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
+	}
+
+	for v := range strings.SplitSeq(takeEnv(envScalingFollowerPCR0s), ",") {
+		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
+			cfg.ScalingFollowerPCR0s = append(cfg.ScalingFollowerPCR0s, v)
+		}
+	}
+
+	return cfg, nil
+}
+
+// Validate rejects an unusable config before any state is touched.
 func (c *Config) Validate() error {
 	if c.ExtPort == 0 || c.IntPort == 0 || c.HostProxyPort == 0 {
-		return errCfgMissingPort
+		return fmt.Errorf("config is missing port")
 	}
 	if c.FQDN == "" {
-		return errCfgMissingFQDN
+		return fmt.Errorf("config is missing FQDN")
 	}
+	if c.Namespace == "" {
+		return fmt.Errorf("ENCLAVE_NAMESPACE must be set: it namespaces all SSM state")
+	}
+	if c.AppName == "" {
+		return fmt.Errorf("ENCLAVE_APP_NAME must be set: it namespaces all SSM state")
+	}
+	if err := validateNamespaceName("ENCLAVE_NAMESPACE", c.Namespace, true); err != nil {
+		return err
+	}
+	if err := validateNamespaceName("ENCLAVE_APP_NAME", c.AppName, false); err != nil {
+		return err
+	}
+	if depth := strings.Count(c.Namespace, "/") + 1; depth > maxNamespaceDepth {
+		return fmt.Errorf(
+			"ENCLAVE_NAMESPACE %q: %d segments, at most %d fit SSM's hierarchy",
+			c.Namespace, depth, maxNamespaceDepth,
+		)
+	}
+	ns := c.namespace()
+	if len(ns) > maxNamespaceLen {
+		return fmt.Errorf(
+			"namespace %q is %d characters, at most %d fit SSM and CloudWatch name limits",
+			ns, len(ns), maxNamespaceLen,
+		)
+	}
+	first := strings.ToLower(strings.SplitN(c.Namespace, "/", 2)[0])
+	if strings.HasPrefix(first, "aws") || strings.HasPrefix(first, "ssm") {
+		return fmt.Errorf(
+			"namespace %q: SSM reserves parameter names starting with \"aws\" or \"ssm\"", ns,
+		)
+	}
+	if !c.genesisImage() && !isCanonicalPCR0(strings.ToLower(c.PreviousPCR0)) {
+		return fmt.Errorf(
+			"ENCLAVE_PREVIOUS_PCR0 must be %q or the predecessor's PCR0, got %q",
+			genesisPreviousPCR0, c.PreviousPCR0,
+		)
+	}
+	switch c.ScalingRole {
+	case "", scalingRoleFollower:
+	case scalingRoleLeader:
+		if len(c.ScalingFollowerPCR0s) == 0 {
+			return fmt.Errorf("%s must name the follower images a leader admits",
+				envScalingFollowerPCR0s)
+		}
+		for _, pcr0 := range c.ScalingFollowerPCR0s {
+			if !isCanonicalPCR0(pcr0) {
+				return fmt.Errorf("%s: invalid PCR0 %q", envScalingFollowerPCR0s, pcr0)
+			}
+		}
+	default:
+		return fmt.Errorf("invalid %s %q, want %q or %q",
+			envScalingRole, c.ScalingRole, scalingRoleLeader, scalingRoleFollower)
+	}
+	if c.AppPort == "" {
+		return fmt.Errorf("config is missing application process settings")
+	}
+	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
+		return fmt.Errorf("config has invalid telemetry timing")
+	}
+	return c.validateTelemetryEnv()
+}
+
+func (c *Config) validateTelemetryEnv() error {
+	reserved := (Config{}).reservedEnv()
+	for _, setting := range []struct{ key, value string }{
+		{envOtelEndpointEnv, c.OtelEndpointEnv},
+		{envOtelTokenEnv, c.OtelTokenEnv},
+	} {
+		if setting.value == "" {
+			return fmt.Errorf("%s must be set", setting.key)
+		}
+		if !envVarNamePattern.MatchString(setting.value) {
+			return fmt.Errorf(
+				"%s: invalid environment variable name %q", setting.key, setting.value,
+			)
+		}
+		if reserved[setting.value] {
+			return fmt.Errorf("%s: environment variable %q is reserved", setting.key, setting.value)
+		}
+	}
+	if c.OtelEndpointEnv == c.OtelTokenEnv {
+		return fmt.Errorf("%s and %s must use different names", envOtelEndpointEnv, envOtelTokenEnv)
+	}
+	return nil
+}
+
+// reservedEnv includes environment variables exported by the runtime.
+func (c Config) reservedEnv() map[string]bool {
+	return map[string]bool{
+		envAppPort:        true,
+		"PORT":            true,
+		c.OtelEndpointEnv: true,
+		c.OtelTokenEnv:    true,
+	}
+}
+
+func validateNamespaceName(name, value string, multiSegment bool) error {
+	// Names are used verbatim in S3 keys too, where "." and ".." read as relative
+	// paths: S3 refuses keys that climb above their root, and tools may resolve
+	// the rest into another name's keys.
+	for _, seg := range strings.Split(value, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("%s %q: no leading, trailing or doubled \"/\" allowed", name, value)
+		case ".", "..":
+			return fmt.Errorf("%s %q: \".\" and \"..\" segments are not allowed", name, value)
+		}
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune(namespaceNameChars, r):
+		case r == '/' && multiSegment:
+		case r == '/':
+			return fmt.Errorf("%s %q must be a single path segment", name, value)
+		default:
+			return fmt.Errorf(
+				"%s %q: SSM parameter names and CloudWatch log groups allow only "+
+					"letters, digits and %s",
+				name, value, namespaceNameChars,
+			)
+		}
+	}
+	return nil
+}
+
+func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
+	prefix := c.envOverlayPrefix()
+
+	params, err := ssm.ListParams(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list env override SSM params: %w", err)
+	}
+
+	applied := 0
+	for _, p := range params {
+		key := strings.TrimPrefix(p.Name, prefix)
+		// Defensive: skip empty or nested keys so a misconfigured SSM
+		// tree can't surface unexpected env var names.
+		if key == "" || strings.ContainsRune(key, '/') {
+			continue
+		}
+
+		switch key {
+		case envAppPort:
+			port, err := strconv.ParseUint(p.Value, 10, 16)
+			if err != nil || port == 0 {
+				return fmt.Errorf("invalid application port %q", p.Value)
+			}
+			appWebSrv, err := url.Parse("http://127.0.0.1:" + p.Value)
+			if err != nil {
+				return fmt.Errorf("parse app web srv url: %w", err)
+			}
+			c.AppPort = p.Value
+			c.AppWebSrv = appWebSrv
+		case envFQDN:
+			c.FQDN = p.Value
+		case envUseACME:
+			c.UseACME = strings.EqualFold(p.Value, "true")
+		case envACMEDirectory:
+			c.ACMEDirectory = p.Value
+		case envACMEEmail:
+			c.ACMEEmail = p.Value
+		case envACMECA:
+			c.ACMECA = p.Value
+		case envOtelEndpointEnv:
+			c.OtelEndpointEnv = p.Value
+		case envOtelTokenEnv:
+			c.OtelTokenEnv = p.Value
+		case envScalingLeaderAddr:
+			c.ScalingLeaderAddr = p.Value
+		// key is not an overridable env var, check if overriding is allowed by the app
+		default:
+			if _, allowed := c.OverrideAllowList[key]; !allowed {
+				slog.Warn("ignoring non-overridable env var from SSM overlay", "key", key)
+				continue
+			}
+
+			c.ChildEnv[key] = p.Value
+		}
+		applied++
+	}
+
+	if err := c.validateTelemetryEnv(); err != nil {
+		return err
+	}
+	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
+
 	return nil
 }
 
@@ -49,4 +517,130 @@ func (c *Config) String() string {
 		return "failed to marshal config"
 	}
 	return string(b)
+}
+
+// genesisImage reports whether this image starts a deployment. It is measured,
+// so no runtime state can turn a successor into a genesis.
+func (c *Config) genesisImage() bool {
+	return c.PreviousPCR0 == genesisPreviousPCR0
+}
+
+// appPath is the application binary the runtime execs.
+func (c *Config) appPath() string {
+	return "/app/" + c.AppBinaryName
+}
+
+func (c *Config) lockSegment() string {
+	if c.KMSLocked {
+		return "locked"
+	}
+	return "unlocked"
+}
+
+func (c *Config) namespace() string {
+	return fmt.Sprintf("/%s/%s/%s", c.Namespace, c.AppName, namespaceSegment)
+}
+
+func (c *Config) logGroup(sig signal) string {
+	return fmt.Sprintf("%s/%s", c.namespace(), sig)
+}
+
+func (c *Config) envOverlayPrefix() string {
+	return c.namespace() + "/env/"
+}
+
+func (c *Config) certBucketParam() string {
+	return c.namespace() + "/CertBucketName"
+}
+
+func (c *Config) leaseBucketParam() string {
+	return c.namespace() + "/LeaseBucketName"
+}
+
+func (c *Config) route53ZoneIDParam() string {
+	return c.namespace() + "/Route53ZoneID"
+}
+
+// inheritSecretPrefix: SSM path prefix under which the operator places inherited
+// secrets, one parameter per configured name.
+func (c *Config) inheritSecretPrefix() string {
+	return c.namespace() + "/inherit/"
+}
+
+// migrationChallengeParam: the live challenge published by a predecessor.
+func (c *Config) migrationChallengeParam(sourcePCR0 string) string {
+	return fmt.Sprintf("%s/MigrationChallenge/%s", c.namespace(), strings.ToLower(sourcePCR0))
+}
+
+// migrationResponseParam identifies a candidate or operator response.
+func (c *Config) migrationResponseParam(sourcePCR0, responder string) string {
+	return fmt.Sprintf(
+		"%s/MigrationResponse/%s/%s",
+		c.namespace(),
+		strings.ToLower(sourcePCR0),
+		strings.ToLower(responder),
+	)
+}
+
+// takeEnvRaw consumes a configuration variable, removing it from the process
+// environment. Identity is taken this way, untrimmed: what the operator sets is
+// what gets hashed into the intent bucket name, so a padded value is refused.
+func takeEnvRaw(key string) string {
+	value := os.Getenv(key)
+	_ = os.Unsetenv(key)
+	return value
+}
+
+// takeEnv is takeEnvRaw with surrounding whitespace trimmed.
+func takeEnv(key string) string {
+	return strings.TrimSpace(takeEnvRaw(key))
+}
+
+func takeEnvDefault(key, fallback string) string {
+	if v := takeEnv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// takeEnvBool consumes an optional boolean: unset is false, and a value
+// strconv.ParseBool rejects is an error rather than a silent default.
+func takeEnvBool(key string) (bool, error) {
+	v := takeEnv(key)
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: want true or false", key, v)
+	}
+	return b, nil
+}
+
+func logShipInterval() time.Duration {
+	value := takeEnvDefault(envLogShipInterval, defaultLogShipInterval.String())
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return defaultLogShipInterval
+	}
+	return interval
+}
+
+func scalingDuration(key string, fallback time.Duration) time.Duration {
+	d, err := time.ParseDuration(takeEnvDefault(key, fallback.String()))
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func logRetentionDays() int32 {
+	value := takeEnvDefault(
+		envLogRetentionDays, strconv.FormatInt(int64(defaultLogRetentionDays), 10),
+	)
+	days, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || days <= 0 {
+		return defaultLogRetentionDays
+	}
+	return int32(days)
 }

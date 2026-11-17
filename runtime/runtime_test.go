@@ -1,185 +1,419 @@
 package runtime
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
-	"golang.org/x/net/http2"
+	"github.com/stretchr/testify/require"
 )
 
-// tagRoundTripper is an http.RoundTripper that reports its own name in the
-// response Status, so a test can tell which transport handled a request.
-type tagRoundTripper string
-
-func (t tagRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return &http.Response{Status: string(t)}, nil
-}
-
-func TestProtocolSwitchTransport(t *testing.T) {
-	tr := &protocolSwitchTransport{
-		h1:  tagRoundTripper("h1"),
-		h2c: tagRoundTripper("h2c"),
-	}
+func TestAppEnv(t *testing.T) {
 	for _, tc := range []struct {
-		protoMajor int
-		want       string
-	}{
-		{1, "h1"},
-		{2, "h2c"},
-	} {
-		resp, err := tr.RoundTrip(&http.Request{ProtoMajor: tc.protoMajor})
-		if err != nil {
-			t.Fatalf("ProtoMajor %d: RoundTrip: %v", tc.protoMajor, err)
-		}
-		if resp.Status != tc.want {
-			t.Errorf("ProtoMajor %d routed to %q, want %q", tc.protoMajor, resp.Status, tc.want)
-		}
-	}
-}
-
-func TestUpstreamTransport(t *testing.T) {
-	if _, ok := upstreamTransport("h2c").(*http2.Transport); !ok {
-		t.Errorf(`upstreamTransport("h2c"): not *http2.Transport`)
-	}
-	if _, ok := upstreamTransport("h1").(*http.Transport); !ok {
-		t.Errorf(`upstreamTransport("h1"): not *http.Transport`)
-	}
-	for _, mode := range []string{"auto", "", "bogus"} {
-		if _, ok := upstreamTransport(mode).(*protocolSwitchTransport); !ok {
-			t.Errorf("upstreamTransport(%q): not *protocolSwitchTransport (want auto fallback)", mode)
-		}
-	}
-}
-
-func TestCorsWildcard_Preflight(t *testing.T) {
-	calls := 0
-	inner := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ })
-	h := corsWildcard(inner)
-
-	req := httptest.NewRequest(http.MethodOptions, "/v1/enclave-info", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("OPTIONS status = %d, want %d", rec.Code, http.StatusNoContent)
-	}
-	if calls != 0 {
-		t.Errorf("inner handler called %d times on OPTIONS, want 0", calls)
-	}
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
-	}
-}
-
-func TestCorsWildcard_PassthroughAndHeaders(t *testing.T) {
-	called := false
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	})
-	h := corsWildcard(inner)
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/enclave-info", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if !called {
-		t.Errorf("inner handler not called on GET")
-	}
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	for _, hdr := range []string{
-		"Access-Control-Allow-Origin",
-		"Access-Control-Allow-Methods",
-		"Access-Control-Allow-Headers",
-		"Access-Control-Expose-Headers",
-	} {
-		if got := rec.Header().Get(hdr); got != "*" {
-			t.Errorf("%s = %q, want %q", hdr, got, "*")
-		}
-	}
-}
-
-// TestUpstreamExited_DefaultsFalse verifies a fresh runtime reports the app
-// as not-exited (the only state observable until cmd/runtime/main.go calls
-// MarkUpstreamExited).
-func TestUpstreamExited_DefaultsFalse(t *testing.T) {
-	e := &Runtime{}
-	exited, msg := e.UpstreamExited()
-	if exited {
-		t.Errorf("UpstreamExited() exited=true on fresh runtime, want false")
-	}
-	if msg != "" {
-		t.Errorf("UpstreamExited() msg=%q on fresh runtime, want empty", msg)
-	}
-}
-
-// TestUpstreamExited_RecordsError flips the latch with a non-nil error and
-// confirms both the bool and the error string round-trip.
-func TestUpstreamExited_RecordsError(t *testing.T) {
-	e := &Runtime{}
-	e.MarkUpstreamExited(errors.New("exit status 1"))
-	exited, msg := e.UpstreamExited()
-	if !exited {
-		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(err), want true")
-	}
-	if msg != "exit status 1" {
-		t.Errorf("UpstreamExited() msg=%q, want %q", msg, "exit status 1")
-	}
-}
-
-// TestUpstreamExited_RecordsCleanExit: nil error means "app exited cleanly"
-// — still marks the latch, but message stays empty.
-func TestUpstreamExited_RecordsCleanExit(t *testing.T) {
-	e := &Runtime{}
-	e.MarkUpstreamExited(nil)
-	exited, msg := e.UpstreamExited()
-	if !exited {
-		t.Errorf("UpstreamExited() exited=false after MarkUpstreamExited(nil), want true")
-	}
-	if msg != "" {
-		t.Errorf("UpstreamExited() msg=%q after clean exit, want empty", msg)
-	}
-}
-
-// TestUpstreamAppInfo_JSONShape locks in the JSON field names that
-// test/run.sh and external clients depend on (.upstream_app.exited,
-// .upstream_app.error).
-func TestUpstreamAppInfo_JSONShape(t *testing.T) {
-	cases := []struct {
-		name string
-		in   UpstreamAppInfo
-		want string
+		name      string
+		config    map[string]string
+		parent    map[string]string
+		allowlist string
+		overrides map[string]string
+		secrets   []StaticSecret
+		want      map[string]string
+		absent    []string
 	}{
 		{
-			name: "not exited — no error field",
-			in:   UpstreamAppInfo{Exited: false},
-			want: `{"exited":false}`,
+			name:   "missing SSM override preserves baked values",
+			parent: map[string]string{"CHILD_ENV_TEST_SETTING": "baked"},
+			want:   map[string]string{"CHILD_ENV_TEST_SETTING": "baked"},
 		},
 		{
-			name: "exited cleanly — no error field",
-			in:   UpstreamAppInfo{Exited: true},
-			want: `{"exited":true}`,
+			name:      "SSM overrides baked values",
+			parent:    map[string]string{"CHILD_ENV_TEST_SETTING": "baked"},
+			allowlist: "CHILD_ENV_TEST_SETTING",
+			overrides: map[string]string{"CHILD_ENV_TEST_SETTING": "ssm"},
+			want:      map[string]string{"CHILD_ENV_TEST_SETTING": "ssm"},
 		},
 		{
-			name: "exited with error — error included",
-			in:   UpstreamAppInfo{Exited: true, Error: "exit status 1"},
-			want: `{"exited":true,"error":"exit status 1"}`,
+			name:      "secrets override SSM and baked values",
+			parent:    map[string]string{"CHILD_ENV_TEST_KEY": "baked"},
+			allowlist: "CHILD_ENV_TEST_KEY,CHILD_ENV_TEST_SETTING",
+			overrides: map[string]string{
+				"CHILD_ENV_TEST_KEY": "host-value", "CHILD_ENV_TEST_SETTING": "keep",
+			},
+			secrets: []StaticSecret{
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "CHILD_ENV_TEST_KEY"}, Plaintext: "secret"},
+			},
+			want: map[string]string{
+				"CHILD_ENV_TEST_KEY": "secret", "CHILD_ENV_TEST_SETTING": "keep",
+			},
 		},
-	}
-	for _, tc := range cases {
+		{
+			name: "runtime exports override every other source",
+			parent: map[string]string{
+				envAppPort: "1111", "PORT": "1111",
+				"APP_OTEL_ENDPOINT": "https://baked.example.com", "APP_OTEL_TOKEN": "baked-token",
+			},
+			allowlist: "PORT,APP_OTEL_ENDPOINT,APP_OTEL_TOKEN",
+			overrides: map[string]string{
+				"PORT": "2222", "APP_OTEL_ENDPOINT": "https://ssm.example.com", "APP_OTEL_TOKEN": "host-token",
+			},
+			secrets: []StaticSecret{
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: envAppPort}, Plaintext: "3333"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "PORT"}, Plaintext: "3333"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "APP_OTEL_ENDPOINT"}, Plaintext: "3334"},
+				{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "APP_OTEL_TOKEN"}, Plaintext: "secret-token"},
+			},
+		},
+		{
+			name:      "SSM app port reaches both child port variables",
+			overrides: map[string]string{envAppPort: "9090"},
+			want:      map[string]string{envAppPort: "9090", "PORT": "9090"},
+		},
+		{
+			name:      "explicitly empty SSM override clears baked value",
+			parent:    map[string]string{"CHILD_ENV_TEST_SETTING": "baked"},
+			allowlist: "CHILD_ENV_TEST_SETTING",
+			overrides: map[string]string{"CHILD_ENV_TEST_SETTING": ""},
+			want:      map[string]string{"CHILD_ENV_TEST_SETTING": ""},
+		},
+		{
+			name:      "values survive serialization unchanged",
+			allowlist: "CHILD_ENV_TEST_SETTING",
+			overrides: map[string]string{"CHILD_ENV_TEST_SETTING": "  café\nkey=value \t"},
+			want:      map[string]string{"CHILD_ENV_TEST_SETTING": "  café\nkey=value \t"},
+		},
+		{
+			name: "baked telemetry names override child settings",
+			config: map[string]string{
+				envOtelEndpointEnv: "APP_OTEL_ENDPOINT", envOtelTokenEnv: "APP_OTEL_TOKEN",
+			},
+			parent: map[string]string{
+				"APP_OTEL_ENDPOINT": "https://baked.example.com", "APP_OTEL_TOKEN": "baked-token",
+			},
+			allowlist: "APP_OTEL_ENDPOINT,APP_OTEL_TOKEN",
+			overrides: map[string]string{
+				"APP_OTEL_ENDPOINT": "https://ssm.example.com", "APP_OTEL_TOKEN": "ssm-token",
+			},
+			want: map[string]string{
+				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
+			},
+		},
+		{
+			name: "SSM telemetry names override baked names without an allowlist",
+			config: map[string]string{
+				envOtelEndpointEnv: "BAKED_ENDPOINT", envOtelTokenEnv: "BAKED_TOKEN",
+			},
+			overrides: map[string]string{
+				envOtelEndpointEnv: "APP_OTEL_ENDPOINT", envOtelTokenEnv: "APP_OTEL_TOKEN",
+			},
+			want: map[string]string{
+				"APP_OTEL_ENDPOINT": "http://127.0.0.1:8080", "APP_OTEL_TOKEN": "runtime-token",
+			},
+			absent: []string{
+				"BAKED_ENDPOINT", "BAKED_TOKEN",
+			},
+		},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b, err := json.Marshal(tc.in)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
+			setConfigTestEnv(t, false)
+			for key, value := range tc.config {
+				t.Setenv(key, value)
 			}
-			if string(b) != tc.want {
-				t.Errorf("json shape mismatch:\n  got:  %s\n  want: %s", b, tc.want)
+			t.Setenv(envOverrideAllowList, tc.allowlist)
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.NoError(t, cfg.Validate())
+			for key, value := range tc.parent {
+				t.Setenv(key, value)
 			}
+			parentEnv := os.Environ()
+
+			params := make(map[string]string)
+			for key, value := range tc.overrides {
+				params["/prod/app/enclave/env/"+key] = value
+			}
+			require.NoError(t, cfg.ApplySSMOverlay(t.Context(), NewSSM(&fakeSSM{params: params})))
+			overrides := maps.Clone(cfg.ChildEnv)
+
+			entries := (&exec.Cmd{
+				Env: appEnv(*cfg, "runtime-token", Secrets{Static: tc.secrets}),
+			}).Environ()
+			values := make(map[string]string)
+			counts := make(map[string]int)
+			for _, entry := range entries {
+				key, value, _ := strings.Cut(entry, "=")
+				values[key] = value
+				counts[key]++
+			}
+			want := map[string]string{
+				envAppPort: "7074", "PORT": "7074",
+				cfg.OtelEndpointEnv: "http://127.0.0.1:8080", cfg.OtelTokenEnv: "runtime-token",
+			}
+			for _, key := range tc.absent {
+				delete(want, key)
+				require.NotContains(t, values, key)
+			}
+			require.NotContains(t, values, envOtelEndpointEnv)
+			require.NotContains(t, values, envOtelTokenEnv)
+			maps.Copy(want, tc.want)
+			for key, value := range want {
+				require.Equal(
+					t,
+					1,
+					counts[key],
+					"%s must appear exactly once, even when empty",
+					key,
+				)
+				require.Equal(t, value, values[key], key)
+			}
+			require.Equal(t, "http://127.0.0.1:"+want["PORT"], cfg.AppWebSrv.String())
+			require.Equal(t, overrides, cfg.ChildEnv, "appEnv must not change the config overrides")
+			require.True(
+				t,
+				slices.Equal(parentEnv, os.Environ()),
+				"parent environment must not change",
+			)
 		})
 	}
+}
+
+type fakeAppProcess struct {
+	stops    int
+	restarts chan struct{}
+	err      error
+}
+
+func (a *fakeAppProcess) Restart() error {
+	a.restarts <- struct{}{}
+	return nil
+}
+
+func (a *fakeAppProcess) Stop() error {
+	a.stops++
+	return a.err
+}
+
+// Run refuses an app it could not exec before writing any state.
+func TestCheckAppBinary(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, mode os.FileMode) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"), mode))
+		return path
+	}
+
+	require.NoError(t, checkAppBinary(write("app", 0o755)))
+	require.Error(t, checkAppBinary(write("not-executable", 0o644)))
+	require.Error(t, checkAppBinary(filepath.Join(dir, "missing")))
+	require.Error(t, checkAppBinary(dir))
+}
+
+func TestSuperviseContextDoneStopsApp(t *testing.T) {
+	rt := newRuntimeState()
+	want := errors.New("stop failed")
+	app := &fakeAppProcess{err: want}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := supervise(ctx, rt, app, nil, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("supervise error = %v, want %v", err, want)
+	}
+	if app.stops != 1 {
+		t.Fatalf("Stop calls = %d, want 1", app.stops)
+	}
+}
+
+func TestSuperviseListenerErrorStopsApp(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{}
+	want := errors.New("listener failed")
+
+	done := make(chan error, 1)
+	go func() { done <- supervise(context.Background(), rt, app, nil, nil) }()
+	rt.NotifyListenerError(want)
+
+	err := waitTestResult(t, done)
+	if !errors.Is(err, want) {
+		t.Fatalf("supervise error = %v, want %v", err, want)
+	}
+	if app.stops != 1 {
+		t.Fatalf("Stop calls = %d, want 1", app.stops)
+	}
+}
+
+func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app, nil, nil) }()
+
+	rt.NotifyChildExit(nil)
+	cancel()
+
+	if err := waitTestResult(t, done); err != nil {
+		t.Fatalf("supervise error = %v, want nil", err)
+	}
+	if app.stops != 0 {
+		t.Fatalf("Stop calls = %d, want 0", app.stops)
+	}
+	if !rt.UpstreamAppInfo().Exited {
+		t.Fatalf("UpstreamAppInfo().Exited = false, want true")
+	}
+}
+
+// A cutoff restart relaunches the app and keeps supervising it.
+func TestSuperviseRestartRelaunchesApp(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	restart := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app, restart, nil) }()
+
+	restart <- struct{}{}
+	select {
+	case <-app.restarts:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for restart")
+	}
+	cancel()
+
+	require.NoError(t, waitTestResult(t, done))
+	require.Equal(t, 1, app.stops)
+}
+
+// The whole cutoff path short of the exec: a secret reaching its cutoff while
+// the app runs is left out of its environment, and the app is relaunched.
+func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
+	rt := newRuntimeState()
+	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Now()
+	legacy := InheritSecretMetadata{
+		Name: "legacy", EnvVar: "LEGACY_KEY", Cutoff: now.Add(50 * time.Millisecond),
+	}
+	token := InheritSecretMetadata{
+		Name: "token", EnvVar: "LEGACY_TOKEN", Cutoff: now.Add(time.Hour),
+	}
+	// Without a cutoff, a secret is neither watched nor ever dropped.
+	forever := InheritSecretMetadata{Name: "forever", EnvVar: "LEGACY_FOREVER"}
+	// Already past its cutoff, a secret is neither handed to the app nor watched.
+	expired := InheritSecretMetadata{
+		Name: "expired", EnvVar: "LEGACY_EXPIRED", Cutoff: now.Add(-time.Minute),
+	}
+	secrets := Secrets{
+		Inherited: []InheritedSecret{
+			{InheritSecretMetadata: legacy, Plaintext: "inherited"},
+			{InheritSecretMetadata: token, Plaintext: "inherited"},
+			{InheritSecretMetadata: forever, Plaintext: "inherited"},
+			{InheritSecretMetadata: expired, Plaintext: "inherited"},
+		},
+	}
+	restart := watchInheritCutoffs(ctx, secrets.Inherited, 5*time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- supervise(ctx, rt, app, restart, nil) }()
+
+	select {
+	case <-app.restarts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("app was not restarted at the cutoff")
+	}
+	require.False(t, time.Now().Before(now.Add(50*time.Millisecond)), "restarted before the cutoff")
+
+	// The relaunched app's environment is built at relaunch.
+	relaunched := appEnv(*testConfig(), "runtime-token", secrets)
+	require.Subset(t, relaunched, []string{"LEGACY_TOKEN=inherited", "LEGACY_FOREVER=inherited"})
+	require.NotContains(t, relaunched, "LEGACY_KEY=inherited",
+		"the expired secret must be gone before the app comes back")
+	require.NotContains(t, relaunched, "LEGACY_EXPIRED=inherited")
+
+	select {
+	case <-app.restarts:
+		t.Fatal("app restarted again with no further cutoff due")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	require.NoError(t, waitTestResult(t, done))
+	require.Equal(t, 1, app.stops)
+}
+
+func TestNotifyChildStartClearsExit(t *testing.T) {
+	rt := newRuntimeState()
+	go func() { <-rt.ChildDone() }()
+	rt.NotifyChildExit(errors.New("killed"))
+	require.True(t, rt.UpstreamAppInfo().Exited)
+
+	rt.NotifyChildStart()
+	require.Equal(t, UpstreamAppInfo{}, rt.UpstreamAppInfo())
+}
+
+func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {
+	rt := newRuntimeState()
+	want := errors.New("clock sync failed")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	done := make(chan error, 1)
+	go func() { done <- waitForRuntime(ctx, rt) }()
+	cancel(want)
+
+	require.ErrorIs(t, waitTestResult(t, done), want)
+}
+
+func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
+	rt := newRuntimeState()
+	want := errors.New("listener failed")
+
+	done := make(chan error, 1)
+	go func() { done <- waitForRuntime(context.Background(), rt) }()
+	rt.NotifyListenerError(want)
+
+	err := waitTestResult(t, done)
+	if !errors.Is(err, want) {
+		t.Fatalf("waitForRuntime error = %v, want %v", err, want)
+	}
+}
+
+func waitTestResult(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for result")
+		return nil
+	}
+}
+
+func TestRuntimeStateLifecycleOnlyMovesForward(t *testing.T) {
+	rt := newRuntimeState()
+	require.Equal(t, runtimeStatusCandidate, rt.Status())
+	require.False(t, rt.Ready())
+
+	rt.NotifyStarting()
+	require.Equal(t, runtimeStatusStarting, rt.Status())
+	require.False(t, rt.Ready())
+
+	rt.NotifyReady()
+	require.Equal(t, runtimeStatusReady, rt.Status())
+	require.True(t, rt.Ready())
+
+	// Ready is terminal.
+	rt.NotifyStarting()
+	require.Equal(t, runtimeStatusReady, rt.Status())
 }

@@ -1,0 +1,131 @@
+{
+  description = "Simple AWS Nitro Enclave Runtime";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util";
+  };
+
+  outputs =
+    {
+      nixpkgs,
+      aws-nitro-util,
+      self,
+    }:
+    let
+      enclaveSystems = [
+        "x86_64-linux"
+      ];
+
+      allSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+
+      forSystems =
+        systems: f:
+        nixpkgs.lib.genAttrs systems (
+          system:
+          f {
+            inherit system;
+            pkgs = import nixpkgs { inherit system; };
+          }
+        );
+    in
+    {
+      packages =
+        nixpkgs.lib.recursiveUpdate
+          (forSystems enclaveSystems (
+            { pkgs, system, ... }:
+            {
+              runtime = pkgs.buildGoModule (finalAttrs: {
+                pname = "runtime";
+                version = "0.1.0";
+                # Only these two directories, so unrelated edits do not rebuild the runtime.
+                src = pkgs.lib.fileset.toSource {
+                  root = ./.;
+                  fileset = pkgs.lib.fileset.unions [
+                    ./runtime
+                    ./internal/signing
+                  ];
+                };
+                modRoot = "runtime";
+                subPackages = [ "cmd/runtime" ];
+                vendorHash = "sha256-muATleogX6sOD6uameroAdgCLiT660ydYPqeJE7cIq0=";
+                env.CGO_ENABLED = "0";
+                buildFlags = [
+                  "-trimpath"
+                ];
+                ldflags = [
+                  "-X github.com/ArkLabsHQ/enclave/runtime.Version=${finalAttrs.version}"
+                ];
+                tags = [ "netgo" ];
+              });
+
+              # x86_64-linux only, like runtime: aarch64 EIFs measure correctly but
+              # cannot boot. Built from nix/tests/test-app, and exposed so this repo can
+              # exercise its own eif-build workflow against a real EIF.
+              eif-blue = (import ./nix/tests { inherit pkgs system self; }).eif-blue;
+              eif-green = (import ./nix/tests { inherit pkgs system self; }).eif-green;
+            }
+          ))
+          (
+            forSystems allSystems (
+              { pkgs, system, ... }:
+              {
+                cli = pkgs.buildGoModule (finalAttrs: {
+                  pname = "enclave-cli";
+                  version = "0.1.0";
+                  src = ./.;
+                  subPackages = [ "cmd/enclave" ];
+                  vendorHash = "sha256-+rOrv+GKRtpm1rOv1SrQNycrKHFXJGI99rbCUz4s6Iw=";
+                  env.GOWORK = "off";
+                  buildFlags = [
+                    "-trimpath"
+                  ];
+                  ldflags = [
+                    "-X main.Version=${finalAttrs.version}"
+                  ];
+
+                  # subPackages installs cmd/enclave as bin/enclave, but nix run derives
+                  # the program name from pname and would look for bin/enclave-cli.
+                  meta.mainProgram = "enclave";
+                });
+                default = self.packages.${system}.cli;
+              }
+            )
+          );
+
+      devShells = forSystems allSystems (
+        { pkgs, system, ... }:
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.go
+              pkgs.gofumpt
+              pkgs.golangci-lint
+              pkgs.golangci-lint-langserver
+              pkgs.golines
+              pkgs.gopls
+            ];
+          };
+        }
+      );
+
+      checks = forSystems enclaveSystems (
+        { pkgs, system, ... }:
+        (import ./nix/tests {
+          inherit
+            pkgs
+            system
+            self
+            ;
+        }).checks
+      );
+
+      lib = {
+        buildEif = import ./nix/build-eif.nix { inherit self aws-nitro-util; };
+      };
+    };
+}

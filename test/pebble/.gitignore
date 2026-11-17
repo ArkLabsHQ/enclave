@@ -1,7 +1,0 @@
-# Generated per-run by gen-certs.sh (see test/acme-test.sh / `make test-acme`).
-pebble-ca.key
-pebble-ca.crt
-pebble-ca.srl
-pebble-cert.key
-pebble-cert.csr
-pebble-cert.pem

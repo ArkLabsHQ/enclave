@@ -17,51 +17,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestScalingHandshakeGating verifies the handshake route (mounted unconditionally
-// at New) gates correctly at request time: 503 before Init returns, 404 when there's
-// no leader scaling entity, and a nonce once a leader entity is wired.
-func TestScalingHandshakeGating(t *testing.T) {
+// TestConfigureScalingHandlers verifies a leader's handshake route is served from
+// the enclave mux once configured, and not before.
+func TestConfigureScalingHandlers(t *testing.T) {
+	s := &servers{rm: http.NewServeMux()}
 	newReq := func() *http.Request { return httptest.NewRequest("GET", handshakePathNonce, nil) }
 
-	// Before Init returns → 503.
-	e := &Runtime{}
 	w := httptest.NewRecorder()
-	e.scalingHandshakeNonce(w, newReq())
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("pre-init: got %d, want 503", w.Code)
-	}
-
-	// Init done, no scaling entity → 404.
-	e.initDone.Store(true)
-	w = httptest.NewRecorder()
-	e.scalingHandshakeNonce(w, newReq())
+	s.rm.ServeHTTP(w, newReq())
 	if w.Code != http.StatusNotFound {
-		t.Errorf("no entity: got %d, want 404", w.Code)
+		t.Errorf("unconfigured: got %d, want 404", w.Code)
 	}
 
-	// Init done, follower → 404 (a follower never serves the handshake).
-	t.Setenv("ENCLAVE_SCALING_ROLE", "follower")
-	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "https://leader:443")
-	follower, err := newScalingEntity()
-	if err != nil {
-		t.Fatalf("newScalingEntity follower: %v", err)
-	}
-	e.scalingEntity = follower
+	s.ConfigureScalingHandlers(newLeaderEntity(t))
 	w = httptest.NewRecorder()
-	e.scalingHandshakeNonce(w, newReq())
-	if w.Code != http.StatusNotFound {
-		t.Errorf("follower: got %d, want 404", w.Code)
-	}
-
-	// Init done, leader → 200 with a base64 nonce body.
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	leader, err := newScalingEntity()
-	if err != nil {
-		t.Fatalf("newScalingEntity leader: %v", err)
-	}
-	e.scalingEntity = leader
-	w = httptest.NewRecorder()
-	e.scalingHandshakeNonce(w, newReq())
+	s.rm.ServeHTTP(w, newReq())
 	if w.Code != http.StatusOK {
 		t.Fatalf("leader: got %d, want 200", w.Code)
 	}
@@ -72,14 +42,12 @@ func TestScalingHandshakeGating(t *testing.T) {
 
 func TestScalingRoleParsing(t *testing.T) {
 	// An unset or invalid role is rejected.
-	t.Setenv("ENCLAVE_SCALING_ROLE", "")
-	if _, err := newScalingEntity(); err == nil {
+	if _, err := newScalingEntity(&Config{}, nil); err == nil {
 		t.Errorf("empty role should be rejected")
 	}
 
 	// Leader.
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	leader, err := newScalingEntity()
+	leader, err := newScalingEntity(&Config{ScalingRole: "leader"}, nil)
 	if err != nil {
 		t.Fatalf("leader: %v", err)
 	}
@@ -88,13 +56,12 @@ func TestScalingRoleParsing(t *testing.T) {
 	}
 
 	// A follower requires a leader address.
-	t.Setenv("ENCLAVE_SCALING_ROLE", "follower")
-	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "")
-	if _, err := newScalingEntity(); err == nil {
+	if _, err := newScalingEntity(&Config{ScalingRole: "follower"}, nil); err == nil {
 		t.Errorf("follower without ENCLAVE_SCALING_LEADER_ADDR should error")
 	}
-	t.Setenv("ENCLAVE_SCALING_LEADER_ADDR", "https://leader:443")
-	follower, err := newScalingEntity()
+	follower, err := newScalingEntity(
+		&Config{ScalingRole: "follower", ScalingLeaderAddr: "https://leader:443"}, nil,
+	)
 	if err != nil {
 		t.Fatalf("follower: %v", err)
 	}
@@ -104,9 +71,13 @@ func TestScalingRoleParsing(t *testing.T) {
 }
 
 func TestScalingListenPortDefault(t *testing.T) {
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	t.Setenv("ENCLAVE_SCALING_LISTEN_PORT", "")
-	ts, err := newScalingEntity()
+	t.Setenv(envScalingRole, "leader")
+	t.Setenv(envScalingListenPort, "")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	ts, err := newScalingEntity(cfg, nil)
 	if err != nil {
 		t.Fatalf("newScalingEntity: %v", err)
 	}
@@ -116,7 +87,7 @@ func TestScalingListenPortDefault(t *testing.T) {
 }
 
 func TestThresholdStoreLeaderSecret(t *testing.T) {
-	// A leader resolves a0 through the injected resolver (its in-memory leader-secret cache).
+	// A leader resolves a0 through the injected resolver (its seed-derived signing secrets).
 	leaderSecrets := map[string][]byte{"SIGNING_KEY": {0x0a, 0x0b, 0x0c}}
 	resolve := func(label string) ([]byte, error) {
 		m, ok := leaderSecrets[label]
@@ -153,11 +124,7 @@ func TestThresholdStoreRecoveryKey(t *testing.T) {
 }
 
 func TestAdmissionNonceOneShotAndExpiry(t *testing.T) {
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	a, err := newScalingEntity()
-	if err != nil {
-		t.Fatalf("newScalingEntity: %v", err)
-	}
+	a := newLeaderEntity(t)
 
 	b64, err := a.issueNonce()
 	if err != nil {
@@ -182,11 +149,7 @@ func TestAdmissionNonceOneShotAndExpiry(t *testing.T) {
 }
 
 func TestAdmissionAuthorizeGate(t *testing.T) {
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	a, err := newScalingEntity()
-	if err != nil {
-		t.Fatalf("newScalingEntity: %v", err)
-	}
+	a := newLeaderEntity(t)
 	hostpub := []byte{0x02, 0x01, 0x02, 0x03}
 
 	if a.IsAuthorized(hostpub) {
@@ -199,6 +162,46 @@ func TestAdmissionAuthorizeGate(t *testing.T) {
 	if a.IsAuthorized([]byte{0x02, 0x09, 0x09}) {
 		t.Errorf("a different host key must remain unauthorized")
 	}
+}
+
+// TestVerifyFollowerAttestation: the leader admits only the follower images it was
+// built with, and each nonce it issued only once.
+func TestVerifyFollowerAttestation(t *testing.T) {
+	fake := newFakeNSM(t)
+	followerPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	a := newLeaderEntity(t)
+	a.cfg.ScalingFollowerPCR0s = []string{hex.EncodeToString(followerPCR0)}
+	a.nsm = &nsmW{nsm: fake}
+
+	sk, err := secp.GeneratePrivateKey()
+	require.NoError(t, err)
+	hostPub := sk.PubKey().SerializeCompressed()
+	reqData, err := json.Marshal(admitRequestData{Nonce: []byte{1, 2, 3}, HostPub: hostPub})
+	require.NoError(t, err)
+	boxPub := bytes.Repeat([]byte{0x07}, 32)
+	attest := func(pcr0 []byte) string {
+		b64, err := a.issueNonce()
+		require.NoError(t, err)
+		nonce, err := base64.StdEncoding.DecodeString(b64)
+		require.NoError(t, err)
+		return fake.attestWithNonce(
+			map[uint][]byte{0: pcr0}, time.Now(), reqData, nonce, boxPub,
+		).docB64
+	}
+
+	req, pub, err := a.verifyFollowerAttestation(attest(followerPCR0))
+	require.NoError(t, err)
+	require.Equal(t, hostPub, req.HostPub)
+	require.Equal(t, boxPub, pub)
+
+	_, _, err = a.verifyFollowerAttestation(attest(bytes.Repeat([]byte{0xcd}, 48)))
+	require.ErrorContains(t, err, "not an admitted follower image")
+
+	doc := attest(followerPCR0)
+	_, _, err = a.verifyFollowerAttestation(doc)
+	require.NoError(t, err)
+	_, _, err = a.verifyFollowerAttestation(doc)
+	require.ErrorContains(t, err, "unknown or expired nonce", "a nonce admits once")
 }
 
 func TestAdmitDataRoundTrip(t *testing.T) {
@@ -223,12 +226,61 @@ func TestAdmitDataRoundTrip(t *testing.T) {
 	}
 }
 
-func newLeaderEntity(t *testing.T) *ScalingEntity {
-	t.Helper()
-	t.Setenv("ENCLAVE_SCALING_ROLE", "leader")
-	a, err := newScalingEntity()
-	require.NoError(t, err)
-	return a
+// TestShareStoreAndRestore: a share a ceremony delivers is persisted and signalled,
+// replaces only its signing secret, and is restored after a restart.
+func TestShareStoreAndRestore(t *testing.T) {
+	ctx := context.Background()
+	store := &thresholdStore{
+		cfg: newTestConfig(
+			"prod",
+			"myapp",
+			false,
+		),
+		s3:     newFakeS3(),
+		dek:    testDEK(),
+		bucket: "certs",
+	}
+	share := bytes.Repeat([]byte{0x11}, 32)
+	groupKey := bytes.Repeat([]byte{0x02}, 33)
+
+	a := newLeaderEntity(t)
+	a.storage = store
+	a.labels = []string{"GROUP_KEY"}
+	require.ErrorContains(t, a.storeShare(ctx, "OTHER_KEY", share, groupKey),
+		"no configured signing secret")
+	require.NoError(t, a.storeShare(ctx, "GROUP_KEY", share, groupKey))
+	select {
+	case <-a.Reshared():
+	default:
+		t.Fatal("storing a share signals Reshared")
+	}
+
+	static := []StaticSecret{
+		{
+			StaticSecretMetadata: StaticSecretMetadata{EnvVar: "GROUP_KEY", Kind: "signing"},
+			Plaintext:            "a0",
+		},
+		{StaticSecretMetadata: StaticSecretMetadata{EnvVar: "APP_KEY"}, Plaintext: "app"},
+	}
+	want := []StaticSecret{
+		{
+			StaticSecretMetadata: static[0].StaticSecretMetadata,
+			Plaintext:            hex.EncodeToString(share),
+			GroupKey:             groupKey,
+		},
+		static[1],
+	}
+	require.Equal(t, want, a.applyShares(static))
+	require.Equal(t, "a0", static[0].Plaintext, "applyShares leaves its input unchanged")
+
+	restarted := newLeaderEntity(t)
+	restarted.storage = store
+	restarted.labels = a.labels
+	require.NoError(t, restarted.loadShares(ctx))
+	require.Equal(t, want, restarted.applyShares(static))
+
+	var none *ScalingEntity
+	require.Equal(t, static, none.applyShares(static), "no scaling role leaves secrets unchanged")
 }
 
 // TestHeartbeatAuth exercises the leader's liveness endpoint
@@ -274,7 +326,12 @@ func TestHeartbeatAuth(t *testing.T) {
 
 	// Valid signature by an unadmitted key → 403.
 	stranger, _ := secp.GeneratePrivateKey()
-	require.Equal(t, http.StatusForbidden, post(beat(stranger, stranger.PubKey().SerializeCompressed())), "unadmitted host")
+	require.Equal(
+		t,
+		http.StatusForbidden,
+		post(beat(stranger, stranger.PubKey().SerializeCompressed())),
+		"unadmitted host",
+	)
 
 	// Banned key → 403 even with a valid nonce+signature.
 	a.mu.Lock()
@@ -328,14 +385,32 @@ func TestStaleFollowers(t *testing.T) {
 	a.lastSeen[hex.EncodeToString(stale)] = time.Now().Add(-2 * time.Minute)
 	a.mu.Unlock()
 
-	require.Equal(t, [][]byte{stale}, a.staleFollowers(time.Minute), "only the silent follower is stale")
+	require.Equal(
+		t,
+		[][]byte{stale},
+		a.staleFollowers(time.Minute),
+		"only the silent follower is stale",
+	)
 }
 
 func TestScalingDurationConfig(t *testing.T) {
-	t.Setenv("ENCLAVE_SCALING_HEARTBEAT_INTERVAL", "")
-	require.Equal(t, 10*time.Second, scalingHeartbeatInterval(), "default heartbeat interval")
-	t.Setenv("ENCLAVE_SCALING_HEARTBEAT_INTERVAL", "3s")
-	require.Equal(t, 3*time.Second, scalingHeartbeatInterval(), "override heartbeat interval")
-	t.Setenv("ENCLAVE_SCALING_LIVENESS_TIMEOUT", "garbage")
-	require.Equal(t, 60*time.Second, scalingLivenessTimeout(), "invalid timeout falls back to default")
+	t.Setenv(envScalingHeartbeatInterval, "")
+	require.Equal(t, 10*time.Second,
+		scalingDuration(envScalingHeartbeatInterval, defaultScalingHeartbeatInterval),
+		"default heartbeat interval")
+	t.Setenv(envScalingHeartbeatInterval, "3s")
+	require.Equal(t, 3*time.Second,
+		scalingDuration(envScalingHeartbeatInterval, defaultScalingHeartbeatInterval),
+		"override heartbeat interval")
+	t.Setenv(envScalingLivenessTimeout, "garbage")
+	require.Equal(t, 60*time.Second,
+		scalingDuration(envScalingLivenessTimeout, defaultScalingLivenessTimeout),
+		"invalid timeout falls back to default")
+}
+
+func newLeaderEntity(t *testing.T) *ScalingEntity {
+	t.Helper()
+	a, err := newScalingEntity(&Config{ScalingRole: scalingRoleLeader}, nil)
+	require.NoError(t, err)
+	return a
 }

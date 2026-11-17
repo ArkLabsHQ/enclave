@@ -3,78 +3,25 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 )
-
-// VerifyManifestProvenance checks that a deployment manifest has a valid
-// GitHub artifact attestation, proving it was produced by a GitHub Actions
-// workflow — not manually uploaded. It calls the GitHub Attestations API
-// with the SHA256 digest of the manifest bytes.
-//
-// For public repos, token can be empty. For private repos, pass a GitHub
-// token with attestations:read permission.
-func VerifyManifestProvenance(ctx context.Context, repo string, manifestBytes []byte, token string) error {
-	digest := sha256.Sum256(manifestBytes)
-	digestStr := fmt.Sprintf("sha256:%x", digest)
-
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/attestations/%s", repo, digestStr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("attestations API: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("attestations API status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var result struct {
-		Attestations []json.RawMessage `json:"attestations"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode attestations: %w", err)
-	}
-
-	if len(result.Attestations) == 0 {
-		return fmt.Errorf("no attestations found for manifest (repo: %s)", repo)
-	}
-
-	return nil
-}
-
-// enclaveInfoResponse is the JSON structure returned by /v1/enclave-info.
-type enclaveInfoResponse struct {
-	Version           string `json:"version"`
-	PreviousPCR0      string `json:"previous_pcr0"`
-	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
-	Error             string `json:"error,omitempty"`
-}
 
 // fetchAndVerifyAttestation fetches the attestation document from the enclave,
 // verifies it against the AWS Nitro root certificate chain, checks the nonce,
@@ -84,7 +31,12 @@ type enclaveInfoResponse struct {
 // check is bypassed (the document is parsed manually). PCR0 and nonce checks
 // still run. Used for local QEMU tests where the emulated NSM doesn't sign
 // with AWS Nitro keys.
-func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, baseURL, expectedPCR0 string, insecureSkipCOSEVerify bool) (*nitrite.Result, error) {
+func fetchAndVerifyAttestation(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL, expectedPCR0 string,
+	insecureSkipCOSEVerify bool,
+) (*nitrite.Result, error) {
 	// Generate a random nonce to prevent replay attacks.
 	nonce := make([]byte, 20)
 	if _, err := rand.Read(nonce); err != nil {
@@ -106,7 +58,11 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("attestation status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf(
+			"attestation status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
 
 	payload, err := io.ReadAll(resp.Body)
@@ -145,12 +101,7 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 			CurrentTime: time.Now(),
 		})
 		if err != nil {
-			if result != nil && result.SignatureOK {
-				// Signature is valid but certificate may have expired — proceed
-				// with a warning since we still trust the attestation.
-			} else {
-				return nil, fmt.Errorf("attestation verification: %w", err)
-			}
+			return nil, fmt.Errorf("attestation verification: %w", err)
 		}
 	}
 
@@ -176,178 +127,145 @@ func fetchAndVerifyAttestation(ctx context.Context, httpClient *http.Client, bas
 		return nil, fmt.Errorf("attestation missing PCR0")
 	}
 	if !strings.EqualFold(hex.EncodeToString(pcr0), expectedPCR0) {
-		return nil, fmt.Errorf("PCR0 mismatch: expected %s, got %s", expectedPCR0, hex.EncodeToString(pcr0))
+		return nil, fmt.Errorf(
+			"PCR0 mismatch: expected %s, got %s",
+			expectedPCR0,
+			hex.EncodeToString(pcr0),
+		)
 	}
 
 	return result, nil
 }
 
-// UserData format embedded in NSM attestation documents (nitriding v1.4.2):
+// UserData format embedded in NSM attestation documents:
 //
-//	"sha256:" ++ tlsKeyHash(32) ++ ";" ++ "sha256:" ++ appKeyHash(32)
+//	"sha256:" ++ tlsKeyHash(32) ++ "ed25519:" ++ responseSigningKey(32)
 //
-// Total 79 bytes. tlsKeyHash at bytes 7:39, appKeyHash at bytes 47:79.
+// Total 79 bytes: the raw TLS PublicKey hash at bytes 7:39 and the raw Ed25519
+// response-signing public key at bytes 47:79.
 const (
-	udHashPrefix = "sha256:"
-	udHashSep    = ";"
-	udTLSStart   = len(udHashPrefix)
-	udTLSEnd     = udTLSStart + 32
-	udSepStart   = udTLSEnd
-	udAppPrefix  = udSepStart + len(udHashSep)
-	udAppStart   = udAppPrefix + len(udHashPrefix)
-	udAppEnd     = udAppStart + 32
+	udHashPrefix    = "sha256:"
+	udTLSStart      = len(udHashPrefix)
+	udTLSEnd        = udTLSStart + 32
+	udSigningPrefix = "ed25519:"
+	udSigningStart  = udTLSEnd + len(udSigningPrefix)
+	udLen           = udSigningStart + ed25519.PublicKeySize
 )
 
-// extractTLSKeyHash returns the hex-encoded SHA-256 fingerprint of the
-// enclave's TLS leaf cert, taken from bytes 7:39 of user_data.
-func extractTLSKeyHash(attestResult *nitrite.Result) (string, error) {
+// parseUserData returns the hex-encoded SHA-256 fingerprint of the enclave's
+// TLS PublicKey and its response-signing key, which is nil while unset.
+func parseUserData(attestResult *nitrite.Result) (string, ed25519.PublicKey, error) {
 	if attestResult == nil || attestResult.Document == nil {
-		return "", fmt.Errorf("no attestation result")
+		return "", nil, fmt.Errorf("no attestation result")
 	}
 	userData := attestResult.Document.UserData
-	if len(userData) < udTLSEnd {
-		return "", fmt.Errorf("user_data too short for tlsKeyHash (got %d bytes)", len(userData))
+	if len(userData) != udLen {
+		return "", nil, fmt.Errorf(
+			"user_data must be exactly %d bytes (got %d)", udLen, len(userData),
+		)
 	}
 	if string(userData[:udTLSStart]) != udHashPrefix {
-		return "", fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
+		return "", nil, fmt.Errorf("user_data missing %q prefix at offset 0", udHashPrefix)
 	}
-	return hex.EncodeToString(userData[udTLSStart:udTLSEnd]), nil
+	if string(userData[udTLSEnd:udSigningStart]) != udSigningPrefix {
+		return "", nil, fmt.Errorf(
+			"user_data missing %q prefix at offset %d", udSigningPrefix, udTLSEnd,
+		)
+	}
+	h := hex.EncodeToString(userData[udTLSStart:udTLSEnd])
+	if isAllZeroHex(h) {
+		return "", nil, fmt.Errorf("attested tlsKeyHash is all-zero (runtime bound no TLS cert)")
+	}
+	var signingKey ed25519.PublicKey
+	if key := userData[udSigningStart:]; !bytes.Equal(key, make([]byte, len(key))) {
+		signingKey = bytes.Clone(key)
+	}
+	return h, signingKey, nil
 }
 
-// verifyKeyBinding verifies the enclave's ephemeral attestation key by
-// checking that the pubkey from /v1/enclave-info matches the appKeyHash
-// in the attestation document's UserData.
-func verifyKeyBinding(ctx context.Context, httpClient *http.Client, baseURL string, attestResult *nitrite.Result) (string, error) {
-	if attestResult == nil || attestResult.Document == nil {
-		return "", fmt.Errorf("no attestation result to verify against")
-	}
+// Signed responses; runtime/servers.go holds the signing half.
+const (
+	signNonceHeader = "X-Enclave-Sign-Nonce"
+	signatureHeader = "X-Enclave-Signature"
+)
 
-	const (
-		hashPrefix = "sha256:"
-		hashSep    = ";"
-		tlsStart   = len(hashPrefix)
-		tlsEnd     = tlsStart + 32
-		sepStart   = tlsEnd
-		appPrefix  = sepStart + len(hashSep)
-		appStart   = appPrefix + len(hashPrefix)
-		appEnd     = appStart + 32
-	)
-
-	userData := attestResult.Document.UserData
-	if len(userData) < appEnd {
-		// UserData too short — enclave may not support attestation key.
-		return "", nil
-	}
-	if !bytes.Equal(userData[:tlsStart], []byte(hashPrefix)) {
-		return "", fmt.Errorf("UserData missing %q prefix at offset 0 (got %q)", hashPrefix, string(userData[:tlsStart]))
-	}
-	if string(userData[sepStart:appPrefix]) != hashSep {
-		return "", fmt.Errorf("UserData missing %q separator at offset %d (got %q)", hashSep, sepStart, string(userData[sepStart:appPrefix]))
-	}
-	if !bytes.Equal(userData[appPrefix:appStart], []byte(hashPrefix)) {
-		return "", fmt.Errorf("UserData missing %q prefix at offset %d (got %q)", hashPrefix, appPrefix, string(userData[appPrefix:appStart]))
-	}
-	appKeyHash := userData[appStart:appEnd]
-
-	// Check if appKeyHash is all zeros (key not yet registered).
-	allZero := true
-	for _, b := range appKeyHash {
-		if b != 0 {
-			allZero = false
-			break
+// prepareResponseSigningContext asks for a signed response under a fresh nonce and
+// captures the authority, headers, and body the response must authenticate.
+func prepareResponseSigningContext(req *http.Request) (signing.ResponseSigningContext, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		if body, err = io.ReadAll(req.Body); err != nil {
+			return signing.ResponseSigningContext{}, fmt.Errorf("read request body: %w", err)
 		}
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	if allZero {
-		return "", fmt.Errorf("attestation key not yet registered (appKeyHash is all zeros)")
+	// Normalize aliases before HTTP/2 can serialize map keys in a different
+	// order. Preserve repeated values in the same order as HTTP/1 writes them.
+	headers := make(http.Header, len(req.Header)+1)
+	for _, name := range slices.Sorted(maps.Keys(req.Header)) {
+		canonical := http.CanonicalHeaderKey(name)
+		headers[canonical] = append(headers[canonical], req.Header[name]...)
 	}
-
-	// Fetch the attestation pubkey from the enclave.
-	info, err := fetchEnclaveInfo(ctx, httpClient, baseURL)
-	if err != nil {
-		return "", fmt.Errorf("fetch enclave info: %w", err)
+	req.Header = headers
+	// Let the transport ask for gzip and decode it, so the body we hash is the
+	// decoded one the runtime signed, even if a proxy compresses it.
+	req.Header.Del("Accept-Encoding")
+	// http.Client adds URL credentials after Do starts; bind them before that.
+	if req.URL != nil && req.URL.User != nil && req.Header.Get("Authorization") == "" {
+		password, _ := req.URL.User.Password()
+		req.SetBasicAuth(req.URL.User.Username(), password)
 	}
-	if info.AttestationPubkey == "" {
-		return "", fmt.Errorf("enclave reports no attestation pubkey but appKeyHash is set")
-	}
-
-	attestPubkeyBytes, err := hex.DecodeString(info.AttestationPubkey)
-	if err != nil {
-		return "", fmt.Errorf("decode attestation pubkey hex: %w", err)
-	}
-
-	// Verify that SHA256(pubkey) matches the appKeyHash from attestation.
-	expectedHash := sha256.Sum256(attestPubkeyBytes)
-	if !bytes.Equal(expectedHash[:], appKeyHash) {
-		return "", fmt.Errorf("appKeyHash mismatch: expected SHA256(%s) = %s, got %s",
-			info.AttestationPubkey,
-			hex.EncodeToString(expectedHash[:]),
-			hex.EncodeToString(appKeyHash))
-	}
-
-	return info.AttestationPubkey, nil
+	req.Header.Set(signNonceHeader, rand.Text())
+	return signing.CaptureResponseSigningContext(req, body)
 }
 
-// verifySchnorrSignature verifies a BIP-340 Schnorr signature over the
-// SHA256 hash of body, using the hex-encoded compressed secp256k1 pubkey.
-func verifySchnorrSignature(body []byte, sigHex, attestPubkeyHex string) error {
-	pubkeyBytes, err := hex.DecodeString(attestPubkeyHex)
-	if err != nil {
-		return fmt.Errorf("decode pubkey: %w", err)
+// verifyResponseSignature checks the X-Enclave-Signature header over msg.
+func verifyResponseSignature(key ed25519.PublicKey, msg []byte, header http.Header) error {
+	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
+	if err != nil || !ed25519.Verify(key, msg, sig) {
+		return fmt.Errorf("missing or invalid %s", signatureHeader)
 	}
-	// The attestation pubkey is compressed (33 bytes). Extract x-only (32 bytes)
-	// by dropping the prefix byte for Schnorr verification.
-	if len(pubkeyBytes) == 33 {
-		pubkeyBytes = pubkeyBytes[1:]
-	}
-	pubkey, err := schnorr.ParsePubKey(pubkeyBytes)
-	if err != nil {
-		return fmt.Errorf("parse attestation pubkey: %w", err)
-	}
-
-	sigBytes, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return fmt.Errorf("decode signature hex: %w", err)
-	}
-	sig, err := schnorr.ParseSignature(sigBytes)
-	if err != nil {
-		return fmt.Errorf("parse signature: %w", err)
-	}
-
-	msgHash := sha256.Sum256(body)
-	if !sig.Verify(msgHash[:], pubkey) {
-		return fmt.Errorf("signature verification failed")
-	}
-
 	return nil
 }
 
-// fetchEnclaveInfo fetches the /v1/enclave-info endpoint.
-func fetchEnclaveInfo(ctx context.Context, httpClient *http.Client, baseURL string) (*enclaveInfoResponse, error) {
-	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
+// isAllZeroHex reports whether s is empty or all '0' — an uninitialized binding.
+func isAllZeroHex(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyLeafKeyHash returns nil iff SHA-256 of the live leaf certificate's
+// PublicKey equals expectedHashHex. The public key remains
+// stable across routine certificate renewal. Shared by HTTP and gRPC.
+func verifyLeafKeyHash(rawCerts [][]byte, expectedHashHex string) error {
+	if isAllZeroHex(expectedHashHex) {
+		return fmt.Errorf("no attested TLS public-key fingerprint to pin against")
+	}
+	if len(rawCerts) == 0 {
+		return fmt.Errorf("no peer certificate presented")
+	}
+	leaf, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("parse peer leaf certificate: %w", err)
 	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
+	got := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	if !strings.EqualFold(hex.EncodeToString(got[:]), expectedHashHex) {
+		return fmt.Errorf(
+			"TLS public-key fingerprint mismatch: expected %s, got %x",
+			expectedHashHex,
+			got[:],
+		)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var info enclaveInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return nil, fmt.Errorf("decode enclave info: %w", err)
-	}
-	if info.Error != "" {
-		return &info, fmt.Errorf("enclave init error: %s", info.Error)
-	}
-	return &info, nil
+	return nil
 }
 
 // parseCOSEPayloadInsecure decodes a COSE Sign1 attestation envelope without

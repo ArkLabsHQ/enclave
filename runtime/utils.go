@@ -1,25 +1,40 @@
 package runtime
 
-// OTLP protobuf parsers for the telemetry signals the runtime ingests over
-// HTTP from the user's app: structured logs (POST /v1/logs) and metrics
-// (POST /v1/metrics). OTLP trace ingest lives alongside its handler in
-// tracing.go.
+// Shared runtime helpers.
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/hf/nsm"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
-// =============================================================================
-// Random source
-// =============================================================================
+func verifyAttestationUserData(
+	nsm NSM,
+	attestDocB64 string,
+	expectedPCRs map[uint]string,
+	expectedUserData []byte,
+) error {
+	result, err := nsm.VerifyAttestationDocument(attestDocB64, expectedPCRs)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(result.Document.UserData, expectedUserData) {
+		return fmt.Errorf("attested user data does not match expected user data")
+	}
+	return nil
+}
 
-// generateRuntimeToken returns a 32-byte hex-encoded bearer token used to
-// authenticate calls to the admin /v1/* endpoints.
+// generateRuntimeToken returns a 32-byte hex bearer token.
 func generateRuntimeToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := secureRandom(b); err != nil {
@@ -28,12 +43,7 @@ func generateRuntimeToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// secureRandom prefers the NSM hardware RNG when running inside an
-// enclave and falls back to crypto/rand otherwise. Inside an enclave
-// crypto/rand depends on a starved kernel entropy pool (no disk, no
-// network, no HID — only RDRAND), so the NSM RNG is the only fully
-// trustworthy source. If /dev/nsm opens but GetRandom fails the error
-// surfaces rather than silently falling back to the weak pool.
+// secureRandom uses NSM RNG when available, else crypto/rand.
 func secureRandom(b []byte) (int, error) {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
@@ -43,54 +53,123 @@ func secureRandom(b []byte) (int, error) {
 	return session.Read(b)
 }
 
-// anyValueToGo converts an OTLP AnyValue to a Go value.
-func anyValueToGo(v *commonpb.AnyValue) any {
-	if v == nil {
-		return nil
-	}
-	switch val := v.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		return val.StringValue
-	case *commonpb.AnyValue_IntValue:
-		return val.IntValue
-	case *commonpb.AnyValue_DoubleValue:
-		return val.DoubleValue
-	case *commonpb.AnyValue_BoolValue:
-		return val.BoolValue
-	case *commonpb.AnyValue_BytesValue:
-		return fmt.Sprintf("%x", val.BytesValue)
-	case *commonpb.AnyValue_ArrayValue:
-		if val.ArrayValue == nil {
+// prefix16 truncates a string to at most 16 characters for less noisy log fields.
+func prefix16(s string) string {
+	return s[:min(16, len(s))]
+}
+
+// forEachObjectVersion pages a versioned listing
+func forEachObjectVersion(
+	ctx context.Context,
+	s3api S3API,
+	bucket, prefix string,
+	storeErr error,
+	what string,
+	visit func(key, versionID string, lastModified *time.Time) (stop bool, err error),
+) error {
+	var keyMarker, versionMarker *string
+	for {
+		out, err := s3api.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(bucket),
+			Prefix:          aws.String(prefix),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			return fmt.Errorf("%w: %s: %w", storeErr, what, err)
+		}
+		for _, version := range out.Versions {
+			stop, err := visit(
+				aws.ToString(version.Key),
+				aws.ToString(version.VersionId),
+				version.LastModified,
+			)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
 			return nil
 		}
-		result := make([]any, len(val.ArrayValue.Values))
-		for i, item := range val.ArrayValue.Values {
-			result[i] = anyValueToGo(item)
+		if out.NextKeyMarker == nil && out.NextVersionIdMarker == nil {
+			return fmt.Errorf(
+				"%w: %s: truncated response missing markers",
+				storeErr,
+				what,
+			)
 		}
-		return result
-	case *commonpb.AnyValue_KvlistValue:
-		if val.KvlistValue == nil {
-			return nil
-		}
-		result := make(map[string]any, len(val.KvlistValue.Values))
-		for _, kv := range val.KvlistValue.Values {
-			result[kv.Key] = anyValueToGo(kv.Value)
-		}
-		return result
-	default:
-		return nil
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
 	}
 }
 
-// anyValueToString extracts a string representation from an AnyValue.
-func anyValueToString(v *commonpb.AnyValue) string {
-	if v == nil {
-		return ""
+// readLockedVersion returns one exact version's body if it is a single-part
+// upload retained under compliance mode for the configured period. Any other
+// version reports false and is logged as what; a failed read is an error
+// wrapping storeErr.
+func readLockedVersion(
+	ctx context.Context,
+	s3api S3API,
+	bucket, key, versionID string,
+	publishedAt time.Time,
+	retention, writeBudget time.Duration,
+	storeErr error,
+	what string,
+) ([]byte, bool, error) {
+	out, err := s3api.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String(key),
+		VersionId:  aws.String(versionID),
+		PartNumber: aws.Int32(1), // Exposes res.PartsCount if object was a multipart upload
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"%w: get %s %q version %q: %w", storeErr, what, key, versionID, err,
+		)
 	}
-	switch val := v.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		return val.StringValue
-	default:
-		return fmt.Sprintf("%v", anyValueToGo(v))
+	defer func() { _ = out.Body.Close() }()
+	// Multipart LastModified dates from upload initiation, so a host could
+	// replay a record into an old upload to backdate it.
+	if out.PartsCount != nil {
+		slog.Warn("ignoring multipart "+what, "key", key, "version", versionID)
+		return nil, false, nil
 	}
+	if !compliesWithObjectLock(what, key, versionID, publishedAt, out, retention, writeBudget) {
+		return nil, false, nil
+	}
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"%w: read %s %q version %q: %w", storeErr, what, key, versionID, err,
+		)
+	}
+	return body, true, nil
+}
+
+// compliesWithObjectLock accepts only compliance mode, retained for retention
+// after publishedAt less writeBudget, the allowance for upload delay and for skew
+// between the writer's clock and S3's LastModified.
+func compliesWithObjectLock(
+	what, key, versionID string,
+	publishedAt time.Time,
+	out *s3.GetObjectOutput,
+	retention, writeBudget time.Duration,
+) bool {
+	if out.ObjectLockMode != s3types.ObjectLockModeCompliance {
+		slog.Warn("ignoring "+what+" that is not retained under compliance mode",
+			"key", key, "version", versionID, "mode", string(out.ObjectLockMode))
+		return false
+	}
+
+	retainUntil := aws.ToTime(out.ObjectLockRetainUntilDate)
+	minimum := retention - writeBudget
+	if retainUntil.IsZero() || retainUntil.Before(publishedAt.Add(minimum)) {
+		slog.Warn("ignoring "+what+" retained for less than the configured period",
+			"key", key, "version", versionID,
+			"retained_for", retainUntil.Sub(publishedAt), "minimum", minimum)
+		return false
+	}
+	return true
 }

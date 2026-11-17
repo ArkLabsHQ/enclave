@@ -1,0 +1,1814 @@
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"math"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fxamacker/cbor/v2"
+	"github.com/stretchr/testify/require"
+)
+
+const migrationIntentTestBucket = "migration-intent-test"
+
+func TestMigrationIntentJSON(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	entry, err := decodeMigrationIntentObject([]byte(`{
+		"attestation":"doc",
+		"target_pcr0":"` + target + `",
+		"action":"requested",
+		"sequence":1,
+		"schema":"enclave.migration_intent.v1"
+	}`))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), entry.Sequence)
+	require.Equal(t, target, entry.TargetPCR0)
+
+	// Only a finalised intent carries a snapshot.
+	entry, err = decodeMigrationIntentObject([]byte(
+		`{"schema":"x","sequence":2,"action":"finalised","target_pcr0":"x","attestation":"x",` +
+			`"finalised_snapshot":"c25hcA=="}`,
+	))
+	require.NoError(t, err)
+	require.Equal(t, []byte("snap"), entry.FinalisedSnapshot)
+
+	for name, body := range map[string]string{
+		"missing":                      `{"schema":"x"}`,
+		"duplicate":                    `{"schema":"x","schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"}`,
+		"unknown":                      `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x","extra":true}`,
+		"trailing":                     `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x"} true`,
+		"finalised without a snapshot": `{"schema":"x","sequence":1,"action":"finalised","target_pcr0":"x","attestation":"x"}`,
+		"request carrying a snapshot": `{"schema":"x","sequence":1,"action":"requested","target_pcr0":"x","attestation":"x",` +
+			`"finalised_snapshot":"c25hcA=="}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := decodeMigrationIntentObject([]byte(body))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestMigrationIntentObjectKey(t *testing.T) {
+	source := strings.Repeat("ab", 48)
+	key := migrationIntentObjectKey(source, 42)
+	require.Equal(t, migrationIntentPrefix+source+"/00000000000000000042", key)
+	gotSource, sequence, ok := parseMigrationIntentObjectKey(key)
+	require.True(t, ok)
+	require.Equal(t, source, gotSource)
+	require.Equal(t, uint64(42), sequence)
+
+	for _, invalid := range []string{
+		"other/" + source + "/00000000000000000042",
+		migrationIntentPrefix + strings.ToUpper(source) + "/00000000000000000042",
+		migrationIntentPrefix + source + "/42",
+		migrationIntentPrefix + source + "/00000000000000000000",
+		migrationIntentPrefix + source + "/00000000000000000042/extra",
+	} {
+		_, _, ok := parseMigrationIntentObjectKey(invalid)
+		require.False(t, ok, invalid)
+	}
+}
+
+func TestMigrationIntentAppend(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	targetA := strings.Repeat("cd", 48)
+	targetB := strings.Repeat("ef", 48)
+	empty := newMigrationIntentFixture(t)
+	_, err := empty.log.Abort(context.Background(), empty.source, targetA)
+	require.ErrorIs(t, err, errMigrationIntentAbsent)
+
+	head, err := fx.log.Request(context.Background(), fx.source, strings.ToUpper(targetA))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), head.Sequence)
+	require.Equal(t, migrationIntentRequested, head.Action)
+	require.Equal(t, targetA, head.TargetPCR0)
+	require.Equal(t, fx.source, head.SourcePCR0)
+	require.False(t, head.PublishedAt.IsZero())
+
+	key := migrationIntentObjectKey(fx.source, 1)
+	fx.s3.mu.Lock()
+	stored := fx.s3.objects[key][0]
+	fx.s3.mu.Unlock()
+	require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
+	require.WithinDuration(
+		t,
+		time.Now().Add(testCfg.IntentRetention),
+		stored.retainUntil,
+		time.Second,
+	)
+	entry, err := decodeMigrationIntentObject(stored.body)
+	require.NoError(t, err)
+	require.NoError(t, verifyAttestationUserData(
+		fx.nsm, entry.Attestation, map[uint]string{0: fx.source},
+		mustMigrationIntentPayload(t, fx.log, entry, migrationIntentTestBucket),
+	))
+
+	_, err = fx.log.Request(context.Background(), fx.source, targetB)
+	require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+
+	head, err = fx.log.Abort(context.Background(), fx.source, strings.ToUpper(targetA))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), head.Sequence)
+	require.Equal(t, migrationIntentAborted, head.Action)
+	require.Equal(t, targetA, head.TargetPCR0)
+
+	_, err = fx.log.Abort(context.Background(), fx.source, targetA)
+	require.ErrorIs(t, err, errMigrationIntentAborted)
+
+	head, err = fx.log.Request(context.Background(), fx.source, targetB)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), head.Sequence)
+	require.Equal(t, targetB, head.TargetPCR0)
+}
+
+func TestMigrationIntentAbortRejectsInactiveTarget(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+	fx := newMigrationIntentFixture(t)
+	_, err := fx.log.Request(ctx, fx.source, targetA)
+	require.NoError(t, err)
+	_, err = fx.log.Abort(ctx, fx.source, targetA)
+	require.NoError(t, err)
+	requested, err := fx.log.Request(ctx, fx.source, targetB)
+	require.NoError(t, err)
+
+	aborted, err := fx.log.Abort(ctx, fx.source, targetA)
+	require.ErrorIs(t, err, errMigrationIntentAbortTargetMismatch)
+	require.Nil(t, aborted)
+	require.Empty(t, fx.s3.objects[migrationIntentObjectKey(fx.source, requested.Sequence+1)],
+		"a rejected abort must not append a record")
+	head, err := fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, requested, head, "the active request must remain unchanged")
+}
+
+func TestMigrationIntentAbortRejectsMalformedTarget(t *testing.T) {
+	ctx := context.Background()
+	for name, target := range map[string]string{
+		"empty target":   "",
+		"invalid length": "cd",
+		"invalid hex":    strings.Repeat("gg", 48),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			requested, err := fx.log.Request(ctx, fx.source, strings.Repeat("cd", 48))
+			require.NoError(t, err)
+
+			aborted, err := fx.log.Abort(ctx, fx.source, target)
+			require.Error(t, err)
+			require.Nil(t, aborted)
+			require.Empty(
+				t,
+				fx.s3.objects[migrationIntentObjectKey(fx.source, requested.Sequence+1)],
+				"a rejected abort must not append a record",
+			)
+			head, err := fx.log.Head(ctx, fx.source)
+			require.NoError(t, err)
+			require.Equal(t, requested, head, "the active request must remain unchanged")
+		})
+	}
+}
+
+func TestMigrationIntentAppendConfirmsItsVersionDespiteConcurrentConflict(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+
+	t.Run("requested", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		written := fx.injectConflictAfterPut(t, targetA, targetB)
+
+		recorded, err := fx.log.Request(ctx, fx.source, targetA)
+		require.NoError(t, err, "the returned S3 version was successfully persisted")
+		require.Equal(t, written, recorded)
+
+		_, err = fx.log.Head(ctx, fx.source)
+		require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+		m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source}
+		require.ErrorIs(t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAmbiguous,
+			"a successful append must not authorize a conflicting handoff")
+
+		// A subsequent abort still resolves the conflict above both writes.
+		fx.s3.afterPut = nil
+		_, err = fx.log.Abort(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentAborted, head.Action)
+		require.Greater(t, head.Sequence, written.Sequence)
+	})
+
+	t.Run("aborted", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		published := time.Now().Add(-time.Minute)
+		for _, target := range []string{targetA, targetB} {
+			fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1),
+				fx.object(t, 1, migrationIntentRequested, target, fx.log.bucket, fx.pcr0),
+				published)
+		}
+
+		written := fx.injectConflictAfterPut(t, targetB, targetA)
+
+		recorded, err := fx.log.Abort(ctx, fx.source, targetB)
+		require.NoError(t, err, "the returned S3 version was successfully persisted")
+		require.Equal(t, written, recorded)
+
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentAborted, head.Action)
+		require.Equal(t, written.Sequence, head.Sequence)
+		require.Equal(t, targetA, head.TargetPCR0)
+		require.NotEqual(t, written.VersionID, head.VersionID,
+			"append returns its own version even when Head selects the other abort")
+		m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source}
+		status, err := m.MigrationStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, migrationStateAborted, status.State)
+		require.ErrorIs(t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAborted)
+
+		// Both writes cancel the round, so neither target needs another abort.
+		fx.s3.afterPut = nil
+		for _, target := range []string{targetA, targetB} {
+			_, err = fx.log.Abort(ctx, fx.source, target)
+			require.ErrorIs(t, err, errMigrationIntentAborted)
+		}
+		require.Empty(t, fx.s3.objects[migrationIntentObjectKey(fx.source, written.Sequence+1)])
+		require.Len(t, fx.s3.objects[migrationIntentObjectKey(fx.source, written.Sequence)], 2,
+			"both signed abort records remain stored")
+
+		// A new request starts the next round after the tied aborts.
+		requested, err := fx.log.Request(ctx, fx.source, targetB)
+		require.NoError(t, err)
+		require.Equal(t, written.Sequence+1, requested.Sequence)
+		require.Equal(t, migrationIntentRequested, requested.Action)
+		require.Equal(t, targetB, requested.TargetPCR0)
+		head, err = fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, requested, head)
+	})
+}
+
+func TestMigrationIntentAppendRequiresItsPersistedVersion(t *testing.T) {
+	ctx := context.Background()
+	target := strings.Repeat("cd", 48)
+	for _, scenario := range []string{
+		"missing version", "invalid attestation", "missing retention",
+		"list failure", "get failure", "read failure",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			fx.s3.afterPut = func(in *s3.PutObjectInput, _ *s3.PutObjectOutput) {
+				key := aws.ToString(in.Key)
+				switch scenario {
+				case "missing version":
+					// An equivalent sibling must not stand in for the returned version.
+					fx.s3.mu.Lock()
+					stored := fx.s3.objects[key][0]
+					delete(fx.s3.objects, key)
+					fx.s3.mu.Unlock()
+					fx.s3.putRawObjectAt(key, stored.body, stored.lastModified)
+				case "invalid attestation":
+					fx.s3.objects[key][0].body = fx.object(t, 1, migrationIntentRequested,
+						target, fx.log.bucket, bytes.Repeat([]byte{0xee}, 48))
+				case "missing retention":
+					fx.s3.objects[key][0].lockMode = ""
+				case "list failure":
+					fx.s3.listErr = errors.New("list failed after put")
+				case "get failure":
+					fx.s3.getErr = errors.New("get failed after put")
+				case "read failure":
+					fx.s3.readErr = errors.New("read failed after put")
+				}
+			}
+			recorded, err := fx.log.Request(ctx, fx.source, target)
+			require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+			require.Nil(t, recorded)
+		})
+	}
+}
+
+func TestMigrationIntentRejectsSelfTarget(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+
+	// A self-targeted handoff would satisfy the PCR31 check trivially.
+	_, err := fx.log.Request(context.Background(), fx.source, strings.ToUpper(fx.source))
+
+	require.ErrorIs(t, err, errMigrationIntentSelfTarget)
+	head, err := fx.log.Head(context.Background(), fx.source)
+	require.NoError(t, err)
+	require.Nil(t, head, "a refused request must publish no intent")
+}
+
+func TestMigrationIntentRetentionComesFromTheEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		isDev bool
+	}{
+		{name: "production", isDev: false},
+		{name: "dev", isDev: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newTestConfig("prod", "app", tc.isDev)
+			fx := newMigrationIntentFixtureWithConfig(t, cfg)
+
+			_, err := fx.log.Request(
+				context.Background(), fx.source, strings.Repeat("cd", 48),
+			)
+			require.NoError(t, err)
+
+			fx.s3.mu.Lock()
+			stored := fx.s3.objects[migrationIntentObjectKey(fx.source, 1)][0]
+			fx.s3.mu.Unlock()
+			require.Equal(t, s3types.ObjectLockModeCompliance, stored.lockMode)
+			require.WithinDuration(
+				t,
+				time.Now().Add(cfg.IntentRetention),
+				stored.retainUntil,
+				10*time.Second,
+			)
+		})
+	}
+}
+
+// The log is append-only only because published intents cannot be deleted or
+// rewritten. A version whose Object Lock does not prove that must not count.
+func TestMigrationIntentIgnoresVersionsWithoutComplianceRetention(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	published := time.Now().Add(-time.Hour)
+
+	for _, tc := range []struct {
+		name        string
+		lockMode    s3types.ObjectLockMode
+		retainUntil time.Time
+	}{
+		{
+			name:        "governance mode can be bypassed",
+			lockMode:    s3types.ObjectLockModeGovernance,
+			retainUntil: published.Add(prodRetention),
+		},
+		{
+			name:        "no lock at all",
+			lockMode:    "",
+			retainUntil: published.Add(prodRetention),
+		},
+		{
+			name:     "no retain-until date",
+			lockMode: s3types.ObjectLockModeCompliance,
+		},
+		{
+			name:        "expires far sooner than the configured retention",
+			lockMode:    s3types.ObjectLockModeCompliance,
+			retainUntil: published.Add(time.Minute),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			fx.s3.putRawObjectLockedAt(
+				migrationIntentObjectKey(fx.source, 1),
+				fx.object(t, 1, migrationIntentRequested, target,
+					migrationIntentTestBucket, fx.pcr0),
+				published, tc.lockMode, tc.retainUntil,
+			)
+
+			head, err := fx.log.Head(context.Background(), fx.source)
+
+			require.NoError(t, err, "one unlocked object must not break the log")
+			require.Nil(t, head, "an intent that is not immutably retained must not count")
+		})
+	}
+}
+
+// A hostile writer publishing an unlocked version alongside the genuine one must
+// not be able to displace it, nor to hide it.
+func TestMigrationIntentPrefersTheRetainedVersion(t *testing.T) {
+	genuineTarget := strings.Repeat("cd", 48)
+	forgedTarget := strings.Repeat("ef", 48)
+	published := time.Now().Add(-time.Hour)
+	key := migrationIntentObjectKey(strings.Repeat("ab", 48), 1)
+
+	fx := newMigrationIntentFixture(t)
+	// The forged version is written first, so "earliest wins" alone would take it.
+	fx.s3.putRawObjectLockedAt(
+		key,
+		fx.object(t, 1, migrationIntentRequested, forgedTarget,
+			migrationIntentTestBucket, fx.pcr0),
+		published.Add(-time.Minute), s3types.ObjectLockModeGovernance, published.Add(prodRetention),
+	)
+	fx.s3.putRawObjectAt(
+		key,
+		fx.object(t, 1, migrationIntentRequested, genuineTarget,
+			migrationIntentTestBucket, fx.pcr0),
+		published,
+	)
+
+	head, err := fx.log.Head(context.Background(), fx.source)
+
+	require.NoError(t, err)
+	require.NotNil(t, head)
+	require.Equal(t, genuineTarget, head.TargetPCR0,
+		"the earliest version must be picked from those actually retained")
+}
+
+func TestMigrationIntentIgnoresMultipartVersions(t *testing.T) {
+	for name, parts := range map[string]*int32{
+		"one part":      aws.Int32(1),
+		"several parts": aws.Int32(2),
+		"zero count":    aws.Int32(0),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, latest := range []bool{false, true} {
+				name := "genuine version is latest"
+				if latest {
+					name = "replay is latest"
+				}
+				t.Run(name, func(t *testing.T) {
+					fx := newMigrationIntentFixture(t)
+					ctx := context.Background()
+					key := migrationIntentObjectKey(fx.source, 1)
+					body := fx.object(t, 1, migrationIntentRequested, strings.Repeat("cd", 48),
+						migrationIntentTestBucket, fx.pcr0)
+					published := time.Now().UTC()
+					// The host initiates the upload before the legitimate intent exists,
+					// then replays its body and attestation to backdate publication.
+					fx.s3.putRawObjectAt(key, body, published.Add(-48*time.Hour))
+					fx.s3.objects[key][0].partsCount = parts
+
+					head, err := fx.log.Head(ctx, fx.source)
+					require.NoError(t, err)
+					require.Nil(t, head, "a multipart version alone must not authorize migration")
+
+					fx.s3.putRawObjectAt(key, body, published)
+					genuineID := fx.s3.objects[key][1].id
+					if latest {
+						versions := fx.s3.objects[key]
+						versions[0], versions[1] = versions[1], versions[0]
+					}
+					head, err = fx.log.Head(ctx, fx.source)
+					require.NoError(t, err)
+					require.NotNil(t, head)
+					require.Equal(t, published, head.PublishedAt,
+						"the replay must not advance the start of the cooldown")
+					require.Equal(t, genuineID, head.VersionID)
+				})
+			}
+		})
+	}
+}
+
+func TestMigrationIntentCanonicalHead(t *testing.T) {
+	targetA := strings.Repeat("cd", 48)
+	targetB := strings.Repeat("ef", 48)
+
+	t.Run("highest sequence and earliest version win", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		base := time.Now().Add(-time.Hour)
+		key1 := migrationIntentObjectKey(fx.source, 1)
+		late := fx.object(
+			t,
+			1,
+			migrationIntentRequested,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
+		early := fx.object(
+			t,
+			1,
+			migrationIntentAborted,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
+		fx.s3.putRawObjectAt(key1, late, base.Add(time.Minute))
+		fx.s3.putRawObjectAt(key1, early, base)
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, 2),
+			fx.object(t, 2, migrationIntentRequested, targetB, migrationIntentTestBucket, fx.pcr0),
+			base.Add(2*time.Minute),
+		)
+
+		head, err := fx.log.Head(context.Background(), fx.source)
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), head.Sequence)
+		require.Equal(t, targetB, head.TargetPCR0)
+
+		fx.s3.mu.Lock()
+		delete(fx.s3.objects, migrationIntentObjectKey(fx.source, 2))
+		fx.s3.mu.Unlock()
+		head, err = fx.log.Head(context.Background(), fx.source)
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentAborted, head.Action)
+		require.Equal(t, base.UTC(), head.PublishedAt)
+	})
+
+	t.Run("newer replay does not replace original", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		key := migrationIntentObjectKey(fx.source, 1)
+		body := fx.object(
+			t,
+			1,
+			migrationIntentRequested,
+			targetA,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		)
+		base := time.Now().Add(-time.Hour).UTC()
+		fx.s3.putRawObjectAt(key, body, base)
+		fx.s3.putRawObjectAt(key, body, base.Add(time.Minute))
+
+		head, err := fx.log.Head(context.Background(), fx.source)
+		require.NoError(t, err)
+		require.Equal(t, base, head.PublishedAt)
+	})
+
+	t.Run("timestamp tie fails closed but abort advances", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		key := migrationIntentObjectKey(fx.source, 1)
+		publishedAt := time.Now().Add(-time.Hour).UTC()
+		fx.s3.putRawObjectAt(key,
+			fx.object(t, 1, migrationIntentRequested, targetA, migrationIntentTestBucket, fx.pcr0),
+			publishedAt)
+		fx.s3.putRawObjectAt(key,
+			fx.object(t, 1, migrationIntentRequested, targetB, migrationIntentTestBucket, fx.pcr0),
+			publishedAt)
+
+		_, err := fx.log.Head(context.Background(), fx.source)
+		require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+
+		_, err = fx.log.Request(context.Background(), fx.source, targetB)
+		require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+
+		head, err := fx.log.Abort(context.Background(), fx.source, targetB)
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), head.Sequence)
+		require.Equal(t, targetB, head.TargetPCR0)
+
+		head, err = fx.log.Request(context.Background(), fx.source, targetB)
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), head.Sequence)
+	})
+
+	t.Run("tied aborts cancel the round regardless of listing order", func(t *testing.T) {
+		ctx := context.Background()
+		for _, order := range [][]string{{targetA, targetB}, {targetB, targetA}} {
+			t.Run(order[0][:4]+" first", func(t *testing.T) {
+				fx := newMigrationIntentFixture(t)
+				publishedAt := time.Now().Add(-time.Hour).UTC()
+				for _, target := range order {
+					fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1),
+						fx.object(t, 1, migrationIntentRequested, target, fx.log.bucket, fx.pcr0),
+						publishedAt)
+					fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 2),
+						fx.object(t, 2, migrationIntentAborted, target, fx.log.bucket, fx.pcr0),
+						publishedAt.Add(time.Minute))
+				}
+
+				head, err := fx.log.Head(ctx, fx.source)
+				require.NoError(t, err)
+				require.Equal(t, migrationIntentAborted, head.Action)
+				require.Equal(t, uint64(2), head.Sequence)
+				require.Equal(t, targetA, head.TargetPCR0)
+
+				// A new request can start after the cancelled round without another abort.
+				requested, err := fx.log.Request(ctx, fx.source, targetB)
+				require.NoError(t, err)
+				require.Equal(t, head.Sequence+1, requested.Sequence)
+				head, err = fx.log.Head(ctx, fx.source)
+				require.NoError(t, err)
+				require.Equal(t, requested, head)
+			})
+		}
+	})
+
+	t.Run("a request tied with aborts remains ambiguous", func(t *testing.T) {
+		ctx := context.Background()
+		for _, actions := range [][]string{
+			{migrationIntentRequested, migrationIntentAborted},
+			{migrationIntentAborted, migrationIntentRequested},
+		} {
+			t.Run(actions[0]+" first", func(t *testing.T) {
+				fx := newMigrationIntentFixture(t)
+				publishedAt := time.Now().Add(-time.Hour).UTC()
+				key := migrationIntentObjectKey(fx.source, 1)
+				for _, action := range actions {
+					fx.s3.putRawObjectAt(key,
+						fx.object(t, 1, action, targetA, fx.log.bucket, fx.pcr0), publishedAt)
+				}
+				fx.s3.putRawObjectAt(key,
+					fx.object(t, 1, migrationIntentAborted, targetB, fx.log.bucket, fx.pcr0),
+					publishedAt)
+
+				_, err := fx.log.Head(ctx, fx.source)
+				require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+				_, err = fx.log.Request(ctx, fx.source, targetB)
+				require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+				m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source}
+				require.ErrorIs(
+					t, m.handOffToSuccessor(ctx, leaseHeld), errMigrationIntentAmbiguous,
+				)
+
+				aborted, err := fx.log.Abort(ctx, fx.source, targetB)
+				require.NoError(t, err)
+				head, err := fx.log.Head(ctx, fx.source)
+				require.NoError(t, err)
+				require.Equal(t, aborted, head)
+			})
+		}
+	})
+
+	t.Run("equivalent versions at the earliest timestamp are one intent", func(t *testing.T) {
+		for name, reattest := range map[string]bool{"identical": false, "reattested": true} {
+			t.Run(name, func(t *testing.T) {
+				fx := newMigrationIntentFixture(t)
+				key := migrationIntentObjectKey(fx.source, 1)
+				publishedAt := time.Now().Add(-time.Hour).UTC()
+				body := fx.object(
+					t, 1, migrationIntentRequested, targetA, migrationIntentTestBucket, fx.pcr0,
+				)
+				duplicate := body
+				if reattest {
+					duplicate = fx.reattest(t, body)
+				}
+				fx.s3.putRawObjectAt(key, body, publishedAt)
+				fx.s3.putRawObjectAt(key, duplicate, publishedAt)
+
+				head, err := fx.log.Head(context.Background(), fx.source)
+				require.NoError(t, err)
+				require.Equal(t, uint64(1), head.Sequence)
+				require.Equal(t, targetA, head.TargetPCR0)
+				require.Equal(t, publishedAt, head.PublishedAt)
+
+				_, err = fx.log.Request(context.Background(), fx.source, targetB)
+				require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+			})
+		}
+	})
+
+	t.Run("a conflict reports its targets whatever the listing order", func(t *testing.T) {
+		for _, order := range [][]string{{targetA, targetB, targetA}, {targetB, targetA, targetB}} {
+			fx := newMigrationIntentFixture(t)
+			publishedAt := time.Now().Add(-time.Hour).UTC()
+			for _, target := range order {
+				fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1),
+					fx.object(t, 1, migrationIntentRequested, target,
+						migrationIntentTestBucket, fx.pcr0),
+					publishedAt)
+			}
+
+			_, err := fx.log.Head(context.Background(), fx.source)
+			require.ErrorIs(t, err, errMigrationIntentAmbiguous)
+			state, _, err := fx.log.scanIntents(context.Background(), fx.source)
+			require.NoError(t, err)
+			require.Len(t, state.ambiguous, 2, "the equivalent copy is not a third intent")
+			require.ElementsMatch(t, []string{targetA, targetB},
+				[]string{state.ambiguous[0].TargetPCR0, state.ambiguous[1].TargetPCR0})
+
+			_, err = fx.log.Request(context.Background(), fx.source, targetB)
+			require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+		}
+	})
+}
+
+func TestMigrationIntentInvalidVersionsAreIgnored(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	foreignPCR0 := bytes.Repeat([]byte{0xee}, 48)
+
+	tests := map[string]func(*testing.T, *migrationIntentFixture) []byte{
+		"malformed JSON": func(_ *testing.T, _ *migrationIntentFixture) []byte {
+			return []byte("not-json")
+		},
+		"wrong bucket": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(t, 2, migrationIntentRequested, target, "other-bucket", fx.pcr0)
+		},
+		"wrong schema": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			body := fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
+			var entry migrationIntentObjectV1
+			require.NoError(t, json.Unmarshal(body, &entry))
+			entry.Schema = "enclave.migration_intent.v2"
+			body, err := json.Marshal(entry)
+			require.NoError(t, err)
+			return body
+		},
+		"foreign PCR0": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				foreignPCR0,
+			)
+		},
+		"untrusted root": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			payload, err := fx.log.enc.Marshal(migrationIntentUserDataV1{
+				Schema:     migrationIntentSchemaV1,
+				BucketName: migrationIntentTestBucket,
+				Sequence:   2,
+				Action:     migrationIntentRequested,
+				TargetPCR0: target,
+			})
+			require.NoError(t, err)
+			other := newFakeNSM(t).attest(map[uint][]byte{0: fx.pcr0}, time.Now(), payload)
+			body, err := json.Marshal(migrationIntentObjectV1{
+				Schema:      migrationIntentSchemaV1,
+				Sequence:    2,
+				Action:      migrationIntentRequested,
+				TargetPCR0:  target,
+				Attestation: other.docB64,
+			})
+			require.NoError(t, err)
+			return body
+		},
+		"sequence mismatch": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(
+				t,
+				3,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
+		},
+		"unknown action": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(t, 2, "unknown", target, migrationIntentTestBucket, fx.pcr0)
+		},
+		"noncanonical target": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				strings.ToUpper(target),
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
+		},
+		"noncanonical CBOR": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			payload, err := cbor.Marshal(migrationIntentUserDataV1{
+				Schema:     migrationIntentSchemaV1,
+				BucketName: migrationIntentTestBucket,
+				Sequence:   2,
+				Action:     migrationIntentRequested,
+				TargetPCR0: target,
+			})
+			require.NoError(t, err)
+			canonical, err := fx.log.enc.Marshal(migrationIntentUserDataV1{
+				Schema:     migrationIntentSchemaV1,
+				BucketName: migrationIntentTestBucket,
+				Sequence:   2,
+				Action:     migrationIntentRequested,
+				TargetPCR0: target,
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, canonical, payload)
+			attestation := fx.signer.attest(map[uint][]byte{0: fx.pcr0}, time.Now(), payload)
+			body, err := json.Marshal(migrationIntentObjectV1{
+				Schema:      migrationIntentSchemaV1,
+				Sequence:    2,
+				Action:      migrationIntentRequested,
+				TargetPCR0:  target,
+				Attestation: attestation.docB64,
+			})
+			require.NoError(t, err)
+			return body
+		},
+		"forged signature": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			body := fx.object(
+				t,
+				2,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			)
+			var entry migrationIntentObjectV1
+			require.NoError(t, json.Unmarshal(body, &entry))
+			doc, err := base64.StdEncoding.DecodeString(entry.Attestation)
+			require.NoError(t, err)
+			doc[len(doc)-1] ^= 1
+			entry.Attestation = base64.StdEncoding.EncodeToString(doc)
+			body, err = json.Marshal(entry)
+			require.NoError(t, err)
+			return body
+		},
+	}
+
+	for name, invalidBody := range tests {
+		t.Run(name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			base := time.Now().Add(-time.Hour)
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, 1),
+				fx.object(
+					t,
+					1,
+					migrationIntentRequested,
+					target,
+					migrationIntentTestBucket,
+					fx.pcr0,
+				),
+				base,
+			)
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, 2), invalidBody(t, fx), base.Add(time.Minute),
+			)
+
+			state, highest, err := fx.log.scanIntents(context.Background(), fx.source)
+			require.NoError(t, err)
+			require.NotNil(t, state.current)
+			require.Equal(t, uint64(1), state.current.Sequence)
+			require.Equal(t, uint64(1), highest, "an invalid record must not occupy a sequence")
+		})
+	}
+}
+
+func TestMigrationIntentS3Failures(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	ctx := context.Background()
+
+	for name, configure := range map[string]func(*fakeS3){
+		"list": func(s *fakeS3) { s.listErr = errors.New("list failed") },
+		"get":  func(s *fakeS3) { s.getErr = errors.New("get failed") },
+		"read": func(s *fakeS3) { s.readErr = errors.New("read failed") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, 1),
+				fx.object(
+					t,
+					1,
+					migrationIntentRequested,
+					target,
+					migrationIntentTestBucket,
+					fx.pcr0,
+				),
+				time.Now(),
+			)
+			configure(fx.s3)
+			_, err := fx.log.Head(ctx, fx.source)
+			require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+		})
+	}
+
+	// Unlike a snapshot, an intent must never be skipped: skipping an abort would
+	// leave the request it cancelled as the head.
+	t.Run("an unreadable abort", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		now := time.Now()
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, 1),
+			fx.object(t, 1, migrationIntentRequested, target, migrationIntentTestBucket, fx.pcr0),
+			now,
+		)
+		abortKey := migrationIntentObjectKey(fx.source, 2)
+		fx.s3.putRawObjectAt(
+			abortKey,
+			fx.object(t, 2, migrationIntentAborted, target, migrationIntentTestBucket, fx.pcr0),
+			now.Add(time.Second),
+		)
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentAborted, head.Action)
+
+		objects := fx.s3.objects[abortKey]
+		fx.s3.getErrVersions = map[string]error{
+			objects[len(objects)-1].id: errors.New("get failed"),
+		}
+		_, err = fx.log.Head(ctx, fx.source)
+
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+
+	t.Run("put", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		fx.s3.putErr = errors.New("put failed")
+		_, err := fx.log.Request(ctx, fx.source, target)
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+
+	t.Run("missing put version ID", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		fx.s3.missingVersionID = true
+		_, err := fx.log.Request(ctx, fx.source, target)
+		require.ErrorContains(t, err, "no version ID")
+		require.ErrorIs(t, err, errMigrationIntentStoreUnavailable)
+	})
+}
+
+func TestMigrationIntentSequenceOverflow(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	target := strings.Repeat("cd", 48)
+	fx.s3.putRawObjectAt(
+		migrationIntentObjectKey(fx.source, math.MaxUint64),
+		fx.object(
+			t,
+			math.MaxUint64,
+			migrationIntentAborted,
+			target,
+			migrationIntentTestBucket,
+			fx.pcr0,
+		),
+		time.Now(),
+	)
+
+	_, err := fx.log.Request(context.Background(), fx.source, target)
+	require.ErrorContains(t, err, "overflow")
+}
+
+// For the same source and target: 1 requested -> 2 finalised -> 3 aborted -> 4 requested.
+// Replaying finalisation 2 must not finalise request 4.
+func TestMigrationIntentFinalisedReplayCannotAuthoriseNewRequest(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+	for _, tc := range []struct {
+		name            string
+		keySequence     uint64
+		rewriteSequence bool
+	}{
+		{name: "reupload at key 2 stays before the abort", keySequence: 2},
+		{name: "copy to key 5 mismatches the embedded sequence", keySequence: 5},
+		{
+			name:            "rewriting the sequence breaks the attestation binding",
+			keySequence:     5,
+			rewriteSequence: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			fx := newMigrationIntentFixture(t)
+			requested, err := fx.log.Request(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), requested.Sequence)
+			finalised, err := fx.log.Finalise(
+				ctx, fx.source, target, requested.Sequence, fx.handoff(t, target, "key-a"),
+			)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), finalised.Sequence)
+			head, err := fx.log.Head(ctx, fx.source)
+			require.NoError(t, err)
+			require.Equal(t, finalised, head, "the original finalisation must be valid and active")
+			// Reuse the exact stored record, including its original attestation and snapshot.
+			replayBody := bytes.Clone(fx.s3.latestBody(migrationIntentObjectKey(fx.source, 2)))
+
+			aborted, err := fx.log.Abort(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(3), aborted.Sequence)
+			freshRequest, err := fx.log.Request(ctx, fx.source, target)
+			require.NoError(t, err)
+			require.Equal(t, uint64(4), freshRequest.Sequence)
+			head, err = fx.log.Head(ctx, fx.source)
+			require.NoError(t, err)
+			require.Equal(t, freshRequest, head, "request 4 must be active before the replay")
+
+			if tc.rewriteSequence {
+				entry, err := decodeMigrationIntentObject(replayBody)
+				require.NoError(t, err)
+				// Change only the outer sequence; the attestation still binds sequence 2.
+				entry.Sequence = 5
+				replayBody, err = json.Marshal(entry)
+				require.NoError(t, err)
+			}
+			// A later upload must not make the old finalisation answer request 4.
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, tc.keySequence), replayBody,
+				freshRequest.PublishedAt.Add(time.Second),
+			)
+
+			state, highest, err := fx.log.scanIntents(ctx, fx.source)
+			require.NoError(t, err)
+			require.Empty(t, state.ambiguous)
+			require.Equal(t, freshRequest, state.current, "request 4 must stay active")
+			require.Equal(t, uint64(4), highest, "the replay must not occupy a new sequence")
+		})
+	}
+}
+
+type migrationIntentPagedS3 struct {
+	*fakeS3
+	versions []s3types.ObjectVersion
+	page     int
+}
+
+func (p *migrationIntentPagedS3) ListObjectVersions(
+	ctx context.Context,
+	in *s3.ListObjectVersionsInput,
+	opts ...func(*s3.Options),
+) (*s3.ListObjectVersionsOutput, error) {
+	if p.versions == nil {
+		out, err := p.fakeS3.ListObjectVersions(ctx, in, opts...)
+		if err != nil {
+			return nil, err
+		}
+		p.versions = out.Versions
+		slices.SortFunc(p.versions, func(a, b s3types.ObjectVersion) int {
+			return strings.Compare(aws.ToString(a.Key), aws.ToString(b.Key))
+		})
+	}
+	if p.page == 0 {
+		p.page++
+		return &s3.ListObjectVersionsOutput{
+			Versions:            p.versions[:1],
+			IsTruncated:         aws.Bool(true),
+			NextKeyMarker:       aws.String("next"),
+			NextVersionIdMarker: aws.String("next-version"),
+		}, nil
+	}
+	if in.KeyMarker == nil || in.VersionIdMarker == nil {
+		return nil, errors.New("pagination markers missing")
+	}
+	return &s3.ListObjectVersionsOutput{
+		Versions:    p.versions[1:],
+		IsTruncated: aws.Bool(false),
+	}, nil
+}
+
+func TestMigrationIntentPagination(t *testing.T) {
+	ctx := t.Context()
+	fx := newMigrationIntentFixture(t)
+	target := strings.Repeat("cd", 48)
+	_, err := fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	aborted, err := fx.log.Abort(ctx, fx.source, target)
+	require.NoError(t, err)
+	paged := &migrationIntentPagedS3{fakeS3: fx.s3}
+	fx.log.s3 = paged
+
+	state, highest, err := fx.log.scanIntents(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, aborted, state.current, "the abort is on the second page")
+	require.Equal(t, aborted.Sequence, highest, "both pages must be read")
+}
+
+func mustMigrationIntentPayload(
+	t *testing.T,
+	log *migrationIntentLog,
+	entry migrationIntentObjectV1,
+	bucket string,
+) []byte {
+	t.Helper()
+	payload, err := log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:     entry.Schema,
+		BucketName: bucket,
+		Sequence:   entry.Sequence,
+		Action:     entry.Action,
+		TargetPCR0: entry.TargetPCR0,
+	})
+	require.NoError(t, err)
+	return payload
+}
+
+var _ S3API = (*migrationIntentPagedS3)(nil)
+
+func TestMigrationIntentBucketNameDerivation(t *testing.T) {
+	const account = "123456789012"
+	nameFor := func(namespace, app string) string {
+		return migrationIntentBucketName(newTestConfig(namespace, app, false), account)
+	}
+	name := nameFor("prod", "wallet")
+
+	require.Regexp(t, `^enclave-123456789012-[0-9a-f]{16}-migration-intents$`, name)
+	require.LessOrEqual(t, len(name), 63, "S3 bucket names cap at 63 characters")
+	require.Equal(t, name, nameFor("prod", "wallet"), "must be stable")
+
+	// The account is what keeps two accounts off the same globally unique name.
+	require.NotEqual(t, name, migrationIntentBucketName(
+		newTestConfig("prod", "wallet", false), "210987654321",
+	))
+
+	require.NotEqual(t, name, nameFor("prod", "vault"), "distinct per application")
+	require.NotEqual(t, name, nameFor("staging", "wallet"), "distinct per namespace")
+	require.NotEqual(t, name, nameFor("ark/prod", "wallet"), "distinct per namespace prefix")
+
+	// The NUL separator is what stops "prodwal"+"let" colliding with
+	// "prod"+"wallet".
+	require.NotEqual(t, name, nameFor("prodwal", "let"))
+
+	t.Run("survives names S3 would reject", func(t *testing.T) {
+		long := nameFor("Prod_EU_West", strings.Repeat("long", 40))
+		require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, long)
+		require.LessOrEqual(t, len(long), 63)
+	})
+}
+
+func TestMigrationIntentRetentionBoundary(t *testing.T) {
+	published := time.Now().UTC()
+	for _, retention := range []time.Duration{devIntentRetention, prodRetention} {
+		t.Run(retention.String(), func(t *testing.T) {
+			cfg := newTestConfig("prod", "app", retention == devIntentRetention)
+			log := &migrationIntentLog{retention: retention, cfg: cfg}
+			for _, tc := range []struct {
+				name     string
+				deadline *time.Time
+				want     bool
+			}{
+				{"missing", nil, false},
+				{"below tolerated minimum", aws.Time(published.Add(retention - log.writeTimeout() - time.Nanosecond)), false},
+				{"tolerated minimum", aws.Time(published.Add(retention - log.writeTimeout())), true},
+				{"within tolerance", aws.Time(published.Add(retention - time.Nanosecond)), true},
+				{"exact minimum", aws.Time(published.Add(retention)), true},
+				{"longer", aws.Time(published.Add(retention + time.Second)), true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					out := &s3.GetObjectOutput{
+						ObjectLockMode:            s3types.ObjectLockModeCompliance,
+						ObjectLockRetainUntilDate: tc.deadline,
+					}
+					require.Equal(t, tc.want,
+						compliesWithObjectLock("migration intent", "key", "version", published, out,
+							retention, log.writeTimeout()))
+				})
+			}
+		})
+	}
+}
+
+func TestMigrationIntentWriteTimeout(t *testing.T) {
+	require.Equal(t, 10*time.Minute,
+		(&migrationIntentLog{cfg: newTestConfig("prod", "app", false)}).writeTimeout())
+	require.Equal(t, 2*time.Minute,
+		(&migrationIntentLog{cfg: newTestConfig("dev", "app", true)}).writeTimeout())
+}
+
+func TestEarliestUnabortedIntentRemainsAuthoritative(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	ctx := context.Background()
+	base := time.Now().Add(-prodRetention - time.Hour)
+	target := strings.Repeat("cd", 48)
+	put := func(sequence uint64, action string, published time.Time) {
+		fx.s3.putRawObjectLockedAt(migrationIntentObjectKey(fx.source, sequence),
+			fx.object(t, sequence, action, target, migrationIntentTestBucket, fx.pcr0),
+			published, s3types.ObjectLockModeCompliance, published.Add(prodRetention))
+	}
+	put(1, migrationIntentRequested, base)
+	put(2, migrationIntentRequested, time.Now())
+	head, err := fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), head.Sequence,
+		"a later request must not hide the earliest unaborted authorization")
+	put(3, migrationIntentAborted, base.Add(time.Minute))
+	head, err = fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, migrationIntentAborted, head.Action, "expired aborts must remain visible")
+	put(4, migrationIntentRequested, time.Now())
+	head, err = fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head.Sequence)
+}
+
+// Every append must land above every sequence already published. Writing at the
+// active head's sequence instead would add a second version to a key that
+// already exists, where the earliest-version rule would then bury it.
+func TestAppendAlwaysAdvancesBeyondEverySequence(t *testing.T) {
+	target := strings.Repeat("cd", 48)
+
+	highestSequence := func(t *testing.T, fx *migrationIntentFixture) uint64 {
+		t.Helper()
+		fx.s3.mu.Lock()
+		defer fx.s3.mu.Unlock()
+		var highest uint64
+		for key := range fx.s3.objects {
+			if _, sequence, ok := parseMigrationIntentObjectKey(key); ok {
+				highest = max(highest, sequence)
+			}
+		}
+		return highest
+	}
+
+	for _, action := range []string{migrationIntentRequested, migrationIntentAborted} {
+		t.Run("after "+action, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			ctx := context.Background()
+			// Three open requests: the head stays at 1 while the log reaches 3.
+			for sequence := uint64(1); sequence <= 3; sequence++ {
+				fx.s3.putRawObjectAt(
+					migrationIntentObjectKey(fx.source, sequence),
+					fx.object(t, sequence, action, target,
+						migrationIntentTestBucket, fx.pcr0),
+					time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second),
+				)
+			}
+			before := highestSequence(t, fx)
+			require.Equal(t, uint64(3), before)
+
+			var head *migrationIntent
+			var err error
+			if action == migrationIntentRequested {
+				head, err = fx.log.Abort(ctx, fx.source, target)
+			} else {
+				head, err = fx.log.Request(ctx, fx.source, target)
+			}
+
+			require.NoError(t, err)
+			require.Greater(t, head.Sequence, before,
+				"an append must not reuse a sequence that already has an object")
+			require.Len(t, fx.s3.objects[migrationIntentObjectKey(fx.source, head.Sequence)], 1,
+				"the new sequence must be a fresh key, not another version of an old one")
+		})
+	}
+}
+
+func TestAbortAdvancesPastIgnoredRequests(t *testing.T) {
+	fx := newMigrationIntentFixture(t)
+	ctx := context.Background()
+	target := strings.Repeat("cd", 48)
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		fx.s3.putRawObjectAt(
+			migrationIntentObjectKey(fx.source, sequence),
+			fx.object(
+				t,
+				sequence,
+				migrationIntentRequested,
+				target,
+				migrationIntentTestBucket,
+				fx.pcr0,
+			),
+			time.Now().Add(-time.Hour+time.Duration(sequence)*time.Second),
+		)
+	}
+	head, err := fx.log.Head(ctx, fx.source)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), head.Sequence)
+	head, err = fx.log.Abort(ctx, fx.source, target)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), head.Sequence)
+	require.Equal(t, migrationIntentAborted, head.Action)
+	head, err = fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), head.Sequence)
+}
+
+func TestMigrationIntentFinalise(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+
+	t.Run("records the handoff on the request it answers", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		snapshot := fx.handoff(t, targetA, "key-a")
+
+		finalised, err := fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+
+		require.NoError(t, err)
+		require.Equal(t, migrationIntentFinalised, finalised.Action)
+		require.Equal(t, requested.Sequence+1, finalised.Sequence)
+		require.True(t, finalised.FinalisedSnapshot.sameState(snapshot))
+		require.NotEmpty(t, finalised.FinalisedSnapshot.transitionReceipt,
+			"the record's attestation is the handoff's transition receipt")
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, finalised, head)
+
+		// The handoff stays active until an abort: nothing else is requested or
+		// released meanwhile.
+		_, err = fx.log.Request(ctx, fx.source, targetB)
+		require.ErrorIs(t, err, errMigrationIntentAlreadyRequested)
+		_, err = fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+		require.ErrorIs(t, err, errMigrationAlreadyFinalised)
+		require.Equal(t, 1, finalisedIntentCount(fx.s3))
+
+		aborted, err := fx.log.Abort(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		require.Equal(t, finalised.Sequence+1, aborted.Sequence)
+		head, err = fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, aborted, head)
+	})
+
+	t.Run("returns its own version when a peer finalises first", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+		require.NoError(t, err)
+		snapshot := fx.handoff(t, targetA, "key-b")
+		peerSnapshot := fx.handoff(t, targetA, "key-a")
+		peerLog := *fx.log
+		var peer *migrationIntent
+		fx.log.s3 = migrationIntentBeforePutS3{
+			S3API: fx.s3,
+			beforePut: func() {
+				// Both finalisers pass the request check before either write lands.
+				var err error
+				peer, err = peerLog.Finalise(
+					ctx,
+					fx.source,
+					targetA,
+					requested.Sequence,
+					peerSnapshot,
+				)
+				require.NoError(t, err)
+			},
+		}
+
+		finalised, err := fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
+
+		require.NoError(t, err)
+		require.NotNil(t, peer)
+		require.Equal(t, peer.Sequence, finalised.Sequence)
+		require.NotEqual(t, peer.VersionID, finalised.VersionID)
+		require.True(t, finalised.FinalisedSnapshot.sameState(snapshot))
+		head, err := fx.log.Head(ctx, fx.source)
+		require.NoError(t, err)
+		require.Equal(t, peer, head, "the earlier handoff remains active")
+		require.Len(t, fx.s3.objects[migrationIntentObjectKey(fx.source, finalised.Sequence)], 2,
+			"both finalisers' versions remain stored")
+	})
+
+	for name, tc := range map[string]struct {
+		// prepare returns the sequence of the request Finalise is asked to answer.
+		prepare func(*testing.T, *migrationIntentFixture) uint64
+		want    error
+	}{
+		"without a request": {
+			prepare: func(*testing.T, *migrationIntentFixture) uint64 { return 1 },
+			want:    errMigrationIntentAbsent,
+		},
+		"an aborted request": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Abort(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"a request for another target": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetB)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"a request that a newer one replaced": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				requested, err := fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Abort(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				_, err = fx.log.Request(ctx, fx.source, targetA)
+				require.NoError(t, err)
+				return requested.Sequence
+			},
+			want: errMigrationIntentAborted,
+		},
+		"an ambiguous request": {
+			prepare: func(t *testing.T, fx *migrationIntentFixture) uint64 {
+				tiedAt := time.Now().Add(-time.Hour).UTC()
+				for _, target := range []string{targetA, targetB} {
+					fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 1), fx.object(
+						t, 1, migrationIntentRequested, target, fx.log.bucket, fx.pcr0,
+					), tiedAt)
+				}
+				return 1
+			},
+			want: errMigrationIntentAmbiguous,
+		},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			sequence := tc.prepare(t, fx)
+
+			_, err := fx.log.Finalise(
+				ctx, fx.source, targetA, sequence, fx.handoff(t, targetA, "key-a"),
+			)
+
+			require.ErrorIs(t, err, tc.want)
+			require.Zero(t, finalisedIntentCount(fx.s3), "a refused handoff releases nothing")
+		})
+	}
+}
+
+// Which record is the active intent once a finalised record is in the log.
+func TestMigrationIntentFinalisedHead(t *testing.T) {
+	ctx := context.Background()
+	targetA, targetB := strings.Repeat("cd", 48), strings.Repeat("ef", 48)
+	base := time.Now().Add(-time.Hour).UTC()
+
+	type record struct {
+		sequence uint64
+		action   string
+		target   string
+		after    time.Duration
+	}
+	seed := func(t *testing.T, fx *migrationIntentFixture, records ...record) {
+		t.Helper()
+		for _, r := range records {
+			body := fx.object(t, r.sequence, r.action, r.target, fx.log.bucket, fx.pcr0)
+			if r.action == migrationIntentFinalised {
+				body = fx.finalised(t, r.sequence, fx.handoff(t, r.target, "key"))
+			}
+			fx.s3.putRawObjectAt(
+				migrationIntentObjectKey(fx.source, r.sequence), body, base.Add(r.after),
+			)
+		}
+	}
+	requested := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentRequested, target, after}
+	}
+	aborted := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentAborted, target, after}
+	}
+	finalised := func(sequence uint64, target string, after time.Duration) record {
+		return record{sequence, migrationIntentFinalised, target, after}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		records []record
+		want    *record // the head; nil for none
+		wantErr error
+	}{
+		{
+			name:    "finalised answers its request",
+			records: []record{requested(1, targetA, 0), finalised(2, targetA, time.Minute)},
+			want:    &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name:    "finalised without a request is ignored",
+			records: []record{finalised(1, targetA, 0)},
+		},
+		{
+			name: "finalised after an abort is ignored",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, time.Minute),
+				finalised(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name:    "finalised for another target is ignored",
+			records: []record{requested(1, targetA, 0), finalised(2, targetB, time.Minute)},
+			want:    &record{sequence: 1, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "a request is ignored while a handoff is finalised",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				requested(3, targetB, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "a later finalised does not replace the handoff",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				finalised(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "an abort withdraws a finalised handoff",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(3, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 3, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name: "a new request after the abort starts over",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(3, targetA, 2*time.Minute), requested(4, targetA, 3*time.Minute),
+			},
+			want: &record{sequence: 4, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "an abort outranks an earlier finalised at its sequence",
+			records: []record{
+				requested(1, targetA, 0), finalised(2, targetA, time.Minute),
+				aborted(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			name: "an abort outranks a later finalised at its sequence",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, time.Minute),
+				finalised(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentAborted, target: targetA},
+		},
+		{
+			// A finalise that started before the abort lands after the next request.
+			name: "a delayed finalised cannot bury an abort or revive its target",
+			records: []record{
+				requested(1, targetA, 0), aborted(2, targetA, 2*time.Minute),
+				requested(3, targetA, 3*time.Minute), finalised(2, targetA, time.Minute),
+			},
+			want: &record{sequence: 3, action: migrationIntentRequested, target: targetA},
+		},
+		{
+			name: "a finalised outranks a request at its sequence",
+			records: []record{
+				requested(1, targetA, 0), requested(2, targetB, time.Minute),
+				finalised(2, targetA, 2*time.Minute),
+			},
+			want: &record{sequence: 2, action: migrationIntentFinalised, target: targetA},
+		},
+		{
+			name: "a finalised cannot resolve an existing conflict",
+			records: []record{
+				requested(1, targetA, 0), requested(1, targetB, 0),
+				finalised(2, targetA, time.Minute),
+			},
+			wantErr: errMigrationIntentAmbiguous,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			seed(t, fx, tc.records...)
+
+			head, err := fx.log.Head(ctx, fx.source)
+
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				require.Nil(t, head)
+				return
+			}
+			require.NoError(t, err)
+			if tc.want == nil {
+				require.Nil(t, head)
+				return
+			}
+			require.NotNil(t, head)
+			require.Equal(t,
+				record{tc.want.sequence, tc.want.action, tc.want.target, 0},
+				record{head.Sequence, head.Action, head.TargetPCR0, 0},
+			)
+		})
+	}
+
+	// Replicas racing one request each mint a key. Either record would do, so
+	// the choice only has to be the same for every reader.
+	for _, tc := range []struct {
+		name      string
+		key1After time.Duration
+		wantKey   string
+	}{
+		{"tied finalised records select the smallest key", time.Minute, "key-1"},
+		{"an earlier finalised wins over a smaller key", 2 * time.Minute, "key-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, keys := range [][]string{{"key-1", "key-2"}, {"key-2", "key-1"}} {
+				fx := newMigrationIntentFixture(t)
+				seed(t, fx, requested(1, targetA, 0))
+				for _, key := range keys {
+					publishedAt := base.Add(time.Minute)
+					if key == "key-1" {
+						publishedAt = base.Add(tc.key1After)
+					}
+					fx.s3.putRawObjectAt(
+						migrationIntentObjectKey(fx.source, 2),
+						fx.finalised(t, 2, fx.handoff(t, targetA, key)), publishedAt,
+					)
+				}
+
+				head, err := fx.log.Head(ctx, fx.source)
+
+				require.NoError(t, err)
+				require.NotNil(t, head)
+				require.Equal(t, migrationIntentFinalised, head.Action)
+				require.Equal(t, tc.wantKey, head.FinalisedSnapshot.kmsKeyID,
+					"selection must not depend on listing order: %v", keys)
+			}
+		})
+	}
+
+	t.Run("an ignored finalised still occupies its sequence", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		seed(t, fx, finalised(1, targetA, 0))
+
+		requested, err := fx.log.Request(ctx, fx.source, targetA)
+
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), requested.Sequence)
+	})
+}
+
+// A finalised record is only as good as the snapshot its attestation binds.
+func TestMigrationIntentInvalidFinalisedVersionsAreIgnored(t *testing.T) {
+	ctx := context.Background()
+	targetA := strings.Repeat("cd", 48)
+
+	for name, forge := range map[string]func(*testing.T, *migrationIntentFixture) []byte{
+		"a snapshot swapped after it was attested": func(
+			t *testing.T, fx *migrationIntentFixture,
+		) []byte {
+			swapped, err := fx.handoff(t, targetA, "key-b").encode(fx.log.cfg)
+			require.NoError(t, err)
+			return fx.finalisedObject(t, 2, targetA, fx.handoff(t, targetA, "key-a"),
+				func(entry *migrationIntentObjectV1) { entry.FinalisedSnapshot = swapped })
+		},
+		"a snapshot that is not canonical": func(
+			t *testing.T, fx *migrationIntentFixture,
+		) []byte {
+			return fx.finalisedObject(t, 2, targetA, fx.handoff(t, targetA, "key-a"),
+				func(entry *migrationIntentObjectV1) {
+					entry.FinalisedSnapshot = append(entry.FinalisedSnapshot, 0)
+				})
+		},
+		"a record without its snapshot": func(t *testing.T, fx *migrationIntentFixture) []byte {
+			return fx.object(t, 2, migrationIntentFinalised, targetA, fx.log.bucket, fx.pcr0)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newMigrationIntentFixture(t)
+			requested, err := fx.log.Request(ctx, fx.source, targetA)
+			require.NoError(t, err)
+			fx.s3.putRawObject(migrationIntentObjectKey(fx.source, 2), forge(t, fx))
+
+			state, highest, err := fx.log.scanIntents(ctx, fx.source)
+
+			require.NoError(t, err)
+			require.Equal(t, requested, state.current, "the request stays the active intent")
+			require.Equal(t, requested.Sequence, highest)
+		})
+	}
+}
+
+type migrationIntentFixture struct {
+	log    *migrationIntentLog
+	s3     *fakeS3
+	nsm    *nsmW
+	pcr0   []byte
+	source string
+	signer *fakeNSM
+}
+
+type migrationIntentBeforePutS3 struct {
+	S3API
+	beforePut func()
+}
+
+func (s migrationIntentBeforePutS3) PutObject(
+	ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options),
+) (*s3.PutObjectOutput, error) {
+	s.beforePut()
+	return s.S3API.PutObject(ctx, in, opts...)
+}
+
+func newMigrationIntentFixture(t *testing.T) *migrationIntentFixture {
+	return newMigrationIntentFixtureWithConfig(t, testCfg)
+}
+
+func newMigrationIntentFixtureWithConfig(
+	t *testing.T, cfg *Config,
+) *migrationIntentFixture {
+	t.Helper()
+	pcr0 := bytes.Repeat([]byte{0xab}, 48)
+	session := newFakeNSM(t).withPCRs(map[uint][]byte{0: pcr0}).session
+	nsm := &nsmW{nsm: session.nsm}
+	s3f := newFakeS3()
+	log, err := newMigrationIntentLog(cfg, s3f, nsm, migrationIntentTestBucket)
+	require.NoError(t, err)
+	return &migrationIntentFixture{
+		log:    log,
+		s3:     s3f,
+		nsm:    nsm,
+		pcr0:   pcr0,
+		source: strings.Repeat("ab", 48),
+		signer: session.nsm,
+	}
+}
+
+func (f *migrationIntentFixture) object(
+	t *testing.T,
+	sequence uint64,
+	action, targetPCR0, bucket string,
+	pcr0 []byte,
+) []byte {
+	t.Helper()
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:     migrationIntentSchemaV1,
+		BucketName: bucket,
+		Sequence:   sequence,
+		Action:     action,
+		TargetPCR0: targetPCR0,
+	})
+	require.NoError(t, err)
+	attestation := f.signer.attest(map[uint][]byte{0: pcr0}, time.Now(), payload)
+	body, err := json.Marshal(migrationIntentObjectV1{
+		Schema:      migrationIntentSchemaV1,
+		Sequence:    sequence,
+		Action:      action,
+		TargetPCR0:  targetPCR0,
+		Attestation: attestation.docB64,
+	})
+	require.NoError(t, err)
+	return body
+}
+
+// reattest returns body under a fresh attestation, so its bytes differ while
+// the verified intent stays the same.
+func (f *migrationIntentFixture) reattest(t *testing.T, body []byte) []byte {
+	t.Helper()
+	entry, err := decodeMigrationIntentObject(body)
+	require.NoError(t, err)
+	payload := mustMigrationIntentPayload(t, f.log, entry, f.log.bucket)
+	entry.Attestation = f.signer.attest(
+		map[uint][]byte{0: f.pcr0}, time.Now().Add(-time.Minute), payload,
+	).docB64
+	out, err := json.Marshal(entry)
+	require.NoError(t, err)
+	require.NotEqual(t, body, out)
+	return out
+}
+
+// injectConflictAfterPut installs a hook that adds a competing intent after a write.
+// The returned record is populated with the original version when the hook runs.
+func (f *migrationIntentFixture) injectConflictAfterPut(
+	t *testing.T, targetPCR0, conflictingTargetPCR0 string,
+) *migrationIntent {
+	t.Helper()
+	written := new(migrationIntent)
+	f.s3.afterPut = func(in *s3.PutObjectInput, out *s3.PutObjectOutput) {
+		key := aws.ToString(in.Key)
+		f.s3.mu.Lock()
+		versions := f.s3.objects[key]
+		stored := versions[len(versions)-1]
+		f.s3.mu.Unlock()
+		entry, err := decodeMigrationIntentObject(stored.body)
+		require.NoError(t, err)
+		require.Equal(t, targetPCR0, entry.TargetPCR0)
+		*written = migrationIntent{
+			SourcePCR0: f.source, TargetPCR0: entry.TargetPCR0,
+			Action: entry.Action, Sequence: entry.Sequence,
+			PublishedAt: stored.lastModified, VersionID: aws.ToString(out.VersionId),
+		}
+		// Another writer lands a distinct intent at the same sequence and
+		// timestamp after our put but before its verification read.
+		f.s3.putRawObjectAt(key,
+			f.object(t, entry.Sequence, entry.Action, conflictingTargetPCR0, f.log.bucket, f.pcr0),
+			stored.lastModified)
+	}
+	return written
+}
+
+// handoff is a snapshot fx's enclave could hand to targetPCR0 under keyID.
+func (f *migrationIntentFixture) handoff(t *testing.T, targetPCR0, keyID string) Snapshot {
+	t.Helper()
+	snapshot := testGenerationSnapshot(mustDecodeHex(t, targetPCR0), f.pcr0, keyID)
+	snapshot.migrationIntentBucketName = f.log.bucket
+	return snapshot
+}
+
+// finalised is the stored record that hands snapshot to its owner.
+func (f *migrationIntentFixture) finalised(
+	t *testing.T, sequence uint64, snapshot Snapshot,
+) []byte {
+	t.Helper()
+	return f.finalisedObject(t, sequence, snapshot.ownerPCR0, snapshot, nil)
+}
+
+// finalisedObject attests snapshot's root in a finalised record naming
+// targetPCR0; mutate runs after signing, to forge what a host could write.
+func (f *migrationIntentFixture) finalisedObject(
+	t *testing.T,
+	sequence uint64,
+	targetPCR0 string,
+	snapshot Snapshot,
+	mutate func(*migrationIntentObjectV1),
+) []byte {
+	t.Helper()
+	raw, err := snapshot.encode(f.log.cfg)
+	require.NoError(t, err)
+	payload, err := f.log.enc.Marshal(migrationIntentUserDataV1{
+		Schema:                migrationIntentSchemaV1,
+		BucketName:            f.log.bucket,
+		Sequence:              sequence,
+		Action:                migrationIntentFinalised,
+		TargetPCR0:            targetPCR0,
+		FinalisedSnapshotRoot: snapshotRootOf(raw),
+	})
+	require.NoError(t, err)
+	entry := migrationIntentObjectV1{
+		Schema:            migrationIntentSchemaV1,
+		Sequence:          sequence,
+		Action:            migrationIntentFinalised,
+		TargetPCR0:        targetPCR0,
+		Attestation:       f.signer.attest(map[uint][]byte{0: f.pcr0}, time.Now(), payload).docB64,
+		FinalisedSnapshot: raw,
+	}
+	if mutate != nil {
+		mutate(&entry)
+	}
+	body, err := json.Marshal(entry)
+	require.NoError(t, err)
+	return body
+}

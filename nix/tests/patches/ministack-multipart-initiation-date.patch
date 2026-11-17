@@ -1,0 +1,103 @@
+--- a/ministack/services/s3.py
++++ b/ministack/services/s3.py
+@@ -2811,55 +2811,45 @@
+     if err is not None:
+         return err
+
+     version_id = _qp(query_params, "versionId", "")
+     if version_id:
+-        vkey = (bucket_name, key)
+-        versions = _object_versions.get(vkey, [])
++        versions = _object_versions.get((bucket_name, key), [])
+         for v in versions:
+             if v["version_id"] == version_id:
+-                # Route through the shared header builder (same path as versioned
+-                # HeadObject) so a version's user metadata (x-amz-meta-*),
+-                # preserved headers and content-encoding are emitted — not just
+-                # the five wire basics. Versioned reads honor
+-                # `x-amz-checksum-mode: ENABLED` exactly as current-version reads do.
+-                include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+-                vobj = _object_record_from_version(v)
+-                resp_headers = _object_response_headers(
+-                    vobj, bucket_name, key, include_checksums=include_checksums)
+-                resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
++                obj = _object_record_from_version(v)
+                 body = v.get("data")
+                 if body is None:
+                     body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+-                return 200, resp_headers, body
+-        return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+-
+-    if key not in bucket["objects"]:
+-        return _error(
+-            "NoSuchKey",
+-            "The specified key does not exist.",
+-            404,
+-            f"/{bucket_name}/{key}",
+-        )
+-
+-    obj = bucket["objects"][key]
++                break
++        else:
++            return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
++    else:
++        if key not in bucket["objects"]:
++            return _error(
++                "NoSuchKey",
++                "The specified key does not exist.",
++                404,
++                f"/{bucket_name}/{key}",
++            )
++        obj = bucket["objects"][key]
++        body = _read_body(bucket_name, key, obj)
++
+     range_header = headers.get("range", "")
+     # AWS returns whole-object checksums only on full-object responses (HTTP
+     # 200). On a 206 Partial Content reply the bytes are a slice, and a
+     # whole-object checksum can't validate them — boto3 raises
+     # `FlexibleChecksumError` if it sees one alongside sliced bytes.
+     checksum_mode_on = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+-    include_checksums = checksum_mode_on and not range_header
++    part_number = _qp(query_params, "partNumber")
++    include_checksums = checksum_mode_on and not (range_header or (part_number and obj.get("parts")))
+     resp_headers = _object_response_headers(obj, bucket_name, key,
+                                             include_checksums=include_checksums)
+     resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
+-
+-    body = _read_body(bucket_name, key, obj)
+
+     # partNumber: return a single part of a completed multipart object as 206
+     # Partial Content with a Content-Range and x-amz-mp-parts-count, rather than
+     # the whole object. Parts are matched by their part number (which may be
+     # non-contiguous), and their byte offset is the sum of the preceding sizes.
+-    part_number = _qp(query_params, "partNumber") if query_params else None
+     if part_number and obj.get("parts"):
+         try:
+             pn = int(part_number)
+@@ -3084,6 +3074,7 @@
+         "storage_class": v.get("storage_class") or "STANDARD",
+         "checksums": v.get("checksums") or {},
+         "version_id": v["version_id"],
++        "parts": v.get("parts"),
+     }
+
+
+@@ -4600,7 +4591,9 @@
+         "content_type": upload["content_type"],
+         "content_encoding": upload.get("content_encoding"),
+         "etag": final_etag,
+-        "last_modified": now_iso(),
++        # AWS dates multipart objects from upload initiation, not completion:
++        # https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
++        "last_modified": upload["created"],
+         "size": len(combined),
+         "metadata": upload["metadata"],
+         "preserved_headers": upload.get("preserved_headers", {}),
+@@ -4634,6 +4627,7 @@
+             "size": obj["size"],
+             "is_latest": True,
+             "data": combined,
++            "parts": part_records,
+             "content_type": obj.get("content_type") or "application/octet-stream",
+             "content_encoding": obj.get("content_encoding"),
+             "metadata": obj.get("metadata", {}),

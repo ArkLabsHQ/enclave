@@ -1,812 +1,1554 @@
-# Simple Enclave
+# enclave
 
-A framework for running applications inside [AWS Nitro Enclaves](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) with zero SDK imports. The enclave supervisor handles attestation, KMS secret management, PCR extension, and BIP-340 Schnorr response signing automatically. You write a plain HTTP server.
+A Nix toolchain and Go runtime for running an application inside an AWS Nitro
+Enclave. The runtime establishes encrypted state under a KMS key whose policy is
+conditioned on the enclave's PCR0 measurement, exposes an attested HTTPS
+endpoint, and implements a blue/green migration protocol that transfers that
+state to a successor enclave with a different measurement.
 
-## Architecture
+The repository exports `lib.buildEif` for constructing enclave images, packages
+the runtime and client CLI, provides a development shell, and includes NixOS tests
+that exercise the runtime against an AWS emulator under nested KVM.
 
-```
-Client                                  AWS Services (KMS, SSM)
-  |                                              ^
-  | HTTPS (port 443)                             |
-  v                                              |
-EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
-  |                                              |
-  |  vsock:1024                          gvproxy (Docker)
-  v                                       192.168.127.1
-Nitro Enclave ---------------------------------->+
-  ├── nitriding             (TLS :443 -> :7073)
-  ├── runtime              (reverse proxy :7073 -> :7074)
-  │     ├── attestation key + Schnorr signing
-  │     ├── KMS secret decryption
-  │     ├── PCR extension endpoints
-  │     └── management API (/health, /v1/enclave-info, ...)
-  ├── your-app              (plain HTTP server :7074)
-  └── viproxy               (IMDS forwarding -> vsock CID 3:8002)
-```
+The runtime, enclave images, and checks support `x86_64-linux`. The CLI and
+development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 
-### Boot Sequence
+## Contents
 
-1. **nitriding** starts, sets up the TAP network interface via gvproxy, and terminates TLS on port 443
-2. **runtime** initializes:
-   - Decrypts secrets from KMS using a Nitro attestation document (PCR0-bound)
-   - Sets decrypted secrets as environment variables
-   - Generates an ephemeral secp256k1 attestation key
-   - Registers `SHA256(attestationPubkey)` with nitriding (embedded as `appKeyHash` in attestation UserData)
-   - Starts the reverse proxy on port 7073 with Schnorr response signing
-3. **your-app** is launched as a child process on port 7074, inheriting secret env vars
+- [Repository layout](#repository-layout)
+- [Quickstart](#quickstart)
+- [Architecture](#architecture)
+- [Nix API](#nix-api)
+- [Runtime configuration](#runtime-configuration)
+- [HTTP API](#http-api)
+- [Deployment](#deployment)
+- [Blue/green migration](#bluegreen-migration)
+- [Verifying an enclave](#verifying-an-enclave)
+- [Testing](#testing)
+- [Security notes](#security-notes)
 
-### Networking
+## Repository layout
 
-The enclave uses [gvproxy](https://github.com/containers/gvisor-tap-vsock) for outbound connectivity:
+| Path | Contents |
+|---|---|
+| `runtime/` | The Go runtime that runs as PID 1 inside the enclave. Separate Go module, `github.com/ArkLabsHQ/enclave/runtime`. |
+| `client/` | Go client library for attestation-verified requests. Part of the root module. |
+| `internal/signing/` | The signed-response wire format, shared by `client/` and `runtime/`. Separate Go module, `github.com/ArkLabsHQ/enclave/internal/signing`. |
+| `cmd/enclave/` | The `enclave` CLI. |
+| `nix/` | `buildEif` function |
+| `nix/tests/` | EIF construction and full blue/green runtime checks. |
+| `.github/workflows/` | `eif-build.yml` and `eif-publish.yml`, reusable workflows an app repo calls to build and publish its EIF. |
 
-- `192.168.127.1` - Gateway/DNS server (gvproxy)
-- `192.168.127.2` - Enclave's virtual IP
-- `127.0.0.1:80` - IMDS endpoint (via viproxy -> vsock CID 3:8002)
+## Quickstart
 
-## Supported Languages
+Add the flake as an input and build an enclave image from your application
+derivation.
 
-Your enclave app is a plain HTTP server — no SDK imports needed. The framework supports three languages:
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    enclave.url = "github:ArkLabsHQ/enclave";
+  };
 
-| Language | Min Version | Template | Nix Build System | Dependency Mechanism |
-|----------|-------------|----------|-----------------|---------------------|
-| **Go** | 1.25+ | `enclave generate template --golang` | `buildGoModule` | `vendorHash` (from `go.sum`) |
-| **Node.js** | 22+ | `enclave generate template --nodejs` | `buildNpmPackage` | `npmDepsHash` (from `package-lock.json`) |
-| **.NET** | 10.0 | `enclave generate template --dotnet` | `buildDotnetModule` | `deps.json` (via `fetch-deps`) |
+  outputs =
+    { nixpkgs, enclave, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
 
-**Go** — The CLI and SDK are written in Go 1.25. Your app is built with `buildGoModule` using vendored dependencies. The `vendorHash` is computed from `go.sum` during `enclave setup`.
+      myapp = pkgs.buildGoModule {
+        pname = "myapp";
+        version = "1.0.0";
+        src = ./.;
+        vendorHash = null;
+      };
 
-**Node.js** — Your app is built with `buildNpmPackage`. Requires `package-lock.json` committed to the repo (Nix needs it for reproducible dependency hashes).
-
-**.NET** — Your app targets `net10.0` and is built with `buildDotnetModule` using the .NET 10 SDK (`dotnetCorePackages.sdk_10_0_1xx`). Dependencies are managed via `deps.json` generated by Nix's `fetch-deps` mechanism, not a hash.
-
-## Prerequisites
-
-- Docker (for reproducible EIF builds via pinned NixOS container)
-- [Nix](https://nixos.org/) (for hash computation and local builds)
-- AWS CLI v2 with appropriate credentials
-- [OpenTofu CLI](https://opentofu.org)
-- `jq`
-- **Go apps:** Go 1.25+
-- **Node.js apps:** Node.js 22+
-- **.NET apps:** .NET SDK 10.0+
-
-## Quick Start
-
-### 1. Install the CLI
-
-```sh
-go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@latest
-```
-
-Or build from source with SDK hashes baked in:
-
-```sh
-make sdk-hashes REV=v1.0.0   # compute source hash
-make vendor-hash              # compute vendor hash
-make build                    # build CLI with hashes baked in
-```
-
-### 2. Initialize your project
-
-**Option A:** Generate a complete template (recommended for new projects):
-
-```sh
-enclave generate template --golang my-app    # Go project
-enclave generate template --nodejs my-app    # Node.js project
-```
-
-**Option B:** Add enclave support to an existing repo:
-
-```sh
-enclave init
-```
-
-Both create:
-- `enclave/enclave.yaml` — main config file
-- `enclave/flake.nix` — Nix build definition (language-specific)
-
-If built with `make build`, the `sdk:` section is auto-populated with the correct hashes.
-
-Run `enclave tofu` to generate the OpenTofu deployment module into `./tofu/`. It's a separate step so you can iterate on the build without regenerating (and clobbering customizations to) your infrastructure scaffold. Re-runs are safe — existing files are skipped. The `enclave-supervisor.service` systemd unit is inlined into `tofu/modules/enclave/templates/user_data.sh.tftpl`.
-
-Two artifact-source modes:
-
-- **Default** — `enclave tofu` writes `terraform.tfvars.json` pointing at the EIF and supervisor binary that `enclave build` produced under `.enclave/artifacts/`. Tofu uploads them to S3 directly. Best for fast iteration.
-- **Remote** — `enclave tofu --remote` leaves the local paths empty so tofu's bundled `null_resource` curls `image.eif` and `supervisor` from `github.com/<app.nix_owner>/<app.nix_repo>/releases/download/<app.release_tag>/` at apply time, then mirrors them to S3. Use this when a CI pipeline has already published a versioned GitHub Release. Pin a specific build by setting `release_tag: "eif-v1.2.3"` in `enclave.yaml`; default is `"eif-latest"`.
-
-### KMS recovery vs. strict mode
-
-The locked KMS key is the framework's confidentiality root. The framework preserves a strong invariant: **plaintext only ever exists inside an attested enclave**. Recovery options are designed not to break that.
-
-By default the locked policy grants the AWS account principal (root, plus any IAM admin in the account) `kms:PutKeyPolicy`, `kms:GetKeyPolicy`, and `kms:DescribeKey`. **Root never has `kms:Decrypt`** — recovery means rewriting the policy to add a new PCR0 condition, and decryption then flows through the freshly-deployed enclave that attests to that PCR0. The plaintext invariant holds even during recovery; root's role is to pivot the lock, not to read the data.
-
-For workloads that want the strongest immutability — "**nothing**, not even an IAM admin, can change this policy" — set `is_kms_key_locked: true` in `enclave.yaml`. The locked policy is permanently frozen: only the attested PCR0 enclave can decrypt, and even rewriting the policy is impossible. Use this only when you accept that an irrecoverable failure means data loss. **The choice is permanent at first lock**, so pick at first deploy.
-
-### 3. Set up app hashes
-
-The `setup` command auto-detects your GitHub remote and computes all nix hashes:
-
-```sh
-enclave setup                          # Go app (default), runs in Docker
-enclave setup --language nodejs        # Node.js app (writes correct enclave/flake.nix)
-enclave setup                  # uses local nix installation
-```
-
-This populates `nix_owner`, `nix_repo`, `nix_rev`, `nix_hash`, and `nix_vendor_hash` in `enclave/enclave.yaml` from your local git state.
-
-> **Node.js:** `package-lock.json` must be committed to your repo. Nix requires it to compute reproducible dependency hashes.
-
-### 4. Configure `enclave/enclave.yaml`
-
-After `enclave setup`, review and fill in remaining fields:
-
-```yaml
-name: my-app                     # app name
-region: us-east-1                # AWS region
-account: "123456789012"          # your AWS account ID
-
-sdk:
-  rev: "v1.0.0"                  # auto-populated by 'make build'
-  hash: "sha256-..."
-  vendor_hash: "sha256-..."
-
-app:
-  language: go                   # "go" or "nodejs"
-  nix_owner: my-org              # auto-populated by 'enclave setup'
-  nix_repo: my-app
-  nix_rev: "abc123..."
-  nix_hash: "sha256-..."
-  nix_vendor_hash: "sha256-..."  # Go vendor hash or npm deps hash
-  nix_sub_packages:
-    - "cmd"                      # Go sub-package with main() (Go only)
-  binary_name: my-app
-
-  env:
-    MY_APP_PORT: "7074"
-    MY_APP_DATADIR: "/app/data"
-
-secrets:
-  - name: signing_key
-    env_var: APP_SIGNING_KEY
-```
-
-Values in `app.env` are baked into the EIF as **build-time defaults** —
-each value contributes to PCR0, so changing one forces an EIF rebuild
-and a migration. To change a value at deploy time **without rebuilding
-the EIF**, hand it to tofu via the `env_values` map. Tofu writes each
-key/value to SSM at `/<deployment>/<app>/env/<key>`, and the runtime
-overlays it on top of the baked default at boot. PCR0 stays identical
-across the override — the schema (the set of keys) is attested, the
-values are not.
-
-There are three places to supply `env_values`, in increasing order of
-precedence:
-
-1. **`TF_VAR_env_values` environment variable** — pairs well with
-   `direnv`, secret managers (sops, vault), and CI runners that
-   already inject env vars natively.
-   ```sh
-   export TF_VAR_env_values='{"MY_APP_DATADIR":"/srv/data"}'
-   tofu apply
-   ```
-2. **`*.auto.tfvars.json` file** — tofu auto-loads any file matching
-   this pattern next to the root module. Best for committed
-   per-environment config (`prod.auto.tfvars.json`,
-   `staging.auto.tfvars.json`).
-   ```json
-   { "env_values": { "MY_APP_DATADIR": "/srv/data" } }
-   ```
-3. **`-var` on the command line** — one-off overrides. Highest
-   precedence.
-   ```sh
-   tofu apply -var 'env_values={"MY_APP_DATADIR":"/srv/data"}'
-   ```
-
-
-
-Your app is a plain HTTP server — no SDK imports needed:
-
-**Go:**
-```go
-package main
-
-import (
-    "net/http"
-    "os"
-)
-
-func main() {
-    port := os.Getenv("ENCLAVE_APP_PORT") // default 7074
-    signingKey := os.Getenv("APP_SIGNING_KEY") // decrypted by supervisor
-
-    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("Hello from the enclave"))
-    })
-    http.ListenAndServe(":"+port, nil)
+      eif = enclave.lib.buildEif {
+        inherit pkgs;
+        app = myapp;
+        env = {
+          ENCLAVE_NAMESPACE = "prod";
+          ENCLAVE_APP_NAME = "myapp";
+          ENCLAVE_AWS_REGION = "eu-west-1";
+          ENCLAVE_PREVIOUS_PCR0 = "genesis";
+          ENCLAVE_OTEL_ENDPOINT_ENV = "MYAPP_OTEL_ENDPOINT";
+          ENCLAVE_OTEL_TOKEN_ENV = "MYAPP_OTEL_TOKEN";
+        };
+      };
+    in
+    {
+      packages.${system} = {
+        inherit eif;
+      };
+    };
 }
 ```
 
-**Node.js:**
-```js
-const http = require("http");
-const port = process.env.ENCLAVE_APP_PORT || "7074";
-const signingKey = process.env.APP_SIGNING_KEY; // decrypted by supervisor
-
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Hello from the enclave\n");
-}).listen(port, () => console.log(`listening on :${port}`));
-```
-
-### 5. Validate config
+Build the image and read its measurement:
 
 ```sh
-enclave init
+nix build .#eif
+cat result/pcr.json          # {"PCR0":"...","PCR1":"...","PCR2":"..."}
 ```
 
-Running `init` again when `enclave.yaml` already exists validates all fields and prints a summary.
+`PCR0` is the identity of the enclave. It is what the KMS key policy is
+conditioned on and what clients pin. It changes whenever the runtime, the
+application, or the baked environment changes.
 
-### 6. Build the enclave image
+Provide the resulting EIF to a Nitro-capable host that satisfies the
+[deployment requirements](#deployment). Once it is running, verify it from a
+client:
 
 ```sh
-enclave build              # build EIF via Docker + Nix (reproducible)
-enclave build      # build EIF using local Nix installation
+nix run github:ArkLabsHQ/enclave -- curl /enclave/v1/info \
+  --base-url https://enclave.example.com \
+  --expected-pcr0 "$(jq -r .PCR0 result/pcr.json)"
 ```
 
-Outputs `artifacts/image.eif` and `artifacts/pcr.json` with PCR0, PCR1, PCR2 measurements.
+## Architecture
 
-### 7. Deploy
+`buildEif` combines the packaged runtime, the application executable, and the
+baked environment into one measured EIF.
 
-```sh
-enclave tofu                       # scaffold the OpenTofu module into ./tofu/
-cd tofu && tofu init && tofu apply # provision VPC, EC2, KMS, IAM, secrets
+```text
+┌─ Enclave image, EIF ──────────────────────────────────────┐
+│  /app/runtime   PID 1: clock, network, AWS, state, TLS    │
+│  /app/<name>    application, exec'd by the runtime        │
+│                 listens on 127.0.0.1:7074                 │
+└───────────────────────────────────────────────────────────┘
+          │ AWS APIs through host networking and IMDS
+          │ HTTPS application and attestation endpoint
+          ▼
+   encrypted AWS state                 verified clients
 ```
 
-### 8. Verify
+The host launcher and infrastructure are external to this flake. Their required
+interfaces are documented under [Deployment](#deployment).
 
-```sh
-enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
-```
+### Ports
 
-`tofu apply` prints both the elastic IP and the expected PCR0 after a successful apply; pass them through to `enclave verify`.
-
-## Updating Your App
-
-The enclave build fetches your app source from GitHub at the exact commit specified in `enclave.yaml`. Code must be committed and pushed before building.
-
-**Code-only changes (no new dependencies):**
-
-```sh
-git add . && git commit -m "update" && git push
-enclave update     # fast: updates nix_rev + nix_hash only (~1 second)
-enclave build
-cd tofu && tofu apply
-```
-
-**Dependency changes (go.mod/go.sum or package.json/package-lock.json):**
-
-```sh
-git add . && git commit -m "update deps" && git push
-enclave setup      # full: recomputes all hashes including vendor/deps hash
-enclave build
-cd tofu && tofu apply
-```
-
-## CI/CD Workflows
-
-The `enclave init` and `enclave generate template` commands scaffold three GitHub Actions workflows for your app:
-
-### Deploy (`deploy-enclave.yml`)
-
-Triggered manually via `workflow_dispatch`. Builds the EIF, provisions the OpenTofu infrastructure, and verifies the running enclave:
-
-1. **Build** — installs the CLI, pulls the Nix Docker image, runs `enclave build`
-2. **Deploy** — runs `enclave tofu init` then `tofu apply` (creates/updates VPC, EC2, KMS, IAM, S3, secrets)
-3. **Publish manifest** — creates a GitHub Release (`deployment.json`) with PCR values and Elastic IP
-4. **Attest** — generates [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) for both `deployment.json` and `pcr.json`
-5. **Verify** — runs `enclave verify` against the live enclave (waits up to 5 minutes for boot)
-6. **Status page** — publishes an attestation status page to `gh-pages` at `/attestation/`
-
-**Required repo variables:**
-
-| Variable | Description |
-|----------|-------------|
-| `AWS_ROLE_ARN` | IAM role ARN with OIDC trust policy for this repo |
-| `AWS_REGION` | AWS region (e.g. `us-east-1`) |
-
-**Required permissions:** `id-token: write`, `contents: write`, `attestations: write`
-
-### Destroy (`destroy-enclave.yml`)
-
-Triggered manually via `workflow_dispatch`. Tears down the OpenTofu infrastructure:
-
-1. Installs the CLI and authenticates via OIDC
-2. Runs `tofu init` then `tofu destroy` in the `tofu/` module
-
-Uses the same `AWS_ROLE_ARN` and `AWS_REGION` repo variables as the deploy workflow.
-
-### Verify (`verify-enclave.yml`)
-
-Runs daily (8:00 UTC cron) and on `workflow_dispatch`. Provides continuous attestation monitoring:
-
-1. Downloads `deployment.json` from the `latest` GitHub Release
-2. Runs `enclave verify` against the live enclave using the manifest's base URL and PCR0
-3. Updates the attestation status page on `gh-pages`
-
-No repo variables needed — all inputs come from the deployment manifest published by the deploy workflow.
-
-**Verify an attestation manually:**
-
-```sh
-# Verify against a known PCR0
-enclave verify --base-url https://<elastic-ip> --expected-pcr0 <pcr0>
-
-# Verify the deployment manifest provenance
-gh attestation verify deployment.json --repo <owner>/<repo>
-```
-
-## SDK Release Workflow
-
-SDK hashes are computed per release tag and baked into CLI builds via ldflags. This lets `enclave init` auto-populate the `sdk:` section with the correct source and vendor hashes.
-
-Releases are created via the **Release SDK Version** GitHub Actions workflow (`.github/workflows/sdk-hashes.yml`), triggered manually with a version input (e.g. `v0.0.29`):
-
-1. **Validate** — checks version format (`vX.Y.Z`) and that the tag doesn't already exist
-2. **Compute vendor hash** — runs a trial Nix build of `runtime` to extract the Go vendor hash
-3. **Compute source hash** — archives the repo at HEAD, computes `nix hash path` over the archive
-4. **Commit and tag** — writes `sdk-hashes.json`, commits, tags, and pushes to `master`
-5. **Verify build** — confirms `runtime` builds successfully with the computed hashes
-
-### Building from source
-
-```sh
-make build     # build enclave-cli with SDK hashes from sdk-hashes.json baked in via ldflags
-make install   # install to $GOPATH/bin
-```
-
-## CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `enclave init` | Scaffold enclave project or validate existing config |
-| `enclave generate template --golang` | Generate a complete Go enclave app template |
-| `enclave generate template --nodejs` | Generate a complete Node.js enclave app template |
-| `enclave generate template --dotnet` | Generate a complete .NET enclave app template |
-| `enclave setup` | Auto-populate app nix hashes from git remote |
-| `enclave setup --language <lang>` | Set language (go, nodejs, dotnet) and rewrite enclave/flake.nix |
-| `enclave setup` | Use Nix for hash computation |
-| `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
-| `enclave tofu` | Generate OpenTofu deployment scaffold into ./tofu/ (merge-only-new). Pass `--remote` to pull EIF + supervisor from a GitHub Release at apply time instead of from local files. |
-| `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
-| `enclave build --push-cache` | Build, then push the closure to the first Cachix substituter (requires `CACHIX_AUTH_TOKEN` + `cachix` CLI) |
-| `enclave nixpkgs pin` | Pin `nixpkgs` to the tip of `nixos-25.11` (writes enclave.yaml + flake.nix). See [BINARY-CACHE.md](BINARY-CACHE.md). |
-| `enclave nixpkgs pin --check` | Validate the existing nixpkgs pin without bumping it |
-| `enclave vendor --path <dir>` | Run `cargo vendor` / `go mod vendor` in the upstream app source (language taken from enclave.yaml). Then commit `vendor/`, run `enclave setup`, and set `app.vendor: true`. |
-| `tofu apply` (in `./tofu/`) | Provision infrastructure (VPC, EC2, KMS, IAM, secrets) after `enclave tofu` |
-| `enclave verify` | Verify attestation document and PCR0 against local build |
-| `enclave status` | Show deployment status |
-| `tofu destroy` (in `./tofu/`) | Tear down the OpenTofu infrastructure |
-
-## API Endpoints
-
-The supervisor exposes management endpoints alongside proxied requests to your app. All responses include Schnorr signature headers.
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/health` | — | Supervisor health check (ready/degraded) |
-| GET | `/v1/enclave-info` | — | Build + runtime metadata (version, attestation key, previous PCR0) |
-| PUT | `/v1/storage/{key}` | Token | Store encrypted data (AES-256-GCM + S3) |
-| GET | `/v1/storage/{key}` | Token | Retrieve and decrypt stored data |
-| DELETE | `/v1/storage/{key}` | Token | Delete stored data |
-| GET | `/v1/storage?prefix=` | Token | List keys matching a prefix |
-| PUT | `/v1/secrets/{name}` | Token | Create/update a dynamic secret |
-| GET | `/v1/secrets/{name}` | Token | Retrieve a dynamic secret |
-| DELETE | `/v1/secrets/{name}` | Token | Delete a dynamic secret |
-| GET | `/v1/secrets` | Token | List all dynamic secrets (metadata only) |
-| GET | `/enclave/attestation` | — | Nitro attestation document (served by nitriding) |
-| `*` | `/*` | — | All other requests proxied to your app on port 7074 |
-
-Endpoints marked **Token** require `Authorization: Bearer {token}` where the token is auto-generated at boot and passed to your app via the `ENCLAVE_RUNTIME_TOKEN` environment variable.
-
-#### Internal Endpoints
-
-These endpoints are used internally and are not exposed to external clients.
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/v1/start-migration` | — | Re-encrypt secrets for locked-key migration (gated by SSM parameter, called by supervisor) |
-
-### Response Signing
-
-Every response includes:
-- `X-Attestation-Signature`: BIP-340 Schnorr signature over `SHA256(response_body)`
-- `X-Attestation-Pubkey`: compressed public key of the ephemeral attestation key
-
-Clients verify the signature, then confirm the pubkey hash matches `appKeyHash` in the attestation document's UserData.
-
-### PCR Extension
-
-The supervisor automatically extends PCR registers 16+ during initialization with `SHA256(compressed_secp256k1_pubkey)` for each configured secret. This binds the enclave's cryptographic identity to specific PCR values, which can be verified via the attestation document.
-
-### Encrypted Storage
-
-The enclave provides persistent encrypted storage backed by S3 with automatic KMS envelope encryption:
-
-- On first boot, a 256-bit **Data Encryption Key (DEK)** is generated via KMS and stored (encrypted) in SSM
-- Data is encrypted with **AES-256-GCM** (random 12-byte nonce per write) before upload to S3
-- The storage bucket is provisioned by the OpenTofu module and discovered via SSM parameter
-- DEK is automatically re-encrypted during locked-key migration
-
-```sh
-# Store data
-curl -X PUT https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
-  -d 'binary data here'
-
-# Retrieve data
-curl https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# List keys by prefix
-curl "https://your-enclave/v1/storage?prefix=my/" \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Delete
-curl -X DELETE https://your-enclave/v1/storage/my/key \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-```
-
-### Dynamic Secrets
-
-Runtime-configurable secrets stored in encrypted S3 (reuses the storage DEK). Unlike static KMS secrets (provisioned at deploy time), dynamic secrets can be created, updated, and deleted at runtime.
-
-- Each secret has a `name`, optional `env_var` binding, and `value`
-- When `env_var` is set, the value is injected as an environment variable (conflicts with static secrets are rejected)
-- On boot, all stored dynamic secrets are loaded and their env vars injected
-- Survive enclave restarts and migrations
-
-```sh
-# Create a dynamic secret with env var binding
-curl -X PUT https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"env_var": "API_TOKEN", "value": "sk-..."}'
-
-# List all secrets (metadata only, no values)
-curl https://your-enclave/v1/secrets \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Retrieve a secret
-curl https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-
-# Delete
-curl -X DELETE https://your-enclave/v1/secrets/api-token \
-  -H "Authorization: Bearer $ENCLAVE_RUNTIME_TOKEN"
-```
-
-### Management Server
-
-The host-side supervisor (`supervisor/`) runs on the EC2 instance at `127.0.0.1:8443` (plain HTTP, localhost only). Access it via [SSM Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html).
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Enclave status (running/stopped, CID, memory, CPU count) |
-| GET | `/metrics` | Prometheus metrics (nitriding + host-level gauges) |
-| POST | `/start` | Launch the enclave via the in-process watchdog (`nitro-cli run-enclave`) |
-| POST | `/stop` | Terminate the enclave via the in-process watchdog (`nitro-cli terminate-enclave`) |
-| POST | `/migrate` | Full locked-key migration (streaming NDJSON progress) |
-| POST | `/schedule-key-deletion` | Schedule KMS key for 7-day deletion |
-
-The `/migrate` endpoint orchestrates the 9-step locked-key migration described in [Locked KMS Key (Migration)](#locked-kms-key-migration) below. It streams progress as newline-delimited JSON:
-
-```
-{"step":1,"total":9,"status":"progress","message":"Reading current KMS key..."}
-{"step":2,"total":9,"status":"progress","message":"Creating new KMS key..."}
-...
-{"step":9,"total":9,"status":"complete","message":"Migration complete. New KMS key: arn:aws:kms:..."}
-```
-
-## Security Model
-
-### Secret Lifecycle
-
-1. On first deploy, the CLI generates 32 random bytes per secret, encrypts them with KMS (attaching a Nitro attestation document), and stores the ciphertext in SSM Parameter Store
-2. On boot, the supervisor loads ciphertexts from SSM and decrypts via KMS (which validates PCR0)
-3. Decrypted values are set as environment variables — plaintext only exists in enclave memory
-4. SSM parameter path: `/{prefix}/{appName}/{secretName}/Ciphertext`
-
-### KMS Policy
-
-The deploy command applies a KMS key policy where:
-- The **admin statement** explicitly excludes `kms:Decrypt` and `kms:CreateGrant` — nobody outside the enclave can decrypt
-- The **enclave statement** allows `kms:Decrypt` only when `kms:RecipientAttestation:PCR0` matches the enclave measurement
-
-### Irreversible KMS Lockdown
-
-For maximum security, the `lock` command applies an **irreversible** policy using `--bypass-policy-lockout-safety-check`:
-
-- Removes all admin access (no `kms:PutKeyPolicy`, no `kms:ScheduleKeyDeletion`)
-- Only the enclave with the exact PCR0 can call `kms:Decrypt`
-- **This cannot be undone.** Not even the AWS root account can modify the policy afterward.
-
-```sh
-enclave lock
-```
-
-### Upgrade Paths
-
-When deploying a new enclave version (different PCR0), the upgrade path depends on whether the KMS key is locked.
-
-#### Unlocked KMS Key
-
-The KMS key policy still allows `kms:PutKeyPolicy`, so the CLI can update it with the new PCR0:
-
-1. CLI updates the KMS key policy with the new PCR0
-2. CLI stops the old enclave, uploads the new EIF, and restarts
-3. The new enclave boots and decrypts secrets using the existing KMS key (new PCR0 now allowed)
-
-#### Locked KMS Key (Migration)
-
-The KMS key policy is irreversible — only the old PCR0 can decrypt. Secrets must be re-encrypted to a new KMS key. The management server's `POST /migrate` endpoint orchestrates this as a 9-step process:
-
-1. Read current KMS key ID from SSM
-2. Create a **new KMS key** with a policy allowing the new PCR0 to decrypt
-3. Apply transitional KMS policy (grants Encrypt to EC2 role, no Decrypt)
-4. Store migration parameters in SSM (`MigrationKMSKeyID`, `MigrationOldKMSKeyID`)
-5. Call `POST /v1/start-migration` on the running enclave. The enclave:
-   - Reads `MigrationKMSKeyID` from SSM (this is the only gate — if the param is unset, the endpoint returns an error)
-   - Decrypts each secret using the old KMS key (which only this enclave can do)
-   - Re-encrypts each secret with the new KMS key
-   - Stores the migration ciphertexts in SSM under `Migration/{secretName}/Ciphertext`
-   - Stores its PCR0 and an NSM attestation proof in SSM
-6. Poll SSM for migration ciphertexts (60s timeout)
-7. Adopt migration ciphertexts — copy to permanent SSM paths, update `KMSKeyID`
-8. Download new EIF from S3, stop old enclave, replace EIF, start new enclave
-9. Clean up migration SSM parameters
-
-The new enclave boots, decrypts secrets using the new KMS key (PCR0 matches), and schedules the old KMS key for deletion (7-day pending window via `MigrationOldKMSKeyID`).
-
-### PCR0 Attestation Chain
-
-Each enclave version records its predecessor's PCR0, creating a verifiable upgrade chain:
-
-```
-Genesis -> PCR0_v1 (previous_pcr0=genesis)
-        -> PCR0_v2 (previous_pcr0=PCR0_v1, attestation=<signed proof>)
-        -> PCR0_v3 (previous_pcr0=PCR0_v2, attestation=<signed proof>)
-```
-
-The attestation proof is an NSM attestation document — a COSE Sign1 structure signed by AWS Nitro hardware. It contains the enclave's PCR values, proving the reported `previous_pcr0` came from a real enclave (not a compromised host).
-
-`GET /v1/enclave-info` returns both `previous_pcr0` and `previous_pcr0_attestation`. The `enclave verify` command automatically verifies the attestation document against the AWS Nitro root certificate and confirms the PCR0 inside matches the reported value.
-
-## Reproducible Build
-
-The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util), producing a byte-identical EIF on every build. The framework pins every Nix input (`nixpkgs`, `flake-utils`, `aws-nitro-util`) to a specific commit SHA at release time — a fresh `enclave init` produces a fully deterministic build without any operator action.
-
-Three layers protect reproducibility against different failure modes:
-
-| Layer | What it protects | Status |
+| Endpoint | Direction | Purpose |
 |---|---|---|
-| **Pinned inputs** | Derivation graph stability (all Nix inputs at fixed SHAs) | ✅ Always on — framework-managed |
-| **Cachix cache** | Upstream source availability (yanked crates, deleted repos) | Opt-in — add `nix.substituters` |
-| **Vendor mode** | App source deps (Rust/Go) — survives first build with no cache | Opt-in — set `app.vendor: true` |
+| vsock CID 3:1024 | enclave to host | gvproxy L2 network |
+| vsock CID 3:8002 | enclave to host | IMDS forwarding |
+| vsock CID 3:9000 | EIF init to host | boot heartbeat |
+| TCP :443 | public to enclave | TLS, runtime API, application proxy |
+| TCP 127.0.0.1:8080 | inside enclave | internal runtime API |
+| TCP 127.0.0.1:7074 | inside enclave | the application |
 
-### `nix:` yaml block
+Migration has no control endpoint. It runs between the enclaves themselves,
+over SSM and the intent log, so there is no inbound surface to authenticate or
+restrict.
 
-Cachix and the optional nixpkgs override are configured here:
+### State model
+
+The runtime keeps no state on disk. Each generation publishes one attested,
+compliance-locked S3 snapshot containing its KMS-encrypted master seed and TLS
+key. SSM holds configuration, inherited secrets and the migration challenge
+exchange.
+
+- Each generation's KMS key admits only its PCR0. `Decrypt` and `GenerateDataKey`
+  require attestation, even for callers with the instance role.
+- Genesis creates a 32-byte master seed and an independent P-256 TLS key.
+  Application secrets, the storage DEK and the ACME account key derive from the
+  seed. Static secret *i* extends PCR(16+i), which is then locked.
+- Migration preserves the seed and TLS key, re-encrypting them for the
+  successor. The predecessor keeps its own snapshot and key and can continue
+  serving or restart independently.
+
+### Boot paths
+
+An enclave starts as **candidate**, serving `/enclave/v1/info` over an ephemeral
+self-signed certificate. Application routes, `/health` and
+`/enclave/attestation` return `503`. After establishing state, it moves to
+**starting** while configuring PCRs and TLS, then **ready** when the application
+starts. Candidates cannot be pinned through attestation.
+
+| Condition | Behaviour |
+|---|---|
+| Own `snapshot/<pcr0>` verifies | Resume from it without reading generation state from SSM. |
+| No snapshot; `ENCLAVE_PREVIOUS_PCR0=genesis` | Acquire the genesis lease, create keys and publish the snapshot. |
+| No snapshot; `ENCLAVE_PREVIOUS_PCR0=<predecessor PCR0>` | Wait for the predecessor's finalised intent, verify its receipt and key policy, then adopt and publish a snapshot. |
+| Existing versions cannot be verified, or S3 cannot be read | Fail boot; never treat invalid or unreadable state as absent. |
+
+**Use one independent deployment per namespace and app name.** Update an existing
+deployment through [migration](#bluegreen-migration). For a fresh genesis, choose
+a new `ENCLAVE_NAMESPACE` or `ENCLAVE_APP_NAME`. Different genesis images in the
+same namespace/app create unrelated keys but share certificate storage; with the
+same FQDN, the new image cannot decrypt the existing certificate. The runtime
+has no deployment-wide guard against this configuration.
+
+Replicas of one image share its snapshot. Concurrent publishers accept the same
+state even if their receipt bytes differ; a publisher with different state fails
+and can resume the winner's state on restart.
+
+Boot synchronises the clock, starts networking and AWS clients, applies the SSM
+overlay, runs the [permission preflight](#aws-requirements) and starts telemetry
+before establishing state. A failure from the preflight through telemetry leaves
+`/enclave/v1/info` available with status `failed` and the error, naming the
+missing grants for the preflight, and writes no state. Later failures terminate
+the runtime and are logged as `runtime failed` in the runtime log group. Earlier
+failures reach only the console.
+
+### Generation state
+
+The derived [state bucket](#aws-requirements) holds two kinds of locked record:
+
+| Key | Writer | Contents |
+|---|---|---|
+| `snapshot/<pcr0>` | The generation's enclave | Ciphertexts, KMS key ID, deployment and predecessor identities, and attestation receipts. |
+| `migration-intent/<sourcePCR0>/<sequence>` | The predecessor | Migration requests, aborts and finalised handoffs. A finalised record carries the successor's snapshot, and its attestation is the successor's transition receipt. |
+
+Snapshots use canonical CBOR wrapped in JSON with receipts. The owner's
+state-origin receipt authenticates the snapshot root and lineage. A migrated
+snapshot also carries the predecessor's transition receipt, binding its PCR0
+and PCR31 commitment to the successor. See [snapshot.go](runtime/snapshot.go)
+for the schemas and receipt format.
+
+**Discovery** lists object versions because newer versions and delete markers
+can hide a locked version. It selects the earliest version whose encoding,
+deployment identity, receipts and compliance retention all verify. Multipart
+uploads are rejected to prevent backdating. Conflicting states at the earliest
+timestamp, unreadable versions, or existing versions with none valid cause boot
+to fail.
+
+**Publication** uses `If-None-Match: *` with compliance retention. The writer then
+verifies the stored version and requires it to match its snapshot before
+serving. This read-back checks the actual lock; IAM preflight cannot check bucket
+configuration. Before first adoption succeeds, the successor still needs the
+handoff to be its predecessor's active intent. Keep the predecessor serving
+until the successor is ready.
+
+**Retention** is ten years in production and five minutes under `ENCLAVE_DEV`.
+To keep a generation beyond that period, extend the earliest valid version's
+lock before it expires:
+
+```sh
+aws s3api put-object-retention --bucket <state bucket> --key snapshot/<pcr0> \
+  --version-id <earliest valid version> \
+  --retention 'Mode=COMPLIANCE,RetainUntilDate=<new date>'
+```
+
+**Recovery** of a published generation needs its snapshot, KMS key and image.
+Restarting discovers the snapshot whatever SSM holds. Configuration and
+inherited secrets still come from SSM. Deleting a
+generation's own KMS key prevents recovery; deleting a predecessor's key does
+not prevent an adopted successor from booting. See
+[blue/green migration](#bluegreen-migration) before retiring keys.
+
+If no version verifies, inspect the runtime's validation errors and list the
+versions with `aws s3api list-object-versions --bucket <bucket> --prefix snapshot/<pcr0>`.
+
+## Nix API
+
+The flake exports one function under `lib`.
+
+### `lib.buildEif`
+
+Builds a measured enclave image.
+
+Arguments:
+
+```nix
+{
+  pkgs,                   # x86_64-linux package set
+  app,                    # package; executable selected with pkgs.lib.getExe
+  env,                    # environment baked into the measurement
+  overrideAllowlist ? [ ], # application env vars that SSM may override
+  extraPackages ? [ ],     # additional packages in the enclave rootfs
+}
+```
+
+Produces a derivation containing `image.eif` and `pcr.json`.
+
+- `buildEif` selects the executable with `pkgs.lib.getExe`. Set
+  `app.meta.mainProgram` when it differs from the package name. The executable
+  is copied under `/app`, and `APP_BINARY_NAME` is injected automatically.
+- `env` is part of the measurement. Changing any value changes PCR0.
+  `buildEif` does not currently validate runtime configuration; missing or invalid
+  required values fail when the EIF boots.
+- `overrideAllowlist = [ "VAR_FOO" "VAR_BAR" ];` allows SSM to override those
+  application environment variables. It defaults to an empty list and is part of
+  the measurement. `buildEif` joins the names with commas and sets
+  `ENCLAVE_OVERRIDE_ALLOWLIST`; specifying that variable in `env` is an error.
+  The runtime's explicit SSM configuration overrides remain available regardless
+  of this list. Runtime configuration names are reserved; use separate names for
+  application settings. See [SSM environment overlay](#ssm-environment-overlay).
+- The rootfs contains the system CA store and nothing else by default. The
+  runtime never shells out. Applications that need `/bin/sh` or other utilities
+  must request them: `extraPackages = [ pkgs.busybox ]`.
+
+### Packages
+
+The flake also exposes these packages:
+
+| Package | Systems | Purpose |
+|---|---|---|
+| `runtime` | `x86_64-linux` | The runtime executable embedded by `buildEif`. |
+| `cli`, `default` | Linux and Darwin | The `enclave` client CLI. |
+| `eif-blue`, `eif-green` | `x86_64-linux` | Test-app EIFs from `nix/tests/`. Exist so this repo can exercise `eif-build.yml` against a real image. |
+
+For example, `nix run github:ArkLabsHQ/enclave` runs the client CLI, and
+`nix build github:ArkLabsHQ/enclave#runtime` builds the standalone runtime.
+
+### CI
+
+`eif-build.yml` and `eif-publish.yml` are reusable workflows. An app repo calls
+them instead of writing its own pipeline:
 
 ```yaml
-nix:
-  substituters:
-    - "https://your-cache.cachix.org"   # only Cachix URLs are accepted
-  trusted_public_keys:
-    - "your-cache.cachix.org-1:<base64-key>="
-  nixpkgs_rev:  "25f5383..."            # written by `enclave nixpkgs pin`
-  nixpkgs_hash: "sha256-..."            # written by `enclave nixpkgs pin`
+jobs:
+  build:
+    uses: ArkLabsHQ/enclave/.github/workflows/eif-build.yml@<sha>
+    with:
+      environments: '["dev"]'
+      app_name: myapp
 ```
 
-All four fields are optional and independent. An empty `nix:` block (or no block at all) leaves the framework's built-in defaults in effect.
+The calling flake must expose `packages.<system>.eif-<env>` for each environment,
+each producing `image.eif` and `pcr.json`. `version_flake_attr` additionally
+requires an attribute carrying a `version`, asserted against a `v*` tag.
 
-### `enclave nixpkgs pin`
+`eif-publish.yml` must run in the same workflow run as `eif-build.yml`, and the
+**caller** must grant `permissions: id-token: write` — a called workflow cannot
+elevate it, which matters when the repos are in different organisations.
 
-The framework already ships a pinned `nixpkgs` SHA per release (same as `flake-utils` / `aws-nitro-util`), so new projects are pinned by default. Run this only when you want to **upgrade** to a newer nixpkgs — to pick up security patches or a newer compiler:
+### Development shell
+
+`nix develop` provides Go, `gopls`, formatting tools, and `golangci-lint` for
+working on this repository.
+
+## Runtime configuration
+
+Configuration is supplied through the EIF environment, which is part of the
+measurement. A subset can be overridden at runtime from SSM.
+
+### Identity and security
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENCLAVE_NAMESPACE` | none | Required. Leading segments of every SSM path, CloudWatch log group and S3 object key: `prod` yields `/prod/<app>/enclave/...`, `ark/prod` yields `/ark/prod/<app>/enclave/...`. Used exactly as set, never cleaned, and the enclave refuses to boot unless it is one to nine `/`-separated segments of letters, digits and `_.-` (the characters SSM parameter names accept) with no leading, trailing or doubled `/` and no `.` or `..` segment, its first segment does not start with `aws` or `ssm` in any case (SSM reserves those), and `/<namespace>/<app>/enclave` is at most 256 characters. Baked into the EIF, never read from the SSM overlay, which is itself read from under it. |
+| `ENCLAVE_APP_NAME` | none | Required. The path segment after the namespace, used exactly as set: one segment of letters, digits and `_.-`, other than `.` or `..`. |
+| `ENCLAVE_DEV` | `false` | Selects development retention periods, write timeout, clock-sync interval and unlocked KMS policy, as listed below. Attestation signature verification remains enabled. See [Security notes](#security-notes). |
+| `ENCLAVE_INSECURE_VERIFY_SKIPPED` | `false` | Skips COSE signature and certificate chain verification of attestation documents only when `ENCLAVE_DEV=true`. Ignored entirely in production, including malformed values. For QEMU-based tests only. Baked into the EIF, never read from the SSM overlay. |
+| `ENCLAVE_VERIFY_CLOCK_SOURCE` | `true` | Requires the system clock source to be `kvm-clock`. Can be enabled or disabled in either production or dev mode. Baked into the EIF, never read from the SSM overlay. |
+| `ENCLAVE_PREVIOUS_PCR0` | required | Predecessor PCR0 for migration, or `genesis` for a fresh deployment. Measured and not SSM-overridable; see [Boot paths](#boot-paths). |
+| `ENCLAVE_SECRETS_CONFIG` | empty | JSON array of managed static secrets. Schema below. |
+| `ENCLAVE_AWS_REGION` | `us-east-1` | Region for all AWS SDK clients. |
+
+`ENCLAVE_DEV=true` lets dev deployments use shorter timings while retaining
+attestation signature verification:
+
+| Setting | Production | Dev |
+|---|---|---|
+| Generation snapshot Object Lock retention | 10 years | 5 minutes |
+| Migration intent Object Lock retention | 10 years | 10 minutes |
+| Migration intent write timeout | 10 minutes | 2 minutes |
+| Clock-sync interval | 5 minutes | 5 seconds |
+| KMS key policy / SSM namespace segment | Locked / `locked` | Root recovery principal retained / `unlocked` |
+
+Clock-source verification defaults to enabled and migration cooldown defaults
+to 24 hours in both modes. Set `ENCLAVE_VERIFY_CLOCK_SOURCE` and
+`ENCLAVE_MIGRATION_COOLDOWN` independently to override them.
+
+### Listeners and application
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENCLAVE_APP_PORT` | `7074` | Port the application listens on. |
+| `ENCLAVE_UPSTREAM` | `auto` | Runtime-to-application HTTP version. `h1` pins HTTP/1.1, `h2c` pins HTTP/2 cleartext and is required for gRPC, `auto` matches the inbound request. |
+| `ENCLAVE_FQDN` | `localhost` | Hostname for the TLS certificate. |
+| `ENCLAVE_VIPROXY_IN_ADDRS` | `127.0.0.1:80` | IMDS forwarder listen address. |
+| `ENCLAVE_VIPROXY_OUT_ADDRS` | `3:8002` | IMDS forwarder target, `CID:PORT` or `host:port`. |
+| `APP_BINARY_NAME` | `app` | Set by `buildEif` from the selected executable. The runtime execs `/app/<value>`, and exits before writing any state if it is missing or not executable. |
+
+The runtime always starts the in-process IMDS forwarder before loading AWS
+credentials. `ENCLAVE_VIPROXY_ENABLED` has been removed; setting it to `false`
+has no effect. The listen and target addresses remain configurable through
+`ENCLAVE_VIPROXY_IN_ADDRS` and `ENCLAVE_VIPROXY_OUT_ADDRS`.
+
+The external TLS listener (443), the internal loopback listener (8080) and the
+host vsock port gvproxy listens on (1024) are fixed. The last of those is
+hardcoded on the host side too, so a value only the enclave knew about would
+silently break networking.
+
+### Migration
+
+Object Lock retention is fixed by the measured image: ten years in production;
+in development, five minutes for snapshots and ten minutes for migration
+intents. Governance mode and insufficient retention are rejected. The check
+allows two minutes in development and ten in production for upload delay and
+clock skew; this write budget has no environment override.
+
+The migration cooldown defaults to 24 hours in both modes. Set
+`ENCLAVE_MIGRATION_COOLDOWN` in the image to change the delay between adopting a
+candidate's attestation and committing its handoff.
+
+Version reads use `PartNumber=1` and reject any response with `PartsCount`.
+Multipart timestamps date from upload initiation, so accepting them could let a
+host backdate a replay to bypass the cooldown or replace the earliest snapshot.
+A failed read stops the scan.
+
+### Clock
+
+By default, both production and dev mode fail the boot unless the system clock
+source is `kvm-clock`. `ENCLAVE_VERIFY_CLOCK_SOURCE=false` skips this assertion
+in either mode. The QEMU harness sets it explicitly because it boots without
+the required clock source.
+
+The runtime hard-steps the clock onto the PTP hardware clock at startup, then
+runs a PI servo that corrects frequency drift every five minutes in production
+or every five seconds with `ENCLAVE_DEV=true`. Offsets above 100 ms trigger
+another hard-step. `/dev/ptp0` is mandatory even when clock-source verification
+is disabled; the boot fails without it.
+
+### Telemetry
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENCLAVE_MIGRATION_COOLDOWN` | `24h` | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Can be set in either production or dev mode; unset defaults to 24 hours in both. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
+| `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Export cadence for the runtime's own logs, spans and metrics. The application's cadence is its own exporter's. |
+| `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required | Child environment variable that receives the OTLP/HTTP base URL. Must be set in the image. SSM-overridable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required | Child environment variable that receives the per-boot bearer token. Must be set in the image. SSM-overridable. |
+| `ENCLAVE_TRACES` | `false` | `true` exports spans to X-Ray: the runtime's own and the application's, relayed from `/v1/traces`. Needs Transaction Search and the `XRayAccess` statement. Otherwise the application's uploads and the runtime's own spans are dropped inside the enclave with an empty success response. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
+| `ENCLAVE_METRICS` | `false` | `true` exports metrics to CloudWatch: the runtime's own counters, `/proc` readings and forward-duration histograms, and the application's, relayed from `/v1/metrics`. Needs the `CloudWatchMetricsAccess` statement. Otherwise the application's uploads and the runtime's own metrics are dropped inside the enclave with an empty success response, so export failures show only on `stderr`. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
+
+The application posts OTLP/HTTP to the internal listener. The runtime signs
+each request with the instance role, forwards its body unchanged, and returns
+the AWS response:
+
+| Signal | Endpoint | Signed as | Lands in |
+|---|---|---|---|
+| logs | `logs.<region>.amazonaws.com/v1/logs` | `logs` | The log groups below, in the stream named for the instance. |
+| traces | `xray.<region>.amazonaws.com/v1/traces` | `xray` | X-Ray, in the `aws/spans` log group Transaction Search owns. |
+| metrics | `monitoring.<region>.amazonaws.com/v1/metrics` | `monitoring` | The CloudWatch OpenTelemetry metrics store, queried with PromQL. |
+
+Logs are always forwarded. Traces and metrics are forwarded only when
+`ENCLAVE_TRACES` or `ENCLAVE_METRICS` is `true`; otherwise their uploads get an
+empty success response and are dropped, so the application's exporter carries on.
+
+The relay accepts `application/x-protobuf` and `application/json`, including
+`gzip`, and caps encoded request bodies at 1 MiB for logs and metrics and 5 MiB
+for traces. AWS applies its decoded size, record count and timestamp limits. The
+runtime does not decode or retry uploads; it returns the AWS status,
+`Retry-After` and response body to the application exporter.
+
+The runtime exports its own telemetry with the OpenTelemetry SDK and identifies
+it with the `service.name=enclave-runtime` resource.
+
+With `ENCLAVE_TRACES=true`, the runtime records a server span for each external
+request, named for its route: `proxy`, `enclave-info` or `enclave-attestation`.
+`/health`, unmatched `/enclave/` paths and `/enclave/` CORS preflights have none.
+Proxied requests add an `upstream` client span, which ends when the app's response
+headers arrive, so each one costs two spans in Transaction Search.
+
+The runtime sends the app a W3C `traceparent` naming the `upstream` span. To join
+the trace, the app must extract it with a TraceContext propagator. Trace context
+from the internet is untrusted: each request starts a new root span that only links
+the caller's trace and span IDs, and the caller's `traceparent` and `tracestate` do
+not reach the app. With `ENCLAVE_TRACES=false`, the proxy forwards them unchanged.
+
+These spans carry only the method, response status and app host. They carry no path,
+query or client headers, because the operator can read X-Ray but not the TLS traffic.
+
+Log groups are named `/<namespace>/<app>/enclave/logs/<source>`, under the same
+namespace as the [SSM parameters](#ssm-parameters), where `<namespace>` is
+`ENCLAVE_NAMESPACE`:
+
+| Log group | Holds |
+|---|---|
+| `/<namespace>/<app>/enclave/logs/app` | The application's OTLP log records. |
+| `/<namespace>/<app>/enclave/logs/runtime` | The runtime's own records. |
+
+At boot, the runtime creates both groups and one stream per group named after
+the EC2 instance ID, applies retention, and writes a probe record to the runtime
+group. Failure to read the instance ID from IMDS or write the probe aborts
+startup. Restarts on the same instance reuse its streams.
+
+**Changed:** group names used to be `<ENCLAVE_LOG_GROUP_PREFIX>/<deployment>/enclave/...`,
+with no `<app>` segment, so two applications in one deployment shared groups unless the
+prefix told them apart. `ENCLAVE_LOG_GROUP_PREFIX` and `ENCLAVE_DEPLOYMENT` are gone.
+`ENCLAVE_NAMESPACE` replaces both: `ENCLAVE_DEPLOYMENT=prod` becomes
+`ENCLAVE_NAMESPACE=prod` with S3 keys and the intent bucket name unchanged, and a former prefix
+moves in front, as in `ENCLAVE_NAMESPACE=ark/prod`, which then heads the SSM paths and
+S3 keys as well. It is baked rather than settable from the overlay, and with
+`ENCLAVE_APP_NAME` names every log group exactly as it names every SSM parameter. Alarms, dashboards and the `CloudWatchLogsAccess`
+policy keyed on the old names need updating.
+
+When those signals are on, spans require Transaction Search to be enabled for X-Ray traces in the
+CloudWatch account settings, and metrics require `cloudwatch:PutMetricData`. Export failures are counted in
+`enclave_telemetry_export_errors_total`, rate limited on `stderr`, and do not
+abort startup. Metrics are queried with PromQL by their OTLP attributes.
+
+With `ENCLAVE_METRICS=true`, the runtime's counters ship as cumulative sums: `enclave_http_requests_total`,
+`enclave_http_client_errors_total` (`4xx` responses), `enclave_http_server_errors_total`
+(`5xx`), `enclave_app_proxied_requests_total`,
+`enclave_app_proxied_errors_total`, `enclave_otlp_<logs|traces|metrics>_forwarded_total`
+(uploads accepted with a `2xx`, by AWS or, for a signal that is off, by the enclave
+dropping them),
+`enclave_otlp_<logs|traces|metrics>_upstream_errors_total` (a transport failure, a
+`429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime
+and `/proc` readings ship as `enclave_runtime_*` gauges and counters.
+
+The public listener receives internet scanner traffic, so client errors are mostly
+probes for paths such as `/.env` and `/.git/config`. Alarm on
+`enclave_http_server_errors_total` and on `enclave_app_proxied_errors_total`, which counts
+the proxy failing to reach the app; that `502` is also a server error. `404`s on the
+public listener are counted but not written to the access log; other `4xx`, such as a
+real client's `400` or `401`, still are. Apps should create spans only for the routes
+they serve, for example by skipping requests whose `r.Pattern` is empty with Go's
+`ServeMux`, or sample them.
+
+`enclave_otlp_<logs|traces|metrics>_forward_duration_seconds` is a histogram of
+each upload's full exchange with AWS, from sending the request to the end of the
+response body, failed ones included, whether relayed for the application or
+exported by the runtime. Both leave the enclave over the vsock
+proxy, so a slowing egress path shows here as rising latency long before uploads
+fail at the 30-second timeout. Buckets run from 5 ms to 30 s.
+
+**Changed:** `enclave_http_errors_total` is replaced by `enclave_http_client_errors_total`
+and `enclave_http_server_errors_total`.
+The access log no longer records `404`s on the public listener and records `5xx`
+responses at `WARN`.
+
+**Changed:** traces and metrics are opt-in. Set `ENCLAVE_TRACES=true` and
+`ENCLAVE_METRICS=true` to keep exporting them; without them only logs leave the
+enclave.
+
+**Changed:** trace and metric log groups and the local telemetry decoder were
+removed. Logs remain in the two groups above; spans and metrics use their native
+AWS stores. Records no longer contain the runtime-added `id`, `level` or
+`source` fields. Eight counters were removed, so alarms and dashboards on them
+need updating: `enclave_log_entries_total`, `enclave_supervisor_log_entries_total`,
+`enclave_app_metrics_dropped_total`, and the queue-overflow counters
+`enclave_telemetry_logs_app_dropped_total`,
+`enclave_telemetry_logs_supervisor_dropped_total`,
+`enclave_telemetry_traces_app_dropped_total`,
+`enclave_telemetry_traces_supervisor_dropped_total` and
+`enclave_telemetry_metrics_dropped_total`. Application uploads are no longer
+queued: the relay is synchronous, so the application's exporter sees each failure
+and `Retry-After` itself. The runtime's own records still pass through the
+OpenTelemetry SDK's batch queues, whose overflow drops are not counted. The
+forward-duration histograms show a congested egress path, not whether anything
+was dropped.
+
+`stderr` is unaffected: it still carries every runtime record, unbatched.
+
+### AWS endpoint overrides
+
+`AWS_ENDPOINT_URL_KMS`, `AWS_ENDPOINT_URL_SSM`, `AWS_ENDPOINT_URL_STS`,
+`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_LOGS`, `AWS_ENDPOINT_URL_XRAY`,
+`AWS_ENDPOINT_URL_MONITORING`, `AWS_ENDPOINT_URL_IAM` and `AWS_ENDPOINT_URL_ROUTE53`
+override the corresponding service endpoints.
+`AWS_ENDPOINT_URL_LOGS` covers both the CloudWatch Logs API and its OTLP `/v1/logs`
+path, since they share an endpoint in production. Setting the S3 endpoint also
+forces path-style addressing. These exist for testing against an emulator.
+
+### Static secrets
+
+`ENCLAVE_SECRETS_CONFIG` is a JSON array:
+
+```json
+[
+  { "name": "signing-key", "env_var": "SIGNING_KEY" }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Stable derivation name, baked into the image. |
+| `env_var` | Environment variable set on the application process, containing 64 lowercase hex characters. |
+| `kind` | Optional. `static` (default) or `signing`, a secret threshold-shared across a scaled group; see [Threshold scaling](#threshold-scaling). |
+
+Each secret derives from the deployment's master seed using HKDF-SHA256 with
+salt `enclave.derived-secret.v1` and the name encoded as one deterministic CBOR
+text string. The runtime scans successive 32-byte blocks of one 255-block
+expansion, choosing the first valid secp256k1 scalar without modular reduction.
+It exports exactly 64 lowercase hex characters and commits the public key to
+an application PCR. If no block is valid, boot fails.
+
+Changing `env_var` preserves the key; changing `name` rotates it. Removing and
+later restoring a name restores the same key. Removing a declaration stops its
+export but does not erase the key while the master seed exists. Migration
+preserves the seed, so a predecessor need not know its successor's declarations.
+
+The storage DEK uses the first 32 HKDF bytes for `runtime/StorageDEK` directly.
+The ACME account signer uses the same rejection sampling with P-256's scalar
+order and the name `runtime/ACMEAccountKey`. These names, the salt and the
+algorithm are protocol constants; environment variables, PCR0 and KMS IDs do
+not enter derivation. Storage-key rotation requires a separate data migration
+design; keep `runtime/StorageDEK` unchanged.
+
+Master-seed compromise requires another fresh deployment with a new seed: migration and renaming
+cannot restore secrecy, including for names introduced by future releases. Renaming can replace
+a compromised derived key while the seed remains private, but it neither revokes
+the old key nor removes it from previous releases. The release must handle any
+dependent state, including account registration if the ACME derivation name changes.
+
+The runtime keeps the seed and internal private keys out of the child's environment.
+This assumes a trusted child; it does not isolate runtime memory from malicious
+application code.
+
+Constraints:
+
+- `name` must be unique and contain only ASCII letters, digits and `_.-`.
+  Application names cannot contain `/`; the entire `runtime/` namespace is
+  reserved for current and future internal keys. Bare `StorageDEK` is allowed.
+- `env_var` must be a valid environment identifier, unique across static and
+  inherited secrets, and must not use a runtime-reserved child variable.
+- Order is significant. Secret *i* is committed to PCR(16+i). PCR31 is reserved
+  for migration, so at most 15 secrets are supported.
+- Changing the array changes the measurement, and therefore PCR0.
+
+### Inherited secrets
+
+A static secret is born inside the enclave. An inherited secret already exists
+in the outside world — a legacy signing key, say — and is handed to the
+application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array:
+
+```json
+[
+  {
+    "name": "legacy-signer",
+    "env_var": "LEGACY_SIGNING_KEY",
+    "type": "publicKey",
+    "value": ["02…"],
+    "cutoff": "2027-01-01T00:00:00Z"
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The operator places the secret at `/<namespace>/<app>/enclave/inherit/<name>`, as a `String` or `SecureString`. |
+| `env_var` | Environment variable set on the application process, containing the parameter value with surrounding whitespace trimmed. |
+| `type` | `hash` or `publicKey`: what `value` pins. |
+| `value` | Array of commitments, one per delivered entry. `hash`: hex SHA-256 of the secret; the entry is the secret hex-encoded, and the pin covers the decoded bytes. `publicKey`: hex compressed secp256k1 public key; the entry is the matching private key as 64 hex characters. Every entry is hex, so a comma or colon inside a secret cannot occur. With more than one commitment the delivered value is a comma-separated list of the same length, each entry matched against one unused commitment in any order. Any entry may carry metadata for the application after a colon, as in `<private-key>:<unix-timestamp>`: only the secret is pinned, and the entry reaches the application whole. The metadata must not contain a comma. |
+| `cutoff` | Optional RFC 3339 timestamp from which the application no longer receives the secret. Without one, the value is still verified against its pin, but it is delivered on every boot for as long as its parameter exists and no restart ever withdraws it. |
+
+The array is baked into the image, so the pins and cutoffs are part of PCR0: a
+verifier knows which outside secret the enclave accepts, and until when, or
+that no cutoff applies.
+
+At boot, before the application starts:
+
+- A secret at or past its `cutoff` is not read: its parameter is never
+  fetched, so the parameter and the KMS key of a `SecureString` can be retired
+  once the cutoff has passed without affecting later boots.
+- A value that does not match its pin **aborts boot**.
+- A missing parameter is logged and skipped. Deleting a parameter therefore
+  withdraws the secret from future boots; enclaves already running keep it
+  until its cutoff or their next restart.
+- The cutoff is checked again just before the application is launched, so a
+  slow boot cannot hand over a secret that expired in the meantime.
+
+When a cutoff passes while the enclave is running, the runtime clears the
+variable and restarts the application without it. The runtime itself, its
+attestation and its TLS identity are unaffected; the application sees a
+`SIGTERM` (then `SIGKILL` after ten seconds) and a fresh start. The cutoff is
+checked every 30 seconds against the enclave's synchronised clock.
+
+Constraints:
+
+- `name` must be unique and a single path segment.
+- `env_var` must be a valid identifier, unique across static and inherited
+  secrets, and not one of the runtime exports listed under
+  [Application process environment](#application-process-environment).
+- `env_var` must not be set in the baked environment nor be in
+  `overrideAllowlist`, so nothing else can stand in for a secret that is not
+  delivered or is past its cutoff. Either **aborts boot**.
+
+An inherited secret is only as private as its history: whoever can read the SSM
+parameter can read it, and so could everyone who held it before. The pin
+guarantees the enclave uses the intended secret, not that nobody else has it.
+Inherited secrets are not extended into a PCR and are not part of the migration
+snapshot — a successor reads the same parameter.
+
+The parameter type is the operator's choice and does not change what the
+enclave guarantees. A `String` is readable by anyone with `ssm:GetParameter` on
+the path. A `SecureString` is encrypted at rest by SSM with a KMS key the
+operator owns — the account's `aws/ssm` key or a customer-managed one, created
+before the parameter is written and unrelated to the enclave's own key — so
+reading it also takes `kms:Decrypt` on that key, and every read leaves a
+CloudTrail record. The runtime asks SSM to decrypt when it reads the parameter;
+the instance role therefore needs `kms:Decrypt` on that key, and on no other.
+
+### Threshold scaling
+
+A static secret with `"kind": "signing"` can be threshold-shared across a group
+of enclaves: each node holds only a share, and a majority reconstructs the
+secret. [SCALING-ARCHITECTURE.md](SCALING-ARCHITECTURE.md) describes the protocol.
+
+The leader and its followers are separate images, built from the same code with
+a different baked role, so each has its own seed and KMS key and no follower can
+reach the leader secret. The leader derives that secret from its seed like any
+static secret, so migration preserves it and the group key never changes.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENCLAVE_SCALING_ROLE` | empty | `leader` or `follower`. Empty disables scaling, and a signing secret is then an ordinary static secret. Baked into the EIF. |
+| `ENCLAVE_SCALING_FOLLOWER_PCR0S` | empty | Required for a leader: comma-separated PCR0s of the follower images it admits. Baked into the EIF, so the follower images are built first. |
+| `ENCLAVE_SCALING_LEADER_ADDR` | empty | Required for a follower: the leader's `https://` handshake URL. Baked, or set through the SSM overlay. |
+| `ENCLAVE_SCALING_LISTEN_PORT` | `9000` | Leader: port of its threshold relay, which the host forwards like 443. |
+| `ENCLAVE_SCALING_HEARTBEAT_INTERVAL` | `10s` | Follower: how often it proves liveness to the leader. |
+| `ENCLAVE_SCALING_LIVENESS_TIMEOUT` | `60s` | Leader: silence after which it evicts a follower and reshares. |
+| `ENCLAVE_SCALING_MONITOR_TICK` | `15s` | Leader: how often it checks for silent followers. |
+
+- The leader admits only the listed follower PCR0s. A follower can only check
+  that the leader attests the same kernel (PCR1).
+- A follower does not derive its signing secrets: boot waits up to five minutes
+  for its share before the application starts.
+- Until a follower joins, the leader's application receives the leader secret.
+  After every ceremony, each node's application restarts with its new share.
+- Each node keeps its share, and the group's public recovery data, in the
+  certificate bucket under `<namespace>/<app>/data/threshold/`, sealed with the
+  storage DEK, so a restart reuses its share. The leader keeps its ban list there.
+- PCR(16+i) of a signing secret commits to the group public key, the same on
+  every member, instead of to the secret's own public key.
+- Run at most one node of each image per AWS account: replicas of an image share
+  its seed, and with it their threshold identity.
+
+### SSM environment overlay
+
+Parameters under `/<namespace>/<app>/enclave/env/` are read at boot (non-recursively,
+with decryption). Application variables are exported only when named in
+`buildEif.overrideAllowlist`, which defaults to an empty list. This allows
+application configuration changes without rebuilding the image.
+
+The following names update runtime configuration directly, regardless of the
+allowlist. They are reserved for the runtime: adding them to the allowlist does
+not export them into the application's environment. The runtime explicitly
+passes the final application port to the child as described in
+[Application process environment](#application-process-environment).
+
+| Parameter under `/<namespace>/<app>/enclave/env/` | Purpose |
+|---|---|
+| `ENCLAVE_APP_PORT` | Application listen port and runtime proxy target port. |
+| `ENCLAVE_FQDN` | Certificate hostname. |
+| `ENCLAVE_USE_ACME` | `true` switches from self-signed to ACME. |
+| `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
+| `ENCLAVE_ACME_EMAIL` | ACME account contact. |
+| `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required name of the child's OTLP endpoint variable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required name of the child's OTLP bearer-token variable. |
+| `ENCLAVE_SCALING_LEADER_ADDR` | A threshold follower's leader handshake URL; see [Threshold scaling](#threshold-scaling). |
+
+`ENCLAVE_FQDN` and the four ACME settings start with their baked values, which
+the overlay may replace; `ENCLAVE_FQDN` defaults to `localhost` and ACME to off.
+A baked `ENCLAVE_USE_ACME` that is not a boolean fails the boot, while the
+overlay treats anything but `true`, in any case, as off.
+
+Applications that need the same value must use a separate variable. For example,
+allowlist `APP_PUBLIC_HOSTNAME` and set
+`/prod/wallet/enclave/env/APP_PUBLIC_HOSTNAME` to `wallet.example.com` for the app.
+Set `/prod/wallet/enclave/env/ENCLAVE_FQDN` separately for the runtime's TLS certificate.
+
+The overlay cannot change the runtime's captured identity, lineage or security
+settings: `ENCLAVE_NAMESPACE`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
+`ENCLAVE_INHERIT_SECRETS_CONFIG`, `ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`,
+`ENCLAVE_VERIFY_CLOCK_SOURCE`, `ENCLAVE_INSECURE_VERIFY_SKIPPED`,
+`ENCLAVE_PREVIOUS_PCR0`, `ENCLAVE_SCALING_ROLE` and
+`ENCLAVE_SCALING_FOLLOWER_PCR0S`. Changing those runtime settings requires rebuilding the
+image. `ENCLAVE_DEV` selects the KMS lock posture and Object Lock retentions;
+neither has a separate environment-variable override.
+
+The TLS key is generated at genesis, encrypted with KMS, and included in the
+state root. Renewed certificates reuse it. The certificate bucket stores only
+encrypted certificates; the ACME account signer derives from the master seed
+and is separate from the TLS key.
+
+### Application process environment
+
+The runtime removes each configuration variable from the process environment
+as it loads it. The application inherits the remaining environment, including
+baked application variables, allowlisted SSM application overrides, static
+secrets and inherited secrets, plus these explicit runtime exports:
+
+| Variable | Value |
+|---|---|
+| `PORT` | `ENCLAVE_APP_PORT`, default `7074` |
+| `ENCLAVE_APP_PORT` | the same value |
+| value of `ENCLAVE_OTEL_ENDPOINT_ENV` | the OTLP/HTTP base URL, `http://127.0.0.1:8080` |
+| value of `ENCLAVE_OTEL_TOKEN_ENV` | a 32-byte hex bearer token, regenerated each boot |
+
+The bearer token authenticates the application to the runtime's OTLP forwarders.
+`stdout` and `stderr` are inherited.
+
+Set both telemetry variable names in the image to match the application's configuration.
+The names must be valid environment identifiers, must differ, and must not
+collide with another runtime export or a secret.
+
+```text
+ENCLAVE_OTEL_ENDPOINT_ENV=ARKD_SIGNER_OTEL_COLLECTOR_ENDPOINT
+ENCLAVE_OTEL_TOKEN_ENV=ARKD_SIGNER_OTEL_TOKEN
+```
+
+The application must accept a full HTTP URL and a raw bearer token. It appends
+the signal path, such as `/v1/logs`, and sends `Authorization: Bearer <token>`.
+The runtime sets these values after baked variables, SSM application overrides
+and secrets. SSM can replace either name but cannot clear it.
+
+### SSM parameters
+
+With `N` = `ENCLAVE_NAMESPACE` (one or more segments), `A` = app name, `L` = `locked`
+or `unlocked`. Everything the runtime reads or writes sits under `/N/A/enclave/`; the
+rest of `/N/A/` is the application's to use, and the same `/N/A/enclave` root names the
+CloudWatch log groups.
+
+**Changed:** parameters used to sit directly under `/N/A/`. The runtime reads only the
+new paths, so an existing deployment moves by recreating its operator parameters under
+`/N/A/enclave/` and taking a fresh genesis; a successor cannot adopt state a predecessor
+wrote under the old layout, and the `SSMParams` and `CloudWatchLogsAccess` policies
+must match the new root.
+
+
+| Path | Written by | Purpose |
+|---|---|---|
+| `/N/A/enclave/CertBucketName` | operator | Shared encrypted-certificate bucket. |
+| `/N/A/enclave/LeaseBucketName` | operator | Ephemeral coordination lease bucket. |
+| `/N/A/enclave/env/<NAME>` | operator | Environment overlay. |
+| `/N/A/enclave/inherit/<name>` | operator | Inherited secret, verified against its baked pin. |
+| `/N/A/enclave/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge: the predecessor's attestation over a fresh nonce, bound to the state namespace. Its attested timestamp drives rotation every minute. Advanced tier. |
+| `/N/A/enclave/MigrationResponse/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
+| `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. While the intent is ambiguous, naming any of the tied targets clears it. The predecessor records the abort in the intent log as soon as it sees it. |
+
+SSM holds no generation state and no handoff. A predecessor releases state to
+its successor in one place only, the finalised record in its
+[intent log](#generation-state). Deleting, overwriting or expiring a parameter
+can stall the challenge exchange but never select other state, and never
+trigger a genesis.
+
+Genesis writes no parameter at all.
+
+## HTTP API
+
+### External listener, TCP :443
+
+TLS 1.2 minimum. HTTP and gRPC clients authenticate the enclave by verifying its
+PCRs and pinning the live TLS public key to the PublicKey hash in the attestation document.
+`/enclave/*` responses also carry permissive CORS headers, and an `OPTIONS`
+preflight to any path in that namespace is answered `204` by the runtime.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 79 bytes: ASCII `sha256:`, the raw 32-byte SHA-256 of the TLS PublicKey, ASCII `ed25519:`, then the raw 32-byte Ed25519 response-signing public key (all zero until state is established). `503` until the application has been started, so always on a candidate. |
+| GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` when the boot stops at the permission preflight or telemetry, naming the missing grants for the preflight), for a candidate the predecessor offering it a handoff, PCR0, the predecessor PCR0 measured into the image, with its attestation once an adopted snapshot is published, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. Signed on request; see [Signed responses](#signed-responses). |
+| GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before, and `{"status":"upstream_exited"}` with status 503 after the application process exits. |
+| any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
+
+Telemetry is forwarded, never stored. The OTLP forwarders live on the internal
+listener only, since they sign with the instance role, and nothing is read back
+through the runtime, so a compromised enclave has no history to serve.
+
+The complete `/enclave` namespace is reserved for runtime APIs. Unknown
+non-preflight paths beneath it return the runtime's `404` response, and no
+request in that namespace is proxied to the application. A request to the bare
+`/enclave` is redirected to `/enclave/`, which then returns that `404`.
+
+`/health` reports ready as soon as the application process has been started,
+which is marginally before it binds its port. Readiness probes should target an
+application endpoint.
+
+#### Signed responses
+
+A proxy in front of the enclave defeats TLS pinning, so a client can instead ask
+for each application response to be signed. A request carrying
+`X-Enclave-Sign-Nonce: <nonce>` (any non-empty value; use a fresh random one per
+request) gets back `X-Enclave-Signature`, a base64 Ed25519 signature by the key
+in the attestation `user_data` over these lines joined by `\n`, with no trailing
+newline:
+
+```
+enclave-signed-response
+<METHOD> <path as received, then ?query only if the query is non-empty>
+<lowercase authority: Host / HTTP/2 :authority, including any explicit port>
+<hex SHA-256 of the canonical request headers>
+<hex SHA-256 of the request body>
+<status code, decimal>
+<hex SHA-256 of the response body>
+```
+
+The signature binds the response to the request's method, path/query, authority,
+body, and its `Authorization`, `Content-Type`, and `X-Enclave-Sign-Nonce`
+headers; the nonce is bound through the header hash. Adding, removing, or
+changing a covered header invalidates verification. A gateway must preserve the
+authority and the covered headers; rewriting the path also breaks verification.
+
+No other request header is covered. Browsers, proxies, and CDNs add and rewrite
+headers such as `Origin`, `Cookie`, `X-Forwarded-For`, and tracing IDs in
+transit, and page JavaScript cannot read `HttpOnly` cookies, so covering them
+would fail legitimate requests. In a signed request an application must not rely
+on any other header for identity or authority, cookies and custom headers such
+as `X-API-Key` or `X-Tenant-ID` included: a proxy can add or change them
+unnoticed.
+
+The canonical headers are the covered names that are present, lowercase and
+sorted. Each is a record `name:base64(value1),base64(value2)\n`, including its
+final newline. Values are raw HTTP header bytes, with only leading/trailing
+spaces and tabs trimmed. Repeated values preserve their order and remain
+distinct from comma-folded values. An absent header has no record; a present
+empty value has one. Signed requests reject trailers and `Connection` options
+other than `close`/`keep-alive`, so a proxy cannot hide a covered header from
+the application by marking it hop-by-hop.
+
+Verification detects tampering when the response arrives; it does not prevent
+an altered request from executing. Response headers are not authenticated.
+Unsigned requests do not use this signature format.
+
+Boot derives the key from the deployment's master seed and the current PCR0
+read from NSM using HKDF-SHA256 with salt `enclave.derived-secret.v1`. The
+context is `runtime/ResponseSigningKey`, a zero byte, and the raw 48-byte PCR0,
+encoded together as one CBOR text string. The first 32-byte block is the
+Ed25519 seed. Replicas and restarts of the same image share the key, while a
+migration to another PCR0 changes it without storing additional state. A
+predecessor's response cannot verify against the successor's attested signing
+key. This separates responses by measured image; a holder of
+the shared master seed can still derive keys for other PCR0 values.
+
+Requests without the header are proxied unchanged and stream as before.
+Signed request and response bodies are buffered whole before the signature is
+sent, so signed requests suit bounded bodies, not uploads, downloads or streams.
+Each is capped at 4 MiB, gRPC's default receive limit: a larger request body is
+answered `413` before the application sees it, and a larger application
+response is aborted, so the client gets no response. Signed responses carry `Cache-Control: no-store`, since each
+answers a single nonce. The `502` for an unreachable application is signed like
+any other response. `/enclave/v1/info` is signed the same way once the runtime
+holds its signing key; before that, as a candidate, a signed request to it is
+answered `503` while unsigned requests are served as usual. Other `/enclave/*`
+endpoints, `/health`, the `503` served before the application starts, and gRPC
+are not signed.
+
+The response body is signed decoded: for a signed request the runtime drops
+`Accept-Encoding` before proxying, so Go's upstream transport requests gzip and
+decodes it, and clients verify the body after their own decompression (the Go
+client also lets its transport handle compression). An application that sends a
+compressed body regardless of `Accept-Encoding`, such as pre-compressed `br`
+assets, fails verification. Signed responses carry
+`Access-Control-Expose-Headers: X-Enclave-Signature`; a cross-origin page also
+needs the application's CORS preflight to allow `X-Enclave-Sign-Nonce`.
+
+##### Verifying in a browser
+
+Browsers verify with WebCrypto Ed25519 (Chrome 137+, Firefox 129+, Safari 17+).
+`signingKey` must come from an attestation document the page has verified
+(COSE signature, AWS Nitro chain, PCR0): it is bytes 47–79 of `user_data`.
+
+```js
+async function signedFetch(url, init = {}, signingKey) {
+  const hex = (b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+  const sha256 = async (b) => hex(await crypto.subtle.digest("SHA-256", b));
+  const nonce = hex(crypto.getRandomValues(new Uint8Array(20)));
+  const headers = new Headers(init.headers);
+  headers.set("X-Enclave-Sign-Nonce", nonce);
+
+  // Build once: Request captures the automatic Content-Type and the body bytes.
+  const req = new Request(new URL(url, location.href), {
+    ...init, headers, redirect: "error", cache: "no-store",
+  });
+  const u = new URL(req.url);
+  const reqBody = await req.clone().arrayBuffer();
+  const canonical = ["authorization", "content-type", "x-enclave-sign-nonce"]
+    .filter((name) => req.headers.has(name))
+    .map((name) => `${name}:${btoa(req.headers.get(name).replace(/^[ \t]+|[ \t]+$/g, ""))}\n`)
+    .join("");
+  const headerHash = await sha256(new TextEncoder().encode(canonical));
+
+  const resp = await fetch(req);
+  const body = new Uint8Array(await resp.arrayBuffer());
+  const msg = `enclave-signed-response\n${req.method} ${u.pathname}${u.search}\n` +
+    `${u.host.toLowerCase()}\n${headerHash}\n${await sha256(reqBody)}\n` +
+    `${resp.status}\n${await sha256(body)}`;
+
+  const key = await crypto.subtle.importKey("raw", signingKey, { name: "Ed25519" }, false, ["verify"]);
+  const sig = Uint8Array.from(atob(resp.headers.get("X-Enclave-Signature") ?? ""), (c) => c.charCodeAt(0));
+  if (!(await crypto.subtle.verify({ name: "Ed25519" }, key, sig, new TextEncoder().encode(msg)))) {
+    throw new Error("missing or invalid X-Enclave-Signature");
+  }
+  return { status: resp.status, headers: resp.headers, body };
+}
+```
+
+Cookies, if the page sends them, are not covered; authenticate signed requests
+with an `Authorization` header.
+
+#### Ancestor-key audit
+
+Each generation mints its own KMS key and migration is strictly additive, so a
+retired generation keeps a key that can still decrypt state until an operator
+deletes it. The `ancestry` block of `/enclave/v1/info` reports what became of
+those keys, newest first.
+
+`complete` is true only when each predecessor's published `snapshot/<pcr0>`
+verifies, names the KMS key the link above it recorded, and the walk reaches a
+state with no predecessor. Missing, altered, malformed or cyclic state makes it
+false and `reason` explains the failure without exposing the underlying AWS
+error. The genesis generation is not repeated separately: it is the final
+verified state in the chain. The walk reads S3 only, never SSM.
+
+| `state` | Meaning |
+|---|---|
+| `exists` | `DescribeKey` reports that the key is present and not scheduled for deletion. |
+| `pending_deletion` | Deletion is scheduled. |
+| `deleted` | KMS no longer knows the key. This generation can no longer decrypt anything. |
+| `unknown` | The state could not be read. The cause is logged, not published: the AWS error names role ARNs and account IDs, and this endpoint is unauthenticated. |
+
+`unknown` never means deleted. Only KMS reporting the key as absent produces
+`deleted`, so a permissions failure or a KMS outage can never be read as proof
+that a retired generation was retired.
+
+The block is a cached snapshot, rebuilt once at boot and then daily: `checked_at`
+is when it was built, and is `null` before the first probe completes. Reading it
+never calls SSM or KMS, so the endpoint cannot be made slow or unavailable by
+either.
+
+The chain has no length cap. A corrupt chain still terminates: a repeated
+PCR0/key identity stops the walk and is reported through `complete` and
+`reason`.
+
+### Internal listener, TCP 127.0.0.1:8080
+
+Serves `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces` and `GET /health`
+only. The three forwarders expect `Authorization: Bearer <token>` with the
+per-boot token supplied through the configured child variable. They accept
+OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
+`gzip`-encoded, and answer with whatever AWS answered. When traces or metrics
+are off, that forwarder answers with an empty success and forwards nothing. This is the endpoint
+advertised through the configured endpoint variable.
+It does not serve `/enclave/v1/info`, the `/enclave/*` endpoints, or the
+application proxy.
+
+## Deployment
+
+This flake builds the EIF but does not provision or configure its host or AWS
+resources. Any deployment system may be used if it supplies the following
+interfaces.
+
+### Host requirements
+
+- Launch the EIF with AWS Nitro Enclaves and allocate sufficient CPU and memory.
+- Make `/dev/nsm` and `/dev/ptp0` available inside the enclave.
+- Run gvproxy at host CID 3, vsock port 1024, with outbound connectivity to the
+  configured AWS endpoints and any application dependencies.
+- Forward IMDS from host CID 3, vsock port 8002, to the host's instance metadata
+  service so the runtime can obtain AWS credentials.
+- Answer the EIF boot heartbeat at host CID 3, vsock port 9000.
+- Route intended client traffic to the enclave's TLS listener, TCP port 443 by
+  default.
+
+### Reaching the enclave from its instance
+
+An enclave has no shell, and its console is unreadable in production, so its
+runtime API is how an operator sees what it is doing, including why a boot
+stopped. The host already routes port 443 to the enclave's TLS listener, so from
+a shell on the instance (SSH or SSM Session Manager):
 
 ```sh
-enclave nixpkgs pin          # fetch nixos-25.11 tip → write to enclave.yaml + flake.nix
-enclave nixpkgs pin --check  # validate existing pin, no network
+curl -sk --http1.1 https://127.0.0.1/enclave/v1/info | jq
 ```
 
-After running, commit both changed files. The derivation graph changes → PCR0 changes → deploy via normal migration flow.
+The same request works wherever port 443 is
+routed to it. `-k` is needed because, until it holds state, an enclave serves an
+ephemeral self-signed certificate. That includes an
+enclave stopped by the [permission preflight](#aws-requirements), which answers
+`503` with (abridged):
 
-### `enclave build --push-cache`
+```json
+{
+  "version": "0.1.0",
+  "status": "failed",
+  "error": "permission preflight: role arn:aws:iam::123456789012:role/enclave is missing CloudWatchLogsAccess logs:PutLogEvents on arn:aws:logs:eu-west-1:123456789012:log-group:/prod/enclave/logs/app:log-stream:i-0123456789abcdef0 (implicitDeny)"
+}
+```
 
-After a successful build, pushes the full EIF closure to your Cachix cache:
+A response read this way is not attested: whoever controls the host could have
+produced it. Use it to diagnose, and once the enclave reports `ready`, verify it
+with the CLI before trusting anything it says.
+
+### AWS requirements
+
+Create a private S3 bucket for shared certificate state and write its name to
+`/<namespace>/<app>/enclave/CertBucketName`. Create a separate private S3 bucket for
+ephemeral coordination leases and write its name to
+`/<namespace>/<app>/enclave/LeaseBucketName`.
+
+The state bucket, which holds every generation's state and the migration intent
+log, is **not** configured. Its name is derived, so no parameter a host can
+rewrite decides where deployment state is looked for:
+
+```text
+enclave-<account-id>-<sha256(namespace \x00 app)[:8]>-migration-intents
+```
+
+`namespace` is `ENCLAVE_NAMESPACE` exactly as set, such as `ark/prod`.
+
+Provisioning must create exactly that bucket, with versioning and Object Lock
+enabled at creation, before the enclave first boots; the runtime only reads and
+writes it. The digest keeps its name inside S3's 63-character limit and its
+character rules whatever the namespace and application are called, and the
+account ID keeps two AWS accounts off the same globally unique name.
+
+AWS credentials delivered through IMDS must allow:
+
+| Statement | Permissions |
+|---|---|
+| `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
+| `S3MigrationIntentObjectLock` | On the derived state bucket: `ListBucketVersions` on the bucket; `GetObject`, `GetObjectVersion`, `GetObjectRetention` on `<bucket>/*`; `PutObject` and `PutObjectRetention` on `<bucket>/snapshot/*` and `<bucket>/migration-intent/*` only. `PutObjectRetention` is what lets a `PutObject` carry its compliance lock. Without `GetObjectRetention`, S3 hides the lock on every object and the runtime ignores every state and intent. Grant no `s3:DeleteObject`, `s3:BypassGovernanceRetention` or `s3:CreateBucket`: the runtime never deletes a record and must never manufacture an empty authority. |
+| `SSMParams` | `GetParameter`, `GetParametersByPath` on `/<namespace>/<app>/enclave/*`. |
+| `SSMMigrationCoordination` | `PutParameter` on `/<namespace>/<app>/enclave/` + `MigrationChallenge/*` and `MigrationResponse/*`. Nothing else: the runtime never writes configuration, the environment overlay, inherited secrets or a handoff to SSM. |
+| `KMSAccess` | `CreateKey`, `TagResource`. `DescribeKey` is optional; see below. |
+| `STSAccess` | `GetCallerIdentity`. |
+| `PermissionPreflight` | `iam:SimulatePrincipalPolicy` on the enclave role's own ARN, and nothing else, so the enclave can ask what it may do but not what any other principal may. |
+| `Route53AcmeChallenge` | Only with `ENCLAVE_USE_ACME=true`: `ChangeResourceRecordSets` on the hosted zone named in `/<namespace>/<app>/enclave/Route53ZoneID`, and `GetChange`. |
+| `CloudWatchLogsAccess` | Required, and write-only: `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` on `/<namespace>/<app>/enclave/*`. The OTLP `/v1/logs` endpoint authorises as `PutLogEvents` on the same group ARNs. `PutRetentionPolicy` is optional but recommended — without it the boot still succeeds and log groups never expire. Nothing more — the runtime never reads its own telemetry back, and granting `FilterLogEvents` or `DescribeLogStreams` would hand a compromised enclave the history it was designed not to hold. Read the logs with operator or CI credentials instead. Without this statement the enclave does not boot. |
+| `XRayAccess` | Only with `ENCLAVE_TRACES=true`. `xray:PutSpans`, `xray:PutSpansForIndexing` and `xray:PutTraceSegments` on `*`, plus Transaction Search enabled on the account. Without them every span export is refused; the enclave still boots and counts the refusals. |
+| `CloudWatchMetricsAccess` | Only with `ENCLAVE_METRICS=true`. `cloudwatch:PutMetricData` on `*`. Without it every metric export is refused; the enclave still boots and counts the refusals. |
+
+`Encrypt`, `Decrypt`, and `GenerateDataKey` are deliberately absent. Those
+operations are authorised by the enclave-created key's own PCR0-conditioned
+policy, not by the host credentials, so possessing those credentials is not
+sufficient to read enclave state.
+
+The key policy admits the role by its ARN: each statement allows principal `*`
+only where `aws:PrincipalArn` equals the role's ARN, so a role recreated under
+the same name and path keeps access to its keys. Anyone who can create and
+assume a role with that ARN gets the role's key permissions, but decrypting
+still requires the PCR0 attestation.
+
+`DescribeKey` is read-only and only reports whether ancestor keys were deleted.
+Each key's `EnclaveOperations` statement already grants it to the role that
+created the key, so this grant only matters for unlocked ancestor keys created
+under another role, which otherwise read `unknown`.
+
+Before telemetry starts and before its first durable write, every boot asks IAM,
+through `SimulatePrincipalPolicy`, whether the role holds the S3, SSM, KMS,
+CloudWatch Logs and (with ACME) Route53 grants above. A denied or incomplete
+simulation stops the boot before durable writes. The enclave stays up and
+`/enclave/v1/info` answers `503` with `status: "failed"` and an `error` naming every
+missing statement, action and resource, since the
+console is unreadable in production and telemetry has not started. Read it
+[from the instance](#reaching-the-enclave-from-its-instance), fix the policy,
+then restart the enclave.
+
+A check AWS leaves unanswered, because it throttled, failed server-side or was
+unreachable after the SDK's own retries, is repeated up to five times over about
+a minute before the boot stops on it, so a burst of enclaves booting together
+does not park on a momentary IAM limit. A denial, or any other error AWS
+answered with, such as a missing `iam:SimulatePrincipalPolicy` grant or bucket
+parameter, stops the boot at once.
+
+Known resources, including this enclave's `snapshot/<pcr0>`, its migration
+challenge and response, certificate objects and leases, are checked by their
+exact names. Future key IDs,
+migration objects and Route53 change IDs are checked at namespace scope; those
+checks cannot rule out denials on specific future resources or later policy changes.
+
+The simulation includes the region, caller ARN, KMS creation tags and DNS-01
+record context. Missing context reported by IAM is named in the error. It reads
+the role's policies, permissions boundary and service control policies, but not
+bucket policies or configuration. Object Lock is verified separately, on the
+objects themselves: every state the runtime publishes is read back and adopted
+only if S3 reports it compliance-locked for the full retention, so a state bucket
+without versioning and Object Lock still fails at genesis, before anything is
+served. The role is derived from the STS session, so a role
+created with a path other than `/` is not found.
+
+`PermissionPreflight` must name the role itself, so whoever holds its
+credentials, the enclave or the host, can ask only what this role may do. In
+Terraform:
+
+```hcl
+resource "aws_iam_role_policy" "enclave_permission_preflight" {
+  role = aws_iam_role.enclave.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "PermissionPreflight"
+      Effect   = "Allow"
+      Action   = "iam:SimulatePrincipalPolicy"
+      Resource = aws_iam_role.enclave.arn
+    }]
+  })
+}
+```
+
+## Blue/green migration
+
+Migration preserves an existing deployment's secrets and TLS identity while
+moving to a new PCR0. **Booting a candidate is the request**: the protocol runs
+between enclaves over SSM and the intent log, with no control endpoint.
+
+```text
+predecessor                                candidate
+  publish challenge   ------------------>  read it
+  read answers        <------------------  publish attestation
+  verify, record Object-Locked intent
+  ... cooldown, abort window ...
+  record Object-Locked handoff  -------->  adopt, publish snapshot/<target>
+```
+
+The predecessor verifies a live attestation bound to the same namespace, app and
+lock posture. The host cannot forge that evidence, but it can choose which image
+to launch. The protocol does not establish operator approval of that image.
+Run one candidate image at a time for deterministic selection: the first verified
+answer wins. Predecessor replicas share the challenge and intent chain.
+
+1. Build the successor with `ENCLAVE_PREVIOUS_PCR0` set to the predecessor's
+   PCR0, preserving namespace, app name and lock posture.
+2. Boot it as a candidate. It answers the predecessor's challenge without
+   serving the application or attestation endpoint.
+3. Check `migration.target_pcr0` on the predecessor's `/enclave/v1/info` during
+   the cooldown. To abort, write that target PCR0 to
+   `/<namespace>/<app>/enclave/MigrationResponse/<predecessor PCR0>/abort` and
+   stop the candidate. The predecessor records the abort in its intent log.
+   If different requests, or a request and an abort, are recorded for the same
+   sequence at the same instant, `/enclave/v1/info` reports `migration.state`
+   as `ambiguous` and lists `migration.ambiguous_targets`. The migration stays
+   blocked until an abort names one of them. Tied records that are all aborts
+   resolve as `aborted`, even when they name different targets; another abort
+   is unnecessary and is ignored.
+4. After the cooldown, the predecessor commits the target into PCR31, creates
+   the successor's KMS key, and encrypts the seed and TLS key under it. Nothing
+   has left the enclave yet. It then re-checks the intent and its migration
+   lease, and records one `finalised` intent carrying the successor's snapshot.
+   Its attestation is the transition receipt. That record is the handoff: the
+   commit, the release of the ciphertexts and the audit trail are the same
+   locked write.
+   `/enclave/v1/info` then reports `migration.state` as `finalised`.
+5. The successor waits until its predecessor's active intent is `finalised`
+   for its own PCR0. A request alone is never adopted. It verifies the receipt
+   and key policy before decrypting, then publishes its snapshot with both
+   receipts. Check `/enclave/v1/info` for
+   `status: "ready"`, the expected `previous_pcr0`, and a non-empty
+   `previous_pcr0_attestation`. Snapshot publication alone is not readiness.
+6. Shift traffic using your deployment system. Keep both generations healthy
+   during the soak period, then retire the predecessor. Its snapshot and key
+   remain available for restarts unless you explicitly retire the key.
+
+If adoption fails, keep serving from the predecessor; its state is unchanged
+by the handoff. A finalised handoff is not released again. An attempt that
+stops before the finalised record releases nothing and may leave an unused key;
+the next attempt mints a new one.
+
+An abort can also be recorded after the handoff is finalised. A successor
+running this runtime then refuses to adopt until a new request has waited out
+its own cooldown and been finalised, and a published snapshot is not revoked.
+The abort does not take the released ciphertexts back: the record stays in the
+log, and an image that skips these checks could already have decrypted them.
+The cooldown before the first `finalised` record is what protects users, and
+the locked record shows that the handoff was released.
+
+Both the handoff and an abort re-check the migration lease just before writing.
+If they still land on the same sequence, the abort wins whichever was written
+first. To migrate to a different target afterwards, restart the predecessor:
+its PCR31 remains committed to the earlier target for that boot.
+
+**Retiring keys.** Keep a generation's key if you may need to boot it again.
+Otherwise, schedule deletion out of band and check the successor's signed
+`/enclave/v1/info` response until the ancestor reports `state: "deleted"`.
+`pending_deletion` is reversible: the instance role can call `CancelKeyDeletion`
+and then `EnableKey` to restore access. To prevent that role from cancelling a
+retirement, attach a deny scoped to the retired key before scheduling deletion:
+
+```json
+{
+  "Effect": "Deny",
+  "Action": "kms:CancelKeyDeletion",
+  "Resource": "arn:aws:kms:<region>:<account>:key/<retired key ID>"
+}
+```
+
+The deny overrides the key policy's allow. Retain the ancestor's locked snapshot
+so the audit can follow the lineage; missing or unverifiable state makes ancestry
+incomplete and does not prove retirement.
+
+### Migration compatibility
+
+Two schemas version the handoff, and both are checked before anything is
+committed. Each challenge carries the predecessor's challenge schema
+(`enclave.migration_challenge.v1`) and the successor claim schema it will check
+(`enclave.successor_claim.v1`). A candidate answers only if both match its own;
+otherwise it publishes no response and logs `candidate handoff` with `migration
+challenge is not bound to this state namespace`. A predecessor likewise adopts
+only a response in its own successor claim schema and ignores any other. Either
+way it records no intent and commits nothing.
+
+Bump `migrationChallengeSchemaV1` when what a predecessor's handoff writes
+changes, and `successorClaimSchemaV1` when what a successor reads changes, so a
+runtime on the previous schemas is refused before the commit. That covers where
+a generation is stored as well as how: the intent and snapshot encodings, the
+seed derivation, the receipts a successor verifies, and the protocol itself. An invalid secrets
+configuration stops the runtime before it answers any challenge; the successor
+still starts its application only after the handoff.
+
+### Compatibility
+
+This state format has no import or fallback for earlier SSM-backed deployments,
+`deployment-genesis` objects, or older snapshots and receipts. Their transition
+receipts cover a different state root and cannot be adopted. Start a fresh
+genesis under a new namespace or app name, with a new seed and derived secrets.
+
+Earlier images still running keep their state in SSM. Until they are retired:
+
+- leave their role's `PutParameter` grant on `/<namespace>/<app>/enclave/*` in
+  place; narrowing it strands them;
+- do not attach parameter policies, expiration in particular, to their
+  runtime-written parameters; and
+- deny `ssm:DeleteParameter` and `ssm:DeleteParameters` on those paths, because
+  for those images SSM, not Object Lock, is all that protects their state.
+
+## Verifying an enclave
+
+An enclave is only meaningful if clients verify it. Both the CLI and the library
+prove, before returning any response body, that they are talking to an enclave
+running the expected measured image.
+
+### CLI
 
 ```sh
-CACHIX_AUTH_TOKEN=... enclave build --push-cache
+nix run github:ArkLabsHQ/enclave -- curl <path> \
+  --base-url <url> --expected-pcr0 <hex>
 ```
 
-Requires `cachix` CLI on PATH. In GitHub Actions, `cachix/cachix-action@v15` handles this automatically — set `vars.CACHIX_CACHE_NAME` and `secrets.CACHIX_AUTH_TOKEN` on the repo and the scaffolded workflows pick it up.
+The Nix derivation is named `enclave-cli`; the installed binary is `enclave`.
 
-### `enclave vendor` (Rust + Go only)
-
-Cachix protects rebuilds after the cache is populated. For coverage that survives upstream disappearance even on the first build (no cache history yet), vendor the app's source deps into git. Order matters — flip `app.vendor: true` before running `enclave setup`:
+| Flag | Default | Purpose |
+|---|---|---|
+| `--base-url` | required | Enclave base URL. |
+| `--expected-pcr0` | required | Expected PCR0, compared case-insensitively. |
+| `-X`, `--method` | `GET` | HTTP method. |
+| `-d`, `--data` | none | Request body. Sets `Content-Type: application/json`. |
+| `-H`, `--header` | none | `Name: value`, repeatable. |
+| `--strict-tls` | `false` | Additionally require public CA and hostname validation. |
+| `--insecure-skip-cose-verify` | `false` | Skip COSE Sign1 + AWS Nitro root chain verification (QEMU/local test only; prints a warning). PCR0, nonce, the exact 79-byte `user_data` binding, and live certificate pinning are still checked. |
+| `--signed` | `false` | Require a [signed response](#signed-responses), verified against the attested signing key. Covers application routes and `/enclave/v1/info`. |
+| `-v`, `--verbose` | `false` | Print request and verification summary to stderr. |
 
 ```sh
-enclave vendor --path ~/my-app   # cargo vendor or go mod vendor
-git add vendor/ && git commit && git push
-# Edit enclave.yaml: app.vendor: true, clear nix_vendor_hash
-enclave setup                    # skips hash discovery; refreshes nix_rev/nix_hash
-enclave build                    # Nix uses committed vendor/, no upstream fetch
+# Runtime and migration status.
+enclave curl /enclave/v1/info \
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
+
+# Authenticated POST.
+enclave curl /v1/orders -X POST -d '{"amount":1000}' \
+  -H "Authorization: Bearer $TOKEN" \
+  --base-url https://enclave.example.com --expected-pcr0 834837d8...9ba9
 ```
 
-### Commit `enclave/flake.lock`
+The CLI exits non-zero if attestation, TLS pinning, or a requested response
+signature fails, and if the HTTP status is 400 or above.
 
-Commit `enclave/flake.lock` alongside your flake. It pins any transitive flake inputs introduced by future framework upgrades, ensuring the derivation graph stays fully closed even when you bump framework deps.
+### Go client
 
-See [BINARY-CACHE.md](BINARY-CACHE.md) for the full setup guide, Cachix account setup, CI integration (GitHub Actions), trust model, and vendor mode trade-offs.
+```go
+import "github.com/ArkLabsHQ/enclave/client"
+```
 
-## Local Testing
+```go
+c, err := client.New("https://enclave.example.com", client.Options{
+    ExpectedPCR0: "834837d8fdff29f35317acc40ba4e1e505b71a3cf7374ebba016a38e05c43784a01f0c1e88bf2b6174e4dbfc6f679ba9",
+})
+if err != nil {
+    log.Fatal(err)
+}
 
-The test suite runs a full enclave inside QEMU (`-M nitro-enclave`) with mock AWS services, executing 15 integration tests followed by a locked-key migration with post-migration verification.
+resp, err := c.Post(ctx, "/v1/orders", strings.NewReader(`{"amount":1000}`))
+if err != nil {
+    log.Fatal(err)
+}
 
-### Quick Start
+if resp.StatusCode >= 400 {
+    log.Fatalf("HTTP %d: %s", resp.StatusCode, resp.Body)
+}
+```
 
-**Docker Compose (CI path):**
+Methods: `Get`, `Post`, `Do`, `VerifyAttestation`, `GRPCConn`. Package
+functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
+`FetchManifest`.
+
+| Option | Default | Effect |
+|---|---|---|
+| `ExpectedPCR0` | required | `New` fails without it. |
+| `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
+| `CacheTTL` | `60s` | Attestation cache lifetime. |
+| `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
+| `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
+| `InsecureTLS` | unset | Removes the certificate pin entirely. |
+| `SignedResponses` | `false` | Requests and verifies a [signed response](#signed-responses) on every `Do`, `Get`, and `Post`, on top of the TLS pin. Redirects are returned to the caller, not followed. Behind a proxy that terminates TLS, also set `InsecureTLS`. |
+
+What is verified on the first request, and cached for `CacheTTL`:
+
+| Check | Default | Relaxed by |
+|---|---|---|
+| Fresh 20-byte nonce echoed in the attestation document | always | nothing |
+| COSE Sign1 signature and AWS Nitro root certificate chain | on | `InsecureSkipCOSEVerify` |
+| PCR0 equals `ExpectedPCR0` | always | nothing |
+| `user_data` is exactly the 79-byte TLS PublicKey hash and signing key layout, and the live certificate contains that public key | on | `InsecureTLS` |
+| Public CA and hostname validation | off | enabled by `StrictTLS` |
+| PCR16 onward match `ExpectedPCRs` | off | populated by `ExpectedPCRs` |
+| Each response's signature verifies under the attested signing key (per response, not cached) | off | enabled by `SignedResponses` |
+
+The certificate pin is installed from the attestation document before any
+request carrying data is made, so a request issued before verification completes
+fails closed.
+
+`GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
+but does not perform public CA validation. Applications serving gRPC must set
+`ENCLAVE_UPSTREAM=h2c`.
+
+## Testing
 
 ```sh
-# 1. Build the test EIF (requires Nix)
-go build -o /tmp/enclave-cli ./cmd/enclave
-cd test/app && /tmp/enclave-cli build 
-
-# 2. Run all tests
-cd test && docker compose --profile test run --build test-runner
+nix flake check
 ```
 
-**Native with Nix:**
+| Check | Purpose |
+|---|---|
+| `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
+| `e2e` | x86-only runtime lifecycle across five NixOS nodes: AWS setup, concurrent genesis and handoffs, clock recovery, attestation, ACME, secret derivation and replacement, replica joins, and restart recovery. |
+| `scaling` | x86-only threshold scaling across a leader and two follower images: attested admission, a share on every node, resharing on each join, and eviction of a silent follower. |
+
+Unit tests are not flake checks. Run them with `make test`, or
+`nix develop --command make test` as CI does. `make lint` and `make fmt` are also
+available.
+
+### Requirements
+
+Both checks run on `x86_64-linux` only. The `e2e` check uses QEMU's
+x86_64-only `nitro-enclave` machine type.
+
+The e2e check needs a builder with:
+
+- `/dev/kvm`
+- nested virtualisation enabled
+- Nix system features `kvm` and `nixos-test`
+
+Nested KVM is not optional. The runtime requires `/dev/ptp0` inside the enclave,
+which the guest kernel provides through `ptp_kvm`, which in turn issues the
+`KVM_HC_CLOCK_PAIRING` hypercall. The intermediate VM's KVM only services that
+hypercall while its own clocksource is TSC-based. The enclave test nodes
+therefore force `clocksource=tsc`; NixOS test instrumentation otherwise appends
+`clocksource=acpi_pm`, and the kernel honours the last value on the command line.
+Without this the enclave has no `/dev/ptp0` and boot fails before networking.
+
+The e2e test includes a one-minute migration cooldown. During that cooldown,
+it replays a genuine intent through a multipart upload initiated 48 hours earlier
+and checks that both blue replicas preserve the original eligibility time and
+keep green waiting. The same fleet then completes the handoff and recovery checks.
+
+Run the lifecycle check on Linux with
+`nix build .#checks.x86_64-linux.e2e --print-build-logs`.
+
+### Reading test output
+
+`--print-build-logs` includes every test VM's kernel and systemd serial output.
+Filter it to keep evaluation progress, test driver actions, failures, and the
+result:
 
 ```sh
-cd test && nix develop . --command ./run.sh
+set -o pipefail
+nix flake check --print-build-logs 2>&1 |
+  rg --line-buffered \
+    '(^evaluating |^checking |^error:|> (machine|aws|blue(_peer)?|green(_peer)?):|> !!!|> cleanup|> test script|all checks passed)'
 ```
 
-### What Gets Tested
+`pipefail` preserves the exit status through the filter.
 
-**15 integration tests** run after enclave boot:
+### E2E boundaries
 
-1. Health endpoint returns HTTP 200
-2. Enclave info JSON is valid
-3. Init completed without errors
-4. BIP-340 Schnorr signature verification
-5. SDK version present
-6. App proxy (requests reach user app through nitriding)
-7. KMS secrets loaded (SIGNING_KEY decrypted, correct length)
-8. Encrypted storage round-trip (PUT/GET/DELETE)
-9. Previous PCR0 field present
-10. Dynamic secrets round-trip (PUT/GET/LIST/DELETE)
-11. PCR16 extended with SHA256(compressed secp256k1 pubkey)
-12. Storage persistence write (for migration verification)
-13. Dynamic secret persistence write (for migration verification)
-14. Attestation persistence write (pubkey + PCR16 hash)
-15. Pre-migration Schnorr signature baseline
+The test uses five NixOS nodes: `aws` runs the AWS emulator, KMS Recipient proxy,
+IMDS, ACME fixtures and OTLP receiver; `blue`, `blue_peer`, `green` and
+`green_peer` run measured EIFs under QEMU. It covers:
 
-**Migration verification** then runs a full locked-key migration and confirms:
-- Secrets decrypted from the new KMS key
-- Persistent storage survived
-- Dynamic secrets preserved
-- Attestation key (SIGNING_KEY) unchanged across migration
-- PCR0 attestation chain intact
+- Concurrent genesis and successor adoption, with one locked snapshot per PCR0.
+- Static/inherited secret replacement under unchanged environment variable names,
+  missing inherited values, derivation continuity and TLS certificate reuse.
+- The handoff as one locked intent record, adopted unchanged by the successor.
+- Restart and replica joins after invalid newer snapshot versions are added.
+- Predecessor key deletion scheduling and cancellation, with successor recovery.
 
-### Test Infrastructure
+The emulator has limits; Go tests cover the corresponding branches, but these
+behaviours also need validation against AWS:
 
-| Component | Port | Purpose |
-|-----------|------|---------|
-| Enclave (QEMU via gvproxy) | 8443 | TLS-terminated enclave |
-|  Supervisor | 8444 | Host-side supervisor (migration orchestration) |
-| LocalStack | 4566 | S3, SSM, STS mock |
-| KMS proxy | 4000 | Custom KMS mock |
-| Mock IMDS | 1338 | EC2 instance metadata mock |
+| Boundary | Emulator limitation |
+|---|---|
+| Delete markers | Rejects deletion of a locked object rather than adding a marker. |
+| Retention | Tracks retention per key rather than per version. Stacked E2E versions therefore omit lock headers. |
+| Object Lock permissions | Does not establish real bucket configuration and `PutObjectRetention` enforcement. |
+| IAM scoping | Denies by action only, so resource restrictions need separate validation. |
+| Completed KMS deletion | The run reaches `pending_deletion`; Go tests model a fully deleted predecessor key. |
 
-The Docker test runner image (`test/Dockerfile.runner`) builds QEMU 9.2.4, vhost-device-vsock 0.3.0, gvproxy 0.8.6, and the CLI/supervisor binaries in a multi-stage build. QEMU 9.2 is the first version with the `nitro-enclave` machine type.
+The test namespace is `ark/e2e/dev`. Images enable `ENCLAVE_DEV` and
+`ENCLAVE_INSECURE_VERIFY_SKIPPED` because QEMU's NSM has no AWS certificate chain.
+Signature verification is covered by Go tests, not E2E. Normal dev deployments
+should leave the skip flag unset. Tests also enable clock-source verification,
+traces and metrics, and use a 60-second migration cooldown.
 
-### Test Environment Variables
+The driver provisions AWS resources and controls node startup. It does not test
+a deployment system, host image lifecycle or traffic cutover.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOOT_TIMEOUT` | `90` | Seconds to wait for QEMU boot |
-| `INIT_TIMEOUT` | `120` | Seconds to wait for enclave Init |
-| `HOST_TLS_PORT` | `8443` | Enclave TLS port on host |
+### Troubleshooting
 
-## Project Structure
+**The enclave does not start.** Read `/enclave/v1/info`
+[from the instance](#reaching-the-enclave-from-its-instance): a boot stopped at
+the permission preflight or telemetry reports `status: "failed"` and the error.
+A failure after telemetry has started is logged as `runtime failed` in the
+runtime log group. Otherwise, inspect the QEMU launcher and enclave console on
+the affected enclave node.
 
-```
-.
-├── cmd/enclave/main.go          # CLI (main package + all command code)
-├── config.go                    # Config loading + validation
-├── build.go                     # EIF build orchestration
-├── setup.go                     # Auto-populate app nix hashes
-├── update.go                    # Fast update (rev + source hash only)
-├── template.go                  # Template generation (Go, Node.js)
-├── tofu.go                      # `enclave tofu` scaffold command
-├── tofu_files.go                # OpenTofu module definition (emitted into ./tofu/)
-├── verify.go                    # Attestation verification
-├── init.go                      # Scaffold command + config template
-├── framework_files.go           # Framework files as Go string constants
-├── version.go                   # SDK hash vars (set via ldflags)
-├── Makefile                     # Build + hash computation targets
-├── sdk-hashes.json              # Cached SDK Nix hashes
-├── runtime/                     # Runtime (in-enclave library + binary)
-│   ├── enclave.go               # Init, attestation key, signing middleware, routes
-│   ├── kms_ssm.go               # KMS encrypt/decrypt, SSM storage
-│   ├── storage.go               # Encrypted storage (AES-256-GCM + S3)
-│   ├── secrets.go               # Dynamic secrets API
-│   ├── imds.go                  # IMDS credential fetching
-│   ├── migrate.go               # Key export for locked-key migration
-│   └── cmd/runtime/
-│       └── main.go              # Standalone supervisor binary
-├── supervisor/                 # Host-side supervisor
-│   ├── main.go                  # Routes + server setup
-│   ├── health.go                # Health endpoint (nitro-cli describe)
-│   ├── enclave.go               # Start/stop via systemd
-│   ├── migrate.go               # 9-step locked-key migration
-│   └── deletion.go              # KMS key deletion scheduling
-├── test/                        # Local testing infrastructure
-│   ├── run.sh                   # 7-step E2E test orchestration
-│   ├── integration-test.sh      # 15 integration tests
-│   ├── boot-qemu.sh             # QEMU nitro-enclave boot
-│   ├── docker-compose.yml       # Mock services + test runner
-│   ├── Dockerfile.runner        # Test runner image (QEMU 9.2 + tools)
-│   └── app/                     # Skeleton test application
-└── .github/workflows/
-    ├── sdk-hashes.yml           # CI: verify SDK hashes on tag push
-    └── integration-test.yml     # CI: full E2E test suite
+**`starting clock sync failed: open /dev/ptp0`.** Nested KVM, invariant TSC
+exposure, or the clocksource. Confirm the guest's kernel command line ends with
+`clocksource=tsc`.
+
+**The runtime cannot obtain credentials.** Confirm the test IMDS endpoint and
+the host's vsock port 8002 forward are reachable.
+
+```sh
+curl -fsS http://169.254.169.254/latest/meta-data/
 ```
 
-## Configuration Reference
+**`/health` is ready but application routes fail.** `/health` only proves the
+application process started. Check an application endpoint directly and read the
+enclave console for application errors.
 
-### `enclave/enclave.yaml`
+**Migration stalls under QEMU.** `vhost-device-vsock`
+0.3 occasionally drops a forwarded host-to-guest connection before it reaches
+the enclave. Retry. This affects the emulated transport only; production uses
+Nitro AF_VSOCK. A genuine validation failure returns an HTTP status and body and
+should not be retried.
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `name` | App name (used in stack name, EIF) | (required) |
-| `version` | Build version | `dev` |
-| `region` | AWS region | (required) |
-| `account` | AWS account ID | (required for deploy) |
-| `prefix` | Deployment prefix (stack = `{prefix}Nitro{name}`) | `dev` |
-| `instance_type` | EC2 instance type | `m6i.xlarge` |
-| `nix_image` | Docker image for builds | `nixos/nix:2.24.9` |
-| `sdk.rev` | SDK git commit SHA or tag | (required for build) |
-| `sdk.hash` | Nix source hash (SRI) | (required for build) |
-| `sdk.vendor_hash` | Go vendor hash (SRI) | (required for build) |
-| `app.language` | App language (`go`, `nodejs`) | `go` |
-| `app.source` | Build source type | `nix` |
-| `app.nix_owner` | GitHub owner | (auto by `setup`) |
-| `app.nix_repo` | GitHub repo | (auto by `setup`) |
-| `app.nix_rev` | Git commit SHA | (auto by `setup`) |
-| `app.nix_hash` | Nix source hash (SRI) | (auto by `setup`) |
-| `app.nix_vendor_hash` | Go vendor hash or npm deps hash (SRI) | (auto by `setup`) |
-| `app.nix_sub_packages` | Go sub-packages to build (Go only) | `["."]` |
-| `app.binary_name` | Output binary name | `{name}` |
-| `app.vendor` | (go/rust) Use committed `vendor/` in app source; mutually exclusive with `nix_vendor_hash`. See [BINARY-CACHE.md](BINARY-CACHE.md#vendor-mode-rust--go--survives-upstream-dep-disappearance). | `false` |
-| `app.env` | Environment variables baked into EIF as defaults (tofu can override per-deploy via `-var env_values={...}`) | `{}` |
-| `secrets[].name` | Secret name (SSM path component) | (required) |
-| `secrets[].env_var` | Env var for decrypted value | (required) |
-| `nix.substituters` | Cachix substituter URLs (`https://<name>.cachix.org`) — only Cachix is accepted | `[]` |
-| `nix.trusted_public_keys` | Public keys for the substituters above (Cachix shows on cache settings page) | `[]` |
-| `nix.nixpkgs_rev` | 40-char nixpkgs commit SHA — pins the derivation graph | `nixos-25.11` branch |
-| `nix.nixpkgs_hash` | SRI hash of the nixpkgs tarball at `nixpkgs_rev` | — |
+## Security notes
 
-### Environment Variables (Runtime)
+**Pin PCR0.** The client requires `ExpectedPCR0`, verifies Nitro attestation and
+PCRs, and pins the live TLS leaf to the attested hash before sending application
+requests. Attestation without an expected measurement does not identify your
+code.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ENCLAVE_APP_PORT` | Port your app listens on | `7074` |
-| `ENCLAVE_PROXY_PORT` | Supervisor proxy port | `7073` |
-| `APP_BINARY_NAME` | User app binary name | `app` |
-| `ENCLAVE_DEPLOYMENT` | Deployment name for SSM paths | `dev` |
-| `ENCLAVE_APP_NAME` | App name (used in SSM path construction) | (from config) |
-| `ENCLAVE_KMS_KEY_ID` | KMS key ID override | (auto from SSM) |
-| `ENCLAVE_AWS_REGION` | AWS region for KMS/SSM | `us-east-1` |
-| `ENCLAVE_RUNTIME_TOKEN` | Bearer token for storage/secrets API auth | (auto-generated) |
-| `ENCLAVE_SECRETS_CONFIG` | JSON array of secret definitions (baked into EIF) | (from config) |
+**Dev mode still verifies signatures.** `ENCLAVE_DEV` retains the KMS root
+recovery principal and shortens retention, write timeout and clock-sync
+intervals. Signature checks are skipped only when
+`ENCLAVE_INSECURE_VERIFY_SKIPPED=true` is also set; production ignores that flag.
+The skip is for QEMU tests, where PCR and payload checks still run but COSE
+signature and certificate-chain checks do not. Namespace names such as `dev`
+and `prod` do not select a security mode.
+
+**Host credentials alone cannot decrypt state.** KMS operations require the
+PCR0-bound policy and enclave attestation. Static secrets are committed to
+locked PCRs. Snapshot authentication and recovery rules are described under
+[Generation state](#generation-state).
+
+**Migration verifies the candidate, not operator approval.** A live challenge
+prevents replay, but the host chooses which image to launch. Inspect the target
+PCR0 during the cooldown as described in [Blue/green migration](#bluegreen-migration).
+
+**CloudWatch Logs is a boot dependency.** Startup creates both log groups and
+streams and probes the runtime group's OTLP path. A failure stops the boot and is
+reported on `/enclave/v1/info`. The probe does not test
+application uploads: those can fail later and increment
+`enclave_otlp_logs_upstream_errors_total`. Trace and metric export failures are
+not fatal.
+
+**Telemetry forwarding uses the instance role.** The loopback-only forwarders
+require the per-boot telemetry bearer token, expose no read endpoints, and keep no
+local history. Their IAM permissions are write-only.

@@ -15,7 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -28,8 +28,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"golang.org/x/crypto/nacl/box"
-
-	"github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
 )
 
 // =============================================================================
@@ -37,11 +35,13 @@ import (
 // =============================================================================
 //
 // Implements the leader–follower protocol used to scale an enclave cluster.
-// Followers are admitted through mutual attestation, proving they are running
-// the same measured enclave image before exchanging host public keys. Once
-// admitted, followers maintain membership via authenticated heartbeats, while
-// the leader tracks liveness, evicts stale members, and persists bans to
-// prevent re-admission.
+// The leader and its followers run separate images, so each has its own seed
+// and KMS key and no follower can reach the leader secret. Followers are
+// admitted through mutual attestation: the leader admits only the follower
+// images it was built with, and a follower checks the leader runs on the same
+// kernel. Once admitted, followers maintain membership via authenticated
+// heartbeats, while the leader tracks liveness, evicts stale members, and
+// persists bans to prevent re-admission.
 
 const (
 	handshakePathNonce = "/enclave/handshake/nonce"
@@ -58,17 +58,20 @@ const (
 	relayTAPHost     = "192.168.127.2"
 	defaultRelayPort = "9000"
 
-	thresholdBannedKey = "threshold/banned"
+	thresholdBannedKey   = "threshold/banned"
+	thresholdSharePrefix = "threshold/share/"
 
 	// followerReshareKeyTimeout bounds how long a joiner waits for its share after
 	// joining the ceremony.
 	followerReshareKeyTimeout = 5 * time.Minute
 )
 
-// PCR0 (EIF), PCR1 (kernel+bootstrap), PCR2 (application). Host-specific PCRs
-// (PCR3 IAM role, PCR4 instance ID) are excluded so same-image enclaves on
-// different EC2 instances are admitted.
-var scalingIdentityPCRs = []uint{0, 1, 2}
+// sharedSecret is a signing secret's persisted share and the group key it
+// belongs to. The leader secret is not kept: the leader derives it from its seed.
+type sharedSecret struct {
+	Share    string `json:"share"`     // hex; this node's threshold share
+	GroupKey []byte `json:"group_key"` // the group's 33-byte compressed key
+}
 
 // admitRequestData is packed into the joiner's attestation UserData.
 type admitRequestData struct {
@@ -90,31 +93,39 @@ type heartbeatRequest struct {
 
 type ScalingEntity struct {
 	mu              sync.Mutex
-	kms             *KMS
-	storage         *Storage             // leader: durable ban-set persistence
-	hostSk          *secp.PrivateKey     // this node's threshold host key (follower: signs heartbeats)
-	authorized      map[string]bool      // hex(hostpub) admitted after a valid handshake
-	banned          map[string]bool      // hex(hostpub) durably evicted; refused at both admission gates
-	lastSeen        map[string]time.Time // hex(hostpub) -> last valid heartbeat (leader liveness tracking)
-	nonces          map[string]time.Time // base64(nonce) -> issued-at (one-shot, TTL-bounded)
-	leaderPub       []byte               // leader's threshold host pubkey, set at StartLeader
+	cfg             *Config
+	nsm             NSM
+	storage         *thresholdStore         // durable shares and recovery blobs; leader: ban set
+	shares          map[string]sharedSecret // env var -> share this node signs with now
+	labels          []string                // env vars of the signing secrets
+	reshared        chan struct{}           // signalled when a ceremony delivers a share
+	hostSk          *secp.PrivateKey        // this node's threshold host key (follower: signs heartbeats)
+	authorized      map[string]bool         // hex(hostpub) admitted after a valid handshake
+	banned          map[string]bool         // hex(hostpub) durably evicted; refused at both admission gates
+	lastSeen        map[string]time.Time    // hex(hostpub) -> last valid heartbeat (leader liveness tracking)
+	nonces          map[string]time.Time    // base64(nonce) -> issued-at (one-shot, TTL-bounded)
+	leaderPub       []byte                  // leader's threshold host pubkey, set at StartLeader
 	role            string
 	listenPort      string // leader: port the gRPC relay binds/advertises (on the TAP iface)
 	leaderURL       string // follower: leader handshake base URL (e.g. https://host:443)
 	leader          *sdk.Leader
 	sdkBan          func(ctx context.Context, hostPubkey []byte) error // seam over leader.Ban (raw-keyed); set at startLeader
 	follower        *sdk.Follower
-	onShare         func(ctx context.Context, label string, share []byte) error // onShare persists+materializes a share delivered by a reshare ceremony.
-	getLeaderSecret func(label string) ([]byte, error)                          // leader a0 resolver for GetLeaderSecret; nil on a follower.
+	getLeaderSecret func(label string) ([]byte, error) // leader a0 resolver for GetLeaderSecret; nil on a follower.
 }
 
-func newScalingEntity() (*ScalingEntity, error) {
-	role := os.Getenv("ENCLAVE_SCALING_ROLE")
+func newScalingEntity(cfg *Config, nsm NSM) (*ScalingEntity, error) {
+	role := cfg.ScalingRole
 	if role != scalingRoleFollower && role != scalingRoleLeader {
-		return nil, fmt.Errorf("invalid ENCLAVE_SCALING_ROLE %q, want %q or %q", role, scalingRoleLeader, scalingRoleFollower)
+		return nil, fmt.Errorf("invalid %s %q, want %q or %q",
+			envScalingRole, role, scalingRoleLeader, scalingRoleFollower)
 	}
 
 	e := &ScalingEntity{
+		cfg:        cfg,
+		nsm:        nsm,
+		shares:     make(map[string]sharedSecret),
+		reshared:   make(chan struct{}, 1),
 		authorized: make(map[string]bool),
 		banned:     make(map[string]bool),
 		lastSeen:   make(map[string]time.Time),
@@ -125,80 +136,45 @@ func newScalingEntity() (*ScalingEntity, error) {
 	switch role {
 	case scalingRoleLeader:
 		// The relay binds on the known TAP address, so only the port is configurable.
-		port := os.Getenv("ENCLAVE_SCALING_LISTEN_PORT")
-		if port == "" {
-			port = defaultRelayPort
-		}
-		e.listenPort = port
+		e.listenPort = cfg.ScalingListenPort
 	case scalingRoleFollower:
-		leaderURL := os.Getenv("ENCLAVE_SCALING_LEADER_ADDR")
-		if leaderURL == "" {
-			return nil, fmt.Errorf("ENCLAVE_SCALING_LEADER_ADDR must be set for role %q", role)
+		if cfg.ScalingLeaderAddr == "" {
+			return nil, fmt.Errorf("%s must be set for role %q", envScalingLeaderAddr, role)
 		}
-		e.leaderURL = leaderURL
+		e.leaderURL = cfg.ScalingLeaderAddr
 	}
 
 	return e, nil
-}
-
-func (a *ScalingEntity) loadOrGenerateHostKey(ctx context.Context) (*secp.PrivateKey, error) {
-	keyID, err := a.kms.GetKeyID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get kms key id: %w", err)
-	}
-	paramName := secretCiphertextParam("threshold_host_key", keyID)
-
-	ciphertextB64, err := a.kms.LoadCiphertext(ctx, paramName)
-	if err != nil {
-		return nil, err
-	}
-
-	if ciphertextB64 != "" {
-		plaintext, err := a.kms.decryptToBytes(ctx, keyID, ciphertextB64)
-		if err != nil {
-			return nil, err
-		}
-		return secp.PrivKeyFromBytes(plaintext), nil
-	}
-
-	ciphertextBlob, plaintext, err := a.kms.generateDataKey(ctx, keyID)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := a.kms.StoreCiphertext(ctx, paramName, base64.StdEncoding.EncodeToString(ciphertextBlob)); err != nil {
-		return nil, err
-	}
-
-	return secp.PrivKeyFromBytes(plaintext), nil
 }
 
 func (a *ScalingEntity) IsLeader() bool {
 	return a.role == scalingRoleLeader
 }
 
-// SetLeaderResolver wires the leader's a0 lookup (StaticSecrets.leaderSecret), read by
-// the DKG store to pin the group key. Leave unset on a follower.
+// SetLeaderResolver wires the leader's a0 lookup (its seed-derived signing secrets),
+// read by the DKG store to pin the group key. Leave unset on a follower.
 func (a *ScalingEntity) SetLeaderResolver(fn func(label string) ([]byte, error)) {
 	a.getLeaderSecret = fn
 }
 
-// SetShareHandler wires the sink for reshared follower shares.
-func (a *ScalingEntity) SetShareHandler(fn func(ctx context.Context, label string, share []byte) error) {
-	a.onShare = fn
-}
-
-func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
-	hostSk, err := a.loadOrGenerateHostKey(ctx)
-	if err != nil {
-		return fmt.Errorf("generate host key: %w", err)
-	}
+// Init starts this node's role. labels are the signing secrets' env vars: a share
+// persisted for one is restored, and a follower without one requests it and waits.
+func (a *ScalingEntity) Init(
+	ctx context.Context,
+	hostSk *secp.PrivateKey,
+	storage *thresholdStore,
+	labels []string,
+) error {
 	a.hostSk = hostSk
 	a.storage = storage
+	a.labels = labels
+
+	if err := a.loadShares(ctx); err != nil {
+		return fmt.Errorf("load shares: %w", err)
+	}
 
 	if a.role == scalingRoleLeader {
 		err := a.startLeader(ctx, hostSk, storage)
-
 		if err != nil {
 			return fmt.Errorf("failed to start leader: %w", err)
 		}
@@ -207,9 +183,13 @@ func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
 		return nil
 	}
 
-	err = a.startFollower(ctx, hostSk, storage)
+	err := a.startFollower(ctx, hostSk, storage)
 	if err != nil {
 		return fmt.Errorf("failed to start follower: %w", err)
+	}
+
+	if err := a.awaitShares(ctx); err != nil {
+		return err
 	}
 
 	slog.Info("threshold follower started")
@@ -217,7 +197,118 @@ func (a *ScalingEntity) Init(ctx context.Context, storage *Storage) error {
 	return nil
 }
 
-func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
+// Reshared is signalled when a ceremony delivers a share, so the app can be
+// restarted to adopt it. A nil entity returns a nil channel.
+func (a *ScalingEntity) Reshared() <-chan struct{} {
+	if a == nil {
+		return nil
+	}
+	return a.reshared
+}
+
+// applyShares returns static with every signing secret that has a share set to
+// that share and its group key. A nil entity returns static unchanged.
+func (a *ScalingEntity) applyShares(static []StaticSecret) []StaticSecret {
+	if a == nil {
+		return static
+	}
+	out := slices.Clone(static)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, secret := range out {
+		if s, ok := a.shares[secret.EnvVar]; ok && secret.IsSigning() {
+			out[i].Plaintext = s.Share
+			out[i].GroupKey = s.GroupKey
+		}
+	}
+	return out
+}
+
+func (a *ScalingEntity) hasShare(label string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.shares[label]
+	return ok
+}
+
+// loadShares restores the shares this node persisted, so a reboot skips the ceremony.
+func (a *ScalingEntity) loadShares(ctx context.Context) error {
+	for _, label := range a.labels {
+		blob, err := a.storage.Load(ctx, thresholdSharePrefix+label)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		var s sharedSecret
+		if err := json.Unmarshal(blob, &s); err != nil {
+			return fmt.Errorf("decode share for %q: %w", label, err)
+		}
+		a.mu.Lock()
+		a.shares[label] = s
+		a.mu.Unlock()
+	}
+	return nil
+}
+
+// storeShare persists a share delivered by a (re-)DKG ceremony, makes it what
+// the app receives for label, and signals Reshared.
+func (a *ScalingEntity) storeShare(
+	ctx context.Context,
+	label string,
+	share, groupKey []byte,
+) error {
+	if !slices.Contains(a.labels, label) {
+		return fmt.Errorf("no configured signing secret for reshare label %q", label)
+	}
+	s := sharedSecret{Share: hex.EncodeToString(share), GroupKey: groupKey}
+	blob, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	if err := a.storage.Store(ctx, thresholdSharePrefix+label, blob); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.shares[label] = s
+	a.mu.Unlock()
+	select {
+	case a.reshared <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// awaitShares (follower) requests a reshare for each signing secret without a
+// share and waits for it: a follower has no signing secret until its group
+// delivers one.
+func (a *ScalingEntity) awaitShares(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, followerReshareKeyTimeout)
+	defer cancel()
+	for _, label := range a.labels {
+		if a.hasShare(label) {
+			continue
+		}
+		if err := a.follower.RequestReshare(ctx, label); err != nil {
+			return fmt.Errorf("request reshare for %q: %w", label, err)
+		}
+		for !a.hasShare(label) {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("timeout waiting for a share of %q", label)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	return nil
+}
+
+func (a *ScalingEntity) startLeader(
+	ctx context.Context,
+	hostSk *secp.PrivateKey,
+	storage *thresholdStore,
+) error {
 	// The leader resolves a0 from its leader-secret cache so the group key pins to it.
 	store := newDKGStore(storage, a.getLeaderSecret)
 
@@ -247,7 +338,7 @@ func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey
 	// The leader is a full participant, so each ceremony hands it its own share
 	go func() {
 		for out := range leader.Keys() {
-			a.handleShare(scalingRoleLeader, out.Label, out.Secshare)
+			a.handleShare(scalingRoleLeader, out.Label, out.Secshare, out.ThresholdPubkey)
 		}
 	}()
 
@@ -259,17 +350,11 @@ func (a *ScalingEntity) startLeader(ctx context.Context, hostSk *secp.PrivateKey
 	return nil
 }
 
-func (a *ScalingEntity) DeriveFollowerKey(ctx context.Context, StaticSecret StaticSecret) error {
-	err := a.follower.RequestReshare(ctx, StaticSecret.EnvVar)
-	if err != nil {
-		return fmt.Errorf("request reshare: %w", err)
-	}
-
-	return nil
-
-}
-
-func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateKey, storage *Storage) error {
+func (a *ScalingEntity) startFollower(
+	ctx context.Context,
+	hostSk *secp.PrivateKey,
+	storage *thresholdStore,
+) error {
 	// A follower has no leader secret, so it never answers GetLeaderSecret (nil resolver).
 	store := newDKGStore(storage, nil)
 
@@ -298,7 +383,9 @@ func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateK
 	if err != nil {
 		return err
 	}
-	ourDoc, err := nitriding.Attest(leaderNonce, reqData, encryptionPubkey[:])
+	ourDoc, _, err := a.nsm.BuildAttestationDocument(
+		WithNonce(leaderNonce), WithUserData(reqData), WithPublicKeyBytes(encryptionPubkey[:]),
+	)
 	if err != nil {
 		return fmt.Errorf("attest: %w", err)
 	}
@@ -310,32 +397,37 @@ func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateK
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("admit rejected: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return fmt.Errorf(
+			"admit rejected: status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(msg)),
+		)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	leaderAttestationDoc, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(body)))
+	// The leader runs another image, so only its kernel (PCR1) can match ours.
+	// Unsigned mock documents pass only in dev (the NSM's InsecureVerifySkipped).
+	ourPCR1, _, err := a.nsm.DescribePCR(1)
 	if err != nil {
-		return errors.New("bad leader attestation encoding")
+		return fmt.Errorf("read local PCR1: %w", err)
 	}
-	// Dev-aware verification (see verifyFollowerAttestation): mock docs pass in dev.
-	res, err := verifyAttestationDoc(leaderAttestationDoc, nil)
+	res, err := a.nsm.VerifyAttestationDocument(
+		strings.TrimSpace(string(body)), map[uint]string{1: hex.EncodeToString(ourPCR1)},
+	)
 	if err != nil {
 		return fmt.Errorf("verify leader attestation: %w", err)
-	}
-	ourPCRs, err := nitriding.GetPCRs()
-	if err != nil {
-		return errors.New("read local PCRs")
-	}
-	if !nitriding.ArePCRsIdenticalForKeys(ourPCRs, res.Document.PCRs, scalingIdentityPCRs) {
-		return errors.New("leader PCRs differ from ours")
 	}
 	if !bytes.Equal(res.Document.Nonce, ourNonce) {
 		return errors.New("leader did not echo our nonce")
 	}
-	decryptedUserData, ok := box.OpenAnonymous(nil, res.Document.UserData, encryptionPubkey, encryptionPrivkey)
+	decryptedUserData, ok := box.OpenAnonymous(
+		nil,
+		res.Document.UserData,
+		encryptionPubkey,
+		encryptionPrivkey,
+	)
 	if !ok {
 		return errors.New("failed to open sealed leader payload")
 	}
@@ -374,7 +466,7 @@ func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateK
 
 	go func() {
 		for out := range follower.Keys() {
-			a.handleShare(scalingRoleFollower, out.Label, out.Secshare)
+			a.handleShare(scalingRoleFollower, out.Label, out.Secshare, out.ThresholdPubkey)
 		}
 	}()
 
@@ -385,18 +477,13 @@ func (a *ScalingEntity) startFollower(ctx context.Context, hostSk *secp.PrivateK
 	return nil
 }
 
-// handleShare feeds one (re-)DKG output to the wired handler, which persists the
-// share and sets its env var.
-func (a *ScalingEntity) handleShare(role, label string, share []byte) {
+// handleShare persists one (re-)DKG output and makes it the app's signing secret.
+func (a *ScalingEntity) handleShare(role, label string, share, groupKey []byte) {
 	if len(share) == 0 {
 		slog.Warn("threshold "+role+" received empty share", "envvar", label)
 		return
 	}
-	if a.onShare == nil {
-		slog.Error("threshold "+role+" received share with no handler wired; not persisted", "envvar", label)
-		return
-	}
-	if err := a.onShare(context.Background(), label, share); err != nil {
+	if err := a.storeShare(context.Background(), label, share, groupKey); err != nil {
 		slog.Warn("threshold "+role+" failed to store share", "envvar", label, "error", err)
 	}
 }
@@ -435,13 +522,13 @@ func (a *ScalingEntity) issueNonce() (string, error) {
 	b64 := base64.StdEncoding.EncodeToString(n)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	cutoff := nitriding.CurrentTime().Add(-handshakeNonceTTL)
+	cutoff := time.Now().Add(-handshakeNonceTTL)
 	for k, issued := range a.nonces {
 		if issued.Before(cutoff) {
 			delete(a.nonces, k)
 		}
 	}
-	a.nonces[b64] = nitriding.CurrentTime()
+	a.nonces[b64] = time.Now()
 	return b64, nil
 }
 
@@ -456,7 +543,7 @@ func (a *ScalingEntity) consumeNonce(raw []byte) bool {
 		return false
 	}
 	delete(a.nonces, b64)
-	return !issued.Before(nitriding.CurrentTime().Add(-handshakeNonceTTL))
+	return !issued.Before(time.Now().Add(-handshakeNonceTTL))
 }
 
 func (a *ScalingEntity) authorize(hostPubkey []byte) {
@@ -467,7 +554,7 @@ func (a *ScalingEntity) authorize(hostPubkey []byte) {
 		return // never re-admit a banned host key
 	}
 	a.authorized[key] = true
-	a.lastSeen[key] = nitriding.CurrentTime()
+	a.lastSeen[key] = time.Now()
 }
 
 func (a *ScalingEntity) handleNonce(w http.ResponseWriter, r *http.Request) {
@@ -486,13 +573,8 @@ func (a *ScalingEntity) handleAdmitFollower(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
 	}
-	followerAttestationDoc, err := base64.StdEncoding.DecodeString(string(body))
-	if err != nil {
-		http.Error(w, "invalid base64 attestation", http.StatusBadRequest)
-		return
-	}
 
-	req, encryptionPubKey, err := a.verifyFollowerAttestation(followerAttestationDoc)
+	req, encryptionPubKey, err := a.verifyFollowerAttestation(string(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -517,7 +599,7 @@ func (a *ScalingEntity) handleAdmitFollower(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "failed to seal response", http.StatusInternalServerError)
 		return
 	}
-	ourDoc, err := nitriding.Attest(req.Nonce, sealed, nil)
+	ourDoc, _, err := a.nsm.BuildAttestationDocument(WithNonce(req.Nonce), WithUserData(sealed))
 	if err != nil {
 		http.Error(w, "failed to attest", http.StatusInternalServerError)
 		return
@@ -526,22 +608,18 @@ func (a *ScalingEntity) handleAdmitFollower(w http.ResponseWriter, r *http.Reque
 	_, _ = io.WriteString(w, base64.StdEncoding.EncodeToString(ourDoc))
 }
 
-// verifyFollower authenticates a Follower's attestation doc: valid signature, PCRs
-// identical to ours, and a nonce we issued. Returns the Follower's request data and
-// NaCl box public key.
-func (a *ScalingEntity) verifyFollowerAttestation(doc []byte) (admitRequestData, []byte, error) {
-	// Dev-aware: honors skipCOSEVerification so the QEMU NSM's unsigned mock docs are
-	// accepted in dev; a real deployment still verifies against the AWS Nitro root.
-	res, err := verifyAttestationDoc(doc, nil)
+// verifyFollower authenticates a Follower's base64 attestation doc: valid signature,
+// the PCR0 of an admitted follower image, and a nonce we issued. Returns the
+// Follower's request data and NaCl box public key.
+func (a *ScalingEntity) verifyFollowerAttestation(docB64 string) (admitRequestData, []byte, error) {
+	// Unsigned mock documents pass only in dev (the NSM's InsecureVerifySkipped);
+	// a real deployment verifies against the AWS Nitro root.
+	res, err := a.nsm.VerifyAttestationDocument(strings.TrimSpace(docB64), nil)
 	if err != nil {
 		return admitRequestData{}, nil, fmt.Errorf("verify attestation: %w", err)
 	}
-	ourPCRs, err := nitriding.GetPCRs()
-	if err != nil {
-		return admitRequestData{}, nil, errors.New("read local PCRs")
-	}
-	if !nitriding.ArePCRsIdenticalForKeys(ourPCRs, res.Document.PCRs, scalingIdentityPCRs) {
-		return admitRequestData{}, nil, errors.New("joiner PCRs differ from ours")
+	if !slices.Contains(a.cfg.ScalingFollowerPCR0s, hex.EncodeToString(res.Document.PCRs[0])) {
+		return admitRequestData{}, nil, errors.New("joiner PCR0 is not an admitted follower image")
 	}
 	if !a.consumeNonce(res.Document.Nonce) {
 		return admitRequestData{}, nil, errors.New("unknown or expired nonce")
@@ -598,7 +676,7 @@ func (a *ScalingEntity) handleHeartbeat(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "host key not admitted", http.StatusForbidden)
 		return
 	}
-	a.lastSeen[key] = nitriding.CurrentTime()
+	a.lastSeen[key] = time.Now()
 	a.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -614,7 +692,7 @@ func (a *ScalingEntity) runFollowerHeartbeat(ctx context.Context, hostSk *secp.P
 		},
 	}
 	hostPub := hostSk.PubKey().SerializeCompressed()
-	ticker := time.NewTicker(scalingHeartbeatInterval())
+	ticker := time.NewTicker(a.cfg.ScalingHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -628,7 +706,11 @@ func (a *ScalingEntity) runFollowerHeartbeat(ctx context.Context, hostSk *secp.P
 	}
 }
 
-func (a *ScalingEntity) sendHeartbeat(client *http.Client, hostSk *secp.PrivateKey, hostPub []byte) error {
+func (a *ScalingEntity) sendHeartbeat(
+	client *http.Client,
+	hostSk *secp.PrivateKey,
+	hostPub []byte,
+) error {
 	nonce, err := fetchHandshakeNonce(client, a.leaderURL)
 	if err != nil {
 		return fmt.Errorf("fetch nonce: %w", err)
@@ -648,7 +730,11 @@ func (a *ScalingEntity) sendHeartbeat(client *http.Client, hostSk *secp.PrivateK
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("heartbeat rejected: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return fmt.Errorf(
+			"heartbeat rejected: status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(msg)),
+		)
 	}
 	return nil
 }
@@ -656,8 +742,8 @@ func (a *ScalingEntity) sendHeartbeat(client *http.Client, hostSk *secp.PrivateK
 // runLivenessMonitor (leader) evicts followers whose last heartbeat is older than the
 // liveness timeout. Runs for the leader's lifetime.
 func (a *ScalingEntity) runLivenessMonitor(ctx context.Context) {
-	timeout := scalingLivenessTimeout()
-	ticker := time.NewTicker(scalingMonitorTick())
+	timeout := a.cfg.ScalingLivenessTimeout
+	ticker := time.NewTicker(a.cfg.ScalingMonitorTick)
 	defer ticker.Stop()
 	for {
 		select {
@@ -677,7 +763,7 @@ func (a *ScalingEntity) runLivenessMonitor(ctx context.Context) {
 // staleFollowers returns the raw host pubkeys of admitted followers whose last heartbeat is
 // older than timeout — never the leader's own key.
 func (a *ScalingEntity) staleFollowers(timeout time.Duration) [][]byte {
-	cutoff := nitriding.CurrentTime().Add(-timeout)
+	cutoff := time.Now().Add(-timeout)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	leaderKey := hex.EncodeToString(a.leaderPub)
@@ -790,7 +876,9 @@ func fetchHandshakeNonce(client *http.Client, baseURL string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch threshold nonce: status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(base64.StdEncoding.EncodedLen(handshakeNonceLen)+1)))
+	body, err := io.ReadAll(
+		io.LimitReader(resp.Body, int64(base64.StdEncoding.EncodedLen(handshakeNonceLen)+1)),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -828,4 +916,82 @@ func verifyHeartbeatSig(hostPub, nonce, sigBytes []byte) bool {
 		return false
 	}
 	return sig.Verify(heartbeatDigest(nonce), pub)
+}
+
+// deriveThresholdHostKey derives this node's threshold identity from its seed, so
+// it survives restarts and migration.
+func deriveThresholdHostKey(seed []byte) (*secp.PrivateKey, error) {
+	return deriveValidScalar(
+		seed,
+		thresholdHostKeyDerivationName,
+		func(candidate []byte) (*secp.PrivateKey, bool) {
+			var scalar secp.ModNScalar
+			if scalar.SetByteSlice(candidate) || scalar.IsZero() {
+				return nil, false
+			}
+			return secp.NewPrivateKey(&scalar), true
+		},
+	)
+}
+
+// startScaling runs this node's threshold-scaling role, if it has one, once boot
+// has established state. A leader starts serving admission; a follower joins its
+// leader and waits for a share of every signing secret.
+func startScaling(
+	ctx context.Context,
+	cfg *Config,
+	nsm NSM,
+	s3api S3API,
+	ssm SSM,
+	servers Servers,
+	result bootState,
+) (*ScalingEntity, error) {
+	if cfg.ScalingRole == "" {
+		return nil, nil
+	}
+	scaling, err := newScalingEntity(cfg, nsm)
+	if err != nil {
+		return nil, err
+	}
+	hostSk, err := deriveThresholdHostKey(result.masterSeed)
+	if err != nil {
+		return nil, fmt.Errorf("derive threshold host key: %w", err)
+	}
+	bucket, err := ssm.MustGet(ctx, cfg.certBucketParam())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate bucket name: %w", err)
+	}
+
+	leaderSecrets := make(map[string][]byte)
+	var labels []string
+	for _, secret := range result.secrets.Static {
+		if !secret.IsSigning() {
+			continue
+		}
+		labels = append(labels, secret.EnvVar)
+		if scaling.IsLeader() {
+			a0, err := hex.DecodeString(secret.Plaintext)
+			if err != nil {
+				return nil, fmt.Errorf("decode leader secret %q: %w", secret.Name, err)
+			}
+			leaderSecrets[secret.EnvVar] = a0
+		}
+	}
+	if scaling.IsLeader() {
+		scaling.SetLeaderResolver(func(label string) ([]byte, error) {
+			if a0, ok := leaderSecrets[label]; ok {
+				return a0, nil
+			}
+			return nil, fmt.Errorf("no leader secret for %q", label)
+		})
+	}
+
+	store := &thresholdStore{cfg: cfg, s3: s3api, dek: result.dek, bucket: bucket}
+	if err := scaling.Init(ctx, hostSk, store, labels); err != nil {
+		return nil, err
+	}
+	if scaling.IsLeader() {
+		servers.ConfigureScalingHandlers(scaling)
+	}
+	return scaling, nil
 }

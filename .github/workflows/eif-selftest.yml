@@ -1,0 +1,19 @@
+name: EIF self-test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  # Build the test app's EIFs through the same reusable workflow the emulator uses.
+  # Build and measure only: no publish, so this repository needs no AWS role.
+  build:
+    uses: ./.github/workflows/eif-build.yml
+    with:
+      environments: '["blue","green"]'
+      app_name: testapp
+      upload_images: false

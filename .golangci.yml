@@ -1,0 +1,11 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofumpt
+    - golines
+  settings:
+    gofumpt:
+      module-path: github.com/ArkLabsHQ/enclave
+    golines:
+      max-len: 100

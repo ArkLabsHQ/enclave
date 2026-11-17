@@ -2,173 +2,34 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
-	"time"
 
-	runtime "github.com/ArkLabsHQ/introspector-enclave/runtime"
+	runtime "github.com/ArkLabsHQ/enclave/runtime"
 	// Imported for its init() — seeds /dev/random from /dev/nsm before main()
 	// runs. See runtime/nitriding/package_init.go.
-	_ "github.com/ArkLabsHQ/introspector-enclave/runtime/nitriding"
+	_ "github.com/ArkLabsHQ/enclave/runtime/nitriding"
 )
 
 func main() {
-	if runtime.IsDev() {
-		runtime.ApplyDevCmdlineOverrides()
-	}
-
-	cfg, err := runtime.BuildNitridingConfig()
+	cfg, err := runtime.LoadConfig()
 	if err != nil {
-		slog.Error("build runtime config", "error", err)
+		slog.Error("load runtime config", "error", err)
 		os.Exit(1)
 	}
 
-	enc, err := runtime.New(cfg)
-	if err != nil {
-		slog.Error("runtime.New", "error", err)
+	if cfg == nil {
+		slog.Error("load runtime config", "error", "nil config")
 		os.Exit(1)
 	}
 
-	slog.SetDefault(slog.New(
-		runtime.NewBufferHandler(enc.Logging()),
-	))
-	runtime.InitMetrics()
-	tracing := enc.Tracing()
-
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	defer func() { _ = tracing.Shutdown(ctx) }()
 
-	// EIF rootfs doesn't symlink /etc/resolv.conf to gvproxy's DNS; write it directly.
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 192.168.127.1\n"), 0644); err != nil {
-		slog.Debug("write /etc/resolv.conf", "error", err)
-	}
-
-	// IMDS forwarder must be up before Start: certcache and metrics dial IMDS.
-	if err := runtime.StartViproxy(); err != nil {
-		slog.Error("viproxy start failed", "error", err)
+	// Run logs its own error, while telemetry can still export it.
+	if err := runtime.Run(ctx, *cfg); err != nil {
 		os.Exit(1)
 	}
-
-	enc.UseMiddleware(enc.Middleware)
-	enc.UseMiddleware(runtime.LoggingMiddleware)
-
-	if err := enc.Start(); err != nil {
-		slog.Error("runtime.Start", "error", err)
-		os.Exit(1)
-	}
-	defer func() { _ = enc.Stop() }()
-	enc.SetAttestationRegistrar(enc)
-
-	initCtx := ctx
-	if t := envOr("ENCLAVE_INIT_TIMEOUT", ""); t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			var cancel context.CancelFunc
-			initCtx, cancel = context.WithTimeout(ctx, d)
-			defer cancel()
-			slog.Info("init timeout configured", "timeout", d.String())
-		}
-	}
-
-	appPort := envOr("ENCLAVE_APP_PORT", "7074")
-	slog.Info("supervisor started", "app_port", appPort, "version", runtime.Version)
-
-	if err := enc.Init(initCtx); err != nil {
-		slog.Error("enclave init failed — app will NOT be started", "error", err)
-		<-ctx.Done()
-		slog.Info("shutting down (init failed, no child)")
-	} else {
-		appBinary := envOr("APP_BINARY_NAME", "app")
-		appPath := fmt.Sprintf("/app/%s", appBinary)
-
-		startChild := func() (*exec.Cmd, chan error, error) {
-			child := exec.Command(appPath)
-			child.Stdout = os.Stdout
-			child.Stderr = os.Stderr
-			child.Env = append(os.Environ(),
-				"ENCLAVE_APP_PORT="+appPort,
-				"PORT="+appPort,
-				"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-				"ENCLAVE_RUNTIME_TOKEN="+enc.RuntimeToken(),
-			)
-			if err := child.Start(); err != nil {
-				return nil, nil, err
-			}
-			slog.Info("child started", "path", appPath, "pid", child.Process.Pid)
-			done := make(chan error, 1)
-			go func() { done <- child.Wait() }()
-			return child, done, nil
-		}
-
-		// stopChild asks the app to exit, escalating to SIGKILL after a grace period.
-		stopChild := func(child *exec.Cmd, done chan error) {
-			_ = child.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-done:
-			case <-time.After(10 * time.Second):
-				slog.Warn("child did not exit, sending SIGKILL")
-				_ = child.Process.Kill()
-				<-done
-			}
-		}
-
-		child, childDone, err := startChild()
-		if err != nil {
-			slog.Error("start child failed", "path", appPath, "error", err)
-			os.Exit(1)
-		}
-
-		enc.MarkUpstreamStarted()
-
-		for {
-			select {
-			case <-enc.UpstreamRestart():
-				slog.Info("restarting app to adopt re-randomized share", "old_pid", child.Process.Pid)
-				stopChild(child, childDone)
-				child, childDone, err = startChild()
-				if err != nil {
-					slog.Error("restart child failed", "path", appPath, "error", err)
-					os.Exit(1)
-				}
-			case err := <-childDone:
-				// Upstream app exited. Record the state on the runtime
-				if err != nil {
-					slog.Error("upstream app exited — runtime stays alive", "error", err)
-				} else {
-					slog.Warn("upstream app exited cleanly — runtime stays alive")
-				}
-				enc.MarkUpstreamExited(err)
-				// Wait for explicit shutdown or a listener failure.
-				select {
-				case lerr := <-enc.ListenErr():
-					slog.Error("HTTP listener failed after app exit", "error", lerr)
-					os.Exit(1)
-				case <-ctx.Done():
-					slog.Info("shutting down (upstream app already exited)")
-				}
-				return
-			case err := <-enc.ListenErr():
-				slog.Error("HTTP listener failed", "error", err)
-				stopChild(child, childDone)
-				os.Exit(1)
-			case <-ctx.Done():
-				slog.Info("shutting down")
-				stopChild(child, childDone)
-				return
-			}
-		}
-	}
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

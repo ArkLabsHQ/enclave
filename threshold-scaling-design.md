@@ -1,5 +1,9 @@
 # Threshold-shared static secrets for horizontal enclave scaling
 
+> Historical implementation plan. The feature has since been ported onto the
+> seed-derived runtime, with separate leader and follower images;
+> [SCALING-ARCHITECTURE.md](SCALING-ARCHITECTURE.md) describes the current design.
+
 ## Implementation status (2026-07-01)
 
 Done + green across `threshold-magic` and the enclave repo (all unit tests pass;

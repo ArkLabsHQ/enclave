@@ -1,0 +1,1207 @@
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing/iotest"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/route53"
+	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
+	"github.com/fxamacker/cbor/v2"
+)
+
+// Doubles shared by the runtime tests. One that holds a map or channel either
+// works from its zero value or is built with its newX constructor.
+
+type fakeKMS struct {
+	mu           sync.Mutex
+	seq          int
+	keys         map[string]string
+	blobs        map[string][]byte
+	encryptErr   error
+	createKeyErr error
+
+	// dataKey and encrypted, when set, replace the material GenerateDataKey
+	// mints and Encrypt seals, so an authentic key can hand boot malformed input.
+	dataKey, encrypted          []byte
+	generateCalls, decryptCalls int
+
+	// Key-audit surface.
+	keyStates           map[string]*kmstypes.KeyMetadata
+	describeErr         error
+	describeNilMetadata bool
+	getKeyPolicyErr     error
+	describeCalls       int
+	policyCalls         int
+
+	// deleted keys refuse every operation, as KMS does once deletion completes.
+	deleted map[string]bool
+}
+
+func (f *fakeKMS) deleteKey(keyID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	delete(f.keys, keyID)
+	if f.deleted == nil {
+		f.deleted = map[string]bool{}
+	}
+	f.deleted[keyID] = true
+}
+
+func fakeKMSNotFound() error {
+	return &kmstypes.NotFoundException{Message: aws.String("fake kms key not found")}
+}
+
+func newFakeKMS() *fakeKMS { return &fakeKMS{keys: map[string]string{}, blobs: map[string][]byte{}} }
+
+func (f *fakeKMS) putKey(keyID, policy string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.keys[keyID] = policy
+}
+
+func (f *fakeKMS) keyPolicy(keyID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keys[keyID]
+}
+
+func (f *fakeKMS) init() {
+	if f.keys == nil {
+		f.keys = map[string]string{}
+	}
+	if f.blobs == nil {
+		f.blobs = map[string][]byte{}
+	}
+}
+
+func (f *fakeKMS) Encrypt(
+	_ context.Context,
+	in *kms.EncryptInput,
+	_ ...func(*kms.Options),
+) (*kms.EncryptOutput, error) {
+	if f.encryptErr != nil {
+		return nil, f.encryptErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	if f.deleted[aws.ToString(in.KeyId)] {
+		return nil, fakeKMSNotFound()
+	}
+	f.seq++
+	blob := fmt.Appendf(nil, "fake-kms-blob-%d", f.seq)
+	plaintext := in.Plaintext
+	if f.encrypted != nil {
+		plaintext = f.encrypted
+	}
+	f.blobs[string(blob)] = append([]byte(nil), plaintext...)
+	return &kms.EncryptOutput{KeyId: in.KeyId, CiphertextBlob: blob}, nil
+}
+
+func (f *fakeKMS) Decrypt(
+	_ context.Context,
+	in *kms.DecryptInput,
+	_ ...func(*kms.Options),
+) (*kms.DecryptOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.init()
+	f.decryptCalls++
+	plaintext, ok := f.blobs[string(in.CiphertextBlob)]
+	plaintext = append([]byte(nil), plaintext...)
+	f.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("fake kms ciphertext not found")
+	}
+	if in.Recipient == nil {
+		return &kms.DecryptOutput{KeyId: in.KeyId, Plaintext: plaintext}, nil
+	}
+	enveloped, err := f.envelopeForRecipient(plaintext, in.Recipient.AttestationDocument)
+	if err != nil {
+		return nil, err
+	}
+	return &kms.DecryptOutput{KeyId: in.KeyId, CiphertextForRecipient: enveloped}, nil
+}
+
+func (f *fakeKMS) GenerateDataKey(
+	_ context.Context,
+	in *kms.GenerateDataKeyInput,
+	_ ...func(*kms.Options),
+) (*kms.GenerateDataKeyOutput, error) {
+	if err := f.authorizeAttested(aws.ToString(in.KeyId), in.Recipient); err != nil {
+		return nil, err
+	}
+	n := int(aws.ToInt32(in.NumberOfBytes))
+	if n == 0 {
+		n = 32
+	}
+	plaintext := make([]byte, n)
+	for i := range plaintext {
+		plaintext[i] = byte(i + 1)
+	}
+
+	f.mu.Lock()
+	f.init()
+	f.generateCalls++
+	if f.dataKey != nil {
+		plaintext = append([]byte(nil), f.dataKey...)
+	}
+	f.seq++
+	blob := fmt.Appendf(nil, "fake-kms-data-key-%d", f.seq)
+	f.blobs[string(blob)] = append([]byte(nil), plaintext...)
+	f.mu.Unlock()
+
+	out := &kms.GenerateDataKeyOutput{KeyId: in.KeyId, CiphertextBlob: blob}
+	if in.Recipient == nil {
+		out.Plaintext = plaintext
+		return out, nil
+	}
+	enveloped, err := f.envelopeForRecipient(plaintext, in.Recipient.AttestationDocument)
+	if err != nil {
+		return nil, err
+	}
+	out.CiphertextForRecipient = enveloped
+	return out, nil
+}
+
+func (f *fakeKMS) authorizeAttested(keyID string, recipient *kmstypes.RecipientInfo) error {
+	f.mu.Lock()
+	f.init()
+	policy, ok := f.keys[keyID]
+	deleted := f.deleted[keyID]
+	f.mu.Unlock()
+	if deleted {
+		return fakeKMSNotFound()
+	}
+	if !ok || policy == "" || recipient == nil {
+		return nil
+	}
+
+	decoded, err := decodeKMSPolicy(policy, nil, false)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	if decoded.attested.Condition == nil {
+		return fmt.Errorf("AccessDeniedException: key %s lacks an attestation condition", keyID)
+	}
+	pcr0, err := f.attestedPCR0(recipient.AttestationDocument)
+	if err != nil {
+		return fmt.Errorf("fake kms: %w", err)
+	}
+	if !strings.EqualFold(decoded.attested.Condition.StringEqualsIgnoreCase.PCR0[0], pcr0) {
+		return fmt.Errorf(
+			"AccessDeniedException: key %s does not admit PCR0 %s", keyID, pcr0,
+		)
+	}
+	return nil
+}
+
+func (*fakeKMS) attestedPCR0(attestationDoc []byte) (string, error) {
+	var coseSign1 []cbor.RawMessage
+	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
+		return "", err
+	}
+	if len(coseSign1) < 3 {
+		return "", fmt.Errorf("invalid attestation document")
+	}
+	var payload []byte
+	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
+		return "", err
+	}
+	var doc struct {
+		PCRs map[uint][]byte `cbor:"pcrs"`
+	}
+	if err := cbor.Unmarshal(payload, &doc); err != nil {
+		return "", err
+	}
+	return strings.ToLower(hex.EncodeToString(doc.PCRs[0])), nil
+}
+
+func (f *fakeKMS) GetKeyPolicy(
+	_ context.Context,
+	in *kms.GetKeyPolicyInput,
+	_ ...func(*kms.Options),
+) (*kms.GetKeyPolicyOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.policyCalls++
+	if f.getKeyPolicyErr != nil {
+		return nil, f.getKeyPolicyErr
+	}
+	policy, ok := f.keys[aws.ToString(in.KeyId)]
+	if !ok {
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
+	}
+	return &kms.GetKeyPolicyOutput{Policy: aws.String(policy)}, nil
+}
+
+// DescribeKey reports keyStates when seeded, otherwise derives presence from the
+// key set: a known key is Enabled, an unknown one is gone.
+func (f *fakeKMS) DescribeKey(
+	_ context.Context,
+	in *kms.DescribeKeyInput,
+	_ ...func(*kms.Options),
+) (*kms.DescribeKeyOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.describeCalls++
+	if f.describeErr != nil {
+		return nil, f.describeErr
+	}
+	if f.describeNilMetadata {
+		return &kms.DescribeKeyOutput{}, nil
+	}
+	keyID := aws.ToString(in.KeyId)
+	if md, ok := f.keyStates[keyID]; ok {
+		return &kms.DescribeKeyOutput{KeyMetadata: md}, nil
+	}
+	if _, ok := f.keys[keyID]; !ok {
+		return nil, &kmstypes.NotFoundException{
+			Message: aws.String("fake kms key not found"),
+		}
+	}
+	return &kms.DescribeKeyOutput{KeyMetadata: &kmstypes.KeyMetadata{
+		KeyId:    aws.String(keyID),
+		KeyState: kmstypes.KeyStateEnabled,
+	}}, nil
+}
+
+func (f *fakeKMS) CreateKey(
+	_ context.Context,
+	in *kms.CreateKeyInput,
+	_ ...func(*kms.Options),
+) (*kms.CreateKeyOutput, error) {
+	if f.createKeyErr != nil {
+		return nil, f.createKeyErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.seq++
+	keyID := fmt.Sprintf("fake-kms-key-%d", f.seq)
+	f.keys[keyID] = aws.ToString(in.Policy)
+	return &kms.CreateKeyOutput{KeyMetadata: &kmstypes.KeyMetadata{KeyId: aws.String(keyID)}}, nil
+}
+
+var (
+	fakeKMSOIDData          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
+	fakeKMSOIDEnvelopedData = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 3}
+	fakeKMSOIDRSAESOAEP     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 7}
+	fakeKMSOIDAES256CBC     = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+)
+
+type fakeKMSContentInfo struct {
+	ContentType asn1.ObjectIdentifier
+	Content     fakeKMSEnvelopedData `asn1:"explicit,tag:0"`
+}
+
+type fakeKMSEnvelopedData struct {
+	Version              int
+	RecipientInfos       []fakeKMSKeyTransRecipientInfo `asn1:"set"`
+	EncryptedContentInfo fakeKMSEncryptedContentInfo
+}
+
+type fakeKMSKeyTransRecipientInfo struct {
+	Version                int
+	RecipientIdentifier    []byte `asn1:"tag:0"`
+	KeyEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedKey           []byte
+}
+
+type fakeKMSEncryptedContentInfo struct {
+	ContentType                asn1.ObjectIdentifier
+	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedContent           asn1.RawValue `asn1:"tag:0"`
+}
+
+func (f *fakeKMS) envelopeForRecipient(plaintext, attestationDoc []byte) ([]byte, error) {
+	pubKey, err := f.rsaPublicKey(attestationDoc)
+	if err != nil {
+		return nil, err
+	}
+	cek := make([]byte, 32)
+	if _, err := rand.Read(cek); err != nil {
+		return nil, err
+	}
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+
+	padLen := aes.BlockSize - len(plaintext)%aes.BlockSize
+	padded := append(
+		append([]byte(nil), plaintext...),
+		bytes.Repeat([]byte{byte(padLen)}, padLen)...,
+	)
+	block, err := aes.NewCipher(cek)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, padded)
+
+	encryptedCEK, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pubKey, cek, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return asn1.Marshal(fakeKMSContentInfo{
+		ContentType: fakeKMSOIDEnvelopedData,
+		Content: fakeKMSEnvelopedData{
+			Version: 2,
+			RecipientInfos: []fakeKMSKeyTransRecipientInfo{{
+				Version:             2,
+				RecipientIdentifier: []byte{},
+				KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+					Algorithm: fakeKMSOIDRSAESOAEP,
+				},
+				EncryptedKey: encryptedCEK,
+			}},
+			EncryptedContentInfo: fakeKMSEncryptedContentInfo{
+				ContentType: fakeKMSOIDData,
+				ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+					Algorithm: fakeKMSOIDAES256CBC,
+					Parameters: asn1.RawValue{
+						Tag:   asn1.TagOctetString,
+						Class: asn1.ClassUniversal,
+						Bytes: iv,
+					},
+				},
+				EncryptedContent: asn1.RawValue{
+					Tag:   0,
+					Class: asn1.ClassContextSpecific,
+					Bytes: ciphertext,
+				},
+			},
+		},
+	})
+}
+
+func (*fakeKMS) rsaPublicKey(attestationDoc []byte) (*rsa.PublicKey, error) {
+	var coseSign1 []cbor.RawMessage
+	if err := cbor.Unmarshal(attestationDoc, &coseSign1); err != nil {
+		return nil, err
+	}
+	if len(coseSign1) < 3 {
+		return nil, fmt.Errorf("invalid attestation document")
+	}
+	var payload []byte
+	if err := cbor.Unmarshal(coseSign1[2], &payload); err != nil {
+		return nil, err
+	}
+	var doc struct {
+		PublicKey []byte `cbor:"public_key"`
+	}
+	if err := cbor.Unmarshal(payload, &doc); err != nil {
+		return nil, err
+	}
+	pub, err := x509.ParsePKIXPublicKey(doc.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("attestation public key is not RSA")
+	}
+	return rsaPub, nil
+}
+
+type fakeSSM struct {
+	params  map[string]string
+	err     error
+	putErrs map[string]error
+	getErrs map[string]error // per-name GetParameter failures, e.g. a retired KMS key
+	calls   []string
+	// decryptedGets lists the names read with WithDecryption, in order.
+	decryptedGets []string
+
+	// getSeq scripts successive reads of one parameter, for races that turn on
+	// a value changing between two reads. The i-th read returns the i-th entry;
+	// the last entry repeats. An empty entry reads as absent, as it would
+	// before anything committed the parameter.
+	getSeq map[string][]string
+
+	// beforePut fires just before a write lands, for races that turn on a peer
+	// winning a create-only claim inside our window.
+	beforePut func(name string)
+
+	// For GetParametersByPath pagination tests: pages[i] is the i-th page of
+	// (Name, Value) pairs. nextTokens[i] is the NextToken returned on page i
+	// (empty string = no more). lastDecryption captures the last call's
+	// WithDecryption value so tests can assert SecureString handling.
+	pages          [][]ssmtypes.Parameter
+	nextTokens     []string
+	lastDecryption bool
+	pathCalls      int
+}
+
+func (f *fakeSSM) PutParameter(
+	_ context.Context,
+	in *ssm.PutParameterInput,
+	_ ...func(*ssm.Options),
+) (*ssm.PutParameterOutput, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if err := f.putErrs[aws.ToString(in.Name)]; err != nil {
+		return nil, err
+	}
+	if f.params == nil {
+		f.params = map[string]string{}
+	}
+	name := aws.ToString(in.Name)
+	if f.beforePut != nil {
+		f.beforePut(name)
+	}
+	if !aws.ToBool(in.Overwrite) {
+		if _, exists := f.params[name]; exists {
+			return nil, &ssmtypes.ParameterAlreadyExists{}
+		}
+	}
+	f.params[name] = aws.ToString(in.Value)
+	return &ssm.PutParameterOutput{}, nil
+}
+
+func (f *fakeSSM) GetParameter(
+	_ context.Context,
+	in *ssm.GetParameterInput,
+	_ ...func(*ssm.Options),
+) (*ssm.GetParameterOutput, error) {
+	name := aws.ToString(in.Name)
+	f.calls = append(f.calls, name)
+	if aws.ToBool(in.WithDecryption) {
+		f.decryptedGets = append(f.decryptedGets, name)
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if err := f.getErrs[name]; err != nil {
+		return nil, err
+	}
+	v, ok := f.params[name]
+	if seq, scripted := f.getSeq[name]; scripted && len(seq) > 0 {
+		v, ok = seq[0], seq[0] != ""
+		if len(seq) > 1 {
+			f.getSeq[name] = seq[1:]
+		}
+	}
+	if !ok {
+		return nil, &ssmtypes.ParameterNotFound{}
+	}
+	return &ssm.GetParameterOutput{
+		Parameter: &ssmtypes.Parameter{Name: aws.String(name), Value: aws.String(v)},
+	}, nil
+}
+
+func (f *fakeSSM) GetParametersByPath(
+	_ context.Context,
+	in *ssm.GetParametersByPathInput,
+	_ ...func(*ssm.Options),
+) (*ssm.GetParametersByPathOutput, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if in.WithDecryption != nil {
+		f.lastDecryption = *in.WithDecryption
+	}
+
+	if f.pages != nil {
+		i := f.pathCalls
+		if i == 0 && in.NextToken != nil {
+			return nil, fmt.Errorf("unexpected next token %q", aws.ToString(in.NextToken))
+		}
+		if i > 0 {
+			want := ""
+			if i-1 < len(f.nextTokens) {
+				want = f.nextTokens[i-1]
+			}
+			if aws.ToString(in.NextToken) != want {
+				return nil, fmt.Errorf(
+					"unexpected next token %q, want %q",
+					aws.ToString(in.NextToken),
+					want,
+				)
+			}
+		}
+		f.pathCalls++
+		if i >= len(f.pages) {
+			return &ssm.GetParametersByPathOutput{}, nil
+		}
+		out := &ssm.GetParametersByPathOutput{Parameters: f.pages[i]}
+		if i < len(f.nextTokens) && f.nextTokens[i] != "" {
+			out.NextToken = aws.String(f.nextTokens[i])
+		}
+		return out, nil
+	}
+
+	prefix := aws.ToString(in.Path)
+	var out []ssmtypes.Parameter
+	for name, val := range f.params {
+		if strings.HasPrefix(name, prefix) {
+			n, v := name, val
+			out = append(out, ssmtypes.Parameter{Name: &n, Value: &v})
+		}
+	}
+	return &ssm.GetParametersByPathOutput{Parameters: out}, nil
+}
+
+func (f *fakeSSM) Set(_ context.Context, key, val string, opts ...SSMSetOption) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.params == nil {
+		f.params = map[string]string{}
+	}
+	so := &SSMSetOptions{overwrite: true}
+	for _, opt := range opts {
+		opt(so)
+	}
+	if !so.overwrite {
+		if _, exists := f.params[key]; exists {
+			return fmt.Errorf("parameter %s already exists", key)
+		}
+	}
+	f.params[key] = val
+	return nil
+}
+
+func (f *fakeSSM) MustGet(_ context.Context, key string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	val := strings.TrimSpace(f.params[key])
+	if val == "" || val == "UNSET" {
+		return "", fmt.Errorf("parameter %s is unset", key)
+	}
+	return val, nil
+}
+
+func (f *fakeSSM) MayGet(_ context.Context, key string, withDecryption bool) (string, error) {
+	if withDecryption {
+		f.decryptedGets = append(f.decryptedGets, key)
+	}
+	if f.err != nil {
+		return "", f.err
+	}
+	if err := f.getErrs[key]; err != nil {
+		return "", err
+	}
+	val := strings.TrimSpace(f.params[key])
+	if val == "UNSET" {
+		return "", nil
+	}
+	return val, nil
+}
+
+func (f *fakeSSM) ListParams(_ context.Context, prefix string) ([]Param, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []Param
+	for key, val := range f.params {
+		if strings.HasPrefix(key, prefix) {
+			out = append(out, Param{Name: key, Value: val})
+		}
+	}
+	return out, nil
+}
+
+type fakeS3Object struct {
+	id           string
+	etag         string
+	body         []byte
+	lockMode     s3types.ObjectLockMode
+	retainUntil  time.Time
+	lastModified time.Time
+	partsCount   *int32
+	deleteMarker bool
+}
+
+type fakeS3 struct {
+	mu      sync.Mutex
+	seq     int
+	objects map[string][]fakeS3Object
+
+	listErr          error
+	getErr           error
+	readErr          error
+	putErr           error
+	missingVersionID bool
+
+	// putConflicts makes the next N conditional writes fail with S3's retryable 409.
+	putConflicts int
+
+	// beforePut fires just before a write is evaluated, so a test can change the
+	// object out from under the condition the caller is about to apply.
+	beforePut func(key string)
+
+	// afterPut fires after a successful write, with mu released so the hook can
+	// use helpers that acquire it, before the caller reads the written version.
+	afterPut func(*s3.PutObjectInput, *s3.PutObjectOutput)
+
+	// getMissing simulates an object disappearing between HeadObject and GetObject.
+	getMissing map[string]bool
+
+	// getErrVersions simulates GetObject failures for specific versions.
+	getErrVersions map[string]error
+
+	// versioned gives DeleteObject without a VersionId AWS's versioned-bucket
+	// behaviour: it stacks a delete marker, even over a compliance-locked version.
+	versioned bool
+}
+
+func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]fakeS3Object{}} }
+
+func (f *fakeS3) PutObject(
+	ctx context.Context,
+	in *s3.PutObjectInput,
+	_ ...func(*s3.Options),
+) (out *s3.PutObjectOutput, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
+	f.mu.Lock()
+	defer func() {
+		f.mu.Unlock()
+		if err == nil && out != nil && f.afterPut != nil {
+			f.afterPut(in, out)
+		}
+	}()
+	key := aws.ToString(in.Key)
+	if f.beforePut != nil {
+		// Runs holding f.mu, for races that turn on the object changing between
+		// a read and the conditional write that follows it.
+		f.beforePut(key)
+	}
+	conditional := in.IfNoneMatch != nil || in.IfMatch != nil
+	if conditional && f.putConflicts > 0 {
+		f.putConflicts--
+		return nil, conditionalRequestConflict()
+	}
+	if err := f.checkConditions(key, in.IfMatch, in.IfNoneMatch); err != nil {
+		return nil, err
+	}
+	body, _ := io.ReadAll(in.Body)
+	f.seq++
+	id := strconv.Itoa(f.seq)
+	etag := fmt.Sprintf("%q", "etag-"+id)
+	f.objects[key] = append(
+		f.objects[key],
+		fakeS3Object{
+			id:           id,
+			etag:         etag,
+			body:         body,
+			lockMode:     in.ObjectLockMode,
+			retainUntil:  aws.ToTime(in.ObjectLockRetainUntilDate),
+			lastModified: time.Now().UTC(),
+		},
+	)
+	out = &s3.PutObjectOutput{VersionId: aws.String(id), ETag: aws.String(etag)}
+	if f.missingVersionID {
+		out.VersionId = nil
+	}
+	return out, nil
+}
+
+// checkConditions mirrors S3's If-Match / If-None-Match evaluation against the
+// current object. Caller holds f.mu.
+func (f *fakeS3) checkConditions(key string, ifMatch, ifNoneMatch *string) error {
+	cur, exists := f.currentLocked(key)
+	if ifNoneMatch != nil {
+		if *ifNoneMatch == "*" && exists {
+			return preconditionFailed()
+		}
+		if *ifNoneMatch != "*" && exists && cur.etag == *ifNoneMatch {
+			return preconditionFailed()
+		}
+	}
+	if ifMatch != nil {
+		// S3 answers a conditional write against a missing object with 404, not
+		// 412: a concurrent delete is a different event from a peer's write.
+		if !exists {
+			return &s3types.NoSuchKey{}
+		}
+		if cur.etag != *ifMatch {
+			return preconditionFailed()
+		}
+	}
+	return nil
+}
+
+func (f *fakeS3) currentLocked(key string) (fakeS3Object, bool) {
+	objects := f.objects[key]
+	if len(objects) == 0 || objects[len(objects)-1].deleteMarker {
+		return fakeS3Object{}, false
+	}
+	return objects[len(objects)-1], true
+}
+
+func preconditionFailed() error {
+	return &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "precondition failed"}
+}
+
+func conditionalRequestConflict() error {
+	return &smithy.GenericAPIError{
+		Code:    "ConditionalRequestConflict",
+		Message: "conditional request conflict",
+	}
+}
+
+func (f *fakeS3) GetObject(
+	ctx context.Context,
+	in *s3.GetObjectInput,
+	_ ...func(*s3.Options),
+) (*s3.GetObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getMissing[aws.ToString(in.Key)] {
+		return nil, &s3types.NoSuchKey{}
+	}
+	if err := f.getErrVersions[aws.ToString(in.VersionId)]; err != nil {
+		return nil, err
+	}
+	objects := f.objects[aws.ToString(in.Key)]
+	for i := len(objects) - 1; i >= 0; i-- {
+		if in.VersionId == nil || objects[i].id == aws.ToString(in.VersionId) {
+			if objects[i].deleteMarker {
+				return nil, &s3types.NoSuchKey{}
+			}
+			body := io.NopCloser(bytes.NewReader(objects[i].body))
+			if f.readErr != nil {
+				body = io.NopCloser(iotest.ErrReader(f.readErr))
+			}
+			out := &s3.GetObjectOutput{Body: body, ETag: aws.String(objects[i].etag)}
+			if in.PartNumber != nil {
+				out.PartsCount = objects[i].partsCount
+			}
+			out.ObjectLockMode = objects[i].lockMode
+			if !objects[i].retainUntil.IsZero() {
+				out.ObjectLockRetainUntilDate = aws.Time(objects[i].retainUntil)
+			}
+			return out, nil
+		}
+	}
+	return nil, &s3types.NoSuchKey{}
+}
+
+func (f *fakeS3) HeadObject(
+	ctx context.Context,
+	in *s3.HeadObjectInput,
+	_ ...func(*s3.Options),
+) (*s3.HeadObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.currentLocked(aws.ToString(in.Key))
+	if !ok {
+		return nil, &s3types.NotFound{}
+	}
+	return &s3.HeadObjectOutput{
+		ETag:          aws.String(cur.etag),
+		ContentLength: aws.Int64(int64(len(cur.body))),
+	}, nil
+}
+
+func (f *fakeS3) ListObjectVersions(
+	ctx context.Context,
+	in *s3.ListObjectVersionsInput,
+	_ ...func(*s3.Options),
+) (*s3.ListObjectVersionsOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prefix := aws.ToString(in.Prefix)
+	var out []s3types.ObjectVersion
+	var markers []s3types.DeleteMarkerEntry
+	for key, objects := range f.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		for _, obj := range objects {
+			lastModified := obj.lastModified
+			if obj.deleteMarker {
+				markers = append(markers, s3types.DeleteMarkerEntry{
+					Key: aws.String(key), VersionId: aws.String(obj.id),
+					LastModified: &lastModified,
+				})
+				continue
+			}
+			out = append(
+				out,
+				s3types.ObjectVersion{
+					Key:          aws.String(key),
+					VersionId:    aws.String(obj.id),
+					LastModified: &lastModified,
+				},
+			)
+		}
+	}
+	return &s3.ListObjectVersionsOutput{
+		Versions: out, DeleteMarkers: markers, IsTruncated: aws.Bool(false),
+	}, nil
+}
+
+func (f *fakeS3) ListObjectsV2(
+	_ context.Context,
+	_ *s3.ListObjectsV2Input,
+	_ ...func(*s3.Options),
+) (*s3.ListObjectsV2Output, error) {
+	return &s3.ListObjectsV2Output{}, nil
+}
+
+func (f *fakeS3) DeleteObject(
+	ctx context.Context,
+	in *s3.DeleteObjectInput,
+	_ ...func(*s3.Options),
+) (*s3.DeleteObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := aws.ToString(in.Key)
+	if in.IfMatch != nil {
+		if err := f.checkConditions(key, in.IfMatch, nil); err != nil {
+			return nil, err
+		}
+	}
+	objects := f.objects[key]
+	if len(objects) == 0 {
+		return &s3.DeleteObjectOutput{}, nil
+	}
+
+	if f.versioned && in.VersionId == nil {
+		f.seq++
+		f.objects[key] = append(objects, fakeS3Object{
+			id: strconv.Itoa(f.seq), deleteMarker: true, lastModified: time.Now().UTC(),
+		})
+		return &s3.DeleteObjectOutput{DeleteMarker: aws.Bool(true)}, nil
+	}
+
+	target := len(objects) - 1
+	if in.VersionId != nil {
+		target = -1
+		want := aws.ToString(in.VersionId)
+		for i, obj := range objects {
+			if obj.id == want {
+				target = i
+				break
+			}
+		}
+		if target == -1 {
+			return &s3.DeleteObjectOutput{}, nil
+		}
+	}
+	if objects[target].lockMode == s3types.ObjectLockModeCompliance {
+		return &s3.DeleteObjectOutput{}, nil
+	}
+	if in.VersionId == nil {
+		delete(f.objects, key)
+		return &s3.DeleteObjectOutput{}, nil
+	}
+
+	objects = append(objects[:target], objects[target+1:]...)
+	if len(objects) == 0 {
+		delete(f.objects, key)
+	} else {
+		f.objects[key] = objects
+	}
+	return &s3.DeleteObjectOutput{}, nil
+}
+
+// putRawObject injects object bytes as if written outside runtime code.
+func (f *fakeS3) putRawObject(key string, body []byte) {
+	f.putRawObjectAt(key, body, time.Now().UTC())
+}
+
+// putRawObjectAt seeds a version the way the runtime writes one: retained under
+// compliance mode for the production intent retention. putRawObjectLockedAt
+// seeds the malformed lock states a hostile writer could publish instead.
+func (f *fakeS3) putRawObjectAt(key string, body []byte, lastModified time.Time) {
+	f.putRawObjectLockedAt(
+		key, body, lastModified,
+		s3types.ObjectLockModeCompliance, lastModified.Add(prodRetention),
+	)
+}
+
+func (f *fakeS3) putRawObjectLockedAt(
+	key string,
+	body []byte,
+	lastModified time.Time,
+	lockMode s3types.ObjectLockMode,
+	retainUntil time.Time,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seq++
+	id := strconv.Itoa(f.seq)
+	f.objects[key] = append(f.objects[key], fakeS3Object{
+		id:           id,
+		etag:         fmt.Sprintf("%q", "etag-"+id),
+		body:         body,
+		lockMode:     lockMode,
+		retainUntil:  retainUntil,
+		lastModified: lastModified,
+	})
+}
+
+func (f *fakeS3) currentETag(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.currentLocked(key)
+	if !ok {
+		return ""
+	}
+	return cur.etag
+}
+
+func (f *fakeS3) latestBody(key string) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	objects := f.objects[key]
+	if len(objects) == 0 {
+		return nil
+	}
+	return objects[len(objects)-1].body
+}
+
+// fakeRoute53 records change batches and reports PENDING until pendingCalls
+// GetChange calls have been made.
+type fakeRoute53 struct {
+	mu            sync.Mutex
+	changes       []*route53.ChangeResourceRecordSetsInput
+	getCalls      int
+	pendingCalls  int
+	changeErr     error
+	nilChangeInfo bool
+}
+
+func (f *fakeRoute53) ChangeResourceRecordSets(
+	_ context.Context,
+	in *route53.ChangeResourceRecordSetsInput,
+	_ ...func(*route53.Options),
+) (*route53.ChangeResourceRecordSetsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.changeErr != nil {
+		return nil, f.changeErr
+	}
+	f.changes = append(f.changes, in)
+	return &route53.ChangeResourceRecordSetsOutput{
+		ChangeInfo: &r53types.ChangeInfo{Id: aws.String("/change/C1")},
+	}, nil
+}
+
+func (f *fakeRoute53) GetChange(
+	_ context.Context,
+	_ *route53.GetChangeInput,
+	_ ...func(*route53.Options),
+) (*route53.GetChangeOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCalls++
+	if f.nilChangeInfo {
+		return &route53.GetChangeOutput{}, nil
+	}
+	status := r53types.ChangeStatusInsync
+	if f.getCalls <= f.pendingCalls {
+		status = r53types.ChangeStatusPending
+	}
+	return &route53.GetChangeOutput{ChangeInfo: &r53types.ChangeInfo{Status: status}}, nil
+}
+
+func (f *fakeRoute53) lastChange() *route53.ChangeResourceRecordSetsInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.changes) == 0 {
+		return nil
+	}
+	return f.changes[len(f.changes)-1]
+}
+
+const fakeSTSAccountID = "123456789012"
+
+type fakeSTS struct {
+	arn string
+	err error
+}
+
+func (f *fakeSTS) GetCallerIdentity(
+	_ context.Context,
+	_ *sts.GetCallerIdentityInput,
+	_ ...func(*sts.Options),
+) (*sts.GetCallerIdentityOutput, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	arn := f.arn
+	if arn == "" {
+		arn = "arn:aws:iam::" + fakeSTSAccountID + ":role/enclave"
+	}
+	return &sts.GetCallerIdentityOutput{
+		Arn:     aws.String(arn),
+		Account: aws.String(fakeSTSAccountID),
+	}, nil
+}
+
+// fakeIAM allows actions unless a test supplies a denial or response.
+type fakeIAM struct {
+	denied   map[string]bool
+	err      error
+	calls    []*iam.SimulatePrincipalPolicyInput
+	respond  func(*iam.SimulatePrincipalPolicyInput) (*iam.SimulatePrincipalPolicyOutput, error)
+	evaluate func(string, string, []iamtypes.ContextEntry) iamtypes.PolicyEvaluationDecisionType
+}
+
+func (f *fakeIAM) SimulatePrincipalPolicy(
+	_ context.Context,
+	in *iam.SimulatePrincipalPolicyInput,
+	_ ...func(*iam.Options),
+) (*iam.SimulatePrincipalPolicyOutput, error) {
+	f.calls = append(f.calls, in)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.respond != nil {
+		return f.respond(in)
+	}
+	out := &iam.SimulatePrincipalPolicyOutput{}
+	for _, action := range in.ActionNames {
+		decision := iamtypes.PolicyEvaluationDecisionTypeAllowed
+		if f.denied[action] {
+			decision = iamtypes.PolicyEvaluationDecisionTypeImplicitDeny
+		}
+		if f.evaluate != nil {
+			decision = f.evaluate(action, in.ResourceArns[0], in.ContextEntries)
+		}
+		out.EvaluationResults = append(out.EvaluationResults, iamtypes.EvaluationResult{
+			EvalActionName:   aws.String(action),
+			EvalResourceName: aws.String(in.ResourceArns[0]),
+			EvalDecision:     decision,
+		})
+	}
+	return out, nil
+}
+
+// simulated reports whether any call asked about action on resource.
+func (f *fakeIAM) simulated(action, resource string) bool {
+	return slices.ContainsFunc(f.calls, func(in *iam.SimulatePrincipalPolicyInput) bool {
+		return slices.Contains(in.ActionNames, action) && slices.Contains(in.ResourceArns, resource)
+	})
+}
+
+type fakeCloudWatchLogs struct {
+	mu                 sync.Mutex
+	createLogGroupErr  error
+	createLogStreamErr error
+	groups             []string
+	streams            []string
+	retentionDays      []int32
+}
+
+func newFakeCloudWatchLogs() *fakeCloudWatchLogs { return &fakeCloudWatchLogs{} }
+
+func (f *fakeCloudWatchLogs) CreateLogGroup(
+	_ context.Context,
+	in *cloudwatchlogs.CreateLogGroupInput,
+	_ ...func(*cloudwatchlogs.Options),
+) (*cloudwatchlogs.CreateLogGroupOutput, error) {
+	if f.createLogGroupErr != nil {
+		return nil, f.createLogGroupErr
+	}
+	f.mu.Lock()
+	f.groups = append(f.groups, aws.ToString(in.LogGroupName))
+	f.mu.Unlock()
+	return &cloudwatchlogs.CreateLogGroupOutput{}, nil
+}
+
+func (f *fakeCloudWatchLogs) CreateLogStream(
+	_ context.Context,
+	in *cloudwatchlogs.CreateLogStreamInput,
+	_ ...func(*cloudwatchlogs.Options),
+) (*cloudwatchlogs.CreateLogStreamOutput, error) {
+	if f.createLogStreamErr != nil {
+		return nil, f.createLogStreamErr
+	}
+	f.mu.Lock()
+	f.streams = append(f.streams, aws.ToString(in.LogStreamName))
+	f.mu.Unlock()
+	return &cloudwatchlogs.CreateLogStreamOutput{}, nil
+}
+
+func (f *fakeCloudWatchLogs) PutRetentionPolicy(
+	_ context.Context,
+	in *cloudwatchlogs.PutRetentionPolicyInput,
+	_ ...func(*cloudwatchlogs.Options),
+) (*cloudwatchlogs.PutRetentionPolicyOutput, error) {
+	f.mu.Lock()
+	f.retentionDays = append(f.retentionDays, aws.ToInt32(in.RetentionInDays))
+	f.mu.Unlock()
+	return &cloudwatchlogs.PutRetentionPolicyOutput{}, nil
+}
+
+// bodyIMDS answers every metadata request with the given body.
+type bodyIMDS struct{ body io.Reader }
+
+func (b bodyIMDS) GetMetadata(
+	context.Context, *imds.GetMetadataInput, ...func(*imds.Options),
+) (*imds.GetMetadataOutput, error) {
+	return &imds.GetMetadataOutput{Content: io.NopCloser(b.body)}, nil
+}

@@ -61,7 +61,11 @@ func (c *Cache) Add(key string) {
 func (c *Cache) Exists(key string) bool {
 	c.RLock()
 	defer c.RUnlock()
-	_, exists := c.Items[key]
 
-	return exists
+	added, exists := c.Items[key]
+	if !exists {
+		return false
+	}
+
+	return time.Since(added) < c.TTL
 }

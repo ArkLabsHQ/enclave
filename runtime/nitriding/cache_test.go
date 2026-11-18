@@ -27,6 +27,24 @@ func TestCache(t *testing.T) {
 	}
 }
 
+// TestCacheExistsChecksExpiry verifies that expiry is decided from the stored
+// timestamp, not only by the pruning goroutine. A delayed prune must not make
+// an already expired item look present.
+func TestCacheExistsChecksExpiry(t *testing.T) {
+	c := NewCache(time.Minute)
+
+	c.Add("expired")
+	c.Items["expired"] = time.Now().UTC().Add(-2 * c.TTL)
+	if c.Exists("expired") {
+		t.Fatal("expected an expired item to be absent")
+	}
+
+	c.Add("fresh")
+	if !c.Exists("fresh") {
+		t.Fatal("expected a fresh item to be present")
+	}
+}
+
 func TestCacheWithManyElems(t *testing.T) {
 	c := NewCache(time.Millisecond * 50)
 

@@ -773,9 +773,11 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		msg    string
 	}{
 		{
+			// The predecessor's log ignores a handoff whose snapshot names
+			// another owner than its target, so no handoff is found.
 			name:   "rejects an authenticated snapshot naming another owner",
 			modify: func(a *adoption) { a.owner = otherHex },
-			msg:    "handoff snapshot owner does not match current PCR0",
+			msg:    "holds no handoff",
 		},
 		{
 			name:   "rejects an authenticated snapshot naming another bucket",
@@ -783,11 +785,13 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			msg:    "handoff snapshot bucket does not match configured snapshot bucket",
 		},
 		{
+			// The predecessor's log ignores a handoff whose PCR31 does not
+			// commit to its target, so no handoff is found.
 			name: "rejects a transition receipt with the wrong PCR31",
 			modify: func(a *adoption) {
 				a.pcrs[migrationPCRIndex] = pcrExtendFromZero(other)
 			},
-			msg: "invalid transition receipt",
+			msg: "holds no handoff",
 		},
 		{
 			name:   "refuses when no intent was ever recorded",

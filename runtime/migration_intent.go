@@ -10,13 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/migration"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -25,11 +25,11 @@ import (
 
 const (
 	migrationIntentPrefix   = "migration-intent/"
-	migrationIntentSchemaV1 = "enclave.migration_intent.v1"
+	migrationIntentSchemaV1 = migration.IntentSchemaV1
 
-	migrationIntentRequested = "requested"
-	migrationIntentAborted   = "aborted"
-	migrationIntentFinalised = "finalised"
+	migrationIntentRequested = migration.Requested
+	migrationIntentAborted   = migration.Aborted
+	migrationIntentFinalised = migration.Finalised
 )
 
 var (
@@ -50,23 +50,9 @@ var (
 	errMigrationAlreadyFinalised = errors.New("migration: already finalised for this target")
 )
 
-type migrationIntentUserDataV1 struct {
-	Schema                string `cbor:"schema"`
-	BucketName            string `cbor:"bucket_name"`
-	Sequence              uint64 `cbor:"sequence"`
-	Action                string `cbor:"action"`
-	TargetPCR0            string `cbor:"target_pcr0"`
-	FinalisedSnapshotRoot []byte `cbor:"finalised_snapshot_root,omitempty"`
-}
+type migrationIntentUserDataV1 = migration.UserDataV1
 
-type migrationIntentObjectV1 struct {
-	Schema            string `json:"schema"`
-	Sequence          uint64 `json:"sequence"`
-	Action            string `json:"action"`
-	TargetPCR0        string `json:"target_pcr0"`
-	Attestation       string `json:"attestation"`
-	FinalisedSnapshot []byte `json:"finalised_snapshot,omitempty"`
-}
+type migrationIntentObjectV1 = migration.ObjectV1
 
 type migrationIntent struct {
 	SourcePCR0        string
@@ -76,6 +62,8 @@ type migrationIntent struct {
 	PublishedAt       time.Time
 	VersionID         string
 	FinalisedSnapshot *Snapshot
+	// SnapshotRoot is the attested root of a finalised intent's snapshot.
+	SnapshotRoot []byte
 }
 
 // intentState is what a log's intents resolve to: one intent in force, or
@@ -83,14 +71,6 @@ type migrationIntent struct {
 type intentState struct {
 	current   *migrationIntent   // nil when there is none, or a conflict
 	ambiguous []*migrationIntent // the tied intents of a conflict
-}
-
-// intentHead derives a log's active intents from its versions.
-type intentHead struct {
-	// Per sequence, the distinct intents published first. Requests and aborts
-	// compete for a sequence; finalised intents are kept apart.
-	requestsAndAborts map[uint64][]*migrationIntent
-	finalised         map[uint64][]*migrationIntent
 }
 
 type migrationIntentLog struct {
@@ -268,7 +248,7 @@ func (l *migrationIntentLog) append(
 		}
 		expected.FinalisedSnapshot = &snapshot
 	}
-	payload, err := l.enc.Marshal(userData)
+	payload, err := migration.EncodeUserData(userData)
 	if err != nil {
 		return nil, fmt.Errorf("encode migration intent: %w", err)
 	}
@@ -369,13 +349,6 @@ func (i *migrationIntent) equivalent(other *migrationIntent) bool {
 	return sameIntent && i.FinalisedSnapshot.sameState(*other.FinalisedSnapshot)
 }
 
-func newIntentHead() *intentHead {
-	return &intentHead{
-		requestsAndAborts: make(map[uint64][]*migrationIntent),
-		finalised:         make(map[uint64][]*migrationIntent),
-	}
-}
-
 // scanIntents returns the active authorization separately from the highest
 // valid sequence, so ignored requests cannot occupy the next abort slot. More
 // than one active intent means a tie involving a request. Tied aborts all cancel
@@ -384,8 +357,87 @@ func (l *migrationIntentLog) scanIntents(
 	ctx context.Context,
 	sourcePCR0 string,
 ) (intentState, uint64, error) {
-	head := newIntentHead()
-	err := forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
+	intents, err := l.listIntents(ctx, sourcePCR0)
+	if err != nil {
+		return intentState{}, 0, err
+	}
+
+	modifiedIntents := make([]migration.Intent, len(intents))
+	for i, intent := range intents {
+		modifiedIntents[i] = migration.Intent{
+			Sequence:    intent.Sequence,
+			Action:      intent.Action,
+			TargetPCR0:  intent.TargetPCR0,
+			PublishedAt: intent.PublishedAt,
+		}
+		if intent.FinalisedSnapshot != nil {
+			modifiedIntents[i].SnapshotRoot = intent.SnapshotRoot
+		}
+	}
+	resolved := migration.ResolveGeneration(modifiedIntents)
+	var state intentState
+	if resolved.Current >= 0 {
+		state.current = intents[resolved.Current]
+	}
+	for _, i := range resolved.Ambiguous {
+		state.ambiguous = append(state.ambiguous, intents[i])
+	}
+	return state, resolved.HighestSequence, nil
+}
+
+// listIntents returns every valid version of the log in S3 listing order.
+func (l *migrationIntentLog) listIntents(
+	ctx context.Context,
+	sourcePCR0 string,
+) ([]*migrationIntent, error) {
+	var intents []*migrationIntent
+	err := l.forEachIntentVersion(ctx, sourcePCR0,
+		func(key, versionID string, sequence uint64, publishedAt time.Time) error {
+			intent, valid, err := l.fetchAttestedIntent(
+				ctx, key, versionID, sourcePCR0, sequence, publishedAt,
+			)
+			if err != nil || !valid {
+				return err
+			}
+			intents = append(intents, intent)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return intents, nil
+}
+
+// listRecords returns the locked, well-formed versions of a log as stored,
+// without verifying their attestations; verifiers do that.
+func (l *migrationIntentLog) listRecords(
+	ctx context.Context,
+	sourcePCR0 string,
+) ([]migration.Record, error) {
+	records := []migration.Record{}
+	err := l.forEachIntentVersion(ctx, sourcePCR0,
+		func(key, versionID string, sequence uint64, publishedAt time.Time) error {
+			_, body, valid, err := l.readIntent(ctx, key, versionID, sequence, publishedAt)
+			if err != nil || !valid {
+				return err
+			}
+			records = append(records, migration.Record{PublishedAt: publishedAt, Object: body})
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// forEachIntentVersion calls readVersion for every version filed under
+// sourcePCR0's log.
+func (l *migrationIntentLog) forEachIntentVersion(
+	ctx context.Context,
+	sourcePCR0 string,
+	readVersion func(key, versionID string, sequence uint64, publishedAt time.Time) error,
+) error {
+	return forEachObjectVersion(ctx, l.s3, l.bucket, migrationIntentPrefix+sourcePCR0+"/",
 		errMigrationIntentStoreUnavailable, "list migration intents",
 		func(key, versionID string, lastModified *time.Time) (bool, error) {
 			if versionID == "" || lastModified == nil {
@@ -397,20 +449,8 @@ func (l *migrationIntentLog) scanIntents(
 				return false, nil
 			}
 
-			nextHead, valid, err := l.fetchAttestedIntent(
-				ctx, key, versionID, keySourcePCR0, sequence, lastModified.UTC(),
-			)
-			if err != nil || !valid {
-				return false, err
-			}
-			head.record(nextHead)
-			return false, nil
+			return false, readVersion(key, versionID, sequence, lastModified.UTC())
 		})
-	if err != nil {
-		return intentState{}, 0, err
-	}
-	state, highest := head.resolve()
-	return state, highest, nil
 }
 
 // writeTimeout bounds upload delay and the corresponding read-side tolerance.
@@ -426,22 +466,22 @@ func (l *migrationIntentLog) readIntent(
 	key, versionID string,
 	sequence uint64,
 	publishedAt time.Time,
-) (migrationIntentObjectV1, bool, error) {
+) (migrationIntentObjectV1, []byte, bool, error) {
 	var entry migrationIntentObjectV1
 	body, ok, err := readLockedVersion(
 		ctx, l.s3, l.bucket, key, versionID, publishedAt,
 		l.retention, l.writeTimeout(), errMigrationIntentStoreUnavailable, "migration intent",
 	)
 	if err != nil || !ok {
-		return entry, false, err
+		return entry, nil, false, err
 	}
 	entry, err = decodeMigrationIntentObject(body)
 	if err != nil || entry.Schema != migrationIntentSchemaV1 || entry.Sequence != sequence ||
-		!isMigrationIntentAction(entry.Action) ||
+		!migration.IsAction(entry.Action) ||
 		entry.Attestation == "" || !isCanonicalPCR0(entry.TargetPCR0) {
-		return entry, false, nil
+		return entry, nil, false, nil
 	}
-	return entry, true, nil
+	return entry, body, true, nil
 }
 
 func (l *migrationIntentLog) fetchAttestedIntent(
@@ -450,7 +490,7 @@ func (l *migrationIntentLog) fetchAttestedIntent(
 	sequence uint64,
 	publishedAt time.Time,
 ) (*migrationIntent, bool, error) {
-	entry, valid, err := l.readIntent(ctx, key, versionID, sequence, publishedAt)
+	entry, _, valid, err := l.readIntent(ctx, key, versionID, sequence, publishedAt)
 	if err != nil || !valid {
 		return nil, false, err
 	}
@@ -462,157 +502,37 @@ func (l *migrationIntentLog) fetchAttestedIntent(
 		PublishedAt: publishedAt,
 		VersionID:   versionID,
 	}
-	userData := migrationIntentUserDataV1{
-		Schema:     entry.Schema,
-		BucketName: l.bucket,
-		Sequence:   entry.Sequence,
-		Action:     entry.Action,
-		TargetPCR0: entry.TargetPCR0,
-	}
 	if entry.Action == migrationIntentFinalised {
-		// The attested root binds the carried snapshot to this record.
+		// Only a snapshot of this deployment can be adopted.
 		snapshot, err := decodeSnapshot(l.cfg, entry.FinalisedSnapshot)
 		if err != nil {
-			return nil, false, nil
-		}
-		if userData.FinalisedSnapshotRoot, err = snapshot.root(l.cfg); err != nil {
 			return nil, false, nil
 		}
 		snapshot.transitionReceipt = entry.Attestation
 		intent.FinalisedSnapshot = &snapshot
 	}
-	payload, err := l.enc.Marshal(userData)
+	view, _, err := migration.VerifyIntentObject(
+		entry, sourcePCR0, l.bucket, publishedAt, l.verifyAttestation,
+	)
 	if err != nil {
-		return nil, false, fmt.Errorf(
-			"encode migration intent %q version %q: %w",
-			key,
-			versionID,
-			err,
-		)
-	}
-	if err := verifyAttestationUserData(
-		l.nsm,
-		entry.Attestation,
-		map[uint]string{0: sourcePCR0},
-		payload,
-	); err != nil {
 		return nil, false, nil
 	}
+	intent.SnapshotRoot = view.SnapshotRoot
 	return intent, true, nil
 }
 
-// record takes one valid version. The scan calls it once per version, in any order.
-func (h *intentHead) record(intent *migrationIntent) {
-	earliestBySequence := h.requestsAndAborts
-	if isFinalisedIntent(intent) {
-		earliestBySequence = h.finalised
+// verifyAttestation checks an attestation with the enclave's NSM verifier, which
+// verifies at the document's own time.
+func (l *migrationIntentLog) verifyAttestation(b64 string) (migration.Attestation, error) {
+	result, err := l.nsm.VerifyAttestationDocument(b64, nil)
+	if err != nil {
+		return migration.Attestation{}, err
 	}
-	earliest := earliestBySequence[intent.Sequence]
-	if len(earliest) == 0 || intent.PublishedAt.Before(earliest[0].PublishedAt) {
-		earliestBySequence[intent.Sequence] = []*migrationIntent{intent}
-		return
-	}
-	if intent.PublishedAt.Equal(earliest[0].PublishedAt) &&
-		!slices.ContainsFunc(earliest, intent.equivalent) {
-		earliestBySequence[intent.Sequence] = append(earliest, intent)
-	}
-}
-
-// resolve applies the sequences in order and returns what they resolve to and
-// the highest sequence.
-func (h *intentHead) resolve() (intentState, uint64) {
-	var state intentState
-	var highestSequence uint64
-	for _, sequence := range h.sequences() {
-		highestSequence = sequence
-		earliest := h.earliestAt(sequence)
-		conflict := len(state.ambiguous) > 0
-		pendingRequest := !conflict && state.current != nil &&
-			state.current.Action == migrationIntentRequested
-		nothingPending := !conflict &&
-			(state.current == nil || state.current.Action == migrationIntentAborted)
-
-		// An abort ends the pending request, its handoff or a conflict.
-		if len(earliest) == 1 && earliest[0].Action == migrationIntentAborted {
-			state = intentState{current: earliest[0]}
-			continue
-		}
-
-		// A tie involving a request is a conflict, whatever was pending.
-		if len(earliest) > 1 {
-			state = intentState{ambiguous: earliest}
-			continue
-		}
-
-		// A finalised intent stands only on the pending request for its target.
-		if pendingRequest {
-			finalised := h.finalisedFor(sequence, state.current.TargetPCR0)
-			if finalised != nil {
-				state = intentState{current: finalised}
-				continue
-			}
-		}
-
-		// A single request is accepted only when nothing is pending.
-		if len(earliest) == 1 && nothingPending {
-			state = intentState{current: earliest[0]}
-		}
-	}
-	return state, highestSequence
-}
-
-// sequences returns every sequence with a recorded intent, in order.
-func (h *intentHead) sequences() []uint64 {
-	sequences := slices.Concat(
-		slices.Collect(maps.Keys(h.requestsAndAborts)),
-		slices.Collect(maps.Keys(h.finalised)),
-	)
-	slices.Sort(sequences)
-	return slices.Compact(sequences)
-}
-
-// earliestAt returns the requests and aborts published first at sequence.
-// Tied aborts all cancel the same round and resolve to one representative.
-func (h *intentHead) earliestAt(sequence uint64) []*migrationIntent {
-	earliest := h.requestsAndAborts[sequence]
-	if len(earliest) < 2 {
-		return earliest
-	}
-
-	chosen := earliest[0]
-	for _, intent := range earliest {
-		// A tie involving a request stays as it is.
-		if intent.Action != migrationIntentAborted {
-			return earliest
-		}
-
-		// Choose consistently, regardless of S3 listing order.
-		if intent.TargetPCR0 < chosen.TargetPCR0 {
-			chosen = intent
-		}
-	}
-
-	return []*migrationIntent{chosen}
-}
-
-// finalisedFor returns the finalised intent recorded at sequence for
-// targetPCR0, or nil. Tied ones each release the same state to the same target
-// under their own key and resolve to one representative.
-func (h *intentHead) finalisedFor(sequence uint64, targetPCR0 string) *migrationIntent {
-	var chosen *migrationIntent
-	for _, intent := range h.finalised[sequence] {
-		if intent.TargetPCR0 != targetPCR0 {
-			continue
-		}
-
-		// Choose consistently, regardless of S3 listing order.
-		if chosen == nil ||
-			intent.FinalisedSnapshot.kmsKeyID < chosen.FinalisedSnapshot.kmsKeyID {
-			chosen = intent
-		}
-	}
-
-	return chosen
+	return migration.Attestation{
+		PCRs:      result.Document.PCRs,
+		UserData:  result.Document.UserData,
+		Timestamp: time.UnixMilli(int64(result.Document.Timestamp)).UTC(),
+	}, nil
 }
 
 func migrationIntentObjectKey(sourcePCR0 string, sequence uint64) string {
@@ -645,14 +565,6 @@ func normalizePCR0(value string) (string, []byte, error) {
 		return "", nil, fmt.Errorf("must be valid hex")
 	}
 	return hex.EncodeToString(decoded), decoded, nil
-}
-
-func isMigrationIntentAction(action string) bool {
-	switch action {
-	case migrationIntentRequested, migrationIntentAborted, migrationIntentFinalised:
-		return true
-	}
-	return false
 }
 
 func isCanonicalPCR0(value string) bool {
@@ -718,8 +630,4 @@ func decodeMigrationIntentObject(body []byte) (migrationIntentObjectV1, error) {
 		return entry, fmt.Errorf("unexpected trailing JSON token %v", token)
 	}
 	return entry, nil
-}
-
-func isFinalisedIntent(intent *migrationIntent) bool {
-	return intent.Action == migrationIntentFinalised
 }

@@ -773,6 +773,30 @@ green.wait_until_succeeds(
     timeout=60,
 )
 
+# Third parties verify the lineage from the records themselves. Green serves
+# any generation's log by PCR0, its own by default: blue's holds its request and
+# handoff exactly as stored, each attested by blue.
+green_log = json.loads(
+    green.succeed("curl -skf --http1.1 https://127.0.0.1/enclave/v1/migration")
+)
+assert green_log["pcr0"] == GREEN_PCR0, green_log
+blue_log = json.loads(
+    green.succeed(
+        f"curl -skf --http1.1 'https://127.0.0.1/enclave/v1/migration?pcr0={BLUE_PCR0}'"
+    )
+)
+assert blue_log["pcr0"] == BLUE_PCR0, blue_log
+assert handoff in [record["object"] for record in blue_log["records"]], blue_log
+verify_migration = (
+    f"--genesis-pcr0 {BLUE_PCR0} --expected-pcr0 {GREEN_PCR0} --insecure-skip-cose-verify "
+    f"--min-cooldown {MIGRATION_COOLDOWN_SECONDS}s"
+)
+verified = green.succeed(
+    f"enclave verify-migration --base-url https://127.0.0.1 {verify_migration}"
+)
+assert f"{BLUE_PCR0}: handed off to {GREEN_PCR0}," in verified, verified
+assert "1 handed off, 0 pending, 0 ignored, 0 failed" in verified, verified
+
 leaf_issuer = served_leaf(green, "-noout -issuer")
 assert "Pebble" in leaf_issuer, leaf_issuer
 leaf_san = served_leaf(green, "-noout -ext subjectAltName")

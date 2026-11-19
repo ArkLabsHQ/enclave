@@ -3,7 +3,6 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/migration"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -20,7 +20,7 @@ const (
 	snapshotObjectPrefix   = "snapshot/"
 	snapshotObjectSchemaV1 = "enclave.snapshot_object.v1"
 	snapshotSchemaV1       = "enclave.snapshot.v1"
-	snapshotRootDomainV1   = "enclave.snapshot_root.v1\x00" // SHA256 domain separator
+	snapshotRootDomainV1   = migration.SnapshotRootDomainV1 // SHA256 domain separator
 
 	purposeStateOrigin = "enclave.state_origin"
 )
@@ -94,7 +94,7 @@ func (s Snapshot) verifyOriginReceipt(nsm NSM, receipt string, root []byte) erro
 func transitionPCRs(predecessorPCR0 string, owner []byte) map[uint]string {
 	return map[uint]string{
 		0:                 predecessorPCR0,
-		migrationPCRIndex: hex.EncodeToString(pcrExtendFromZero(owner)),
+		migrationPCRIndex: hex.EncodeToString(migration.TargetCommitment(owner)),
 	}
 }
 
@@ -296,10 +296,7 @@ func (s Snapshot) root(cfg *Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := sha256.New()
-	h.Write([]byte(snapshotRootDomainV1))
-	h.Write(raw)
-	return h.Sum(nil), nil
+	return migration.SnapshotRoot(raw), nil
 }
 
 func (s Snapshot) encode(cfg *Config) ([]byte, error) {

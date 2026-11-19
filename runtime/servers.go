@@ -283,6 +283,30 @@ func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {
 		s.cfg.ExportTraces, "enclave-info", signResponses(s.attData, http.HandlerFunc(info)),
 	))
 
+	migrationLog := func(w http.ResponseWriter, r *http.Request) {
+		pcr0 := r.URL.Query().Get("pcr0")
+		if pcr0 != "" {
+			normalized, _, err := normalizePCR0(pcr0)
+			if err != nil {
+				http.Error(w, "pcr0 "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			pcr0 = normalized
+		}
+		generation, err := migrator.MigrationGeneration(r.Context(), pcr0)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to read migration intents: %v", err),
+				migrationHTTPStatus(err))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(generation)
+	}
+	s.rm.Handle("GET /enclave/v1/migration", routeSpan(
+		s.cfg.ExportTraces, "enclave-migration",
+		signResponses(s.attData, http.HandlerFunc(migrationLog)),
+	))
+
 	return nil
 }
 
@@ -301,8 +325,8 @@ func (s *servers) ReportBootFailure(err error) {
 	})
 }
 
-// migrationHTTPStatus maps the errors /enclave/v1/info can surface. Migration
-// itself has no HTTP surface; only reading its status does.
+// migrationHTTPStatus maps the errors /enclave/v1/info and /enclave/v1/migration
+// can surface. Migration itself has no HTTP surface; only reading its state does.
 func migrationHTTPStatus(err error) int {
 	switch {
 	case errors.Is(err, errMigrationIntentStoreUnavailable):
@@ -654,7 +678,8 @@ type tracedTransport struct {
 }
 
 func (t tracedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	ctx, span := otel.Tracer(runtimeService).Start(r.Context(), "upstream",
+	ctx, span := otel.Tracer(runtimeService).Start(
+		r.Context(), "upstream",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
 			spanMethod(r.Method),

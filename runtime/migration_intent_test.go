@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/migration"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -385,6 +386,50 @@ func TestMigrationIntentIgnoresVersionsWithoutComplianceRetention(t *testing.T) 
 			require.Nil(t, head, "an intent that is not immutably retained must not count")
 		})
 	}
+}
+
+func TestMigrationIntentListRecordsServesLockedRecordsUnverified(t *testing.T) {
+	ctx := context.Background()
+	target := strings.Repeat("cd", 48)
+	fx := newMigrationIntentFixture(t)
+	requested, err := fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	stored := fx.s3.objects[migrationIntentObjectKey(fx.source, requested.Sequence)][0]
+	// An unlocked version is not a record.
+	fx.s3.putRawObjectLockedAt(migrationIntentObjectKey(fx.source, 2),
+		fx.object(t, 2, migrationIntentAborted, target, fx.log.bucket, fx.pcr0),
+		time.Now(), "", time.Time{})
+	// A locked record another enclave attested is served as stored; verifiers
+	// reject it, as the runtime does.
+	forged := fx.object(t, 3, migrationIntentAborted, target, fx.log.bucket,
+		mustDecodeHex(t, strings.Repeat("12", 48)))
+	forgedPublished := time.Now().Add(-time.Minute).UTC()
+	fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 3), forged, forgedPublished)
+
+	records, err := fx.log.listRecords(ctx, fx.source)
+
+	require.NoError(t, err)
+	require.ElementsMatch(t, []migration.Record{
+		{PublishedAt: stored.lastModified, Object: stored.body},
+		{PublishedAt: forgedPublished, Object: forged},
+	}, records)
+}
+
+func TestMigrationIntentListIntentsActsOnlyOnVerifiedRecords(t *testing.T) {
+	ctx := context.Background()
+	target := strings.Repeat("cd", 48)
+	fx := newMigrationIntentFixture(t)
+	requested, err := fx.log.Request(ctx, fx.source, target)
+	require.NoError(t, err)
+	// A locked record another enclave attested.
+	fx.s3.putRawObject(migrationIntentObjectKey(fx.source, 2),
+		fx.object(t, 2, migrationIntentAborted, target, fx.log.bucket,
+			mustDecodeHex(t, strings.Repeat("12", 48))))
+
+	intents, err := fx.log.listIntents(ctx, fx.source)
+
+	require.NoError(t, err)
+	require.Equal(t, []*migrationIntent{requested}, intents)
 }
 
 // A hostile writer publishing an unlocked version alongside the genuine one must
@@ -954,6 +999,8 @@ func TestMigrationIntentFinalisedReplayCannotAuthoriseNewRequest(t *testing.T) {
 			requested, err := fx.log.Request(ctx, fx.source, target)
 			require.NoError(t, err)
 			require.Equal(t, uint64(1), requested.Sequence)
+			// As handOffToSuccessor does, PCR31 commits to the target first.
+			require.NoError(t, fx.nsm.CommitPCR(migrationPCRIndex, mustDecodeHex(t, target)))
 			finalised, err := fx.log.Finalise(
 				ctx, fx.source, target, requested.Sequence, fx.handoff(t, target, "key-a"),
 			)
@@ -1261,6 +1308,8 @@ func TestMigrationIntentFinalise(t *testing.T) {
 		requested, err := fx.log.Request(ctx, fx.source, targetA)
 		require.NoError(t, err)
 		snapshot := fx.handoff(t, targetA, "key-a")
+		// As handOffToSuccessor does, PCR31 commits to the target first.
+		require.NoError(t, fx.nsm.CommitPCR(migrationPCRIndex, mustDecodeHex(t, targetA)))
 
 		finalised, err := fx.log.Finalise(ctx, fx.source, targetA, requested.Sequence, snapshot)
 
@@ -1296,6 +1345,8 @@ func TestMigrationIntentFinalise(t *testing.T) {
 		require.NoError(t, err)
 		snapshot := fx.handoff(t, targetA, "key-b")
 		peerSnapshot := fx.handoff(t, targetA, "key-a")
+		// As handOffToSuccessor does, PCR31 commits to the target first.
+		require.NoError(t, fx.nsm.CommitPCR(migrationPCRIndex, mustDecodeHex(t, targetA)))
 		peerLog := *fx.log
 		var peer *migrationIntent
 		fx.log.s3 = migrationIntentBeforePutS3{
@@ -1547,48 +1598,61 @@ func TestMigrationIntentFinalisedHead(t *testing.T) {
 				return
 			}
 			require.NotNil(t, head)
-			require.Equal(t,
+			require.Equal(
+				t,
 				record{tc.want.sequence, tc.want.action, tc.want.target, 0},
 				record{head.Sequence, head.Action, head.TargetPCR0, 0},
 			)
 		})
 	}
 
-	// Replicas racing one request each mint a key. Either record would do, so
-	// the choice only has to be the same for every reader.
-	for _, tc := range []struct {
-		name      string
-		key1After time.Duration
-		wantKey   string
-	}{
-		{"tied finalised records select the smallest key", time.Minute, "key-1"},
-		{"an earlier finalised wins over a smaller key", 2 * time.Minute, "key-2"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, keys := range [][]string{{"key-1", "key-2"}, {"key-2", "key-1"}} {
-				fx := newMigrationIntentFixture(t)
-				seed(t, fx, requested(1, targetA, 0))
-				for _, key := range keys {
-					publishedAt := base.Add(time.Minute)
-					if key == "key-1" {
-						publishedAt = base.Add(tc.key1After)
-					}
-					fx.s3.putRawObjectAt(
-						migrationIntentObjectKey(fx.source, 2),
-						fx.finalised(t, 2, fx.handoff(t, targetA, key)), publishedAt,
-					)
-				}
-
-				head, err := fx.log.Head(ctx, fx.source)
-
-				require.NoError(t, err)
-				require.NotNil(t, head)
-				require.Equal(t, migrationIntentFinalised, head.Action)
-				require.Equal(t, tc.wantKey, head.FinalisedSnapshot.kmsKeyID,
-					"selection must not depend on listing order: %v", keys)
-			}
-		})
+	// Replicas racing one request each mint a key, so their snapshots differ.
+	// Either record would do, so the choice only has to be the same for every
+	// reader: the earlier one, or the smaller snapshot root when tied.
+	keysBySnapshotRoot := func(t *testing.T, fx *migrationIntentFixture) (string, string) {
+		t.Helper()
+		root1, err := fx.handoff(t, targetA, "key-1").root(fx.log.cfg)
+		require.NoError(t, err)
+		root2, err := fx.handoff(t, targetA, "key-2").root(fx.log.cfg)
+		require.NoError(t, err)
+		if bytes.Compare(root1, root2) < 0 {
+			return "key-1", "key-2"
+		}
+		return "key-2", "key-1"
 	}
+	t.Run("tied finalised records select the smaller snapshot root", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		smaller, larger := keysBySnapshotRoot(t, fx)
+		seed(t, fx, requested(1, targetA, 0))
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 2),
+			fx.finalised(t, 2, fx.handoff(t, targetA, larger)), base.Add(time.Minute))
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 2),
+			fx.finalised(t, 2, fx.handoff(t, targetA, smaller)), base.Add(time.Minute))
+
+		head, err := fx.log.Head(ctx, fx.source)
+
+		require.NoError(t, err)
+		require.NotNil(t, head)
+		require.Equal(t, migrationIntentFinalised, head.Action)
+		require.Equal(t, smaller, head.FinalisedSnapshot.kmsKeyID)
+	})
+
+	t.Run("an earlier finalised wins over a smaller snapshot root", func(t *testing.T) {
+		fx := newMigrationIntentFixture(t)
+		smaller, larger := keysBySnapshotRoot(t, fx)
+		seed(t, fx, requested(1, targetA, 0))
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 2),
+			fx.finalised(t, 2, fx.handoff(t, targetA, larger)), base.Add(time.Minute))
+		fx.s3.putRawObjectAt(migrationIntentObjectKey(fx.source, 2),
+			fx.finalised(t, 2, fx.handoff(t, targetA, smaller)), base.Add(2*time.Minute))
+
+		head, err := fx.log.Head(ctx, fx.source)
+
+		require.NoError(t, err)
+		require.NotNil(t, head)
+		require.Equal(t, migrationIntentFinalised, head.Action)
+		require.Equal(t, larger, head.FinalisedSnapshot.kmsKeyID)
+	})
 
 	t.Run("an ignored finalised still occupies its sequence", func(t *testing.T) {
 		fx := newMigrationIntentFixture(t)
@@ -1798,11 +1862,14 @@ func (f *migrationIntentFixture) finalisedObject(
 	})
 	require.NoError(t, err)
 	entry := migrationIntentObjectV1{
-		Schema:            migrationIntentSchemaV1,
-		Sequence:          sequence,
-		Action:            migrationIntentFinalised,
-		TargetPCR0:        targetPCR0,
-		Attestation:       f.signer.attest(map[uint][]byte{0: f.pcr0}, time.Now(), payload).docB64,
+		Schema:     migrationIntentSchemaV1,
+		Sequence:   sequence,
+		Action:     migrationIntentFinalised,
+		TargetPCR0: targetPCR0,
+		Attestation: f.signer.attest(map[uint][]byte{
+			0:                 f.pcr0,
+			migrationPCRIndex: pcrExtendFromZero(mustDecodeHex(t, targetPCR0)),
+		}, time.Now(), payload).docB64,
 		FinalisedSnapshot: raw,
 	}
 	if mutate != nil {

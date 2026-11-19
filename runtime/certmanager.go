@@ -99,7 +99,9 @@ func (m *certManager) resolve(ctx context.Context) (*certBundle, error) {
 
 	// Prevents duplicate issuance if multiple enclaves start up at once.
 	slog.Info("no shared certificate found, issuing", "fqdn", m.fqdn)
-	lease, err := AcquireLease(ctx, m.cfg, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
+	acquireCtx, cancel := context.WithTimeout(ctx, certIssueTimeout)
+	defer cancel()
+	lease, err := AcquireLease(acquireCtx, m.cfg, m.s3, m.leaseBucket, certLeaseName, leaseTTL)
 	if err != nil {
 		return nil, fmt.Errorf("acquire renewal lease for first issuance: %w", err)
 	}
@@ -145,9 +147,6 @@ func (m *certManager) tick(ctx context.Context) error {
 	}
 
 	renewed, err := m.renewUnderLease(ctx, bundle.etag)
-	if err != nil {
-		return err
-	}
 	if renewed != nil {
 		m.currentCert.Store(renewed)
 	}
@@ -155,6 +154,9 @@ func (m *certManager) tick(ctx context.Context) error {
 	if left := time.Until(m.currentCert.Load().notAfter); left < certHardFloor {
 		slog.Error("shared certificate is close to expiry and not renewing",
 			"fqdn", m.fqdn, "expires_in", left.Truncate(time.Minute).String())
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }

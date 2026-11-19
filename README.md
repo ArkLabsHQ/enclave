@@ -797,6 +797,7 @@ preflight to any path in that namespace is answered `204` by the runtime.
 |---|---|---|---|
 | GET | `/enclave/attestation?nonce=<40 hex>` | none | NSM attestation document, base64. The nonce is mandatory and echoed back. `user_data` is exactly 79 bytes: ASCII `sha256:`, the raw 32-byte SHA-256 of the TLS PublicKey, ASCII `ed25519:`, then the raw 32-byte Ed25519 response-signing public key (all zero until state is established). `503` until the application has been started, so always on a candidate. |
 | GET | `/enclave/v1/info` | none | Version, `status` (`candidate` until state is obtained, `starting` until the application has been started, then `ready`; `failed` with status 503 and an `error` when the boot stops at the permission preflight or telemetry, naming the missing grants for the preflight), for a candidate the predecessor offering it a handoff, PCR0, the predecessor PCR0 measured into the image, with its attestation once an adopted snapshot is published, migration status, application status, and the ancestor-key audit: every ancestor generation's PCR0, KMS key ID, and whether that key still exists, is pending deletion, or is gone. Signed on request; see [Signed responses](#signed-responses). |
+| GET | `/enclave/v1/migration?pcr0=<96 hex>` | none | The migration intent log written by `pcr0`, this enclave's by default, so third parties can verify each request and handoff; see [Verifying a migration](#verifying-a-migration). Each record is the intent object exactly as stored in the intent bucket, with the time S3 published it; attestations are left for verifiers to check. `pcr0` is accepted in either case; `400` unless it is 96 hex characters. Signed on request; see [Signed responses](#signed-responses). |
 | GET | `/health` | none | `{"status":"ready"}` once the application has been started, `{"status":"initializing"}` with status 503 before, and `{"status":"upstream_exited"}` with status 503 after the application process exits. |
 | any | unmatched paths outside the `/enclave` namespace | none | Reverse-proxied to the application. `503` until the application has been started, so always on a candidate. |
 
@@ -876,11 +877,11 @@ Each is capped at 4 MiB, gRPC's default receive limit: a larger request body is
 answered `413` before the application sees it, and a larger application
 response is aborted, so the client gets no response. Signed responses carry `Cache-Control: no-store`, since each
 answers a single nonce. The `502` for an unreachable application is signed like
-any other response. `/enclave/v1/info` is signed the same way once the runtime
-holds its signing key; before that, as a candidate, a signed request to it is
-answered `503` while unsigned requests are served as usual. Other `/enclave/*`
-endpoints, `/health`, the `503` served before the application starts, and gRPC
-are not signed.
+any other response. `/enclave/v1/info` and `/enclave/v1/migration` are signed
+the same way once the runtime holds its signing key; before that, as a
+candidate, a signed request to either is answered `503` while unsigned requests
+are served as usual. Other `/enclave/*` endpoints, `/health`, the `503` served
+before the application starts, and gRPC are not signed.
 
 The response body is signed decoded: for a signed request the runtime drops
 `Accept-Encoding` before proxying, so Go's upstream transport requests gzip and
@@ -1358,6 +1359,66 @@ fails closed.
 `GRPCConn` uses the same PCR verification and attested TLS pinning model as HTTP,
 but does not perform public CA validation. Applications serving gRPC must set
 `ENCLAVE_UPSTREAM=h2c`.
+
+### Verifying a migration
+
+`GET /enclave/v1/migration?pcr0=<hex>` returns the migration intent log one
+generation wrote, this enclave's when `pcr0` is omitted. Every record is the
+object the runtime stored in the Object-Locked intent bucket, carrying the
+source enclave's attestation of its fields, with the time S3 published it. The
+enclave serves every locked, well-formed version without checking its
+attestation; verifiers check each one.
+
+```json
+{
+  "pcr0": "<predecessor>",
+  "records": [
+    {"published_at": "2026-11-01T12:00:00Z",
+     "object": {"schema": "enclave.migration_intent.v1", "sequence": 1,
+                "action": "requested", "target_pcr0": "<this enclave>",
+                "attestation": "<base64>"}},
+    {"published_at": "2026-11-02T12:00:05Z",
+     "object": {"schema": "enclave.migration_intent.v1", "sequence": 2,
+                "action": "finalised", "target_pcr0": "<this enclave>",
+                "attestation": "<base64>", "finalised_snapshot": "<base64>"}}
+  ]
+}
+```
+
+```sh
+enclave verify-migration --base-url https://enclave.example.com \
+  --genesis-pcr0 <hex> --expected-pcr0 <hex>
+```
+
+The command walks forward from the deployment's genesis, which you pin with
+`--genesis-pcr0`: it fetches the genesis log, then the log of every generation
+it handed off to, and so on, following every handoff, including ones off the
+current enclave's path. Every generation that ever received the state is
+reached this way. All responses are signed, so nothing can be dropped or
+replayed in transit. It checks:
+
+- each record, with the check the runtime itself applies (`internal/migration`):
+  the COSE signature and AWS Nitro chain at the attestation's own time, the PCR0
+  of the generation that wrote it, `user_data` equal to the record's fields, and
+  for a handoff the snapshot root it attests, the snapshot's owner and
+  predecessor, and PCR31 committed to the target. A record that fails is
+  reported and ignored, as the runtime ignores it;
+- each handoff: at least `--min-cooldown` (default `24h`) between the request's
+  publication and the handoff's attestation, the runtime's own rule;
+- the chain: the enclave at `--expected-pcr0` is reached from genesis.
+
+Each log is resolved by the same rules the runtime uses, shared through
+`internal/migration`, and the command reports what it shows: every migration
+handed off (target, request and finalisation), any pending migration (a request
+in force that is neither finalised nor aborted), and tied records that block a
+handoff until an abort. A check that fails does not stop the walk: a handoff
+that did not wait the cooldown is still followed, and every failure is printed.
+It prints one line per record, finding and failure, then a summary, and exits
+non-zero if any check failed.
+
+The chain rests on the attested handoff records and on the genesis PCR0 you
+supply; the intent logs alone cannot show that a generation had no predecessor.
+Go programs call `client.WalkHandoffs` with a function that fetches each log.
 
 ## Testing
 

@@ -33,5 +33,6 @@ func NewRootCommand() *cobra.Command {
 		Version: Version,
 	}
 	root.AddCommand(newCurlCommand())
+	root.AddCommand(newVerifyMigrationCommand())
 	return root
 }

@@ -3,6 +3,7 @@ module github.com/ArkLabsHQ/enclave/runtime
 go 1.25.0
 
 require (
+	github.com/ArkLabsHQ/enclave/internal/migration v0.0.0-00010101000000-000000000000
 	github.com/ArkLabsHQ/enclave/internal/signing v0.0.0-00010101000000-000000000000
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
@@ -84,5 +85,7 @@ require (
 	google.golang.org/grpc v1.83.1 // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 )
+
+replace github.com/ArkLabsHQ/enclave/internal/migration => ../internal/migration
 
 replace github.com/ArkLabsHQ/enclave/internal/signing => ../internal/signing

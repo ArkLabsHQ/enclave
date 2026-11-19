@@ -24,6 +24,7 @@ import (
 	"testing/iotest"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/migration"
 	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/hf/nsm/request"
 	"github.com/hf/nsm/response"
@@ -66,6 +67,12 @@ func (m *migrationControlMigrator) CandidateInfo(context.Context) (*CandidateInf
 
 func (m *migrationControlMigrator) MigrationIntentBucket() string {
 	return migrationIntentTestBucket
+}
+
+func (m *migrationControlMigrator) MigrationGeneration(
+	context.Context, string,
+) (*MigrationGeneration, error) {
+	return nil, nil
 }
 
 func TestServersStartReturnsBindErrors(t *testing.T) {
@@ -1199,6 +1206,97 @@ func TestSignedEnclaveInfo(t *testing.T) {
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }
 
+func TestEnclaveMigrationServesStoredRecords(t *testing.T) {
+	ctx := context.Background()
+	fx := newMigrationIntentFixture(t)
+	ancestor := strings.Repeat("12", 48)
+	_, err := fx.log.Request(ctx, fx.source, strings.Repeat("cd", 48))
+	require.NoError(t, err)
+	own := fx.s3.objects[migrationIntentObjectKey(fx.source, 1)][0]
+	ancestorRecord := fx.object(t, 1, migrationIntentRequested, fx.source,
+		fx.log.bucket, mustDecodeHex(t, ancestor))
+	ancestorPublished := time.Now().Add(-time.Hour).UTC()
+	fx.s3.putRawObjectAt(migrationIntentObjectKey(ancestor, 1), ancestorRecord, ancestorPublished)
+
+	m := &migrator{cfg: fx.log.cfg, intent: fx.log, pcr0: fx.source, bucket: fx.log.bucket}
+	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
+	attData := &AttestationData{}
+	attData.SetResponseSigningKey(key)
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), attData: attData}
+	require.NoError(t, s.ConfigureEnclaveInfoHandler(m))
+
+	// Without a PCR0 the enclave serves its own log: each object as stored, with
+	// the time S3 published it.
+	t.Run("its own log by default", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/enclave/v1/migration", nil)
+		req.Header.Set(signNonceHeader, "n1")
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		requireSignedBy(t, key, req, rr)
+		var got MigrationGeneration
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+		require.Equal(t, MigrationGeneration{
+			PCR0:    fx.source,
+			Records: []migration.Record{{PublishedAt: own.lastModified, Object: own.body}},
+		}, got)
+	})
+
+	// Any generation's log is served by its PCR0, so a verifier can walk the lineage.
+	t.Run("another generation's log by its PCR0", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/enclave/v1/migration?pcr0="+ancestor, nil)
+		req.Header.Set(signNonceHeader, "n2")
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		requireSignedBy(t, key, req, rr)
+		var got MigrationGeneration
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+		require.Equal(t, MigrationGeneration{
+			PCR0: ancestor,
+			Records: []migration.Record{
+				{PublishedAt: ancestorPublished, Object: ancestorRecord},
+			},
+		}, got)
+	})
+
+	t.Run("an uppercase PCR0 is lowercased", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet,
+			"/enclave/v1/migration?pcr0="+strings.ToUpper(ancestor), nil)
+		req.Header.Set(signNonceHeader, "n3")
+		rr := httptest.NewRecorder()
+		s.rm.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		requireSignedBy(t, key, req, rr)
+		var got MigrationGeneration
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+		require.Equal(t, MigrationGeneration{
+			PCR0: ancestor,
+			Records: []migration.Record{
+				{PublishedAt: ancestorPublished, Object: ancestorRecord},
+			},
+		}, got)
+	})
+
+	// A candidate has no signing key yet, so it refuses signed requests.
+	t.Run("refused while the enclave has no signing key", func(t *testing.T) {
+		candidate := &servers{
+			cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(),
+			attData: &AttestationData{},
+		}
+		require.NoError(t, candidate.ConfigureEnclaveInfoHandler(m))
+		req := httptest.NewRequest(http.MethodGet, "/enclave/v1/migration", nil)
+		req.Header.Set(signNonceHeader, "n4")
+		rr := httptest.NewRecorder()
+		candidate.rm.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	})
+}
+
 func TestReportBootFailure(t *testing.T) {
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
 	s.ReportBootFailure(errors.New("permission preflight: role is missing SSMParams"))
@@ -1258,4 +1356,21 @@ func TestMetricsMiddleware(t *testing.T) {
 			require.Equal(t, tc.level, record["level"])
 		})
 	}
+}
+
+// requireSignedBy checks that the response carries key's signature over the
+// request and the response.
+func requireSignedBy(
+	t *testing.T,
+	key ed25519.PrivateKey,
+	req *http.Request,
+	rr *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	signingContext, err := signing.CaptureResponseSigningContext(req, nil)
+	require.NoError(t, err)
+	sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+	require.NoError(t, err)
+	msg := signingContext.ResponseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
+	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }

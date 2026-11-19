@@ -16,12 +16,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/internal/migration"
 	"github.com/fxamacker/cbor/v2"
 )
 
 // migrationPCRIndex stores the successor-PCR0 handoff commitment.
 const (
-	migrationPCRIndex          = 31
+	migrationPCRIndex          = migration.TargetPCRIndex
 	successorClaimSchemaV1     = "enclave.successor_claim.v1"
 	migrationChallengeSchemaV1 = "enclave.migration_challenge.v1"
 )
@@ -57,6 +58,10 @@ type MigrationStatus struct {
 	AmbiguousTargets []string   `json:"ambiguous_targets,omitempty"`
 }
 
+// MigrationGeneration is the JSON body returned by GET /enclave/v1/migration:
+// one generation's intent log, each record as stored.
+type MigrationGeneration = migration.Generation
+
 // migrationChallenge is the verified content of a predecessor's challenge
 // attestation. Both fields are signed by the NSM, so SSM cannot alter them.
 type migrationChallenge struct {
@@ -86,6 +91,7 @@ type Migrator interface {
 	MigrationStatus(ctx context.Context) (*MigrationStatus, error)
 	CandidateInfo(ctx context.Context) (*CandidateInfo, error)
 	MigrationIntentBucket() string
+	MigrationGeneration(ctx context.Context, pcr0 string) (*MigrationGeneration, error)
 }
 
 type migrator struct {
@@ -312,6 +318,21 @@ func (m *migrator) isHandOffFinalised(ctx context.Context) (bool, error) {
 
 func (m *migrator) MigrationIntentBucket() string {
 	return m.bucket
+}
+
+// MigrationGeneration returns the intent log written by pcr0, or by this
+// enclave when pcr0 is empty, with each record as stored.
+func (m *migrator) MigrationGeneration(
+	ctx context.Context, pcr0 string,
+) (*MigrationGeneration, error) {
+	if pcr0 == "" {
+		pcr0 = m.pcr0
+	}
+	records, err := m.intent.listRecords(ctx, pcr0)
+	if err != nil {
+		return nil, err
+	}
+	return &MigrationGeneration{PCR0: pcr0, Records: records}, nil
 }
 
 func (m *migrator) advanceMigration(ctx context.Context) error {

@@ -142,8 +142,13 @@ func (c *certStore) get(ctx context.Context, key string) ([]byte, string, error)
 	}
 	plaintext, err := c.dek.Open(sealed, []byte(key))
 	if err != nil {
-		slog.Warn("stored certificate object cannot be decrypted with current DEK, treating as absent",
-			"key", key, "error", err)
+		slog.Warn(
+			"stored certificate object cannot be decrypted with current DEK, treating as absent",
+			"key",
+			key,
+			"error",
+			err,
+		)
 		c.staleETag = aws.ToString(out.ETag)
 		return nil, "", nil
 	}

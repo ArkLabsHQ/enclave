@@ -756,7 +756,14 @@ func TestCertStoreUndecryptableObjectTreatedAsAbsentAndOverwritten(t *testing.T)
 	s3f := newFakeS3()
 
 	// 1. First store saves with DEK A.
-	storeA := newCertStore(testCfg, s3f, &dek{key: []byte("01234567890123456789012345678901")}, newTestTLSKey(t), certTestBucket, "enclave.test")
+	storeA := newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: []byte("01234567890123456789012345678901")},
+		newTestTLSKey(t),
+		certTestBucket,
+		"enclave.test",
+	)
 	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
 	certPEMA := issueTestCertWithKey(t, "enclave.test", notAfter, storeA.key)
 	_, err := storeA.SaveCert(ctx, certPEMA, "")
@@ -764,7 +771,14 @@ func TestCertStoreUndecryptableObjectTreatedAsAbsentAndOverwritten(t *testing.T)
 
 	// 2. Second store has DEK B (simulating bucket reuse across genesis).
 	keyB := newTestTLSKey(t)
-	storeB := newCertStore(testCfg, s3f, &dek{key: []byte("abcdefghijklmnopqrstuvwxyz012345")}, keyB, certTestBucket, "enclave.test")
+	storeB := newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: []byte("abcdefghijklmnopqrstuvwxyz012345")},
+		keyB,
+		certTestBucket,
+		"enclave.test",
+	)
 
 	// LoadCert should treat undecryptable object as absent (nil, nil) instead of failing.
 	bundle, err := storeB.LoadCert(ctx)
@@ -789,7 +803,14 @@ func TestCertManagerRecoversFromUndecryptableStoredCert(t *testing.T) {
 	s3f := newFakeS3()
 
 	// Write an undecryptable cert with an old DEK
-	oldStore := newCertStore(testCfg, s3f, &dek{key: []byte("01234567890123456789012345678901")}, newTestTLSKey(t), certTestBucket, "enclave.test")
+	oldStore := newCertStore(
+		testCfg,
+		s3f,
+		&dek{key: []byte("01234567890123456789012345678901")},
+		newTestTLSKey(t),
+		certTestBucket,
+		"enclave.test",
+	)
 	notAfter := time.Now().Add(42 * time.Hour).Truncate(time.Second)
 	oldCertPEM := issueTestCertWithKey(t, "enclave.test", notAfter, oldStore.key)
 	_, err := oldStore.SaveCert(context.Background(), oldCertPEM, "")

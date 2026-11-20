@@ -143,6 +143,35 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "ENCLAVE_PREVIOUS_PCR0 must be",
 		},
 		{
+			name: "scaling leader admitting a follower image",
+			mutate: func(c *Config) {
+				c.ScalingRole = scalingRoleLeader
+				c.ScalingFollowerPCR0s = []string{strings.Repeat("ab", 48)}
+			},
+		},
+		{
+			name:   "scaling follower",
+			mutate: func(c *Config) { c.ScalingRole = scalingRoleFollower },
+		},
+		{
+			name:    "scaling leader without follower images",
+			mutate:  func(c *Config) { c.ScalingRole = scalingRoleLeader },
+			wantErr: "must name the follower images",
+		},
+		{
+			name: "scaling leader with a malformed follower PCR0",
+			mutate: func(c *Config) {
+				c.ScalingRole = scalingRoleLeader
+				c.ScalingFollowerPCR0s = []string{"genesis"}
+			},
+			wantErr: "invalid PCR0",
+		},
+		{
+			name:    "unknown scaling role",
+			mutate:  func(c *Config) { c.ScalingRole = "observer" },
+			wantErr: "invalid ENCLAVE_SCALING_ROLE",
+		},
+		{
 			name:    "namespace missing",
 			mutate:  func(c *Config) { c.Namespace = "" },
 			wantErr: "ENCLAVE_NAMESPACE must be set",
@@ -577,14 +606,16 @@ func TestApplySSMOverlay(t *testing.T) {
 	t.Run("updates mutable runtime config", func(t *testing.T) {
 		cfg := *testCfg
 		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
-			path(envAppPort):       "9090",
-			path(envFQDN):          "app.example.com",
-			path(envUseACME):       "TRUE",
-			path(envACMEDirectory): "https://acme.example.com/directory",
-			path(envACMEEmail):     "ops@example.com",
-			path(envACMECA):        "test-ca",
+			path(envAppPort):           "9090",
+			path(envFQDN):              "app.example.com",
+			path(envUseACME):           "TRUE",
+			path(envACMEDirectory):     "https://acme.example.com/directory",
+			path(envACMEEmail):         "ops@example.com",
+			path(envACMECA):            "test-ca",
+			path(envScalingLeaderAddr): "https://leader.example.com",
 		}))
 		require.NoError(t, err)
+		require.Equal(t, "https://leader.example.com", cfg.ScalingLeaderAddr)
 		require.Equal(t, "9090", cfg.AppPort)
 		require.Equal(t, "http://127.0.0.1:9090", cfg.AppWebSrv.String())
 		require.Equal(t, "app.example.com", cfg.FQDN)

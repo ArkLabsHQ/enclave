@@ -325,6 +325,48 @@ let
   };
   greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
 
+  # Threshold scaling: each follower is its own image, as each agency would
+  # build one, so every node has its own seed and identity. The leader admits
+  # exactly those follower images. Short liveness settings let the test watch
+  # an eviction.
+  scalingEnv = {
+    ENCLAVE_PREVIOUS_PCR0 = "genesis";
+    ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
+      {
+        name = "e2e-scaling-key";
+        env_var = "SCALING_KEY";
+        kind = "signing";
+      }
+    ];
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [ ];
+    ENCLAVE_SCALING_HEARTBEAT_INTERVAL = "3s";
+    ENCLAVE_SCALING_LIVENESS_TIMEOUT = "12s";
+    ENCLAVE_SCALING_MONITOR_TICK = "4s";
+  };
+  mkFollowerEif =
+    appName:
+    mkTestEif (
+      scalingEnv
+      // {
+        ENCLAVE_APP_NAME = appName;
+        ENCLAVE_SCALING_ROLE = "follower";
+      }
+    );
+  followerAEif = mkFollowerEif "follower-a";
+  followerBEif = mkFollowerEif "follower-b";
+  pcr0Of = eif: lib.toLower (builtins.fromJSON (builtins.readFile "${eif}/pcr.json")).PCR0;
+  leaderEif = mkTestEif (
+    scalingEnv
+    // {
+      ENCLAVE_APP_NAME = "leader";
+      ENCLAVE_SCALING_ROLE = "leader";
+      ENCLAVE_SCALING_FOLLOWER_PCR0S = lib.concatMapStringsSep "," pcr0Of [
+        followerAEif
+        followerBEif
+      ];
+    }
+  );
+
   mkEnclaveNode =
     eif:
     { pkgs, lib, ... }:
@@ -503,7 +545,10 @@ let
         AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
       };
 
-      networking.hosts."${nodes.green.networking.primaryIPAddress}" = [ "enclave.test" ];
+      # The scaling test has no green node and no ACME.
+      networking.hosts = lib.optionalAttrs (nodes ? green) {
+        "${nodes.green.networking.primaryIPAddress}" = [ "enclave.test" ];
+      };
       environment.etc."pebble/ca.crt".source = "${pebbleFixtures}/ca.crt";
       networking.firewall.allowedTCPPorts = [
         1338
@@ -631,6 +676,36 @@ in
         + builtins.readFile ./helpers.py
         + "\n"
         + builtins.readFile ./e2e.py;
+    };
+
+    scaling = pkgs.testers.runNixOSTest {
+      name = "enclave-runtime-scaling";
+      nodes = {
+        aws = awsNode;
+        leader = {
+          imports = [ (mkEnclaveNode leaderEif) ];
+          # Followers dial the leader's threshold relay on the enclave's TAP address.
+          environment.etc."gvproxy/config.yml".source = lib.mkForce (
+            (pkgs.formats.yaml { }).generate "gvproxy-config.yml" {
+              stack.forwards = {
+                ":443" = "192.168.127.2:443";
+                ":9000" = "192.168.127.2:9000";
+              };
+            }
+          );
+          networking.firewall.allowedTCPPorts = [ 9000 ];
+        };
+        follower_a = mkEnclaveNode followerAEif;
+        follower_b = mkEnclaveNode followerBEif;
+      };
+      testScript =
+        { nodes, ... }:
+        ''
+          LEADER_IP = ${builtins.toJSON nodes.leader.networking.primaryIPAddress}
+        ''
+        + builtins.readFile ./helpers.py
+        + "\n"
+        + builtins.readFile ./scaling.py;
     };
   };
 

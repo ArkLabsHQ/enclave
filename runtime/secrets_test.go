@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	thresholdcore "github.com/ArkLabsHQ/threshold-magic/threshold_core"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
@@ -313,6 +314,25 @@ func TestExtendPCRRegistersWithStaticSecrets(t *testing.T) {
 		))
 		require.Empty(t, session.requests)
 	})
+
+	t.Run("signing secret commits to its group key", func(t *testing.T) {
+		session := newFakeNSM(t).withPCRs(nil).session
+		signing := StaticSecretMetadata{Kind: "signing"}
+		shareGroupKey := mustDecodeHex(t, pubB)
+		require.NoError(
+			t,
+			ExtendPCRRegistersWithStaticSecrets(&nsmW{nsm: session.nsm}, []StaticSecret{
+				{StaticSecretMetadata: signing, Plaintext: keyA},
+				{StaticSecretMetadata: signing, Plaintext: keyA, GroupKey: shareGroupKey},
+			}),
+		)
+		leaderGroupKey, err := thresholdcore.LeaderGroupPubkey(mustDecodeHex(t, keyA))
+		require.NoError(t, err)
+		for i, groupKey := range [][]byte{leaderGroupKey, shareGroupKey} {
+			hash := sha256.Sum256(groupKey)
+			require.Equal(t, hash[:], requireExtendPCR(t, session, uint(16+i)).Data)
+		}
+	})
 }
 
 func inheritTestHash(value string) string {
@@ -368,8 +388,12 @@ func TestValidateStaticSecrets(t *testing.T) {
 
 	t.Run("valid", func(t *testing.T) {
 		for name, meta := range map[string]SecretsMetadata{
-			"state origin":   {Static: stateOriginTestSecrets},
-			"signing key":    {Static: []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}},
+			"state origin": {Static: stateOriginTestSecrets},
+			"signing key":  {Static: []StaticSecretMetadata{{Name: "signing-key", EnvVar: "SIGNING_KEY"}}},
+			"signing kind": {Static: []StaticSecretMetadata{
+				{Name: "group-key", EnvVar: "GROUP_KEY", Kind: "signing"},
+				{Name: "app-key", EnvVar: "APP_KEY", Kind: "static"},
+			}},
 			"allowed chars":  {Static: []StaticSecretMetadata{{Name: "A_Z.09-a", EnvVar: "_KEY0"}}},
 			"StorageDEK":     {Static: []StaticSecretMetadata{{Name: "StorageDEK", EnvVar: "KEY"}}},
 			"ACMEAccountKey": {Static: []StaticSecretMetadata{{Name: "ACMEAccountKey", EnvVar: "KEY"}}},
@@ -427,6 +451,9 @@ func TestValidateStaticSecrets(t *testing.T) {
 			{"equals in env var", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "key", EnvVar: "BAD=KEY"},
 			}}, "cannot use invalid env_var"},
+			{"unknown kind", SecretsMetadata{Static: []StaticSecretMetadata{
+				{Name: "key", EnvVar: "KEY", Kind: "bogus"},
+			}}, "must be one of static, signing"},
 			{"duplicate name", SecretsMetadata{Static: []StaticSecretMetadata{
 				{Name: "duplicate", EnvVar: "ONE"},
 				{Name: "duplicate", EnvVar: "TWO"},

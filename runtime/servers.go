@@ -78,6 +78,7 @@ type Servers interface {
 	ConfigureEnclaveInfoHandler(migrator Migrator) error
 	ReportBootFailure(err error)
 	SetAncestry(ctx context.Context, ancestry Ancestry)
+	ConfigureScalingHandlers(scaling *ScalingEntity)
 }
 
 type servers struct {
@@ -229,6 +230,14 @@ func registerRuntimeV1Handlers(
 func (s *servers) SetAncestry(ctx context.Context, ancestry Ancestry) {
 	ancestry.Start(ctx)
 	s.ancestry.Store(ancestry)
+}
+
+// ConfigureScalingHandlers serves a threshold leader's admission handshake and
+// its followers' heartbeats.
+func (s *servers) ConfigureScalingHandlers(scaling *ScalingEntity) {
+	s.rm.HandleFunc("GET "+handshakePathNonce, scaling.handleNonce)
+	s.rm.HandleFunc("POST "+handshakePathAdmit, scaling.handleAdmitFollower)
+	s.rm.HandleFunc("POST "+heartbeatPath, scaling.handleHeartbeat)
 }
 
 func (s *servers) ConfigureEnclaveInfoHandler(migrator Migrator) error {

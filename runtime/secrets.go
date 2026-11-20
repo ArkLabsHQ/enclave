@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	thresholdcore "github.com/ArkLabsHQ/threshold-magic/threshold_core"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -35,6 +36,7 @@ const (
 	storageDEKDerivationName         = runtimeDerivationPrefix + "StorageDEK"
 	acmeAccountKeyDerivationName     = runtimeDerivationPrefix + "ACMEAccountKey"
 	responseSigningKeyDerivationName = runtimeDerivationPrefix + "ResponseSigningKey"
+	thresholdHostKeyDerivationName   = runtimeDerivationPrefix + "ThresholdHostKey"
 )
 
 // deriveValidScalar uses HKDF-SHA256 extract-and-expand with protocol constants.
@@ -156,11 +158,21 @@ type Secrets struct {
 type StaticSecretMetadata struct {
 	Name   string `json:"name"`
 	EnvVar string `json:"env_var"`
+	Kind   string `json:"kind,omitempty"` // "signing" for threshold-shared secrets
 }
 
+// IsSigning reports whether the secret is threshold-shared (kind "signing").
+func (m StaticSecretMetadata) IsSigning() bool {
+	return m.Kind == "signing"
+}
+
+// StaticSecret is a resolved secret. For a signing secret, Plaintext is what
+// this node signs with now: its share once a group forms, else the leader
+// secret (solo leader). GroupKey is set once a share replaces it.
 type StaticSecret struct {
 	StaticSecretMetadata
 	Plaintext string
+	GroupKey  []byte
 }
 
 func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
@@ -209,6 +221,12 @@ func (sm SecretsMetadata) validateStatic(reserved map[string]bool) error {
 			return fmt.Errorf("secret %q: env_var %q is already used", secret.Name, secret.EnvVar)
 		}
 		envVars[secret.EnvVar] = true
+		switch secret.Kind {
+		case "", "static", "signing":
+		default:
+			return fmt.Errorf("secret %q: kind %q must be one of static, signing",
+				secret.Name, secret.Kind)
+		}
 		if seen[secret.Name] {
 			return fmt.Errorf("duplicate static secret %q", secret.Name)
 		}
@@ -246,6 +264,16 @@ func ExtendPCRRegistersWithStaticSecrets(nsm NSM, secrets []StaticSecret) error 
 		privKey := btcec.PrivKeyFromScalar(&scalar)
 
 		pubkeyBytes := privKey.PubKey().SerializeCompressed()
+		if s.IsSigning() {
+			// Every member commits to the same group key; before any share,
+			// the leader computes it from its secret.
+			pubkeyBytes = s.GroupKey
+			if pubkeyBytes == nil {
+				if pubkeyBytes, err = thresholdcore.LeaderGroupPubkey(secretBytes); err != nil {
+					return fmt.Errorf("group key for secret %q: %w", s.Name, err)
+				}
+			}
+		}
 		hash := sha256.Sum256(pubkeyBytes)
 
 		if err := nsm.ExtendPCR(pcrIndex, hash[:]); err != nil {

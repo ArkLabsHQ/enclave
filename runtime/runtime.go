@@ -189,7 +189,14 @@ func Run(ctx context.Context, cfg Config) (err error) {
 
 	rt.NotifyStarting()
 
-	if err := ExtendPCRRegistersWithStaticSecrets(nsm, result.secrets.Static); err != nil {
+	scaling, err := startScaling(ctx, &cfg, nsm, aws.S3, ssm, servers, result)
+	if err != nil {
+		return fmt.Errorf("failed to start threshold scaling: %w", err)
+	}
+
+	if err := ExtendPCRRegistersWithStaticSecrets(
+		nsm, scaling.applyShares(result.secrets.Static),
+	); err != nil {
 		return fmt.Errorf("failed to extend PCR registers with static secrets: %w", err)
 	}
 
@@ -235,7 +242,12 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		result.secrets.Inherited,
 		inheritCutoffPollInterval,
 	)
-	app, err := startApp(rt, cfg, otelToken, result.secrets)
+	// The first launch already carries the shares delivered so far.
+	select {
+	case <-scaling.Reshared():
+	default:
+	}
+	app, err := startApp(rt, cfg, otelToken, result.secrets, scaling)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
@@ -244,7 +256,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	initSpan.End()
 	initSpanEnded = true
 
-	return supervise(ctx, rt, app, restart)
+	return supervise(ctx, rt, app, restart, scaling.Reshared())
 }
 
 type appProcess interface {
@@ -258,6 +270,7 @@ type execApp struct {
 	cfg       Config
 	otelToken string
 	secrets   Secrets
+	scaling   *ScalingEntity
 	cmd       *exec.Cmd
 }
 
@@ -297,8 +310,9 @@ func startApp(
 	cfg Config,
 	otelToken string,
 	secrets Secrets,
+	scaling *ScalingEntity,
 ) (appProcess, error) {
-	app := &execApp{rt: rt, cfg: cfg, otelToken: otelToken, secrets: secrets}
+	app := &execApp{rt: rt, cfg: cfg, otelToken: otelToken, secrets: secrets, scaling: scaling}
 	if err := app.launch(); err != nil {
 		return nil, err
 	}
@@ -320,7 +334,10 @@ func (a *execApp) launch() error {
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = appEnv(cfg, a.otelToken, a.secrets)
+	// Each launch takes the latest share of every signing secret.
+	secrets := a.secrets
+	secrets.Static = a.scaling.applyShares(secrets.Static)
+	child.Env = appEnv(cfg, a.otelToken, secrets)
 
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("start child %s: %w", appPath, err)
@@ -359,12 +376,14 @@ func (a *execApp) Restart() error {
 }
 
 // supervise runs until the runtime stops. A signal on restart relaunches the
-// app, so it comes back without an inherited secret past its cutoff.
+// app, so it comes back without an inherited secret past its cutoff; one on
+// reshared relaunches it with its new signing-secret share.
 func supervise(
 	ctx context.Context,
 	rt RuntimeState,
 	child appProcess,
 	restart <-chan struct{},
+	reshared <-chan struct{},
 ) error {
 	for {
 		select {
@@ -378,6 +397,13 @@ func supervise(
 
 		case <-restart:
 			slog.Info("restarting upstream app without expired inherited secrets")
+			if err := child.Restart(); err != nil {
+				slog.Error("upstream app failed to restart; runtime stays alive", "error", err)
+				return waitForRuntime(ctx, rt)
+			}
+
+		case <-reshared:
+			slog.Info("restarting upstream app to adopt a reshared signing secret")
 			if err := child.Restart(); err != nil {
 				slog.Error("upstream app failed to restart; runtime stays alive", "error", err)
 				return waitForRuntime(ctx, rt)

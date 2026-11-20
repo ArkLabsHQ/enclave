@@ -28,3 +28,6 @@ jobs:
 
       - name: Run integration test
         run: nix build .#checks.x86_64-linux.e2e --print-build-logs
+
+      - name: Run threshold scaling test
+        run: nix build .#checks.x86_64-linux.scaling --print-build-logs

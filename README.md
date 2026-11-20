@@ -560,6 +560,7 @@ forces path-style addressing. These exist for testing against an emulator.
 |---|---|
 | `name` | Stable derivation name, baked into the image. |
 | `env_var` | Environment variable set on the application process, containing 64 lowercase hex characters. |
+| `kind` | Optional. `static` (default) or `signing`, a secret threshold-shared across a scaled group; see [Threshold scaling](#threshold-scaling). |
 
 Each secret derives from the deployment's master seed using HKDF-SHA256 with
 salt `enclave.derived-secret.v1` and the name encoded as one deterministic CBOR
@@ -674,6 +675,41 @@ reading it also takes `kms:Decrypt` on that key, and every read leaves a
 CloudTrail record. The runtime asks SSM to decrypt when it reads the parameter;
 the instance role therefore needs `kms:Decrypt` on that key, and on no other.
 
+### Threshold scaling
+
+A static secret with `"kind": "signing"` can be threshold-shared across a group
+of enclaves: each node holds only a share, and a majority reconstructs the
+secret. [SCALING-ARCHITECTURE.md](SCALING-ARCHITECTURE.md) describes the protocol.
+
+The leader and its followers are separate images, built from the same code with
+a different baked role, so each has its own seed and KMS key and no follower can
+reach the leader secret. The leader derives that secret from its seed like any
+static secret, so migration preserves it and the group key never changes.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENCLAVE_SCALING_ROLE` | empty | `leader` or `follower`. Empty disables scaling, and a signing secret is then an ordinary static secret. Baked into the EIF. |
+| `ENCLAVE_SCALING_FOLLOWER_PCR0S` | empty | Required for a leader: comma-separated PCR0s of the follower images it admits. Baked into the EIF, so the follower images are built first. |
+| `ENCLAVE_SCALING_LEADER_ADDR` | empty | Required for a follower: the leader's `https://` handshake URL. Baked, or set through the SSM overlay. |
+| `ENCLAVE_SCALING_LISTEN_PORT` | `9000` | Leader: port of its threshold relay, which the host forwards like 443. |
+| `ENCLAVE_SCALING_HEARTBEAT_INTERVAL` | `10s` | Follower: how often it proves liveness to the leader. |
+| `ENCLAVE_SCALING_LIVENESS_TIMEOUT` | `60s` | Leader: silence after which it evicts a follower and reshares. |
+| `ENCLAVE_SCALING_MONITOR_TICK` | `15s` | Leader: how often it checks for silent followers. |
+
+- The leader admits only the listed follower PCR0s. A follower can only check
+  that the leader attests the same kernel (PCR1).
+- A follower does not derive its signing secrets: boot waits up to five minutes
+  for its share before the application starts.
+- Until a follower joins, the leader's application receives the leader secret.
+  After every ceremony, each node's application restarts with its new share.
+- Each node keeps its share, and the group's public recovery data, in the
+  certificate bucket under `<namespace>/<app>/data/threshold/`, sealed with the
+  storage DEK, so a restart reuses its share. The leader keeps its ban list there.
+- PCR(16+i) of a signing secret commits to the group public key, the same on
+  every member, instead of to the secret's own public key.
+- Run at most one node of each image per AWS account: replicas of an image share
+  its seed, and with it their threshold identity.
+
 ### SSM environment overlay
 
 Parameters under `/<namespace>/<app>/enclave/env/` are read at boot (non-recursively,
@@ -697,6 +733,7 @@ passes the final application port to the child as described in
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
 | `ENCLAVE_OTEL_ENDPOINT_ENV` | Required name of the child's OTLP endpoint variable. |
 | `ENCLAVE_OTEL_TOKEN_ENV` | Required name of the child's OTLP bearer-token variable. |
+| `ENCLAVE_SCALING_LEADER_ADDR` | A threshold follower's leader handshake URL; see [Threshold scaling](#threshold-scaling). |
 
 `ENCLAVE_FQDN` and the four ACME settings start with their baked values, which
 the overlay may replace; `ENCLAVE_FQDN` defaults to `localhost` and ACME to off.
@@ -711,8 +748,9 @@ Set `/prod/wallet/enclave/env/ENCLAVE_FQDN` separately for the runtime's TLS cer
 The overlay cannot change the runtime's captured identity, lineage or security
 settings: `ENCLAVE_NAMESPACE`, `ENCLAVE_APP_NAME`, `ENCLAVE_SECRETS_CONFIG`,
 `ENCLAVE_INHERIT_SECRETS_CONFIG`, `ENCLAVE_DEV`, `ENCLAVE_MIGRATION_COOLDOWN`,
-`ENCLAVE_VERIFY_CLOCK_SOURCE`, `ENCLAVE_INSECURE_VERIFY_SKIPPED` and
-`ENCLAVE_PREVIOUS_PCR0`. Changing those runtime settings requires rebuilding the
+`ENCLAVE_VERIFY_CLOCK_SOURCE`, `ENCLAVE_INSECURE_VERIFY_SKIPPED`,
+`ENCLAVE_PREVIOUS_PCR0`, `ENCLAVE_SCALING_ROLE` and
+`ENCLAVE_SCALING_FOLLOWER_PCR0S`. Changing those runtime settings requires rebuilding the
 image. `ENCLAVE_DEV` selects the KMS lock posture and Object Lock retentions;
 neither has a separate environment-variable override.
 
@@ -1369,6 +1407,7 @@ nix flake check
 |---|---|
 | `eif-build` | Builds predecessor and successor EIFs, validates PCR0 shape, and proves the measurements differ. |
 | `e2e` | x86-only runtime lifecycle across five NixOS nodes: AWS setup, concurrent genesis and handoffs, clock recovery, attestation, ACME, secret derivation and replacement, replica joins, and restart recovery. |
+| `scaling` | x86-only threshold scaling across a leader and two follower images: attested admission, a share on every node, resharing on each join, and eviction of a silent follower. |
 
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also

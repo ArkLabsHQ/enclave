@@ -3,6 +3,7 @@
 # The NixOS test driver injects aws, blue, blue_peer, green, and green_peer.
 
 import base64
+import time
 from datetime import datetime, timedelta, timezone
 
 CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"

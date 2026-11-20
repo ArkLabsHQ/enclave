@@ -220,7 +220,7 @@ func TestSuperviseContextDoneStopsApp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := supervise(ctx, rt, app, nil)
+	err := supervise(ctx, rt, app, nil, nil)
 	if !errors.Is(err, want) {
 		t.Fatalf("supervise error = %v, want %v", err, want)
 	}
@@ -235,7 +235,7 @@ func TestSuperviseListenerErrorStopsApp(t *testing.T) {
 	want := errors.New("listener failed")
 
 	done := make(chan error, 1)
-	go func() { done <- supervise(context.Background(), rt, app, nil) }()
+	go func() { done <- supervise(context.Background(), rt, app, nil, nil) }()
 	rt.NotifyListenerError(want)
 
 	err := waitTestResult(t, done)
@@ -254,7 +254,7 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app, nil) }()
+	go func() { done <- supervise(ctx, rt, app, nil, nil) }()
 
 	rt.NotifyChildExit(nil)
 	cancel()
@@ -279,7 +279,7 @@ func TestSuperviseRestartRelaunchesApp(t *testing.T) {
 
 	restart := make(chan struct{}, 1)
 	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app, restart) }()
+	go func() { done <- supervise(ctx, rt, app, restart, nil) }()
 
 	restart <- struct{}{}
 	select {
@@ -325,7 +325,7 @@ func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
 	restart := watchInheritCutoffs(ctx, secrets.Inherited, 5*time.Millisecond)
 
 	done := make(chan error, 1)
-	go func() { done <- supervise(ctx, rt, app, restart) }()
+	go func() { done <- supervise(ctx, rt, app, restart, nil) }()
 
 	select {
 	case <-app.restarts:

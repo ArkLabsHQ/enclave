@@ -21,9 +21,10 @@ import (
 )
 
 type BuildAttestationOptions struct {
-	publicKey bool
-	nonce     []byte
-	userData  []byte
+	publicKey      bool
+	publicKeyBytes []byte
+	nonce          []byte
+	userData       []byte
 }
 
 type BuildAttestationOption func(*BuildAttestationOptions)
@@ -31,6 +32,13 @@ type BuildAttestationOption func(*BuildAttestationOptions)
 func WithPublicKey() BuildAttestationOption {
 	return func(opts *BuildAttestationOptions) {
 		opts.publicKey = true
+	}
+}
+
+// WithPublicKeyBytes attests a caller-held public key instead of a new RSA key.
+func WithPublicKeyBytes(publicKey []byte) BuildAttestationOption {
+	return func(opts *BuildAttestationOptions) {
+		opts.publicKeyBytes = publicKey
 	}
 }
 
@@ -328,6 +336,9 @@ func buildAttestationDocument(
 		}
 		privateKey = pk
 		publicKeyDER = der
+	}
+	if bao.publicKeyBytes != nil {
+		publicKeyDER = bao.publicKeyBytes
 	}
 
 	if bao.nonce == nil {

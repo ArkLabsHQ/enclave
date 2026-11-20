@@ -4,6 +4,8 @@ go 1.25.0
 
 require (
 	github.com/ArkLabsHQ/enclave/internal/signing v0.0.0-00010101000000-000000000000
+	github.com/ArkLabsHQ/threshold-magic/threshold_core v0.1.0
+	github.com/ArkLabsHQ/threshold-magic/threshold_sdk v0.1.0
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.20
@@ -15,8 +17,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.56.4
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.9
 	github.com/aws/smithy-go v1.27.6
-	github.com/btcsuite/btcd/btcec/v2 v2.3.3
+	github.com/btcsuite/btcd/btcec/v2 v2.3.4
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0
 	github.com/containers/gvisor-tap-vsock v0.8.8
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/edgebitio/nitro-enclaves-sdk-go v1.0.0
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/hf/nitrite v0.0.0-20241225144000-c2d5d3c4f303
@@ -61,7 +65,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
+	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/docker/libcontainer v2.2.1+incompatible // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

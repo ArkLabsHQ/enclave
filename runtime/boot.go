@@ -235,6 +235,11 @@ func (b *Boot) establish(ctx context.Context, planned *plannedBoot) (bootState, 
 
 	staticSecrets := make([]StaticSecret, 0, len(config.secretsMetadata.Static))
 	for _, meta := range config.secretsMetadata.Static {
+		if meta.IsSigning() && b.cfg.ScalingRole == scalingRoleFollower {
+			// A follower's signing secret is the share the leader's group gives it.
+			staticSecrets = append(staticSecrets, StaticSecret{StaticSecretMetadata: meta})
+			continue
+		}
 		plaintext, err := deriveSecret(masterSeed, meta.Name)
 		if err != nil {
 			return bootState{}, fmt.Errorf("derive static secret %s: %w", meta.Name, err)

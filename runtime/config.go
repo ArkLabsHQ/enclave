@@ -48,6 +48,15 @@ const (
 	envACMEEmail     = "ENCLAVE_ACME_EMAIL"
 	envACMECA        = "ENCLAVE_ACME_CA"
 
+	// Threshold scaling. Baked, except the leader address the SSM overlay may replace.
+	envScalingRole              = "ENCLAVE_SCALING_ROLE"
+	envScalingFollowerPCR0s     = "ENCLAVE_SCALING_FOLLOWER_PCR0S"
+	envScalingLeaderAddr        = "ENCLAVE_SCALING_LEADER_ADDR"
+	envScalingListenPort        = "ENCLAVE_SCALING_LISTEN_PORT"
+	envScalingHeartbeatInterval = "ENCLAVE_SCALING_HEARTBEAT_INTERVAL"
+	envScalingLivenessTimeout   = "ENCLAVE_SCALING_LIVENESS_TIMEOUT"
+	envScalingMonitorTick       = "ENCLAVE_SCALING_MONITOR_TICK"
+
 	// AWS configuration.
 	envAWSRegion           = "ENCLAVE_AWS_REGION"
 	envEC2MetadataEndpoint = "AWS_EC2_METADATA_SERVICE_ENDPOINT"
@@ -77,6 +86,10 @@ const (
 	defaultMigrationCooldown = 24 * time.Hour
 	defaultLogShipInterval   = 10 * time.Second
 	defaultLogRetentionDays  = int32(30)
+
+	defaultScalingHeartbeatInterval = 10 * time.Second
+	defaultScalingLivenessTimeout   = 60 * time.Second
+	defaultScalingMonitorTick       = 15 * time.Second
 
 	otlpHTTPTimeout = 30 * time.Second
 
@@ -171,6 +184,14 @@ type Config struct {
 	OtelTokenEnv          string // Required child variable for the bearer token.
 	InstanceID            string
 
+	ScalingRole              string   // "", "leader" or "follower"
+	ScalingFollowerPCR0s     []string // Leader: lowercase PCR0s of the follower images it admits.
+	ScalingLeaderAddr        string   // Follower: leader handshake base URL.
+	ScalingListenPort        string   // Leader: port its relay binds and advertises.
+	ScalingHeartbeatInterval time.Duration
+	ScalingLivenessTimeout   time.Duration
+	ScalingMonitorTick       time.Duration
+
 	OverrideAllowList map[string]bool
 	ChildEnv          map[string]string
 }
@@ -230,8 +251,18 @@ func LoadConfig() (*Config, error) {
 		VerifyClockSource:     takeEnv(envVerifyClockSource) != "false",
 		InsecureVerifySkipped: false,
 		KMSLocked:             true,
-		OverrideAllowList:     make(map[string]bool),
-		ChildEnv:              make(map[string]string),
+		ScalingRole:           takeEnv(envScalingRole),
+		ScalingLeaderAddr:     takeEnv(envScalingLeaderAddr),
+		ScalingListenPort:     takeEnvDefault(envScalingListenPort, defaultRelayPort),
+		ScalingHeartbeatInterval: scalingDuration(
+			envScalingHeartbeatInterval, defaultScalingHeartbeatInterval,
+		),
+		ScalingLivenessTimeout: scalingDuration(
+			envScalingLivenessTimeout, defaultScalingLivenessTimeout,
+		),
+		ScalingMonitorTick: scalingDuration(envScalingMonitorTick, defaultScalingMonitorTick),
+		OverrideAllowList:  make(map[string]bool),
+		ChildEnv:           make(map[string]string),
 	}
 
 	if takeEnv(envDev) == "true" {
@@ -270,6 +301,12 @@ func LoadConfig() (*Config, error) {
 
 	for v := range strings.SplitSeq(takeEnv(envOverrideAllowList), ",") {
 		cfg.OverrideAllowList[strings.TrimSpace(v)] = true
+	}
+
+	for v := range strings.SplitSeq(takeEnv(envScalingFollowerPCR0s), ",") {
+		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
+			cfg.ScalingFollowerPCR0s = append(cfg.ScalingFollowerPCR0s, v)
+		}
 	}
 
 	return cfg, nil
@@ -319,6 +356,22 @@ func (c *Config) Validate() error {
 			"ENCLAVE_PREVIOUS_PCR0 must be %q or the predecessor's PCR0, got %q",
 			genesisPreviousPCR0, c.PreviousPCR0,
 		)
+	}
+	switch c.ScalingRole {
+	case "", scalingRoleFollower:
+	case scalingRoleLeader:
+		if len(c.ScalingFollowerPCR0s) == 0 {
+			return fmt.Errorf("%s must name the follower images a leader admits",
+				envScalingFollowerPCR0s)
+		}
+		for _, pcr0 := range c.ScalingFollowerPCR0s {
+			if !isCanonicalPCR0(pcr0) {
+				return fmt.Errorf("%s: invalid PCR0 %q", envScalingFollowerPCR0s, pcr0)
+			}
+		}
+	default:
+		return fmt.Errorf("invalid %s %q, want %q or %q",
+			envScalingRole, c.ScalingRole, scalingRoleLeader, scalingRoleFollower)
 	}
 	if c.AppPort == "" {
 		return fmt.Errorf("config is missing application process settings")
@@ -436,6 +489,8 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 			c.OtelEndpointEnv = p.Value
 		case envOtelTokenEnv:
 			c.OtelTokenEnv = p.Value
+		case envScalingLeaderAddr:
+			c.ScalingLeaderAddr = p.Value
 		// key is not an overridable env var, check if overriding is allowed by the app
 		default:
 			if _, allowed := c.OverrideAllowList[key]; !allowed {
@@ -569,6 +624,14 @@ func logShipInterval() time.Duration {
 		return defaultLogShipInterval
 	}
 	return interval
+}
+
+func scalingDuration(key string, fallback time.Duration) time.Duration {
+	d, err := time.ParseDuration(takeEnvDefault(key, fallback.String()))
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 func logRetentionDays() int32 {

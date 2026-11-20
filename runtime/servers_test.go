@@ -1170,6 +1170,104 @@ func TestSignedRequestBodyReadError(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
+func TestSignedRequestSizeLimit(t *testing.T) {
+	for _, unknownLength := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown_length=%t", unknownLength), func(t *testing.T) {
+			attData := &AttestationData{}
+			attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+			called := false
+			h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				called = true
+			}))
+			body := strings.NewReader(strings.Repeat("x", maxSignedBytes+1))
+			req := httptest.NewRequest(http.MethodPost, "/orders", body)
+			if unknownLength {
+				req.ContentLength = -1
+			}
+			req.Header.Set(signNonceHeader, "n")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
+			require.False(t, called, "reject before the app sees the request")
+			require.Empty(t, rr.Header().Get(signatureHeader))
+		})
+	}
+}
+
+func TestSignedResponseSizeLimit(t *testing.T) {
+	t.Run("bodies at the limit are accepted", func(t *testing.T) {
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.Len(t, body, maxSignedBytes)
+			n, err := w.Write(make([]byte, maxSignedBytes))
+			require.NoError(t, err)
+			require.Equal(t, maxSignedBytes, n)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/orders",
+			bytes.NewReader(make([]byte, maxSignedBytes)))
+		req.Header.Set(signNonceHeader, "n")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, maxSignedBytes, rr.Body.Len())
+		require.NotEmpty(t, rr.Header().Get(signatureHeader))
+	})
+
+	t.Run("an oversized response that skips the proxy gets a 502", func(t *testing.T) {
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		var overflowErr, laterErr error
+		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("prefix"))
+			_, overflowErr = w.Write(make([]byte, maxSignedBytes))
+			// This fits if overflow merely rejects the previous Write and forgets it.
+			_, laterErr = w.Write([]byte("tail"))
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/orders", nil)
+		req.Header.Set(signNonceHeader, "n")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Error(t, overflowErr)
+		require.Error(t, laterErr, "overflow must persist across writes")
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Empty(t, rr.Header().Get(signatureHeader))
+		require.NotContains(t, rr.Body.String(), "prefix")
+	})
+
+	t.Run("an oversized proxied response drops the connection", func(t *testing.T) {
+		app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxSignedBytes+1)))
+		}))
+		t.Cleanup(app.Close)
+		appURL, err := url.Parse(app.URL)
+		require.NoError(t, err)
+		rt := newRuntimeState()
+		rt.NotifyReady()
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		s := SetupHttpServers(
+			rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), attData, "token",
+		).(*servers)
+		// Use a real server: ReverseProxy suppresses ErrAbortHandler in direct unit calls.
+		public := httptest.NewServer(s.ext.Handler)
+		t.Cleanup(public.Close)
+		client := public.Client()
+		client.Timeout = 2 * time.Second
+		req, err := http.NewRequest(http.MethodGet, public.URL+"/orders", nil)
+		require.NoError(t, err)
+		req.Header.Set(signNonceHeader, "n")
+		res, err := client.Do(req)
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		require.ErrorIs(t, err, io.EOF, "ReverseProxy drops the connection")
+		require.Nil(t, res)
+	})
+}
+
 func TestSignedEnclaveInfo(t *testing.T) {
 	attData := &AttestationData{}
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), attData: attData}

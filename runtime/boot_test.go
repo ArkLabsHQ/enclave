@@ -30,15 +30,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMigrationStateOriginReceiptParamIsPCRScoped(t *testing.T) {
-	pcr0 := strings.Repeat("AB", 48)
-	require.Equal(
-		t,
-		"/prod/app/enclave/MigrationStateOriginReceipt/key-1/"+strings.ToLower(pcr0),
-		testCfg.migrationStateOriginReceiptParam("key-1", pcr0),
-	)
-}
-
 // requireNoGenerationSSMReads proves a boot took nothing about its generation
 // from SSM: only configuration and inherited secrets may be read there.
 func requireNoGenerationSSMReads(t *testing.T, fake *fakeSSM) {
@@ -55,87 +46,77 @@ func requireNoGenerationSSMReads(t *testing.T, fake *fakeSSM) {
 // A boot decides from its own published state first; without it, only the
 // measured ENCLAVE_PREVIOUS_PCR0 chooses between genesis and adopting a handoff.
 func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
-	own := bytes.Repeat([]byte{0xab}, 48)
-	ownHex := hex.EncodeToString(own)
-	prevHex := hex.EncodeToString(bytes.Repeat([]byte{0x99}, 48))
 	const keyID = "key-plan"
-	handoffBase := handoffParams(t, testCfg, newFakeKMS(), keyID)
-	handoff := func(params map[string]string) {
-		maps.Copy(params, handoffBase)
-		params[testCfg.migrationPreviousPCR0Param(ownHex)] = prevHex
-		params[testCfg.migrationPreviousKMSKeyIDParam(ownHex)] = "previous-key"
-		params[testCfg.migrationStateOriginReceiptParam(keyID, ownHex)] = "transition"
+	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
+	ownPCR0Hex := hex.EncodeToString(ownPCR0)
+	prevPCR0 := bytes.Repeat([]byte{0x99}, 48)
+	prevPCR0Hex := hex.EncodeToString(prevPCR0)
+
+	// The snapshot the predecessor finalises for this enclave.
+	finalisedSnapshot := testGenerationSnapshot(ownPCR0, prevPCR0, keyID)
+	seedFinalisedHandoff := func(t *testing.T, fx *snapshotTestFixture) {
+		seedHandoff(t, fx.s3f, fx.signer, prevPCR0, finalisedSnapshot, time.Now())
 	}
-	published := func(t *testing.T, fx *snapshotTestFixture) {
-		fx.seed(t, own, fx.body(t, testGenerationSnapshot(own, nil, keyID), nil), time.Now())
+	seedOwnSnapshot := func(t *testing.T, fx *snapshotTestFixture) {
+		ownSnapshot := testGenerationSnapshot(ownPCR0, nil, keyID)
+		fx.seed(t, ownPCR0, fx.body(t, ownSnapshot, nil), time.Now())
 	}
 
 	for _, tc := range []struct {
-		name     string
-		previous string
-		params   func(map[string]string)
-		s3       func(*testing.T, *snapshotTestFixture)
-		want     bootMode
-		wantErr  string
-		wantIs   error
+		name         string
+		previousPCR0 string
+		s3           func(*testing.T, *snapshotTestFixture)
+		want         bootMode
+		wantErr      string
+		wantIs       error
 	}{
-		{name: "genesis image without state", previous: genesisPreviousPCR0, want: &genesisBoot{}},
 		{
-			name: "genesis image never adopts a handoff", previous: genesisPreviousPCR0,
-			params: handoff, want: &genesisBoot{},
+			name: "genesis image without state", previousPCR0: genesisPreviousPCR0,
+			want: &genesisBoot{},
 		},
 		{
-			name: "genesis image resumes its state", previous: genesisPreviousPCR0,
-			s3: published, want: &resumeBoot{},
+			name: "genesis image never adopts a handoff", previousPCR0: genesisPreviousPCR0,
+			s3: seedFinalisedHandoff, want: &genesisBoot{},
 		},
 		{
-			name: "successor resumes its state, whatever SSM holds", previous: prevHex,
-			s3: published, params: handoff, want: &resumeBoot{},
+			name: "genesis image resumes its state", previousPCR0: genesisPreviousPCR0,
+			s3: seedOwnSnapshot, want: &resumeBoot{},
 		},
-		{name: "successor adopts the handoff", previous: prevHex, params: handoff, want: &migrationBoot{}},
-		{name: "successor without state or handoff", previous: prevHex, wantErr: "holds no handoff"},
 		{
-			name: "partial predecessor artifacts", previous: prevHex,
-			params: func(p map[string]string) {
-				handoff(p)
-				delete(p, testCfg.migrationPreviousKMSKeyIDParam(ownHex))
+			name: "successor resumes its state, whatever the log holds", previousPCR0: prevPCR0Hex,
+			s3: func(t *testing.T, fx *snapshotTestFixture) {
+				seedOwnSnapshot(t, fx)
+				seedFinalisedHandoff(t, fx)
 			},
-			wantErr: "inconsistent migration predecessor artifacts",
+			want: &resumeBoot{},
 		},
 		{
-			name: "handoff naming no predecessor", previous: prevHex,
-			params: func(p map[string]string) {
-				handoff(p)
-				delete(p, testCfg.migrationPreviousPCR0Param(ownHex))
-				delete(p, testCfg.migrationPreviousKMSKeyIDParam(ownHex))
+			name: "successor adopts the handoff", previousPCR0: prevPCR0Hex,
+			s3: seedFinalisedHandoff, want: &migrationBoot{},
+		},
+		{
+			name: "successor without state or handoff", previousPCR0: prevPCR0Hex,
+			wantErr: "holds no handoff",
+		},
+		{
+			name: "a request alone is not a handoff", previousPCR0: prevPCR0Hex,
+			s3: func(t *testing.T, fx *snapshotTestFixture) {
+				seedMigrationIntent(
+					t, fx.s3f, fx.signer, prevPCR0, migrationIntentRequested, ownPCR0Hex,
+					1, time.Now(),
+				)
 			},
-			wantErr: "no predecessor to migrate from",
+			wantErr: "holds no handoff",
 		},
 		{
-			name: "handoff without a transition receipt", previous: prevHex,
-			params: func(p map[string]string) {
-				handoff(p)
-				delete(p, testCfg.migrationStateOriginReceiptParam(keyID, ownHex))
-			},
-			wantErr: "no migration transition receipt",
-		},
-		{
-			name: "handoff naming the enclave as its own predecessor", previous: prevHex,
-			params: func(p map[string]string) {
-				handoff(p)
-				p[testCfg.migrationPreviousPCR0Param(ownHex)] = ownHex
-			},
-			wantErr: "cannot be its own predecessor",
-		},
-		{
-			name: "unverifiable state is not an absence", previous: genesisPreviousPCR0,
+			name: "unverifiable state is not an absence", previousPCR0: genesisPreviousPCR0,
 			s3: func(_ *testing.T, fx *snapshotTestFixture) {
-				fx.s3f.putRawObject(snapshotObjectKey(ownHex), []byte("garbage"))
+				fx.s3f.putRawObject(snapshotObjectKey(ownPCR0Hex), []byte("garbage"))
 			},
 			wantIs: errSnapshotUnverifiable,
 		},
 		{
-			name: "unreadable store fails closed", previous: genesisPreviousPCR0,
+			name: "unreadable store fails closed", previousPCR0: genesisPreviousPCR0,
 			s3:     func(_ *testing.T, fx *snapshotTestFixture) { fx.s3f.listErr = errors.New("down") },
 			wantIs: errSnapshotStoreUnavailable,
 		},
@@ -145,25 +126,23 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 			if tc.s3 != nil {
 				tc.s3(t, fx)
 			}
-			params := map[string]string{}
-			if tc.params != nil {
-				tc.params(params)
-			}
-			fake, ssm := stateOriginTestSSM(params)
+			fake, ssm := stateOriginTestSSM(nil)
 			cfg := stateOriginTestConfig()
-			cfg.PreviousPCR0 = tc.previous
+			cfg.PreviousPCR0 = tc.previousPCR0
 			boot := &Boot{
 				cfg: cfg, nsm: &nsmW{nsm: fx.signer.peer()},
-				ssm: ssm, s3: fx.s3f, sts: &fakeSTS{}, pcr0: own,
+				ssm: ssm, s3: fx.s3f, sts: &fakeSTS{}, pcr0: ownPCR0,
 				secretsMetadata: SecretsMetadata{Static: stateOriginTestSecrets},
 			}
 
-			// A migration reads its handoff when it builds the snapshot.
+			// A migration reads its handoff when it verifies the snapshot.
 			planned, err := boot.plan(t.Context())
-			var handoff Snapshot
+			var adoptedSnapshot Snapshot
 			if err == nil {
 				if migration, ok := planned.mode.(*migrationBoot); ok {
-					handoff, err = migration.buildSnapshot(t.Context(), boot, &planned.config)
+					adoptedSnapshot, err = migration.verifySnapshot(
+						t.Context(), boot, &planned.config,
+					)
 				}
 			}
 
@@ -176,12 +155,11 @@ func TestBootPlansFromItsOwnSnapshot(t *testing.T) {
 				require.NoError(t, err)
 				require.IsType(t, tc.want, planned.mode)
 				if _, adopting := planned.mode.(*migrationBoot); adopting {
-					require.Equal(t, "transition", handoff.transitionReceipt)
-					require.Equal(t, prevHex, handoff.predecessorPCR0)
-				} else {
-					requireNoGenerationSSMReads(t, fake)
+					require.True(t, adoptedSnapshot.sameState(finalisedSnapshot))
+					require.NotEmpty(t, adoptedSnapshot.transitionReceipt)
 				}
 			}
+			requireNoGenerationSSMReads(t, fake)
 		})
 	}
 }
@@ -268,19 +246,24 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 	ownPCR0 := bytes.Repeat([]byte{0xab}, 48)
 	stateRoot := []byte("successor-state-root")
 	pcr31 := pcrExtendFromZero(ownPCR0)
-	att := signedReceipt(t, map[uint][]byte{
+	snapshot := testGenerationSnapshot(ownPCR0, prevPCR0, "key-1")
+	att := newFakeNSM(t).attest(map[uint][]byte{
 		0:                 prevPCR0,
 		migrationPCRIndex: pcr31,
-	}, purposeMigrationTransition, stateRoot)
+	}, time.Now(), transitionReceiptPayload(t, snapshot, stateRoot))
 	verifier := NewNSM(WithAttestationRoots(att.roots))
 
 	require.NoError(t, verifyStateReceipt(
-		verifier, att.docB64, purposeMigrationTransition, stateRoot,
+		verifier, att.docB64, stateRoot,
 		transitionPCRs(hex.EncodeToString(prevPCR0), ownPCR0),
 	))
 	require.Error(t, verifyStateReceipt(
-		verifier, att.docB64, purposeMigrationTransition, stateRoot,
+		verifier, att.docB64, stateRoot,
 		transitionPCRs(hex.EncodeToString(prevPCR0), bytes.Repeat([]byte{0x33}, 48)),
+	))
+	require.Error(t, verifyStateReceipt(
+		verifier, att.docB64, []byte("another-state-root"),
+		transitionPCRs(hex.EncodeToString(prevPCR0), ownPCR0),
 	))
 }
 
@@ -556,35 +539,6 @@ func TestSuccessorImageNeverGenesises(t *testing.T) {
 	require.Empty(t, fx.s3f.objects[snapshotObjectKey(fx.pcr0Hex)])
 }
 
-// Generation parameters left in SSM, however corrupted, are never consulted.
-func TestResumeIgnoresSSMGenerationParams(t *testing.T) {
-	ctx := t.Context()
-	fx := newGenesisFixture(t, bytes.Repeat([]byte{0xab}, 48))
-	first, err := fx.establish(ctx)
-	require.NoError(t, err)
-	keyID := first.kms.KeyID()
-	garbage := base64.StdEncoding.EncodeToString([]byte("corrupted"))
-	for _, name := range []string{
-		testCfg.kmsKeyIDParam(fx.pcr0Hex),
-		testCfg.masterSeedCiphertextParam(keyID),
-		testCfg.tlsKeyCiphertextParam(keyID),
-		testCfg.migrationPreviousPCR0Param(fx.pcr0Hex),
-		testCfg.migrationPreviousKMSKeyIDParam(fx.pcr0Hex),
-		testCfg.migrationStateOriginReceiptParam(keyID, fx.pcr0Hex),
-		testCfg.namespace() + "/StateOriginReceipt/" + keyID + "/" + fx.pcr0Hex,
-	} {
-		fx.ssmf.params[name] = garbage
-	}
-	fx.ssmf.calls = nil
-
-	resumed, err := fx.establish(ctx)
-
-	require.NoError(t, err)
-	require.Equal(t, first.masterSeed, resumed.masterSeed)
-	require.Equal(t, first.snapshot, resumed.snapshot)
-	requireNoGenerationSSMReads(t, fx.ssmf)
-}
-
 // The intent bucket is measured, never read from SSM. A host that can write the
 // application's SSM namespace could otherwise aim the state lookup at an empty
 // bucket and have a second generation created beside the live one.
@@ -649,7 +603,11 @@ func TestBootRejectsInvalidMaterialBeforeCommit(t *testing.T) {
 				planned, err := boot.plan(t.Context())
 				require.NoError(t, err)
 				if mode == "resume" {
-					snapshot, err := planned.mode.buildSnapshot(t.Context(), boot, &planned.config)
+					snapshot, err := (&genesisBoot{}).buildSnapshot(
+						t.Context(),
+						boot,
+						&planned.config,
+					)
 					require.NoError(t, err)
 					planned.mode = &resumeBoot{snapshot: snapshot}
 				}
@@ -687,25 +645,34 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		at       time.Time
 		weaken   func(*fakeS3Object)
 	}
-	requested := func(source []byte, target string) []intentSeed {
-		return []intentSeed{{
-			source: source, action: migrationIntentRequested, target: target,
-			sequence: 1, at: bootAt.Add(-time.Minute),
-		}}
+	// finalised is a request and, a minute later, the record that finalises it. A
+	// finalised seed carries the handoff under test.
+	finalised := func(source []byte, target string) []intentSeed {
+		return []intentSeed{
+			{
+				source: source, action: migrationIntentRequested, target: target,
+				sequence: 1, at: bootAt.Add(-2 * time.Minute),
+			},
+			{
+				source: source, action: migrationIntentFinalised, target: target,
+				sequence: 2, at: bootAt.Add(-time.Minute),
+			},
+		}
 	}
 	type adoption struct {
-		predecessor     string // named by the SSM handoff
-		eif             string // ENCLAVE_PREVIOUS_PCR0
-		pcrs            map[uint][]byte
+		predecessor     string          // whose log holds the handoff
+		eif             string          // ENCLAVE_PREVIOUS_PCR0
+		pcrs            map[uint][]byte // attested by the finalised intent
 		intents         []intentSeed
-		tamper          func(map[string]string)
-		beforeEstablish func(*fakeS3)
+		owner, bucket   string
+		beforeEstablish func(*fakeS3, *fakeNSM)
 	}
 	valid := func() adoption {
 		return adoption{
 			predecessor: prevHex, eif: prevHex,
 			pcrs:    map[uint][]byte{0: prev, migrationPCRIndex: pcrExtendFromZero(current)},
-			intents: requested(prev, currentHex),
+			intents: finalised(prev, currentHex),
+			owner:   currentHex, bucket: stateOriginTestMigrationIntentBucket(),
 		}
 	}
 	type outcome struct {
@@ -721,31 +688,27 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		ctx := t.Context()
 		signer := newFakeNSMValid(t, bootAt.Add(-24*time.Hour), bootAt.Add(24*time.Hour))
 		kmsf := newFakeKMS()
-		params := handoffParams(t, testCfg, kmsf, keyID)
-		params[testCfg.migrationPreviousPCR0Param(currentHex)] = a.predecessor
-		params[testCfg.migrationPreviousKMSKeyIDParam(currentHex)] = "previous-key"
-		root, err := Snapshot{
-			kmsKeyID: keyID, ownerPCR0: currentHex,
+		handoff := Snapshot{
+			kmsKeyID: keyID, ownerPCR0: a.owner,
 			predecessorPCR0: a.predecessor, predecessorKMSKeyID: "previous-key",
-			masterSeedCiphertext:      params[testCfg.masterSeedCiphertextParam(keyID)],
-			tlsKeyCiphertext:          params[testCfg.tlsKeyCiphertextParam(keyID)],
-			migrationIntentBucketName: stateOriginTestMigrationIntentBucket(),
-		}.root(testCfg)
-
-		require.NoError(t, err)
-		params[testCfg.migrationStateOriginReceiptParam(keyID, currentHex)] = signer.attest(
-			a.pcrs, bootAt, receiptPayload(t, purposeMigrationTransition, root),
-		).docB64
-		if a.tamper != nil {
-			a.tamper(params)
+			migrationIntentBucketName: a.bucket,
 		}
-		fake, ssm := stateOriginTestSSM(params)
+		handoff.masterSeedCiphertext, handoff.tlsKeyCiphertext = handoffCiphertexts(
+			t, testCfg, kmsf, keyID,
+		)
+		fake, ssm := stateOriginTestSSM(nil)
 		s3f := newFakeS3()
 		s3f.versioned = true
 		for _, seed := range a.intents {
-			seedMigrationIntent(
-				t, s3f, signer, seed.source, seed.action, seed.target, seed.sequence, seed.at,
-			)
+			if seed.action == migrationIntentFinalised {
+				seedMigrationFinalisedIntent(
+					t, s3f, signer, a.pcrs, seed.target, handoff, seed.sequence, seed.at,
+				)
+			} else {
+				seedMigrationIntent(
+					t, s3f, signer, seed.source, seed.action, seed.target, seed.sequence, seed.at,
+				)
+			}
 			if seed.weaken != nil {
 				objects := s3f.objects[migrationIntentObjectKey(
 					hex.EncodeToString(seed.source), seed.sequence,
@@ -768,7 +731,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			return out
 		}
 		if a.beforeEstablish != nil {
-			a.beforeEstablish(s3f)
+			a.beforeEstablish(s3f, signer)
 		}
 		out.result, out.err = boot.establish(ctx, planned)
 		return out
@@ -778,8 +741,10 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		require.Error(t, out.err)
 		require.Zero(t, out.kms.decryptCalls, "nothing may decrypt before the handoff verifies")
 		require.Equal(t, out.before, out.ssm.params, "a refused adoption writes nothing to SSM")
-		require.Empty(t, out.s3.objects[snapshotObjectKey(currentHex)],
-			"a refused adoption publishes nothing")
+		for key := range out.s3.objects {
+			require.False(t, strings.HasPrefix(key, snapshotObjectPrefix),
+				"a refused adoption must not publish %s", key)
+		}
 	}
 
 	t.Run("accepts a valid handoff and publishes both receipts", func(t *testing.T) {
@@ -788,10 +753,12 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		state := out.result.snapshot
 		require.Equal(t, prevHex, state.predecessorPCR0)
 		require.Equal(t, "previous-key", state.predecessorKMSKeyID)
-		require.Equal(t,
-			out.ssm.params[testCfg.migrationStateOriginReceiptParam(keyID, currentHex)],
-			state.transitionReceipt,
-			"the predecessor's receipt is published as it was written")
+		var finalisedIntent migrationIntentObjectV1
+		require.NoError(t, json.Unmarshal(
+			out.s3.objects[migrationIntentObjectKey(prevHex, 2)][0].body, &finalisedIntent,
+		))
+		require.Equal(t, finalisedIntent.Attestation, state.transitionReceipt,
+			"the finalised intent's attestation is published as the transition receipt")
 		require.Len(t, out.s3.objects[snapshotObjectKey(currentHex)], 1)
 		require.Equal(t, out.before, out.ssm.params, "adoption writes nothing to SSM")
 		wantSigningKey, err := deriveResponseSigningKey(out.result.masterSeed, current)
@@ -806,6 +773,16 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		msg    string
 	}{
 		{
+			name:   "rejects an authenticated snapshot naming another owner",
+			modify: func(a *adoption) { a.owner = otherHex },
+			msg:    "handoff snapshot owner does not match current PCR0",
+		},
+		{
+			name:   "rejects an authenticated snapshot naming another bucket",
+			modify: func(a *adoption) { a.bucket = "other-snapshot-bucket" },
+			msg:    "handoff snapshot bucket does not match configured snapshot bucket",
+		},
+		{
 			name: "rejects a transition receipt with the wrong PCR31",
 			modify: func(a *adoption) {
 				a.pcrs[migrationPCRIndex] = pcrExtendFromZero(other)
@@ -813,20 +790,9 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			msg: "invalid transition receipt",
 		},
 		{
-			name: "rejects a ciphertext swapped after the receipt was signed",
-			modify: func(a *adoption) {
-				a.tamper = func(p map[string]string) {
-					p[testCfg.masterSeedCiphertextParam(keyID)] = base64.StdEncoding.EncodeToString(
-						bytes.Repeat([]byte{0x5a}, 32),
-					)
-				}
-			},
-			msg: "invalid transition receipt",
-		},
-		{
 			name:   "refuses when no intent was ever recorded",
 			modify: func(a *adoption) { a.intents = nil },
-			is:     errMigrationIntentAbsent,
+			msg:    "holds no handoff",
 		},
 		{
 			name: "refuses an intent naming another successor",
@@ -836,54 +802,58 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 					sequence: 1, at: bootAt.Add(-time.Hour),
 				}}
 			},
-			is: errMigrationIntentAborted,
+			msg: "holds no handoff",
 		},
 		{
-			name: "refuses when a later abort revoked the authorization",
+			name:   "refuses a request that was never finalised",
+			modify: func(a *adoption) { a.intents = a.intents[:1] },
+			msg:    "holds no handoff",
+		},
+		{
+			name: "refuses when a later abort withdrew the handoff",
 			modify: func(a *adoption) {
-				a.intents = []intentSeed{
-					{
-						source: prev, action: migrationIntentRequested, target: currentHex,
-						sequence: 1, at: bootAt.Add(-3 * time.Hour),
-					},
-					{
-						source: prev, action: migrationIntentAborted, target: currentHex,
-						sequence: 2, at: bootAt.Add(-2 * time.Hour),
-					},
+				a.intents = append(a.intents, intentSeed{
+					source: prev, action: migrationIntentAborted, target: currentHex,
+					sequence: 3, at: bootAt.Add(-30 * time.Second),
+				})
+			},
+			msg: "holds no handoff",
+		},
+		{
+			name: "refuses adoption after an abort between planning and verification",
+			modify: func(a *adoption) {
+				a.beforeEstablish = func(s3f *fakeS3, signer *fakeNSM) {
+					seedMigrationIntent(
+						t, s3f, signer, prev, migrationIntentAborted, currentHex,
+						3, time.Now(),
+					)
 				}
 			},
-			is: errMigrationIntentAborted,
+			msg: "holds no handoff",
 		},
 		{
 			name: "fails closed when the intent store is unreadable",
 			modify: func(a *adoption) {
-				a.beforeEstablish = func(s3f *fakeS3) { s3f.listErr = errors.New("s3 unavailable") }
+				a.beforeEstablish = func(s3f *fakeS3, _ *fakeNSM) {
+					s3f.listErr = errors.New("s3 unavailable")
+				}
 			},
 			is: errMigrationIntentStoreUnavailable,
 		},
 		{
-			// B commits to A, but the host supplies Z's genuine handoff under B's PCR0.
-			name: "rejects another predecessor's handoff",
+			// B commits to A, so Z's genuine handoff to B is never read.
+			name: "ignores another predecessor's handoff",
 			modify: func(a *adoption) {
 				a.predecessor = otherHex
 				a.pcrs = map[uint][]byte{0: other, migrationPCRIndex: pcrExtendFromZero(current)}
-				a.intents = requested(other, currentHex)
+				a.intents = finalised(other, currentHex)
 			},
-			msg: "does not match previous PCR0 committed in the EIF",
+			msg: "holds no handoff",
 		},
 		{
 			name:   "rejects an image that commits to no predecessor",
 			modify: func(a *adoption) { a.eif = "" },
-			msg:    "does not match previous PCR0 committed in the EIF",
-		},
-		{
-			name: "rejects an enclave as its own predecessor",
-			modify: func(a *adoption) {
-				a.predecessor = currentHex
-				a.pcrs = map[uint][]byte{0: current, migrationPCRIndex: pcrExtendFromZero(other)}
-				a.intents = nil
-			},
-			msg: "cannot be its own predecessor",
+			msg:    "holds no handoff",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -899,8 +869,9 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 		})
 	}
 
-	// Keep the predecessor and signed intent valid; only its S3 Object Lock
-	// metadata changes. An unprotected request must not authorize adoption.
+	// Keep the predecessor and signed intents valid; only one record's S3 Object
+	// Lock metadata changes. An unprotected record must not authorize adoption:
+	// without the request nothing stands, without the handoff it is not finalised.
 	for _, tc := range []struct {
 		name   string
 		weaken func(*fakeS3Object)
@@ -917,32 +888,46 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 			)
 		}},
 	} {
-		t.Run("refuses intent with "+tc.name, func(t *testing.T) {
-			a := valid()
-			a.intents[0].weaken = tc.weaken
-			out := adopt(t, a)
-			require.ErrorIs(t, out.err, errMigrationIntentAbsent)
-			require.ErrorContains(t, out.err, "recorded no intent")
-			refused(t, out)
-		})
+		for i, record := range []string{"request", "handoff"} {
+			t.Run("refuses "+record+" with "+tc.name, func(t *testing.T) {
+				a := valid()
+				a.intents[i].weaken = tc.weaken
+				out := adopt(t, a)
+				require.ErrorContains(t, out.err, "holds no handoff")
+				refused(t, out)
+			})
+		}
 	}
 
-	t.Run("adopts when a re-request superseded an earlier abort", func(t *testing.T) {
+	// The handoff released before an abort stays in the log, but a fresh request
+	// is not a handoff: its cooldown has to end in a new finalised record.
+	reRequested := func() adoption {
 		a := valid()
-		a.intents = []intentSeed{
-			{
-				source: prev, action: migrationIntentRequested, target: currentHex,
-				sequence: 1, at: bootAt.Add(-5 * time.Hour),
-			},
-			{
+		a.intents = append(a.intents,
+			intentSeed{
 				source: prev, action: migrationIntentAborted, target: currentHex,
-				sequence: 2, at: bootAt.Add(-4 * time.Hour),
+				sequence: 3, at: bootAt.Add(-50 * time.Second),
 			},
-			{
+			intentSeed{
 				source: prev, action: migrationIntentRequested, target: currentHex,
-				sequence: 3, at: bootAt.Add(-3 * time.Hour),
+				sequence: 4, at: bootAt.Add(-40 * time.Second),
 			},
-		}
+		)
+		return a
+	}
+	t.Run("refuses a leftover handoff once an abort was followed by a new request",
+		func(t *testing.T) {
+			out := adopt(t, reRequested())
+			require.ErrorContains(t, out.err, "holds no handoff")
+			refused(t, out)
+		})
+
+	t.Run("adopts once the new request is finalised", func(t *testing.T) {
+		a := reRequested()
+		a.intents = append(a.intents, intentSeed{
+			source: prev, action: migrationIntentFinalised, target: currentHex,
+			sequence: 5, at: bootAt.Add(-30 * time.Second),
+		})
 		require.NoError(t, adopt(t, a).err)
 	})
 }
@@ -950,8 +935,7 @@ func TestMigrationBootAdoptsOnlyAnAuthorizedHandoff(t *testing.T) {
 // The whole handoff through the real predecessor and successor code. Replicas
 // of the successor converge on one published state, an adoption interrupted
 // before publishing is simply redone, and the published state alone keeps the
-// successor booting once its predecessor's key is deleted and the SSM handoff
-// is wiped and rewritten.
+// successor booting once its predecessor's key is deleted and SSM is wiped.
 func TestMigrationSnapshotOutlivesItsHandoff(t *testing.T) {
 	ctx := t.Context()
 	blue, green := bytes.Repeat([]byte{0xab}, 48), bytes.Repeat([]byte{0xcd}, 48)
@@ -1022,10 +1006,6 @@ func TestMigrationSnapshotOutlivesItsHandoff(t *testing.T) {
 			delete(fx.ssmf.params, name)
 		}
 	}
-	fx.ssmf.params[testCfg.kmsKeyIDParam(greenHex)] = "rewritten-key"
-	fx.ssmf.params[testCfg.migrationPreviousPCR0Param(greenHex)] = hex.EncodeToString(
-		bytes.Repeat([]byte{0x77}, 48),
-	)
 	fx.ssmf.calls = nil
 
 	resumed, err := newGreen().Boot(ctx)
@@ -1075,10 +1055,11 @@ func stateOriginTestSSM(params map[string]string) (*fakeSSM, SSM) {
 // testHandoffSeed is the master seed every test handoff carries.
 var testHandoffSeed = bytes.Repeat([]byte{0x42}, 32)
 
-// handoffParams is a handoff a predecessor writes for the test PCR0: the
-// pointer, and the seed and a fresh TLS key encrypted under keyID, which kmsf
-// admits for that PCR0 alone.
-func handoffParams(t *testing.T, cfg *Config, kmsf *fakeKMS, keyID string) map[string]string {
+// handoffCiphertexts is what a predecessor hands the test PCR0: the seed and a
+// fresh TLS key encrypted under keyID, which kmsf admits for that PCR0 alone.
+func handoffCiphertexts(
+	t *testing.T, cfg *Config, kmsf *fakeKMS, keyID string,
+) (masterSeedCiphertext, tlsKeyCiphertext string) {
 	t.Helper()
 	identity, err := (&fakeSTS{}).GetCallerIdentity(t.Context(), nil)
 	require.NoError(t, err)
@@ -1103,28 +1084,25 @@ func handoffParams(t *testing.T, cfg *Config, kmsf *fakeKMS, keyID string) map[s
 		require.NoError(t, err)
 		return base64.StdEncoding.EncodeToString(out.CiphertextBlob)
 	}
-	return map[string]string{
-		cfg.kmsKeyIDParam(stateOriginTestPCR0Hex()): keyID,
-		cfg.masterSeedCiphertextParam(keyID):        encrypt(testHandoffSeed),
-		cfg.tlsKeyCiphertextParam(keyID):            encrypt(tlsKeyPKCS8),
-	}
+	return encrypt(testHandoffSeed), encrypt(tlsKeyPKCS8)
 }
 
-func receiptPayload(t *testing.T, purpose string, stateRoot []byte) []byte {
+// transitionReceiptPayload is what a predecessor attests when it finalises the
+// handoff of snapshot, whose root is stateRoot.
+func transitionReceiptPayload(t *testing.T, snapshot Snapshot, stateRoot []byte) []byte {
 	t.Helper()
-	payload, err := cbor.Marshal(snapshotRootPayloadV1{Purpose: purpose, SnapshotRoot: stateRoot})
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	require.NoError(t, err)
+	payload, err := enc.Marshal(migrationIntentUserDataV1{
+		Schema:                migrationIntentSchemaV1,
+		BucketName:            snapshot.migrationIntentBucketName,
+		Sequence:              2,
+		Action:                migrationIntentFinalised,
+		TargetPCR0:            snapshot.ownerPCR0,
+		FinalisedSnapshotRoot: stateRoot,
+	})
 	require.NoError(t, err)
 	return payload
-}
-
-func signedReceipt(
-	t *testing.T,
-	pcrs map[uint][]byte,
-	purpose string,
-	stateRoot []byte,
-) signedAttestation {
-	t.Helper()
-	return newFakeNSM(t).attest(pcrs, time.Now(), receiptPayload(t, purpose, stateRoot))
 }
 
 func originReceiptPayload(t *testing.T, stateRoot []byte, snapshot Snapshot) []byte {
@@ -1154,9 +1132,6 @@ type genesisFixture struct {
 	signer  *fakeNSM
 	pcr0Hex string
 }
-
-// keyIDParam is the handoff pointer a predecessor commits for this PCR0.
-func (f *genesisFixture) keyIDParam() string { return testCfg.kmsKeyIDParam(f.pcr0Hex) }
 
 func newGenesisFixture(t *testing.T, pcr0 []byte) *genesisFixture {
 	t.Helper()
@@ -1261,7 +1236,7 @@ func seedMigrationIntent(
 	t.Helper()
 	enc, err := cbor.CoreDetEncOptions().EncMode()
 	require.NoError(t, err)
-	payload, err := enc.Marshal(migrationIntentV1{
+	payload, err := enc.Marshal(migrationIntentUserDataV1{
 		Schema:     migrationIntentSchemaV1,
 		BucketName: stateOriginTestMigrationIntentBucket(),
 		Sequence:   sequence,
@@ -1284,6 +1259,72 @@ func seedMigrationIntent(
 		body,
 		publishedAt,
 	)
+}
+
+// seedMigrationFinalisedIntent signs snapshot and targetPCR0 independently so
+// tests can model an authenticated handoff with inconsistent contents.
+func seedMigrationFinalisedIntent(
+	t *testing.T,
+	s3f *fakeS3,
+	signer *fakeNSM,
+	predecessorPCRs map[uint][]byte,
+	targetPCR0 string,
+	snapshot Snapshot,
+	sequence uint64,
+	publishedAt time.Time,
+) {
+	t.Helper()
+	sourcePCR0 := predecessorPCRs[0]
+	encodedSnapshot, err := snapshot.encode(testCfg)
+	require.NoError(t, err)
+	enc, err := cbor.CoreDetEncOptions().EncMode()
+	require.NoError(t, err)
+	payload, err := enc.Marshal(migrationIntentUserDataV1{
+		Schema:                migrationIntentSchemaV1,
+		BucketName:            stateOriginTestMigrationIntentBucket(),
+		Sequence:              sequence,
+		Action:                migrationIntentFinalised,
+		TargetPCR0:            targetPCR0,
+		FinalisedSnapshotRoot: snapshotRootOf(encodedSnapshot),
+	})
+	require.NoError(t, err)
+
+	attestation := signer.attest(predecessorPCRs, publishedAt, payload)
+	body, err := json.Marshal(migrationIntentObjectV1{
+		Schema:            migrationIntentSchemaV1,
+		Sequence:          sequence,
+		Action:            migrationIntentFinalised,
+		TargetPCR0:        targetPCR0,
+		Attestation:       attestation.docB64,
+		FinalisedSnapshot: encodedSnapshot,
+	})
+	require.NoError(t, err)
+	s3f.putRawObjectAt(
+		migrationIntentObjectKey(hex.EncodeToString(sourcePCR0), sequence),
+		body,
+		publishedAt,
+	)
+}
+
+// seedHandoff writes a predecessor's request for snapshot's owner and, a
+// minute later at finalisedAt, the record that hands it over.
+func seedHandoff(
+	t *testing.T,
+	s3f *fakeS3,
+	signer *fakeNSM,
+	sourcePCR0 []byte,
+	snapshot Snapshot,
+	finalisedAt time.Time,
+) {
+	t.Helper()
+	seedMigrationIntent(
+		t, s3f, signer, sourcePCR0, migrationIntentRequested, snapshot.ownerPCR0,
+		1, finalisedAt.Add(-time.Minute),
+	)
+	seedMigrationFinalisedIntent(t, s3f, signer, map[uint][]byte{
+		0:                 sourcePCR0,
+		migrationPCRIndex: pcrExtendFromZero(mustDecodeHexString(snapshot.ownerPCR0)),
+	}, snapshot.ownerPCR0, snapshot, 2, finalisedAt)
 }
 
 var (
@@ -1359,7 +1400,7 @@ func (f *snapshotTestFixture) receipts(
 		transition = f.signer.attest(map[uint][]byte{
 			0:                 mustDecodeHex(t, snapshot.predecessorPCR0),
 			migrationPCRIndex: pcrExtendFromZero(owner),
-		}, time.Now(), receiptPayload(t, purposeMigrationTransition, root)).docB64
+		}, time.Now(), transitionReceiptPayload(t, snapshot, root)).docB64
 	}
 	return transition, origin
 }
@@ -1648,8 +1689,8 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 snapshotTestPredecessor,
 					migrationPCRIndex: pcrExtendFromZero(otherPCR0),
-				}, time.Now(), receiptPayload(
-					t, purposeMigrationTransition, snapshotRootOf(obj.Snapshot),
+				}, time.Now(), transitionReceiptPayload(
+					t, migrated, snapshotRootOf(obj.Snapshot),
 				)).docB64
 			},
 		},
@@ -1659,19 +1700,19 @@ func TestSnapshotRejectsInvalidVersions(t *testing.T) {
 				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 otherPCR0,
 					migrationPCRIndex: pcrExtendFromZero(snapshotTestOwner),
-				}, time.Now(), receiptPayload(
-					t, purposeMigrationTransition, snapshotRootOf(obj.Snapshot),
+				}, time.Now(), transitionReceiptPayload(
+					t, migrated, snapshotRootOf(obj.Snapshot),
 				)).docB64
 			},
 		},
 		{
-			name: "transition receipt with the origin purpose", snapshot: migrated,
+			name: "transition receipt that is not a finalised intent", snapshot: migrated,
 			mutate: func(t *testing.T, fx *snapshotTestFixture, obj *snapshotObjectV1) {
 				obj.TransitionAttestation = fx.signer.attest(map[uint][]byte{
 					0:                 snapshotTestPredecessor,
 					migrationPCRIndex: pcrExtendFromZero(snapshotTestOwner),
-				}, time.Now(), receiptPayload(
-					t, purposeStateOrigin, snapshotRootOf(obj.Snapshot),
+				}, time.Now(), originReceiptPayload(
+					t, snapshotRootOf(obj.Snapshot), migrated,
 				)).docB64
 			},
 		},

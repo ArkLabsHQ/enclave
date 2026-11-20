@@ -149,7 +149,8 @@ func verifyAttestationDocument(
 }
 
 // verifyPCRs returns the document's non-empty PCRs in hex, after checking that
-// PCR16 onwards match expected, the secrets' public key hashes in order.
+// PCR16 onwards hold the extends of expected, the secrets' public key hashes in
+// order.
 func verifyPCRs(docPCRs map[uint][]byte, expected []string) (map[uint]string, error) {
 	pcrs := make(map[uint]string)
 	for idx, pcrBytes := range docPCRs {
@@ -164,11 +165,16 @@ func verifyPCRs(docPCRs map[uint][]byte, expected []string) (map[uint]string, er
 		if !ok {
 			return nil, fmt.Errorf("PCR%d not found in attestation document", pcrIndex)
 		}
-		if !strings.EqualFold(actual, expectedHash) {
+		// The PCR holds the extend of the hash, not the hash itself.
+		expectedPCR, err := secretPCR(expectedHash)
+		if err != nil {
+			return nil, fmt.Errorf("ExpectedPCRs[%d] %w", i, err)
+		}
+		if !strings.EqualFold(actual, expectedPCR) {
 			return nil, fmt.Errorf(
 				"PCR%d mismatch: expected %s, got %s",
 				pcrIndex,
-				expectedHash,
+				expectedPCR,
 				actual,
 			)
 		}

@@ -41,6 +41,9 @@ const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
 	timestampHeader = "X-Enclave-Timestamp"
+
+	// Caps each buffered signed body; 4 MiB is gRPC's default receive limit.
+	maxSignedBytes = 4 << 20
 )
 
 var (
@@ -95,7 +98,7 @@ func SetupHttpServers(
 	nsm NSM,
 	telemetry *Telemetry,
 	attData *AttestationData,
-	authToken string,
+	otelToken string,
 ) Servers {
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 500
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 500
@@ -117,7 +120,7 @@ func SetupHttpServers(
 	}
 
 	sm := http.NewServeMux()
-	registerRuntimeV1Handlers(sm, "/v1/", telemetry, authToken)
+	registerRuntimeV1Handlers(sm, "/v1/", telemetry, otelToken)
 	sm.Handle("GET /health", healthHandler(rt))
 
 	// OTLP forwarding stays on loopback because requests use instance credentials.
@@ -206,19 +209,19 @@ func registerRuntimeV1Handlers(
 	mux *http.ServeMux,
 	prefix string,
 	telemetry *Telemetry,
-	authToken string,
+	otelToken string,
 ) {
 	mux.HandleFunc(
 		"POST "+prefix+"metrics",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpMetrics)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpMetrics)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"logs",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpLogs)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpLogs)),
 	)
 	mux.HandleFunc(
 		"POST "+prefix+"traces",
-		withTokenAuth(authToken, telemetry.forwardHandler(otlpTraces)),
+		withTokenAuth(otelToken, telemetry.forwardHandler(otlpTraces)),
 	)
 }
 
@@ -524,8 +527,13 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 			return
 		}
 		// The request body is signed too, so read it before the app does.
-		reqBody, err := io.ReadAll(r.Body)
+		reqBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedBytes))
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "read request body", http.StatusBadRequest)
 			return
 		}
@@ -540,6 +548,12 @@ func signResponses(attData *AttestationData, next http.Handler) http.Handler {
 		timestamp := time.Now()
 		rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		// Only oversized responses that don't go through the proxy, like enclave
+		// info, get the 502: ReverseProxy drops the connection when its write fails.
+		if rec.tooLarge {
+			http.Error(w, "response body too large", http.StatusBadGateway)
+			return
+		}
 		// A HEAD response carries no body on the wire; sign the empty one sent.
 		if r.Method == http.MethodHead {
 			rec.body.Reset()
@@ -624,9 +638,10 @@ func isGRPC(contentType string) bool {
 
 // bufferedResponse holds a response until it is signed.
 type bufferedResponse struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
+	header   http.Header
+	status   int
+	body     bytes.Buffer
+	tooLarge bool
 }
 
 // normalizeTrailers makes trailers go out once, at the end of the response.
@@ -648,9 +663,15 @@ func (b *bufferedResponse) normalizeTrailers() {
 	b.header.Del("Trailer")
 }
 
-func (b *bufferedResponse) Header() http.Header         { return b.header }
-func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
-func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
+func (b *bufferedResponse) Header() http.Header    { return b.header }
+func (b *bufferedResponse) WriteHeader(status int) { b.status = status }
+func (b *bufferedResponse) Write(p []byte) (int, error) {
+	if b.tooLarge || len(p) > maxSignedBytes-b.body.Len() {
+		b.tooLarge = true
+		return 0, errors.New("response body too large")
+	}
+	return b.body.Write(p)
+}
 
 // UpstreamAppInfo reports whether the user app process has exited and, if
 // so, the error from its exit. The runtime stays alive after app exit so

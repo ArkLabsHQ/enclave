@@ -38,10 +38,13 @@ type telemetry struct {
 // the token it puts in the child's environment, so no other configuration is
 // needed.
 func startTelemetry(ctx context.Context) (*telemetry, error) {
-	endpoint := "127.0.0.1:" + envOrDefault("ENCLAVE_PROXY_PORT", "8080")
-	token := os.Getenv("ENCLAVE_RUNTIME_TOKEN")
+	endpoint := os.Getenv("APP_OTEL_ENDPOINT")
+	if endpoint == "" {
+		return nil, fmt.Errorf("APP_OTEL_ENDPOINT is not set")
+	}
+	token := os.Getenv("APP_OTEL_TOKEN")
 	if token == "" {
-		return nil, fmt.Errorf("ENCLAVE_RUNTIME_TOKEN is not set")
+		return nil, fmt.Errorf("APP_OTEL_TOKEN is not set")
 	}
 	headers := map[string]string{"Authorization": "Bearer " + token}
 
@@ -55,8 +58,7 @@ func startTelemetry(ctx context.Context) (*telemetry, error) {
 	t := &telemetry{}
 
 	traceExp, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpoint(endpoint),
-		otlptracehttp.WithInsecure(),
+		otlptracehttp.WithEndpointURL(endpoint+"/v1/traces"),
 		otlptracehttp.WithHeaders(headers),
 	)
 	if err != nil {
@@ -71,8 +73,7 @@ func startTelemetry(ctx context.Context) (*telemetry, error) {
 	t.shutdown = append(t.shutdown, tracerProvider.Shutdown)
 
 	metricExp, err := otlpmetrichttp.New(ctx,
-		otlpmetrichttp.WithEndpoint(endpoint),
-		otlpmetrichttp.WithInsecure(),
+		otlpmetrichttp.WithEndpointURL(endpoint+"/v1/metrics"),
 		otlpmetrichttp.WithHeaders(headers),
 	)
 	if err != nil {
@@ -93,8 +94,7 @@ func startTelemetry(ctx context.Context) (*telemetry, error) {
 	}
 
 	logExp, err := otlploghttp.New(ctx,
-		otlploghttp.WithEndpoint(endpoint),
-		otlploghttp.WithInsecure(),
+		otlploghttp.WithEndpointURL(endpoint+"/v1/logs"),
 		otlploghttp.WithHeaders(headers),
 	)
 	if err != nil {

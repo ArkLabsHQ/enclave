@@ -72,6 +72,8 @@ derivation.
           ENCLAVE_APP_NAME = "myapp";
           ENCLAVE_AWS_REGION = "eu-west-1";
           ENCLAVE_PREVIOUS_PCR0 = "genesis";
+          ENCLAVE_OTEL_ENDPOINT_ENV = "MYAPP_OTEL_ENDPOINT";
+          ENCLAVE_OTEL_TOKEN_ENV = "MYAPP_OTEL_TOKEN";
         };
       };
     in
@@ -135,14 +137,16 @@ interfaces are documented under [Deployment](#deployment).
 | TCP 127.0.0.1:8080 | inside enclave | internal runtime API |
 | TCP 127.0.0.1:7074 | inside enclave | the application |
 
-Migration has no control endpoint. It runs over SSM between the enclaves
-themselves, so there is no inbound surface to authenticate or restrict.
+Migration has no control endpoint. It runs between the enclaves themselves,
+over SSM and the intent log, so there is no inbound surface to authenticate or
+restrict.
 
 ### State model
 
 The runtime keeps no state on disk. Each generation publishes one attested,
 compliance-locked S3 snapshot containing its KMS-encrypted master seed and TLS
-key. SSM holds configuration, inherited secrets and migration handoffs.
+key. SSM holds configuration, inherited secrets and the migration challenge
+exchange.
 
 - Each generation's KMS key admits only its PCR0. `Decrypt` and `GenerateDataKey`
   require attestation, even for callers with the instance role.
@@ -165,7 +169,7 @@ starts. Candidates cannot be pinned through attestation.
 |---|---|
 | Own `snapshot/<pcr0>` verifies | Resume from it without reading generation state from SSM. |
 | No snapshot; `ENCLAVE_PREVIOUS_PCR0=genesis` | Acquire the genesis lease, create keys and publish the snapshot. |
-| No snapshot; `ENCLAVE_PREVIOUS_PCR0=<predecessor PCR0>` | Wait for the SSM handoff, verify its receipts, key policy and migration intent, then adopt and publish a snapshot. |
+| No snapshot; `ENCLAVE_PREVIOUS_PCR0=<predecessor PCR0>` | Wait for the predecessor's finalised intent, verify its receipt and key policy, then adopt and publish a snapshot. |
 | Existing versions cannot be verified, or S3 cannot be read | Fail boot; never treat invalid or unreadable state as absent. |
 
 **Use one independent deployment per namespace and app name.** Update an existing
@@ -194,7 +198,7 @@ The derived [state bucket](#aws-requirements) holds two kinds of locked record:
 | Key | Writer | Contents |
 |---|---|---|
 | `snapshot/<pcr0>` | The generation's enclave | Ciphertexts, KMS key ID, deployment and predecessor identities, and attestation receipts. |
-| `migration-intent/<sourcePCR0>/<sequence>` | The predecessor | Migration requests and aborts. |
+| `migration-intent/<sourcePCR0>/<sequence>` | The predecessor | Migration requests, aborts and finalised handoffs. A finalised record carries the successor's snapshot, and its attestation is the successor's transition receipt. |
 
 Snapshots use canonical CBOR wrapped in JSON with receipts. The owner's
 state-origin receipt authenticates the snapshot root and lineage. A migrated
@@ -212,8 +216,9 @@ to fail.
 **Publication** uses `If-None-Match: *` with compliance retention. The writer then
 verifies the stored version and requires it to match its snapshot before
 serving. This read-back checks the actual lock; IAM preflight cannot check bucket
-configuration. Before first adoption succeeds, the successor still needs its
-SSM handoff. Keep the predecessor serving until the successor is ready.
+configuration. Before first adoption succeeds, the successor still needs the
+handoff to be its predecessor's active intent. Keep the predecessor serving
+until the successor is ready.
 
 **Retention** is ten years in production and five minutes under `ENCLAVE_DEV`.
 To keep a generation beyond that period, extend the earliest valid version's
@@ -226,8 +231,8 @@ aws s3api put-object-retention --bucket <state bucket> --key snapshot/<pcr0> \
 ```
 
 **Recovery** of a published generation needs its snapshot, KMS key and image.
-Restarting discovers the snapshot even if SSM handoff parameters were deleted
-or changed. Configuration and inherited secrets still come from SSM. Deleting a
+Restarting discovers the snapshot whatever SSM holds. Configuration and
+inherited secrets still come from SSM. Deleting a
 generation's own KMS key prevents recovery; deleting a predecessor's key does
 not prevent an adopted successor from booting. See
 [blue/green migration](#bluegreen-migration) before retiring keys.
@@ -405,6 +410,8 @@ is disabled; the boot fails without it.
 | `ENCLAVE_MIGRATION_COOLDOWN` | `24h` | Overrides the wait between a candidate's attestation being adopted and the handoff committing: the abort window. Can be set in either production or dev mode; unset defaults to 24 hours in both. Must parse as a duration and must not be negative; an explicit `0s` disables the wait. EIF-baked, never read from the SSM overlay. |
 | `ENCLAVE_LOG_SHIP_INTERVAL` | `10s` | Export cadence for the runtime's own logs, spans and metrics. The application's cadence is its own exporter's. |
 | `ENCLAVE_LOG_RETENTION_DAYS` | `30` | Retention applied to created log groups. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required | Child environment variable that receives the OTLP/HTTP base URL. Must be set in the image. SSM-overridable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required | Child environment variable that receives the per-boot bearer token. Must be set in the image. SSM-overridable. |
 | `ENCLAVE_TRACES` | `false` | `true` exports spans to X-Ray: the runtime's own and the application's, relayed from `/v1/traces`. Needs Transaction Search and the `XRayAccess` statement. Otherwise the application's uploads and the runtime's own spans are dropped inside the enclave with an empty success response. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
 | `ENCLAVE_METRICS` | `false` | `true` exports metrics to CloudWatch: the runtime's own counters, `/proc` readings and forward-duration histograms, and the application's, relayed from `/v1/metrics`. Needs the `CloudWatchMetricsAccess` statement. Otherwise the application's uploads and the runtime's own metrics are dropped inside the enclave with an empty success response, so export failures show only on `stderr`. Takes `true`, `True`, `TRUE`, `t`, `T` or `1`, and the matching `false` forms; anything else, including mixed case such as `tRuE`, fails the boot. Baked into the EIF, never read from the SSM overlay. |
 
@@ -688,6 +695,8 @@ passes the final application port to the child as described in
 | `ENCLAVE_ACME_DIRECTORY` | `letsencrypt-staging` or an `https://` directory URL. |
 | `ENCLAVE_ACME_EMAIL` | ACME account contact. |
 | `ENCLAVE_ACME_CA` | PEM CA bundle for a private ACME server. |
+| `ENCLAVE_OTEL_ENDPOINT_ENV` | Required name of the child's OTLP endpoint variable. |
+| `ENCLAVE_OTEL_TOKEN_ENV` | Required name of the child's OTLP bearer-token variable. |
 
 `ENCLAVE_FQDN` and the four ACME settings start with their baked values, which
 the overlay may replace; `ENCLAVE_FQDN` defaults to `localhost` and ACME to off.
@@ -723,11 +732,25 @@ secrets and inherited secrets, plus these explicit runtime exports:
 |---|---|
 | `PORT` | `ENCLAVE_APP_PORT`, default `7074` |
 | `ENCLAVE_APP_PORT` | the same value |
-| `ENCLAVE_PROXY_PORT` | the internal API port, default `8080` |
-| `ENCLAVE_RUNTIME_TOKEN` | a 32-byte hex bearer token, regenerated each boot |
+| value of `ENCLAVE_OTEL_ENDPOINT_ENV` | the OTLP/HTTP base URL, `http://127.0.0.1:8080` |
+| value of `ENCLAVE_OTEL_TOKEN_ENV` | a 32-byte hex bearer token, regenerated each boot |
 
-`ENCLAVE_RUNTIME_TOKEN` authenticates the application to the runtime's OTLP
-forwarders on the internal listener. `stdout` and `stderr` are inherited.
+The bearer token authenticates the application to the runtime's OTLP forwarders.
+`stdout` and `stderr` are inherited.
+
+Set both telemetry variable names in the image to match the application's configuration.
+The names must be valid environment identifiers, must differ, and must not
+collide with another runtime export or a secret.
+
+```text
+ENCLAVE_OTEL_ENDPOINT_ENV=ARKD_SIGNER_OTEL_COLLECTOR_ENDPOINT
+ENCLAVE_OTEL_TOKEN_ENV=ARKD_SIGNER_OTEL_TOKEN
+```
+
+The application must accept a full HTTP URL and a raw bearer token. It appends
+the signal path, such as `/v1/logs`, and sends `Authorization: Bearer <token>`.
+The runtime sets these values after baked variables, SSM application overrides
+and secrets. SSM can replace either name but cannot clear it.
 
 ### SSM parameters
 
@@ -752,21 +775,12 @@ must match the new root.
 | `/N/A/enclave/MigrationChallenge/<sourcePCR0>` | runtime | Live challenge: the predecessor's attestation over a fresh nonce, bound to the state namespace. Its attested timestamp drives rotation every minute. Advanced tier. |
 | `/N/A/enclave/MigrationResponse/<sourcePCR0>/<candidatePCR0>` | runtime | A candidate's attestation answering that challenge. Advanced tier. |
 | `/N/A/enclave/MigrationResponse/<sourcePCR0>/abort` | operator | Naming the pending target PCR0 cancels the handoff. While the intent is ambiguous, naming any of the tied targets clears it. The predecessor records the abort in the intent log as soon as it sees it. |
-| `/N/A/enclave/L/KMSKeyID/<pcr0>` | runtime | Handoff pointer: the migration key a predecessor committed for the successor measuring `<pcr0>`. Written create-only and last. Never manage this with deployment tooling. |
-| `/N/A/enclave/L/MasterSeed/Ciphertext/<keyID>` | runtime | Handoff: the master seed under the successor's migration key. |
-| `/N/A/enclave/L/TLSKey/Ciphertext/<keyID>` | runtime | Handoff: the TLS key under the successor's migration key. |
-| `/N/A/enclave/MigrationPreviousPCR0/<pcr0>` | runtime | Handoff: the predecessor's PCR0, in its successor's scope. |
-| `/N/A/enclave/MigrationPreviousKMSKeyID/<pcr0>` | runtime | Handoff: the predecessor's KMS key ID. |
-| `/N/A/enclave/MigrationStateOriginReceipt/<keyID>/<pcr0>` | runtime | Handoff: the predecessor's transition receipt over the successor's state. Written create-only. |
 
-SSM holds no generation state. The handoff rows are transport: a predecessor
-writes them for a successor it has not met, and the successor reads them once,
-verifies them against the transition receipt, and publishes them as its
-`snapshot/<pcr0>`. From then on nothing reads them again, so deleting, overwriting
-or expiring any of them can stall an adoption still in flight but never select
-other state, and never trigger a genesis. Each handoff attempt writes under a
-key ID minted for it alone, so a losing or interrupted attempt leaves only
-orphans.
+SSM holds no generation state and no handoff. A predecessor releases state to
+its successor in one place only, the finalised record in its
+[intent log](#generation-state). Deleting, overwriting or expiring a parameter
+can stall the challenge exchange but never select other state, and never
+trigger a genesis.
 
 Genesis writes no parameter at all.
 
@@ -860,11 +874,14 @@ the shared master seed can still derive keys for other PCR0 values.
 Requests without the header are proxied unchanged and stream as before.
 Signed requests and their responses are buffered whole before the signature is
 sent, so signed requests suit bounded bodies and unary gRPC calls, not uploads,
-downloads or streams. Signed responses carry `Cache-Control: no-store`, since each answers a
-single nonce. The `502` for an unreachable application is signed like any other
-response. `/enclave/v1/info` is signed the same way once the runtime holds
-its signing key; before that, as a candidate, a signed request to it is answered
-`503` while unsigned requests are served as usual. Other `/enclave/*` endpoints,
+downloads or streams. Each is capped at 4 MiB, gRPC's default receive limit: a
+larger request body is answered `413` before the application sees it, and a
+larger application response is aborted, so the client gets no response. Signed
+responses carry `Cache-Control: no-store`, since each answers a single nonce.
+The `502` for an unreachable application is signed like any other response.
+`/enclave/v1/info` is signed the same way once the runtime holds its signing
+key; before that, as a candidate, a signed request to it is answered `503`
+while unsigned requests are served as usual. Other `/enclave/*` endpoints,
 `/health`, and the `503` served before the application starts are not signed.
 
 The response body is signed decoded: for a signed request the runtime drops
@@ -948,12 +965,14 @@ PCR0/key identity stops the walk and is reported through `complete` and
 ### Internal listener, TCP 127.0.0.1:8080
 
 Serves `POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces` and `GET /health`
-only. The three forwarders expect `Authorization: Bearer <ENCLAVE_RUNTIME_TOKEN>`,
-accept OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
+only. The three forwarders expect `Authorization: Bearer <token>` with the
+per-boot token supplied through the configured child variable. They accept
+OTLP/HTTP as `application/x-protobuf` or `application/json`, optionally
 `gzip`-encoded, and answer with whatever AWS answered. When traces or metrics
 are off, that forwarder answers with an empty success and forwards nothing. This is the endpoint
-advertised to the application through `ENCLAVE_PROXY_PORT`. It does not serve
-`/enclave/v1/info`, the `/enclave/*` endpoints, or the application proxy.
+advertised through the configured endpoint variable.
+It does not serve `/enclave/v1/info`, the `/enclave/*` endpoints, or the
+application proxy.
 
 ## Deployment
 
@@ -1032,7 +1051,7 @@ AWS credentials delivered through IMDS must allow:
 | `S3CertAndLeaseReadWrite` | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, `GetBucketLocation` on the certificate and lease buckets. |
 | `S3MigrationIntentObjectLock` | On the derived state bucket: `ListBucketVersions` on the bucket; `GetObject`, `GetObjectVersion`, `GetObjectRetention` on `<bucket>/*`; `PutObject` and `PutObjectRetention` on `<bucket>/snapshot/*` and `<bucket>/migration-intent/*` only. `PutObjectRetention` is what lets a `PutObject` carry its compliance lock. Without `GetObjectRetention`, S3 hides the lock on every object and the runtime ignores every state and intent. Grant no `s3:DeleteObject`, `s3:BypassGovernanceRetention` or `s3:CreateBucket`: the runtime never deletes a record and must never manufacture an empty authority. |
 | `SSMParams` | `GetParameter`, `GetParametersByPath` on `/<namespace>/<app>/enclave/*`. |
-| `SSMMigrationCoordination` | `PutParameter` on `/<namespace>/<app>/enclave/` + `MigrationChallenge/*`, `MigrationResponse/*`, `<locked\|unlocked>/KMSKeyID/*`, `<locked\|unlocked>/MasterSeed/Ciphertext/*`, `<locked\|unlocked>/TLSKey/Ciphertext/*`, `MigrationPreviousPCR0/*`, `MigrationPreviousKMSKeyID/*` and `MigrationStateOriginReceipt/*`. Nothing else: the runtime never writes configuration, the environment overlay or inherited secrets. |
+| `SSMMigrationCoordination` | `PutParameter` on `/<namespace>/<app>/enclave/` + `MigrationChallenge/*` and `MigrationResponse/*`. Nothing else: the runtime never writes configuration, the environment overlay, inherited secrets or a handoff to SSM. |
 | `KMSAccess` | `CreateKey`, `TagResource`. `DescribeKey` is optional; see below. |
 | `STSAccess` | `GetCallerIdentity`. |
 | `PermissionPreflight` | `iam:SimulatePrincipalPolicy` on the enclave role's own ARN, and nothing else, so the enclave can ask what it may do but not what any other principal may. |
@@ -1046,16 +1065,16 @@ operations are authorised by the enclave-created key's own PCR0-conditioned
 policy, not by the host credentials, so possessing those credentials is not
 sufficient to read enclave state.
 
+The key policy admits the role by its ARN: each statement allows principal `*`
+only where `aws:PrincipalArn` equals the role's ARN, so a role recreated under
+the same name and path keeps access to its keys. Anyone who can create and
+assume a role with that ARN gets the role's key permissions, but decrypting
+still requires the PCR0 attestation.
+
 `DescribeKey` is read-only and only reports whether ancestor keys were deleted.
 Each key's `EnclaveOperations` statement already grants it to the role that
 created the key, so this grant only matters for unlocked ancestor keys created
 under another role, which otherwise read `unknown`.
-
-`/<namespace>/<app>/enclave/<locked|unlocked>/KMSKeyID/<pcr0>` is owned exclusively by
-the runtime. Do not pre-create or declaratively manage it. Migration finalisation
-writes it last, create-only, to elect one finaliser among predecessor replicas;
-a pre-existing value makes the runtime refuse to finalise a handoff onto that
-PCR0. Genesis never writes it.
 
 Before telemetry starts and before its first durable write, every boot asks IAM,
 through `SimulatePrincipalPolicy`, whether the role holds the S3, SSM, KMS,
@@ -1113,7 +1132,7 @@ resource "aws_iam_role_policy" "enclave_permission_preflight" {
 
 Migration preserves an existing deployment's secrets and TLS identity while
 moving to a new PCR0. **Booting a candidate is the request**: the protocol runs
-between enclaves over SSM, with no control endpoint.
+between enclaves over SSM and the intent log, with no control endpoint.
 
 ```text
 predecessor                                candidate
@@ -1121,7 +1140,7 @@ predecessor                                candidate
   read answers        <------------------  publish attestation
   verify, record Object-Locked intent
   ... cooldown, abort window ...
-  commit KMSKeyID/<target>  ------------>  adopt, publish snapshot/<target>
+  record Object-Locked handoff  -------->  adopt, publish snapshot/<target>
 ```
 
 The predecessor verifies a live attestation bound to the same namespace, app and
@@ -1145,35 +1164,40 @@ answer wins. Predecessor replicas share the challenge and intent chain.
    resolve as `aborted`, even when they name different targets; another abort
    is unnecessary and is ignored.
 4. After the cooldown, the predecessor commits the target into PCR31, creates
-   the successor's KMS key, and writes the encrypted seed, TLS key, lineage and
-   transition receipt to SSM. It then re-checks the intent and its migration
-   lease, and writes `KMSKeyID/<successor PCR0>` last, create-only, so only one
-   predecessor replica can commit the handoff.
-5. The successor verifies the handoff and key policy before decrypting, then
-   publishes its snapshot with both receipts. Check `/enclave/v1/info` for
+   the successor's KMS key, and encrypts the seed and TLS key under it. Nothing
+   has left the enclave yet. It then re-checks the intent and its migration
+   lease, and records one `finalised` intent carrying the successor's snapshot.
+   Its attestation is the transition receipt. That record is the handoff: the
+   commit, the release of the ciphertexts and the audit trail are the same
+   locked write.
+   `/enclave/v1/info` then reports `migration.state` as `finalised`.
+5. The successor waits until its predecessor's active intent is `finalised`
+   for its own PCR0. A request alone is never adopted. It verifies the receipt
+   and key policy before decrypting, then publishes its snapshot with both
+   receipts. Check `/enclave/v1/info` for
    `status: "ready"`, the expected `previous_pcr0`, and a non-empty
    `previous_pcr0_attestation`. Snapshot publication alone is not readiness.
 6. Shift traffic using your deployment system. Keep both generations healthy
    during the soak period, then retire the predecessor. Its snapshot and key
    remain available for restarts unless you explicitly retire the key.
 
-Leave handoff parameters intact until the successor is ready. Afterwards they
-may be deleted: published generations resume from S3. A candidate that misses
-the handoff because a peer adopted and the parameters were cleaned up can
-recover by restarting. If adoption fails, keep serving from the predecessor;
-its state is unchanged by the handoff.
+If adoption fails, keep serving from the predecessor; its state is unchanged
+by the handoff. A finalised handoff is not released again. An attempt that
+stops before the finalised record releases nothing and may leave an unused key;
+the next attempt mints a new one.
 
-A committed handoff pointer prevents the predecessor from retrying. Attempts
-that lose the create-only write or stop before it may leave unused keys and SSM
-parameters. Do not manage `KMSKeyID/<pcr0>` through deployment tooling.
+An abort can also be recorded after the handoff is finalised. A successor
+running this runtime then refuses to adopt until a new request has waited out
+its own cooldown and been finalised, and a published snapshot is not revoked.
+The abort does not take the released ciphertexts back: the record stays in the
+log, and an image that skips these checks could already have decrypted them.
+The cooldown before the first `finalised` record is what protects users, and
+the locked record shows that the handoff was released.
 
-An abort can also be recorded after handoff. It prevents an unpublished
-successor from adopting, but does not revoke a published snapshot. Both the
-commit and an abort re-check the migration lease just before writing, so an
-abort cannot slip between the final intent check and the pointer write unless
-the lease changes hands at that moment. To migrate to a different target
-afterwards, restart the predecessor: its PCR31 remains committed to the earlier
-target for that boot.
+Both the handoff and an abort re-check the migration lease just before writing.
+If they still land on the same sequence, the abort wins whichever was written
+first. To migrate to a different target afterwards, restart the predecessor:
+its PCR31 remains committed to the earlier target for that boot.
 
 **Retiring keys.** Keep a generation's key if you may need to boot it again.
 Otherwise, schedule deletion out of band and check the successor's signed
@@ -1208,9 +1232,8 @@ way it records no intent and commits nothing.
 Bump `migrationChallengeSchemaV1` when what a predecessor's handoff writes
 changes, and `successorClaimSchemaV1` when what a successor reads changes, so a
 runtime on the previous schemas is refused before the commit. That covers where
-a generation is stored as well as how: the `KMSKeyID`, `MasterSeed`, `TLSKey`
-and `MigrationPrevious*` paths and their encodings, the seed derivation, the
-receipts a successor verifies, and the protocol itself. An invalid secrets
+a generation is stored as well as how: the intent and snapshot encodings, the
+seed derivation, the receipts a successor verifies, and the protocol itself. An invalid secrets
 configuration stops the runtime before it answers any challenge; the successor
 still starts its application only after the handoff.
 
@@ -1302,7 +1325,7 @@ functions: `New`, `NewFromManifest`, `PinnedHTTPClient`, `ManifestURL`,
 | Option | Default | Effect |
 |---|---|---|
 | `ExpectedPCR0` | required | `New` fails without it. |
-| `ExpectedPCRs` | empty | Expected values for PCR16 onward, in order, matching `ENCLAVE_SECRETS_CONFIG`. |
+| `ExpectedPCRs` | empty | Hex SHA-256 of each static secret's compressed public key, in `ENCLAVE_SECRETS_CONFIG` order. Entry *i* is checked against PCR(16+i) as `SHA-384(48 zero bytes ‖ hash)`, the value the runtime extends it to. |
 | `CacheTTL` | `60s` | Attestation cache lifetime. |
 | `StrictTLS` | `false` | Adds public CA and hostname validation on top of the attestation pin. |
 | `InsecureSkipCOSEVerify` | `false` | Skips COSE signature and certificate chain verification. For local testing against emulated NSM only. |
@@ -1400,8 +1423,8 @@ IMDS, ACME fixtures and OTLP receiver; `blue`, `blue_peer`, `green` and
 - Concurrent genesis and successor adoption, with one locked snapshot per PCR0.
 - Static/inherited secret replacement under unchanged environment variable names,
   missing inherited values, derivation continuity and TLS certificate reuse.
-- Restart and replica joins after handoff parameters are deleted or corrupted
-  and invalid newer snapshot versions are added.
+- The handoff as one locked intent record, adopted unchanged by the successor.
+- Restart and replica joins after invalid newer snapshot versions are added.
 - Predecessor key deletion scheduling and cancellation, with successor recovery.
 
 The emulator has limits; Go tests cover the corresponding branches, but these
@@ -1486,5 +1509,5 @@ application uploads: those can fail later and increment
 not fatal.
 
 **Telemetry forwarding uses the instance role.** The loopback-only forwarders
-require a per-boot `ENCLAVE_RUNTIME_TOKEN`, expose no read endpoints, and keep no
+require the per-boot telemetry bearer token, expose no read endpoints, and keep no
 local history. Their IAM permissions are write-only.

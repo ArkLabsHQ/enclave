@@ -134,13 +134,12 @@ func TestPermissionsPreflight(t *testing.T) {
 		require.False(t, fake.simulated("ssm:PutParameter", ssmARN+"*"),
 			"SSM writes are scoped to migration coordination")
 		for _, param := range []string{
-			"MigrationChallenge/" + permissionTestPCR0,
-			"locked/KMSKeyID/*", "locked/MasterSeed/Ciphertext/*", "locked/TLSKey/Ciphertext/*",
-			"MigrationPreviousPCR0/*", "MigrationPreviousKMSKeyID/*",
-			"MigrationStateOriginReceipt/*/*", "MigrationResponse/*/*",
+			"MigrationChallenge/" + permissionTestPCR0, "MigrationResponse/*/*",
 		} {
 			require.True(t, fake.simulated("ssm:PutParameter", ssmARN+param), param)
 		}
+		require.False(t, fake.simulated("ssm:PutParameter", ssmARN+"locked/KMSKeyID/*"),
+			"the handoff is an intent-log record, not an SSM write")
 		for _, key := range []string{
 			snapshotObjectKey(permissionTestPCR0), "migration-intent/" + permissionTestPCR0 + "/*",
 		} {
@@ -329,8 +328,8 @@ func TestPermissionsConcreteResourceDenials(t *testing.T) {
 			"ssm:PutParameter",
 		},
 		{
-			"handoff pointer",
-			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/locked/KMSKeyID/*",
+			"migration response",
+			"arn:aws:ssm:eu-west-1:123456789012:parameter/prod/app/enclave/MigrationResponse/*/*",
 			"ssm:PutParameter",
 		},
 	}

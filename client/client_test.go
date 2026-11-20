@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -318,7 +319,10 @@ func TestManifestRequiresHTTPSBaseURL(t *testing.T) {
 
 func TestVerifyFailureKeepsPinAndCache(t *testing.T) {
 	pcr0 := strings.Repeat("ab", 48)
-	goodPCR16 := strings.Repeat("11", 32)
+	// The caller passes the pubkey hash; the enclave reports the PCR extended with it.
+	pubkeyHash := bytes.Repeat([]byte{0x11}, sha256.Size)
+	extended := sha512.Sum384(append(make([]byte, sha512.Size384), pubkeyHash...))
+	goodPCR16 := hex.EncodeToString(extended[:])
 	fe := &fakeEnclave{pcr0Hex: pcr0, pcr16Hex: goodPCR16}
 	srv := httptest.NewTLSServer(fe.handler())
 	defer srv.Close()
@@ -326,7 +330,7 @@ func TestVerifyFailureKeepsPinAndCache(t *testing.T) {
 
 	c, err := New(srv.URL, Options{
 		ExpectedPCR0:           pcr0,
-		ExpectedPCRs:           []string{goodPCR16},
+		ExpectedPCRs:           []string{hex.EncodeToString(pubkeyHash)},
 		InsecureSkipCOSEVerify: true,
 		CacheTTL:               time.Hour,
 	})
@@ -339,7 +343,7 @@ func TestVerifyFailureKeepsPinAndCache(t *testing.T) {
 
 	// Same build measurement, wrong secret PCR, different TLS identity.
 	fe.mu.Lock()
-	fe.pcr16Hex = strings.Repeat("22", 32)
+	fe.pcr16Hex = strings.Repeat("22", sha512.Size384)
 	fe.attestedTLS = sha256.Sum256([]byte("rejected enclave TLS key"))
 	fe.mu.Unlock()
 
@@ -364,6 +368,34 @@ func TestVerifyFailureKeepsPinAndCache(t *testing.T) {
 	resp, err = c.Get(context.Background(), "/enclave/v1/info")
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestSecretPCR pins the derivation to a real Nitro attestation: an enclave whose
+// first static secret has this compressed public key reported this PCR16.
+func TestSecretPCR(t *testing.T) {
+	pubkey, err := hex.DecodeString(
+		"0365ad0d169b0fec5c880e43535b3033de46e230252d017e50cb1d3e0b118bf189",
+	)
+	require.NoError(t, err)
+	pubkeyHash := sha256.Sum256(pubkey)
+
+	got, err := secretPCR(hex.EncodeToString(pubkeyHash[:]))
+	require.NoError(t, err)
+	require.Equal(t,
+		"49365c2d0012b48ffaa58d97ab146cd920b13470c975891c27560ed846c7184d"+
+			"997e29d9418ee989fc7ccc47cb72aea8",
+		got,
+	)
+
+	// Anything other than a 32-byte hash, including the PCR value itself, is refused
+	// when the client is built instead of failing every verify.
+	for _, bad := range []string{got, "not hex", strings.Repeat("11", sha256.Size-1)} {
+		_, err := New("https://enclave.example", Options{
+			ExpectedPCR0: strings.Repeat("ab", 48),
+			ExpectedPCRs: []string{bad},
+		})
+		require.ErrorContains(t, err, "ExpectedPCRs[0]")
+	}
 }
 
 func TestClientSignedResponses(t *testing.T) {

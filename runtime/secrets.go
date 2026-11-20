@@ -128,14 +128,15 @@ func LoadSecretsMetadata(cfg Config) (SecretsMetadata, error) {
 	return SecretsMetadata{Static: static, Inherited: inherited}, nil
 }
 
-func (sm SecretsMetadata) Validate(overrideAllowList map[string]bool) error {
-	if err := sm.validateStatic(); err != nil {
+func (sm SecretsMetadata) Validate(cfg Config) error {
+	reserved := cfg.reservedEnv()
+	if err := sm.validateStatic(reserved); err != nil {
 		return fmt.Errorf("invalid static secret metadata: %w", err)
 	}
-	if err := sm.validateInherited(); err != nil {
+	if err := sm.validateInherited(reserved); err != nil {
 		return fmt.Errorf("invalid inherited secret metadata: %w", err)
 	}
-	if err := sm.validateChildEnv(overrideAllowList); err != nil {
+	if err := sm.validateChildEnv(cfg.OverrideAllowList); err != nil {
 		return fmt.Errorf("invalid inherited secret metadata: %w", err)
 	}
 	return nil
@@ -175,7 +176,7 @@ func LoadStaticSecretMetadata(cfg Config) ([]StaticSecretMetadata, error) {
 	return secretMeta, nil
 }
 
-func (sm SecretsMetadata) validateStatic() error {
+func (sm SecretsMetadata) validateStatic(reserved map[string]bool) error {
 	if len(sm.Static) > maxStaticSecrets {
 		return fmt.Errorf("at most %d static secrets fit in PCR16–PCR30", maxStaticSecrets)
 	}
@@ -196,7 +197,7 @@ func (sm SecretsMetadata) validateStatic() error {
 			)
 		}
 
-		if childReservedEnv[secret.EnvVar] {
+		if reserved[secret.EnvVar] {
 			return fmt.Errorf(
 				"secret %q: cannot use reserved env_var %q",
 				secret.Name,
@@ -288,14 +289,6 @@ type InheritedSecret struct {
 	Plaintext string
 }
 
-// childReservedEnv lists the vars appEnv sets on the child itself.
-var childReservedEnv = map[string]bool{
-	"ENCLAVE_APP_PORT":      true,
-	"PORT":                  true,
-	"ENCLAVE_PROXY_PORT":    true,
-	"ENCLAVE_RUNTIME_TOKEN": true,
-}
-
 var (
 	envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	// secretNamePattern is SSM's own path-segment charset.
@@ -333,7 +326,7 @@ func (sm SecretsMetadata) validateChildEnv(overrideAllowList map[string]bool) er
 }
 
 // validateInherited also refuses an env_var a static secret already uses.
-func (sm SecretsMetadata) validateInherited() error {
+func (sm SecretsMetadata) validateInherited(reserved map[string]bool) error {
 	envVars := make(map[string]bool, len(sm.Inherited)+len(sm.Static))
 	for _, s := range sm.Static {
 		envVars[s.EnvVar] = true
@@ -352,7 +345,7 @@ func (sm SecretsMetadata) validateInherited() error {
 		if !envVarNamePattern.MatchString(m.EnvVar) {
 			return fmt.Errorf("inherited secret %q: invalid env_var %q", m.Name, m.EnvVar)
 		}
-		if childReservedEnv[m.EnvVar] {
+		if reserved[m.EnvVar] {
 			return fmt.Errorf("inherited secret %q: env_var %q is reserved", m.Name, m.EnvVar)
 		}
 		if envVars[m.EnvVar] {

@@ -65,14 +65,6 @@ def setup_aws():
     put_env("ENCLAVE_FQDN", FQDN)
 
 
-def key_param(pcr0):
-    return f"/ark/e2e/dev/testapp/enclave/unlocked/KMSKeyID/{pcr0}"
-
-
-def migration_receipt_param(key_id, pcr0):
-    return f"/ark/e2e/dev/testapp/enclave/MigrationStateOriginReceipt/{key_id}/{pcr0.lower()}"
-
-
 def get_param(name):
     status, out = aws.execute(
         f"{CLOUD} ssm get-parameter --name {name} --query Parameter.Value --output text"
@@ -94,6 +86,26 @@ def snapshot_versions(pcr0):
     )
     versions = [v for v in out.get("Versions", []) if v["Key"] == snapshot_key(pcr0)]
     return [v["VersionId"] for v in sorted(versions, key=lambda v: v["LastModified"])]
+
+
+def finalised_handoffs(source_pcr0):
+    """Every finalised record in a generation's intent log, earliest first."""
+    out = json.loads(
+        cloud(
+            f"s3api list-object-versions --bucket {INTENT_BUCKET} "
+            f"--prefix migration-intent/{source_pcr0.lower()}/ --output json"
+        )
+    )
+    handoffs = []
+    for version in sorted(out.get("Versions", []), key=lambda v: v["LastModified"]):
+        cloud(
+            f"s3api get-object --bucket {INTENT_BUCKET} --key {version['Key']} "
+            f"--version-id {version['VersionId']} /tmp/intent-version.json >/dev/null"
+        )
+        record = json.loads(aws.succeed("cat /tmp/intent-version.json"))
+        if record.get("action") == "finalised":
+            handoffs.append((version, record))
+    return handoffs
 
 
 def runtime_ssm_params():

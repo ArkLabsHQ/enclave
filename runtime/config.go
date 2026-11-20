@@ -39,6 +39,8 @@ const (
 	envLogRetentionDays = "ENCLAVE_LOG_RETENTION_DAYS"
 	envTraces           = "ENCLAVE_TRACES"
 	envMetrics          = "ENCLAVE_METRICS"
+	envOtelEndpointEnv  = "ENCLAVE_OTEL_ENDPOINT_ENV"
+	envOtelTokenEnv     = "ENCLAVE_OTEL_TOKEN_ENV"
 
 	// ACME settings: baked defaults the SSM overlay may replace.
 	envUseACME       = "ENCLAVE_USE_ACME"
@@ -96,8 +98,7 @@ const (
 	// extPort is the public TLS listener. Fixed: the host's routing, the README
 	// and every client URL assume 443.
 	extPort = 443
-	// intPort is the loopback API listener, handed to the application as
-	// ENCLAVE_PROXY_PORT so it does not have to assume the value.
+	// intPort is the loopback API listener, included in the child's OTLP URL.
 	intPort = 8080
 	// hostProxyPort is the vsock port gvproxy listens on. Fixed because the host
 	// side hardcodes it too (`gvproxy --listen vsock://:1024`); changing one side
@@ -166,6 +167,8 @@ type Config struct {
 	LogRetentionDays      int32
 	ExportTraces          bool // Logs always ship; traces and metrics only when enabled.
 	ExportMetrics         bool
+	OtelEndpointEnv       string // Required child variable for the OTLP base URL.
+	OtelTokenEnv          string // Required child variable for the bearer token.
 	InstanceID            string
 
 	OverrideAllowList map[string]bool
@@ -217,6 +220,8 @@ func LoadConfig() (*Config, error) {
 		UpstreamProtocol:      strings.ToLower(takeEnvDefault(envUpstream, "auto")),
 		LogShipInterval:       logShipInterval(),
 		LogRetentionDays:      logRetentionDays(),
+		OtelEndpointEnv:       takeEnvRaw(envOtelEndpointEnv),
+		OtelTokenEnv:          takeEnvRaw(envOtelTokenEnv),
 		SnapshotRetention:     prodRetention,
 		IntentRetention:       prodRetention,
 		IntentWriteTimeout:    prodIntentWriteTimeout,
@@ -321,7 +326,41 @@ func (c *Config) Validate() error {
 	if c.LogShipInterval <= 0 || c.LogRetentionDays <= 0 {
 		return fmt.Errorf("config has invalid telemetry timing")
 	}
+	return c.validateTelemetryEnv()
+}
+
+func (c *Config) validateTelemetryEnv() error {
+	reserved := (Config{}).reservedEnv()
+	for _, setting := range []struct{ key, value string }{
+		{envOtelEndpointEnv, c.OtelEndpointEnv},
+		{envOtelTokenEnv, c.OtelTokenEnv},
+	} {
+		if setting.value == "" {
+			return fmt.Errorf("%s must be set", setting.key)
+		}
+		if !envVarNamePattern.MatchString(setting.value) {
+			return fmt.Errorf(
+				"%s: invalid environment variable name %q", setting.key, setting.value,
+			)
+		}
+		if reserved[setting.value] {
+			return fmt.Errorf("%s: environment variable %q is reserved", setting.key, setting.value)
+		}
+	}
+	if c.OtelEndpointEnv == c.OtelTokenEnv {
+		return fmt.Errorf("%s and %s must use different names", envOtelEndpointEnv, envOtelTokenEnv)
+	}
 	return nil
+}
+
+// reservedEnv includes environment variables exported by the runtime.
+func (c Config) reservedEnv() map[string]bool {
+	return map[string]bool{
+		envAppPort:        true,
+		"PORT":            true,
+		c.OtelEndpointEnv: true,
+		c.OtelTokenEnv:    true,
+	}
 }
 
 func validateNamespaceName(name, value string, multiSegment bool) error {
@@ -393,6 +432,10 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 			c.ACMEEmail = p.Value
 		case envACMECA:
 			c.ACMECA = p.Value
+		case envOtelEndpointEnv:
+			c.OtelEndpointEnv = p.Value
+		case envOtelTokenEnv:
+			c.OtelTokenEnv = p.Value
 		// key is not an overridable env var, check if overriding is allowed by the app
 		default:
 			if _, allowed := c.OverrideAllowList[key]; !allowed {
@@ -405,6 +448,9 @@ func (c *Config) ApplySSMOverlay(ctx context.Context, ssm SSM) error {
 		applied++
 	}
 
+	if err := c.validateTelemetryEnv(); err != nil {
+		return err
+	}
 	slog.Info("env overrides applied", "count", applied, "prefix", prefix)
 
 	return nil
@@ -460,50 +506,10 @@ func (c *Config) route53ZoneIDParam() string {
 	return c.namespace() + "/Route53ZoneID"
 }
 
-func (c *Config) kmsKeyIDParam(pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/%s/KMSKeyID/%s", c.namespace(), c.lockSegment(), strings.ToLower(pcr0),
-	)
-}
-
 // inheritSecretPrefix: SSM path prefix under which the operator places inherited
 // secrets, one parameter per configured name.
 func (c *Config) inheritSecretPrefix() string {
 	return c.namespace() + "/inherit/"
-}
-
-// masterSeedCiphertextParam: SSM path for the master seed's KMS ciphertext,
-// lock-scoped and key-scoped.
-func (c *Config) masterSeedCiphertextParam(keyID string) string {
-	return fmt.Sprintf("%s/%s/MasterSeed/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
-}
-
-// tlsKeyCiphertextParam returns the encrypted TLS key path.
-func (c *Config) tlsKeyCiphertextParam(keyID string) string {
-	return fmt.Sprintf("%s/%s/TLSKey/Ciphertext/%s", c.namespace(), c.lockSegment(), keyID)
-}
-
-// migrationStateOriginReceiptParam: SSM path for the receipt a predecessor
-// writes over a successor's state during a migration handoff. Scoped by the
-// successor key ID and the successor PCR0, and written create-only, so a
-// published handoff artifact is immutable. The key ID is minted fresh per
-// finalisation attempt, so this path is private to one attempt; the atomic
-// commitment point for a handoff is kmsKeyIDParam, not this receipt.
-func (c *Config) migrationStateOriginReceiptParam(keyID, pcr0 string) string {
-	return fmt.Sprintf(
-		"%s/MigrationStateOriginReceipt/%s/%s", c.namespace(), keyID, strings.ToLower(pcr0),
-	)
-}
-
-// migrationPreviousPCR0Param: SSM path for the predecessor enclave's PCR0,
-// scoped by the successor PCR0 that reads it.
-func (c *Config) migrationPreviousPCR0Param(pcr0 string) string {
-	return fmt.Sprintf("%s/MigrationPreviousPCR0/%s", c.namespace(), strings.ToLower(pcr0))
-}
-
-// migrationPreviousKMSKeyIDParam returns the predecessor key path for a generation.
-func (c *Config) migrationPreviousKMSKeyIDParam(pcr0 string) string {
-	return fmt.Sprintf("%s/MigrationPreviousKMSKeyID/%s", c.namespace(), strings.ToLower(pcr0))
 }
 
 // migrationChallengeParam: the live challenge published by a predecessor.

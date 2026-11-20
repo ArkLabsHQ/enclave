@@ -18,6 +18,8 @@ func newTestConfig(namespace, appName string, dev bool) *Config {
 		AppPort:         "7074",
 		LogShipInterval: 10 * time.Millisecond, LogRetentionDays: defaultLogRetentionDays,
 		ExportTraces: true, ExportMetrics: true,
+		OtelEndpointEnv:    "APP_OTEL_ENDPOINT",
+		OtelTokenEnv:       "APP_OTEL_TOKEN",
 		InstanceID:         "i-0e2ce2ce2ce2ce2ce",
 		KMSLocked:          true,
 		VerifyClockSource:  true,
@@ -69,6 +71,8 @@ func setConfigTestEnv(t *testing.T, dev bool) {
 	t.Setenv(envInsecureVerifySkipped, "")
 	t.Setenv(envTraces, "")
 	t.Setenv(envMetrics, "")
+	t.Setenv(envOtelEndpointEnv, "APP_OTEL_ENDPOINT")
+	t.Setenv(envOtelTokenEnv, "APP_OTEL_TOKEN")
 	t.Setenv(envUseACME, "")
 	t.Setenv(envSecretsConfig, "[]")
 	t.Setenv(envOverrideAllowList, "")
@@ -251,6 +255,34 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestTelemetryEnvValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		token    string
+		wantErr  string
+	}{
+		{"empty endpoint", "", "TOKEN", envOtelEndpointEnv + " must be set"},
+		{"empty token", "ENDPOINT", "", envOtelTokenEnv + " must be set"},
+		{"equals", "BAD=NAME", "TOKEN", "invalid environment variable name"},
+		{"whitespace", " ENDPOINT", "TOKEN", "invalid environment variable name"},
+		{"digit", "ENDPOINT", "1TOKEN", "invalid environment variable name"},
+		{"newline", "ENDPOINT", "TOKEN\n", "invalid environment variable name"},
+		{"port collision", "PORT", "TOKEN", "reserved"},
+		{"application port collision", "ENCLAVE_APP_PORT", "TOKEN", "reserved"},
+		{"duplicate names", "SAME", "SAME", "must use different names"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigTestEnv(t, false)
+			t.Setenv(envOtelEndpointEnv, tc.endpoint)
+			t.Setenv(envOtelTokenEnv, tc.token)
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			require.ErrorContains(t, cfg.Validate(), tc.wantErr)
+		})
+	}
+}
+
 func TestLoadConfigTelemetrySettings(t *testing.T) {
 	setConfigTestEnv(t, false)
 	t.Setenv(envLogShipInterval, "250ms")
@@ -322,38 +354,6 @@ func TestConfigLogGroup(t *testing.T) {
 	cfg := newTestConfig("prod", "app", false)
 	require.Equal(t, "/prod/app/enclave/logs/app", cfg.logGroup(signalAppLogs))
 	require.Equal(t, "/prod/app/enclave/logs/runtime", cfg.logGroup(signalRuntimeLogs))
-}
-
-// The lock posture is an IAM-enforceable boundary, so it must move exactly the
-// KMS-subtree paths and nothing else.
-func TestLockSegmentScopesOnlyTheKMSSubtree(t *testing.T) {
-	pcr0, keyID := strings.Repeat("ab", 48), "key-1"
-	locked, unlocked := testConfig(), testConfig()
-	unlocked.KMSLocked = false
-
-	scoped := func(c *Config) []string {
-		return []string{
-			c.kmsKeyIDParam(pcr0),
-			c.masterSeedCiphertextParam(keyID),
-			c.tlsKeyCiphertextParam(keyID),
-		}
-	}
-	unscoped := func(c *Config) []string {
-		return []string{
-			c.migrationStateOriginReceiptParam(keyID, pcr0),
-			c.migrationPreviousPCR0Param(pcr0),
-		}
-	}
-
-	require.Equal(t, "locked", locked.lockSegment())
-	require.Equal(t, "unlocked", unlocked.lockSegment())
-	for i, p := range scoped(locked) {
-		require.Contains(t, p, "/locked/")
-		require.Contains(t, scoped(unlocked)[i], "/unlocked/")
-		require.NotEqual(t, p, scoped(unlocked)[i], "the posture must move this path")
-	}
-	require.Equal(t, unscoped(locked), unscoped(unlocked),
-		"these paths must not be lock-scoped")
 }
 
 func TestLoadConfigMigrationCooldown(t *testing.T) {
@@ -602,6 +602,14 @@ func TestApplySSMOverlay(t *testing.T) {
 
 		require.ErrorContains(t, err, "invalid application port")
 		require.Equal(t, testCfg.AppPort, cfg.AppPort)
+	})
+
+	t.Run("rejects colliding telemetry names", func(t *testing.T) {
+		cfg := testConfig()
+		err := cfg.ApplySSMOverlay(ctx, ssmFor(map[string]string{
+			path(envOtelTokenEnv): cfg.OtelEndpointEnv,
+		}))
+		require.ErrorContains(t, err, "must use different names")
 	})
 
 	t.Run("skips empty and nested keys", func(t *testing.T) {

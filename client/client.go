@@ -27,6 +27,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -50,10 +52,11 @@ type Options struct {
 	ExpectedPCR0 string
 
 	// ExpectedPCRs is a list of hex-encoded SHA256 hashes of secret
-	// compressed public keys, in the same order as secrets are defined
-	// in enclave.yaml. Index 0 maps to PCR16, index 1 to PCR17, etc.
-	// The enclave extends these PCRs with SHA256(compressed_pubkey)
-	// at boot time.
+	// compressed public keys, in the same order as ENCLAVE_SECRETS_CONFIG.
+	// Index 0 maps to PCR16, index 1 to PCR17, etc. The enclave extends
+	// each of these PCRs once, from zero, with SHA256(compressed_pubkey)
+	// at boot time, so PCR(16+i) is checked against
+	// SHA384(48 zero bytes || ExpectedPCRs[i]).
 	ExpectedPCRs []string
 
 	// CacheTTL controls how long a verified attestation is cached.
@@ -137,6 +140,11 @@ func (c *Client) currentTLSHash() string {
 func New(baseURL string, opts Options) (*Client, error) {
 	if opts.ExpectedPCR0 == "" {
 		return nil, fmt.Errorf("ExpectedPCR0 is required")
+	}
+	for i, pubkeyHash := range opts.ExpectedPCRs {
+		if _, err := secretPCR(pubkeyHash); err != nil {
+			return nil, fmt.Errorf("ExpectedPCRs[%d] %w", i, err)
+		}
 	}
 	endpoint, err := requireHTTPSURL(baseURL)
 	if err != nil {
@@ -500,4 +508,20 @@ func NewFromManifest(ctx context.Context, manifestURL string, opts Options) (*Cl
 	opts.ExpectedPCR0 = m.PCR0
 
 	return New(m.BaseURL, opts)
+}
+
+// secretPCR returns, hex-encoded, the value a secret PCR holds once the runtime
+// has extended it from zero with pubkeyHashHex, the SHA256 of a compressed
+// public key: an NSM extend is SHA384(old || data), and the PCR starts as 48
+// zero bytes.
+func secretPCR(pubkeyHashHex string) (string, error) {
+	hash, err := hex.DecodeString(pubkeyHashHex)
+	if err != nil || len(hash) != sha256.Size {
+		return "", fmt.Errorf(
+			"must be the hex SHA256 of a compressed public key (%d hex characters)",
+			2*sha256.Size,
+		)
+	}
+	pcr := sha512.Sum384(append(make([]byte, sha512.Size384), hash...))
+	return hex.EncodeToString(pcr[:]), nil
 }

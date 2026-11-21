@@ -1184,7 +1184,7 @@ func TestSignedRequestSizeLimit(t *testing.T) {
 			if unknownLength {
 				req.ContentLength = -1
 			}
-			req.Header.Set(signNonceHeader, "n")
+			req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, req)
 			require.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
@@ -1208,7 +1208,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		}))
 		req := httptest.NewRequest(http.MethodPost, "/orders",
 			bytes.NewReader(make([]byte, maxSignedBytes)))
-		req.Header.Set(signNonceHeader, "n")
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code)
@@ -1227,7 +1227,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 			_, laterErr = w.Write([]byte("tail"))
 		}))
 		req := httptest.NewRequest(http.MethodGet, "/orders", nil)
-		req.Header.Set(signNonceHeader, "n")
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, req)
 		require.Error(t, overflowErr)
@@ -1258,7 +1258,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		client.Timeout = 2 * time.Second
 		req, err := http.NewRequest(http.MethodGet, public.URL+"/orders", nil)
 		require.NoError(t, err)
-		req.Header.Set(signNonceHeader, "n")
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
 		res, err := client.Do(req)
 		if res != nil {
 			_ = res.Body.Close()

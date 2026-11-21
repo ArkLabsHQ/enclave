@@ -91,9 +91,9 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		return fmt.Errorf("generate runtime token: %w", err)
 	}
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 
-	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
+	nsm := NewNSM(OpenDefault, WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
@@ -506,7 +506,9 @@ func (r *runtimeState) ChildDone() <-chan error {
 	return r.childDoneCh
 }
 
-func newRuntimeState() *runtimeState {
+// NewRuntimeState returns the state a runtime starts in, for callers that run
+// SetupHttpServers themselves.
+func NewRuntimeState() *runtimeState {
 	r := &runtimeState{
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),

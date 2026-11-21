@@ -80,7 +80,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 			cfg: testCfg,
 			int: &http.Server{Addr: occupied.Addr().String()},
 			ext: &http.Server{},
-			rt:  newRuntimeState(),
+			rt:  NewRuntimeState(),
 		}
 		err := s.Start(context.Background(), Config{})
 		require.ErrorContains(t, err, "private listener")
@@ -96,7 +96,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 			cfg: testCfg,
 			int: &http.Server{Addr: "127.0.0.1:0"},
 			ext: &http.Server{},
-			rt:  newRuntimeState(),
+			rt:  NewRuntimeState(),
 		}
 		err := s.Start(context.Background(), Config{ExtPort: uint16(port)})
 		require.ErrorContains(t, err, "public listener")
@@ -124,7 +124,7 @@ func TestHealthHandler(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rt := newRuntimeState()
+			rt := NewRuntimeState()
 			if tc.ready {
 				rt.NotifyReady()
 			}
@@ -303,7 +303,7 @@ func TestAttestationHandler(t *testing.T) {
 func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	ctx := context.Background()
 	ssm := NewSSM(&fakeSSM{})
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
@@ -372,7 +372,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
 	requestedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	inbound := &CandidateInfo{
 		AwaitingHandoffFrom: strings.Repeat("ab", 48), RequestedAt: &requestedAt,
@@ -492,7 +492,7 @@ func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
 	s := &servers{
 		cfg: testCfg,
 		rm:  http.NewServeMux(),
-		rt:  newRuntimeState(),
+		rt:  NewRuntimeState(),
 	}
 	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
@@ -542,7 +542,7 @@ func TestInternalMuxRoutesOTLPToTheForwarders(t *testing.T) {
 	appURL, err := url.Parse("http://127.0.0.1:1")
 	require.NoError(t, err)
 	s := SetupHttpServers(
-		newRuntimeState(),
+		NewRuntimeState(),
 		Config{AppWebSrv: appURL},
 		&nsmW{},
 		NewTelemetry(testCfg, testAWS(t, newFakeCloudWatchLogs(), up.URL)),
@@ -580,7 +580,7 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := SetupHttpServers(
 		rt,
 		Config{AppWebSrv: appURL},
@@ -766,7 +766,7 @@ func TestRuntimeSpans(t *testing.T) {
 		return s
 	}
 	ready := func() *runtimeState {
-		rt := newRuntimeState()
+		rt := NewRuntimeState()
 		rt.NotifyReady()
 		return rt
 	}
@@ -882,7 +882,7 @@ func TestRuntimeSpans(t *testing.T) {
 
 	t.Run("the runtime's own 503 is recorded", func(t *testing.T) {
 		rr := serve(
-			setup(t, true, newRuntimeState()),
+			setup(t, true, NewRuntimeState()),
 			httptest.NewRequest(http.MethodGet, "/orders", nil),
 		)
 
@@ -931,7 +931,7 @@ func TestSignedProxiedResponse(t *testing.T) {
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	rt.NotifyReady()
 	attData := &AttestationData{}
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
@@ -1106,7 +1106,7 @@ func TestSignedGRPCResponse(t *testing.T) {
 			appURL, err := url.Parse(app.URL)
 			require.NoError(t, err)
 
-			rt := newRuntimeState()
+			rt := NewRuntimeState()
 			rt.NotifyReady()
 			attData := &AttestationData{}
 			key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
@@ -1244,7 +1244,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 		t.Cleanup(app.Close)
 		appURL, err := url.Parse(app.URL)
 		require.NoError(t, err)
-		rt := newRuntimeState()
+		rt := NewRuntimeState()
 		rt.NotifyReady()
 		attData := &AttestationData{}
 		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
@@ -1270,7 +1270,7 @@ func TestSignedResponseSizeLimit(t *testing.T) {
 
 func TestSignedEnclaveInfo(t *testing.T) {
 	attData := &AttestationData{}
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), attData: attData}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: NewRuntimeState(), attData: attData}
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
 		previous: &PreviousPCR0Info{},
 		status:   &MigrationStatus{},
@@ -1330,7 +1330,7 @@ func requireSigned(
 }
 
 func TestReportBootFailure(t *testing.T) {
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: NewRuntimeState()}
 	s.ReportBootFailure(errors.New("permission preflight: role is missing SSMParams"))
 
 	rr := httptest.NewRecorder()

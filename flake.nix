@@ -42,20 +42,17 @@
               runtime = pkgs.buildGoModule (finalAttrs: {
                 pname = "runtime";
                 version = "0.1.0";
-                # Only what the runtime module needs, so unrelated edits do not rebuild
-                # it. The client and the root go.mod are for the runtime's tests.
+                # Only these two directories, so unrelated edits do not rebuild the runtime.
                 src = pkgs.lib.fileset.toSource {
                   root = ./.;
                   fileset = pkgs.lib.fileset.unions [
                     ./runtime
                     ./internal/signing
-                    ./go.mod
-                    ./client
                   ];
                 };
                 modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-Nvg5VzzTHg77WOI+iFVKAiRB+kw7rBZPRsiODAwrwlg=";
+                vendorHash = "sha256-/c3tonLTeWaVO3+QOjf8apo2cqYGVLalghBe+QLOeyk=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -111,6 +108,12 @@
               pkgs.golangci-lint-langserver
               pkgs.golines
               pkgs.gopls
+              # proxy-example/: code generation and the TypeScript caller.
+              pkgs.buf
+              pkgs.protoc-gen-go
+              pkgs.protoc-gen-go-grpc
+              pkgs.protoc-gen-es
+              pkgs.nodejs_24
             ];
           };
         }

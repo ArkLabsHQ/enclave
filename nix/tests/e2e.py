@@ -5,6 +5,8 @@
 import base64
 from datetime import datetime, timedelta, timezone
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 CERT_KEY = f"ark/e2e/dev/testapp/data/acme/{FQDN}/cert"
 SELF_SIGNED_KEY = f"ark/e2e/dev/testapp/data/self-signed/{FQDN}/cert"
 CHALLENGE_NAME = f"_acme-challenge.{FQDN}."
@@ -60,15 +62,32 @@ def signing_key(node):
     # Compares the response-signing key across replicas, restarts, and
     # migration. Signatures cover a timestamp, so they differ per request; the
     # attested key follows "ed25519:" in user_data, read without decoding CBOR.
+    nonce = "00" * 20
     doc = base64.b64decode(
         node.succeed(
-            f"curl -skf --http1.1 'https://127.0.0.1/enclave/attestation?nonce={'00' * 20}'"
+            f"curl -skf --http1.1 'https://127.0.0.1/enclave/attestation?nonce={nonce}'"
         ).strip(),
         validate=True,
     )
     start = doc.index(b"ed25519:") + len(b"ed25519:")
     key = doc[start : start + 32]
     assert key != bytes(32), "no response-signing key attested"
+
+    # The attested key must have signed a response: rebuild the message the
+    # runtime signed, in the README's format, and verify its signature.
+    body, status, timestamp, signature = node.succeed(
+        "curl -skf --http1.1 https://127.0.0.1/test/health "
+        f"-H 'X-Enclave-Sign-Nonce: {nonce}' "
+        "-w '\\n%{http_code}\\n%header{x-enclave-timestamp}\\n%header{x-enclave-signature}'"
+    ).rsplit("\n", 3)
+    message = (
+        f"enclave-signed-response\nGET /test/health\n{nonce}\n{timestamp}\n"
+        f"{hashlib.sha256(b'').hexdigest()}\n{status}\n"
+        f"{hashlib.sha256(body.encode()).hexdigest()}"
+    )
+    Ed25519PublicKey.from_public_bytes(key).verify(
+        base64.b64decode(signature, validate=True), message.encode()
+    )
     return key.hex()
 
 

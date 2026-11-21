@@ -621,6 +621,8 @@ in
         green = mkEnclaveNode greenEif;
         green_peer = mkEnclaveNode greenEif;
       };
+      # e2e.py verifies response signatures with Ed25519.
+      extraPythonPackages = p: [ p.cryptography ];
       testScript =
         ''
           BLUE_PCR0 = ${builtins.toJSON bluePCR0}

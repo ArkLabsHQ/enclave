@@ -200,7 +200,7 @@ func TestVerifyStateOriginReceipt(t *testing.T) {
 	pcr0Hex := hex.EncodeToString(pcr0)
 	snapshot := Snapshot{ownerPCR0: pcr0Hex, kmsKeyID: "key"}
 	att := signedOriginReceipt(t, map[uint][]byte{0: pcr0}, stateRoot, snapshot)
-	verifier := NewNSM(WithAttestationRoots(att.roots))
+	verifier := NewNSM(OpenDefault, WithAttestationRoots(att.roots))
 
 	require.NoError(t, snapshot.verifyOriginReceipt(verifier, att.docB64, stateRoot))
 
@@ -251,7 +251,7 @@ func TestVerifyStateOriginReceiptMigrationPCR31(t *testing.T) {
 		0:                 prevPCR0,
 		migrationPCRIndex: pcr31,
 	}, time.Now(), transitionReceiptPayload(t, snapshot, stateRoot))
-	verifier := NewNSM(WithAttestationRoots(att.roots))
+	verifier := NewNSM(OpenDefault, WithAttestationRoots(att.roots))
 
 	require.NoError(t, verifyStateReceipt(
 		verifier, att.docB64, stateRoot,
@@ -1364,7 +1364,7 @@ func newSnapshotTestFixture(t *testing.T) *snapshotTestFixture {
 	s3f := newFakeS3()
 	s3f.versioned = true
 	nsm := ownerNSM{
-		NSM: &nsmW{nsm: &awsNSM{roots: signer.roots}}, signer: signer,
+		NSM: &nsmW{nsm: &awsNSM{roots: signer.roots, open: OpenDefault}}, signer: signer,
 		pcr0: snapshotTestOwner,
 	}
 	boot := &Boot{cfg: testCfg, s3: s3f, nsm: nsm}

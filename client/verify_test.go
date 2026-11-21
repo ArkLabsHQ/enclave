@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -11,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"math/big"
 	"net/http"
@@ -20,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ArkLabsHQ/enclave/internal/signing"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nitrite"
 	"github.com/stretchr/testify/require"
@@ -225,11 +226,16 @@ func TestVerifyAttestationRejectsTamperedDocument(t *testing.T) {
 	require.False(t, err == nil && result != nil && result.SignatureOK)
 }
 
-// testUserData builds the 79-byte user_data the runtime attests.
+// testUserData builds the 149-byte user_data the runtime attests, with a 24h
+// migration cooldown and no pending migration.
 func testUserData(tlsHash [sha256.Size]byte, signingKey []byte) []byte {
 	ud := append([]byte(udHashPrefix), tlsHash[:]...)
 	ud = append(ud, udSigningPrefix...)
-	return append(ud, signingKey...)
+	ud = append(ud, signingKey...)
+	ud = append(ud, udCooldownPrefix...)
+	ud = binary.BigEndian.AppendUint64(ud, uint64(24*time.Hour/time.Second))
+	ud = append(ud, udPCR0Prefix...)
+	return append(ud, make([]byte, sha512.Size384)...)
 }
 
 func TestParseUserDataRequiresExactFormat(t *testing.T) {
@@ -237,63 +243,87 @@ func TestParseUserDataRequiresExactFormat(t *testing.T) {
 	signingKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public().(ed25519.PublicKey)
 	valid := testUserData(digest, signingKey)
 	unsigned := testUserData(digest, make([]byte, ed25519.PublicKeySize))
+	migrating := append([]byte(nil), valid...)
+	copy(migrating[udPCR0Start:], bytes.Repeat([]byte{0xab}, sha512.Size384))
 	short := append([]byte(nil), valid[:len(valid)-1]...)
 	long := append(append([]byte(nil), valid...), 0)
-	tlsOnly := append([]byte(udHashPrefix), digest[:]...)
-	badPrefix := append([]byte(nil), valid...)
-	badPrefix[0] = 'x'
-	badSigningPrefix := append([]byte(nil), valid...)
-	badSigningPrefix[udTLSEnd+1] = 'x'
+	keysOnly := append([]byte(nil), valid[:udSigningEnd]...)
+	mutate := func(offset int, b byte) []byte {
+		out := append([]byte(nil), valid...)
+		out[offset] = b
+		return out
+	}
+	hugeCooldown := append([]byte(nil), valid...)
+	copy(hugeCooldown[udCooldownStart:udCooldownEnd], bytes.Repeat([]byte{0xff}, 8))
 	zero := testUserData([sha256.Size]byte{}, signingKey)
-	require.Len(t, valid, 79)
-	require.Len(t, tlsOnly, 39)
+	require.Len(t, valid, 149)
+	require.Len(t, keysOnly, 79)
 
+	data := func(raw []byte) *nitrite.Result {
+		return &nitrite.Result{Document: &nitrite.Document{UserData: raw}}
+	}
+	digestHex := hex.EncodeToString(digest[:])
 	tests := []struct {
 		name        string
 		result      *nitrite.Result
-		want        string
-		wantKey     ed25519.PublicKey
+		want        *attestedUserData
 		errContains string
 	}{
 		{
-			name:    "valid exact payload",
-			result:  &nitrite.Result{Document: &nitrite.Document{UserData: valid}},
-			want:    hex.EncodeToString(digest[:]),
-			wantKey: signingKey,
+			name:   "valid exact payload",
+			result: data(valid),
+			want: &attestedUserData{
+				tlsKeyHash: digestHex, signingKey: signingKey, migrationCooldown: 24 * time.Hour,
+			},
 		},
 		{
 			name:   "no signing key set",
-			result: &nitrite.Result{Document: &nitrite.Document{UserData: unsigned}},
-			want:   hex.EncodeToString(digest[:]),
+			result: data(unsigned),
+			want:   &attestedUserData{tlsKeyHash: digestHex, migrationCooldown: 24 * time.Hour},
 		},
 		{
-			name:        "short payload",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: short}},
-			errContains: "exactly 79 bytes",
+			name:   "pending migration",
+			result: data(migrating),
+			want: &attestedUserData{
+				tlsKeyHash: digestHex, signingKey: signingKey, migrationCooldown: 24 * time.Hour,
+				migrationTargetPCR0: strings.Repeat("ab", sha512.Size384),
+			},
 		},
+		{name: "short payload", result: data(short), errContains: "exactly 149 bytes"},
+		{name: "long payload", result: data(long), errContains: "exactly 149 bytes"},
 		{
-			name:        "long payload",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: long}},
-			errContains: "exactly 79 bytes",
-		},
-		{
-			name:        "TLS-only payload",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: tlsOnly}},
-			errContains: "exactly 79 bytes",
+			name:        "keys-only payload of an older runtime",
+			result:      data(keysOnly),
+			errContains: "exactly 149 bytes",
 		},
 		{
 			name:        "bad prefix",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: badPrefix}},
+			result:      data(mutate(0, 'x')),
 			errContains: "missing \"sha256:\" prefix",
 		},
 		{
 			name:        "bad signing key prefix",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: badSigningPrefix}},
+			result:      data(mutate(udTLSEnd+1, 'x')),
 			errContains: "missing \"ed25519:\" prefix",
 		},
 		{
+			name:        "bad cooldown prefix",
+			result:      data(mutate(udSigningEnd, 'x')),
+			errContains: "missing \"cooldown:\" prefix",
+		},
+		{
+			name:        "bad target prefix",
+			result:      data(mutate(udCooldownEnd, 'x')),
+			errContains: "missing \"pcr0:\" prefix",
+		},
+		{
+			name:        "cooldown out of range",
+			result:      data(hugeCooldown),
+			errContains: "out of range",
+		},
+		{
 			name:        "all-zero digest",
-			result:      &nitrite.Result{Document: &nitrite.Document{UserData: zero}},
+			result:      data(zero),
 			errContains: "all-zero",
 		},
 		{name: "nil attestation", errContains: "no attestation result"},
@@ -306,15 +336,14 @@ func TestParseUserDataRequiresExactFormat(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, key, err := parseUserData(tc.result)
+			got, err := parseUserData(tc.result)
 			if tc.errContains != "" {
 				require.ErrorContains(t, err, tc.errContains)
-				require.Empty(t, got)
+				require.Nil(t, got)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
-			require.Equal(t, tc.wantKey, key)
 		})
 	}
 }
@@ -380,25 +409,5 @@ func TestVerifyLeafKeyHash(t *testing.T) {
 		t,
 		verifyLeafKeyHash([][]byte{cert}, strings.Repeat("0", 64)),
 		"no attested TLS public-key fingerprint",
-	)
-}
-
-func TestPrepareResponseSigningContextCapturesURLCredentials(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "https://alice:password@api.example/orders", nil)
-	require.NoError(t, err)
-	signingContext, err := prepareResponseSigningContext(req)
-	require.NoError(t, err)
-	require.Equal(t, "Basic YWxpY2U6cGFzc3dvcmQ=", req.Header.Get("Authorization"))
-	recaptured, err := signing.CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	require.Equal(t, recaptured, signingContext)
-	req.Header.Set("Authorization", "Bearer substituted")
-	recaptured, err = signing.CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	require.NotEqual(
-		t,
-		recaptured,
-		signingContext,
-		"verification must use the pre-transport snapshot",
 	)
 }

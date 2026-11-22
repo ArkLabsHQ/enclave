@@ -7,7 +7,6 @@ import (
 	"crypto/elliptic"
 	"crypto/hkdf"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -265,10 +264,10 @@ const (
 
 // InheritSecretMetadata defines a secret born outside the enclave and handed in
 // through SSM (ENCLAVE_INHERIT_SECRETS_CONFIG). The image pins what the secret
-// must be, so the pin and the cutoff are part of PCR0. Value holds one
-// commitment per delivered entry, and every entry's secret is hex: `hash` pins
-// the SHA-256 of the decoded secret, `publicKey` pins compressed secp256k1
-// public keys whose secrets are private keys.
+// must be, so the pin and the cutoff are part of PCR0. Value holds the
+// commitments, each matched by one delivered entry, and every entry's secret
+// is hex: `hash` pins the SHA-256 of the decoded secret, `publicKey` pins
+// compressed secp256k1 public keys whose secrets are private keys.
 // From Cutoff on, the app no longer receives it; without a Cutoff, it always does.
 type InheritSecretMetadata struct {
 	Name   string    `json:"name"`
@@ -371,10 +370,11 @@ func (sm SecretsMetadata) validateInherited(reserved map[string]bool) error {
 		}
 		seenValues := make(map[string]bool, len(m.Value))
 		for i, value := range m.Value {
-			if seenValues[value] {
+			// Hex case is not significant, so "AB" and "ab" are the same pin.
+			if seenValues[strings.ToLower(value)] {
 				return fmt.Errorf("inherited secret %q: %s %d is a duplicate", m.Name, m.Type, i)
 			}
-			seenValues[value] = true
+			seenValues[strings.ToLower(value)] = true
 			commitment, err := hex.DecodeString(value)
 			if err != nil {
 				return fmt.Errorf(
@@ -402,37 +402,34 @@ func (sm SecretsMetadata) validateInherited(reserved map[string]bool) error {
 	return nil
 }
 
-// verifyInheritedSecret checks a handed-in value against its measured pin: each
-// comma-separated delivered entry must match one commitment, in any order, and
-// each commitment is used once. The secrets are hex, so a comma or colon in one
-// can never be mistaken for a separator. The commitments were validated with
-// the config; they are decoded again here so the check fails closed on its own.
-func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
+// verifyInheritedSecret checks a handed-in value against its measured pin and
+// returns the entries the app receives, one per commitment and sorted:
+// every commitment must be matched by a comma-separated delivered entry, in any
+// order. A delivered entry that matches no commitment is left out, so SSM may
+// hold more secrets than this image pins. The secrets are hex, so a comma
+// or colon in one can never be mistaken for a separator. The commitments were
+// validated with the config; one that is not hex matches no entry, so the check
+// fails closed on its own.
+func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, error) {
 	values := strings.Split(plaintext, ",")
 	for i := range values {
 		values[i] = strings.TrimSpace(values[i])
 	}
-	if len(values) != len(m.Value) {
-		return fmt.Errorf(
-			"inherited secret %q: value count %d, want %d", m.Name, len(values), len(m.Value),
-		)
-	}
-	commitments := make([][]byte, len(m.Value))
-	for i, value := range m.Value {
-		commitment, err := hex.DecodeString(value)
-		if err != nil {
-			return fmt.Errorf("inherited secret %q: %s %d is not hex: %w", m.Name, m.Type, i, err)
-		}
-		commitments[i] = commitment
-	}
 
+	// entryByCommitment holds every pinned commitment, as lower-case hex, with
+	// the delivered entry that matches it; "" until one does.
+	entryByCommitment := make(map[string]string, len(m.Value))
+	for _, value := range m.Value {
+		entryByCommitment[strings.ToLower(value)] = ""
+	}
 	for i, value := range values {
 		// An entry may carry app metadata after a colon, "<secret>:<unix-ts>";
 		// only the secret is pinned, the entry is delivered whole.
 		value, _, _ = strings.Cut(value, ":")
 		secretBytes, err := hex.DecodeString(value)
 		if err != nil || len(secretBytes) == 0 {
-			return fmt.Errorf("inherited secret %q: value %d is not hex", m.Name, i)
+			slog.Warn("inherited secret value ignored: not hex", "name", m.Name, "index", i)
+			continue
 		}
 		var got []byte
 		switch m.Type {
@@ -441,40 +438,59 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) error {
 			got = hash[:]
 		case inheritSecretTypePublicKey:
 			if len(secretBytes) != btcec.PrivKeyBytesLen {
-				return fmt.Errorf(
-					"inherited secret %q: value %d is not a 32-byte private key", m.Name, i,
+				slog.Warn(
+					"inherited secret value ignored: not a 32-byte private key",
+					"name", m.Name, "index", i,
 				)
+				continue
 			}
 			var scalar btcec.ModNScalar
 			if overflow := scalar.SetByteSlice(secretBytes); overflow || scalar.IsZero() {
-				return fmt.Errorf(
-					"inherited secret %q: value %d is not a valid secp256k1 private key",
-					m.Name,
-					i,
+				slog.Warn(
+					"inherited secret value ignored: not a valid secp256k1 private key",
+					"name", m.Name, "index", i,
 				)
+				continue
 			}
 			privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
 			got = privKey.PubKey().SerializeCompressed()
 		default:
-			// Validation refuses this first; failing here keeps got non-empty
-			// below, so it can never match a consumed (nil) commitment.
-			return fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
+			// Validation refuses this first.
+			return "", fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
 		}
-		matched := -1
-		for j, commitment := range commitments { // consumed entries are nil and never match
-			if subtle.ConstantTimeCompare(got, commitment) == 1 {
-				matched = j
-			}
+		commitment := hex.EncodeToString(got)
+		matchedEntry, pinned := entryByCommitment[commitment]
+		if !pinned {
+			slog.Warn(
+				"inherited secret value ignored: matches no pinned commitment",
+				"name", m.Name, "index", i,
+			)
+			continue
 		}
-		if matched < 0 {
-			return fmt.Errorf(
-				"inherited secret %q: value %d does not match an unused pinned %s",
-				m.Name, i, m.Type,
+		if matchedEntry != "" {
+			slog.Warn(
+				"inherited secret value ignored: its commitment is already matched",
+				"name", m.Name, "index", i,
+			)
+			continue
+		}
+		entryByCommitment[commitment] = values[i]
+	}
+
+	pinnedEntries := make([]string, 0, len(entryByCommitment))
+	for _, value := range m.Value {
+		commitment := strings.ToLower(value)
+		entry := entryByCommitment[commitment]
+		if entry == "" {
+			return "", fmt.Errorf(
+				"inherited secret %q: pinned %s %s has no delivered value",
+				m.Name, m.Type, commitment,
 			)
 		}
-		commitments[matched] = nil
+		pinnedEntries = append(pinnedEntries, entry)
 	}
-	return nil
+	slices.Sort(pinnedEntries)
+	return strings.Join(pinnedEntries, ","), nil
 }
 
 // resolveInheritedSecrets reads the inherited secrets still before their cutoff
@@ -511,7 +527,8 @@ func resolveInheritedSecrets(
 			)
 			continue
 		}
-		if err := verifyInheritedSecret(m, plaintext); err != nil {
+		plaintext, err = verifyInheritedSecret(m, plaintext)
+		if err != nil {
 			return nil, err
 		}
 		secrets = append(secrets, InheritedSecret{InheritSecretMetadata: m, Plaintext: plaintext})

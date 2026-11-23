@@ -43,11 +43,14 @@ import (
 // Proxy proof of concept: a proxy, such as arkd's GetInfo, returns the enclave
 // signer's pubkey with evidence for it, so its caller does not have to trust
 // the proxy. The enclave here is the runtime's own servers, with a software
-// NSM, in front of a gRPC signer.
+// NSM, in front of a signer that answers GetPubkey over gRPC and over REST.
 //
 //	caller ─ GET /v1/info ─▶ proxy ─ GET /enclave/attestation?nonce ─▶ runtime
 //	                         proxy ─ gRPC GetPubkey + nonce ──────────▶ runtime ─▶ signer
 //	caller ◀─ {signerPubkey, signerEvidence} ─ proxy
+//
+// GET /v1/info-rest is the same, with the proxy calling the signer's REST
+// route, GET /v1/pubkey, instead of gRPC.
 //
 // The proxy chooses the nonce, and the runtime signs the signer's response for
 // it with the runtime's time. The caller checks that evidence, requires the
@@ -69,18 +72,22 @@ func TestExample(t *testing.T) {
 	enclave := startEnclave(t, signer, pcr0)
 	proxyURL := startProxy(t, enclave)
 
-	// ts/main.ts runs the caller, ts/verify.ts, and prints the signer's response
-	// it verified, as JSON.
-	out, err := exec.Command(
-		"node", "--no-warnings", "ts/main.ts", proxyURL, hex.EncodeToString(pcr0),
-	).CombinedOutput()
-	require.NoError(t, err, string(out))
+	// ts/main.ts runs the caller, ts/verify.ts, against the proxy's gRPC or REST
+	// route, and prints the signer's response it verified, as JSON.
 	want, err := protojson.Marshal(pubkey)
 	require.NoError(t, err)
-	require.JSONEq(t, string(want), string(out))
+	for _, call := range []string{"grpc", "rest"} {
+		t.Run(call, func(t *testing.T) {
+			out, err := exec.Command(
+				"node", "--no-warnings", "ts/main.ts", call, proxyURL, hex.EncodeToString(pcr0),
+			).CombinedOutput()
+			require.NoError(t, err, string(out))
+			require.JSONEq(t, string(want), string(out))
+		})
+	}
 }
 
-// Signer: the gRPC app inside the enclave.
+// Signer: the app inside the enclave, serving gRPC and REST.
 
 // signer answers GetPubkey with pubkey.
 type signer struct {
@@ -92,6 +99,18 @@ func (s signer) GetPubkey(
 	context.Context, *signerv1.GetPubkeyRequest,
 ) (*signerv1.GetPubkeyResponse, error) {
 	return s.pubkey, nil
+}
+
+// getPubkeyREST answers GetPubkey at its REST route, GET /v1/pubkey, with
+// pubkey as JSON, as arkd's HTTP gateway does.
+func (s signer) getPubkeyREST(w http.ResponseWriter, _ *http.Request) {
+	body, err := protojson.Marshal(s.pubkey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }
 
 // Enclave: the runtime's servers in front of the signer.
@@ -169,22 +188,24 @@ func (e enclave) fetchAttestation(ctx context.Context, nonceHex string) (string,
 
 // Proxy: what arkd does for GetInfo.
 
-// getInfoResponse is the proxy's GET /v1/info answer, plain JSON: the caller
-// speaks REST to the proxy, so only the signer's response is protobuf. Bytes
-// are base64 in JSON; timestamp is Unix milliseconds.
+// getInfoResponse is the proxy's GET /v1/info and /v1/info-rest answer, plain
+// JSON, as the caller speaks REST to the proxy. Bytes are base64 in JSON;
+// timestamp is Unix milliseconds.
 type getInfoResponse struct {
 	SignerPubkey   string `json:"signerPubkey"`
 	SignerEvidence struct {
 		// The base64 document from /enclave/attestation.
 		Attestation string `json:"attestation"`
 		Payload     struct {
-			// The full gRPC method called.
+			// The call's request line as the runtime signed it:
+			// "POST /signer.v1.SignerService/GetPubkey" or "GET /v1/pubkey".
 			Method string `json:"method"`
 			// The nonce the proxy chose for the attestation and the call.
 			Nonce []byte `json:"nonce"`
 			// The runtime's x-enclave-timestamp.
 			Timestamp int64 `json:"timestamp"`
-			// The GetPubkeyResponse, without gRPC framing.
+			// The GetPubkeyResponse as the runtime signed it: protobuf without
+			// gRPC framing, or the REST route's JSON body.
 			Response []byte `json:"response"`
 		} `json:"payload"`
 		// The runtime's x-enclave-signature, decoded.
@@ -199,48 +220,57 @@ type proxy struct {
 	conn    *grpc.ClientConn // gRPC to the signer, through the runtime
 }
 
-// getInfo answers GET /v1/info with the signer's pubkey and the evidence for
-// it.
-func (p *proxy) getInfo(w http.ResponseWriter, r *http.Request) {
-	// 1. Choose a fresh nonce.
-	nonce := make([]byte, 20)
-	if _, err := rand.Read(nonce); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	nonceHex := hex.EncodeToString(nonce)
+// getInfo answers with the signer's pubkey and the evidence for it. It calls
+// GetPubkey with call, whose request line the runtime signs as method, and
+// decodes the response with unmarshal: protobuf for gRPC, JSON for REST.
+func (p *proxy) getInfo(
+	method string,
+	call func(ctx context.Context, nonceHex string) (
+		response []byte, timestamp int64, signature []byte, err error,
+	),
+	unmarshal func([]byte, proto.Message) error,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 1. Choose a fresh nonce.
+		nonce := make([]byte, 20)
+		if _, err := rand.Read(nonce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		nonceHex := hex.EncodeToString(nonce)
 
-	// 2. Fetch the attestation with that nonce.
-	attestation, err := p.enclave.fetchAttestation(r.Context(), nonceHex)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+		// 2. Fetch the attestation with that nonce.
+		attestation, err := p.enclave.fetchAttestation(r.Context(), nonceHex)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 
-	// 3. Call GetPubkey with the same nonce, keeping the response bytes as
-	// received: the signature covers them.
-	response, timestamp, signature, err := p.callGetPubkey(r.Context(), nonceHex)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	pubkey := &signerv1.GetPubkeyResponse{}
-	if err := proto.Unmarshal(response, pubkey); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+		// 3. Call GetPubkey with the same nonce, keeping the response bytes as
+		// received: the signature covers them.
+		response, timestamp, signature, err := call(r.Context(), nonceHex)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		pubkey := &signerv1.GetPubkeyResponse{}
+		if err := unmarshal(response, pubkey); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 
-	// 4. Return the pubkey and the evidence for it.
-	var info getInfoResponse
-	info.SignerPubkey = pubkey.GetPubkey()
-	info.SignerEvidence.Attestation = attestation
-	info.SignerEvidence.Payload.Method = signerv1.SignerService_GetPubkey_FullMethodName
-	info.SignerEvidence.Payload.Nonce = nonce
-	info.SignerEvidence.Payload.Timestamp = timestamp
-	info.SignerEvidence.Payload.Response = response
-	info.SignerEvidence.Signature = signature
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(info)
+		// 4. Return the pubkey and the evidence for it.
+		var info getInfoResponse
+		info.SignerPubkey = pubkey.GetPubkey()
+		info.SignerEvidence.Attestation = attestation
+		info.SignerEvidence.Payload.Method = method
+		info.SignerEvidence.Payload.Nonce = nonce
+		info.SignerEvidence.Payload.Timestamp = timestamp
+		info.SignerEvidence.Payload.Response = response
+		info.SignerEvidence.Signature = signature
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(info)
+	}
 }
 
 // callGetPubkey calls the signer's GetPubkey through the runtime with
@@ -269,6 +299,41 @@ func (p *proxy) callGetPubkey(
 	return response, timestamp, signature, nil
 }
 
+// callGetPubkeyREST calls the signer's REST route for GetPubkey,
+// GET /v1/pubkey, through the runtime with nonceHex. It returns the response
+// body and, read from the response headers, the runtime's timestamp and its
+// signature over both.
+func (p *proxy) callGetPubkeyREST(
+	ctx context.Context, nonceHex string,
+) (response []byte, timestamp int64, signature []byte, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.enclave.url+"/v1/pubkey", nil)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	req.Header.Set("X-Enclave-Sign-Nonce", nonceHex)
+	res, err := p.enclave.client.Do(req)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer func() { _ = res.Body.Close() }()
+	response, err = io.ReadAll(res.Body)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, 0, nil, fmt.Errorf("GetPubkey: HTTP %d", res.StatusCode)
+	}
+	timestamp, err = strconv.ParseInt(res.Header.Get("X-Enclave-Timestamp"), 10, 64)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	signature, err = base64.StdEncoding.DecodeString(res.Header.Get("X-Enclave-Signature"))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return response, timestamp, signature, nil
+}
+
 // rawCodec passes message bytes through unchanged, so the proxy relays exactly
 // the response the runtime signed.
 type rawCodec struct{}
@@ -282,16 +347,25 @@ func (rawCodec) Unmarshal(data []byte, v any) error {
 
 func (rawCodec) Name() string { return "proto" }
 
-// startSigner serves the signer, answering GetPubkey with pubkey, on a plain
-// grpc-go server over h2c, and returns its address.
+// startSigner serves the signer, answering GetPubkey with pubkey, and returns
+// its address. One port serves gRPC over h2c and the REST route over
+// HTTP/1.1; the runtime forwards each request with the protocol it came in.
 func startSigner(t *testing.T, pubkey *signerv1.GetPubkeyResponse) string {
 	t.Helper()
-	server := grpc.NewServer()
-	signerv1.RegisterSignerServiceServer(server, signer{pubkey: pubkey})
+	s := signer{pubkey: pubkey}
+	grpcServer := grpc.NewServer()
+	signerv1.RegisterSignerServiceServer(grpcServer, s)
+	mux := http.NewServeMux()
+	mux.Handle("POST /signer.v1.SignerService/", grpcServer)
+	mux.HandleFunc("GET /v1/pubkey", s.getPubkeyREST)
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	server := &http.Server{Handler: mux, Protocols: &protocols}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	go func() { _ = server.Serve(lis) }()
-	t.Cleanup(server.Stop)
+	t.Cleanup(func() { _ = server.Close() })
 	return lis.Addr().String()
 }
 
@@ -335,7 +409,8 @@ func startEnclave(t *testing.T, signerAddr string, pcr0 []byte) enclave {
 	}
 }
 
-// startProxy serves the proxy's GET /v1/info and returns its URL.
+// startProxy serves the proxy's GET /v1/info, which calls the signer over
+// gRPC, and GET /v1/info-rest, which calls it over REST, and returns its URL.
 func startProxy(t *testing.T, enclave enclave) string {
 	t.Helper()
 	conn, err := grpc.NewClient(
@@ -345,7 +420,14 @@ func startProxy(t *testing.T, enclave enclave) string {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	p := &proxy{enclave: enclave, conn: conn}
-	server := httptest.NewServer(http.HandlerFunc(p.getInfo))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/info", p.getInfo(
+		"POST "+signerv1.SignerService_GetPubkey_FullMethodName, p.callGetPubkey, proto.Unmarshal,
+	))
+	mux.HandleFunc("GET /v1/info-rest", p.getInfo(
+		"GET /v1/pubkey", p.callGetPubkeyREST, protojson.Unmarshal,
+	))
+	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server.URL
 }

@@ -3,10 +3,14 @@
 // then decodes the signed signer response with the buf-generated schema. It
 // mirrors client.VerifyProxyEvidence.
 //
+// The proxy calls the signer over gRPC for GET /v1/info (verifyGetInfo) and
+// over its REST route for GET /v1/info-rest (verifyGetInfoREST). The checks
+// are the same; only the signed call and the response's encoding differ.
+//
 // It uses only web-standard APIs, so it runs in Node and in browsers; main.ts
 // runs it from the command line.
 
-import { fromBinary } from "@bufbuild/protobuf";
+import { fromBinary, fromJsonString } from "@bufbuild/protobuf";
 import { base64Decode } from "@bufbuild/protobuf/wire";
 import { decode } from "cbor2";
 import {
@@ -20,17 +24,23 @@ const userDataLength = 149;
 const signingKeyStart = 47;
 const signingKeyEnd = 79;
 
-// The proxy's GET /v1/info answer. The caller speaks REST to the proxy, so
-// this is plain JSON; only the signed signer response is protobuf.
+// GetPubkey's request line as the runtime signs it (README, "Signed
+// responses"): over gRPC, a POST to its full method; over REST, arkd's gateway
+// route.
+const grpcGetPubkey = `POST /${SignerService.typeName}/${SignerService.method.getPubkey.name}`;
+const restGetPubkey = "GET /v1/pubkey";
+
+// The proxy's GET /v1/info and /v1/info-rest answer. The caller speaks REST
+// to the proxy, so this is plain JSON.
 type GetInfoResponse = {
   signerPubkey: string;
   signerEvidence: {
     attestation: string; // base64 NSM document
     payload: {
-      method: string;
+      method: string; // the request line the runtime signed
       nonce: string; // base64
       timestamp: number; // Unix milliseconds
-      response: string; // base64 GetPubkeyResponse
+      response: string; // base64 GetPubkeyResponse: protobuf, or JSON over REST
     };
     signature: string; // base64
   };
@@ -48,14 +58,50 @@ const hex = (b: Uint8Array) =>
 const sha256 = async (b: Uint8Array) =>
   hex(new Uint8Array(await crypto.subtle.digest("SHA-256", b)));
 
+// verifyGetInfo verifies the proxy's GET /v1/info, whose evidence is the
+// signer's gRPC response: protobuf, signed with grpc-status 0.
 export async function verifyGetInfo(
   proxyURL: string,
   expectedPCR0: string,
 ): Promise<GetPubkeyResponse> {
+  return verifyEvidence(
+    `${proxyURL}/v1/info`,
+    expectedPCR0,
+    grpcGetPubkey,
+    "0",
+    (response) => fromBinary(GetPubkeyResponseSchema, response),
+  );
+}
+
+// verifyGetInfoREST verifies the proxy's GET /v1/info-rest, whose evidence is
+// the signer's REST response: JSON, signed with status 200.
+export async function verifyGetInfoREST(
+  proxyURL: string,
+  expectedPCR0: string,
+): Promise<GetPubkeyResponse> {
+  return verifyEvidence(
+    `${proxyURL}/v1/info-rest`,
+    expectedPCR0,
+    restGetPubkey,
+    "200",
+    (response) => fromJsonString(GetPubkeyResponseSchema, new TextDecoder().decode(response)),
+  );
+}
+
+// verifyEvidence fetches infoURL and checks the evidence for the signer's
+// call, whose request line and success status the runtime signed as call and
+// status. It then decodes the signed response with decodeResponse.
+async function verifyEvidence(
+  infoURL: string,
+  expectedPCR0: string,
+  call: string,
+  status: string,
+  decodeResponse: (response: Uint8Array) => GetPubkeyResponse,
+): Promise<GetPubkeyResponse> {
   // The caller notes when it asked: the evidence must be attested and signed
   // no earlier.
   const notBefore = Date.now();
-  const res = await fetch(`${proxyURL}/v1/info`);
+  const res = await fetch(infoURL);
   if (!res.ok) {
     throw new Error(`GetInfo: HTTP ${res.status}`);
   }
@@ -90,24 +136,22 @@ export async function verifyGetInfo(
 
   // 2. The signed call must be the one the caller expects, made no earlier
   // than it asked.
-  const method = `/${SignerService.typeName}/${SignerService.method.getPubkey.name}`;
-  if (payload.method !== method) {
-    throw new Error(`evidence is for method ${payload.method}, not ${method}`);
+  if (payload.method !== call) {
+    throw new Error(`evidence is for ${payload.method}, not ${call}`);
   }
   if (payload.timestamp < notBefore) {
     throw new Error(`response from ${payload.timestamp}, before ${notBefore}`);
   }
 
-  // 3. Rebuild the message the runtime signed (README, "Signed responses"): a
-  // gRPC call is a POST to its method, GetPubkey's request is empty, and
-  // grpc-status 0 is OK.
+  // 3. Rebuild the message the runtime signed (README, "Signed responses").
+  // GetPubkey's request is empty over gRPC and REST alike.
   const message = [
     "enclave-signed-response",
-    `POST ${method}`,
+    call,
     hex(nonce),
     payload.timestamp.toString(),
     await sha256(new Uint8Array()),
-    "0",
+    status,
     await sha256(signedResponse),
   ].join("\n");
   const key = await crypto.subtle.importKey("raw", signingKey, { name: "Ed25519" }, false, [
@@ -125,7 +169,7 @@ export async function verifyGetInfo(
 
   // 4. Only the signed response is authenticated: decode it, and check the
   // pubkey GetInfo reports against it.
-  const response = fromBinary(GetPubkeyResponseSchema, signedResponse);
+  const response = decodeResponse(signedResponse);
   if (response.pubkey.toLowerCase() !== info.signerPubkey.toLowerCase()) {
     throw new Error("GetInfo pubkey mismatch");
   }

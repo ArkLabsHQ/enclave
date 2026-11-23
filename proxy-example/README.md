@@ -31,6 +31,12 @@ caller ◀─ {signerPubkey, signerEvidence} ─ proxy
 4. The proxy answers the caller with the pubkey and the evidence for it.
 5. The caller checks the evidence, then decodes the signed response.
 
+`GET /v1/info-rest` runs the same flow, except that in step 3 the proxy calls
+the signer's REST route for `GetPubkey`, `GET /v1/pubkey`, as arkd's HTTP
+gateway serves it. The nonce goes in the `X-Enclave-Sign-Nonce` header, and the
+runtime returns its timestamp and signature as the `X-Enclave-Timestamp` and
+`X-Enclave-Signature` response headers.
+
 The signature format is specified in the main README under
 [Signed responses](../README.md#signed-responses).
 
@@ -46,17 +52,18 @@ go test ./...
 ```
 
 `make test` at the repository root runs the same commands after the other
-modules' tests. The test passes when the TypeScript caller accepts the proxy's
-answer and prints the same response the signer gave.
+modules' tests. The test runs the TypeScript caller against both routes, and
+passes when it accepts the proxy's answer and prints the same response the
+signer gave.
 
 To regenerate the Go and TypeScript code after changing the proto, run
 `make proto` at the repository root.
 
 ## The proxy's answer
 
-The caller speaks plain REST to the proxy, so the answer is JSON. Only
-`response` is protobuf: it holds the signer's `GetPubkeyResponse` exactly as the
-runtime signed it.
+The caller speaks plain REST to the proxy, so the answer is JSON. `response`
+holds the signer's `GetPubkeyResponse` exactly as the runtime signed it:
+protobuf from `/v1/info`, the REST route's JSON body from `/v1/info-rest`.
 
 ```json
 {
@@ -64,7 +71,7 @@ runtime signed it.
   "signerEvidence": {
     "attestation": "<base64 attestation document>",
     "payload": {
-      "method": "/signer.v1.SignerService/GetPubkey",
+      "method": "POST /signer.v1.SignerService/GetPubkey",
       "nonce": "<base64, 20 bytes>",
       "timestamp": 1795269236000,
       "response": "<base64 GetPubkeyResponse>"
@@ -74,7 +81,9 @@ runtime signed it.
 }
 ```
 
-`timestamp` is the runtime's `x-enclave-timestamp`, in Unix milliseconds.
+`method` is the request line the runtime signed; from `/v1/info-rest` it is
+`GET /v1/pubkey`. `timestamp` is the runtime's `X-Enclave-Timestamp`, in Unix
+milliseconds.
 
 ## What the caller checks
 
@@ -82,21 +91,26 @@ The caller's `expectedPCR0` must come from a trusted source identifying the
 intended enclave build. Accepting that value from the untrusted proxy would
 defeat the check.
 
-`ts/verify.ts` notes the time before it calls the proxy, then checks:
+`ts/verify.ts` notes the time before it calls the proxy, then checks, for
+either route:
 
 1. **The attestation.** Its nonce is the one in the evidence, its PCR0 is the
    one the caller expects, and its timestamp is no earlier than the caller's
    request. The response-signing key is read from its `user_data`.
-2. **The call.** The evidence is for `GetPubkey`, and its `timestamp`, set by
-   the runtime, is no earlier than the caller's request. A proxy that pairs an
+2. **The call.** The evidence's `method` is the `GetPubkey` call that route
+   makes, `POST /signer.v1.SignerService/GetPubkey` or `GET /v1/pubkey`, and
+   its `timestamp`, set by the runtime, is no earlier than the caller's
+   request. A proxy that pairs an
    old response with a fresh attestation fails here.
 3. **The signature.** The caller rebuilds the message the runtime signed, which
-   covers the method, the nonce, the timestamp and the response, and verifies
+   covers the method, the nonce, the timestamp, the status (gRPC's `0` or
+   HTTP's `200`) and the response, and verifies
    it against the key in the attestation with WebCrypto Ed25519. Once the
    attestation itself is verified, this prevents the proxy from changing any
    of them.
-4. **The pubkey.** The caller decodes the signed response and requires the
-   pubkey in it to match the `signerPubkey` the proxy reported.
+4. **The pubkey.** The caller decodes the signed response, with `fromBinary`
+   for gRPC or `fromJsonString` for REST, and requires the pubkey in it to
+   match the `signerPubkey` the proxy reported.
 
 The proxy-selected nonce binds the attestation and signed response together;
 freshness depends on their timestamps and the caller's clock. The example
@@ -112,10 +126,10 @@ attestation.
 
 | Path | Contents |
 |---|---|
-| `example_test.go` | The whole setup in one Go test: a gRPC signer, the runtime's own servers in front of it with a software NSM, and the proxy. It then runs the TypeScript caller against the proxy. |
-| `ts/verify.ts` | The caller: `verifyGetInfo(proxyURL, expectedPCR0)`. |
+| `example_test.go` | The whole setup in one Go test: a signer serving gRPC and REST, the runtime's own servers in front of it with a software NSM, and the proxy. It then runs the TypeScript caller against the proxy's two routes. |
+| `ts/verify.ts` | The caller: `verifyGetInfo(proxyURL, expectedPCR0)` for `/v1/info`, `verifyGetInfoREST` for `/v1/info-rest`. |
 | `ts/main.ts` | A command-line wrapper around the caller, which the test runs. |
-| `proto/signer/v1/service.proto` | A copy of arkd's signer service, without its HTTP gateway annotations. |
+| `proto/signer/v1/service.proto` | A copy of arkd's signer service, without its HTTP gateway annotations; the test serves the `GET /v1/pubkey` route by hand. |
 | `gen/`, `ts/gen/` | The Go and TypeScript code generated from the proto, committed. |
 | `buf.yaml`, `buf.gen.yaml` | The buf configuration. |
 
@@ -164,10 +178,10 @@ same version as the plugin: both are 2.12.0 here.
 ### Using it
 
 The generated module gives the caller the method name to expect and a typed
-decoder for the signed bytes:
+decoder for the signed bytes, protobuf or JSON:
 
 ```ts
-import { fromBinary } from "@bufbuild/protobuf";
+import { fromBinary, fromJsonString } from "@bufbuild/protobuf";
 import { GetPubkeyResponseSchema, SignerService } from "./gen/signer/v1/service_pb.ts";
 
 // "/signer.v1.SignerService/GetPubkey", from the generated descriptor.
@@ -177,6 +191,9 @@ const method = `/${SignerService.typeName}/${SignerService.method.getPubkey.name
 const response = fromBinary(GetPubkeyResponseSchema, signedResponse);
 response.pubkey; // string
 response.deprecatedSigners; // { pubkey: string; cutoffDate: bigint }[]
+
+// A signed REST body is JSON, decoded into the same type.
+const restResponse = fromJsonString(GetPubkeyResponseSchema, new TextDecoder().decode(signedBody));
 ```
 
 ## In a browser
@@ -199,5 +216,5 @@ The example has only been run under Node, not in a browser.
   `client/proxy.go`, does the full verification.
 - **The enclave is simulated.** The runtime's servers are real, but they run
   outside an enclave with a software NSM and a self-signed certificate.
-- **The proxy is a stand-in.** It lives in the test and serves one route; it is
-  not arkd.
+- **The proxy is a stand-in.** It lives in the test and serves two routes; it
+  is not arkd.

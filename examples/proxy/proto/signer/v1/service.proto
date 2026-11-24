@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package signer.v1;
+
+// arkd's api-spec/protobuf/signer/v1/service.proto, without its HTTP gateway
+// annotations.
+
+// SignerService defines the apis to interact with the Ark signer.
+service SignerService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetPubkey(GetPubkeyRequest) returns (GetPubkeyResponse);
+  rpc SignTransaction(SignTransactionRequest) returns (SignTransactionResponse);
+}
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  bool ready = 1;
+}
+
+message GetPubkeyRequest {}
+message GetPubkeyResponse {
+  string pubkey = 1;
+  repeated DeprecatedSigner deprecated_signers = 2;
+}
+
+message DeprecatedSigner {
+  string pubkey = 1;
+  // unix timestamp after which the key is no longer accepted, 0 if unset
+  int64 cutoff_date = 2;
+}
+
+message SignTransactionRequest {
+  string partial_tx = 1;
+  repeated int32 input_indexes = 2;
+}
+message SignTransactionResponse {
+  string signed_tx = 1;
+}

@@ -82,14 +82,16 @@ type nsmW struct {
 	nsm nsmAPI
 }
 
-func NewNSM(opts ...VerifyAttestationOption) NSM {
+// NewNSM returns the NSM whose sessions open opens: OpenDefault in an enclave,
+// or a software NSM outside one.
+func NewNSM(open func() (NSMSession, error), opts ...VerifyAttestationOption) NSM {
 	vao := &VerifyAttestationOptions{}
 
 	for _, opt := range opts {
 		opt(vao)
 	}
 
-	return &nsmW{nsm: &awsNSM{unsigned: vao.unsigned, roots: vao.roots}}
+	return &nsmW{nsm: &awsNSM{unsigned: vao.unsigned, roots: vao.roots, open: open}}
 }
 
 // VerifyAttestationDocument checks the document's signature chain and that it
@@ -369,14 +371,19 @@ type nsmSession interface {
 	Close() error
 }
 
+// NSMSession is a session with the NSM, which the open given to NewNSM returns.
+type NSMSession = nsmSession
+
 type awsNSM struct {
 	unsigned bool
 	// nil for production verification
 	roots *x509.CertPool
+	// open opens a session with the NSM: OpenDefault in an enclave.
+	open func() (NSMSession, error)
 }
 
 func (n *awsNSM) OpenSession() (nsmSession, error) {
-	return nsm.OpenDefaultSession()
+	return n.open()
 }
 
 func (n *awsNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
@@ -421,4 +428,9 @@ func (n *awsNSM) VerifyAttestationSig(doc []byte) (*nitrite.Result, error) {
 		return nil, fmt.Errorf("attestation verification: %w", err)
 	}
 	return res, nil
+}
+
+// OpenDefault opens a session with the enclave's NSM device.
+func OpenDefault() (NSMSession, error) {
+	return nsm.OpenDefaultSession()
 }

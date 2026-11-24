@@ -331,7 +331,7 @@ let
   greenEif = mkTestEif self (greenEnv bluePCR0);
   greenPCR0 = eifPCR0 greenEif;
 
-  # Blue as previous-release builds it, with that release's runtime, and the
+  # Blue as previous-release builds it, with that tag's runtime, and the
   # green that must adopt from it.
   releaseBlueEif = mkTestEif previous-release blueEnv;
   releaseBluePCR0 = eifPCR0 releaseBlueEif;

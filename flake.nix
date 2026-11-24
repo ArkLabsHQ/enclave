@@ -4,9 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
-    # The release the e2e-upgrade check hands off from. Bump it on each release; a
-    # deliberately incompatible change pins its bridge release instead and says so
-    # in the release notes.
+    # The tag the e2e-upgrade check hands off from, bumped on each new tag: HEAD
+    # must adopt from the tag before it, not from older ones.
     previous-release.url = "github:ArkLabsHQ/enclave/v0.1.0";
   };
 

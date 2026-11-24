@@ -108,7 +108,7 @@
               pkgs.golangci-lint-langserver
               pkgs.golines
               pkgs.gopls
-              # proxy-example/: code generation and the TypeScript caller.
+              # examples/proxy/: code generation and the TypeScript caller.
               pkgs.buf
               pkgs.protoc-gen-go
               pkgs.protoc-gen-go-grpc

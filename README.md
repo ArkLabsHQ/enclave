@@ -35,7 +35,7 @@ development shell additionally support `aarch64-linux` and `aarch64-darwin`.
 | `client/` | Go client library for attestation-verified requests. Part of the root module. |
 | `internal/signing/` | The signed-response wire format, shared by `client/` and `runtime/`. Separate Go module, `github.com/ArkLabsHQ/enclave/internal/signing`. |
 | `cmd/enclave/` | The `enclave` CLI. |
-| `proxy-example/` | A service relaying signed enclave responses to its callers, such as arkd's GetInfo, tested end to end: the runtime's servers in front of a gRPC signer, and a TypeScript caller using buf-generated code. Separate Go module, `github.com/ArkLabsHQ/enclave/proxy-example`. |
+| `examples/proxy/` | A service relaying signed enclave responses to its callers, such as arkd's GetInfo, tested end to end: the runtime's servers in front of a gRPC signer, and a TypeScript caller using buf-generated code. Separate Go module, `github.com/ArkLabsHQ/enclave/examples/proxy`. |
 | `nix/` | `buildEif` function |
 | `nix/tests/` | EIF construction and full blue/green runtime checks. |
 | `.github/workflows/` | `eif-build.yml` and `eif-publish.yml`, reusable workflows an app repo calls to build and publish its EIF. |
@@ -1371,8 +1371,8 @@ nix flake check
 
 Unit tests are not flake checks. Run them with `make test`, or
 `nix develop --command make test` as CI does. `make lint` and `make fmt` are also
-available. `make test` runs the TypeScript caller in `proxy-example/` with Node
-from the development shell, and `make proto` regenerates `proxy-example/`'s Go and
+available. `make test` runs the TypeScript caller in `examples/proxy/` with Node
+from the development shell, and `make proto` regenerates `examples/proxy/`'s Go and
 TypeScript code.
 
 ### Requirements

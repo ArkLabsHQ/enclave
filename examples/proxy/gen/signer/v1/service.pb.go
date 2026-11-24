@@ -363,8 +363,8 @@ const file_signer_v1_service_proto_rawDesc = "" +
 	"\rSignerService\x12F\n" +
 	"\tGetStatus\x12\x1b.signer.v1.GetStatusRequest\x1a\x1c.signer.v1.GetStatusResponse\x12F\n" +
 	"\tGetPubkey\x12\x1b.signer.v1.GetPubkeyRequest\x1a\x1c.signer.v1.GetPubkeyResponse\x12X\n" +
-	"\x0fSignTransaction\x12!.signer.v1.SignTransactionRequest\x1a\".signer.v1.SignTransactionResponseB\xa5\x01\n" +
-	"\rcom.signer.v1B\fServiceProtoP\x01ZAgithub.com/ArkLabsHQ/enclave/proxy-example/gen/signer/v1;signerv1\xa2\x02\x03SXX\xaa\x02\tSigner.V1\xca\x02\tSigner\\V1\xe2\x02\x15Signer\\V1\\GPBMetadata\xea\x02\n" +
+	"\x0fSignTransaction\x12!.signer.v1.SignTransactionRequest\x1a\".signer.v1.SignTransactionResponseB\xa6\x01\n" +
+	"\rcom.signer.v1B\fServiceProtoP\x01ZBgithub.com/ArkLabsHQ/enclave/examples/proxy/gen/signer/v1;signerv1\xa2\x02\x03SXX\xaa\x02\tSigner.V1\xca\x02\tSigner\\V1\xe2\x02\x15Signer\\V1\\GPBMetadata\xea\x02\n" +
 	"Signer::V1b\x06proto3"
 
 var (

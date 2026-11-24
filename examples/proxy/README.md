@@ -46,7 +46,7 @@ Go and Node 24 or later are needed; `nix develop` provides both. Node runs the
 `.ts` files directly, so there is no build step.
 
 ```sh
-cd proxy-example
+cd examples/proxy
 npm ci --prefix ts
 go test ./...
 ```
@@ -157,7 +157,7 @@ plugins:
 To generate:
 
 ```sh
-cd proxy-example
+cd examples/proxy
 buf generate
 ```
 

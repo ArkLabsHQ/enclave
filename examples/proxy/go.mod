@@ -1,10 +1,10 @@
-module github.com/ArkLabsHQ/enclave/proxy-example
+module github.com/ArkLabsHQ/enclave/examples/proxy
 
 go 1.25.0
 
-replace github.com/ArkLabsHQ/enclave/internal/signing => ../internal/signing
+replace github.com/ArkLabsHQ/enclave/internal/signing => ../../internal/signing
 
-replace github.com/ArkLabsHQ/enclave/runtime => ../runtime
+replace github.com/ArkLabsHQ/enclave/runtime => ../../runtime
 
 require (
 	github.com/ArkLabsHQ/enclave/runtime v0.0.0-00010101000000-000000000000

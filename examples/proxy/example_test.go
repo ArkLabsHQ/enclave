@@ -36,7 +36,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	signerv1 "github.com/ArkLabsHQ/enclave/proxy-example/gen/signer/v1"
+	signerv1 "github.com/ArkLabsHQ/enclave/examples/proxy/gen/signer/v1"
 	"github.com/ArkLabsHQ/enclave/runtime"
 )
 

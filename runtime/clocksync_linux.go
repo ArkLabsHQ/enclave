@@ -210,6 +210,7 @@ func (cs *clockSyncer) step(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
+		clockSyncReadings.failures.Add(1)
 
 		// PHC read failures are usually transient rather than indicating a
 		// dead clock: the driver returns EOPNOTSUPP while the PTP device
@@ -246,11 +247,13 @@ var (
 // adjust folds one measurement into the PI loop and applies the resulting correction.
 func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 	raw := m.offsetNs
+	clockSyncReadings.offsetNs.Store(raw)
 	// Gross offset: jump the clock and restart the loop (the standing frequency persists).
 	if raw > cs.cfg.maxStepNs || raw < -cs.cfg.maxStepNs {
 		ts := unix.NsecToTimespec(m.phcNs)
 		err := clockSettime(unix.CLOCK_REALTIME, &ts)
 		if err == nil {
+			clockSyncReadings.hardSteps.Add(1)
 			cs.lastXMonoNs = m.xMonoNs
 			slog.Warn("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)
 		}
@@ -281,6 +284,7 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 	if _, err := clockAdjtime(unix.CLOCK_REALTIME, &tx); err != nil {
 		return err
 	}
+	clockSyncReadings.freqPpb.Store(int64(math.Round(applied * 1000)))
 
 	cs.integralPpm = nextIntegralPpm
 	cs.lastXMonoNs = m.xMonoNs

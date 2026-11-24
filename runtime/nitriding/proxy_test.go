@@ -7,6 +7,8 @@ import (
 	"io"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func send(t *testing.T, sizeBuf, expectedBytes []byte, expectedErr error) {
@@ -71,10 +73,19 @@ func TestTx(t *testing.T) {
 	frameSize := make([]byte, frameSizeLen)
 
 	binary.LittleEndian.PutUint16(frameSize, uint16(len(expected)))
+	// The counters are package-level, so check how far they moved.
+	ingressFrames := TunnelTraffic.IngressFrames.Load()
+	ingressBytes := TunnelTraffic.IngressBytes.Load()
 	send(t, frameSize, []byte(expected), io.EOF)
+	require.Equal(t, uint64(1), TunnelTraffic.IngressFrames.Load()-ingressFrames)
+	require.Equal(t, uint64(len(expected)), TunnelTraffic.IngressBytes.Load()-ingressBytes)
 }
 
 func TestRx(t *testing.T) {
 	expected := "foobar"
+	egressFrames := TunnelTraffic.EgressFrames.Load()
+	egressBytes := TunnelTraffic.EgressBytes.Load()
 	receive(t, []byte(expected), io.EOF)
+	require.Equal(t, uint64(1), TunnelTraffic.EgressFrames.Load()-egressFrames)
+	require.Equal(t, uint64(len(expected)), TunnelTraffic.EgressBytes.Load()-egressBytes)
 }

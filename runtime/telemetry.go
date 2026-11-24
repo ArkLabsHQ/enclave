@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
@@ -127,6 +128,8 @@ var (
 		runtimeMetricMemTotalKB,
 		runtimeMetricMemFreeKB,
 		runtimeMetricMemAvailableKB,
+		runtimeMetricClockOffsetNs,
+		runtimeMetricClockFreqPpb,
 	}
 	runtimeCounters = []string{
 		runtimeMetricGCPauseTotalNS,
@@ -139,6 +142,13 @@ var (
 		runtimeMetricCPUIRQ,
 		runtimeMetricCPUSoftIRQ,
 		runtimeMetricCPUSteal,
+		runtimeMetricVsockEgressFrames,
+		runtimeMetricVsockEgressBytes,
+		runtimeMetricVsockEgressWriteNS,
+		runtimeMetricVsockIngressFrames,
+		runtimeMetricVsockIngressBytes,
+		runtimeMetricClockHardSteps,
+		runtimeMetricClockSyncFailures,
 	}
 )
 
@@ -506,10 +516,23 @@ func (t *Telemetry) registerMetrics(meter metric.Meter) error {
 			runtimeMetricHeapAllocBytes: float64(ms.HeapAlloc),
 			runtimeMetricHeapSysBytes:   float64(ms.HeapSys),
 			runtimeMetricSysBytes:       float64(ms.Sys),
+
+			runtimeMetricClockOffsetNs: float64(clockSyncReadings.offsetNs.Load()),
+			runtimeMetricClockFreqPpb:  float64(clockSyncReadings.freqPpb.Load()),
 		}
+		tunnel := &nitriding.TunnelTraffic
 		growing := map[string]float64{
 			runtimeMetricGCPauseTotalNS: float64(ms.PauseTotalNs),
 			runtimeMetricGCCount:        float64(ms.NumGC),
+
+			runtimeMetricVsockEgressFrames:  float64(tunnel.EgressFrames.Load()),
+			runtimeMetricVsockEgressBytes:   float64(tunnel.EgressBytes.Load()),
+			runtimeMetricVsockEgressWriteNS: float64(tunnel.EgressWriteNanos.Load()),
+			runtimeMetricVsockIngressFrames: float64(tunnel.IngressFrames.Load()),
+			runtimeMetricVsockIngressBytes:  float64(tunnel.IngressBytes.Load()),
+
+			runtimeMetricClockHardSteps:    float64(clockSyncReadings.hardSteps.Load()),
+			runtimeMetricClockSyncFailures: float64(clockSyncReadings.failures.Load()),
 		}
 		// /proc is best effort: absent outside Linux and in some sandboxes.
 		if cpu, err := readProcCPU(); err == nil {

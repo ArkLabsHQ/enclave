@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
@@ -21,6 +22,15 @@ var (
 	frameLen     = 0xffff
 	frameSizeLen = 2
 )
+
+// TunnelTraffic counts frames relayed over the vsock tunnel to gvproxy since
+// boot, across reconnects. Bytes are frame payloads, without the 2-byte
+// length prefix.
+var TunnelTraffic struct {
+	EgressFrames, EgressBytes   atomic.Uint64 // enclave -> host
+	EgressWriteNanos            atomic.Uint64 // time blocked writing to vsock
+	IngressFrames, IngressBytes atomic.Uint64 // host -> enclave
+}
 
 // RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
 // on failure. hostProxyPort is the vsock port gvproxy listens on (typically 1024).
@@ -149,7 +159,9 @@ func rx(conn io.Writer, tap io.Reader, errCh chan error) {
 		}
 
 		binary.LittleEndian.PutUint16(buf[:frameSizeLen], uint16(n))
+		start := time.Now()
 		m, err := conn.Write(buf[:frameSizeLen+n])
+		TunnelTraffic.EgressWriteNanos.Add(uint64(time.Since(start)))
 		if err != nil {
 			errCh <- fmt.Errorf("failed to write payload to host: %w", err)
 			return
@@ -159,6 +171,8 @@ func rx(conn io.Writer, tap io.Reader, errCh chan error) {
 			errCh <- fmt.Errorf("wrote %d instead of %d bytes to host", m, n)
 			return
 		}
+		TunnelTraffic.EgressFrames.Add(1)
+		TunnelTraffic.EgressBytes.Add(uint64(n))
 	}
 }
 
@@ -190,6 +204,8 @@ func tx(conn io.Reader, tap io.Writer, errCh chan error) {
 			errCh <- fmt.Errorf("expected payload of size %d but got %d", size, n)
 			return
 		}
+		TunnelTraffic.IngressFrames.Add(1)
+		TunnelTraffic.IngressBytes.Add(uint64(n))
 
 		m, err := tap.Write(buf[frameSizeLen : n+frameSizeLen])
 		if err != nil {

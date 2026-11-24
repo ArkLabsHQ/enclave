@@ -59,12 +59,8 @@ type MigrationStatus struct {
 	AmbiguousTargets []string   `json:"ambiguous_targets,omitempty"`
 }
 
-// Serialize is the migration part of attestation user_data: "cooldown:"
-// followed by the seconds left of the cooldown, rounded up, as a big-endian
-// uint64, then "pcr0:" followed by the target PCR0: 70 bytes. The target is
-// set only for a migration that can still hand off, and the cooldown only while
-// it is cooling down. None, aborted, and ambiguous intents attest zero: an
-// ambiguous one cannot hand off until an abort resolves it.
+// Serialize encodes "cooldown:", RemainingSeconds as a big-endian uint64,
+// "pcr0:", then the 48-byte target PCR0 (70 bytes), zero unless cooling down or eligible.
 func (s *MigrationStatus) Serialize() ([]byte, error) {
 	var target [sha512.Size384]byte
 	if s.State == migrationStateCoolingDown || s.State == migrationStateEligible {

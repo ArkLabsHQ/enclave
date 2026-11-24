@@ -46,6 +46,8 @@ type ProxyEvidence struct {
 func VerifyProxyEvidence(
 	evidence ProxyEvidence, method string, request []byte, notBefore time.Time, opts Options,
 ) (*AttestationResult, error) {
+	// Both timestamps are in milliseconds; match notBefore so the same millisecond passes.
+	notBefore = notBefore.Truncate(time.Millisecond)
 	docBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(evidence.Attestation))
 	if err != nil {
 		return nil, fmt.Errorf("decode attestation document: %w", err)

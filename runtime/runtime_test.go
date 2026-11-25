@@ -214,7 +214,7 @@ func TestCheckAppBinary(t *testing.T) {
 }
 
 func TestSuperviseContextDoneStopsApp(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	want := errors.New("stop failed")
 	app := &fakeAppProcess{err: want}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -230,7 +230,7 @@ func TestSuperviseContextDoneStopsApp(t *testing.T) {
 }
 
 func TestSuperviseListenerErrorStopsApp(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	app := &fakeAppProcess{}
 	want := errors.New("listener failed")
 
@@ -248,7 +248,7 @@ func TestSuperviseListenerErrorStopsApp(t *testing.T) {
 }
 
 func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	app := &fakeAppProcess{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -272,7 +272,7 @@ func TestSuperviseChildExitWaitsForRuntime(t *testing.T) {
 
 // A cutoff restart relaunches the app and keeps supervising it.
 func TestSuperviseRestartRelaunchesApp(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -296,7 +296,7 @@ func TestSuperviseRestartRelaunchesApp(t *testing.T) {
 // The whole cutoff path short of the exec: a secret reaching its cutoff while
 // the app runs is left out of its environment, and the app is relaunched.
 func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	app := &fakeAppProcess{restarts: make(chan struct{}, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -353,7 +353,7 @@ func TestSuperviseRestartsAppAtInheritedSecretCutoff(t *testing.T) {
 }
 
 func TestNotifyChildStartClearsExit(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	go func() { <-rt.ChildDone() }()
 	rt.NotifyChildExit(errors.New("killed"))
 	require.True(t, rt.UpstreamAppInfo().Exited)
@@ -363,7 +363,7 @@ func TestNotifyChildStartClearsExit(t *testing.T) {
 }
 
 func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	want := errors.New("clock sync failed")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
@@ -376,7 +376,7 @@ func TestWaitForRuntimeReturnsCancelCause(t *testing.T) {
 }
 
 func TestWaitForRuntimeReturnsListenerError(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	want := errors.New("listener failed")
 
 	done := make(chan error, 1)
@@ -401,7 +401,7 @@ func waitTestResult(t *testing.T, ch <-chan error) error {
 }
 
 func TestRuntimeStateLifecycleOnlyMovesForward(t *testing.T) {
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	require.Equal(t, runtimeStatusCandidate, rt.Status())
 	require.False(t, rt.Ready())
 

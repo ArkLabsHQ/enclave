@@ -52,7 +52,7 @@
                 };
                 modRoot = "runtime";
                 subPackages = [ "cmd/runtime" ];
-                vendorHash = "sha256-v8II7XFhbzEP/uVpR4+Rj7DBGedy8N7nhTgVYpa82Uw=";
+                vendorHash = "sha256-nHbHserW+EkO0k9QJjhwh+DrIz6pbHLWBYy6b46Qdvs=";
                 env.CGO_ENABLED = "0";
                 buildFlags = [
                   "-trimpath"
@@ -79,7 +79,7 @@
                   version = "0.1.0";
                   src = ./.;
                   subPackages = [ "cmd/enclave" ];
-                  vendorHash = "sha256-+rOrv+GKRtpm1rOv1SrQNycrKHFXJGI99rbCUz4s6Iw=";
+                  vendorHash = "sha256-ZrRnAJMhtkx+rtJdW1yNK3yS38ndbRMFCUScXZDFR1M=";
                   env.GOWORK = "off";
                   buildFlags = [
                     "-trimpath"
@@ -108,6 +108,12 @@
               pkgs.golangci-lint-langserver
               pkgs.golines
               pkgs.gopls
+              # examples/proxy/: code generation and the TypeScript caller.
+              pkgs.buf
+              pkgs.protoc-gen-go
+              pkgs.protoc-gen-go-grpc
+              pkgs.protoc-gen-es
+              pkgs.nodejs_24
             ];
           };
         }

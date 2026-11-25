@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -22,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -81,7 +83,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 			cfg: testCfg,
 			int: &http.Server{Addr: occupied.Addr().String()},
 			ext: &http.Server{},
-			rt:  newRuntimeState(),
+			rt:  NewRuntimeState(),
 		}
 		err := s.Start(context.Background(), Config{})
 		require.ErrorContains(t, err, "private listener")
@@ -97,7 +99,7 @@ func TestServersStartReturnsBindErrors(t *testing.T) {
 			cfg: testCfg,
 			int: &http.Server{Addr: "127.0.0.1:0"},
 			ext: &http.Server{},
-			rt:  newRuntimeState(),
+			rt:  NewRuntimeState(),
 		}
 		err := s.Start(context.Background(), Config{ExtPort: uint16(port)})
 		require.ErrorContains(t, err, "public listener")
@@ -122,7 +124,7 @@ func TestPublicServerConnectionLimits(t *testing.T) {
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	key := newTestTLSKey(t)
 	certPEM := issueTestCertWithKey(t, "localhost", time.Now().Add(time.Hour), key)
 	certDER, _ := pem.Decode(certPEM)
@@ -241,7 +243,7 @@ func TestHealthHandler(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rt := newRuntimeState()
+			rt := NewRuntimeState()
 			if tc.ready {
 				rt.NotifyReady()
 			}
@@ -362,6 +364,9 @@ func TestAttestationHandler(t *testing.T) {
 		attData := &AttestationData{}
 		tlsHash := sha256.Sum256([]byte("tls"))
 		attData.SetTLSKeyHashSource(staticKeyHash(tlsHash))
+		attData.SetMigrationSource(
+			staticMigrationStatus(&MigrationStatus{State: migrationStateNone}, nil),
+		)
 		rawNonce := bytes.Repeat([]byte{0xab}, nonceNumDigits/2)
 
 		rr := httptest.NewRecorder()
@@ -386,17 +391,38 @@ func TestAttestationHandler(t *testing.T) {
 		if !bytes.Equal(req.Nonce, rawNonce) {
 			t.Fatalf("nonce: got %x, want %x", req.Nonce, rawNonce)
 		}
-		if !bytes.Equal(req.UserData, attData.Serialize()) {
-			t.Fatalf("user_data: got %x, want %x", req.UserData, attData.Serialize())
+		want, err := attData.UserData(context.Background())
+		require.NoError(t, err)
+		if !bytes.Equal(req.UserData, want) {
+			t.Fatalf("user_data: got %x, want %x", req.UserData, want)
 		}
-		require.Len(t, req.UserData, 79)
+		require.Len(t, req.UserData, 149)
+	})
+
+	t.Run("fails closed while the pending migration is unknown", func(t *testing.T) {
+		nonce := strings.Repeat("ab", nonceNumDigits/2)
+		unread := &AttestationData{}
+		unreadable := &AttestationData{}
+		unreadable.SetMigrationSource(
+			staticMigrationStatus(nil, errors.New("intent log unavailable")),
+		)
+		for name, attData := range map[string]*AttestationData{
+			"no source": unread, "source fails": unreadable,
+		} {
+			session := &fakeNSMSession{}
+			rr := httptest.NewRecorder()
+			attestationHandler(&nsmW{nsm: &fakeNSM{session: session}}, attData).ServeHTTP(rr,
+				httptest.NewRequest(http.MethodGet, "/enclave/attestation?nonce="+nonce, nil))
+			require.Equal(t, http.StatusInternalServerError, rr.Code, name)
+			require.Empty(t, session.requests, "%s: nothing may be attested", name)
+		}
 	})
 }
 
 func TestConfigureEnclaveInfoHandler(t *testing.T) {
 	ctx := context.Background()
 	ssm := NewSSM(&fakeSSM{})
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
@@ -465,7 +491,7 @@ func TestConfigureEnclaveInfoHandler(t *testing.T) {
 
 func TestConfigureEnclaveInfoHandlerReportsInboundHandoff(t *testing.T) {
 	requestedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: rt}
 	inbound := &CandidateInfo{
 		AwaitingHandoffFrom: strings.Repeat("ab", 48), RequestedAt: &requestedAt,
@@ -585,7 +611,7 @@ func enclaveInfoTestServer(t *testing.T) (*servers, Migrator) {
 	s := &servers{
 		cfg: testCfg,
 		rm:  http.NewServeMux(),
-		rt:  newRuntimeState(),
+		rt:  NewRuntimeState(),
 	}
 	nsm := &nsmW{nsm: newFakeNSM(t).withPCRs(map[uint][]byte{
 		0: bytes.Repeat([]byte{0xab}, 48),
@@ -635,7 +661,7 @@ func TestInternalMuxRoutesOTLPToTheForwarders(t *testing.T) {
 	appURL, err := url.Parse("http://127.0.0.1:1")
 	require.NoError(t, err)
 	s := SetupHttpServers(
-		newRuntimeState(),
+		NewRuntimeState(),
 		Config{AppWebSrv: appURL},
 		&nsmW{},
 		NewTelemetry(testCfg, testAWS(t, newFakeCloudWatchLogs(), up.URL)),
@@ -673,7 +699,7 @@ func TestExternalMuxSeparatesRuntimeAndApplicationRoutes(t *testing.T) {
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	s := SetupHttpServers(
 		rt,
 		Config{AppWebSrv: appURL},
@@ -859,7 +885,7 @@ func TestRuntimeSpans(t *testing.T) {
 		return s
 	}
 	ready := func() *runtimeState {
-		rt := newRuntimeState()
+		rt := NewRuntimeState()
 		rt.NotifyReady()
 		return rt
 	}
@@ -975,7 +1001,7 @@ func TestRuntimeSpans(t *testing.T) {
 
 	t.Run("the runtime's own 503 is recorded", func(t *testing.T) {
 		rr := serve(
-			setup(t, true, newRuntimeState()),
+			setup(t, true, NewRuntimeState()),
 			httptest.NewRequest(http.MethodGet, "/orders", nil),
 		)
 
@@ -1004,6 +1030,7 @@ func TestRuntimeSpans(t *testing.T) {
 
 func TestSignedProxiedResponse(t *testing.T) {
 	var received []byte
+	status := http.StatusCreated
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received, _ = io.ReadAll(r.Body)
 		out := append([]byte("echo:"), received...)
@@ -1016,14 +1043,14 @@ func TestSignedProxiedResponse(t *testing.T) {
 			w.Header().Set("Content-Encoding", "gzip")
 			out = buf.Bytes()
 		}
-		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(status)
 		_, _ = w.Write(out)
 	}))
 	defer app.Close()
 	appURL, err := url.Parse(app.URL)
 	require.NoError(t, err)
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 	rt.NotifyReady()
 	attData := &AttestationData{}
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
@@ -1031,58 +1058,71 @@ func TestSignedProxiedResponse(t *testing.T) {
 		rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), attData, "token",
 	).(*servers)
 
-	serveURI := func(uri, nonce string, header http.Header) *httptest.ResponseRecorder {
+	nonce := strings.Repeat("ab", nonceNumDigits/2)
+	serveURI := func(uri string, header http.Header) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, uri, strings.NewReader("amount=10"))
 		maps.Copy(req.Header, header)
-		if nonce != "" {
-			req.Header.Set(signNonceHeader, nonce)
-		}
 		rr := httptest.NewRecorder()
 		s.em.ServeHTTP(rr, req)
 		return rr
 	}
 	serve := func(nonce string) *httptest.ResponseRecorder {
-		return serveURI("/orders?x=1", nonce, nil)
-	}
-	verify := func(t *testing.T, rr *httptest.ResponseRecorder, nonce, uri string) {
-		t.Helper()
-		reqHash := sha256.Sum256([]byte("amount=10"))
-		respHash := sha256.Sum256(rr.Body.Bytes())
-		headersHash := sha256.Sum256([]byte("x-enclave-sign-nonce:" +
-			base64.StdEncoding.EncodeToString([]byte(nonce)) + "\n"))
-		msg := "enclave-signed-response\nPOST " + uri + "\nexample.com\n" +
-			hex.EncodeToString(headersHash[:]) + "\n" + hex.EncodeToString(reqHash[:]) +
-			"\n201\n" + hex.EncodeToString(respHash[:])
-		sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
-		require.NoError(t, err)
-		require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), []byte(msg), sig))
+		if nonce == "" {
+			return serveURI("/orders?x=1", nil)
+		}
+		return serveURI("/orders?x=1", http.Header{signNonceHeader: {nonce}})
 	}
 
 	t.Run("fails closed without a signing key, before the app sees it", func(t *testing.T) {
-		require.Equal(t, http.StatusServiceUnavailable, serve("n1").Code)
+		require.Equal(t, http.StatusServiceUnavailable, serve(nonce).Code)
 		require.Nil(t, received)
 	})
 
 	attData.SetResponseSigningKey(key)
 
-	t.Run("signs request and response when asked", func(t *testing.T) {
-		rr := serve("n1")
+	t.Run("rejects a malformed nonce before the app sees it", func(t *testing.T) {
+		for name, nonces := range map[string][]string{
+			"not 20 bytes": {strings.Repeat("ab", nonceNumDigits/2-1)},
+			"not hex":      {strings.Repeat("zz", nonceNumDigits/2)},
+			"repeated":     {nonce, nonce},
+		} {
+			rr := serveURI("/orders", http.Header{signNonceHeader: nonces})
+			require.Equal(t, http.StatusBadRequest, rr.Code, name)
+		}
+		require.Nil(t, received)
+	})
+
+	t.Run("signs the response when asked", func(t *testing.T) {
+		before := time.Now().Truncate(time.Millisecond)
+		rr := serve(nonce)
 		require.Equal(t, http.StatusCreated, rr.Code)
 		require.Equal(t, "amount=10", string(received), "the app still gets the body")
 		require.Equal(t, "echo:amount=10", rr.Body.String())
-		verify(t, rr, "n1", "/orders?x=1")
-		require.Contains(t, rr.Header().Values("Access-Control-Expose-Headers"), signatureHeader)
+		requireSigned(
+			t, key, rr.Header(),
+			http.MethodPost, "/orders?x=1", nonce, []byte("amount=10"), rr.Code, rr.Body.Bytes(),
+		)
+		ms, err := strconv.ParseInt(rr.Header().Get(timestampHeader), 10, 64)
+		require.NoError(t, err)
+		require.WithinRange(t, time.UnixMilli(ms), before, time.Now())
+		require.Subset(t, rr.Header().Values("Access-Control-Expose-Headers"),
+			[]string{signatureHeader, timestampHeader})
 		require.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
 	})
 
 	// Browsers always decompress and send "/a?" or "/a" interchangeably, so the
 	// signature must cover the decoded body and drop an empty query.
 	t.Run("signs what a browser sees", func(t *testing.T) {
-		rr := serveURI("/orders?", "n3", http.Header{"Accept-Encoding": {"gzip, br"}})
+		rr := serveURI("/orders?", http.Header{
+			signNonceHeader: {nonce}, "Accept-Encoding": {"gzip, br"},
+		})
 		require.Equal(t, http.StatusCreated, rr.Code)
 		require.Empty(t, rr.Header().Get("Content-Encoding"))
 		require.Equal(t, "echo:amount=10", rr.Body.String())
-		verify(t, rr, "n3", "/orders")
+		requireSigned(
+			t, key, rr.Header(),
+			http.MethodPost, "/orders", nonce, []byte("amount=10"), rr.Code, rr.Body.Bytes(),
+		)
 	})
 
 	t.Run("leaves other responses unsigned", func(t *testing.T) {
@@ -1091,71 +1131,148 @@ func TestSignedProxiedResponse(t *testing.T) {
 		require.Empty(t, rr.Header().Get(signatureHeader))
 	})
 
+	t.Run("signs an unsuccessful response like any other", func(t *testing.T) {
+		status = http.StatusConflict
+		defer func() { status = http.StatusCreated }()
+		rr := serve(nonce)
+		require.Equal(t, http.StatusConflict, rr.Code)
+		require.Equal(t, "echo:amount=10", rr.Body.String())
+		requireSigned(
+			t, key, rr.Header(),
+			http.MethodPost, "/orders?x=1", nonce, []byte("amount=10"), rr.Code, rr.Body.Bytes(),
+		)
+	})
+
 	t.Run("signs the proxy's own 502 when the app is down", func(t *testing.T) {
 		app.Close()
-		rr := serve("n2")
+		rr := serve(nonce)
 		require.Equal(t, http.StatusBadGateway, rr.Code)
-		require.NotEmpty(t, rr.Header().Get(signatureHeader))
+		requireSigned(
+			t, key, rr.Header(),
+			http.MethodPost, "/orders?x=1", nonce, []byte("amount=10"), rr.Code, rr.Body.Bytes(),
+		)
 	})
 }
 
-func TestSignedResponseAuthenticatesRequestHeaders(t *testing.T) {
-	attData := &AttestationData{}
-	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
-	attData.SetResponseSigningKey(key)
-	h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	}))
+func TestSignedGRPCResponse(t *testing.T) {
+	const service = "/test.v1.Service/"
+	message := []byte{0x0a, 0x03, 'k', 'e', 'y'}
+	frame := func(compressed byte, messages ...[]byte) []byte {
+		var out []byte
+		for _, m := range messages {
+			out = append(out, compressed)
+			out = binary.BigEndian.AppendUint32(out, uint32(len(m)))
+			out = append(out, m...)
+		}
+		return out
+	}
+	respond := func(header http.Header, body []byte, trailers http.Header) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/grpc")
+			maps.Copy(w.Header(), header)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			maps.Copy(w.Header(), trailers)
+		}
+	}
+	ok := http.Header{http.TrailerPrefix + "Grpc-Status": {"0"}}
 	for _, tc := range []struct {
-		name     string
-		mutate   func(*http.Request)
-		detected bool
+		rpc        string
+		handler    http.HandlerFunc
+		body       []byte
+		status     string // grpc-status as received, in headers or trailers
+		inTrailers bool
+		signed     bool
 	}{
-		{name: "unchanged"},
-		{"authorization", func(r *http.Request) { r.Header.Set("Authorization", "Bearer bob") }, true},
-		{"content type", func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") }, true},
-		{"authority", func(r *http.Request) { r.Host = "other.example" }, true},
-		{"cookie is not covered", func(r *http.Request) { r.Header.Set("Cookie", "session=bob") }, false},
-		{"proxy header is not covered", func(r *http.Request) {
-			r.Header.Set("X-Forwarded-For", "10.0.0.1")
-		}, false},
+		{
+			// grpc-go's own server sends trailers it never announced.
+			rpc: "Unannounced", handler: respond(nil, frame(0, message), ok),
+			body: frame(0, message), status: "0", inTrailers: true, signed: true,
+		},
+		{
+			// grpc-go's ServeHTTP announces them in a Trailer header.
+			rpc: "Announced", handler: respond(
+				http.Header{"Trailer": {"Grpc-Status, Grpc-Message"}},
+				frame(0, message), http.Header{"Grpc-Status": {"0"}},
+			),
+			body: frame(0, message), status: "0", inTrailers: true, signed: true,
+		},
+		{
+			rpc: "TrailersOnly", handler: respond(http.Header{"Grpc-Status": {"5"}}, nil, nil),
+			body: []byte{}, status: "5",
+		},
+		{
+			rpc: "Failed", handler: respond(nil, frame(0, message),
+				http.Header{http.TrailerPrefix + "Grpc-Status": {"13"}}),
+			body: frame(0, message), status: "13", inTrailers: true, signed: true,
+		},
+		{
+			rpc: "Compressed", handler: respond(nil, frame(1, message), ok),
+			body: frame(1, message), status: "0", inTrailers: true,
+		},
+		{
+			rpc: "Streamed", handler: respond(nil, frame(0, message, message), ok),
+			body: frame(0, message, message), status: "0", inTrailers: true,
+		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
-			req.Header.Set(signNonceHeader, "nonce")
-			req.Header.Set("Authorization", "Bearer alice")
-			expected, err := signing.CaptureResponseSigningContext(req, nil)
+		t.Run(tc.rpc, func(t *testing.T) {
+			app := httptest.NewUnstartedServer(tc.handler)
+			app.Config.Protocols = new(http.Protocols)
+			app.Config.Protocols.SetUnencryptedHTTP2(true)
+			app.Start()
+			defer app.Close()
+			appURL, err := url.Parse(app.URL)
 			require.NoError(t, err)
-			if tc.mutate != nil {
-				tc.mutate(req)
+
+			rt := NewRuntimeState()
+			rt.NotifyReady()
+			attData := &AttestationData{}
+			key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
+			attData.SetResponseSigningKey(key)
+			s := SetupHttpServers(
+				rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), attData, "token",
+			).(*servers)
+			front := httptest.NewUnstartedServer(s.ext.Handler)
+			front.EnableHTTP2 = true
+			front.StartTLS()
+			defer front.Close()
+
+			nonce := strings.Repeat("cd", nonceNumDigits/2)
+			req, err := http.NewRequest(
+				http.MethodPost, front.URL+service+tc.rpc, bytes.NewReader(frame(0, nil)),
+			)
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/grpc")
+			req.Header.Set("TE", "trailers")
+			req.Header.Set(signNonceHeader, nonce)
+			resp, err := front.Client().Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			require.Equal(t, 2, resp.ProtoMajor)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, tc.body, body)
+			if tc.inTrailers {
+				require.Equal(t, tc.status, resp.Trailer.Get("Grpc-Status"))
+				require.Empty(t, resp.Header.Get("Grpc-Status"), "status sent only once")
+			} else {
+				require.Equal(t, tc.status, resp.Header.Get("Grpc-Status"))
 			}
-			rr := httptest.NewRecorder()
-			h.ServeHTTP(rr, req)
-			require.Equal(t, http.StatusOK, rr.Code)
-			sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+			if !tc.signed {
+				require.Empty(t, resp.Header.Get(signatureHeader))
+				return
+			}
+			code, err := strconv.Atoi(tc.status)
 			require.NoError(t, err)
-			msg := expected.ResponseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
-			valid := ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig)
-			require.Equal(t, !tc.detected, valid)
+			requireSigned(
+				t, key, resp.Header,
+				http.MethodPost, service+tc.rpc, nonce, nil, code, message,
+			)
 		})
 	}
-}
-
-func TestSignedResponseRejectsConnectionHeaderStripping(t *testing.T) {
-	attData := &AttestationData{}
-	attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
-	called := false
-	h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		called = true
-	}))
-	req := httptest.NewRequest(http.MethodGet, "https://api.example/orders", nil)
-	req.Header.Set(signNonceHeader, "nonce")
-	req.Header.Set("Authorization", "Bearer alice")
-	req.Header.Set("Connection", "Authorization")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusBadRequest, rr.Code)
-	require.False(t, called, "reject before ReverseProxy removes a covered header")
 }
 
 func TestSignedRequestBodyReadError(t *testing.T) {
@@ -1166,62 +1283,173 @@ func TestSignedRequestBodyReadError(t *testing.T) {
 	}))
 	body := iotest.ErrReader(errors.New("client went away"))
 	req := httptest.NewRequest(http.MethodPost, "/orders", body)
-	req.Header.Set(signNonceHeader, "n")
+	req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
+func TestSignedRequestSizeLimit(t *testing.T) {
+	for _, unknownLength := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown_length=%t", unknownLength), func(t *testing.T) {
+			attData := &AttestationData{}
+			attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+			called := false
+			h := signResponses(attData, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				called = true
+			}))
+			body := strings.NewReader(strings.Repeat("x", maxSignedBytes+1))
+			req := httptest.NewRequest(http.MethodPost, "/orders", body)
+			if unknownLength {
+				req.ContentLength = -1
+			}
+			req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
+			require.False(t, called, "reject before the app sees the request")
+			require.Empty(t, rr.Header().Get(signatureHeader))
+		})
+	}
+}
+
+func TestSignedResponseSizeLimit(t *testing.T) {
+	t.Run("bodies at the limit are accepted", func(t *testing.T) {
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.Len(t, body, maxSignedBytes)
+			n, err := w.Write(make([]byte, maxSignedBytes))
+			require.NoError(t, err)
+			require.Equal(t, maxSignedBytes, n)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/orders",
+			bytes.NewReader(make([]byte, maxSignedBytes)))
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, maxSignedBytes, rr.Body.Len())
+		require.NotEmpty(t, rr.Header().Get(signatureHeader))
+	})
+
+	t.Run("an oversized response that skips the proxy gets a 502", func(t *testing.T) {
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		var overflowErr, laterErr error
+		h := signResponses(attData, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("prefix"))
+			_, overflowErr = w.Write(make([]byte, maxSignedBytes))
+			// This fits if overflow merely rejects the previous Write and forgets it.
+			_, laterErr = w.Write([]byte("tail"))
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/orders", nil)
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Error(t, overflowErr)
+		require.Error(t, laterErr, "overflow must persist across writes")
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Empty(t, rr.Header().Get(signatureHeader))
+		require.NotContains(t, rr.Body.String(), "prefix")
+	})
+
+	t.Run("an oversized proxied response drops the connection", func(t *testing.T) {
+		app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxSignedBytes+1)))
+		}))
+		t.Cleanup(app.Close)
+		appURL, err := url.Parse(app.URL)
+		require.NoError(t, err)
+		rt := NewRuntimeState()
+		rt.NotifyReady()
+		attData := &AttestationData{}
+		attData.SetResponseSigningKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+		s := SetupHttpServers(
+			rt, Config{AppWebSrv: appURL}, &nsmW{}, NewTelemetry(testCfg, nil), attData, "token",
+		).(*servers)
+		// Use a real server: ReverseProxy suppresses ErrAbortHandler in direct unit calls.
+		public := httptest.NewServer(s.ext.Handler)
+		t.Cleanup(public.Close)
+		client := public.Client()
+		client.Timeout = 2 * time.Second
+		req, err := http.NewRequest(http.MethodGet, public.URL+"/orders", nil)
+		require.NoError(t, err)
+		req.Header.Set(signNonceHeader, strings.Repeat("ab", nonceNumDigits/2))
+		res, err := client.Do(req)
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		require.ErrorIs(t, err, io.EOF, "ReverseProxy drops the connection")
+		require.Nil(t, res)
+	})
+}
+
 func TestSignedEnclaveInfo(t *testing.T) {
 	attData := &AttestationData{}
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState(), attData: attData}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: NewRuntimeState(), attData: attData}
 	require.NoError(t, s.ConfigureEnclaveInfoHandler(&migrationControlMigrator{
 		previous: &PreviousPCR0Info{},
 		status:   &MigrationStatus{},
 	}))
-	request := func(method, nonce string) (*http.Request, *httptest.ResponseRecorder) {
+	request := func(method, nonce string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, "/enclave/v1/info", nil)
 		if nonce != "" {
 			req.Header.Set(signNonceHeader, nonce)
 		}
 		rr := httptest.NewRecorder()
 		s.rm.ServeHTTP(rr, req)
-		return req, rr
+		return rr
 	}
-	get := func(nonce string) (*http.Request, *httptest.ResponseRecorder) {
-		return request(http.MethodGet, nonce)
-	}
+	nonce := strings.Repeat("ef", nonceNumDigits/2)
 
 	// A candidate has no signing key yet; plain readers still get the info.
-	_, rr := get("")
+	rr := request(http.MethodGet, "")
 	require.Equal(t, http.StatusOK, rr.Code)
-	_, rr = get("n1")
+	rr = request(http.MethodGet, nonce)
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code)
 
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
 	attData.SetResponseSigningKey(key)
-	req, rr := get("n2")
+	rr = request(http.MethodGet, nonce)
 	require.Equal(t, http.StatusOK, rr.Code)
-	signingContext, err := signing.CaptureResponseSigningContext(req, nil)
-	require.NoError(t, err)
-	sig, err := base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
-	require.NoError(t, err)
-	msg := signingContext.ResponseMessage(sha256.Sum256(rr.Body.Bytes()), rr.Code)
-	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
+	requireSigned(
+		t, key, rr.Header(),
+		http.MethodGet, "/enclave/v1/info", nonce, nil, rr.Code, rr.Body.Bytes(),
+	)
 
-	// GET patterns also serve HEAD, whose response reaches the client bodiless.
-	req, rr = request(http.MethodHead, "n3")
+	// GET patterns also serve HEAD, whose response reaches the client bodiless;
+	// the method keeps it from passing as an empty GET.
+	rr = request(http.MethodHead, nonce)
 	require.Equal(t, http.StatusOK, rr.Code)
-	signingContext, err = signing.CaptureResponseSigningContext(req, nil)
+	requireSigned(
+		t, key, rr.Header(), http.MethodHead, "/enclave/v1/info", nonce, nil, rr.Code, nil,
+	)
+}
+
+// requireSigned checks the X-Enclave-Signature in header over status and
+// response, for a request with method, target, the hex nonce, and request.
+func requireSigned(
+	t *testing.T, key ed25519.PrivateKey, header http.Header,
+	method, target, nonce string, request []byte, status int, response []byte,
+) {
+	t.Helper()
+	rawNonce, err := hex.DecodeString(nonce)
 	require.NoError(t, err)
-	sig, err = base64.StdEncoding.DecodeString(rr.Header().Get(signatureHeader))
+	sig, err := base64.StdEncoding.DecodeString(header.Get(signatureHeader))
 	require.NoError(t, err)
-	msg = signingContext.ResponseMessage(sha256.Sum256(nil), rr.Code)
+	ms, err := strconv.ParseInt(header.Get(timestampHeader), 10, 64)
+	require.NoError(t, err)
+	msg := signing.ResponseMessage(
+		method, target, rawNonce, time.UnixMilli(ms), request, status, response,
+	)
 	require.True(t, ed25519.Verify(key.Public().(ed25519.PublicKey), msg, sig))
 }
 
 func TestReportBootFailure(t *testing.T) {
-	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: newRuntimeState()}
+	s := &servers{cfg: testCfg, rm: http.NewServeMux(), rt: NewRuntimeState()}
 	s.ReportBootFailure(errors.New("permission preflight: role is missing SSMParams"))
 
 	rr := httptest.NewRecorder()

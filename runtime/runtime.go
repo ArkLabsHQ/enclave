@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -84,14 +86,14 @@ func Run(ctx context.Context, cfg Config) (err error) {
 
 	attData := &AttestationData{}
 
-	authToken, err := generateRuntimeToken()
+	otelToken, err := generateRuntimeToken()
 	if err != nil {
 		return fmt.Errorf("generate runtime token: %w", err)
 	}
 
-	rt := newRuntimeState()
+	rt := NewRuntimeState()
 
-	nsm := NewNSM(WithAttestationUnsigned(cfg.InsecureVerifySkipped))
+	nsm := NewNSM(OpenDefault, WithAttestationUnsigned(cfg.InsecureVerifySkipped))
 
 	servers := SetupHttpServers(
 		rt,
@@ -99,7 +101,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		nsm,
 		telemetry,
 		attData,
-		authToken,
+		otelToken,
 	)
 
 	if err := servers.Start(ctx, cfg); err != nil {
@@ -171,6 +173,8 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		return fmt.Errorf("failed to initialize migrator: %w", err)
 	}
 
+	attData.SetMigrationSource(migrator.MigrationStatus)
+
 	if err := servers.ConfigureEnclaveInfoHandler(migrator); err != nil {
 		return fmt.Errorf("failed to configure enclave info handler: %w", err)
 	}
@@ -233,7 +237,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		result.secrets.Inherited,
 		inheritCutoffPollInterval,
 	)
-	app, err := startApp(rt, cfg, authToken, result.secrets)
+	app, err := startApp(rt, cfg, otelToken, result.secrets)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
 	}
@@ -254,12 +258,12 @@ type appProcess interface {
 type execApp struct {
 	rt        RuntimeState
 	cfg       Config
-	authToken string
+	otelToken string
 	secrets   Secrets
 	cmd       *exec.Cmd
 }
 
-func appEnv(cfg Config, authToken string, secrets Secrets) []string {
+func appEnv(cfg Config, otelToken string, secrets Secrets) []string {
 	env := os.Environ()
 	// exec.Cmd.Env keeps the last value for duplicate keys, so append overrides.
 	for key, value := range cfg.ChildEnv {
@@ -276,22 +280,27 @@ func appEnv(cfg Config, authToken string, secrets Secrets) []string {
 			env = append(env, secret.EnvVar+"="+secret.Plaintext)
 		}
 	}
+	reserved := cfg.reservedEnv()
+	env = slices.DeleteFunc(env, func(entry string) bool {
+		name, _, _ := strings.Cut(entry, "=")
+		return reserved[name]
+	})
 	return append(
 		env,
 		"ENCLAVE_APP_PORT="+cfg.AppPort,
 		"PORT="+cfg.AppPort,
-		"ENCLAVE_PROXY_PORT="+strconv.Itoa(int(cfg.IntPort)),
-		"ENCLAVE_RUNTIME_TOKEN="+authToken,
+		cfg.OtelEndpointEnv+"=http://127.0.0.1:"+strconv.Itoa(int(cfg.IntPort)),
+		cfg.OtelTokenEnv+"="+otelToken,
 	)
 }
 
 func startApp(
 	rt RuntimeState,
 	cfg Config,
-	authToken string,
+	otelToken string,
 	secrets Secrets,
 ) (appProcess, error) {
-	app := &execApp{rt: rt, cfg: cfg, authToken: authToken, secrets: secrets}
+	app := &execApp{rt: rt, cfg: cfg, otelToken: otelToken, secrets: secrets}
 	if err := app.launch(); err != nil {
 		return nil, err
 	}
@@ -313,7 +322,7 @@ func (a *execApp) launch() error {
 	child := exec.Command(appPath)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = appEnv(cfg, a.authToken, a.secrets)
+	child.Env = appEnv(cfg, a.otelToken, a.secrets)
 
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("start child %s: %w", appPath, err)
@@ -497,7 +506,9 @@ func (r *runtimeState) ChildDone() <-chan error {
 	return r.childDoneCh
 }
 
-func newRuntimeState() *runtimeState {
+// NewRuntimeState returns the state a runtime starts in, for callers that run
+// SetupHttpServers themselves.
+func NewRuntimeState() *runtimeState {
 	r := &runtimeState{
 		tlsReadyCh:  make(chan struct{}),
 		listenErrCh: make(chan error, 4),

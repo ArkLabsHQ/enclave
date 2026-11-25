@@ -107,7 +107,7 @@ func TestFetchOrCreatePrimaryKMS(t *testing.T) {
 		if got.KeyID() == "" {
 			t.Fatalf("created key ID is empty")
 		}
-		requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), pcr0Hex, true)
+		requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), testRoleARN, pcr0Hex, true)
 	})
 }
 
@@ -181,10 +181,16 @@ func TestCreateMigrationKMS(t *testing.T) {
 	if got.KeyID() == "" || got.KeyID() == "primary" {
 		t.Fatalf("migration key ID = %q", got.KeyID())
 	}
-	requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), newPCR0, true)
+	requireKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), testRoleARN, newPCR0, true)
 	require.Error(
 		t,
-		verifyKeyPolicyPosture(t, kmsf.keyPolicy(got.KeyID()), hex.EncodeToString(curPCR0), true),
+		verifyKeyPolicyPosture(
+			t,
+			kmsf.keyPolicy(got.KeyID()),
+			testRoleARN,
+			hex.EncodeToString(curPCR0),
+			true,
+		),
 		"migration key must not admit the predecessor",
 	)
 }

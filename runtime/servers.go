@@ -317,8 +317,14 @@ func migrationHTTPStatus(err error) int {
 // other 4xx, and every 4xx on the internal listener, are real client errors and
 // stay logged.
 func metricsMiddleware(telemetry *Telemetry, public bool) func(http.Handler) http.Handler {
+	inflight := &telemetry.internalInflight
+	if public {
+		inflight = &telemetry.publicInflight
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			inflight.Add(1)
+			defer inflight.Add(-1)
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)

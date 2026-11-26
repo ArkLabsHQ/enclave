@@ -168,6 +168,8 @@ func TestObserveSignDirection(t *testing.T) {
 }
 
 func TestObserveHardStep(t *testing.T) {
+	// The readings are package-level, so check how far they moved.
+	hardSteps := clockSyncReadings.hardSteps.Load()
 	cs := &clockSyncer{cfg: defaultServoConfig()}
 	// First sample has no interval yet: holds the (zero) standing frequency.
 	applied, isHardStep, _ := captureAdjust(cs, offsetMeasurement{xMonoNs: 0, offsetNs: 1000})
@@ -190,6 +192,8 @@ func TestObserveHardStep(t *testing.T) {
 		},
 	)
 	require.True(t, isHardStep, "gross offset triggers hard-step")
+	require.Equal(t, hardSteps+1, clockSyncReadings.hardSteps.Load())
+	require.Zero(t, clockSyncReadings.offsetNs.Load(), "the step leaves no offset")
 	require.Equal(t, int64(42_000_000_000), stepToNs)
 	require.Equal(
 		t,
@@ -261,7 +265,8 @@ func TestAdjustSetsFrequencyOnly(t *testing.T) {
 	var modes uint32
 	clockAdjtime = func(_ int32, tx *unix.Timex) (int, error) { modes = tx.Modes; return 0, nil }
 
-	cs := &clockSyncer{cfg: defaultServoConfig()}
+	// The first sample has no interval yet, so the standing 1.5 ppm is what is applied.
+	cs := &clockSyncer{cfg: defaultServoConfig(), integralPpm: 1.5}
 	require.NoError(t, cs.adjust(offsetMeasurement{xMonoNs: 0, offsetNs: 1000}))
 
 	require.Equal(
@@ -270,6 +275,8 @@ func TestAdjustSetsFrequencyOnly(t *testing.T) {
 		modes,
 		"ADJ_STATUS would replace every writable status flag, clearing STA_UNSYNC and pending STA_INS/STA_DEL",
 	)
+	require.Equal(t, int64(1000), clockSyncReadings.offsetNs.Load())
+	require.Equal(t, int64(1500), clockSyncReadings.freqPpb.Load())
 }
 
 // TestNewClockSyncer covers the OS-facing bootstrap: every failure path is fatal
@@ -345,6 +352,7 @@ func TestStepRetry(t *testing.T) {
 	}
 
 	t.Run("transient failure recovers before the deadline", func(t *testing.T) {
+		failures := clockSyncReadings.failures.Load()
 		var reads int
 		clockGettime = func(int32, *unix.Timespec) error {
 			if reads++; reads <= 3 {
@@ -353,6 +361,8 @@ func TestStepRetry(t *testing.T) {
 			return nil
 		}
 		require.NoError(t, newCS().step(context.Background()))
+		// Each failing read fails one attempt: three failures, then success.
+		require.Equal(t, failures+3, clockSyncReadings.failures.Load())
 	})
 
 	t.Run("failure past the deadline halts", func(t *testing.T) {

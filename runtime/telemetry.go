@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ArkLabsHQ/enclave/runtime/nitriding"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
@@ -106,6 +107,7 @@ const (
 	metricAppProxiedRequests    = "enclave_app_proxied_requests_total"
 	metricAppProxiedErrors      = "enclave_app_proxied_errors_total"
 	metricTelemetryExportErrors = "enclave_telemetry_export_errors_total"
+	metricHTTPInflightRequests  = "enclave_http_inflight_requests"
 )
 
 const runtimeMetricPrefix = "enclave_runtime_"
@@ -127,6 +129,9 @@ var (
 		runtimeMetricMemTotalKB,
 		runtimeMetricMemFreeKB,
 		runtimeMetricMemAvailableKB,
+		runtimeMetricClockOffsetNs,
+		runtimeMetricClockFreqPpb,
+		runtimeMetricTLSCertExpirySeconds,
 	}
 	runtimeCounters = []string{
 		runtimeMetricGCPauseTotalNS,
@@ -139,6 +144,14 @@ var (
 		runtimeMetricCPUIRQ,
 		runtimeMetricCPUSoftIRQ,
 		runtimeMetricCPUSteal,
+		runtimeMetricVsockEgressFrames,
+		runtimeMetricVsockEgressBytes,
+		runtimeMetricVsockEgressWriteNS,
+		runtimeMetricVsockIngressFrames,
+		runtimeMetricVsockIngressBytes,
+		runtimeMetricVsockTunnelFailures,
+		runtimeMetricClockHardSteps,
+		runtimeMetricClockSyncFailures,
 	}
 )
 
@@ -168,6 +181,8 @@ const (
 type Telemetry struct {
 	counters  map[string]metric.Int64Counter
 	durations atomic.Pointer[[otlpEndpointCount]metric.Float64Histogram]
+
+	publicInflight, internalInflight atomic.Int64
 
 	cw            CloudWatchLogsAPI
 	groups        [signalCount]string
@@ -496,8 +511,13 @@ func (t *Telemetry) registerMetrics(meter metric.Meter) error {
 		totals[name] = inst
 		observables = append(observables, inst)
 	}
+	inflight, err := meter.Int64ObservableGauge(metricHTTPInflightRequests)
+	if err != nil {
+		return err
+	}
+	observables = append(observables, inflight)
 
-	_, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+	_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		levels := map[string]float64{
@@ -506,10 +526,29 @@ func (t *Telemetry) registerMetrics(meter metric.Meter) error {
 			runtimeMetricHeapAllocBytes: float64(ms.HeapAlloc),
 			runtimeMetricHeapSysBytes:   float64(ms.HeapSys),
 			runtimeMetricSysBytes:       float64(ms.Sys),
+
+			runtimeMetricClockOffsetNs: float64(clockSyncReadings.offsetNs.Load()),
+			runtimeMetricClockFreqPpb:  float64(clockSyncReadings.freqPpb.Load()),
 		}
+		if notAfter := servedCertNotAfter.Load(); notAfter != 0 {
+			left := time.Until(time.Unix(notAfter, 0))
+			levels[runtimeMetricTLSCertExpirySeconds] = left.Seconds()
+		}
+		tunnel := &nitriding.TunnelTraffic
 		growing := map[string]float64{
 			runtimeMetricGCPauseTotalNS: float64(ms.PauseTotalNs),
 			runtimeMetricGCCount:        float64(ms.NumGC),
+
+			runtimeMetricVsockEgressFrames:  float64(tunnel.EgressFrames.Load()),
+			runtimeMetricVsockEgressBytes:   float64(tunnel.EgressBytes.Load()),
+			runtimeMetricVsockEgressWriteNS: float64(tunnel.EgressWriteNanos.Load()),
+			runtimeMetricVsockIngressFrames: float64(tunnel.IngressFrames.Load()),
+			runtimeMetricVsockIngressBytes:  float64(tunnel.IngressBytes.Load()),
+
+			runtimeMetricVsockTunnelFailures: float64(tunnel.Failures.Load()),
+
+			runtimeMetricClockHardSteps:    float64(clockSyncReadings.hardSteps.Load()),
+			runtimeMetricClockSyncFailures: float64(clockSyncReadings.failures.Load()),
 		}
 		// /proc is best effort: absent outside Linux and in some sandboxes.
 		if cpu, err := readProcCPU(); err == nil {
@@ -528,6 +567,10 @@ func (t *Telemetry) registerMetrics(meter metric.Meter) error {
 				o.ObserveFloat64(inst, v)
 			}
 		}
+		o.ObserveInt64(inflight, t.publicInflight.Load(),
+			metric.WithAttributes(attribute.String("listener", "public")))
+		o.ObserveInt64(inflight, t.internalInflight.Load(),
+			metric.WithAttributes(attribute.String("listener", "internal")))
 		return nil
 	}, observables...)
 	return err

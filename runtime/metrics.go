@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -27,7 +28,34 @@ const (
 	runtimeMetricCPUIRQ         = "cpu_irq"
 	runtimeMetricCPUSoftIRQ     = "cpu_softirq"
 	runtimeMetricCPUSteal       = "cpu_steal"
+
+	runtimeMetricVsockEgressFrames  = "vsock_egress_frames"
+	runtimeMetricVsockEgressBytes   = "vsock_egress_bytes"
+	runtimeMetricVsockEgressWriteNS = "vsock_egress_write_ns"
+	runtimeMetricVsockIngressFrames = "vsock_ingress_frames"
+	runtimeMetricVsockIngressBytes  = "vsock_ingress_bytes"
+
+	runtimeMetricVsockTunnelFailures = "vsock_tunnel_failures"
+
+	runtimeMetricClockOffsetNs     = "clock_offset_ns"
+	runtimeMetricClockFreqPpb      = "clock_freq_ppb"
+	runtimeMetricClockHardSteps    = "clock_hard_steps"
+	runtimeMetricClockSyncFailures = "clock_sync_failures"
+
+	runtimeMetricTLSCertExpirySeconds = "tls_cert_expiry_seconds"
 )
+
+// clockSyncReadings holds the clock syncer's latest results for telemetry.
+var clockSyncReadings struct {
+	offsetNs  atomic.Int64  // PHC - CLOCK_REALTIME
+	freqPpb   atomic.Int64  // last applied frequency correction
+	hardSteps atomic.Uint64 // gross-offset steps after boot
+	failures  atomic.Uint64 // failed sync attempts
+}
+
+// servedCertNotAfter is the served shared certificate's expiry in Unix seconds,
+// for telemetry; zero until a shared certificate is served.
+var servedCertNotAfter atomic.Int64
 
 // readProcCPU reads CPU counters from /proc/stat.
 func readProcCPU() (map[string]float64, error) {

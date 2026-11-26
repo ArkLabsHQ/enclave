@@ -38,6 +38,12 @@ enclave alive but permanently unreachable. We delete any pre-existing
 `tap0` link before creating the TAP device, guaranteeing a clean slate.
 Re-apply this block when syncing to a newer upstream.
 
+**`proxy.go` — `TunnelTraffic` counters in `rx`, `tx` and `RunNetworking`.**
+They count the frames and bytes relayed over the vsock tunnel, the time `rx`
+spends blocked writing to it, and the tunnel setups that fail or drop. The
+runtime exports them as `enclave_runtime_vsock_*` metrics.
+Re-apply them when syncing to a newer upstream.
+
 ## Syncing to a newer upstream
 
 1. `git diff --stat v1.4.2..<new-tag> -- '*.go' ':!main*' ':!system_darwin*'` against

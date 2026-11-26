@@ -16,7 +16,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/fxamacker/cbor/v2"
@@ -41,6 +40,16 @@ const (
 type commitmentCutoff struct {
 	commitment string
 	cutoff     string
+}
+
+// UnmarshalJSON splits "<hex>[:<unix-ts>]", lower-casing the hex.
+func (c *commitmentCutoff) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	c.commitment, c.cutoff, _ = strings.Cut(strings.ToLower(value), ":")
+	return nil
 }
 
 // deriveValidScalar uses HKDF-SHA256 extract-and-expand with protocol constants.
@@ -149,8 +158,7 @@ func (sm SecretsMetadata) Validate(cfg Config) error {
 }
 
 // Secrets is what boot resolved from SecretsMetadata: the derived static
-// secrets, and the inherited ones that are present, verified and before their
-// cutoff.
+// secrets, and the inherited ones that are present and verified.
 type Secrets struct {
 	Static    []StaticSecret
 	Inherited []InheritedSecret
@@ -271,24 +279,16 @@ const (
 
 // InheritSecretMetadata defines a secret born outside the enclave and handed in
 // through SSM (ENCLAVE_INHERIT_SECRETS_CONFIG). The image pins what the secret
-// must be, so the pin and the cutoff are part of PCR0. Value holds the
+// must be, so the pin is part of PCR0. Value holds the
 // commitments, each matched by one delivered entry, and every entry's secret
 // is hex: `hash` pins the SHA-256 of the decoded secret, `publicKey` pins
 // compressed secp256k1 public keys whose secrets are private keys. A
 // commitment may end in ":<unix-ts>", a cutoff its entry must carry as is.
-// From Cutoff on, the app no longer receives it; without a Cutoff, it always does.
 type InheritSecretMetadata struct {
-	Name   string    `json:"name"`
-	EnvVar string    `json:"env_var"`
-	Type   string    `json:"type"`
-	Value  []string  `json:"value"`
-	Cutoff time.Time `json:"cutoff"`
-}
-
-// pastCutoff reports whether the secret has reached its cutoff by now. A secret
-// without a cutoff never does.
-func (m InheritSecretMetadata) pastCutoff(now time.Time) bool {
-	return !m.Cutoff.IsZero() && !now.Before(m.Cutoff)
+	Name   string             `json:"name"`
+	EnvVar string             `json:"env_var"`
+	Type   string             `json:"type"`
+	Value  []commitmentCutoff `json:"value"`
 }
 
 type InheritedSecret struct {
@@ -376,23 +376,21 @@ func (sm SecretsMetadata) validateInherited(reserved map[string]bool) error {
 				m.Type,
 			)
 		}
-		seenValues := make(map[string]bool, len(m.Value))
+		seenValues := make(map[commitmentCutoff]bool, len(m.Value))
 		for i, value := range m.Value {
-			// Hex case is not significant, so "AB" and "ab" are the same pin.
-			if seenValues[strings.ToLower(value)] {
+			if seenValues[value] {
 				return fmt.Errorf("inherited secret %q: %s %d is a duplicate", m.Name, m.Type, i)
 			}
-			seenValues[strings.ToLower(value)] = true
-			commitmentHex, cutoff, hasCutoff := strings.Cut(value, ":")
-			if hasCutoff {
-				if _, err := strconv.ParseUint(cutoff, 10, 64); err != nil {
+			seenValues[value] = true
+			if value.cutoff != "" {
+				if _, err := strconv.ParseUint(value.cutoff, 10, 64); err != nil {
 					return fmt.Errorf(
 						"inherited secret %q: %s %d cutoff %q is not a unix timestamp",
-						m.Name, m.Type, i, cutoff,
+						m.Name, m.Type, i, value.cutoff,
 					)
 				}
 			}
-			commitment, err := hex.DecodeString(commitmentHex)
+			commitment, err := hex.DecodeString(value.commitment)
 			if err != nil {
 				return fmt.Errorf(
 					"inherited secret %q: %s %d is not hex: %w",
@@ -435,12 +433,9 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 
 	// entryByCommitment holds every pinned commitment with the delivered entry
 	// that matches it; "" until one does.
-	commitments := make([]commitmentCutoff, len(m.Value))
 	entryByCommitment := make(map[commitmentCutoff]string, len(m.Value))
-	for i, value := range m.Value {
-		commitment, cutoff, _ := strings.Cut(strings.ToLower(value), ":")
-		commitments[i] = commitmentCutoff{commitment: commitment, cutoff: cutoff}
-		entryByCommitment[commitments[i]] = ""
+	for _, commitment := range m.Value {
+		entryByCommitment[commitment] = ""
 	}
 	for i, value := range values {
 		// An entry may carry a cutoff after a colon, "<secret>:<unix-ts>"; it is
@@ -498,12 +493,12 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 	}
 
 	pinnedEntries := make([]string, 0, len(entryByCommitment))
-	for i, commitment := range commitments {
+	for _, commitment := range m.Value {
 		entry := entryByCommitment[commitment]
 		if entry == "" {
 			return "", fmt.Errorf(
 				"inherited secret %q: pinned %s %s has no delivered value",
-				m.Name, m.Type, m.Value[i],
+				m.Name, m.Type, commitment.commitment,
 			)
 		}
 		pinnedEntries = append(pinnedEntries, entry)
@@ -512,26 +507,19 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 	return strings.Join(pinnedEntries, ","), nil
 }
 
-// resolveInheritedSecrets reads the inherited secrets still before their cutoff
-// and verifies each against its pin. A secret past its cutoff is never fetched,
-// so its parameter and KMS key can be retired. A value that fails its pin
-// aborts boot; an absent one is skipped, which withdraws the secret from this
-// and future boots.
+// resolveInheritedSecrets reads the inherited secrets and verifies each against
+// its pin. A value that fails its pin aborts boot; an absent one is skipped,
+// which withdraws the secret from this and future boots.
 func resolveInheritedSecrets(
 	ctx context.Context,
 	cfg *Config,
 	ssm SSM,
 	meta []InheritSecretMetadata,
-	now time.Time,
 ) ([]InheritedSecret, error) {
 	prefix := cfg.inheritSecretPrefix()
 
 	var secrets []InheritedSecret
 	for _, m := range meta {
-		if m.pastCutoff(now) {
-			slog.Info("inherited secret is past its cutoff", "name", m.Name, "cutoff", m.Cutoff)
-			continue
-		}
 		plaintext, err := ssm.MayGet(ctx, prefix+m.Name, WithDecryption())
 		if err != nil {
 			return nil, fmt.Errorf("failed to read inherited secret %q: %w", m.Name, err)
@@ -554,64 +542,4 @@ func resolveInheritedSecrets(
 	}
 
 	return secrets, nil
-}
-
-// watchInheritCutoffs signals that the app must be relaunched once one of the
-// inherited secrets it was started with reaches its cutoff. Secrets without a
-// cutoff, or already past it, are never watched: the app is launched without
-// the latter, so it must be called before the app is launched.
-func watchInheritCutoffs(
-	ctx context.Context,
-	inherited []InheritedSecret,
-	interval time.Duration,
-) <-chan struct{} {
-	restart := make(chan struct{}, 1)
-	now := time.Now()
-	pending := slices.DeleteFunc(slices.Clone(inherited), func(s InheritedSecret) bool {
-		if s.Cutoff.IsZero() {
-			return true
-		}
-		if !s.pastCutoff(now) {
-			return false
-		}
-		slog.Info("inherited secret reached its cutoff before the app started",
-			"name", s.Name, "cutoff", s.Cutoff)
-		return true
-	})
-	if len(pending) == 0 {
-		return restart
-	}
-
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for len(pending) > 0 {
-			current := time.Now()
-			expired := false
-			pending = slices.DeleteFunc(pending, func(s InheritedSecret) bool {
-				if !s.pastCutoff(current) {
-					return false
-				}
-				slog.Info("inherited secret reached its cutoff", "name", s.Name, "cutoff", s.Cutoff)
-				expired = true
-				return true
-			})
-
-			if expired {
-				select {
-				case restart <- struct{}{}:
-				default:
-				}
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-
-	return restart
 }

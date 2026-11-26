@@ -59,15 +59,10 @@ def setup_aws():
         "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/LeaseBucketName "
         f"--type String --value {LEASE_BUCKET}"
     )
-    for inherited, value in (
-        ("e2e-inherited", INHERITED_WITH_CUTOFF),
-        ("e2e-expired", INHERITED),
-        ("e2e-cutoff", INHERITED),
-    ):
-        cloud(
-            f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/{inherited} "
-            f"--type String --value {value}"
-        )
+    cloud(
+        "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/e2e-inherited "
+        f"--type String --value {INHERITED_WITH_CUTOFF}"
+    )
     put_env("ENCLAVE_FQDN", FQDN)
 
 

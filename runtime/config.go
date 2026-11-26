@@ -91,8 +91,6 @@ const (
 	migrationPollInterval    = 5 * time.Second
 	migrationChallengeRotate = time.Minute
 
-	inheritCutoffPollInterval = 30 * time.Second
-
 	migrationAbortResponse = "abort"
 
 	// extPort is the public TLS listener. Fixed: the host's routing, the README

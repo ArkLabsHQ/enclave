@@ -230,32 +230,13 @@ let
     ENCLAVE_METRICS = "true";
     ENCLAVE_OTEL_ENDPOINT_ENV = "APP_OTEL_ENDPOINT";
     ENCLAVE_OTEL_TOKEN_ENV = "APP_OTEL_TOKEN";
-    # e2e.py places the inherited values in SSM, hex-encoded; each hash pin is
-    # the SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
-    # only verified, and its commitment also pins the entry's ":<unix-ts>" for
-    # the app. The second is already past its cutoff. The third's cutoff
-    # is reached when e2e.py steps a node's clock to just before it, so the
-    # restart-without-the-secret path runs for real.
+    # The pin is the SHA-256 of "inherited-from-outside" plus the app's ":<unix-ts>".
     ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
       {
         name = "e2e-inherited";
         env_var = "E2E_INHERITED";
         type = "hash";
         value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22:1798761600" ];
-      }
-      {
-        name = "e2e-expired";
-        env_var = "E2E_EXPIRED";
-        type = "hash";
-        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
-        cutoff = "2020-01-01T00:00:00Z";
-      }
-      {
-        name = "e2e-cutoff";
-        env_var = "E2E_CUTOFF";
-        type = "hash";
-        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
-        cutoff = "2040-01-01T00:00:00Z";
       }
     ];
 

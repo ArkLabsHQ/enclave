@@ -32,6 +32,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/netutil"
 )
 
 const (
@@ -41,6 +42,10 @@ const (
 	signNonceHeader = "X-Enclave-Sign-Nonce"
 	signatureHeader = "X-Enclave-Signature"
 	timestampHeader = "X-Enclave-Timestamp"
+
+	publicReadHeaderTimeout = 5 * time.Second
+	publicIdleTimeout       = 60 * time.Second
+	maxPublicConnections    = 1024
 
 	// Caps each buffered signed body; 4 MiB is gRPC's default receive limit.
 	maxSignedBytes = 4 << 20
@@ -143,7 +148,9 @@ func SetupHttpServers(
 	im.Handle("/health", sm)
 
 	ext := &http.Server{
-		Handler: metricsMiddleware(telemetry, true)(em),
+		Handler:           metricsMiddleware(telemetry, true)(em),
+		ReadHeaderTimeout: publicReadHeaderTimeout,
+		IdleTimeout:       publicIdleTimeout,
 		TLSConfig: &tls.Config{
 			GetCertificate: certCallback(rt),
 			MinVersion:     tls.VersionTLS12,
@@ -187,7 +194,7 @@ func (s *servers) Start(ctx context.Context, cfg Config) error {
 
 	go func() {
 		if err := s.ext.ServeTLS(
-			public,
+			netutil.LimitListener(public, maxPublicConnections),
 			"",
 			"",
 		); err != nil &&

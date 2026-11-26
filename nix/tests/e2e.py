@@ -219,7 +219,7 @@ for node in BLUES:
 
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
-    assert env_value(node, "E2E_INHERITED") == INHERITED
+    assert env_value(node, "E2E_INHERITED") == INHERITED_WITH_CUTOFF
     assert env_value(node, "E2E_CUTOFF") == INHERITED
     assert env_value(node, "E2E_EXPIRED") == ""
     assert env_value(node, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
@@ -887,7 +887,7 @@ assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
 assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
 assert served_leaf(green_peer, "-noout -pubkey") == tls_public_key
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
-assert env_value(green_peer, "E2E_INHERITED") == INHERITED
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED_WITH_CUTOFF
 assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
 assert env_value(green_peer, "E2E_EXPIRED") == ""
 green_peer.succeed(
@@ -1118,7 +1118,7 @@ assert env_value(green_peer, "E2E_CUTOFF") == ""
 assert secret_value(green_peer) == blue_secret
 assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
 assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
-assert env_value(green_peer, "E2E_INHERITED") == INHERITED
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED_WITH_CUTOFF
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     "| jq -e '.status == \"ready\" and .upstream_app.exited == false'"

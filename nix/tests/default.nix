@@ -232,7 +232,8 @@ let
     ENCLAVE_OTEL_TOKEN_ENV = "APP_OTEL_TOKEN";
     # e2e.py places the inherited values in SSM, hex-encoded; each hash pin is
     # the SHA-256 of "inherited-from-outside". The first has no cutoff, so it is
-    # only verified. The second is already past its cutoff. The third's cutoff
+    # only verified, and its commitment also pins the entry's ":<unix-ts>" for
+    # the app. The second is already past its cutoff. The third's cutoff
     # is reached when e2e.py steps a node's clock to just before it, so the
     # restart-without-the-secret path runs for real.
     ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON [
@@ -240,7 +241,7 @@ let
         name = "e2e-inherited";
         env_var = "E2E_INHERITED";
         type = "hash";
-        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22" ];
+        value = [ "9b6acc38580f4e35c1b3eccea0b489bf119e13c8b1cd0b6d3f8866ae51d98d22:1798761600" ];
       }
       {
         name = "e2e-expired";

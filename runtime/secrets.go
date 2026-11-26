@@ -14,6 +14,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,12 @@ const (
 	acmeAccountKeyDerivationName     = runtimeDerivationPrefix + "ACMEAccountKey"
 	responseSigningKeyDerivationName = runtimeDerivationPrefix + "ResponseSigningKey"
 )
+
+// commitmentCutoff is a lower-case hex commitment and its cutoff, "" for none.
+type commitmentCutoff struct {
+	commitment string
+	cutoff     string
+}
 
 // deriveValidScalar uses HKDF-SHA256 extract-and-expand with protocol constants.
 // A plain CBOR string has a definite, shortest-length header and preserves the
@@ -267,7 +274,8 @@ const (
 // must be, so the pin and the cutoff are part of PCR0. Value holds the
 // commitments, each matched by one delivered entry, and every entry's secret
 // is hex: `hash` pins the SHA-256 of the decoded secret, `publicKey` pins
-// compressed secp256k1 public keys whose secrets are private keys.
+// compressed secp256k1 public keys whose secrets are private keys. A
+// commitment may end in ":<unix-ts>", a cutoff its entry must carry as is.
 // From Cutoff on, the app no longer receives it; without a Cutoff, it always does.
 type InheritSecretMetadata struct {
 	Name   string    `json:"name"`
@@ -375,7 +383,16 @@ func (sm SecretsMetadata) validateInherited(reserved map[string]bool) error {
 				return fmt.Errorf("inherited secret %q: %s %d is a duplicate", m.Name, m.Type, i)
 			}
 			seenValues[strings.ToLower(value)] = true
-			commitment, err := hex.DecodeString(value)
+			commitmentHex, cutoff, hasCutoff := strings.Cut(value, ":")
+			if hasCutoff {
+				if _, err := strconv.ParseUint(cutoff, 10, 64); err != nil {
+					return fmt.Errorf(
+						"inherited secret %q: %s %d cutoff %q is not a unix timestamp",
+						m.Name, m.Type, i, cutoff,
+					)
+				}
+			}
+			commitment, err := hex.DecodeString(commitmentHex)
 			if err != nil {
 				return fmt.Errorf(
 					"inherited secret %q: %s %d is not hex: %w",
@@ -416,17 +433,20 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 		values[i] = strings.TrimSpace(values[i])
 	}
 
-	// entryByCommitment holds every pinned commitment, as lower-case hex, with
-	// the delivered entry that matches it; "" until one does.
-	entryByCommitment := make(map[string]string, len(m.Value))
-	for _, value := range m.Value {
-		entryByCommitment[strings.ToLower(value)] = ""
+	// entryByCommitment holds every pinned commitment with the delivered entry
+	// that matches it; "" until one does.
+	commitments := make([]commitmentCutoff, len(m.Value))
+	entryByCommitment := make(map[commitmentCutoff]string, len(m.Value))
+	for i, value := range m.Value {
+		commitment, cutoff, _ := strings.Cut(strings.ToLower(value), ":")
+		commitments[i] = commitmentCutoff{commitment: commitment, cutoff: cutoff}
+		entryByCommitment[commitments[i]] = ""
 	}
 	for i, value := range values {
-		// An entry may carry app metadata after a colon, "<secret>:<unix-ts>";
-		// only the secret is pinned, the entry is delivered whole.
-		value, _, _ = strings.Cut(value, ":")
-		secretBytes, err := hex.DecodeString(value)
+		// An entry may carry a cutoff after a colon, "<secret>:<unix-ts>"; it is
+		// pinned with the secret, and the entry is delivered whole.
+		secret, cutoff, _ := strings.Cut(value, ":")
+		secretBytes, err := hex.DecodeString(secret)
 		if err != nil || len(secretBytes) == 0 {
 			slog.Warn("inherited secret value ignored: not hex", "name", m.Name, "index", i)
 			continue
@@ -458,8 +478,8 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 			// Validation refuses this first.
 			return "", fmt.Errorf("inherited secret %q: unknown type %q", m.Name, m.Type)
 		}
-		commitment := hex.EncodeToString(got)
-		matchedEntry, pinned := entryByCommitment[commitment]
+		entryCommitment := commitmentCutoff{commitment: hex.EncodeToString(got), cutoff: cutoff}
+		matchedEntry, pinned := entryByCommitment[entryCommitment]
 		if !pinned {
 			slog.Warn(
 				"inherited secret value ignored: matches no pinned commitment",
@@ -474,17 +494,16 @@ func verifyInheritedSecret(m InheritSecretMetadata, plaintext string) (string, e
 			)
 			continue
 		}
-		entryByCommitment[commitment] = values[i]
+		entryByCommitment[entryCommitment] = values[i]
 	}
 
 	pinnedEntries := make([]string, 0, len(entryByCommitment))
-	for _, value := range m.Value {
-		commitment := strings.ToLower(value)
+	for i, commitment := range commitments {
 		entry := entryByCommitment[commitment]
 		if entry == "" {
 			return "", fmt.Errorf(
 				"inherited secret %q: pinned %s %s has no delivered value",
-				m.Name, m.Type, commitment,
+				m.Name, m.Type, m.Value[i],
 			)
 		}
 		pinnedEntries = append(pinnedEntries, entry)

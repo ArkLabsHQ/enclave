@@ -478,6 +478,9 @@ func TestValidateInheritSecrets(t *testing.T) {
 		m.Cutoff = time.Time{} // the cutoff is optional
 	})))
 	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
+		m.Value = []string{pubKey + ":1798761600", secondPubKey}
+	})))
+	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
 		m.Type, m.Value = inheritSecretTypeHash, []string{inheritTestHash("token")}
 	})))
 	require.NoError(t, validate(with(func(m *InheritSecretMetadata) {
@@ -570,6 +573,15 @@ func TestValidateInheritSecrets(t *testing.T) {
 		{"malformed public key list entry", with(func(m *InheritSecretMetadata) {
 			m.Value = []string{pubKey, "zz"}
 		}), "publicKey 1 is not hex"},
+		{"cutoff is not a unix timestamp", with(func(m *InheritSecretMetadata) {
+			m.Value = []string{pubKey + ":2027-01-01"}
+		}), "publicKey 0 cutoff"},
+		{"empty cutoff", with(func(m *InheritSecretMetadata) {
+			m.Value = []string{pubKey + ":"}
+		}), "publicKey 0 cutoff"},
+		{"negative cutoff", with(func(m *InheritSecretMetadata) {
+			m.Value = []string{pubKey + ":-1"}
+		}), "publicKey 0 cutoff"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -611,13 +623,21 @@ func TestVerifyInheritedSecret(t *testing.T) {
 	}
 	keyListMeta := keyMeta
 	keyListMeta.Value = []string{pubKey, secondPubKey}
+	keyListCutoffMeta := keyMeta
+	keyListCutoffMeta.Value = []string{pubKey + ":1798761600", secondPubKey + ":1830297600"}
 	hashMeta := InheritSecretMetadata{
 		Name:  "token",
 		Type:  inheritSecretTypeHash,
 		Value: []string{inheritTestHash("s3cr3t token")},
 	}
+	hashCutoffMeta := hashMeta
+	hashCutoffMeta.Value = []string{inheritTestHash("s3cr3t token") + ":1798761600"}
 	hashListMeta := hashMeta
 	hashListMeta.Value = []string{inheritTestHash("first"), inheritTestHash("second")}
+	hashListCutoffMeta := hashMeta
+	hashListCutoffMeta.Value = []string{
+		inheritTestHash("first") + ":1798761600", inheritTestHash("second") + ":1830297600",
+	}
 	emptyHashMeta := hashMeta
 	emptyHashMeta.Value = []string{inheritTestHash("")}
 
@@ -630,12 +650,11 @@ func TestVerifyInheritedSecret(t *testing.T) {
 		{"private key", keyMeta, privKey, privKey},
 		{"hash secret", hashMeta, token, token},
 		{"decoded bytes are pinned", hashMeta, strings.ToUpper(token), strings.ToUpper(token)},
-		// Metadata after a colon is delivered to the app but not pinned.
-		{"metadata is delivered", hashMeta, token + ":1798761600", token + ":1798761600"},
+		{"pinned cutoff", hashCutoffMeta, token + ":1798761600", token + ":1798761600"},
 		{"hash list", hashListMeta, first + "," + second, first + "," + second},
 		{"hash list, other order", hashListMeta, second + "," + first, first + "," + second},
 		{
-			"hash list with metadata", hashListMeta,
+			"hash list with cutoffs", hashListCutoffMeta,
 			first + ":1798761600," + second + ":1830297600",
 			first + ":1798761600," + second + ":1830297600",
 		},
@@ -646,7 +665,7 @@ func TestVerifyInheritedSecret(t *testing.T) {
 			secondPrivKey + "," + privKey, privKey + "," + secondPrivKey,
 		},
 		{
-			"key list with metadata", keyListMeta,
+			"key list with cutoffs", keyListCutoffMeta,
 			privKey + ":1798761600," + secondPrivKey + ":1830297600",
 			privKey + ":1798761600," + secondPrivKey + ":1830297600",
 		},
@@ -660,9 +679,9 @@ func TestVerifyInheritedSecret(t *testing.T) {
 			first + "," + first + "," + second, first + "," + second,
 		},
 		{
-			"first of repeated entries is kept", hashListMeta,
-			first + ":1798761600," + first + ":1830297600," + second,
-			first + ":1798761600," + second,
+			"entry with another cutoff is left out", hashListCutoffMeta,
+			first + ":1830297600," + first + ":1798761600," + second + ":1830297600",
+			first + ":1798761600," + second + ":1830297600",
 		},
 		{"unpinned key is left out", keyMeta, otherPrivateKey + "," + privKey, privKey},
 		{
@@ -699,6 +718,18 @@ func TestVerifyInheritedSecret(t *testing.T) {
 			inheritTestHex("another token"), "pinned hash " + inheritTestHash("s3cr3t token"),
 		},
 		{
+			"cutoff is not pinned", hashMeta,
+			token + ":1798761600", "pinned hash " + inheritTestHash("s3cr3t token"),
+		},
+		{
+			"cutoff differs from the pinned one", hashCutoffMeta,
+			token + ":1830297600", "pinned hash " + inheritTestHash("s3cr3t token"),
+		},
+		{
+			"pinned cutoff is missing", hashCutoffMeta,
+			token, "pinned hash " + inheritTestHash("s3cr3t token"),
+		},
+		{
 			"another hash secret with metadata", hashMeta,
 			inheritTestHex("another token") + ":1798761600",
 			"pinned hash " + inheritTestHash("s3cr3t token"),
@@ -732,7 +763,7 @@ func TestVerifyInheritedSecret(t *testing.T) {
 			privKey + "," + privKey, "pinned publicKey " + secondPubKey,
 		},
 		{
-			"key list entry is repeated with metadata", keyListMeta,
+			"key list entry is repeated with cutoffs", keyListCutoffMeta,
 			privKey + ":1798761600," + privKey + ":1830297600",
 			"pinned publicKey " + secondPubKey,
 		},

@@ -14,6 +14,8 @@ INTENT_DIGEST = hashlib.sha256(b"ark/e2e/dev\x00testapp").digest()[:8].hex()
 INTENT_BUCKET = f"enclave-{AWS_ACCOUNT_ID}-{INTENT_DIGEST}-migration-intents"
 # Inherited hash secrets are delivered hex; default.nix pins its SHA-256.
 INHERITED = b"inherited-from-outside".hex()
+# e2e-inherited's commitment also pins this cutoff for the app.
+INHERITED_WITH_CUTOFF = f"{INHERITED}:1798761600"
 
 
 def cloud(command):
@@ -57,10 +59,14 @@ def setup_aws():
         "ssm put-parameter --name /ark/e2e/dev/testapp/enclave/LeaseBucketName "
         f"--type String --value {LEASE_BUCKET}"
     )
-    for inherited in ("e2e-inherited", "e2e-expired", "e2e-cutoff"):
+    for inherited, value in (
+        ("e2e-inherited", INHERITED_WITH_CUTOFF),
+        ("e2e-expired", INHERITED),
+        ("e2e-cutoff", INHERITED),
+    ):
         cloud(
             f"ssm put-parameter --name /ark/e2e/dev/testapp/enclave/inherit/{inherited} "
-            f"--type String --value {INHERITED}"
+            f"--type String --value {value}"
         )
     put_env("ENCLAVE_FQDN", FQDN)
 

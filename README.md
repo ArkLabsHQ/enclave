@@ -490,9 +490,10 @@ With `ENCLAVE_METRICS=true`, the runtime's counters ship as cumulative sums: `en
 (uploads accepted with a `2xx`, by AWS or, for a signal that is off, by the enclave
 dropping them),
 `enclave_otlp_<logs|traces|metrics>_upstream_errors_total` (a transport failure, a
-`429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`. Go runtime,
-`/proc`, vsock tunnel and clock sync readings ship as `enclave_runtime_*` gauges and
-counters.
+`429` or a `5xx` from AWS) and `enclave_telemetry_export_errors_total`.
+`enclave_http_inflight_requests` is a gauge of the requests each listener
+(`listener=public|internal`) is serving. Go runtime, `/proc`, vsock tunnel, clock
+sync and TLS certificate readings ship as `enclave_runtime_*` gauges and counters.
 
 The public listener receives internet scanner traffic, so client errors are mostly
 probes for paths such as `/.env` and `/.git/config`. Alarm on

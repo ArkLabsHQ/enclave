@@ -24,12 +24,13 @@ var (
 )
 
 // TunnelTraffic counts frames relayed over the vsock tunnel to gvproxy since
-// boot, across reconnects. Bytes are frame payloads, without the 2-byte
-// length prefix.
+// boot, across reconnects, and the tunnel failures that force a reconnect.
+// Bytes are frame payloads, without the 2-byte length prefix.
 var TunnelTraffic struct {
 	EgressFrames, EgressBytes   atomic.Uint64 // enclave -> host
 	EgressWriteNanos            atomic.Uint64 // time blocked writing to vsock
 	IngressFrames, IngressBytes atomic.Uint64 // host -> enclave
+	Failures                    atomic.Uint64 // tunnel setups that failed or dropped
 }
 
 // RunNetworking sets up the TAP tunnel to the host-side gvproxy, retrying
@@ -40,6 +41,7 @@ func RunNetworking(ctx context.Context, hostProxyPort uint32) {
 		if err = setupNetworking(ctx, hostProxyPort); err == nil {
 			return
 		}
+		TunnelTraffic.Failures.Add(1)
 		elog.Printf("TAP tunnel to EC2 host failed: %v.  Restarting.", err)
 		time.Sleep(time.Second)
 	}

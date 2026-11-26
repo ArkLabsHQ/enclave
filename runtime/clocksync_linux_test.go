@@ -193,6 +193,7 @@ func TestObserveHardStep(t *testing.T) {
 	)
 	require.True(t, isHardStep, "gross offset triggers hard-step")
 	require.Equal(t, hardSteps+1, clockSyncReadings.hardSteps.Load())
+	require.Zero(t, clockSyncReadings.offsetNs.Load(), "the step leaves no offset")
 	require.Equal(t, int64(42_000_000_000), stepToNs)
 	require.Equal(
 		t,

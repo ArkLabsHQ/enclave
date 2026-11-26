@@ -253,6 +253,7 @@ func (cs *clockSyncer) adjust(m offsetMeasurement) error {
 		ts := unix.NsecToTimespec(m.phcNs)
 		err := clockSettime(unix.CLOCK_REALTIME, &ts)
 		if err == nil {
+			clockSyncReadings.offsetNs.Store(0)
 			clockSyncReadings.hardSteps.Add(1)
 			cs.lastXMonoNs = m.xMonoNs
 			slog.Warn("clock sync: hard-step", "offset_ms", float64(m.offsetNs)/1e6)

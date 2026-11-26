@@ -81,6 +81,7 @@ func newCertManager(
 		return nil, err
 	}
 	m.currentCert.Store(bundle)
+	servedCertNotAfter.Store(bundle.notAfter.Unix())
 
 	attData.SetTLSKeyHashSource(func() ([sha256.Size]byte, bool) {
 		return m.currentCert.Load().keyHash, true
@@ -135,6 +136,7 @@ func (m *certManager) tick(ctx context.Context) error {
 	}
 	if stored != nil && stored.etag != m.currentETag() {
 		m.currentCert.Store(stored)
+		servedCertNotAfter.Store(stored.notAfter.Unix())
 		slog.Info("adopted a peer's certificate renewal",
 			"fqdn", m.fqdn, "etag", stored.etag, "not_after", stored.notAfter.UTC())
 	}
@@ -150,6 +152,7 @@ func (m *certManager) tick(ctx context.Context) error {
 	}
 	if renewed != nil {
 		m.currentCert.Store(renewed)
+		servedCertNotAfter.Store(renewed.notAfter.Unix())
 	}
 
 	if left := time.Until(m.currentCert.Load().notAfter); left < certHardFloor {

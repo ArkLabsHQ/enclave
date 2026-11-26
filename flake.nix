@@ -4,12 +4,16 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     aws-nitro-util.url = "github:monzo/aws-nitro-util";
+    # The tag the e2e-upgrade check hands off from, bumped on each new tag: HEAD
+    # must adopt from the tag before it, not from older ones.
+    previous-release.url = "github:ArkLabsHQ/enclave/v0.1.0";
   };
 
   outputs =
     {
       nixpkgs,
       aws-nitro-util,
+      previous-release,
       self,
     }:
     let
@@ -66,8 +70,8 @@
               # x86_64-linux only, like runtime: aarch64 EIFs measure correctly but
               # cannot boot. Built from nix/tests/test-app, and exposed so this repo can
               # exercise its own eif-build workflow against a real EIF.
-              eif-blue = (import ./nix/tests { inherit pkgs system self; }).eif-blue;
-              eif-green = (import ./nix/tests { inherit pkgs system self; }).eif-green;
+              eif-blue = (import ./nix/tests { inherit pkgs system self previous-release; }).eif-blue;
+              eif-green = (import ./nix/tests { inherit pkgs system self previous-release; }).eif-green;
             }
           ))
           (
@@ -126,6 +130,7 @@
             pkgs
             system
             self
+            previous-release
             ;
         }).checks
       );

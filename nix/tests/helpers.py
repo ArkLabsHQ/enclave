@@ -3,7 +3,6 @@
 import hashlib
 import json
 import shlex
-import time
 
 CLOUD = "aws --no-cli-pager --endpoint-url http://127.0.0.1:4566 --region us-east-1"
 AWS_ACCOUNT_ID = "000000000000"

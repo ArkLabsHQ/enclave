@@ -15,6 +15,10 @@ jobs:
   integration-test:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [e2e, e2e-upgrade]
     steps:
       - uses: actions/checkout@v6
 
@@ -26,5 +30,5 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Run integration test
-        run: nix build .#checks.x86_64-linux.e2e --print-build-logs
+      - name: Run ${{ matrix.check }}
+        run: nix build .#checks.x86_64-linux.${{ matrix.check }} --print-build-logs

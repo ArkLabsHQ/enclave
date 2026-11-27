@@ -2,6 +2,7 @@
   pkgs,
   system,
   self,
+  previous-release,
 }:
 let
   lib = pkgs.lib;
@@ -253,16 +254,19 @@ let
     AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required";
   };
 
+  # flake is the one whose lib.buildEif, and so whose runtime, builds the EIF.
   mkTestEif =
-    env:
-    self.lib.buildEif {
+    flake: env:
+    flake.lib.buildEif {
       inherit pkgs;
       app = testApp;
       overrideAllowlist = [ "E2E_OVERRIDE" ];
       env = commonEifEnv // env;
     };
 
-  blueEif = mkTestEif {
+  eifPCR0 = eif: lib.toLower (builtins.fromJSON (builtins.readFile "${eif}/pcr.json")).PCR0;
+
+  blueEnv = {
     ENCLAVE_PREVIOUS_PCR0 = "genesis";
     ENCLAVE_TEST_SALT = "blue";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
@@ -283,10 +287,11 @@ let
       ]
     );
   };
-  bluePCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${blueEif}/pcr.json")).PCR0;
+  blueEif = mkTestEif self blueEnv;
+  bluePCR0 = eifPCR0 blueEif;
 
-  greenEif = mkTestEif {
-    ENCLAVE_PREVIOUS_PCR0 = bluePCR0;
+  greenEnv = previousPCR0: {
+    ENCLAVE_PREVIOUS_PCR0 = previousPCR0;
     ENCLAVE_TEST_SALT = "green";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       signingSecret
@@ -305,7 +310,14 @@ let
       ]
     );
   };
-  greenPCR0 = lib.toLower (builtins.fromJSON (builtins.readFile "${greenEif}/pcr.json")).PCR0;
+  greenEif = mkTestEif self (greenEnv bluePCR0);
+  greenPCR0 = eifPCR0 greenEif;
+
+  # Blue as previous-release builds it, with that tag's runtime, and the
+  # green that must adopt from it.
+  releaseBlueEif = mkTestEif previous-release blueEnv;
+  releaseBluePCR0 = eifPCR0 releaseBlueEif;
+  upgradeGreenEif = mkTestEif self (greenEnv releaseBluePCR0);
 
   mkEnclaveNode =
     eif:
@@ -615,6 +627,22 @@ in
         + builtins.readFile ./helpers.py
         + "\n"
         + builtins.readFile ./e2e.py;
+    };
+
+    e2e-upgrade = pkgs.testers.runNixOSTest {
+      name = "enclave-runtime-e2e-upgrade";
+      nodes = {
+        aws = awsNode;
+        blue = mkEnclaveNode releaseBlueEif;
+        green = mkEnclaveNode upgradeGreenEif;
+      };
+      testScript =
+        ''
+          BLUE_PCR0 = ${builtins.toJSON releaseBluePCR0}
+        ''
+        + builtins.readFile ./helpers.py
+        + "\n"
+        + builtins.readFile ./upgrade.py;
     };
   };
 

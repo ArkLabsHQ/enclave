@@ -608,7 +608,7 @@ Constraints:
 
 A static secret is born inside the enclave. An inherited secret already exists
 in the outside world — a legacy signing key, say — and is handed to the
-application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array:
+application. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array:
 
 ```json
 [
@@ -616,8 +616,7 @@ application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array
     "name": "legacy-signer",
     "env_var": "LEGACY_SIGNING_KEY",
     "type": "publicKey",
-    "value": ["02…"],
-    "cutoff": "2027-01-01T00:00:00Z"
+    "value": ["02…"]
   }
 ]
 ```
@@ -625,32 +624,20 @@ application for a limited time. `ENCLAVE_INHERIT_SECRETS_CONFIG` is a JSON array
 | Field | Meaning |
 |---|---|
 | `name` | The operator places the secret at `/<namespace>/<app>/enclave/inherit/<name>`, as a `String` or `SecureString`. |
-| `env_var` | Environment variable set on the application process, containing the parameter value with surrounding whitespace trimmed. |
+| `env_var` | Environment variable set on the application process, containing the entries of the parameter value that matched a commitment, sorted and comma-separated. |
 | `type` | `hash` or `publicKey`: what `value` pins. |
-| `value` | Array of commitments, one per delivered entry. `hash`: hex SHA-256 of the secret; the entry is the secret hex-encoded, and the pin covers the decoded bytes. `publicKey`: hex compressed secp256k1 public key; the entry is the matching private key as 64 hex characters. Every entry is hex, so a comma or colon inside a secret cannot occur. With more than one commitment the delivered value is a comma-separated list of the same length, each entry matched against one unused commitment in any order. Any entry may carry metadata for the application after a colon, as in `<private-key>:<unix-timestamp>`: only the secret is pinned, and the entry reaches the application whole. The metadata must not contain a comma. |
-| `cutoff` | Optional RFC 3339 timestamp from which the application no longer receives the secret. Without one, the value is still verified against its pin, but it is delivered on every boot for as long as its parameter exists and no restart ever withdraws it. |
+| `value` | Array of commitments, each matched by one entry of the parameter value. `hash`: hex SHA-256 of the secret; the entry is the secret hex-encoded, and the pin covers the decoded bytes. `publicKey`: hex compressed secp256k1 public key; the entry is the matching private key as 64 hex characters. Every entry is hex, so a comma or colon inside a secret cannot occur. The delivered value is a comma-separated list: every commitment must be matched by an entry, in any order. Entries that match no commitment, or repeat one already matched, are ignored and never reach the application, so the parameter may already hold secrets that only a later image pins. A commitment may end in a cutoff for the application, as in `02…:<unix-timestamp>`; its entry must then carry the same one, as in `<private-key>:<unix-timestamp>`, and reaches the application whole. An entry with a cutoff its commitment does not pin, or without the one it pins, matches nothing. |
 
-The array is baked into the image, so the pins and cutoffs are part of PCR0: a
-verifier knows which outside secret the enclave accepts, and until when, or
-that no cutoff applies.
+The array is baked into the image, so the pins are part of PCR0: a verifier
+knows which outside secret the enclave accepts.
 
 At boot, before the application starts:
 
-- A secret at or past its `cutoff` is not read: its parameter is never
-  fetched, so the parameter and the KMS key of a `SecureString` can be retired
-  once the cutoff has passed without affecting later boots.
-- A value that does not match its pin **aborts boot**.
+- A value that leaves any pinned commitment unmatched **aborts boot**. Entries
+  beyond the pinned ones are logged and left out.
 - A missing parameter is logged and skipped. Deleting a parameter therefore
   withdraws the secret from future boots; enclaves already running keep it
-  until its cutoff or their next restart.
-- The cutoff is checked again just before the application is launched, so a
-  slow boot cannot hand over a secret that expired in the meantime.
-
-When a cutoff passes while the enclave is running, the runtime clears the
-variable and restarts the application without it. The runtime itself, its
-attestation and its TLS identity are unaffected; the application sees a
-`SIGTERM` (then `SIGKILL` after ten seconds) and a fresh start. The cutoff is
-checked every 30 seconds against the enclave's synchronised clock.
+  until their next restart.
 
 Constraints:
 
@@ -660,7 +647,7 @@ Constraints:
   [Application process environment](#application-process-environment).
 - `env_var` must not be set in the baked environment nor be in
   `overrideAllowlist`, so nothing else can stand in for a secret that is not
-  delivered or is past its cutoff. Either **aborts boot**.
+  delivered. Either **aborts boot**.
 
 An inherited secret is only as private as its history: whoever can read the SSM
 parameter can read it, and so could everyone who held it before. The pin

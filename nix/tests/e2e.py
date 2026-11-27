@@ -220,9 +220,7 @@ for node in BLUES:
 
 for node in BLUES:
     assert env_value(node, "E2E_OVERRIDE") == "override-from-ssm"
-    assert env_value(node, "E2E_INHERITED") == INHERITED
-    assert env_value(node, "E2E_CUTOFF") == INHERITED
-    assert env_value(node, "E2E_EXPIRED") == ""
+    assert env_value(node, "E2E_INHERITED") == INHERITED_WITH_CUTOFF
     assert env_value(node, "E2E_THIRD_KEY") == BLUE_THIRD_SECRET
     second = env_value(node, "E2E_SECOND_KEY")
     assert len(second) == 64, second
@@ -888,9 +886,7 @@ assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
 assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
 assert served_leaf(green_peer, "-noout -pubkey") == tls_public_key
 assert env_value(green_peer, "E2E_OVERRIDE") == "override-from-ssm"
-assert env_value(green_peer, "E2E_INHERITED") == INHERITED
-assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
-assert env_value(green_peer, "E2E_EXPIRED") == ""
+assert env_value(green_peer, "E2E_INHERITED") == INHERITED_WITH_CUTOFF
 green_peer.succeed(
     "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
     f"| jq -e --arg prev '{BLUE_PCR0}' --arg current '{GREEN_PCR0}' "
@@ -1090,37 +1086,3 @@ blue.succeed("systemctl restart enclave-start")
 wait_enclave_healthy(blue)
 assert secret_value(blue) == blue_secret
 assert snapshot_versions(BLUE_PCR0) == blue_snapshot
-
-# An inherited secret reaching its cutoff while the app runs. The cutoff is
-# baked into the image, so the node's clock is stepped to a minute before it
-# and the enclave follows through /dev/ptp0. Last on purpose: from here this
-# node disagrees with its peers about the time.
-green_peer.succeed("systemctl stop systemd-timesyncd 2>/dev/null || true")
-green_peer.succeed("date -u -s '2039-12-31 23:59:00'")
-green_peer.wait_until_succeeds(
-    "test $(curl -skf --http1.1 https://127.0.0.1/test/clock | jq .unix) -ge 2208988740",
-    timeout=30,
-)
-assert env_value(green_peer, "E2E_CUTOFF") == INHERITED
-green_peer.wait_until_succeeds(
-    "grep 'inherited secret reached its cutoff' /var/log/enclave-console.log "
-    "| grep -q e2e-cutoff",
-    timeout=150,
-)
-# The runtime relaunches the app; the second "child started" is the new process.
-green_peer.wait_until_succeeds(
-    "test \"$(tr -d '\\000' </var/log/enclave-console.log "
-    "| grep -c 'child started')\" -ge 2",
-    timeout=60,
-)
-wait_upstream_healthy(green_peer)
-assert env_value(green_peer, "E2E_CUTOFF") == ""
-# It still holds everything that was not cut off.
-assert secret_value(green_peer) == blue_secret
-assert env_value(green_peer, "E2E_SECOND_KEY") == REPLACEMENT_SECRET
-assert env_value(green_peer, "E2E_THIRD_KEY") == green_third_secret
-assert env_value(green_peer, "E2E_INHERITED") == INHERITED
-green_peer.succeed(
-    "curl -skf --http1.1 https://127.0.0.1/enclave/v1/info "
-    "| jq -e '.status == \"ready\" and .upstream_app.exited == false'"
-)

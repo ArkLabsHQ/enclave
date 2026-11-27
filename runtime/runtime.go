@@ -232,11 +232,6 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	}
 	rt.SetTLSCertCallback(withDefaultSNI(cfg.FQDN, tlsCertCb))
 
-	restart := watchInheritCutoffs(
-		ctx,
-		result.secrets.Inherited,
-		inheritCutoffPollInterval,
-	)
 	app, err := startApp(rt, cfg, otelToken, result.secrets)
 	if err != nil {
 		return fmt.Errorf("failed to start upstream app: %w", err)
@@ -246,13 +241,11 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	initSpan.End()
 	initSpanEnded = true
 
-	return supervise(ctx, rt, app, restart)
+	return supervise(ctx, rt, app)
 }
 
 type appProcess interface {
 	Stop() error
-	// Restart stops the app and launches it again with a freshly built environment.
-	Restart() error
 }
 
 type execApp struct {
@@ -273,12 +266,8 @@ func appEnv(cfg Config, otelToken string, secrets Secrets) []string {
 	for _, secret := range secrets.Static {
 		env = append(env, secret.EnvVar+"="+secret.Plaintext)
 	}
-	// Built at every launch, so a relaunch leaves out a secret past its cutoff.
-	now := time.Now()
 	for _, secret := range secrets.Inherited {
-		if !secret.pastCutoff(now) {
-			env = append(env, secret.EnvVar+"="+secret.Plaintext)
-		}
+		env = append(env, secret.EnvVar+"="+secret.Plaintext)
 	}
 	reserved := cfg.reservedEnv()
 	env = slices.DeleteFunc(env, func(entry string) bool {
@@ -355,18 +344,11 @@ func (a *execApp) Stop() error {
 	return stopApp(a.rt, a.cmd)
 }
 
-func (a *execApp) Restart() error {
-	_ = a.Stop() // stopApp escalates to SIGKILL and never fails
-	return a.launch()
-}
-
-// supervise runs until the runtime stops. A signal on restart relaunches the
-// app, so it comes back without an inherited secret past its cutoff.
+// supervise runs until the runtime stops.
 func supervise(
 	ctx context.Context,
 	rt RuntimeState,
 	child appProcess,
-	restart <-chan struct{},
 ) error {
 	for {
 		select {
@@ -377,13 +359,6 @@ func supervise(
 				slog.Warn("upstream app exited cleanly; runtime stays alive")
 			}
 			return waitForRuntime(ctx, rt)
-
-		case <-restart:
-			slog.Info("restarting upstream app without expired inherited secrets")
-			if err := child.Restart(); err != nil {
-				slog.Error("upstream app failed to restart; runtime stays alive", "error", err)
-				return waitForRuntime(ctx, rt)
-			}
 
 		case err := <-rt.ListenError():
 			_ = child.Stop()

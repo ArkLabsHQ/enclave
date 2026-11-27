@@ -127,7 +127,7 @@ func (b *Boot) Boot(ctx context.Context) (bootState, error) {
 
 	// Reject invalid inherited secrets before creating keys or writing state.
 	inheritedSecrets, err := resolveInheritedSecrets(
-		ctx, b.cfg, b.ssm, config.secretsMetadata.Inherited, time.Now(),
+		ctx, b.cfg, b.ssm, config.secretsMetadata.Inherited,
 	)
 	if err != nil {
 		return bootState{}, err

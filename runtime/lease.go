@@ -122,7 +122,7 @@ func (l *Lease) Verify(ctx context.Context) error {
 		return fmt.Errorf("%w: %s: taken over by a peer", ErrLeaseLost, l.key)
 	}
 
-	if doc.lapsed(time.Now()) {
+	if doc.lapsed(time.Now(), l.ttl) {
 		return fmt.Errorf("%w: %s: lapsed before renewal", ErrLeaseLost, l.key)
 	}
 	return nil
@@ -235,7 +235,7 @@ func (l *Lease) claim(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if !doc.lapsed(time.Now()) {
+		if !doc.lapsed(time.Now(), l.ttl) {
 			return false, nil
 		}
 
@@ -359,8 +359,15 @@ func (l *Lease) get(ctx context.Context) (leaseDocV1, string, error) {
 }
 
 // lapsed reports whether the lease is stealable.
-func (d leaseDocV1) lapsed(now time.Time) bool {
-	return now.After(time.Unix(d.ExpiresAt, 0))
+func (d leaseDocV1) lapsed(now time.Time, ttl time.Duration) bool {
+	expiresAt := time.Unix(d.ExpiresAt, 0)
+	if now.After(expiresAt) {
+		return true
+	}
+	if ttl > 0 && expiresAt.After(now.Add(2*ttl)) {
+		return true
+	}
+	return false
 }
 
 // leaseObjectKey namespaces locks inside the storage bucket.

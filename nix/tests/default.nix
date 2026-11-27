@@ -315,7 +315,15 @@ let
 
   # Blue as previous-release builds it, with that tag's runtime, and the
   # green that must adopt from it.
-  releaseBlueEif = mkTestEif previous-release blueEnv;
+  # previous-release pins bare hashes; it strips the entry's ":<unix-ts>" itself.
+  releaseBlueEnv = blueEnv // {
+    ENCLAVE_INHERIT_SECRETS_CONFIG = builtins.toJSON (
+      map (m: m // { value = map (v: lib.head (lib.splitString ":" v)) m.value; }) (
+        builtins.fromJSON blueEnv.ENCLAVE_INHERIT_SECRETS_CONFIG
+      )
+    );
+  };
+  releaseBlueEif = mkTestEif previous-release releaseBlueEnv;
   releaseBluePCR0 = eifPCR0 releaseBlueEif;
   upgradeGreenEif = mkTestEif self (greenEnv releaseBluePCR0);
 

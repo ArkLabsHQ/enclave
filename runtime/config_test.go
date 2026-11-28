@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -773,4 +775,25 @@ func TestApplySSMOverlayAllowlistedEnvPreservesLoadedConfig(t *testing.T) {
 	after, err := LoadStaticSecretMetadata(*cfg)
 	require.NoError(t, err)
 	require.Equal(t, metadata, after, "boot must parse the captured secret definitions")
+}
+
+func TestLoadConfigWarnsUnrecognizedEnclaveEnv(t *testing.T) {
+	setConfigTestEnv(t, false)
+	t.Setenv("ENCLAVE_TRACING", "true")
+
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	require.Equal(t, "true", os.Getenv("ENCLAVE_TRACING"))
+	require.Contains(
+		t,
+		buf.String(),
+		"unrecognized ENCLAVE_* environment variable",
+	)
+	require.Contains(t, buf.String(), "ENCLAVE_TRACING")
 }

@@ -286,7 +286,7 @@ let
 
   blueEnv = {
     ENCLAVE_PREVIOUS_PCR0 = "genesis";
-    ENCLAVE_TEST_SALT = "blue";
+    E2E_TEST_SALT = "blue";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       signingSecret
       secondSecret
@@ -310,7 +310,7 @@ let
 
   greenEnv = previousPCR0: {
     ENCLAVE_PREVIOUS_PCR0 = previousPCR0;
-    ENCLAVE_TEST_SALT = "green";
+    E2E_TEST_SALT = "green";
     ENCLAVE_SECRETS_CONFIG = builtins.toJSON [
       signingSecret
       thirdSecret

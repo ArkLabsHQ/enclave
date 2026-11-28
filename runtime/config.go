@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -235,6 +234,8 @@ func LoadConfig() (*Config, error) {
 		ChildEnv:              make(map[string]string),
 	}
 
+	// Taken in every mode so it never reaches the app; it only applies in dev mode.
+	insecureVerifySkipped := takeEnv(envInsecureVerifySkipped) == "true"
 	if takeEnv(envDev) == "true" {
 		cfg.KMSLocked = false
 		cfg.SnapshotRetention = devSnapshotRetention
@@ -244,9 +245,7 @@ func LoadConfig() (*Config, error) {
 
 		// only allow overriding cfg.InsecureVerifySkipped in dev mode
 		// It is false by default unless explicitly overridden
-		cfg.InsecureVerifySkipped = takeEnv(envInsecureVerifySkipped) == "true"
-	} else {
-		_ = takeEnv(envInsecureVerifySkipped)
+		cfg.InsecureVerifySkipped = insecureVerifySkipped
 	}
 
 	if cfg.ExportTraces, err = takeEnvBool(envTraces); err != nil {
@@ -279,7 +278,7 @@ func LoadConfig() (*Config, error) {
 	// in the environment. This runs on the success path only: if earlier
 	// parsing fails, the fatal boot error is immediately actionable
 	// and partial consumption makes warning incomplete.
-	warnUnrecognizedEnclaveEnv(os.Environ())
+	warnUnrecognizedEnclaveEnv()
 
 	return cfg, nil
 }
@@ -591,46 +590,14 @@ func logRetentionDays() int32 {
 	return int32(days)
 }
 
-// knownEnclaveEnvVars lists all ENCLAVE_* environment variable names parsed by LoadConfig.
-var knownEnclaveEnvVars = []string{
-	envNamespace,
-	envAppName,
-	envAppPort,
-	envPreviousPCR0,
-	envSecretsConfig,
-	envInheritSecretsConfig,
-	envOverrideAllowList,
-	envDev,
-	envInsecureVerifySkipped,
-	envVerifyClockSource,
-	envMigrationCooldown,
-	envFQDN,
-	envUpstream,
-	envViproxyInAddrs,
-	envViproxyOutAddrs,
-	envLogShipInterval,
-	envLogRetentionDays,
-	envTraces,
-	envMetrics,
-	envUseACME,
-	envACMEDirectory,
-	envACMEEmail,
-	envACMECA,
-	envAWSRegion,
-}
-
-func warnUnrecognizedEnclaveEnv(environ []string) []string {
-	var unrecognized []string
-	for _, env := range environ {
-		key, _, _ := strings.Cut(env, "=")
+// warnUnrecognizedEnclaveEnv logs every ENCLAVE_* variable left in the
+// environment. LoadConfig takes out each name it reads, so a name still here is
+// one the runtime does not use, most likely a typo.
+func warnUnrecognizedEnclaveEnv() {
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
 		if strings.HasPrefix(key, "ENCLAVE_") {
-			unrecognized = append(unrecognized, key)
-			slog.Warn(
-				"unrecognized ENCLAVE_* environment variable",
-				"key", key,
-			)
+			slog.Warn("unrecognized ENCLAVE_* environment variable", "key", key)
 		}
 	}
-	sort.Strings(unrecognized)
-	return unrecognized
 }
